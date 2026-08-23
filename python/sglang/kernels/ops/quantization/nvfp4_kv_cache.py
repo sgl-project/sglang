@@ -32,7 +32,7 @@ def _e2m1_to_float(value):
 
 
 @triton.jit
-def _dequantize_nvfp4_kv_for_target_verify_kernel(
+def _dequantize_nvfp4_kv_for_speculative_extend_kernel(
     k_fp4_ptr,
     v_fp4_ptr,
     k_block_scales_ptr,
@@ -49,13 +49,14 @@ def _dequantize_nvfp4_kv_for_target_verify_kernel(
     prefix_lens_ptr,
     num_reqs,
     num_current_tokens_per_req,
+    prefix_len_delta,
     req_to_token_stride,
     k_current_row_stride,
     v_current_row_stride,
     ROW_ELEMENTS: tl.constexpr,
     BLOCK_ELEMENTS: tl.constexpr,
 ):
-    """Dequantize cached prefixes and copy verify-token KV by physical slot."""
+    """Dequantize cached prefixes and copy speculative-token KV by physical slot."""
     worker_id = tl.program_id(0)
     num_workers = tl.num_programs(0)
     element_offsets = tl.arange(0, BLOCK_ELEMENTS)
@@ -69,7 +70,10 @@ def _dequantize_nvfp4_kv_for_target_verify_kernel(
 
     for request_offset in tl.range(0, num_reqs):
         req_idx = tl.load(req_pool_indices_ptr + request_offset)
-        prefix_len = tl.load(prefix_lens_ptr + request_offset).to(tl.int32)
+        prefix_len = (
+            tl.load(prefix_lens_ptr + request_offset).to(tl.int32) - prefix_len_delta
+        )
+        prefix_len = tl.maximum(prefix_len, 0)
         req_row = req_idx.to(tl.int64) * req_to_token_stride
         current_row_base = request_offset * num_current_tokens_per_req
 
@@ -116,9 +120,9 @@ def _dequantize_nvfp4_kv_for_target_verify_kernel(
             tl.store(dq_k_ptr + output_offsets, k_dequant, mask=element_mask)
             tl.store(dq_v_ptr + output_offsets, v_dequant, mask=element_mask)
 
-        # Current verify tokens have not been committed to the quantized cache
-        # yet. Keep the existing prefill behavior and expose their unquantized
-        # K/V through the FP8 workspace directly.
+        # Current speculative tokens have not been committed to the quantized
+        # cache yet. Keep the existing prefill behavior and expose their
+        # unquantized K/V through the FP8 workspace directly.
         for current_offset in tl.range(
             worker_id, num_current_tokens_per_req, num_workers
         ):
@@ -144,7 +148,7 @@ def _dequantize_nvfp4_kv_for_target_verify_kernel(
 _cached_num_workers = None
 
 
-def dequantize_nvfp4_kv_for_target_verify(
+def dequantize_nvfp4_kv_for_speculative_extend(
     k_fp4: torch.Tensor,
     v_fp4: torch.Tensor,
     k_block_scales: torch.Tensor,
@@ -160,16 +164,34 @@ def dequantize_nvfp4_kv_for_target_verify(
     prefix_lens: torch.Tensor,
     current_locs: torch.Tensor,
     num_current_tokens_per_req: int,
+    prefix_len_delta: int,
 ) -> None:
-    """Populate the physical-slot FP8 workspace for speculative verification.
+    """Populate the physical-slot FP8 workspace for a speculative extend.
 
     This wrapper performs no allocation or device-to-host synchronization. The
     Triton launch shape depends only on static KV-row metadata, while request
     indices and prefix lengths remain device tensors read by the kernel. It is
     therefore safe to record once and replay with different requests/lengths.
+
+    ``prefix_lens`` may contain either committed prefix lengths (target verify)
+    or full post-write sequence lengths (draft extend). ``prefix_len_delta`` is
+    zero for the former and the fixed current-token width for the latter.
+
+    Each workspace row is one tensor-parallel rank's flattened KV head row:
+    ``per_rank_kv_heads * head_dim`` elements.
     """
     if req_pool_indices.numel() == 0:
         return
+
+    if num_current_tokens_per_req <= 0:
+        raise ValueError(
+            "num_current_tokens_per_req must be positive for speculative NVFP4 "
+            f"workspace preparation, got {num_current_tokens_per_req}."
+        )
+    if prefix_len_delta < 0:
+        raise ValueError(
+            f"prefix_len_delta must be non-negative, got {prefix_len_delta}."
+        )
 
     if not (
         k_fp4.is_contiguous()
@@ -179,7 +201,12 @@ def dequantize_nvfp4_kv_for_target_verify(
         and dq_k.is_contiguous()
         and dq_v.is_contiguous()
     ):
-        raise ValueError("NVFP4 target-verify workspace tensors must be contiguous.")
+        raise ValueError("NVFP4 speculative workspace tensors must be contiguous.")
+
+    if prefix_lens.numel() != req_pool_indices.numel():
+        raise ValueError(
+            "NVFP4 speculative prefix lengths must match the request batch size."
+        )
 
     row_elements = dq_k[0].numel()
     if row_elements % 16 != 0:
@@ -192,12 +219,12 @@ def dequantize_nvfp4_kv_for_target_verify(
         raise ValueError("Current K/V rows must match the dequant workspace row size.")
     if k_current.shape[0] != req_pool_indices.numel() * num_current_tokens_per_req:
         raise ValueError(
-            "Current target-verify K/V rows must equal "
+            "Current speculative K/V rows must equal "
             "batch_size * num_current_tokens_per_req."
         )
     if current_locs.numel() != k_current.shape[0]:
         raise ValueError(
-            "Target-verify KV write locations must match the current K/V rows."
+            "Speculative KV write locations must match the current K/V rows."
         )
 
     global _cached_num_workers
@@ -205,7 +232,7 @@ def dequantize_nvfp4_kv_for_target_verify(
         _cached_num_workers = max(1, get_device_core_count())
 
     block_elements = triton.next_power_of_2(row_elements)
-    _dequantize_nvfp4_kv_for_target_verify_kernel[(_cached_num_workers,)](
+    _dequantize_nvfp4_kv_for_speculative_extend_kernel[(_cached_num_workers,)](
         k_fp4,
         v_fp4,
         k_block_scales,
@@ -222,6 +249,7 @@ def dequantize_nvfp4_kv_for_target_verify(
         prefix_lens,
         req_pool_indices.numel(),
         num_current_tokens_per_req,
+        prefix_len_delta,
         req_to_token.stride(0),
         k_current.stride(0),
         v_current.stride(0),

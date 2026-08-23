@@ -2,13 +2,13 @@ import pytest
 import torch
 
 from sglang.kernels.ops.quantization.nvfp4_kv_cache import (
-    dequantize_nvfp4_kv_for_target_verify,
+    dequantize_nvfp4_kv_for_speculative_extend,
 )
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _dequantize_reference(fp4_data, block_scales, global_scale):
@@ -36,7 +36,11 @@ def _dequantize_reference(fp4_data, block_scales, global_scale):
     not (is_sm100_supported() or is_sm120_supported()),
     reason="NVFP4 KV cache requires SM100 or SM120",
 )
-def test_target_verify_workspace_graph_replay_uses_runtime_prefix_lens():
+@pytest.mark.parametrize(
+    "prefix_len_delta",
+    [pytest.param(0, id="target_verify"), pytest.param(4, id="draft_extend")],
+)
+def test_speculative_workspace_graph_replay_uses_runtime_lengths(prefix_len_delta):
     torch.manual_seed(7)
     device = "cuda"
     size, heads, head_dim = 64, 4, 128
@@ -66,7 +70,11 @@ def test_target_verify_workspace_graph_replay_uses_runtime_prefix_lens():
     # The third row models CUDA Graph padding: graph buffers use request row 0
     # and reserved KV slot 0 for padded requests.
     req_pool_indices = torch.tensor([0, 1, 0], dtype=torch.int32, device=device)
-    prefix_lens = torch.tensor([1, 2, 1], dtype=torch.int32, device=device)
+    sequence_lens = torch.tensor(
+        [1 + prefix_len_delta, 2 + prefix_len_delta, 1],
+        dtype=torch.int32,
+        device=device,
+    )
 
     # QKV splits can have a larger per-token stride. Exercise that layout so
     # target verify does not add a contiguous() allocation inside the graph.
@@ -119,7 +127,7 @@ def test_target_verify_workspace_graph_replay_uses_runtime_prefix_lens():
     current_locs = make_current_locs([1, 2])
 
     def run_kernel():
-        dequantize_nvfp4_kv_for_target_verify(
+        dequantize_nvfp4_kv_for_speculative_extend(
             k_fp4,
             v_fp4,
             k_block_scales,
@@ -132,9 +140,10 @@ def test_target_verify_workspace_graph_replay_uses_runtime_prefix_lens():
             dq_v,
             req_to_token,
             req_pool_indices,
-            prefix_lens,
+            sequence_lens,
             current_locs,
             current_tokens_per_req,
+            prefix_len_delta,
         )
 
     # Compile before capture, then capture with short prefixes.
@@ -149,7 +158,15 @@ def test_target_verify_workspace_graph_replay_uses_runtime_prefix_lens():
     dq_k.fill_(float("nan"))
     dq_v.fill_(float("nan"))
     replay_prefix_lens = [6, 7]
-    prefix_lens.copy_(torch.tensor([*replay_prefix_lens, 1], device=device))
+    sequence_lens.copy_(
+        torch.tensor(
+            [
+                *(length + prefix_len_delta for length in replay_prefix_lens),
+                1,
+            ],
+            device=device,
+        )
+    )
     current_locs.copy_(make_current_locs(replay_prefix_lens))
     graph.replay()
     torch.cuda.synchronize()

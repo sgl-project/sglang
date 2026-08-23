@@ -279,7 +279,7 @@ class KVCacheQuantMethodBase(ABC):
             f"KV cache method {self.name!r} does not support plain KV dequant reads."
         )
 
-    def dequantize_target_verify_prefix_to_workspace(
+    def dequantize_speculative_prefix_to_workspace(
         self,
         k_fp4: Tensor,
         v_fp4: Tensor,
@@ -294,11 +294,12 @@ class KVCacheQuantMethodBase(ABC):
         prefix_lens: Tensor,
         current_locs: Tensor,
         num_current_tokens_per_req: int,
+        prefix_len_delta: int,
         layer_id: int,
     ) -> None:
-        """Populate a physical-slot workspace for speculative verification."""
+        """Populate a physical-slot workspace for a speculative extend."""
         raise NotImplementedError(
-            f"KV cache method {self.name!r} does not support target-verify "
+            f"KV cache method {self.name!r} does not support speculative "
             "dequant workspaces."
         )
 
@@ -556,7 +557,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
-    def dequantize_target_verify_prefix_to_workspace(
+    def dequantize_speculative_prefix_to_workspace(
         self,
         k_fp4: Tensor,
         v_fp4: Tensor,
@@ -571,13 +572,14 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         prefix_lens: Tensor,
         current_locs: Tensor,
         num_current_tokens_per_req: int,
+        prefix_len_delta: int,
         layer_id: int,
     ) -> None:
         from sglang.kernels.ops.quantization.nvfp4_kv_cache import (
-            dequantize_nvfp4_kv_for_target_verify,
+            dequantize_nvfp4_kv_for_speculative_extend,
         )
 
-        dequantize_nvfp4_kv_for_target_verify(
+        dequantize_nvfp4_kv_for_speculative_extend(
             k_fp4,
             v_fp4,
             k_scales,
@@ -593,6 +595,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             prefix_lens,
             current_locs,
             num_current_tokens_per_req,
+            prefix_len_delta,
         )
 
     def compute_cell_size(

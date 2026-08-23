@@ -75,9 +75,10 @@ def _resolve_eagle_aux_hidden_state(
     if (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
-        and server_args.speculative_draft_model_path
     ):
-        # Load draft config to get layer count for KV cache sizing
+        # Mirror the draft worker's ModelConfig construction to get its KV layer
+        # count. For integrated MTP, a None draft path intentionally falls back
+        # to the target checkpoint and applies the is_draft_model conversion.
         draft_model_config = ModelConfig.from_server_args(
             server_args,
             model_path=server_args.speculative_draft_model_path,

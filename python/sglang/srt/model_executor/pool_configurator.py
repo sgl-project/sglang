@@ -209,9 +209,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
-                    )
+                    if is_float4_e2m1fn_x2(kvc.kv_cache_dtype):
+                        # FP4 has a per-worker dequant workspace shared across
+                        # layers. The draft therefore needs its own full
+                        # workspace, not a layer-proportional fraction of the
+                        # target workspace.
+                        self._cell_size += self._compute_cell_size(
+                            kvc, draft_num_layers
+                        )
+                    else:
+                        self._cell_size = int(
+                            self._cell_size
+                            * (1 + draft_num_layers / int(num_layers))
+                        )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:

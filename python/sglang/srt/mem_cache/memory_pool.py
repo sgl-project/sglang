@@ -2551,6 +2551,16 @@ class MHATokenToKVPool(KVCache):
             )
 
         if prepare_workspace:
+            if (
+                req_pool_indices_cpu is None
+                or extend_prefix_lens_cpu is None
+                or extend_seq_lens_cpu is None
+            ):
+                raise RuntimeError(
+                    "FlashInfer FP4 extend workspace preparation requires CPU "
+                    "request indices, prefix lengths, and extend lengths. Fixed-width "
+                    "speculative forwards must use the GPU-resident workspace path."
+                )
             transfer_cur_kv = not use_ragged
             k_cur_fp8 = (
                 k_cur.to(torch.float8_e4m3fn)
@@ -2607,7 +2617,7 @@ class MHATokenToKVPool(KVCache):
             v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
         )
 
-    def get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+    def get_flashinfer_speculative_dequant_workspace_kv_buffer(
         self,
         layer: RadixAttention,
         req_to_token: torch.Tensor,
@@ -2617,20 +2627,21 @@ class MHATokenToKVPool(KVCache):
         v_current: torch.Tensor,
         current_locs: torch.Tensor,
         num_current_tokens_per_req: int,
+        prefix_len_delta: int,
         *,
         layer_id_override: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build a graph-safe FP8 workspace for speculative target verify.
+        """Build a graph-safe FP8 workspace for a speculative extend.
 
-        FlashInfer verify metadata indexes the regular physical KV slots, unlike
-        the page-aligned contiguous workspace used by prompt/chunk prefill. The
-        quant method therefore dequantizes cached prefixes directly into their
-        physical workspace slots and writes current verify-token K/V to the same
-        slots, using only GPU-resident request metadata.
+        FlashInfer speculative metadata indexes regular physical KV slots,
+        unlike the page-aligned contiguous workspace used by prompt/chunk
+        prefill. The quant method therefore dequantizes cached prefixes directly
+        into their physical workspace slots and writes current-token K/V to the
+        same slots, using only GPU-resident request metadata.
         """
         if not self.is_quantized_kv_cache:
             raise RuntimeError(
-                "FlashInfer target-verify dequant workspace requested from a "
+                "FlashInfer speculative dequant workspace requested from a "
                 "non-quantized KV pool."
             )
 
@@ -2639,7 +2650,19 @@ class MHATokenToKVPool(KVCache):
         )
         k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(local_layer_id)
         dq_k, dq_v = self.get_dequant_workspace()
-        self.quant_method.dequantize_target_verify_prefix_to_workspace(
+        expected_k_row_elements = layer.tp_k_head_num * layer.head_dim
+        expected_v_row_elements = layer.tp_v_head_num * layer.head_dim
+        if (
+            dq_k[0].numel() != expected_k_row_elements
+            or dq_v[0].numel() != expected_v_row_elements
+        ):
+            raise RuntimeError(
+                "NVFP4 dequant workspace rows must match this tensor-parallel "
+                "rank's KV heads * head_dim: "
+                f"K expected {expected_k_row_elements}, got {dq_k[0].numel()}; "
+                f"V expected {expected_v_row_elements}, got {dq_v[0].numel()}."
+            )
+        self.quant_method.dequantize_speculative_prefix_to_workspace(
             k_fp4,
             v_fp4,
             k_scales,
@@ -2653,6 +2676,7 @@ class MHATokenToKVPool(KVCache):
             prefix_lens,
             current_locs,
             num_current_tokens_per_req,
+            prefix_len_delta,
             layer.layer_id,
         )
         return (
@@ -3940,15 +3964,13 @@ class HybridLinearKVPool(KVCache):
             layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 
-    def get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+    def get_flashinfer_speculative_dequant_workspace_kv_buffer(
         self, layer, *args, **kwargs
     ):
         self._wait_for_layer(layer.layer_id)
         local_layer_id = self._transfer_full_attention_id(layer.layer_id)
-        return (
-            self.full_kv_pool.get_flashinfer_target_verify_dequant_workspace_kv_buffer(
-                layer, *args, layer_id_override=local_layer_id, **kwargs
-            )
+        return self.full_kv_pool.get_flashinfer_speculative_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 
     def get_kv_scale_buffer(self, layer_id: int):
