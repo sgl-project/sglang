@@ -226,7 +226,7 @@ class PrefetchAck:
 _ROUTER_HINT_EXTRA_INFO_KEY = "kvcr_router_hint"
 
 
-def _router_hint_extra_info(operation: "StorageOperation") -> Optional[dict]:
+def _router_hint_extra_info(operation: StorageOperation) -> Optional[dict]:
     """Wrap an operation's router hint into the extra_info dict, or None if absent."""
     if operation.router_hint is None:
         return None

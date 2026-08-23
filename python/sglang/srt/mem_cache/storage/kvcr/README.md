@@ -4,8 +4,8 @@ Cross-instance KV reuse for SGLang: worker B serves a prefix that worker A
 computed, over NIXL, steered by a dynamo router hint. This is a POC — it works
 end to end, and the known gaps are listed at the bottom.
 
-For the design rationale see `RFC_kvcr_hicache_backend.md` next to this file.
-This document is only how to run it and what has been verified.
+For the design rationale see the PR description. This document is only how to
+run it and what has been verified.
 
 ## What it is
 

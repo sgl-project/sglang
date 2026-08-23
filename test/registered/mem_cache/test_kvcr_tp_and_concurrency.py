@@ -40,22 +40,24 @@ from unittest import mock
 
 import torch
 
-from kvcr.policy import FIFOPolicy, LRUPolicy
-from kvcr.types import OpEntryStatus
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.storage.kvcr import kvcr_store
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 from sglang.srt.mem_cache.storage.kvcr.router_hint import ROUTER_HINT_KEY
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from kvcr.policy import FIFOPolicy, LRUPolicy
+    from kvcr.types import OpEntryStatus
 
-    register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-except Exception:  # pragma: no cover - registration is CI-only
-    pass
+    from sglang.srt.mem_cache.storage.kvcr import kvcr_store
+    from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+except ImportError:  # pragma: no cover - wheel not installed on this tier
+    # Every case here drives a real KVCRStore, so there is nothing left to run.
+    raise unittest.SkipTest("nvidia-kvcr wheel not installed")
 
 
 _BASE_CONTROL_PORT = 25000
@@ -567,7 +569,7 @@ class ConcurrentDrainTest(unittest.TestCase):
     def test_completion_drained_by_the_pump_still_reaches_its_waiter(self):
         """The exact case _completed_ops exists for.
 
-        The pump drains the queue on its interval, so a get's own completion is
+        The pump drains the queue on its interval, so the completion of a get is
         routinely observed by a thread that is not waiting on it. If the pump
         dropped it, the waiter would spin to its deadline and report a miss --
         a silent recompute, not an error.
@@ -599,8 +601,7 @@ class ConcurrentDrainTest(unittest.TestCase):
             results[handle] = self.store._drain_until(handle, timeout_s=5.0)
 
         threads = [
-            threading.Thread(target=wait_for, args=(handle,))
-            for handle in (201, 202)
+            threading.Thread(target=wait_for, args=(handle,)) for handle in (201, 202)
         ]
         for thread in threads:
             thread.start()
@@ -766,9 +767,7 @@ class CloseTest(unittest.TestCase):
         core = SimpleNamespace(closed=False)
         core.close = lambda: setattr(core, "closed", True)
         store._kvcr = core
-        store._pump_thread = threading.Thread(
-            target=store._pump_stop.wait, daemon=True
-        )
+        store._pump_thread = threading.Thread(target=store._pump_stop.wait, daemon=True)
         store._pump_thread.start()
 
         store.close()

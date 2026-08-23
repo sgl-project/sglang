@@ -45,13 +45,9 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.test.ci.ci_register import register_cpu_ci
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-
-    register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-except Exception:  # pragma: no cover - registration is CI-only
-    pass
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _RaisingBackend:
@@ -108,9 +104,7 @@ def _controller(backend) -> HiCacheController:
     cc.has_draft = False
     cc.prefetch_sync_groups = []
     cc.mem_pool_host = MagicMock()
-    cc.get_hash_str = lambda tokens, last_hash, page_size: [
-        f"h{t}" for t in tokens
-    ]
+    cc.get_hash_str = lambda tokens, last_hash, page_size: [f"h{t}" for t in tokens]
     cc.page_set_func = cc._page_set_zero_copy
     cc.page_get_func = cc._page_get_zero_copy
     return cc

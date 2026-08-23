@@ -30,6 +30,9 @@ from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     page_hash_key,
 )
 from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # A realistic SGLang page key: a full SHA256 hex digest. The leading 16 chars
 # are >= 2**63 as a u64, so it exercises the signed/unsigned wrap.
@@ -162,7 +165,9 @@ class ParseTest(unittest.TestCase):
             {"source_control_endpoint": "tcp://peer:1", "block_hashes": "abc"},
         ):
             with self.subTest(payload=payload):
-                self.assertIsNone(RouterHint.maybe_from_extra_info(_extra_info(payload)))
+                self.assertIsNone(
+                    RouterHint.maybe_from_extra_info(_extra_info(payload))
+                )
 
     def test_absent_extra_info_yields_no_hint(self):
         self.assertIsNone(RouterHint.maybe_from_extra_info(None))

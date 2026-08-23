@@ -76,9 +76,7 @@ class NoFrameworkPinning:
         poll interval between ``request_pin`` and ``poll_pin_results``.
         """
         with self._lock:
-            self._declined = [
-                entry for entry in self._declined if entry[0] != request
-            ]
+            self._declined = [entry for entry in self._declined if entry[0] != request]
 
     def release_pin(self, pin_handle: PinHandle) -> bool:
         """Unreachable: KVCR only releases handles a non-``None`` result gave it.

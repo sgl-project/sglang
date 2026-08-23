@@ -22,10 +22,17 @@ the two places to update in lockstep.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
-from kvcr.types import BlockKey
+
+if TYPE_CHECKING:
+    from kvcr.types import BlockKey
+else:
+    # kvcr's BlockKey is `NewType("BlockKey", bytes)` -- an identity function at
+    # runtime. Aliasing it keeps this module importable without the wheel, which
+    # is what lets the schema tests run on the CPU CI tier.
+    BlockKey = bytes
 
 # Key under which the controller is expected to stash the hint inside
 # HiCacheStorageExtraInfo.extra_info. Placeholder name.
@@ -108,7 +115,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
     block_hashes: Tuple[str, ...] = ()
 
     @classmethod
-    def maybe_from_payload(cls, payload) -> Optional["RouterHint"]:
+    def maybe_from_payload(cls, payload) -> Optional[RouterHint]:
         """Build a hint from a raw wire dict, or None if it is not well-formed."""
         if not isinstance(payload, dict):
             return None
@@ -127,12 +134,10 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
                 # drop the entry and silently shift the remaining hashes.
                 break
             normalized.append(canonical)
-        return cls(
-            source_control_endpoint=endpoint, block_hashes=tuple(normalized)
-        )
+        return cls(source_control_endpoint=endpoint, block_hashes=tuple(normalized))
 
     @classmethod
-    def maybe_from_extra_info(cls, extra_info) -> Optional["RouterHint"]:
+    def maybe_from_extra_info(cls, extra_info) -> Optional[RouterHint]:
         """Best-effort extraction from a HiCacheStorageExtraInfo.
 
         Returns None whenever no well-formed hint is present -- the backend then

@@ -63,16 +63,6 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import msgspec
 import torch
-
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorage,
-    HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
-    PoolName,
-    PoolTransfer,
-    PoolTransferResult,
-)
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from kvcr import KVCR, KVCRBindings
 from kvcr.config import (
     FrameworkDramInput,
@@ -90,14 +80,24 @@ from kvcr.policy import (
     LRUPolicy,
 )
 from kvcr.types import BlockKey, MemDescriptor, OpEntryStatus, QueryStatus
-from sglang.srt.utils import dynamic_import
+
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRBackendConfig
 from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     RouterHint,
     StrKeyHintAdapter,
-    encode_key as _encode_key,
 )
+from sglang.srt.mem_cache.storage.kvcr.router_hint import encode_key as _encode_key
+from sglang.srt.utils import dynamic_import
 
 logger = logging.getLogger(__name__)
 
@@ -148,9 +148,7 @@ _REQUIRED_KVCR_METHODS = (
 
 
 def _require_kvcr_api() -> None:
-    missing = [
-        name for name in _REQUIRED_KVCR_METHODS if not hasattr(KVCR, name)
-    ]
+    missing = [name for name in _REQUIRED_KVCR_METHODS if not hasattr(KVCR, name)]
     if missing:
         raise RuntimeError(
             f"KVCRStore: the installed nvidia-kvcr is missing {missing}. This "
@@ -252,7 +250,7 @@ def _miss_per_key(self, keys, *_args, **_kwargs) -> List[bool]:
     return [False] * len(keys)
 
 
-def _no_prefix(self, *_args, **_kwargs) -> "PoolTransferResult":
+def _no_prefix(self, *_args, **_kwargs) -> PoolTransferResult:
     return PoolTransferResult.empty()
 
 
@@ -336,9 +334,7 @@ class KVCRStore(HiCacheStorage):
         mem_pool: Optional[HostKVCache] = None,
     ) -> None:
         self._storage_config = storage_config
-        self._config = KVCRBackendConfig.from_extra_config(
-            storage_config.extra_config
-        )
+        self._config = KVCRBackendConfig.from_extra_config(storage_config.extra_config)
         self.mem_pool_host = mem_pool
 
         # A per-worker unique NIXL agent name and control endpoint. Colocated
@@ -365,7 +361,7 @@ class KVCRStore(HiCacheStorage):
         # than the one currently being waited on. poll_completed() clears the
         # core's queue, so a result seen by the wrong waiter would be lost
         # without this stash. Guarded by _poll_lock -- the source pump drains
-        # the same queue, so it can be the one to observe a get's completion.
+        # the same queue, so it can be the one to observe the completion of a get.
         self._completed_ops: Dict[int, Dict] = {}
         # Handles a _drain_until is currently blocked on. A completion for
         # anything else is dropped rather than stashed.
@@ -675,8 +671,7 @@ class KVCRStore(HiCacheStorage):
         segment_bytes = int(size_list[0])
         if segment_bytes <= 0 or any(int(s) != segment_bytes for s in size_list):
             logger.warning(
-                "KVCRStore: non-uniform host segment sizes %s; local tier "
-                "disabled.",
+                "KVCRStore: non-uniform host segment sizes %s; local tier " "disabled.",
                 size_list,
             )
             return None
@@ -762,9 +757,7 @@ class KVCRStore(HiCacheStorage):
         """Offload host KV into KVCR's local DRAM tier via deposit()."""
         results: Dict[str, List[bool]] = {}
         if self._kvcr is None:
-            return {
-                str(t.name): [False] * len(t.keys or []) for t in transfers
-            }
+            return {str(t.name): [False] * len(t.keys or []) for t in transfers}
         for transfer in transfers:
             results[str(transfer.name)] = self._deposit_transfer(transfer)
         return results
@@ -854,9 +847,7 @@ class KVCRStore(HiCacheStorage):
         if host_indices is None or not keys or self._segments_per_page is None:
             return None
         try:
-            ptr_list, size_list = self.mem_pool_host.get_page_buffer_meta(
-                host_indices
-            )
+            ptr_list, size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
         except Exception:
             logger.warning("KVCRStore: get_page_buffer_meta failed", exc_info=True)
             return None
@@ -915,9 +906,7 @@ class KVCRStore(HiCacheStorage):
         """
         results: Dict[str, List[bool]] = {}
         if self._kvcr is None:
-            return {
-                str(t.name): [False] * len(t.keys or []) for t in transfers
-            }
+            return {str(t.name): [False] * len(t.keys or []) for t in transfers}
 
         request_id = self._register_hint(extra_info)
         try:
@@ -1314,9 +1303,7 @@ class KVCRStore(HiCacheStorage):
         host_indices,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        results = self.batch_set_v2(
-            [self._kv_transfer(keys, host_indices)], extra_info
-        )
+        results = self.batch_set_v2([self._kv_transfer(keys, host_indices)], extra_info)
         return results.get(str(PoolName.KV), [False] * len(keys))
 
     @_fail_closed(_miss_per_key)
@@ -1326,9 +1313,7 @@ class KVCRStore(HiCacheStorage):
         host_indices,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        results = self.batch_get_v2(
-            [self._kv_transfer(keys, host_indices)], extra_info
-        )
+        results = self.batch_get_v2([self._kv_transfer(keys, host_indices)], extra_info)
         return results.get(str(PoolName.KV), [False] * len(keys))
 
     @_fail_closed(lambda self, *a, **kw: 0)
@@ -1350,7 +1335,9 @@ class KVCRStore(HiCacheStorage):
     def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
         return False  # DRAFT-STUB
 
-    def batch_set(self, keys, values=None, target_locations=None, target_sizes=None) -> bool:
+    def batch_set(
+        self, keys, values=None, target_locations=None, target_sizes=None
+    ) -> bool:
         return False  # DRAFT-STUB
 
     @_fail_closed(lambda self, *a, **kw: False)

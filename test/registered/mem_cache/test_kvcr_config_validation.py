@@ -16,6 +16,9 @@ from __future__ import annotations
 import unittest
 
 from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRBackendConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # What the README's two-worker launch passes, minus whichever field is under
 # test. Kept here so a test that expects a *rejection* cannot pass because some

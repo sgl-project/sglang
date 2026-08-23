@@ -127,7 +127,7 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
             )
 
     @classmethod
-    def from_extra_config(cls, extra_config: Optional[dict]) -> "KVCRBackendConfig":
+    def from_extra_config(cls, extra_config: Optional[dict]) -> KVCRBackendConfig:
         if not extra_config:
             return cls()
         known = {f for f in cls.__struct_fields__}

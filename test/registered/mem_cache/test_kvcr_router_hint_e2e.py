@@ -24,7 +24,6 @@ covers the hint -> core contract that the store's ``_build_kvcr`` depends on.
 from __future__ import annotations
 
 import ctypes
-import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -64,12 +63,9 @@ if _HAS_KVCR:
         StrKeyHintAdapter,
     )
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-    register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-except Exception:  # pragma: no cover - registration is CI-only
-    pass
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +75,7 @@ except Exception:  # pragma: no cover - registration is CI-only
 # ---------------------------------------------------------------------------
 
 
-def _mem_descriptor(addr: int = 128, size: int = 16) -> "MemDescriptor":
+def _mem_descriptor(addr: int = 128, size: int = 16) -> MemDescriptor:
     return MemDescriptor(
         end_point_name="primary",
         mem_type="DRAM",
@@ -106,7 +102,7 @@ class FakePrimaryPinning:
         self._next_request = 0
         self._completed: list = []
 
-    def request_pin(self, keys) -> "PinRequestId":
+    def request_pin(self, keys) -> PinRequestId:
         keys = tuple(keys)
         self.searches.append(keys)
         request = PinRequestId(self._next_request)
@@ -389,9 +385,7 @@ class TestKVCRRouterHintE2E(unittest.TestCase):
             source_control_endpoint="tcp://source:1",
             block_hashes=hash_strs,
         )
-        env.target.submit_hint(
-            (), src="tcp://source:1", request_id="req", hints=hint
-        )
+        env.target.submit_hint((), src="tcp://source:1", request_id="req", hints=hint)
 
         # (1) query gate: our adapter.matches decides FETCHABLE vs MISS.
         self.assertEqual(
@@ -415,10 +409,10 @@ class TestKVCRRouterHintE2E(unittest.TestCase):
         self._pump_control(env.target_control, env.source_control)
 
         # Source pins, issues the NIXL WRITE for the covered prefix, notifies.
-        self.assertEqual(_poll_until(env.source, lambda _: bool(env.source_agent.xfers)), [])
         self.assertEqual(
-            env.source_agent.xfers[0][2], list(range(completed_count))
+            _poll_until(env.source, lambda _: bool(env.source_agent.xfers)), []
         )
+        self.assertEqual(env.source_agent.xfers[0][2], list(range(completed_count)))
         notification = env.source_agent.xfers[0][5]
         self.assertIsNotNone(notification)
 
@@ -512,9 +506,7 @@ class TestKVCRRouterHintE2E(unittest.TestCase):
             source_control_endpoint="tcp://source:1",
             block_hashes=["k1", "k0"],
         )
-        env.target.submit_hint(
-            (), src="tcp://source:1", request_id="req", hints=hint
-        )
+        env.target.submit_hint((), src="tcp://source:1", request_id="req", hints=hint)
         env.target.deliver(
             {
                 resident: _mem_descriptor(addr=8192),
@@ -544,12 +536,8 @@ class TestKVCRRouterHintE2E(unittest.TestCase):
     def test_query_misses_keys_outside_hint(self):
         """A key not in the hint's block_hashes is not FETCHABLE (adapter gate)."""
         env = self._pair()
-        hint = RouterHint(
-            source_control_endpoint="tcp://source:1", block_hashes=["k0"]
-        )
-        env.target.submit_hint(
-            (), src="tcp://source:1", request_id="req", hints=hint
-        )
+        hint = RouterHint(source_control_endpoint="tcp://source:1", block_hashes=["k0"])
+        env.target.submit_hint((), src="tcp://source:1", request_id="req", hints=hint)
         covered = BlockKey(b"k0")
         uncovered = BlockKey(b"k9")
         self.assertEqual(
