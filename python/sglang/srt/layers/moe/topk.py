@@ -144,6 +144,78 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
+# ATOM-style shared-expert fusion for the aiter grouped-topk path: a persistent
+# topk buffer whose shared columns are pre-populated once, so aiter writes only
+# the routed columns and the per-layer append kernel disappears. Taken whenever
+# the aiter path runs non-EP with fused shared experts, at both prefill and
+# decode; a batch too large for the buffer falls back to the plain append.
+# The cap bounds the buffer when chunked prefill is off, and costs
+# ~[cap, topk + n_shared] * 8B.
+_AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP = 131072
+_aiter_topk_fuse_shared_max_tokens_cache = None
+_aiter_topk_fuse_shared_bufs: dict = {}
+
+
+def _get_aiter_topk_fuse_shared_max_tokens() -> int:
+    """Max per-forward token count the persistent buffer must cover, sized to the
+    largest prefill batch since decode is always tiny. Bounds how often the fast
+    path is taken, not correctness. Cached: server args are fixed after startup."""
+    global _aiter_topk_fuse_shared_max_tokens_cache
+    if _aiter_topk_fuse_shared_max_tokens_cache is None:
+        from sglang.srt.runtime_context import get_schedule
+
+        try:
+            schedule = get_schedule()
+        except ValueError:
+            # Reached before the global config is published (a unit test, or
+            # offline init). Return the cap without caching it, so a later call
+            # still picks up the real value.
+            return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
+        cps = schedule.chunked_prefill_size or 0
+        mpt = schedule.max_prefill_tokens or 0
+        m = max(int(cps), int(mpt), 8192)  # 8192 floor for tiny configs
+        if int(cps) <= 0 and int(mpt) <= 0:
+            # chunked prefill disabled -> use the safety cap
+            m = _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
+        _aiter_topk_fuse_shared_max_tokens_cache = min(
+            m, _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
+        )
+    return _aiter_topk_fuse_shared_max_tokens_cache
+
+
+def _aiter_topk_fuse_shared_ep_is_single() -> bool:
+    """Whether the shared experts live on every rank, which is what lets the fused
+    path pre-populate their columns. Reports False rather than raising when the
+    MoE EP group is not initialized, so this check and its mirror in
+    select_experts fall back to the plain append together."""
+    try:
+        return get_parallel().moe_ep_size == 1
+    except (AssertionError, ValueError):
+        return False
+
+
+def _get_aiter_topk_fuse_shared_buf(
+    topk_routed: int, n_shared: int, num_experts: int, shared_weight: float, device
+):
+    """Persistent [MAX, topk_routed + n_shared] weight/id buffers whose shared
+    columns are pre-filled once (id = num_experts + i, weight = shared_weight).
+    Fixed max size (>= max prefill batch) so the tensor address is stable across
+    CUDA-graph replays."""
+    key = (topk_routed, n_shared, num_experts, float(shared_weight), str(device))
+    buf = _aiter_topk_fuse_shared_bufs.get(key)
+    if buf is None:
+        total = topk_routed + n_shared
+        M = _get_aiter_topk_fuse_shared_max_tokens()
+        w = torch.empty((M, total), dtype=torch.float32, device=device)
+        ids = torch.empty((M, total), dtype=torch.int32, device=device)
+        ids[:, topk_routed:] = torch.arange(
+            num_experts, num_experts + n_shared, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        w[:, topk_routed:] = shared_weight
+        buf = (w, ids)
+        _aiter_topk_fuse_shared_bufs[key] = buf
+    return buf
+
 
 if _is_cuda:
     try:
@@ -1450,6 +1522,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    fused_shared_experts_scaling_factor: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
@@ -1575,8 +1648,30 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
-        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        _shared_fuse = (
+            num_fused_shared_experts > 0
+            and _aiter_topk_fuse_shared_ep_is_single()
+            and token <= _get_aiter_topk_fuse_shared_max_tokens()
+        )
+        if _shared_fuse:
+            # The shared columns already carry the weight the plain append would
+            # write, so the two paths are bit-identical; aiter fills only
+            # [:, :topk] via row stride and leaves those columns intact.
+            _shared_w = (
+                1.0
+                if fused_shared_experts_scaling_factor is None
+                else fused_shared_experts_scaling_factor
+            )
+            full_w, full_ids = _get_aiter_topk_fuse_shared_buf(
+                topk, num_fused_shared_experts, num_experts, _shared_w, device
+            )
+            topk_weights = full_w[:token, :topk]
+            topk_ids = full_ids[:token, :topk]
+        else:
+            topk_weights = torch.empty(
+                (token, topk), dtype=torch.float32, device=device
+            )
+            topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
             correction_bias.to(dtype=gating_output.dtype),
@@ -1587,6 +1682,10 @@ def biased_grouped_topk_gpu(
             renormalize,
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
         )
+        if _shared_fuse:
+            # Return the full [token, topk + n_shared] view (routed just written,
+            # shared pre-populated). _post_process_topk_ids skips its append.
+            return full_w[:token], full_ids[:token]
         return topk_weights, topk_ids
     elif _is_musa and (
         gating_output.shape[1] // num_expert_group <= 32
@@ -1803,7 +1902,12 @@ def biased_grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    fused_shared_experts_scaling_factor: Optional[float] = None,
 ):
+    if fused_shared_experts_scaling_factor is not None:
+        raise ValueError(
+            "fused_shared_experts_scaling_factor is not supported for CPU biased grouped topk"
+        )
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -2063,25 +2167,35 @@ def _post_process_topk_ids(
             ),
         )
     elif _aiter_append:
-        M, N = router_logits.shape
-        scale_factor = (
-            1.0
-            if fused_shared_experts_scaling_factor is None
-            else fused_shared_experts_scaling_factor
+        # biased_grouped_topk_gpu already appended the shared experts when it got
+        # the persistent buffer, which shows up as the full routed + shared width.
+        # Reading the width instead of re-deriving its conditions keeps the two
+        # sides from drifting apart.
+        _shared_fused_in_topk = (
+            num_fused_shared_experts > 0
+            and _aiter_topk_fuse_shared_ep_is_single()
+            and topk_ids.shape[1] == topk_config.top_k
         )
+        if not _shared_fused_in_topk:
+            M, N = router_logits.shape
+            scale_factor = (
+                1.0
+                if fused_shared_experts_scaling_factor is None
+                else fused_shared_experts_scaling_factor
+            )
 
-        # Lazy import to avoid circular-import issues
-        from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
-            fused_append_shared_experts,
-        )
+            # Lazy import to avoid circular-import issues
+            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+                fused_append_shared_experts,
+            )
 
-        topk_ids, topk_weights = fused_append_shared_experts(
-            topk_ids,
-            topk_weights,
-            num_fused_shared_experts,
-            scale_factor,
-            N,  # base id for shared experts
-        )
+            topk_ids, topk_weights = fused_append_shared_experts(
+                topk_ids,
+                topk_weights,
+                num_fused_shared_experts,
+                scale_factor,
+                N,  # base id for shared experts
+            )
 
     elif use_per_rank_shared_slots:
         # DeepEP/MegaMOE: remap to per-rank shared-slot layout where each
@@ -2176,6 +2290,7 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                fused_shared_experts_scaling_factor=topk_config.fused_shared_experts_scaling_factor,
             )
     elif torch_native and custom_routing_function is None:
         assert (
