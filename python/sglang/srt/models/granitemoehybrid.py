@@ -2,22 +2,16 @@ from typing import Iterable, Optional
 
 import torch
 from torch import nn
-from transformers.models.granitemoeshared import GraniteMoeSharedConfig
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -35,47 +29,7 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
 
-from .granitemoe import GraniteMoeMoE
-
-
-# in vLLM this is in a separate file, but keeping it here for decoupling
-class GraniteMoeSharedMLP(nn.Module):
-    def __init__(
-        self,
-        config: GraniteMoeSharedConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        self.input_size = config.hidden_size
-        self.hidden_size = config.shared_intermediate_size
-        self.input_linear = MergedColumnParallelLinear(
-            input_size=self.input_size,
-            output_sizes=[self.hidden_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.input_linear",
-        )
-        self.output_linear = RowParallelLinear(
-            self.hidden_size,
-            self.input_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.output_linear",
-        )
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.input_linear(hidden_states)
-        x = self.act_fn(gate_up)
-        x, _ = self.output_linear(x)
-        return x
+from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
 class GraniteMoeHybridMambaDecoderLayer(nn.Module):
