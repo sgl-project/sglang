@@ -1293,6 +1293,9 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.k_proj.k_scale": ".attn.k_scale",
         ".self_attn.v_proj.v_scale": ".attn.v_scale",
+        # compressed-tensors stores kv_cache_scheme scales on the attention module.
+        ".self_attn.k_scale": ".attn.k_scale",
+        ".self_attn.v_scale": ".attn.v_scale",
     },
 )
 

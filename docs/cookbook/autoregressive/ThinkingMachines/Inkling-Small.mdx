@@ -216,7 +216,7 @@ Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_98f772f3a0044f45b80c
 
 ### 3.3 Multimodal Input (Image + Audio)
 
-Inkling-Small is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. The server must be started with `--enable-multimodal` (already included in every recipe above).
+Inkling-Small is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. Audio can also be sent as OpenAI's `input_audio` part, carrying the base64 bytes in `data` alongside a `format` of `wav` or `mp3`. The server must be started with `--enable-multimodal` (already included in every recipe above).
 
 <Accordion title="Image + Audio Example (Python)">
 

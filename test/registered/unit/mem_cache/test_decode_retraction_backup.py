@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -71,11 +72,12 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             self.assertTrue(torch.equal(key[indices], expected_key))
             self.assertTrue(torch.equal(value[indices], expected_value))
 
-    def test_restores_target_and_draft_kv(self):
+    def _build_cache(self, hicache_ratio: float):
+        """Bring up a UnifiedRadixCache with a draft sidecar over fresh pools."""
         server_args = ServerArgs(
             model_path="dummy",
             page_size=1,
-            hicache_ratio=1.0,
+            hicache_ratio=hicache_ratio,
             hicache_io_backend="kernel",
             hicache_mem_layout="page_first",
         )
@@ -119,16 +121,61 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         )
         self.assertIn(PoolName.DRAFT, cache.host_pool_group.entry_map)
         cache.validate_retraction_host_capacity()
+        return SimpleNamespace(
+            server_args=server_args,
+            req_to_token_pool=req_to_token_pool,
+            allocator=allocator,
+            target_pool=target_pool,
+            draft_pool=draft_pool,
+            cache=cache,
+        )
 
-        req = SimpleNamespace(
-            rid="request", req_pool_idx=None, seqlen=self.num_tokens + 1
-        )
-        self.assertIsNotNone(req_to_token_pool.alloc([req]))
-        source_indices = allocator.alloc(self.num_tokens)
+    def _admit_req(self, env, num_tokens: int):
+        req = SimpleNamespace(rid="request", req_pool_idx=None, seqlen=num_tokens + 1)
+        self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
+        source_indices = env.allocator.alloc(num_tokens)
         self.assertIsNotNone(source_indices)
-        req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, self.num_tokens)), source_indices
+        env.req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, num_tokens)), source_indices
         )
+        return req, source_indices
+
+    def test_backup_declined_when_host_pool_too_small(self):
+        # A backup-only host pool is deliberately smaller than the device pool,
+        # so a large enough request cannot be preserved.
+        env = self._build_cache(hicache_ratio=0.1)
+        self.assertLess(env.cache.host_pool_group.available_size(), self.num_tokens)
+
+        req, source_indices = self._admit_req(env, self.num_tokens)
+        host_free_before = env.cache.host_pool_group.available_size()
+
+        self.assertIsNone(env.cache.retraction_backup(req))
+        # The declined backup must not leak host slots.
+        self.assertEqual(env.cache.host_pool_group.available_size(), host_free_before)
+
+        # This is the signal release_req propagates so retract_decode aborts.
+        self.assertFalse(
+            retraction_backup(
+                req,
+                env.cache,
+                env.req_to_token_pool,
+                env.allocator,
+                "host_pool",
+            )
+        )
+
+        env.allocator.free(source_indices)
+        env.req_to_token_pool.free(req)
+
+    def test_restores_target_and_draft_kv(self):
+        env = self._build_cache(hicache_ratio=1.0)
+        req_to_token_pool = env.req_to_token_pool
+        allocator = env.allocator
+        target_pool = env.target_pool
+        draft_pool = env.draft_pool
+        cache = env.cache
+
+        req, source_indices = self._admit_req(env, self.num_tokens)
 
         self._seed_pool(target_pool, source_indices, base=1000)
         self._seed_pool(draft_pool, source_indices, base=3000)

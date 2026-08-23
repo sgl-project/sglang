@@ -7,7 +7,7 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     load_safetensors_state_dict,
@@ -16,13 +16,10 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
-)
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
-class AdapterLoader(ComponentLoader):
+class AdapterLoader(PlainStateDictComponentLoader):
     """Loader for small adapter-style modules (e.g., LTX-2 connectors).
 
     This loader intentionally avoids FSDP sharding and just:
@@ -46,7 +43,7 @@ class AdapterLoader(ComponentLoader):
         component_name: str = "connectors",
         *args,
     ):
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = self.load_component_config(component_model_path, component_name)
 
         cls_name = config.pop("_class_name", None)
         if cls_name is None:

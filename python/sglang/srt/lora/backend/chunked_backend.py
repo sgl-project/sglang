@@ -12,6 +12,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
     generate_sequence_lengths,
+    get_batch_token_counts,
     get_lm_head_pruned_lens,
     merge_and_chunk_segments,
 )
@@ -184,11 +185,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         Returns:
             The determined chunk size
         """
-        num_tokens = (
-            forward_batch.extend_num_tokens
-            if forward_batch.forward_mode.is_extend()
-            else forward_batch.batch_size
-        )
+        num_tokens, _ = get_batch_token_counts(forward_batch)
         return self._determine_chunk_size_for_tokens(num_tokens)
 
     def _determine_chunk_size_for_tokens(self, num_tokens: int) -> int:
