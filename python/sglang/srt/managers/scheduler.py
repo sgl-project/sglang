@@ -4415,7 +4415,7 @@ class Scheduler(
             weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
-            token_capacity=self.max_total_num_tokens,
+            token_capacity=self.max_total_num_tokens * self.server_args.dcp_size,
             token_capacity_swa=self.swa_tokens_per_layer,
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
