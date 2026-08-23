@@ -60,7 +60,6 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_flags,
     get_parallel,
     get_spec,
@@ -155,8 +154,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
-        self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.dp_size = get_parallel().config.dp_size
+        self.pp_size = get_parallel().config.pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)

@@ -32,8 +32,6 @@ from sglang.srt.ray.engine import (
     _resolve_bundle_indices,
 )
 from sglang.srt.runtime_context import (
-    configured_attn_cp_size,
-    configured_pp_size,
     get_parallel,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -79,7 +77,7 @@ class RayDataParallelController(DataParallelController):
         sockets = []
         dp_port_args_list = []
 
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().config.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -103,7 +101,7 @@ class RayDataParallelController(DataParallelController):
             sock.close()
 
         # Create actors for each DP rank sequentially
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().config.dp_size):
             self._launch_ray_tp_group(server_args, dp_port_args_list[dp_rank], dp_rank)
 
     def launch_dp_attention_schedulers(
@@ -114,7 +112,7 @@ class RayDataParallelController(DataParallelController):
         # rank-0 node IP instead of tcp://* to avoid exposing unauthenticated
         # ZMQ sockets (CVE-2026-3060).
         worker_ports = []
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().config.dp_size):
             worker_port, worker_socket = get_zmq_socket_on_host(
                 self.context, zmq.PUSH, host=self.rank0_node_ip
             )
@@ -149,7 +147,7 @@ class RayDataParallelController(DataParallelController):
                 bundle_idx = self.bundle_for_node[node_idx]
                 pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
                     nnodes,
-                    configured_pp_size(),
+                    get_parallel().config.pp_size,
                     server_args.tp_size,
                     node_rank=node_idx,
                 )
@@ -162,13 +160,13 @@ class RayDataParallelController(DataParallelController):
                             tp_rank % tp_per_node
                         )
 
-                        if get_parallel().enable_dp_attention:
+                        if get_parallel().config.enable_dp_attention:
                             _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
-                                get_parallel().enable_dp_attention,
+                                get_parallel().config.enable_dp_attention,
                                 tp_rank,
                                 server_args.tp_size,
-                                get_parallel().dp_size,
-                                configured_attn_cp_size(),
+                                get_parallel().config.dp_size,
+                                get_parallel().config.attn_cp_size,
                             )
                             rank_port_args = PortArgs.init_new(
                                 server_args, actual_dp_rank, worker_ports
@@ -209,7 +207,7 @@ class RayDataParallelController(DataParallelController):
             world_size = _compute_world_size(server_args)
             bundle_indices = _resolve_bundle_indices(self.pg, world_size)
 
-            ranks_per_tp_group = server_args.tp_size * configured_pp_size()
+            ranks_per_tp_group = server_args.tp_size * get_parallel().config.pp_size
             if dp_rank is not None:
                 start_rank = dp_rank * ranks_per_tp_group
                 end_rank = start_rank + ranks_per_tp_group
@@ -233,13 +231,13 @@ class RayDataParallelController(DataParallelController):
 
                 bundle_idx = bundle_indices[global_rank]
 
-                if get_parallel().enable_dp_attention:
+                if get_parallel().config.enable_dp_attention:
                     _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
-                        get_parallel().enable_dp_attention,
+                        get_parallel().config.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
-                        get_parallel().dp_size,
-                        configured_attn_cp_size(),
+                        get_parallel().config.dp_size,
+                        get_parallel().config.attn_cp_size,
                     )
                     rank_port_args = PortArgs.init_new(
                         server_args, actual_dp_rank, worker_ports

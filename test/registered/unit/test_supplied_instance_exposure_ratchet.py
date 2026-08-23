@@ -160,6 +160,8 @@ _EXPOSED = {
     ("configs/model_config.py", "quantization"),
     ("configs/model_config.py", "speculative_algorithm"),
     ("configs/model_config.py", "speculative_draft_model_quantization"),
+    ("dllm/config.py", "max_running_requests"),
+    ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
@@ -171,20 +173,25 @@ _EXPOSED = {
     ("layers/cp/bcg.py", "cp_strategy"),
     ("layers/cp/bcg.py", "enable_prefill_cp"),
     ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
+    ("layers/moe/utils.py", "deepep_mode"),
+    ("layers/moe/utils.py", "moe_a2a_backend"),
+    ("layers/moe/utils.py", "moe_runner_backend"),
+    ("layers/moe/utils.py", "quantization"),
+    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
     ("lora/lora_manager.py", "enable_lora_overlap_loading"),
     ("lora/marlin_lora_temp/policy.py", "lora_paths"),
     ("model_loader/expert_pack_runtime.py", "model_path"),
     ("model_loader/expert_pack_runtime.py", "tokenizer_path"),
+    ("multimodal/processors/base_processor.py", "image_processor_backend"),
     ("parser/template_detection.py", "model_path"),
     ("speculative/adaptive_spec_params.py", "speculative_algorithm"),
     ("speculative/adaptive_spec_params.py", "speculative_eagle_topk"),
     ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
     ("speculative/spec_info.py", "enable_multi_layer_eagle"),
+    ("speculative/spec_registry.py", "disable_overlap_schedule"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
-    # The daemon command and constructor snapshot the resolved startup layout
-    # before the daemon's loading lifecycle can apply any runtime overrides.
     ("weight_cache/daemon.py", "attn_cp_size"),
     ("weight_cache/daemon.py", "deepep_mode"),
     ("weight_cache/daemon.py", "dp_size"),
@@ -214,6 +221,8 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
+    ("configs/model_config.py", "dtype"),
+    ("configs/model_config.py", "model_path"),
     ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
@@ -234,6 +243,11 @@ _OVERRIDDEN_AND_READ = {
     ("parser/template_detection.py", "model_path"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
 }
 
 

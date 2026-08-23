@@ -119,7 +119,6 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
     get_server_args,
@@ -298,7 +297,7 @@ class KimiK3MLP(nn.Module):
         # but allow the NPU launcher to retain the proven attention-TP layout
         # without a device-type branch in shared model code.
         self._dense_attn_tp = (
-            get_parallel().enable_dense_mlp_attn_tp
+            get_parallel().config.enable_dense_mlp_attn_tp
             and is_dp_attention_enabled()
             and tp_rank is None
             and tp_size is None
@@ -556,13 +555,13 @@ class KimiK3MoE(nn.Module):
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
         self._shared_experts_tp1 = (
-            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
+            self._ep_a2a and not get_parallel().config.enable_shared_experts_attn_tp
         )
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
         self._shared_experts_attn_tp_comm = (
-            get_parallel().enable_shared_experts_attn_tp
+            get_parallel().config.enable_shared_experts_attn_tp
             and self._ep_a2a
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
@@ -2872,7 +2871,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -3384,7 +3383,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().config.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
