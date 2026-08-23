@@ -389,6 +389,20 @@ def handle_deprecated_args(server_args: Any):
             )
 
 
+def handle_rdt_weight_sync(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_rdt_weight_sync:
+        return
+    assert (
+        cfg.use_ray
+    ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through SchedulerActors."
+    declare_resolution(
+        server_args,
+        "_handle_rdt_weight_sync",
+        enable_engine_info_bootstrap=True,
+    )
+
+
 def handle_environment_variables(server_args: Any):
     cfg = resolving_view(server_args)
     handle_multimodal_feature_transport(server_args)

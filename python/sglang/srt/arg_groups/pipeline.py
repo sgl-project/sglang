@@ -78,6 +78,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_multimodal,
         handle_other_validations,
         handle_prefill_delayer_env_compat,
+        handle_rdt_weight_sync,
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
@@ -91,6 +92,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    handle_rdt_weight_sync(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,

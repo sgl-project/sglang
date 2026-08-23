@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import logging
 import threading
+from contextlib import contextmanager
 from typing import Callable, List, Optional
 
 import ray
@@ -38,6 +40,20 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
+
+_caller_placement_group: contextvars.ContextVar[Optional[PlacementGroup]] = (
+    contextvars.ContextVar("sglang_ray_caller_placement_group", default=None)
+)
+
+
+@contextmanager
+def _placement_group_context(placement_group: Optional[PlacementGroup]):
+    """Expose launch-only state while Engine synchronously starts schedulers."""
+    token = _caller_placement_group.set(placement_group)
+    try:
+        yield
+    finally:
+        _caller_placement_group.reset(token)
 
 
 @dataclasses.dataclass
@@ -182,6 +198,22 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def get_scheduler_actor_name(
+    *,
+    rank0_node_ip: str,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+    pg_id_hex: str,
+    bundle_idx: int,
+) -> str:
+    return (
+        f"sglang_scheduler_node{rank0_node_ip}"
+        f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+        f"_pg{pg_id_hex}_bundle{bundle_idx}"
+    )
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -207,14 +239,25 @@ def _create_scheduler_actor(
         server_args, tp_rank
     )
 
+    rdt = server_args.enable_rdt_weight_sync
+
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
-        name=(
-            f"sglang_scheduler_node{rank0_node_ip}"
-            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
+        # for pull_weights, which the trainer calls while generation is paused.
+        max_concurrency=2 if rdt else 1,
+        name=get_scheduler_actor_name(
+            rank0_node_ip=rank0_node_ip,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
+            pg_id_hex=pg.id.hex()[:8],
+            bundle_idx=bundle_idx,
         ),
+        # SchedulerActor calls set_device() with the absolute id from
+        # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=bundle_idx,
@@ -234,15 +277,19 @@ def _create_scheduler_actor(
 
 
 class RayEngine(Engine):
-    """Engine using Ray actors for scheduler processes."""
+    """Engine using Ray actors for scheduler processes.
 
-    def __init__(self, **kwargs):
-        # Set before super().__init__(): it launches the subprocesses, which need
-        # the group to schedule the scheduler actors onto.
-        self._placement_group = kwargs.pop("placement_group", None)
+    Same constructor kwargs as :class:`Engine`, plus ``placement_group`` (a Ray
+    PlacementGroup handle, not a ServerArgs field).
+    """
+
+    def __init__(self, *, placement_group: Optional[PlacementGroup] = None, **kwargs):
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
-        super().__init__(server_args=ServerArgs(**kwargs))
+        # The context is read while super().__init__() launches the subprocesses,
+        # which need the group to schedule the scheduler actors onto.
+        with _placement_group_context(placement_group):
+            super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -259,8 +306,6 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-        *,
-        placement_group=None,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
@@ -268,6 +313,7 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
+        placement_group = _caller_placement_group.get()
         pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (

@@ -140,7 +140,7 @@ diffusion-qvg = [
 ]
 
 ray = [
-  "ray[default]>=2.55.1",
+  "ray[default]>=2.56.0",
 ]
 
 tracing = [

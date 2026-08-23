@@ -3373,6 +3373,16 @@ class ServerArgs:
         "Start seed server via transfer engine backend for remote instance weight loader.",
         NS("model"),
     ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+        NS("model"),
+    ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+        NS("model"),
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -4173,6 +4183,22 @@ class ServerArgs:
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
+
+    def needs_engine_info_bootstrap(self) -> bool:
+        """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
+        return (
+            resolving_view(
+                self
+            ).remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.enable_engine_info_bootstrap
+        )
+
+    def registers_parallelism_config(self) -> bool:
+        """Whether this rank publishes its parallelism config to the bootstrap server."""
+        return (
+            self.remote_instance_weight_loader_use_transfer_engine()
+            or self.enable_engine_info_bootstrap
+        )
 
 
 # --------------------------------------------------------------------------
