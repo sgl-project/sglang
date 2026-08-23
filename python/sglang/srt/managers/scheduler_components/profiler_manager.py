@@ -78,6 +78,7 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
         self.nsys_nvtx_capture_active = False
+        self.nsys_nvtx_capture_handle: Optional[int] = None
         self.nsys_exact_batch = int(
             os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
         )
@@ -266,7 +267,14 @@ class SchedulerProfilerManager:
             if self.ps.gpu_id == get_device().base_gpu_id:
                 capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
                 if capture_range:
-                    torch.cuda.nvtx.range_push(capture_range)
+                    # The scheduler's run_batch NVTX range is already open here.
+                    # A push/pop capture would corrupt that nesting: the
+                    # scheduler's next pop would end this capture prematurely.
+                    # A start/end range has its own handle and is independent of
+                    # the thread-local push/pop stack.
+                    self.nsys_nvtx_capture_handle = torch.cuda.nvtx.range_start(
+                        capture_range
+                    )
                     self.nsys_nvtx_capture_active = True
                     logger.info(
                         "Started Nsight Systems NVTX capture range: %s",
@@ -385,7 +393,11 @@ class SchedulerProfilerManager:
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
                 if self.nsys_nvtx_capture_active:
-                    torch.cuda.nvtx.range_pop()
+                    # Finish all work enqueued by the last captured scheduler
+                    # step before asking Nsight to finalize asynchronously.
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_end(self.nsys_nvtx_capture_handle)
+                    self.nsys_nvtx_capture_handle = None
                     self.nsys_nvtx_capture_active = False
                 else:
                     torch.cuda.cudart().cudaProfilerStop()

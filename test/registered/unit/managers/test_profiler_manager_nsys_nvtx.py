@@ -30,8 +30,9 @@ def test_cuda_profiler_activity_can_use_nsys_nvtx_capture_range(tmp_path):
             "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
             return_value=device,
         ),
-        patch("torch.cuda.nvtx.range_push") as range_push,
-        patch("torch.cuda.nvtx.range_pop") as range_pop,
+        patch("torch.cuda.nvtx.range_start", return_value=73) as range_start,
+        patch("torch.cuda.nvtx.range_end") as range_end,
+        patch("torch.cuda.synchronize") as synchronize,
         patch("torch.cuda.cudart") as cudart,
     ):
         start_result = manager._start_profile()
@@ -39,10 +40,12 @@ def test_cuda_profiler_activity_can_use_nsys_nvtx_capture_range(tmp_path):
 
     assert start_result.success
     assert stop_result.success
-    range_push.assert_called_once_with("agentx_decode_capture")
-    range_pop.assert_called_once_with()
+    range_start.assert_called_once_with("agentx_decode_capture")
+    synchronize.assert_called_once_with()
+    range_end.assert_called_once_with(73)
     cudart.assert_not_called()
     assert not manager.nsys_nvtx_capture_active
+    assert manager.nsys_nvtx_capture_handle is None
 
 
 def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
