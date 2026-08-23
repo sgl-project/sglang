@@ -1320,12 +1320,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # graph; larger prefills fall back to eager and keep the
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
+        #
+        # Also require every DP rank to hold real tokens. Under MAX_LEN an
+        # idle rank fabricates a dummy request whose tokens are counted as
+        # real, and we measure nondeterministic accuracy degradation on the
+        # live ranks' logits when those dummy tokens enter the shared MoE
+        # ops (#31125). Fall back to SUM_LEN for idle-rank steps, which runs
+        # the prefill eagerly instead of with the breakable CUDA graphs.
         prefill_cg = model_runner.server_args.cuda_graph_config.prefill
         if (
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and min(global_num_tokens) > 0
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
