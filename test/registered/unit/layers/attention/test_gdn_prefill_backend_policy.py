@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -79,6 +80,71 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_full_prefill_metadata_keeps_phase_stable_storage(self):
+        server_args = _publish(
+            self,
+            speculative_eagle_topk=None,
+            enable_unified_memory=False,
+        )
+        mapping = torch.tensor([4, 7, 9], dtype=torch.int32)
+        req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda req: mapping[req.to(torch.long)],
+            translate_mamba_indices=lambda indices: indices + 100,
+        )
+        model_runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=None,
+            server_args=server_args,
+        )
+        backend = MambaAttnBackendBase(model_runner)
+        backend.init_full_prefill_cuda_graph_state(max_bs=4, max_num_tokens=16)
+
+        forward_batch = SimpleNamespace(
+            batch_size=4,
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.tensor([2, 0, 1, 0]),
+            extend_seq_lens=torch.tensor([3, 0, 2, 0]),
+            extend_start_loc=torch.tensor([0, 3, 3, 5]),
+        )
+        backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+        state_ptr = backend.forward_metadata.mamba_cache_indices.data_ptr()
+        query_ptr = backend.forward_metadata.query_start_loc.data_ptr()
+        torch.testing.assert_close(
+            backend.forward_metadata.mamba_cache_indices,
+            torch.tensor(
+                [109, backend.pad_slot_id, 107, backend.pad_slot_id],
+                dtype=torch.int32,
+            ),
+        )
+        torch.testing.assert_close(
+            backend.forward_metadata.query_start_loc,
+            torch.tensor([0, 3, 3, 5, 5], dtype=torch.int32),
+        )
+
+        # Replay refreshes values in place; the graph-captured addresses stay
+        # stable even after decode allocates its independent per-bs metadata.
+        forward_batch.req_pool_indices = torch.tensor([1, 2, 0, 0])
+        forward_batch.extend_seq_lens = torch.tensor([1, 2, 1, 0])
+        forward_batch.extend_start_loc = torch.tensor([0, 1, 3, 4])
+        backend.init_forward_metadata_out_graph(forward_batch)
+        backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+
+        self.assertEqual(
+            backend.forward_metadata.mamba_cache_indices.data_ptr(), state_ptr
+        )
+        self.assertEqual(backend.forward_metadata.query_start_loc.data_ptr(), query_ptr)
+        torch.testing.assert_close(
+            backend.forward_metadata.mamba_cache_indices,
+            torch.tensor([107, 109, 104, backend.pad_slot_id], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            backend.forward_metadata.query_start_loc,
+            torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32),
+        )
+
     def apply_policy(
         self,
         runner,

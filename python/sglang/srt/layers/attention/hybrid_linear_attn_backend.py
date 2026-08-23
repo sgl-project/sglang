@@ -78,6 +78,11 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        # Full prefill graphs are captured before decode graphs. Keep their
+        # pointer-stable EXTEND metadata in phase-private buffers so the later
+        # init_cuda_graph_state call cannot replace captured tensor addresses.
+        self.full_prefill_state_indices: Optional[torch.Tensor] = None
+        self.full_prefill_query_start_loc: Optional[torch.Tensor] = None
         self.conv_states_shape: tuple[int, int] = None
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
@@ -255,6 +260,12 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if (
+            self.full_prefill_state_indices is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self.forward_metadata = self._full_prefill_metadata(forward_batch)
+            return
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
@@ -468,6 +479,47 @@ class MambaAttnBackendBase(AttentionBackend):
             step=draft_token_num,
             dtype=torch.int32,
             device=self.device,
+        )
+
+    def init_full_prefill_cuda_graph_state(
+        self, max_bs: int, max_num_tokens: int
+    ) -> None:
+        del max_num_tokens  # Full prefill metadata is request-axis only.
+        self.full_prefill_state_indices = torch.full(
+            (max_bs,), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+        self.full_prefill_query_start_loc = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+
+    def _full_prefill_metadata(self, forward_batch: ForwardBatch) -> ForwardMetadata:
+        """Refresh capture-stable metadata for a fixed-slot Full prefill graph."""
+        bs = forward_batch.batch_size
+        state_indices = self.full_prefill_state_indices
+        query_start_loc = self.full_prefill_query_start_loc
+        assert state_indices is not None and query_start_loc is not None
+        assert bs <= state_indices.shape[0], f"{bs=} > {state_indices.shape[0]=}"
+
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices[:bs]
+        )
+        mamba_indices = self._translate_mamba_indices(mamba_indices)
+        state_indices[:bs].copy_(mamba_indices)
+        # FullCG pads the request axis with zero-length sentinel rows. Poison
+        # their state ids after the mapping gather so no captured kernel can
+        # accidentally write through a recycled request-0 mapping.
+        state_indices[:bs].masked_fill_(
+            forward_batch.extend_seq_lens[:bs] == 0, self.pad_slot_id
+        )
+
+        query_start_loc[:bs].copy_(forward_batch.extend_start_loc[:bs])
+        query_start_loc[bs].copy_(
+            forward_batch.extend_start_loc[bs - 1]
+            + forward_batch.extend_seq_lens[bs - 1]
+        )
+        return ForwardMetadata(
+            query_start_loc=query_start_loc[: bs + 1],
+            mamba_cache_indices=state_indices[:bs],
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -1056,6 +1108,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_full_prefill_cuda_graph_state(
+        self, max_bs: int, max_num_tokens: int
+    ) -> None:
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_full_prefill_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

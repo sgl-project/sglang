@@ -381,6 +381,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ) from e
 
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self.stage_full_cuda_graph_outputs = self._is_full_backend
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
@@ -462,6 +463,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
+        if self._is_full_backend:
+            model_runner.attn_backend.init_full_prefill_cuda_graph_state(
+                self._capture_req_slots, self.max_num_tokens
+            )
 
         server_args = model_runner.server_args
         self.enable_cp_v2_bcg_capture = isinstance(
@@ -1111,6 +1116,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # FullCG captures the no-checkpoint EXTEND topology. Saving a Mamba
+        # radix checkpoint adds data-dependent gather/scatter work, so those
+        # infrequent boundary batches must use the eager path.
+        if (
+            self._is_full_backend
+            and getattr(forward_batch, "mamba_track_mask", None) is not None
+            and bool(forward_batch.mamba_track_mask.any())
+        ):
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (

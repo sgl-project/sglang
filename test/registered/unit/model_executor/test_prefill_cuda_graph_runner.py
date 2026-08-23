@@ -62,6 +62,15 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_full_graph_falls_back_for_mamba_checkpoint_batch(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = True
+        forward_batch = SimpleNamespace(
+            mamba_track_mask=torch.tensor([False, True, False])
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()

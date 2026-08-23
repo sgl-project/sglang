@@ -865,7 +865,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     forward_batch,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states, forward_batch)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1269,7 +1269,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     forward_batch,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.mlp(hidden_states, forward_batch)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:

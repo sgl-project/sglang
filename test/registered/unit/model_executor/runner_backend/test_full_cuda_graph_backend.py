@@ -24,6 +24,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -116,6 +118,28 @@ class TestCaptureOneNoProfiling(CustomTestCase):
             backend.capture_one(ShapeKey(size=2), forward_fn)
 
         self.assertEqual(forward_fn.call_count, 3)
+
+    def test_prefill_outputs_are_staged_outside_the_graph_pool(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        runner.stage_full_cuda_graph_outputs = True
+        backend = _make_backend(runner)
+        outputs = [
+            (torch.tensor([1]), [torch.tensor([2]), torch.tensor([3])]),
+            (torch.tensor([4]), [torch.tensor([5]), torch.tensor([6])]),
+            (torch.tensor([7]), [torch.tensor([8]), torch.tensor([9])]),
+        ]
+        forward_fn = mock.Mock(side_effect=outputs)
+        shape_key = ShapeKey(size=4)
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(shape_key, forward_fn)
+
+        staged = backend._outputs[shape_key]
+        self.assertNotEqual(staged[0].data_ptr(), outputs[-1][0].data_ptr())
+        self.assertNotEqual(staged[1][0].data_ptr(), outputs[-1][1][0].data_ptr())
+        torch.testing.assert_close(staged[0], outputs[-1][0])
+        torch.testing.assert_close(staged[1][0], outputs[-1][1][0])
+        torch.testing.assert_close(staged[1][1], outputs[-1][1][1])
 
 
 class TestCaptureOneWithProfiling(CustomTestCase):

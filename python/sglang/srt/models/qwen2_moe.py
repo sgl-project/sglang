@@ -248,9 +248,24 @@ class Qwen2MoeMLP(nn.Module):
     def forward(
         self,
         x,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+        # Full prefill graphs for different token buckets share a CUDA graph
+        # pool and may replay in arbitrary order. FlashInfer's fused
+        # SiLU+mul+NVFP4-quant temporaries are not safe under that policy:
+        # capturing later buckets can clobber an earlier bucket's replay.
+        # Keep the fusion for eager/other prefill backends and for decode.
+        is_full_graph_prefill = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+        )
+        if (
+            self._enable_silu_fp4_quant_fusion
+            and not isinstance(gate_up, tuple)
+            and not is_full_graph_prefill
+        ):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
         x = self.act_fn(gate_up)

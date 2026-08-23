@@ -46,6 +46,32 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+def _allocate_staged_output(output: Any) -> Any:
+    """Mirror a transformer-body output in eager-pool storage."""
+    if output is None:
+        return None
+    if torch.is_tensor(output):
+        return torch.empty_like(output)
+    if isinstance(output, tuple):
+        return tuple(_allocate_staged_output(item) for item in output)
+    if isinstance(output, list):
+        return [_allocate_staged_output(item) for item in output]
+    raise TypeError(f"Unsupported staged Full CUDA graph output: {type(output)}")
+
+
+def _copy_staged_output(dst: Any, src: Any) -> None:
+    """Copy a matching output tree into capture-stable eager-pool storage."""
+    if src is None:
+        assert dst is None
+        return
+    if torch.is_tensor(src):
+        dst.copy_(src)
+        return
+    assert type(dst) is type(src) and len(dst) == len(src)
+    for dst_item, src_item in zip(dst, src):
+        _copy_staged_output(dst_item, src_item)
+
+
 class FullCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
@@ -104,14 +130,27 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+        warmup_output = None
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
+            warmup_output = forward_fn()
             if profiler is not None:
                 profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+
+        # Full prefill graphs capture the transformer body and may return a
+        # nested auxiliary-hidden-state tree (for example DFLASH). Different
+        # token buckets share a CUDA graph pool, so graph-pool output storage
+        # from an earlier bucket can be recycled while a later bucket is
+        # captured. Copy each replay's outputs into per-bucket eager-pool
+        # buffers before leaving the graph; consumers then never read recycled
+        # graph-pool storage.
+        stage_outputs = getattr(runner, "stage_full_cuda_graph_outputs", False)
+        staged_output = (
+            _allocate_staged_output(warmup_output) if stage_outputs else None
+        )
 
         graph = torch.cuda.CUDAGraph()
 
@@ -132,6 +171,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             out = forward_fn()
+            if stage_outputs:
+                _copy_staged_output(staged_output, out)
+                out = staged_output
 
         if profiler is not None:
             profiler.step()

@@ -160,6 +160,19 @@ class AttentionBackend(ABC):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
+    def init_full_prefill_cuda_graph_state(
+        self, max_bs: int, max_num_tokens: int
+    ) -> None:
+        """Allocate state whose tensor addresses are captured by Full prefill CG.
+
+        Decode and Full prefill graphs can coexist and are captured in separate
+        phases. Backends that need capture-stable prefill metadata must keep it
+        separate from ``init_cuda_graph_state`` so the later decode
+        initialization cannot invalidate pointers captured by the prefill graph.
+
+        Default: no-op.
+        """
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,
