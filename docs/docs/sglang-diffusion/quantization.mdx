@@ -184,11 +184,11 @@ backend.
     </tr>
     <tr>
       <td><code>comfy-w4a4-convrot</code></td>
-      <td>Safetensors with serialized <code>convrot_w4a4</code> layer metadata</td>
+      <td>Safetensors with serialized <code>convrot_w4a4</code> metadata, optionally mixed with <code>int8_tensorwise</code> layers</td>
       <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
       <td>Native DiTs and encoders with matching parameter mappings; MiniMax-H3 FL2VA / Ref2VA DiTs and Qwen3-VL encoder layouts are recognized</td>
       <td><code>comfy-kitchen</code></td>
-      <td>Auto-detected; omit <code>--quantization</code>. Packed INT4 weights use the checkpoint's W4A4 ConvRot kernel and <code>linear_dtype</code>. CUDA requires SM75+; TP must preserve the 64-element quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
+      <td>Auto-detected; omit <code>--quantization</code>. Each layer dispatches to its serialized W4A4 or INT8 ConvRot kernel. CUDA requires SM75+; TP must preserve each format's quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>

@@ -302,6 +302,8 @@ current `comfy-kitchen`, then pass a full or pruned FL2VA / Ref2VA file such as
 `Merserk/MiniMax-H3-INT4-ConvRot/minimax_h3_fl2va_pruned_int4_convrot.safetensors`
 to `--transformer-weights-path`. The packed weights stay INT4 and the runtime
 honors each layer's activation mode; omit `--quantization`.
+Mixed exports use the same command: SGLang dispatches each marked layer to its
+serialized W4A4 or INT8 ConvRot kernel instead of applying one global method.
 
 ### Advanced: precomputed AdaLN cache
 

@@ -447,6 +447,53 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(layer.weight_scale.shape, (3,))
         self.assertEqual(layer.weight_scale.dtype, torch.float32)
 
+    def test_mixed_w4a4_int8_dispatches_each_serialized_layer(self):
+        markers = {
+            "w4a4": {
+                "format": "convrot_w4a4",
+                "convrot_groupsize": 256,
+                "linear_dtype": "int8",
+            },
+            "int8": {
+                "format": "int8_tensorwise",
+                "convrot": True,
+                "convrot_groupsize": 256,
+            },
+        }
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4."
+                "convrot_w4a4_linear",
+                new=object(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+                "_load_comfy_kitchen"
+            ),
+        ):
+            config = resolve_minimax_h3_checkpoint_quantization(markers)
+            w4a4 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="w4a4",
+            )
+            int8 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="int8",
+            )
+
+        self.assertIsInstance(config, KitchenW4A4Config)
+        self.assertEqual(w4a4.weight.shape, (3, 128))
+        self.assertEqual(int8.weight.shape, (3, 256))
+        self.assertEqual(set(config.selected), {"w4a4", "int8"})
+
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
         "_load_comfy_kitchen"
