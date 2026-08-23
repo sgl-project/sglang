@@ -343,16 +343,16 @@ class TransformerLoader(ComponentLoader):
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
-        if (
-            init_params["quant_config"] is None
-            and component_server_args.transformer_weights_path is not None
-        ):
+        runtime_quant_config = init_params["quant_config"]
+        if runtime_quant_config is not None:
+            logger.debug(
+                "Runtime quantization: %s", type(runtime_quant_config).__name__
+            )
+        elif component_server_args.transformer_weights_path is not None:
             logger.info(
                 "Using an unquantized transformer weight override from %s",
                 component_server_args.transformer_weights_path,
             )
-        else:
-            logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
         checkpoint_load_device = (

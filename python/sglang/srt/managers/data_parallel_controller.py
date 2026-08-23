@@ -49,7 +49,16 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.runtime_context import get_exec, get_parallel, publish
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_moe_dp_size,
+    configured_pp_size,
+    get_device,
+    get_disagg,
+    get_exec,
+    get_parallel,
+    publish,
+)
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -142,7 +151,7 @@ class DataParallelController:
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
-            server_args.load_balance_method
+            get_parallel().load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
@@ -212,7 +221,7 @@ class DataParallelController:
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DataParallelController",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
@@ -386,7 +395,7 @@ class DataParallelController:
             )
             threads.append(thread)
             base_gpu_id += (
-                server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
+                server_args.tp_size * configured_pp_size() * server_args.gpu_id_step
             )
 
             if server_args.node_rank == 0:
@@ -607,8 +616,8 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_size_per_node = max(configured_pp_size() // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // configured_pp_size(), 1)
         pp_rank_range = range(
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
@@ -639,7 +648,7 @@ class DataParallelController:
                         tp_rank,
                         server_args.tp_size,
                         get_parallel().dp_size,
-                        server_args.attn_cp_size,
+                        configured_attn_cp_size(),
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
@@ -675,18 +684,18 @@ class DataParallelController:
                 # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
                 # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
                 attn_tp_size = (
-                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                    server_args.tp_size // attn_dp_size // configured_attn_cp_size()
                 )
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                attn_cp_rank = (tp_rank // attn_tp_size) % configured_attn_cp_size()
                 moe_dp_rank = tp_rank // (
-                    server_args.tp_size // server_args.moe_dp_size
+                    server_args.tp_size // configured_moe_dp_size()
                 )
                 moe_ep_rank = (
                     tp_rank
-                    % (server_args.tp_size // server_args.moe_dp_size)
+                    % (server_args.tp_size // configured_moe_dp_size())
                     // (
                         server_args.tp_size
-                        // server_args.moe_dp_size
+                        // configured_moe_dp_size()
                         // get_parallel().ep_size
                     )
                 )
@@ -829,9 +838,9 @@ def run_data_parallel_controller_process(
             trace_modules=server_args.trace_modules,
         )
         thread_label = "DP Controller"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode DP Controller"
         trace_set_thread_info(thread_label)
 
