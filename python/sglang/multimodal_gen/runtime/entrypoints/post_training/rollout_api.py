@@ -14,6 +14,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
     RolloutResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
+    TIMING_HEADER,
+    RequestStamps,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
 )
@@ -317,7 +321,10 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     },
 )
 async def rollout_generate(request: RolloutRequest):
+    stamps = RequestStamps()
+    stamps.mark("srv_recv")
     request_id = generate_request_id()
+    stamps.request_id = request_id
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
@@ -330,9 +337,10 @@ async def rollout_generate(request: RolloutRequest):
         server_args=server_args, sampling_params=sampling_params
     )
     try:
-        output_batch: OutputBatch = await async_scheduler_client.forward(
-            pipeline_request
-        )
+        with stamps.span("forward"):
+            output_batch: OutputBatch = await async_scheduler_client.forward(
+                pipeline_request
+            )
     except Exception as exc:
         logger.error("Rollout generation failed: %s", exc, exc_info=True)
         raise HTTPException(
@@ -340,11 +348,18 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
-    )
-    payload = [r.model_dump() for r in rollout_responses]
+    with stamps.span("build"):
+        rollout_responses = _build_response(
+            request_id, request.prompt, request.seed, request.rollout, output_batch
+        )
+    with stamps.span("dump"):
+        payload = [r.model_dump() for r in rollout_responses]
+    with stamps.span("msgpack"):
+        content = msgspec.msgpack.encode(payload)
+
+    # Timing rides a header: the last marks postdate the encoded body.
     return Response(
-        content=msgspec.msgpack.encode(payload),
+        content=content,
         media_type="application/msgpack",
+        headers={TIMING_HEADER: stamps.to_header()},
     )

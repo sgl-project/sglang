@@ -1,10 +1,22 @@
-"""Unit tests for the rollout generate API (serialization, io_struct, rollout_api)."""
+"""Unit tests for the rollout generate API (serialization, io_struct, rollout_api).
 
+Request timing model (TestRequestStamps):
+
+    srv_recv .. forward .. build .. dump .. msgpack   (absolute wall-clock marks)
+    -> all marks ride the x-sgld-timing response header
+"""
+
+import json
+import time
 import types
 import unittest
 
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
+    MARKS,
+    RequestStamps,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
@@ -415,6 +427,49 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+
+class TestRequestStamps(unittest.TestCase):
+    """The client joins these marks with its own, so what matters is that the
+    header decodes, keeps wall-clock order, and stays readable when a request
+    returned early with only some marks taken."""
+
+    def _decode(self, stamps: RequestStamps) -> dict:
+        header = stamps.to_header()
+        self.assertEqual(header, header.encode("ascii").decode())
+        return json.loads(header)
+
+    def test_marks_decode_in_wall_clock_order(self):
+        before = time.time()
+        stamps = RequestStamps("req-1")
+        for name in MARKS:
+            stamps.mark(name)
+        decoded = self._decode(stamps)
+        self.assertEqual(decoded.pop("request_id"), "req-1")
+        self.assertEqual(set(decoded), set(MARKS))
+        values = [decoded[name] for name in MARKS]
+        self.assertEqual(values, sorted(values))
+        self.assertGreaterEqual(values[0], round(before, 6) - 1e-6)
+
+    def test_span_pairs_start_and_end_marks(self):
+        stamps = RequestStamps()
+        with stamps.span("forward"):
+            pass
+        with stamps.span("dump"):
+            pass
+        self.assertEqual(
+            set(json.loads(stamps.to_header())),
+            {"forward_start", "forward_end", "dump_end"},
+        )
+
+    def test_partial_marks_only_report_what_was_taken(self):
+        stamps = RequestStamps("req-3")
+        stamps.mark("srv_recv")
+        self.assertEqual(set(self._decode(stamps)), {"srv_recv", "request_id"})
+
+    def test_unknown_mark_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            RequestStamps().mark("no_such_mark")
 
 
 if __name__ == "__main__":
