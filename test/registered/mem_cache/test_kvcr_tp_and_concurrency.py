@@ -43,6 +43,8 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.kvcr.router_hint import ROUTER_HINT_KEY
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -51,7 +53,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 try:
     from kvcr.policy import FIFOPolicy, LRUPolicy
-    from kvcr.types import OpEntryStatus
+    from kvcr.types import OpEntryStatus, QueryStatus
 
     from sglang.srt.mem_cache.storage.kvcr import kvcr_store
     from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
@@ -573,6 +575,141 @@ class UnusableHostPoolTest(unittest.TestCase):
 
 
 @_needs_kvcr
+class SidecarPoolTest(unittest.TestCase):
+    """A pool this backend cannot address must never be reported as served.
+
+    A hybrid KV stack (DSA/MiniMax indexer, Mamba, SWA) hands the backend one
+    ``PoolTransfer`` per pool, and the sidecar transfer is *derived*: the
+    controller copies the KV pool's own host indices and hashes into it. This
+    backend resolves host addresses through ``mem_pool_host``, which for a
+    hybrid stack is a ``HostPoolGroup`` that forwards to the anchor (KV) pool --
+    so a sidecar transfer would be handed KV addresses, move KV bytes into KV
+    pages, report success, and leave the sidecar's host pool untouched. That is
+    the one failure shape this backend must never produce: ``True`` for a page
+    it never wrote makes ``_sync_and_clamp_prefetch_result`` skip the clamp, and
+    the model attends over an indexer page holding KV bytes -- wrong output, no
+    error anywhere. Every entry point below has to score the pool a miss on its
+    own; a guard on only some of them still leaves a fail-open path.
+    """
+
+    def _store_with_core(self) -> KVCRStore:
+        store = _store(0, 1)
+        store._kvcr = FakeKVCR()
+        store._segments_per_page = 1
+        return store
+
+    def _transfers(self):
+        """One KV transfer and one sidecar transfer, as a hybrid stack sends."""
+        return [
+            PoolTransfer(name=PoolName.KV, keys=["p0", "p1"]),
+            PoolTransfer(
+                name=PoolName.INDEXER,
+                keys=["p0", "p1"],
+                indices_from_pool=PoolName.KV,
+            ),
+        ]
+
+    def test_registering_a_sidecar_pool_refuses_to_start_the_backend(self):
+        """Rejecting at startup is what turns wrong output into a failed launch.
+
+        The runtime guards below are a backstop for pools registered through
+        another path; this is the one that makes the limitation visible, so the
+        message has to name the cause and a backend that does support the model.
+        """
+        store = _store(0, 1)
+
+        with self.assertRaises(RuntimeError) as raised:
+            store.register_mem_host_pool_v2(SimpleNamespace(), PoolName.INDEXER)
+
+        self.assertIn("indexer", str(raised.exception))
+
+    def test_registering_the_kv_pool_is_still_accepted(self):
+        """The guard must reject by pool, not reject every v2 registration."""
+        store = _store(0, 1)
+        pool = SimpleNamespace()
+
+        store.register_mem_host_pool_v2(pool, PoolName.KV)
+
+        self.assertIs(store.registered_pools[PoolName.KV], pool)
+
+    def test_a_sidecar_get_is_a_miss_and_never_reaches_the_core(self):
+        """The fail-open case: all-True here is silently wrong model output.
+
+        Asserting the deliver never ran, rather than only that the result is
+        False, is what separates the guard from the ``_fail_closed`` decorator
+        wrapped around this method -- an exception raised inside would also
+        produce all-False, and would not be the same fix.
+        """
+        store = self._store_with_core()
+        delivered = []
+
+        def record_and_succeed(transfer, request_id):
+            delivered.append(transfer.name)
+            return [True] * len(transfer.keys)
+
+        store._deliver_transfer = record_and_succeed
+
+        results = store.batch_get_v2(self._transfers())
+
+        self.assertEqual(results[str(PoolName.INDEXER)], [False, False])
+        self.assertEqual(delivered, [PoolName.KV])
+
+    def test_a_sidecar_set_is_a_miss_and_never_reaches_the_core(self):
+        """A page reported as backed up becomes evictable from host memory.
+
+        The write side fails open one step later than the read side: the
+        sidecar's host page is marked offloaded, HiCache is free to evict it,
+        and the only copy of it is gone -- the later read cannot recover what
+        was never stored.
+        """
+        store = self._store_with_core()
+        deposited = []
+
+        def record_and_succeed(transfer):
+            deposited.append(transfer.name)
+            return [True] * len(transfer.keys)
+
+        store._deposit_transfer = record_and_succeed
+
+        results = store.batch_set_v2(self._transfers())
+
+        self.assertEqual(results[str(PoolName.INDEXER)], [False, False])
+        self.assertEqual(deposited, [PoolName.KV])
+
+    def test_a_sidecar_pool_makes_the_whole_prefix_unavailable(self):
+        """A KV-only prefix here reads downstream as covering every pool.
+
+        ``batch_exists_v2`` returns one ``kv_hit_pages`` for the request, and
+        the controller issues gets for that prefix across all pools. Reporting
+        the KV pages this backend really does hold would therefore promise
+        sidecar pages it cannot serve, which is the same fail-open one call
+        earlier.
+        """
+        store = self._store_with_core()
+        store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.HIT, None)] * len(keys)
+        )
+
+        result = store.batch_exists_v2(["p0", "p1"], self._transfers())
+
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.extra_pool_hit_pages, {})
+
+    def test_a_kv_only_prefix_is_still_reported(self):
+        """The prefix must collapse on a sidecar pool, not on every request."""
+        store = self._store_with_core()
+        store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.HIT, None)] * len(keys)
+        )
+
+        result = store.batch_exists_v2(
+            ["p0", "p1"], [PoolTransfer(name=PoolName.KV, keys=["p0", "p1"])]
+        )
+
+        self.assertEqual(result.kv_hit_pages, 2)
+
+
+@_needs_kvcr
 class ConcurrentDrainTest(unittest.TestCase):
     """_drain_until and the source pump racing for the same completion queue."""
 
@@ -842,7 +979,7 @@ class RemoteFailureTest(unittest.TestCase):
 
     def _transfer(self, keys: List[str]) -> SimpleNamespace:
         """A PoolTransfer-alike whose host descriptors always resolve."""
-        return SimpleNamespace(name="t0", keys=keys)
+        return SimpleNamespace(name=PoolName.KV, keys=keys)
 
     def test_a_source_that_never_answers_reports_a_miss_rather_than_hanging(self):
         """The deliver completes for nobody, and the deadline must end it.
@@ -963,7 +1100,7 @@ class RaisingCoreTest(unittest.TestCase):
         self.store._kvcr = _ExplodingKVCR()
 
     def _transfer(self, keys: List[str]) -> SimpleNamespace:
-        return SimpleNamespace(name="t0", keys=keys)
+        return SimpleNamespace(name=PoolName.KV, keys=keys)
 
     def test_a_raising_deposit_reports_every_page_unstored(self):
         self.store._host_descriptors = lambda transfer: (
@@ -973,7 +1110,7 @@ class RaisingCoreTest(unittest.TestCase):
 
         results = self.store.batch_set_v2([self._transfer(["page-a", "page-b"])])
 
-        self.assertEqual(results, {"t0": [False, False]})
+        self.assertEqual(results, {str(PoolName.KV): [False, False]})
         self.assertEqual(self.store.stats()["faults_batch_set_v2"], 1)
 
     def test_a_raising_deliver_reports_every_page_unloaded(self):
@@ -984,7 +1121,7 @@ class RaisingCoreTest(unittest.TestCase):
 
         results = self.store.batch_get_v2([self._transfer(["page-a"])])
 
-        self.assertEqual(results, {"t0": [False]})
+        self.assertEqual(results, {str(PoolName.KV): [False]})
         self.assertEqual(self.store.stats()["faults_batch_get_v2"], 1)
 
     def test_a_raising_query_reports_no_available_prefix(self):
@@ -1070,7 +1207,7 @@ class RaisingCoreTest(unittest.TestCase):
             _hint_extra_info("tcp://10.0.0.7:25000"),
         )
 
-        self.assertEqual(results, {"t0": [True]})
+        self.assertEqual(results, {str(PoolName.KV): [True]})
         self.assertEqual(self.store.stats()["faults_discard_hint"], 1)
 
 

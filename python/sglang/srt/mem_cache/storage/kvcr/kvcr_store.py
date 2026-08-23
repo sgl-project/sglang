@@ -422,6 +422,33 @@ class KVCRStore(HiCacheStorage):
             return
         self._build_kvcr(mem_pool_host)
 
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name) -> None:
+        """Accept the KV pool; refuse every sidecar pool.
+
+        Hybrid stacks (DSA/MiniMax indexer, Mamba, SWA) hand each pool to the
+        backend separately, and a backend that keeps them has to address each
+        one's own buffer. This one cannot yet: ``_host_descriptors`` reads
+        ``self.mem_pool_host``, which for a hybrid stack is a ``HostPoolGroup``
+        whose ``get_page_buffer_meta`` forwards to the *anchor* (KV) pool. A
+        sidecar transfer would therefore be handed KV addresses, report success,
+        and leave the sidecar's host pool untouched -- wrong data with no error.
+
+        Two KVCR constraints have to lift before that can be fixed, so this
+        refuses at startup rather than degrading: ``framework_dram`` is a single
+        region while a sidecar buffer is a separate allocation, and the local
+        DRAM tier is one global slot size while KV and indexer segments differ.
+        """
+        if host_pool_name != PoolName.KV:
+            raise RuntimeError(
+                f"KVCRStore does not support the '{host_pool_name}' host pool. "
+                "This model needs a hybrid KV stack (e.g. the DSA/MiniMax "
+                "indexer), and KVCR can only address the primary KV pool, so "
+                "sidecar pages would be silently filled with KV data. Run this "
+                "model without --hicache-storage-backend kvcr, or use a backend "
+                "with hybrid-pool support (e.g. mooncake)."
+            )
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
     def _control_port(self) -> int:
         """Bind port for this rank's KVCR control channel.
 
@@ -784,6 +811,21 @@ class KVCRStore(HiCacheStorage):
     # v2 interface (the real HiCache path)
     # ------------------------------------------------------------------
 
+    def _is_kv_transfer(self, transfer: PoolTransfer) -> bool:
+        """Whether this backend may serve ``transfer``; log once if it may not.
+
+        ``register_mem_host_pool_v2`` already refuses a hybrid stack at startup,
+        so reaching here means a sidecar transfer arrived on a pool that was
+        never registered. Scoring it a miss is what keeps that fail-closed:
+        ``update_extra_pool_hit_pages`` records 0 for the pool and
+        ``_sync_and_clamp_prefetch_result`` clamps the usable prefix to 0, so
+        HiCache recomputes instead of reading a page this backend never wrote.
+        """
+        if transfer.name == PoolName.KV:
+            return True
+        self._note(f"rejected_pool_{transfer.name}")
+        return False
+
     @_fail_closed(_miss_per_transfer)
     def batch_set_v2(
         self,
@@ -795,6 +837,9 @@ class KVCRStore(HiCacheStorage):
         if self._kvcr is None:
             return {str(t.name): [False] * len(t.keys or []) for t in transfers}
         for transfer in transfers:
+            if not self._is_kv_transfer(transfer):
+                results[str(transfer.name)] = [False] * len(transfer.keys or [])
+                continue
             results[str(transfer.name)] = self._deposit_transfer(transfer)
         return results
 
@@ -956,6 +1001,9 @@ class KVCRStore(HiCacheStorage):
         request_id = self._register_hint(extra_info)
         try:
             for transfer in transfers:
+                if not self._is_kv_transfer(transfer):
+                    results[str(transfer.name)] = [False] * len(transfer.keys or [])
+                    continue
                 results[str(transfer.name)] = self._deliver_transfer(
                     transfer, request_id
                 )
@@ -1206,6 +1254,11 @@ class KVCRStore(HiCacheStorage):
         here.
         """
         if self._kvcr is None or self._segments_per_page is None:
+            return PoolTransferResult.empty()
+        # A sidecar pool this backend cannot serve makes the whole prefix
+        # unusable, so report none rather than a KV-only prefix the caller would
+        # read as covering every pool.
+        if any(not self._is_kv_transfer(t) for t in pool_transfers or []):
             return PoolTransferResult.empty()
         # Same parse as batch_get_v2, so a hint this rank cannot align is
         # reported unavailable here rather than promised and then missed.
