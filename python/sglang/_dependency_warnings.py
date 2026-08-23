@@ -1,4 +1,4 @@
-"""Filters for known, non-actionable dependency warnings."""
+"""Early warning filters installed before SGLang imports torch-backed packages."""
 
 import logging
 
