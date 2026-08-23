@@ -1,0 +1,231 @@
+---
+title: "NPU Graph Mode Usage Guide"
+metatags:
+  description: "Consolidated Ascend NPU graph mode guide for SGLang: adaptation, capture batch sizes, graph updates, profiling, and troubleshooting."
+keywords:
+  - npu graph
+  - cuda graph
+  - aclgraph
+  - graph capture
+  - graph update
+  - ascend npu
+---
+
+This guide consolidates NPU graph mode (internally **NPU Graph**, exposed via CUDA Graph CLI flags) into one place. On Ascend, SGLang captures compute graphs with `torch.npu.NPUGraph` and replays them to remove per-step kernel launch overhead during decode.
+
+For general tuning knobs, see [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning). For graph-related profiling, see [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
+
+## Concepts
+
+| Term | Meaning on Ascend NPU |
+| --- | --- |
+| **NPU Graph** | Graph capture/replay path backed by `torch.npu.NPUGraph` |
+| **CLI flags** | Still named `--cuda-graph-*` / `--disable-cuda-graph` for cross-platform parity |
+| **Capture batch size** | Discrete decode batch sizes listed in `--cuda-graph-bs` |
+| **Graph update stream** | Dedicated stream used when refreshing captured graphs after shape/control-flow changes |
+
+NPU Graph is most effective when decode batch sizes are stable and predictable. It requires fixed control flow and tensor shapes during capture, so some feature combinations are only partially compatible.
+
+## Enable and Configure
+
+### Default behavior
+
+NPU Graph is **enabled by default** on supported decode paths. Typical model tutorials document recommended capture sizes, for example:
+
+```bash Command
+sglang serve \
+  --model-path /path/to/model \
+  --attention-backend ascend \
+  --cuda-graph-bs 1 4 8 16
+```
+
+### Core flags
+
+<table>
+  <thead>
+    <tr><th>Flag</th><th>Purpose</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--disable-cuda-graph</code></td>
+      <td>Disable graph capture/replay entirely (eager decode).</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-bs</code></td>
+      <td>Explicit list of decode batch sizes to capture, e.g. <code>1 4 8 16</code>.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-max-bs-decode</code></td>
+      <td>Upper bound on captured decode batch sizes when auto-selecting sizes.</td>
+    </tr>
+    <tr>
+      <td><code>--disable-decode-cuda-graph</code></td>
+      <td>Disable decode-phase graphs only (PD prefill role).</td>
+    </tr>
+    <tr>
+      <td><code>--disable-prefill-cuda-graph</code></td>
+      <td>Disable prefill-phase graphs only (PD decode role).</td>
+    </tr>
+    <tr>
+      <td><code>--enable-profile-cuda-graph</code></td>
+      <td>Capture graph construction traces under <code>SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Choosing capture batch sizes
+
+1. Start from the model tutorial or best-practice page for your target model.
+2. Include the batch sizes you expect under steady serving load (`--max-running-requests`, DP width, speculative verify width).
+3. Keep the list **small** (often ≤10 distinct sizes) to reduce capture time, memory, and graph-update stream pressure.
+4. If latency spikes appear only at certain concurrency levels, add those batch sizes rather than capturing a dense range.
+
+Example for a 7B dense model on one card:
+
+```bash Command
+sglang serve \
+  --model-path /path/to/Qwen3-8B \
+  --attention-backend ascend \
+  --max-running-requests 32 \
+  --cuda-graph-bs 1 2 4 8 16 32
+```
+
+## Graph Adaptation Workflow
+
+Use this checklist when bringing a new model or feature combination online with NPU Graph.
+
+### 1. Baseline in eager mode
+
+Run a short functional smoke test with graphs disabled:
+
+```bash Command
+sglang serve \
+  --model-path /path/to/model \
+  --attention-backend ascend \
+  --disable-cuda-graph
+```
+
+Confirm correctness first. Graph mode should never be the first debugging surface for a new model.
+
+### 2. Enable graphs with conservative capture sizes
+
+Re-enable graphs using a minimal `--cuda-graph-bs` list from the model tutorial. Warm up with a few requests before measuring TPOT/throughput.
+
+### 3. Expand capture sizes only when needed
+
+Add batch sizes incrementally when benchmarks show replay misses (fallback to eager kernels) at specific concurrency levels. Watch server logs for `npu graph: True` in batch summaries during serving.
+
+### 4. Validate feature compatibility
+
+Before enabling advanced features together with NPU Graph, check [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features) and the model tutorial notes. Common constraints:
+
+- `--enable-torch-compile` requires `--disable-cuda-graph`.
+- Some PD disaggregation roles disable one graph phase by design.
+- Speculative decoding and dynamic batching may require narrower capture lists.
+
+## Graph Update Operations
+
+Graph refresh happens when SGLang must recapture after a shape or routing change. Treat graph updates as a **capacity-managed** operation.
+
+### When updates occur
+
+Typical triggers include:
+
+- First request at a previously unseen decode batch size (if not pre-captured).
+- Configuration changes that alter decode batch shape or control flow.
+- Warmup transitions from prefill-heavy to decode-heavy steady state.
+
+### Operational guidance
+
+| Scenario | Recommendation |
+| --- | --- |
+| High capture cardinality | Reduce `--cuda-graph-bs` entries; prefer ≤10 sizes |
+| Stream/resource conflicts | Upgrade CANN/TorchNPU; reduce captured graphs |
+| PD mixed serving | Follow model tutorial PD flags; do not reuse GPU-only capture lists blindly |
+| Debugging update failures | Temporarily disable graphs and compare eager traces |
+
+### Known issue: graph update stream exhaustion
+
+If too many graphs are captured, the dedicated graph update stream can conflict with per-graph streams. Symptoms include `aclnnInplaceFillScalar` / ACL runtime errors during decode.
+
+**Mitigations:**
+
+1. Upgrade to a CANN/TorchNPU combination recommended by your Ascend release notes (CANN 8.5 + TorchNPU 2.8 resolves several historical cases).
+2. Reduce captured graph count to **10 or fewer** distinct batch sizes.
+3. Narrow `--cuda-graph-max-bs-decode` when auto-generated sizes are too broad.
+
+See also [Troubleshooting and FAQ — Graph mode aclnnInplaceFillScalar error](/docs/hardware-platforms/ascend-npus/faq#2-graph-mode-aclnninplacefillscalar-error).
+
+## Profiling NPU Graph Mode
+
+### Serving with graphs enabled (production-like)
+
+Use normal serving settings and collect traces with `bench_serving --profile`:
+
+```bash Command
+export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
+
+python -m sglang.bench_serving \
+  --backend sglang \
+  --base-url http://127.0.0.1:30000 \
+  --model /path/to/model \
+  --tokenizer /path/to/model \
+  --dataset-name random \
+  --random-input-len 128 \
+  --random-output-len 32 \
+  --num-prompts 8 \
+  --profile \
+  --profile-steps 5 \
+  --profile-output-dir ./sglang_profile
+```
+
+Inspect `operator_details.csv`, `kernel_details.csv`, and `trace_view.json` under the `*_ascend_pt/ASCEND_PROFILER_OUTPUT` directory. See [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) for full capture methods.
+
+### Profiling Python stack visibility (debug only)
+
+To map Python call stacks to individual operators, temporarily disable graphs:
+
+```bash Command
+sglang serve ... --disable-cuda-graph
+```
+
+This reduces decode performance and is intended **only** for profiling sessions.
+
+### Profiling graph capture itself
+
+To analyze capture overhead and failures:
+
+```bash Command
+export SGLANG_TORCH_PROFILER_DIR=./graph_capture_profile
+sglang serve ... --enable-profile-cuda-graph
+```
+
+Traces are written under `SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`.
+
+## Troubleshooting Quick Reference
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| ACL Fill / graph kernel launch failures | Too many captured graphs / stream conflict | Reduce `--cuda-graph-bs`; upgrade CANN/TorchNPU |
+| TPOT regression after feature toggle | Graph replay miss → eager fallback | Add missing batch size or disable incompatible feature |
+| Missing Python stacks in trace | Graph mode enabled | Re-run with `--disable-cuda-graph` for profiling only |
+| PD role mismatch | Wrong phase graph disabled/enabled | Use PD-specific flags from model tutorial |
+| OOM during startup | Excessive capture sizes | Lower `--cuda-graph-max-bs-decode` and capture list |
+
+## Model-Specific Starting Points
+
+Each model tutorial documents recommended graph settings. Use these as authoritative starting lists:
+
+- [Qwen3-8B Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b)
+- [Qwen3-235B-A22B Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b)
+- [DeepSeek-V3.2 Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2)
+
+For benchmark-backed launch commands, see the [Deployment Best Practices Knowledge Base](/docs/hardware-platforms/ascend-npus/model-deployment/knowledge_base).
+
+## See Also
+
+- [Parameter Tuning — NPU Graph section](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#npu-graph---cuda-graph-bs)
+- [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling)
+- [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq)
+- [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features)
+- [NPU Profiler Analysis Skill](/docs/developer_guide/benchmark_and_profiling) (agent workflow in `.claude/skills/sglang-npu-profiler-analysis/`)
