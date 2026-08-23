@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import validate_repo_id
 
 WeightSourceKind = Literal["local", "huggingface"]
@@ -38,6 +38,14 @@ class WeightInventory:
 class ResolvedWeight:
     inventory: WeightInventory
     selected_file: str
+
+
+def is_explicit_weight_file_reference(source: str) -> bool:
+    """Whether a component override names one weight file, not a component root."""
+    expanded = os.path.expanduser(source)
+    if os.path.isdir(expanded):
+        return False
+    return urlparse(source).path.lower().endswith(_WEIGHT_SUFFIXES)
 
 
 def _validate_relative_hub_path(path: str, field_name: str) -> str:
@@ -263,4 +271,21 @@ def resolve_weight(
     return ResolvedWeight(
         inventory=inventory,
         selected_file=selected_file,
+    )
+
+
+def materialize_weight(resolved: ResolvedWeight) -> str:
+    """Return the selected local file, downloading one pinned Hub file if needed."""
+    source = resolved.inventory.source
+    if source.kind == "local":
+        assert source.local_path is not None
+        if os.path.isfile(source.local_path):
+            return source.local_path
+        return os.path.join(source.local_path, resolved.selected_file)
+
+    assert source.repo_id is not None
+    return hf_hub_download(
+        repo_id=source.repo_id,
+        filename=resolved.selected_file,
+        revision=resolved.inventory.resolved_revision,
     )

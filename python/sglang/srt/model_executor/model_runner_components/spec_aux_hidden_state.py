@@ -31,6 +31,8 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
+    # Draft layers whose KV cache uses the target SWA pool capacity.
+    eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
@@ -91,6 +93,14 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_hidden_layers,
                     draft_model_config.num_attention_layers,
                 )
+            )
+
+        if (
+            draft_model_config.is_hybrid_swa
+            and not draft_model_config.is_deepseek_v4_arch
+        ):
+            config.eagle_draft_swa_num_layers = len(
+                draft_model_config.swa_attention_layer_ids
             )
 
         if spec_algorithm.is_eagle3():
