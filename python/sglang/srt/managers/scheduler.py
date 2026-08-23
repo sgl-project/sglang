@@ -279,7 +279,12 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
-from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED,
+    QUEUE_REJECTION_REASON_QUEUE_FULL,
+    QUEUE_REJECTION_REASON_WAITING_TIMEOUT,
+    SchedulerMetricsCollector,
+)
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
@@ -2834,6 +2839,27 @@ class Scheduler(
             return False
         return True
 
+    def _record_queue_rejected_req(self, reason: str, count: int = 1) -> None:
+        """Count requests rejected from the waiting queue before generation began.
+
+        These rejections are invisible to the tokenizer-side abort counter, which
+        only tracks aborts the frontend initiates, and to HTTP status codes for
+        streaming requests, whose 200 is committed before the rejection is sent.
+
+        Gated on current_scheduler_metrics_enabled and pp_rank 0, not
+        enable_metrics: requests are broadcast to every TP rank and processed by
+        every PP stage, so each rank can run the rejection path for the same logical
+        request and gating on enable_metrics would overcount it.
+        """
+        if (
+            self.metrics_reporter.current_scheduler_metrics_enabled
+            and self.ps.pp_rank == 0
+            and count > 0
+        ):
+            self.metrics_reporter.metrics_collector.increment_queue_rejected_reqs(
+                reason, count
+            )
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -2845,6 +2871,7 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
+        reason = QUEUE_REJECTION_REASON_QUEUE_FULL
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -2868,6 +2895,7 @@ class Scheduler(
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                reason = QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED
 
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
@@ -2881,6 +2909,7 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._record_queue_rejected_req(reason)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2912,6 +2941,9 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+            self._record_queue_rejected_req(
+                QUEUE_REJECTION_REASON_WAITING_TIMEOUT, len(deleted_reqs)
+            )
 
     def handle_embedding_request(
         self,

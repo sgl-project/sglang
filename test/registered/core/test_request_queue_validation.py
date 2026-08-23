@@ -3,6 +3,13 @@ import os
 import re
 import unittest
 
+import requests
+from prometheus_client.parser import text_string_to_metric_families
+
+from sglang.srt.observability.metrics_collector import (
+    QUEUE_REJECTION_REASON_QUEUE_FULL,
+    QUEUE_REJECTION_REASONS,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -17,8 +24,8 @@ from sglang.test.test_utils import (
     send_generate_requests,
 )
 
-register_cuda_ci(est_time=53, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=70, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=87, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMaxQueuedRequests(CustomTestCase):
@@ -42,6 +49,7 @@ class TestMaxQueuedRequests(CustomTestCase):
                 "1",
                 "--attention-backend",
                 "triton",
+                "--enable-metrics",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -73,6 +81,51 @@ class TestMaxQueuedRequests(CustomTestCase):
 
         # expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
         # self.assertEqual(status_codes, expected_status_codes)
+
+    def _rejections_by_reason(self) -> dict:
+        """sglang:num_queue_rejected_requests_total summed per reason label."""
+        response = requests.get(f"{self.base_url}/metrics")
+        self.assertEqual(response.status_code, 200)
+
+        totals = {}
+        for family in text_string_to_metric_families(response.text):
+            for sample in family.samples:
+                if sample.name == "sglang:num_queue_rejected_requests_total":
+                    reason = sample.labels["reason"]
+                    totals[reason] = totals.get(reason, 0.0) + sample.value
+        return totals
+
+    def test_queue_rejection_reasons_are_pre_seeded(self):
+        """Every reason is exported before it first fires.
+
+        A labelled Counter has no children until its first increment, which
+        leaves the series missing rather than zero, so rate() and alerting
+        queries return no data precisely when the server is healthy.
+        """
+        self.assertEqual(
+            set(self._rejections_by_reason()),
+            set(QUEUE_REJECTION_REASONS),
+        )
+
+    def test_queue_full_rejections_are_counted(self):
+        """Verify queue-full rejections are exported as a metric.
+
+        Streaming clients never observe the 503, because the 200 is committed
+        before the scheduler rejects, so this counter is the only server-side
+        signal that the queue cap shed load.
+        """
+        before = self._rejections_by_reason().get(
+            QUEUE_REJECTION_REASON_QUEUE_FULL, 0.0
+        )
+
+        status_codes = asyncio.run(
+            send_concurrent_generate_requests(self.base_url, num_requests=10)
+        )
+        num_rejected = status_codes.count(503)
+        self.assertGreater(num_rejected, 0, "expected the queue cap to reject requests")
+
+        after = self._rejections_by_reason().get(QUEUE_REJECTION_REASON_QUEUE_FULL, 0.0)
+        self.assertEqual(after - before, num_rejected)
 
     def test_max_running_requests_and_max_queued_request_validation(self):
         """Verify running request and queued request numbers based on server logs."""

@@ -45,6 +45,15 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 
 logger = logging.getLogger(__name__)
 
+QUEUE_REJECTION_REASON_QUEUE_FULL = "queue_full"
+QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED = "priority_preempted"
+QUEUE_REJECTION_REASON_WAITING_TIMEOUT = "waiting_timeout"
+QUEUE_REJECTION_REASONS = (
+    QUEUE_REJECTION_REASON_QUEUE_FULL,
+    QUEUE_REJECTION_REASON_PRIORITY_PREEMPTED,
+    QUEUE_REJECTION_REASON_WAITING_TIMEOUT,
+)
+
 
 @dataclass
 class QueueCount:
@@ -241,7 +250,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -485,6 +493,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of paused requests by async weight sync.",
             labelnames=labels.keys(),
         )
+
+        # =================================================================
+        # Rejection
+        # =================================================================
+        self.num_queue_rejected_requests_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_queue_rejected_requests_total",
+            documentation=(
+                "Total number of requests rejected from the waiting queue before "
+                "generation began, labelled by reason."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        # Pre-seed every reason at 0. Without this the series is absent until the
+        # first rejection, so rate() queries and alerts return no data instead of 0
+        # exactly when the server is healthy.
+        for reason in QUEUE_REJECTION_REASONS:
+            self.num_queue_rejected_requests_total.labels(**labels, reason=reason)
 
         # =================================================================
         # PD disaggregation
@@ -1217,6 +1243,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             output_reason=output_reason,
             actual_execution=str(actual_execution).lower(),
         ).inc(1)
+
+    def increment_queue_rejected_reqs(self, reason: str, count: int = 1) -> None:
+        self.num_queue_rejected_requests_total.labels(**self.labels, reason=reason).inc(
+            count
+        )
 
     def increment_retracted_reqs(
         self,
