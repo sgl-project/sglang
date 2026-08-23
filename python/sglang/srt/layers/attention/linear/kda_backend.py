@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -31,6 +31,12 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _k3_fused_decode_enabled(decode_kernel) -> bool:
+    return getattr(decode_kernel, "supports_k3_fused_decode", True) and not (
+        get_bool_env_var("SGLANG_DISABLE_K3_FUSED_DECODE")
+    )
 
 
 class KDAKernelDispatcher:
@@ -431,11 +437,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
-        self._allow_fused_decode = getattr(
-            self.kernel_dispatcher.decode_kernel,
-            "supports_k3_fused_decode",
-            True,
+        fused_decode_supported = getattr(
+            self.kernel_dispatcher.decode_kernel, "supports_k3_fused_decode", True
         )
+        self._allow_fused_decode = _k3_fused_decode_enabled(
+            self.kernel_dispatcher.decode_kernel
+        )
+        if fused_decode_supported and not self._allow_fused_decode:
+            rank0_log(
+                "K3 fused KDA decode disabled by "
+                "SGLANG_DISABLE_K3_FUSED_DECODE; using the selected decode backend."
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
