@@ -129,6 +129,8 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    supports_direct_lora_merge = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
