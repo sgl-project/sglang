@@ -280,10 +280,16 @@ class TestPublishInstallsSlot(_IsolatedPublish):
         set_global_server_args_for_scheduler(sa)
         self.assertIs(get_server_args(), sa)
         # Publishing is what resolved it; the handlers ahead of the dummy
-        # short-circuit still declare.
+        # short-circuit still declare. What they decided is the projection --
+        # the fields keep what the caller passed.
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        self.assertTrue(sa._resolved_overrides, "publishing declared nothing")
         for source, declared in sa._resolved_overrides:
             for field, value in declared.items():
-                self.assertEqual(getattr(sa, field), value, f"{source}: {field}")
+                self.assertEqual(
+                    resolution_result(sa, field), value, f"{source}: {field}"
+                )
 
 
 class TestGoldenModelOverrides(_IsolatedPublish):

@@ -3840,8 +3840,6 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        # Read through the declarations from here on: the handlers below declare
-        # rather than assign, so a field read would answer with the raw input.
         cfg = resolving_view(self)
 
         from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
@@ -5488,19 +5486,20 @@ class ServerArgs:
     def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Runtime activation working-set reserve for eager decode above the captured
         # max_bs and transient prefill/logits; also covers fixed state caches.
-        if self.disaggregation_mode == "decode":
+        cfg = resolving_view(self)
+        if cfg.disaggregation_mode == "decode":
             running_requests = (
-                self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
+                cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
             )
             activation_tokens = max(
-                running_requests * (self.speculative_num_draft_tokens or 1), 2048
+                running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
             )
-        elif self.chunked_prefill_size > 0:
-            activation_tokens = max(self.chunked_prefill_size, 2048)
+        elif cfg.chunked_prefill_size > 0:
+            activation_tokens = max(cfg.chunked_prefill_size, 2048)
         else:
-            activation_tokens = max(self.max_prefill_tokens, 2048)
+            activation_tokens = max(cfg.max_prefill_tokens, 2048)
         reserved_mem = (
-            512 + activation_tokens * 1.5 + self.tp_size * self.pp_size / 8 * 1024
+            512 + activation_tokens * 1.5 + cfg.tp_size * cfg.pp_size / 8 * 1024
         )
         if gpu_mem is not None and gpu_mem > 60 * 1024:
             reserved_mem = max(reserved_mem, 10 * 1024)
@@ -6303,6 +6302,7 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
+        cfg = resolving_view(self)
         # OOT platforms provide their own default attention backend.
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
@@ -6327,8 +6327,8 @@ class ServerArgs:
                 is_sm100_supported()
                 and is_no_spec_infer_or_topk_one(resolved_view(self))
                 and (
-                    self.speculative_algorithm is None
-                    or self.speculative_eagle_topk is not None
+                    cfg.speculative_algorithm is None
+                    or cfg.speculative_eagle_topk is not None
                 )
             ):
                 # trtllm_mha requires equal K/V row widths; fa4 carries
@@ -8305,7 +8305,7 @@ class ServerArgs:
                 "(--weight-cache-mode off) for this configuration."
             )
 
-        if self.weight_cache_mode != "off" and self.enable_eplb:
+        if cfg.weight_cache_mode != "off" and cfg.enable_eplb:
             raise ValueError(
                 "--weight-cache-mode is not supported together with --enable-eplb."
             )
@@ -9837,17 +9837,18 @@ class ServerArgs:
         return model_config.attention_arch == AttentionArch.MLA
 
     def is_attention_backend_not_set(self):
+        cfg = resolving_view(self)
         return (
-            self.attention_backend is None
-            and self.prefill_attention_backend is None
-            and self.decode_attention_backend is None
+            cfg.attention_backend is None
+            and cfg.prefill_attention_backend is None
+            and cfg.decode_attention_backend is None
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return mamba_extra_buffer_of(self)
+        return mamba_extra_buffer_of(resolving_view(self))
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return mamba_extra_buffer_lazy_of(self)
+        return mamba_extra_buffer_lazy_of(resolving_view(self))
 
     @property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
@@ -10285,20 +10286,21 @@ class ServerArgs:
         Adapters apply to the target only; a shared draft runs unadapted.
         Matches resolved algorithm names (NEXTN has collapsed to EAGLE).
         """
-        if self.speculative_algorithm in ["NGRAM", None]:
+        cfg = resolving_view(self)
+        if cfg.speculative_algorithm in ["NGRAM", None]:
             return
 
-        if self.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+        if cfg.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
             promoted = (
                 " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
                 "promoted to FROZEN_KV_MTP, which does not support LoRA)"
-                if self.speculative_algorithm == "FROZEN_KV_MTP"
+                if cfg.speculative_algorithm == "FROZEN_KV_MTP"
                 else ""
             )
             raise ValueError(
                 "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
                 "DFLASH, or DSPARK speculative decoding, not "
-                f"{self.speculative_algorithm}{promoted}."
+                f"{cfg.speculative_algorithm}{promoted}."
             )
 
         ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
@@ -10307,20 +10309,20 @@ class ServerArgs:
         # prefix so the message names the combination, not just the flag.
         unsupported = [
             (
-                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+                cfg.speculative_algorithm == "DSPARK" and ragged_mode != "static",
                 f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
                 "the per-request verify lengths it schedules break the "
                 "uniform-width LoRA segment layout",
             ),
             (
-                self.speculative_adaptive,
+                cfg.speculative_adaptive,
                 "does not support --speculative-adaptive: the draft is built "
                 "from a static ServerArgs snapshot, and the runtime-state "
                 "swap does not rebuild LoRA cuda-graph metadata",
             ),
             (
                 "experimental_sgl_trtllm"
-                in (self.moe_runner_backend, self.speculative_moe_runner_backend),
+                in (cfg.moe_runner_backend, cfg.speculative_moe_runner_backend),
                 "does not support the experimental_sgl_trtllm MoE runner: its "
                 "TopK reads the LoRA config per forward, which the draft "
                 "resolves against the target's after its own publish ended",
@@ -10471,14 +10473,15 @@ class ServerArgs:
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(self, load_format)
+        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
     @property
     def kv_event_block_size(self) -> int:
         """Width KV events are emitted at: under DCP the radix tree pages at
         ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
         """
-        return self.page_size * self.dcp_size
+        cfg = resolving_view(self)
+        return cfg.page_size * self.dcp_size
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
@@ -10751,6 +10754,7 @@ class PortArgs:
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
     ) -> PortArgs:
+        cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
             nccl_port = get_free_port()
         else:
@@ -10783,7 +10787,7 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not server_args.enable_dp_attention:
+        if not cfg.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -10814,7 +10818,7 @@ class PortArgs:
             # every init_new call agrees, decrementing below dist_init_port on
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
             if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
