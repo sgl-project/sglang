@@ -1143,7 +1143,9 @@ class KVCacheConfigurator:
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels keep the physical page size even when a replicated
+            # DCP draft uses a wider virtual location space.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1347,7 +1349,9 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            # DSA kernels keep the physical page size even when a replicated
+            # DCP draft uses a wider virtual location space.
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,

@@ -84,6 +84,14 @@ class TestDSATransformIndex(CustomTestCase):
         expected[:real_num_tokens][real_topk < 0] = -1
         return expected
 
+    def _expected_dcp_rank(
+        self, global_indices: torch.Tensor, dcp_size: int, dcp_rank: int
+    ) -> torch.Tensor:
+        owned = (global_indices >= 0) & (
+            global_indices.remainder(dcp_size) == dcp_rank
+        )
+        return torch.where(owned, global_indices // dcp_size, -1)
+
     def _check_decode_case(
         self,
         batch_size: int,
@@ -230,6 +238,66 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_correctness_and_strides(self):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
+
+    def test_decode_filters_and_localizes_dcp_owned_slots(self):
+        batch_size = 3
+        context_length = 4096
+        dcp_size = 4
+        page_table = self._make_page_table(batch_size, context_length)
+        topk_indices = self._make_topk(batch_size, context_length)
+        global_indices = torch.empty(
+            (batch_size, TOPK), dtype=torch.int32, device=self.device
+        )
+        torch.gather(
+            page_table,
+            dim=1,
+            index=topk_indices.clamp(min=0),
+            out=global_indices,
+        )
+        global_indices[topk_indices < 0] = -1
+
+        for dcp_rank in range(dcp_size):
+            with self.subTest(dcp_rank=dcp_rank):
+                actual = transform_index_page_table_decode_fast(
+                    page_table=page_table,
+                    topk_indices=topk_indices,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                expected = self._expected_dcp_rank(
+                    global_indices, dcp_size, dcp_rank
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_prefill_filters_and_localizes_dcp_owned_slots(self):
+        extend_lens_cpu = [2, 1]
+        context_length = 4096
+        dcp_size = 4
+        page_table = self._make_page_table(len(extend_lens_cpu), context_length)
+        topk_indices = self._make_topk(sum(extend_lens_cpu), context_length)
+        global_indices = self._expected(
+            page_table,
+            topk_indices,
+            extend_lens_cpu,
+            sum(extend_lens_cpu),
+            page_table_is_expanded=False,
+        )
+
+        for dcp_rank in range(dcp_size):
+            with self.subTest(dcp_rank=dcp_rank):
+                actual = transform_index_page_table_prefill_fast(
+                    page_table=page_table,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=extend_lens_cpu,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                expected = self._expected_dcp_rank(
+                    global_indices, dcp_size, dcp_rank
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)

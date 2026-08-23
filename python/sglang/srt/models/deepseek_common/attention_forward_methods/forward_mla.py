@@ -102,8 +102,50 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def is_dsa_tp_dcp_prefill_phase(
+    forward_batch: ForwardBatch, *, use_dsa: bool
+) -> bool:
+    """Whether DSA TP+DCP prefill attends rank-local KV after gathering Q."""
+    return (
+        use_dsa
+        and get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+        and not dsa_use_prefill_cp(forward_batch)
+    )
+
+
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla"}
+
+
+def is_dsa_dcp_lse_base_on_e(forward_batch: ForwardBatch) -> bool:
+    """Whether the active DSA implementation returns natural-log LSE."""
+    dsa_backend = get_attn_backend()
+    forward_mode = forward_batch.forward_mode
+    use_decode_impl = (
+        forward_mode.is_decode_or_idle()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend_v2()
+    )
+    dsa_impl = (
+        dsa_backend.dsa_decode_impl
+        if use_decode_impl
+        else dsa_backend.dsa_prefill_impl
+    )
+    return dsa_impl == "flashmla_kv"
+
+
+def _zero_dsa_dcp_padding(
+    attn_output: torch.Tensor, forward_batch: ForwardBatch
+) -> None:
+    """Clear attention-TP padding from DSA DCP outputs."""
+    num_valid_tokens = (
+        forward_batch.extend_num_tokens
+        if get_attn_tp_context().input_scattered
+        else forward_batch.num_token_non_padded_cpu
+    )
+    if num_valid_tokens is not None and num_valid_tokens < attn_output.shape[0]:
+        attn_output[num_valid_tokens:] = 0
 
 
 if _is_cuda:
@@ -154,6 +196,10 @@ class DeepseekMLAForwardMixin:
         if not is_graph_dsa_split_op_surface(forward_batch):
             return False
         if not self.use_dsa:
+            return False
+        # DCP must receive each rank's local LSE so it can combine partial
+        # attention outputs. The composite graph op only returns the output.
+        if get_parallel().dcp_enabled:
             return False
         if self.use_deep_gemm_bmm:
             return False
@@ -617,7 +663,8 @@ class DeepseekMLAForwardMixin:
                 k_pe,
             )
 
-        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
+        # Decode and DSA TP-prefill gather Q and reduce partial attention with
+        # LSE. DSA CP-prefill (like dense MLA prefill) gathers KV instead.
         if get_parallel().dcp_enabled:
             if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
@@ -625,19 +672,26 @@ class DeepseekMLAForwardMixin:
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-            elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                if is_dsa_tp_dcp_prefill_phase(
+                    forward_batch, use_dsa=self.use_dsa
+                ):
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
+                else:
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -670,6 +724,9 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        # Set only by the DCP attention branches; the combine below asserts on
+        # it so a fusion path silently skipping the LSE fails loudly.
+        lse = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -702,8 +759,13 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch):
-                # set return_lse=True to correct attn_output
+            elif is_dcp_mla_decode_phase(
+                forward_batch
+            ) or is_dsa_tp_dcp_prefill_phase(
+                forward_batch, use_dsa=self.use_dsa
+            ):
+                # Q-gather DCP (decode and TP+DCP extend) attends each rank's
+                # local KV shard and returns an LSE for cross-rank combine.
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
                     k_nope,
@@ -749,9 +811,17 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        if self.use_dsa and get_parallel().dcp_enabled:
+            _zero_dsa_dcp_padding(attn_output, forward_batch)
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_mla_decode_phase(
+            forward_batch
+        ) or is_dsa_tp_dcp_prefill_phase(forward_batch, use_dsa=self.use_dsa):
+            assert lse is not None, (
+                "DCP LSE combine reached without an LSE — the attention call "
+                "above must go through the attn_mqa_for_dcp_decode branch."
+            )
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
@@ -766,11 +836,13 @@ class DeepseekMLAForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
-                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
-                    self.current_attention_backend
+                is_lse_base_on_e = (
+                    is_dsa_dcp_lse_base_on_e(forward_batch)
+                    if self.use_dsa
+                    else is_mla_dcp_lse_base_on_e(self.current_attention_backend)
                 )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    # Exchange head partials + LSE, then combine locally.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),

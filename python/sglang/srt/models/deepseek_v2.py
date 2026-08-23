@@ -153,7 +153,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -3213,6 +3216,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        kv_buffer_token_padding = 1
+        if is_deepseek_dsa(self.config):
+            # DSA TP+DCP uses Q gather and does not need a temporary KV view.
+            # CP+DCP gathers KV into a temporary buffer whose row layout and
+            # dtype match the token-to-KV pool values supplied by the caller.
+            if not (is_dsa_enable_prefill_cp() and get_parallel().attn_cp_size > 1):
+                return None
+            token_to_kv_pool = get_token_to_kv_pool()
+            # FlashMLA reshapes the flat gathered storage into physical pages.
+            # Logical DCP indices cover only the valid rows; padding is storage-only.
+            kv_buffer_token_padding = token_to_kv_pool.page_size
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3225,6 +3239,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            kv_buffer_token_padding=kv_buffer_token_padding,
         )
 
 
