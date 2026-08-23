@@ -824,12 +824,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # (_handle_batch_output), so entries still present here belong to
+            # requests that never completed -- including CancelledError/
+            # GeneratorExit from client disconnects, where the scheduler may
+            # still be decoding. Abort those on the scheduler BEFORE dropping
+            # the HTTP-side state; otherwise the delayed create_abort_task
+            # dispatch is dropped by the rid_to_state guard in abort_request()
+            # and the request runs to its generation limit as a zombie.
+            self._abort_and_discard_pending_req_states(obj)
             raise
 
     def _detect_input_format(
@@ -3400,19 +3402,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+    def _abort_and_discard_pending_req_states(self, obj):
+        """Abort still-pending requests on the scheduler, then drop their state.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Dispatch happens BEFORE the pop: once rid_to_state is gone, no code path
+        is left that can tell the scheduler to stop the request -- the delayed
+        create_abort_task would be dropped by the rid_to_state guard in
+        abort_request(). Only concrete, still-tracked rids are dispatched
+        (never arbitrary caller input), and a later output for a discarded rid
+        is ignored (the scheduler-response path looks up state with
+        ``.get(...)``), so this is safe for partial/failed dispatches.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            if rid in self.rid_to_state:
+                self._dispatch_to_scheduler(AbortReq(rid=rid))
+                self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
