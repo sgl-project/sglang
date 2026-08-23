@@ -5,7 +5,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.lora.linear import (
+    BaseLayerWithLoRA,
+    _use_owned_base_snapshot,
+    wrap_with_lora_layer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -69,6 +73,25 @@ def test_merge_cache_only_accepts_cpu_backed_weights():
         enabled=True,
     )
     assert resident_cache is None
+
+
+def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
+    assert not _use_owned_base_snapshot(False, "cpu")
+    assert not _use_owned_base_snapshot(False, "meta")
+    assert _use_owned_base_snapshot(False, "cuda")
+    assert _use_owned_base_snapshot(True, "cpu")
+
+    cpu_layer = wrap_with_lora_layer(
+        torch.nn.Linear(2, 2, bias=False), snapshot_base=False
+    )
+    assert cpu_layer is not None
+    assert cpu_layer._base_is_view
+
+    meta_layer = wrap_with_lora_layer(
+        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
+    )
+    assert meta_layer is not None
+    assert meta_layer._base_is_view
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():

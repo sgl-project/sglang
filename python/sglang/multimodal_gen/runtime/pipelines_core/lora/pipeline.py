@@ -397,11 +397,10 @@ class LoRAPipeline(ComposedPipelineBase):
         """
         Unified method to convert the transformer to a LoRA transformer.
 
-        snapshot_base=False keeps the unmerge snapshots as zero-copy views of
-        the base weights instead of clones (38 GB of anonymous memory on H3's
-        DiT). Safe whenever merges go through the LoRA merge cache, which
-        never writes the base storage; a later in-place merge materializes
-        the clone on its own.
+        snapshot_base=False keeps CPU-backed unmerge snapshots as zero-copy
+        views of the base weights instead of clones (38 GB of anonymous memory
+        on H3's DiT). Resident accelerator layers still retain owned CPU
+        snapshots because they cannot be rebound to the CPU merge cache.
         """
         if self.lora_initialized:
             return

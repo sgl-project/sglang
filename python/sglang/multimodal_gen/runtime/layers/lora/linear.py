@@ -218,7 +218,7 @@ class BaseLayerWithLoRA(nn.Module):
     def _ensure_base_snapshot_owned(self) -> None:
         """An in-place merge is about to write the base storage; if the
         snapshot is a zero-copy view into it, materialize the clone now."""
-        if getattr(self, "_base_is_view", False):
+        if self._base_is_view:
             self.cpu_weight = self.cpu_weight.clone()
             self._base_is_view = False
 
@@ -751,6 +751,10 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             return out
 
 
+def _use_owned_base_snapshot(snapshot_base: bool, device_type: str) -> bool:
+    return snapshot_base or device_type not in ("cpu", "meta")
+
+
 def wrap_with_lora_layer(
     layer: nn.Module,
     lora_rank: int | None = None,
@@ -774,11 +778,14 @@ def wrap_with_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
+            effective_snapshot_base = _use_owned_base_snapshot(
+                snapshot_base, layer.weight.device.type
+            )
             ret = lora_layer_type(
                 layer,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
-                snapshot_base=snapshot_base,
+                snapshot_base=effective_snapshot_base,
             )
             return ret
     return None
