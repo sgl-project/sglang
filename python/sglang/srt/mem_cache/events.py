@@ -53,6 +53,11 @@ def _same_placement(a, b) -> bool:
     )
 
 
+def _stored_metadata(event):
+    """The metadata a store carries, or ``None`` for the plain variant."""
+    return event.metadata if isinstance(event, BlockStoredWithMetadata) else None
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -81,26 +86,21 @@ class KVCacheEventRecorder:
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
-                tail_metadata = (
-                    tail.metadata if isinstance(tail, BlockStoredWithMetadata) else None
-                )
-                event_metadata = (
-                    event.metadata
-                    if isinstance(event, BlockStoredWithMetadata)
-                    else None
-                )
                 if (
-                    tail.medium == event.medium
+                    # Most selective test first: a store that does not chain onto
+                    # the tail can never coalesce, and that is the common case, so
+                    # it keeps the field comparisons below off the hot path.
+                    tail.block_hashes
+                    and event.parent_block_hash == tail.block_hashes[-1]
+                    and tail.medium == event.medium
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
-                    and tail_metadata == event_metadata
                     and tail.lora_name == event.lora_name
                     # extra_keys is per-block, so merging two events that carry
                     # different ones would misalign it with block_hashes.
                     and tail.extra_keys == event.extra_keys
                     and _same_placement(tail, event)
-                    and tail.block_hashes
-                    and event.parent_block_hash == tail.block_hashes[-1]
+                    and _stored_metadata(tail) == _stored_metadata(event)
                 ):
                     tail.block_hashes.extend(event.block_hashes)
                     tail.token_ids.extend(event.token_ids)
@@ -151,6 +151,9 @@ class KVCacheEventRecorder:
         logical_len = len(node.key)
         is_bigram = node.key.is_bigram
         raw = node.key.token_ids
+        # The salt is a property of the node, so both of these are loop-invariant.
+        cache_salt = node.key.cache_salt
+        extra_keys = cache_salt_extra_keys(cache_salt)
         for start in range(0, logical_len, self.page_size):
             end = min(start + self.page_size, logical_len)
             if end <= start:
@@ -172,14 +175,14 @@ class KVCacheEventRecorder:
                 "medium": medium,
                 # The salt also rides in the positional extra_keys slot, which
                 # is where a cross-framework consumer reads it from.
-                "extra_keys": cache_salt_extra_keys(node.key.cache_salt),
+                "extra_keys": extra_keys,
             }
-            if node.key.cache_salt is None:
+            if cache_salt is None:
                 event = BlockStored(**event_args)
             else:
                 event = BlockStoredWithMetadata(
                     **event_args,
-                    metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+                    metadata=BlockStoredMetadata(cache_salt=cache_salt),
                 )
             self.enqueue(event)
 

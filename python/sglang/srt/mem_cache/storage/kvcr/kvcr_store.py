@@ -823,13 +823,14 @@ class KVCRStore(HiCacheStorage):
             )
             return [False] * len(keys)
         # Build one source descriptor per (page, segment).
-        descriptors = self._host_descriptors(transfer)
-        if descriptors is None:
+        built = self._host_descriptors(transfer)
+        if built is None:
             logger.warning(
                 "KVCRStore deposit skipped: no host descriptors for %d pages",
                 len(keys),
             )
             return [False] * len(keys)
+        descriptors, per_page_keys = built
 
         op_handle, result_map = self._submit_and_wait(
             lambda: self._kvcr.deposit(descriptors)
@@ -854,12 +855,10 @@ class KVCRStore(HiCacheStorage):
         # residency table is what ``_locally_resident`` and the source path both
         # read. ``descriptors`` names the *host* pages we copied out of, which
         # HiCache is free to reuse the moment this call returns.
-        results: List[bool] = []
-        for key in keys:
-            segment_keys = self._page_segment_keys(key)
-            results.append(
-                all(result_map.get(seg_key, False) for seg_key in segment_keys)
-            )
+        results = [
+            all(result_map.get(seg_key, False) for seg_key in page_keys)
+            for page_keys in per_page_keys
+        ]
         # Counted because the first question about any missed P2P fetch is
         # whether the source ever held the blocks, and until now every counter
         # here was on the get side -- so a source that quietly stored nothing
@@ -870,13 +869,18 @@ class KVCRStore(HiCacheStorage):
 
     def _host_descriptors(
         self, transfer: PoolTransfer
-    ) -> Optional[Dict[BlockKey, MemDescriptor]]:
+    ) -> Optional[Tuple[Dict[BlockKey, MemDescriptor], List[List[BlockKey]]]]:
         """Map each page key's segments to per-segment source MemDescriptors.
 
-        Returns a flat ``{segment_key: MemDescriptor}`` mapping with
-        ``segments_per_page`` entries per page key, or None if the pool meta
-        can't be lined up with the requested keys. Each descriptor is exactly
-        ``slot_size`` bytes so it lands in one KVCR slot.
+        Returns ``(descriptors, per_page_keys)``, or None if the pool meta can't
+        be lined up with the requested keys. ``descriptors`` is the flat
+        ``{segment_key: MemDescriptor}`` mapping KVCR takes, with
+        ``segments_per_page`` entries per page key; each descriptor is exactly
+        ``slot_size`` bytes so it lands in one KVCR slot. ``per_page_keys`` is
+        the same segment keys grouped by page, handed back so callers scoring
+        the result map index into it instead of re-formatting every key -- a
+        ``layer_first`` layout puts ``2 * layer_num`` segments on a page, which
+        makes that string building the dominant cost of the call.
         """
         host_indices = transfer.host_indices
         keys = transfer.keys or []
@@ -898,8 +902,10 @@ class KVCRStore(HiCacheStorage):
             )
             return None
         descriptors: Dict[BlockKey, MemDescriptor] = {}
+        per_page_keys: List[List[BlockKey]] = []
         for page_idx, key in enumerate(keys):
             base = page_idx * segments
+            page_keys: List[BlockKey] = []
             for seg in range(segments):
                 ptr = int(ptr_list[base + seg])
                 size = int(size_list[base + seg])
@@ -910,7 +916,9 @@ class KVCRStore(HiCacheStorage):
                         self._slot_size,
                     )
                     return None
-                descriptors[self._segment_key(key, seg)] = MemDescriptor(
+                segment_key = self._segment_key(key, seg)
+                page_keys.append(segment_key)
+                descriptors[segment_key] = MemDescriptor(
                     end_point_name=self._agent_name,
                     mem_type="DRAM",
                     addr=ptr,
@@ -918,7 +926,8 @@ class KVCRStore(HiCacheStorage):
                     device_Id=0,
                     info="",
                 )
-        return descriptors
+            per_page_keys.append(page_keys)
+        return descriptors, per_page_keys
 
     @_fail_closed(_miss_per_transfer)
     def batch_get_v2(
@@ -1061,18 +1070,12 @@ class KVCRStore(HiCacheStorage):
         policy is doing its job, while a rising FAILED count means something is
         wrong. Keeping them apart is what makes the counters usable as evidence
         when a policy is being tuned, which the fault-injection run relies on.
-
-        Statuses are read by name so an entry type without a ``status`` (the
-        older core, or a test double built on ``success`` alone) still counts.
         """
         dropped = failed = 0
         for entry in entries.values():
-            status = getattr(entry, "status", None)
-            if status is OpEntryStatus.DROPPED:
+            if entry.status is OpEntryStatus.DROPPED:
                 dropped += 1
-            elif status is OpEntryStatus.FAILED or (
-                status is None and not entry.success
-            ):
+            elif entry.status is not OpEntryStatus.SUCCESS:
                 failed += 1
         if dropped:
             self._note("entries_dropped_by_policy", dropped)
@@ -1161,20 +1164,19 @@ class KVCRStore(HiCacheStorage):
         keys = transfer.keys or []
         if not keys or self._segments_per_page is None:
             return [False] * len(keys)
-        destinations = self._host_descriptors(transfer)
-        if destinations is None:
+        built = self._host_descriptors(transfer)
+        if built is None:
             return [False] * len(keys)
+        destinations, per_page_keys = built
 
         _, result_map = self._submit_and_wait(
             lambda: self._kvcr.deliver(destinations, request_id=request_id)
         )
 
-        results: List[bool] = []
-        for key in keys:
-            segment_keys = self._page_segment_keys(key)
-            results.append(
-                all(result_map.get(seg_key, False) for seg_key in segment_keys)
-            )
+        results = [
+            all(result_map.get(seg_key, False) for seg_key in page_keys)
+            for page_keys in per_page_keys
+        ]
         loaded = sum(results)
         self._note("pages_requested", len(results))
         self._note("pages_loaded", loaded)

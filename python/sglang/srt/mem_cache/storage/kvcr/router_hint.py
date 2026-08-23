@@ -21,7 +21,6 @@ the two places to update in lockstep.
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
@@ -86,7 +85,7 @@ def normalize_block_hash(value: Union[int, str]) -> Optional[str]:
     return None
 
 
-class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
+class RouterHint(msgspec.Struct, kw_only=True):
     """Mirror of the dynamo RouterHint schema (oandreeva/router_hints).
 
     Fields intentionally match the *compact* 2-field wire schema on the dynamo
@@ -107,12 +106,23 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
     caller sends hex digests, and everything downstream compares against SGLang
     page keys. Normalizing once at parse time keeps that conversion out of the
     membership test, which the core runs per block key.
+
+    Not ``frozen``: msgspec forbids ``__post_init__`` writes on a frozen struct,
+    and ``covered_pages`` has to be derived there. Treat it as immutable anyway
+    -- rebind through ``msgspec.structs.replace``, which re-runs the hook.
     """
 
     source_control_endpoint: str
-    # A tuple, not a list, so the struct stays hashable and the covered-page set
-    # can be memoized across the per-block-key membership tests.
     block_hashes: Tuple[str, ...] = ()
+    # Derived from block_hashes in __post_init__; never passed in. The core runs
+    # covers() once per block key and one prefetch fans each page out into every
+    # segment, so the set is built once here rather than per call. Keeping it on
+    # the struct (rather than in a keyed cache) makes the lookup independent of
+    # how many hashes the hint carries.
+    covered_pages: frozenset = frozenset()
+
+    def __post_init__(self) -> None:
+        self.covered_pages = frozenset(self.block_hashes)
 
     @classmethod
     def maybe_from_payload(cls, payload) -> Optional[RouterHint]:
@@ -160,21 +170,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
         block identity that :meth:`KVCRStore._segment_key` produced, while the
         hint only ever names whole pages.
         """
-        return page_hash_key(key.split("#", 1)[0]) in _covered_pages(
-            tuple(self.block_hashes)
-        )
-
-
-@lru_cache(maxsize=64)
-def _covered_pages(block_hashes: Tuple[str, ...]) -> frozenset:
-    """Memoized page set for :meth:`RouterHint.covers`.
-
-    The KVCR core runs the membership test once per block key, and one prefetch
-    fans a page out into every segment, so rebuilding the set per call is the
-    hot path. Keyed on the hashes rather than the hint, so a hint built directly
-    with a list (rather than through ``maybe_from_payload``) still memoizes.
-    """
-    return frozenset(block_hashes)
+        return page_hash_key(key.split("#", 1)[0]) in self.covered_pages
 
 
 class StrKeyHintAdapter:

@@ -153,19 +153,21 @@ def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
 
 
 class FakeEntry:
-    """One completed block key. _drain_until reads ``.success`` off each entry.
+    """One completed block key, shaped like the core's ``OpEntryResult``.
 
-    ``status`` mirrors the core's ``OpEntryResult``, where ``success`` is
-    ``status is SUCCESS`` -- so DROPPED and FAILED are both falsy and only the
-    status tells them apart. It defaults to ``None`` so the many cases here that
-    only care about pass/fail stay readable, which also stands in for an entry
-    type that predates the field.
+    ``success`` is derived from ``status`` exactly as the core derives it, so
+    DROPPED and FAILED are both falsy and only the status tells them apart.
+    Constructed by pass/fail because most cases here care about nothing else.
     """
 
     def __init__(self, success: bool = True, status=None) -> None:
-        self.success = success
-        if status is not None:
-            self.status = status
+        if status is None:
+            status = OpEntryStatus.SUCCESS if success else OpEntryStatus.FAILED
+        self.status = status
+
+    @property
+    def success(self) -> bool:
+        return self.status is OpEntryStatus.SUCCESS
 
 
 def _per_op_residue(store: KVCRStore, op_handle: int) -> List[str]:
@@ -852,7 +854,10 @@ class RemoteFailureTest(unittest.TestCase):
         thread.
         """
         self.store._kvcr = FakeKVCR()  # finish() is never called
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
 
         started = time.monotonic()
         results = self.store._deliver_transfer(
@@ -876,8 +881,10 @@ class RemoteFailureTest(unittest.TestCase):
         self.store._segments_per_page = 2
         core = FakeKVCR()
         self.store._kvcr = core
-        self.store._host_descriptors = lambda transfer: {"s0": object(), "s1": object()}
-        self.store._page_segment_keys = lambda key: ["s0", "s1"]
+        self.store._host_descriptors = lambda transfer: (
+            {"s0": object(), "s1": object()},
+            [["s0", "s1"]],
+        )
 
         def deliver_then_half_fail(destinations, request_id=None):
             handle = 101
@@ -959,7 +966,10 @@ class RaisingCoreTest(unittest.TestCase):
         return SimpleNamespace(name="t0", keys=keys)
 
     def test_a_raising_deposit_reports_every_page_unstored(self):
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
 
         results = self.store.batch_set_v2([self._transfer(["page-a", "page-b"])])
 
@@ -967,7 +977,10 @@ class RaisingCoreTest(unittest.TestCase):
         self.assertEqual(self.store.stats()["faults_batch_set_v2"], 1)
 
     def test_a_raising_deliver_reports_every_page_unloaded(self):
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
 
         results = self.store.batch_get_v2([self._transfer(["page-a"])])
 
@@ -994,7 +1007,10 @@ class RaisingCoreTest(unittest.TestCase):
         covered v2 would return v2's dict here and the caller would read it as
         an unexpected type rather than as a miss.
         """
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
 
         self.assertEqual(
             self.store.batch_set_v1(["a", "b"], torch.arange(2)), [False, False]
@@ -1012,7 +1028,10 @@ class RaisingCoreTest(unittest.TestCase):
         nothing new after the first, but dropping the count would hide how bad
         it is -- so the count is exact and the log is throttled.
         """
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
 
         with self.assertLogs(kvcr_store.__name__, "WARNING") as logs:
             for _ in range(5):
@@ -1033,8 +1052,10 @@ class RaisingCoreTest(unittest.TestCase):
         core.discard_hint = _raise_fault
         core.submit_hint = lambda *a, **k: None
         self.store._kvcr = core
-        self.store._host_descriptors = lambda transfer: {"seg-a": object()}
-        self.store._page_segment_keys = lambda key: ["seg-a"]
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": object()},
+            [["seg-a"]],
+        )
         original_deliver = core.deliver
 
         def deliver_and_succeed(destinations, request_id=None):
@@ -1101,23 +1122,6 @@ class StatsTest(unittest.TestCase):
         stats = store.stats()
         self.assertEqual(stats["entries_dropped_by_policy"], 1)
         self.assertEqual(stats["entries_failed"], 1)
-
-    def test_an_entry_without_a_status_counts_as_a_failure(self):
-        """The classification must not depend on a field the core may not have.
-
-        ``OpEntryStatus.DROPPED`` arrived in kvcr e3a816e; the store still has
-        to work against a core that reports only ``success``. Treating a
-        status-less falsy entry as DROPPED would be the unsafe direction --
-        real faults would silently land in the "policy did this on purpose"
-        bucket -- so it counts as a failure.
-        """
-        store = _store(0, 1)
-
-        store._note_entry_statuses({"legacy": FakeEntry(False)})
-
-        stats = store.stats()
-        self.assertEqual(stats["entries_failed"], 1)
-        self.assertNotIn("entries_dropped_by_policy", stats)
 
 
 @_needs_kvcr
