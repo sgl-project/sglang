@@ -75,8 +75,7 @@ _HF_SAFETENSORS_URL_RE = re.compile(
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
     if config is None:
         return None
-    quant_name_getter = getattr(type(config), "get_name", None)
-    return quant_name_getter() if callable(quant_name_getter) else None
+    return config.get_name()
 
 
 def _merge_modelopt_fp4_configs(
@@ -292,9 +291,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if cls_name != "Flux2Transformer2DModel" or quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-        if quant_name != "modelopt_fp4":
+        if _get_quant_config_name(quant_config) != "modelopt_fp4":
             return
 
         weights_path = os.path.basename(server_args.transformer_weights_path or "")
@@ -377,10 +374,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-
-        if quant_name != "modelopt_fp8":
+        if _get_quant_config_name(quant_config) != "modelopt_fp8":
             return
 
         component_offload = _uses_component_offload(
