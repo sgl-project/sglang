@@ -38,6 +38,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1520,6 +1521,8 @@ _MAX_MEDIA_URL_REDIRECTS = 5
 _MEDIA_URL_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _allowed_media_domains: frozenset[str] = frozenset()
 _media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+_allow_private_media_networks = True
+_allow_local_media_paths = True
 
 
 def _normalize_media_domain(domain: str) -> str:
@@ -1557,6 +1560,9 @@ def _normalize_media_domain(domain: str) -> str:
 def configure_media_url_security(
     allowed_media_domains: Optional[Sequence[str]] = None,
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    *,
+    allow_private_networks: bool = True,
+    allow_local_file_paths: bool = True,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -1572,9 +1578,38 @@ def configure_media_url_security(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
+    global _allow_private_media_networks, _allow_local_media_paths
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    _allow_private_media_networks = allow_private_networks
+    _allow_local_media_paths = allow_local_file_paths
     return normalized_domains
+
+
+def _iter_media_url_ip_addresses(parsed) -> list[ipaddress._BaseAddress]:
+    hostname = parsed.hostname
+    if hostname is None:
+        return []
+
+    try:
+        return [ipaddress.ip_address(hostname)]
+    except ValueError:
+        pass
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    seen: set[str] = set()
+    resolved: list[ipaddress._BaseAddress] = []
+    for family, _, _, _, sockaddr in socket.getaddrinfo(
+        hostname, port, type=socket.SOCK_STREAM
+    ):
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        ip_text = sockaddr[0].split("%", 1)[0]
+        if ip_text in seen:
+            continue
+        seen.add(ip_text)
+        resolved.append(ipaddress.ip_address(ip_text))
+    return resolved
 
 
 def _assert_media_url_allowed(url: str) -> None:
@@ -1589,6 +1624,28 @@ def _assert_media_url_allowed(url: str) -> None:
             f"Allowed domains: {sorted(_allowed_media_domains)}; "
             f"input domain: {hostname}"
         )
+
+    if not _allow_private_media_networks:
+        for address in _iter_media_url_ip_addresses(parsed):
+            if not address.is_global:
+                raise ValueError(
+                    "Media URL resolves to a non-public IP address. "
+                    f"input host: {hostname}"
+                )
+
+
+def resolve_local_media_path(path_or_uri: str) -> str:
+    resolved = (
+        unquote(urlparse(path_or_uri).path)
+        if path_or_uri.startswith("file://")
+        else path_or_uri
+    )
+    if not _allow_local_media_paths:
+        raise ValueError(
+            "Local media paths are disabled. "
+            "Enable --allow-local-media-paths only for trusted callers."
+        )
+    return resolved
 
 
 def download_remote_media(url: str, timeout: float) -> bytes:
@@ -1707,9 +1764,9 @@ def load_audio(
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
-        source = unquote(urlparse(audio_file).path)
+        source = resolve_local_media_path(audio_file)
     elif isinstance(audio_file, str):
-        source = audio_file
+        source = resolve_local_media_path(audio_file)
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
@@ -1884,13 +1941,16 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
-            image_file=unquote(urlparse(image_file).path),
+            image_file=resolve_local_media_path(image_file),
             gpu_image_decode=gpu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=resolve_local_media_path(image_file),
+            gpu_image_decode=gpu_image_decode,
+        )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(
@@ -1910,7 +1970,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
     if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
+        with open(resolve_local_media_path(image_file), "rb") as f:
             return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
@@ -1939,9 +1999,9 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
+            return resolve_local_media_path(video_file)
         elif os.path.isfile(unquote(urlparse(video_file).path)):
-            return video_file
+            return resolve_local_media_path(video_file)
         else:
             return pybase64.b64decode(video_file, validate=True)
     else:

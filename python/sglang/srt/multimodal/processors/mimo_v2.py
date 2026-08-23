@@ -41,7 +41,7 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, resolve_local_media_path
 from sglang.utils import logger
 
 
@@ -505,7 +505,7 @@ class MiMoProcessor:
         ):
             source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
-            source = path_or_data  # local path or file://
+            source = resolve_local_media_path(path_or_data)
         try:
             AudioDecoder(source)
             return True
@@ -1453,7 +1453,7 @@ class MiMoProcessor:
                 with BytesIO(download_remote_media(image, timeout=3)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+                image_obj = Image.open(resolve_local_media_path(image))
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1461,7 +1461,7 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                image_obj = Image.open(resolve_local_media_path(image))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:

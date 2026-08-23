@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torchaudio.functional as AF
 from transformers.feature_extraction_utils import BatchFeature, FeatureExtractionMixin
 
+from sglang.srt.utils.common import resolve_local_media_path
+
 
 @dataclass
 class InklingAudioEncoderParams:
@@ -40,7 +42,7 @@ def _load_audio_bytes(audio) -> bytes:
     if hasattr(audio, "read"):
         return audio.read()
     if isinstance(audio, str):
-        path = audio[len("file://") :] if audio.startswith("file://") else audio
+        path = resolve_local_media_path(audio)
         with open(path, "rb") as f:
             return f.read()
     raise TypeError(
