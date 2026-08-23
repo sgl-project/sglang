@@ -41,14 +41,16 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
+/// Default per-route body-size cap on `/v1/chat/completions`, overridable
+/// with `--max-chat-body-bytes`. 5 MiB accommodates a long context — a
+/// ~1 M-token context tokenized as JSON fits under this — while preventing
+/// a hostile client from forcing the router to heap-allocate hundreds of
+/// MiB before forwarding. The effective cap lives on
+/// `ProxyConfig::max_chat_body_bytes` and is wired in
 /// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
 /// layer; axum's `Bytes` extractor enforces it and returns 413
 /// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = crate::config::default_max_chat_body_bytes();
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -101,6 +103,24 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
+
+    // Arrival half of the access log. Emitted before any parsing or routing so
+    // a request that never completes — client hang, worker stall, body reject —
+    // still leaves a trace; the completion line below is only reached on exit,
+    // so an arrival with no matching completion IS the signal for a stuck
+    // request. `model` is absent here because it comes from the body probe.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    tracing::info!(
+        request_id = %request_id,
+        method = "POST",
+        path = "/v1/chat/completions",
+        "chat_completions_start",
+    );
+
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -577,15 +597,11 @@ pub async fn chat_completions(
     ctx.metrics
         .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
-    // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+    // Completion half of the access log — always on at INFO so incoming traffic
+    // and its status are visible without DEBUG. `request_id` is the
+    // client/gateway X-Request-Id (echoed end-to-end), captured at arrival
+    // above; `worker` is the engine the policy selected. The cache-aware
+    // routing rationale is logged separately at DEBUG by the policy.
     let http_status = match &result {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.status_code().as_u16(),

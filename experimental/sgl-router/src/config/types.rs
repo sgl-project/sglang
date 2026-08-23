@@ -27,16 +27,31 @@ pub struct ProxyConfig {
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
     pub request_timeout_secs: u64,
+    /// Max accepted body size for `/v1/chat/completions`, in bytes.
+    /// Enforced as a route-level `DefaultBodyLimit` before the handler
+    /// runs, so oversized bodies get 413 without being read into memory.
+    /// Raising this raises the worst-case heap a single request can pin,
+    /// so size it against expected concurrency, not just the largest
+    /// prompt.
+    pub max_chat_body_bytes: usize,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
     300
 }
 
+/// 5 MiB — comfortably fits a ~1 M-token context serialized as JSON while
+/// keeping a hostile client from forcing hundreds of MiB of heap per
+/// request. `const fn` so it can also seed `chat::MAX_CHAT_BODY_BYTES`.
+pub const fn default_max_chat_body_bytes() -> usize {
+    5 << 20
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            max_chat_body_bytes: default_max_chat_body_bytes(),
         }
     }
 }
