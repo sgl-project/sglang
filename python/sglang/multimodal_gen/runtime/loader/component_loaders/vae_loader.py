@@ -1,10 +1,13 @@
+import hashlib
 import importlib.util
 import os
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
+from safetensors.torch import save_file as safetensors_save_file
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -30,7 +33,11 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled,
+    resolve_component_precision,
+    resolve_decode_precision,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
@@ -124,6 +131,124 @@ def _should_use_channels_last_3d(
     ):
         return True
     return False
+
+
+def _decode_dtype_store_path(
+    component_model_path: str, component_name: str, dtype: torch.dtype
+) -> str:
+    key = hashlib.sha1(
+        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}".encode()
+    ).hexdigest()[:16]
+    return os.path.join(
+        envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"
+    )
+
+
+def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
+    """Adopt a decode-dtype store if it matches the module, else refuse."""
+    state = vae.state_dict()
+    for name, tensor in mapped.items():
+        param = state.get(name)
+        if param is None or param.shape != tensor.shape or tensor.dtype != dtype:
+            return False
+    vae.load_state_dict(mapped, strict=False, assign=True)
+    return True
+
+
+def _rehome_cast_weights_to_file(
+    vae, dtype: torch.dtype, component_model_path: str, component_name: str, prepare
+) -> tuple[int, bool]:
+    """Hold the decode-dtype weights in a file-backed mapping.
+
+    The cast copies are anonymous host memory the kernel cannot reclaim, and
+    on a budgeted host every one of those bytes comes out of the pin budget
+    the stepped components live on. Written once to a cache file and mapped
+    back, the same bytes become page cache: droppable under pressure, free to
+    re-fault, and absent from the anonymous accounting. safetensors round-trips
+    tensors byte-exactly, so the mapping holds the identical rounded values —
+    and a later start adopts the store without paying the cast at all.
+
+    Returns (weights held, file-backed?).
+    """
+    path = _decode_dtype_store_path(component_model_path, component_name, dtype)
+    try:
+        if os.path.exists(path):
+            mapped = safetensors_load_file(path)
+            if mapped and _assign_matching_store(vae, mapped, dtype):
+                return len(mapped), True
+            raise ValueError("existing decode-dtype store does not match the module")
+        converted = prepare(dtype)
+        if not converted:
+            return 0, False
+        cast_state = {
+            name: tensor
+            for name, tensor in vae.state_dict().items()
+            if tensor.dtype == dtype and tensor.device.type == "cpu"
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
+        os.replace(tmp, path)
+        mapped = safetensors_load_file(path)
+        if set(mapped) != set(cast_state):
+            raise ValueError("decode-dtype store does not match the cast weights")
+        vae.load_state_dict(mapped, strict=False, assign=True)
+        return converted, True
+    except Exception as exc:
+        logger.warning(
+            "VAE: could not re-home %s decode-dtype weights to %s (%s); "
+            "keeping in-memory copies",
+            component_name,
+            path,
+            exc,
+        )
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return prepare(dtype), False
+
+
+def _hold_decoder_weights_in_decode_dtype(
+    vae, server_args: ServerArgs, component_name: str, component_model_path: str = ""
+) -> None:
+    """Round decoder weights to their decode compute dtype at load.
+
+    The decode stage persists these frozen weights in the autocast dtype on
+    first use (``prepare_autocast_linear_weights``), so the rounding itself is
+    already part of the output. Doing it at load makes residency plans, host
+    pins, and every host-to-device copy carry the halved size: MiniMax-H3's
+    video decoder drops from 9.7 to ~4.9 GiB, which is the difference between
+    restreaming a third of it per tile and holding all 36 blocks on a 12 GiB
+    card for the decode.
+    """
+    if component_name not in ("vae", "video_vae"):
+        return
+    if envs.SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST:
+        return
+    prepare = getattr(vae, "prepare_decoder_autocast_weights", None)
+    if prepare is None:
+        return
+    dtype = resolve_decode_precision(server_args, component_name)
+    if dtype == torch.float32:
+        return
+    if not autocast_enabled(dtype, server_args.disable_autocast):
+        return
+    if component_model_path and not envs.SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE:
+        held, file_backed = _rehome_cast_weights_to_file(
+            vae, dtype, component_model_path, component_name, prepare
+        )
+    else:
+        held, file_backed = prepare(dtype), False
+    if held:
+        logger.info(
+            "VAE: %s holds %d decoder weights in %s from load (%s)",
+            component_name,
+            held,
+            dtype,
+            "file-backed" if file_backed else "anonymous host memory",
+        )
 
 
 def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
@@ -235,6 +360,9 @@ class VAELoader(ComponentLoader):
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            _hold_decoder_weights_in_decode_dtype(
+                vae, server_args, component_name, component_model_path
+            )
             vae = current_platform.optimize_vae(vae)
             return vae
 
@@ -276,7 +404,12 @@ class VAELoader(ComponentLoader):
         keep_mapping = component_starts_on_cpu and (
             current_platform.is_mps()
             or keep_checkpoint_mapped(
-                weight_bytes=checkpoint_bytes(server_args.model_path),
+                # server_args.model_path can be a hub repo id, which is not a
+                # directory anywhere; the component path is always local, and
+                # its parent holds the rest of the variant being deployed.
+                weight_bytes=checkpoint_bytes(
+                    os.path.dirname(str(component_model_path))
+                ),
                 component=f"{component_name or 'vae'} (VAE)",
             )
         )
@@ -303,5 +436,8 @@ class VAELoader(ComponentLoader):
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        _hold_decoder_weights_in_decode_dtype(
+            vae, server_args, component_name, component_model_path
+        )
         vae = current_platform.optimize_vae(vae)
         return vae

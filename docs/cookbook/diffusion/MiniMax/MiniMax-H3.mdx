@@ -281,11 +281,13 @@ contract and low resident weight memory, but that part is slower than a fully
 quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
 component/layerwise offload are supported; FSDP inference is rejected.
 
-The `pruned_int8_convrot` files are detected but remain unsupported. They
-require online regular-Hadamard ConvRot, dynamic INT8 activation quantization,
-and a matching W8A8 GEMM. SGLang fails before loading them instead of silently
-treating their stored INT8 values as ordinary weights. A native ConvRot kernel
-path should be added and benchmarked separately before these files are accepted.
+The `pruned_int8_convrot` files use the same override path and are detected
+automatically. Install `comfy-kitchen`, replace the FP8 filename above with
+`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and still omit
+`--quantization`. SGLang loads their serialized INT8 weights and row scales into
+the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
+layerwise offload are supported; TP8 violates the checkpoint's 256-element
+ConvRot group boundary, and FSDP is rejected.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -907,7 +909,7 @@ sglang generate \
 `--attention-backend sol_attn` with
 `--attention-backend-config dense_backend=sage_attn,dense_steps=10` and
 `--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn`.
-See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8-online-quantization)
+See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)
 and [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
 
 <Warning>
@@ -1196,6 +1198,187 @@ peak per GPU.
 | prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Selected recipe |
 | prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
 | Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
+
+### Consumer GPU tuning
+
+On consumer hardware the binding question is not which card you have but how much
+host RAM sits behind it. H3's weights are about 108 GB — 61.73 GB of DiT and
+46.18 GB of text encoder — so no consumer configuration holds them all, and where
+the shortfall lands decides the throughput.
+
+**The command** — most consumer machines need exactly one flag beyond the model:
+
+```bash consumer single GPU, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --layerwise-offload-components dit,text_encoder,vae
+```
+
+With 16 GB of VRAM or more, add `--layerwise-resident-layers video_vae=36` for
+the 13 s decode; with ~96 GB of host RAM and 16 GB+ of VRAM, add
+`--dit-layerwise-resident-layers 4` for the 6 s step. That is the whole flag
+surface. The [builder at the top of this page](#1-quick-start) has consumer
+cards and a Host RAM selector: pick your budget and it emits this command with
+your tier's measured expectations attached as comments. The table below is the
+same data in one view.
+
+**Two budgets, and what each one buys**
+
+| | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |
+| --- | ---: | ---: |
+| Recipe | A | B |
+| Peak VRAM | ≤ 12 GiB | ≤ 16 GiB (OOMs at 12) |
+| Host anonymous (must fit) | 24.5 GiB | 116.7 GB pinned |
+| Denoise, 864×480 / 124 frames / 20 NFE | 16.8 - 18.7 s/it | **6.01 s/it** |
+| Runs at all | yes | yes |
+
+The left column is one configuration measured twice, at 318.94 s and 356.37 s;
+the 12% spread tracked host load on a shared machine, so treat smaller
+differences than that as unresolved. The right column is 120.92 s at a 16 GiB
+allocator cap. Four resident DiT layers is what Recipe B buys its speed with,
+and it is also why 12 GiB is not enough for it.
+
+Read the host row carefully, because the two numbers are not the same kind of
+memory. *Anonymous* host memory — pinned buffers and pageable copies — has to fit,
+and the kernel cannot reclaim it. Page cache backing a file mapping is
+*droppable*, so it does not count against the budget even though it shows up in
+`VmRSS`; use `RssAnon` from `/proc/<pid>/status` when checking. Likewise measure
+VRAM with `torch.cuda.set_per_process_memory_fraction` and let the allocator fail,
+rather than reading `nvidia-smi`, which reports the caching allocator's reserved
+pool and overstates the requirement.
+
+Inside 32 GB the weights cannot be pinned, so each denoise step copies about
+60 GiB from the checkpoint mapping, and a mapped source is synchronous however
+the copy is requested: the driver stages it through its own buffer, so the
+transfer neither overlaps compute nor runs at pinned bandwidth. That is where
+the step goes, and giving the host room to pin the weights instead is what takes
+it to 6.01 s.
+
+Two caveats on the constrained number, both from instrumenting the run rather
+than from arithmetic. The machine it was measured on has 2 TB of host memory, so
+the kernel kept all 107.7 GiB of mapped checkpoint pages resident: major faults
+across a whole request were 6, and `read_bytes` was zero. Nothing was read from
+disk. A real 32 GB host cannot cache 107.7 GiB, so it will fault and re-read,
+and should be expected to be slower than the figures here rather than equal to
+them — an NVMe is a requirement, not a recommendation. Measure your own machine
+with major faults (`/proc/<pid>/stat`) on the worker process, not on the
+launcher, which holds no weights.
+
+**Recipe A — fits 12 GB VRAM + 32 GB host**
+
+```bash 12 GB + 32 GB, lossless
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --layerwise-resident-layers video_vae=36
+```
+
+**Recipe B — host memory is free (the fast path)**
+
+```bash unconstrained host, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-layerwise-resident-layers 4 \
+  --layerwise-resident-layers video_vae=36
+```
+
+Recipe B pins ~112 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
+~4.5 GB in its decode dtype). Do not reach for it on a 32 GB machine.
+
+**What not to change, and why**
+
+- `video_vae=36` holds every decoder block for the decode only — residency
+  arms at the decoder's first block and releases when it finishes, so the
+  denoise still runs on an empty card. It fits 12 GB because decoder weights
+  are held in their decode compute dtype (fp16) from load, which halves them
+  to ~4.9 GiB; the rounding was already part of every output (the decode
+  computes in fp16 autocast), so the result is bit-identical, and the decode
+  drops from 60 s streamed (or 209 s on a busy host) to ~10 s. The
+  `expandable_segments` line stays: the decode sits close enough to the cap
+  that fragmentation otherwise tips it over.
+- Leave `--enable-torch-compile` off, as elsewhere on this page. Layerwise offload
+  rebinds `param.data` on every layer, so compiled graphs do not get the benefit
+  they would on resident weights.
+- Recipe A's flags are what the automatic policy should choose on its own. Until
+  the model declares its own placement, `--performance-mode memory` plus the
+  explicit component list is what makes it happen; pass them.
+
+**Reading the startup log**
+
+The server prints the memory decisions it made; checking three lines against
+your budget catches a mis-set machine in the first minute instead of the first
+request.
+
+- `Layerwise offload: host memory available: N GiB` — what the runtime sees
+  after loading, not your DIMM size. On a 32 GB host expect single digits here;
+  a much larger number means another process's memory accounting (or a
+  container limit) is in play.
+- `leaving N GiB of weights on the checkpoint mapping` — the expected line on a
+  32 GB host: the DiT streams from the checkpoint file. If instead the log
+  reports pinned weights, the runtime decided your host has room — which is
+  faster, and means the 32 GB figures above do not apply to you.
+- `Loaded video_vae: ... host mmap` vs `host pageable` — where the VAE landed
+  (decoder weights are ~4.9 GiB once held in their decode dtype).
+  `Loaded <component>` lines carry the same buckets for every component.
+
+If a request dies after the denoise finishes, it is the decode colliding with
+the cap: keep the `expandable_segments` line, and if it persists drop to
+`video_vae=24` and take the partially streamed decode.
+
+**Against ComfyUI, on the same weights**
+
+Same unpruned bf16 checkpoints, same card, same sampler settings (cfg 1.0,
+euler_ancestral, sigma shift 12.0/3.0, seed 1101), 864×480 / 124 frames / 20 NFE:
+
+When host memory is free, the engines are close and sglang is ahead:
+
+| | denoise | host anonymous | peak VRAM |
+| --- | ---: | ---: | ---: |
+| sglang, Recipe B | **6.01 s/it** | 116.7 GB pinned | ≤ 16 GiB |
+| ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
+
+Inside 12 GB, both engines run these weights, and one measurement convention
+matters on each side. ComfyUI's memory manager reads system RAM and adapts, so
+the rows below patch `psutil` to a pretend host size — the same convention the
+sglang rows use. Its `--reserve-vram` is also soft: told to keep 12 GiB free it
+still peaked at 13.5 GiB, a figure a real 12 GB card cannot give it, so both
+engines here run under the same hard allocator cap
+(`set_per_process_memory_fraction`), where its peak stays at 12.1–12.3 GiB.
+Under that cap, Recipe A wins the whole request at every host size:
+
+| 12 GB VRAM, both engines hard-capped | sglang Recipe A (TE + denoise + decode) | ComfyUI, bf16 (warm) |
+| --- | ---: | ---: |
+| 32 GB host | 12.4 + 212.8 + 9.4 ≈ **235 s** | 276–302 s |
+| 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
+| 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
+
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
+VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
+and at 24 GiB (with `--dit-layerwise-resident-layers 10`, which only a 24 GB
+card has headroom for) ~230 vs 249–260 s. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+#35946), per-layer pinning with net-cost accounting (#35867), the courier
+thread that ships still-mapped layers through pinned slots (#35882), and
+decoder weights held in their decode dtype from load (#35967) — which is what
+lets `video_vae=36` fit and turns the decode from the slowest stage (54–96 s
+streamed) into the fastest (~10 s, faster than ComfyUI's own 15–25 s). Output
+equivalence is bit-level: the fp16-held decode reproduced the fp32-store run's
+video byte for byte, and the audio stream is bit-identical.
+
+Stage by stage under the cap: text encoding is even (both stream the same
+48 GB Qwen3VL), the denoise leads at 32–48 GB hosts and sits within
+run-to-run variance of ComfyUI at 64 GB (162 vs 159 s), and the decode leads
+everywhere. Two ComfyUI notes that still matter: `--fast-disk` measured no
+faster than its default here, and stacking
+`--novram --cache-none --disable-pinned-memory` made things strictly worse
+(69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
+configuration on a small host.
+
+The path ComfyUI ships for 12 GB cards uses
+`minimax_h3_fl2va_pruned_int8_convrot` and `qwen3vl_32b_minimax_h3_nvfp4_awq`,
+i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
+against the unpruned 66.3 GB. Those are different weights, so it is not a
+like-for-like comparison with the recipes above.
 
 ### RTX 4090 24 GB single-GPU run
 

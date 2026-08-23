@@ -16,7 +16,7 @@ precision are resolved independently.
 Use these paths:
 
 - `--model-path`: the base or original model
-- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo or local directory
+- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo/local directory; for transformer and native encoder loaders, an explicit weight filename retains the base component config
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: replacement transformer weights in safetensors
   format (file, directory, or Hub repository/file) or a supported GGUF file
@@ -50,10 +50,11 @@ directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
-MiniMax-H3 auto-detects the per-layer metadata in Comfy's
-`pruned_fp8_scaled` safetensors. Pass one selected FL2VA or Ref2VA file by local
-path, `owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do
-not combine it with `--quantization`. MiniMax-H3 GGUF usage is documented in
+MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
+including `pruned_fp8_scaled` and serialized ConvRot INT8. Pass one selected
+FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
+direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
+usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quantized Component Repositories
@@ -70,7 +71,7 @@ paths:
 | Component path | Quantized checkpoint behavior |
 | --- | --- |
 | `transformer`, `transformer_2`, `unconditional_transformer`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
-| `text_encoder*`, `image_encoder*` | Requires the native encoder class to declare support for the detected format. MiniMax-H3 FP8 and model-managed integrations such as Ideogram are supported; unknown combinations fail closed. |
+| `text_encoder*`, `image_encoder*` | Passes detected metadata to the registered native encoder. Loading continues only when that implementation constructs compatible quantized layers; unknown or incompatible combinations fail closed. |
 | `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
 | Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
 | Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
@@ -164,6 +165,14 @@ backend.
       <td>MiniMax-H3 pruned FL2VA / Ref2VA DiTs</td>
       <td>None</td>
       <td>CUDA; auto-detected; TP, sequence parallelism, and component/layerwise offload are supported, while FSDP is not. Checkpoint-marked <code>fc2</code> layers retain FP8 storage and use compute-dtype matmul.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-int8-convrot</code></td>
+      <td>One selected safetensors file with per-layer <code>int8_tensorwise</code> and ConvRot metadata</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 native DiT; pruned FL2VA is E2E-verified and Ref2VA has the same validated tensor contract</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary; the H3 256-group checkpoint supports TP1/2/4, not TP8. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -334,7 +343,14 @@ sglang generate \
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
-### Kitchen INT8 Online Quantization
+### Kitchen INT8
+
+Serialized Comfy ConvRot INT8 DiTs are selected through
+`--transformer-weights-path` and auto-detected from their per-layer markers.
+They load INT8 weights and row scales directly; omit `--quantization`.
+
+For a BF16 checkpoint, `--quantization kitchen_int8` instead performs online
+quantization after loading:
 
 `kitchen_int8` quantizes DiT linear weights online from the stock BF16
 checkpoint. Forward uses the fused `comfy_kitchen.int8_linear` op (rotation,
@@ -401,27 +417,6 @@ sglang generate \
 ```
 
 Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantized if its prefix contains any of the given patterns.
-
-## MiniMax-H3 Text Encoder FP8
-
-MiniMax-H3 can load a serialized FP8 checkpoint for the language linear layers
-in its native Qwen3-VL text encoder independently of the DiT. Embeddings,
-normalization layers, and the Qwen vision tower remain in BF16.
-
-```bash Command
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
-  --num-gpus 4 \
-  --port 30010
-```
-
-`--text-encoder-path` is accepted as a shorter alias. No quantization flag is
-needed: SGLang detects the checkpoint metadata and only enables formats that
-the native encoder explicitly supports. Text-encoder FP8 is approximate, is
-not enabled by default, and is rejected by MiniMax-H3's strict
-`quality="high"` deployment contract.
 
 ## Transformers Component BnB4
 

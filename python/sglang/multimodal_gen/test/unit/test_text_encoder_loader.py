@@ -16,12 +16,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
     TextEncoderLoader,
     _configure_encoder_quantization,
     _process_quantized_encoder_weights,
+    _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import (
-    CheckpointQuantizationCapability,
-    TextEncoder,
-)
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -182,26 +180,48 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.addCleanup(self.quant_config_patcher.stop)
         self.serialized = serialized
 
-    def test_serialized_fp8_checkpoint_configures_h3_encoder(self):
+    def test_serialized_checkpoint_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         _configure_encoder_quantization(
             model_config,
-            MiniMaxH3Qwen3VLEncoder,
+            TextEncoder,
             {},
+            "/model/text_encoder",
             "/model/text_encoder",
             "text_encoder",
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
-    def test_encoder_class_must_opt_in(self):
+    def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
-        with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "does not support"
-        ):
+        self.get_quant_config.return_value = None
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+            return_value=self.serialized,
+        ) as get_file_quant_config:
             _configure_encoder_quantization(
                 model_config,
                 TextEncoder,
                 {},
+                "/model/text_encoder",
+                "/weights/encoder.safetensors",
+                "text_encoder",
+            )
+
+        self.assertIs(model_config.quant_config, self.serialized)
+        get_file_quant_config.assert_called_once_with("/weights/encoder.safetensors")
+
+    def test_encoder_must_use_native_loader(self):
+        model_config = SimpleNamespace(quant_config=None)
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "requires an in-tree native encoder"
+        ):
+            _configure_encoder_quantization(
+                model_config,
+                nn.Module,
+                {},
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -227,6 +247,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     SimpleNamespace(architectures=[architecture], quant_config=None),
                     component_config,
                     "/model/text_encoder",
+                    "/model/text_encoder",
                     "text_encoder",
                 )
         self.get_quant_config.assert_not_called()
@@ -245,6 +266,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "quant_method": "bitsandbytes",
                     }
                 },
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -266,27 +288,6 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     }
                 },
                 "/model/text_encoder",
-                "text_encoder",
-            )
-
-    def test_srt_backend_is_not_admitted_without_an_adapter(self):
-        model_config = SimpleNamespace(quant_config=None)
-        capability = CheckpointQuantizationCapability(
-            backend="srt",
-            methods=frozenset({"fp8"}),
-        )
-        with mock.patch.object(
-            MiniMaxH3Qwen3VLEncoder,
-            "checkpoint_quantization_capability",
-            capability,
-        ), self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError,
-            "'srt'.*only the 'diffusion' backend",
-        ):
-            _configure_encoder_quantization(
-                model_config,
-                MiniMaxH3Qwen3VLEncoder,
-                {},
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -307,6 +308,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "quant_method": "bitsandbytes",
                     }
                 },
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -341,6 +343,13 @@ class _QuantizedEncoder(nn.Module):
 
 
 class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
+    def test_rejects_native_encoder_without_quantized_layers(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "does not construct quantized linear layers",
+        ):
+            _require_quantized_encoder_layers(nn.Linear(2, 2), "text_encoder")
+
     def test_processes_quantized_layers_without_moving_the_model(self):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)

@@ -1504,6 +1504,16 @@ export const Deployment = ({ config, benchmarks }) => {
             ring_degree: resourcesFollowPlatformDefault
               ? (nextRecipe?.ring_degree ?? 1)
               : next.ring_degree,
+            // Placement and encoder are per-hardware recipe facts just like
+            // the resource shape: keeping the previous card's picks produces
+            // a command the new card cannot run (e.g. a resident 61.7 GB DiT
+            // on a single consumer GPU) shown as "unverified".
+            placement: resourcesFollowPlatformDefault
+              ? (nextRecipe?.placement || "auto")
+              : next.placement,
+            encoder: resourcesFollowPlatformDefault
+              ? (nextRecipe?.encoder || "auto")
+              : next.encoder,
           };
         }
         return reseatHiddenPicks(normalizeBuilderSelection(next));
@@ -1829,7 +1839,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>Verified recipe · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -1841,10 +1851,10 @@ export const Deployment = ({ config, benchmarks }) => {
               </strong>
             </div>
             <div>
-              {renderStatus("verified")}
+              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use verified recipe</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
             </div>
           </section>
         )}
