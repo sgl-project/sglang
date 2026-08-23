@@ -15,8 +15,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
+    STAGES_HEADER,
     TIMING_HEADER,
     RequestStamps,
+    stages_header,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
@@ -358,8 +360,12 @@ async def rollout_generate(request: RolloutRequest):
         content = msgspec.msgpack.encode(payload)
 
     # Timing rides a header: the last marks postdate the encoded body.
+    headers = {TIMING_HEADER: stamps.to_header()}
+    stages = stages_header(output_batch.metrics)
+    if stages:
+        headers[STAGES_HEADER] = stages
     return Response(
         content=content,
         media_type="application/msgpack",
-        headers={TIMING_HEADER: stamps.to_header()},
+        headers=headers,
     )

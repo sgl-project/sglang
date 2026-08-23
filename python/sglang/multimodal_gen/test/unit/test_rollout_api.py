@@ -1,9 +1,10 @@
 """Unit tests for the rollout generate API (serialization, io_struct, rollout_api).
 
-Request timing model (TestRequestStamps):
+Request timing model (TestRequestStamps / TestStagesHeader):
 
     srv_recv .. forward .. build .. dump .. msgpack   (absolute wall-clock marks)
     -> all marks ride the x-sgld-timing response header
+    stages_header: engine per-stage milliseconds -> x-sgld-stages header
 """
 
 import json
@@ -16,6 +17,7 @@ import torch
 from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
     MARKS,
     RequestStamps,
+    stages_header,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
@@ -470,6 +472,24 @@ class TestRequestStamps(unittest.TestCase):
     def test_unknown_mark_is_rejected(self):
         with self.assertRaises(AssertionError):
             RequestStamps().mark("no_such_mark")
+
+
+class TestStagesHeader(unittest.TestCase):
+    """The engine's own stage breakdown is the only view inside the forward the
+    client waits on, so it has to survive the trip and stay absent when unset."""
+
+    def test_stages_are_reported_in_milliseconds(self):
+        metrics = types.SimpleNamespace(
+            stages={"decoding": 8123.4567, "text_encoding": 91.2}
+        )
+        self.assertEqual(
+            json.loads(stages_header(metrics)),
+            {"decoding": 8123.457, "text_encoding": 91.2},
+        )
+
+    def test_no_metrics_or_no_stages_yields_no_header(self):
+        self.assertEqual(stages_header(None), "")
+        self.assertEqual(stages_header(types.SimpleNamespace(stages={})), "")
 
 
 if __name__ == "__main__":

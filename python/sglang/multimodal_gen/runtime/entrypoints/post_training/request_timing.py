@@ -12,10 +12,13 @@ import json
 import time
 from contextlib import contextmanager
 
-# Compact JSON rides under the header, e.g.
+# Compact JSON rides under each header, e.g.
 #   x-sgld-timing: {"srv_recv":1787472609.104512,...,"msgpack_end":1787472691.63172,"request_id":"abc123"}
 #     mark name -> epoch seconds (6 dp), plus this request's id
+#   x-sgld-stages: {"TextEncodingStage":91.2,"DenoisingStage":448512.301,"DecodingStage":8123.457}
+#     pipeline stage class -> milliseconds (3 dp)
 TIMING_HEADER = "x-sgld-timing"
+STAGES_HEADER = "x-sgld-stages"
 
 MARKS = (
     "srv_recv",
@@ -64,3 +67,17 @@ class RequestStamps:
             payload["request_id"] = self.request_id
         return json.dumps(payload, separators=(",", ":"))
 
+
+def stages_header(metrics) -> str:
+    """The per-stage milliseconds the engine already recorded, verbatim.
+
+    The client sees the whole forward as one number, so without these it cannot
+    tell a slow denoise from a slow VAE decode. Only stage totals travel, never
+    the per-step list, which would grow the header with the step count.
+    """
+    if metrics is None or not metrics.stages:
+        return ""
+    return json.dumps(
+        {name: round(ms, 3) for name, ms in metrics.stages.items()},
+        separators=(",", ":"),
+    )
