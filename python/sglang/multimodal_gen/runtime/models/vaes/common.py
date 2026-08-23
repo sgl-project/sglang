@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -369,7 +370,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
         )
-        dist.all_gather_into_tensor(gathered_results, padded_results)
+        all_gather_single(gathered_results, padded_results)
         dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
         gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
 
@@ -510,7 +511,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             device=padded_results.device,
             dtype=padded_results.dtype,
         )
-        dist.all_gather_into_tensor(gathered_results, padded_results)
+        all_gather_single(gathered_results, padded_results)
 
         dec = z.new_empty(
             (
