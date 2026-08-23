@@ -41,6 +41,7 @@ Input images required for image-guided models:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -98,6 +99,16 @@ QUALITY_BCG_ABBA_MATRIX = (
     ("bcg-high-b", "high", True),
     ("eager-high-b", "high", False),
 )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 CATALOG_TABLE_WIDTH = 140
 RESULTS_TABLE_WIDTH = 124
 MODEL_CACHE_MARKER = ".sglang-diffusion-benchmark-cache"
@@ -175,6 +186,9 @@ LINGBOT_VIDEO_PROMPT = json.dumps(
     },
     separators=(",", ":"),
 )
+LINGBOT_WORLD_CONFIG_OVERRIDES = {
+    "actions": [["w"] for _ in range(9)],
+}
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -321,6 +335,22 @@ MODELS = {
             "--tp-size=2",
         ],
     },
+    # Explicit throughput comparator. CFG parallelism changes sampling numerics,
+    # so compare its output against the TP=2 preset before using the speedup.
+    "cosmos3-super-t2v-cfg2tp2": {
+        "path": "nvidia/Cosmos3-Super",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--num-gpus=4",
+            "--tp-size=2",
+        ],
+    },
     # 11. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
@@ -406,6 +436,42 @@ MODELS = {
             "--performance-mode=manual",
         ],
     },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "sana-wm-bidirectional": {
+        "path": "Efficient-Large-Model/SANA-WM_bidirectional",
+        "prompt": "a camera moving forward and turning left",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "extra_args": [
+            "--pipeline-class-name=SanaWMTwoStagePipeline",
+            "--width=1280",
+            "--height=704",
+            "--num-frames=49",
+            "--fps=16",
+            "--num-inference-steps=20",
+            "--guidance-scale=4.5",
+            "--action=w-16,wl-16,l-16",
+            "--performance-mode=manual",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "sana-wm-streaming": {
+        "path": "Efficient-Large-Model/SANA-WM_streaming",
+        "prompt": "a camera moving forward and turning left",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "extra_args": [
+            "--pipeline-class-name=SanaWMTwoStagePipeline",
+            "--streaming",
+            "--refiner-chunked",
+            "--width=1280",
+            "--height=704",
+            "--num-frames=49",
+            "--fps=16",
+            "--action=w-16,wl-16,l-16",
+            "--performance-mode=manual",
+        ],
+    },
     "lingbot-video-moe": {
         "path": "robbyant/lingbot-video-moe-30b-a3b",
         "prompt": LINGBOT_VIDEO_PROMPT,
@@ -418,6 +484,42 @@ MODELS = {
             "--num-inference-steps=12",
             "--text-encoder-cpu-offload",
             "--performance-mode=manual",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "lingbot-world": {
+        "path": "robbyant/lingbot-world-fast-diffusers",
+        "prompt": "A slow aerial orbit around a pastel island hotel in the ocean.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "config_overrides": LINGBOT_WORLD_CONFIG_OVERRIDES,
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=9",
+            "--fps=16",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+            "--text-encoder-cpu-offload",
+            "--warmup-mode=off",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "lingbot-world-v2": {
+        "path": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        "prompt": "A slow aerial orbit around a pastel island hotel in the ocean.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "config_overrides": LINGBOT_WORLD_CONFIG_OVERRIDES,
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=9",
+            "--fps=16",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+            "--text-encoder-cpu-offload",
+            "--warmup-mode=off",
         ],
     },
     "fastwan21-t2v-1.3b": {
@@ -719,6 +821,27 @@ MODELS = {
             "--performance-mode=manual",
         ],
     },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "cosmos3-super-i2v": {
+        "path": "nvidia/Cosmos3-Super-Image2Video",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--fps=24",
+            "--num-inference-steps=35",
+            "--guidance-scale=6.0",
+            "--flow-shift=10.0",
+            "--num-gpus=2",
+            "--tp-size=2",
+        ],
+    },
     "cosmos3-super-t2i-distilled": {
         "path": "nvidia/Cosmos3-Super-Text2Image-4Step",
         "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
@@ -881,6 +1004,19 @@ MODELS = {
             "--width=1280",
             "--height=720",
             "--num-frames=81",
+        ],
+    },
+    # Blackwell-only ModelOpt NVFP4 comparator.
+    "wan22-t2v-nvfp4": {
+        "path": "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--performance-mode=manual",
+            "--dit-layerwise-offload=false",
+            "--dit-cpu-offload=false",
         ],
     },
     "ltx23-hq-two-stage": {
@@ -1665,6 +1801,7 @@ def _run_benchmark_once_impl(
         "bcg_capture_detected": bcg_capture_detected,
         "elapsed_s": elapsed,
         "output_artifacts": [str(path) for path in output_artifacts],
+        "output_sha256": [_sha256_file(path) for path in output_artifacts],
         "error": False,
     }
     if perf_path.exists():
@@ -1723,6 +1860,44 @@ def _run_benchmark_once_impl(
             print(f"  Warning: could not parse perf dump: {e}")
 
     return metrics
+
+
+def _validate_quality_bcg_output_hashes(results: list[dict]) -> None:
+    """Reject BCG rows whose generated artifacts differ from eager."""
+    for quality in BENCHMARK_QUALITY_LEVELS:
+        quality_results = [
+            result for result in results if result.get("quality") == quality
+        ]
+        eager_results = [
+            result
+            for result in quality_results
+            if not result.get("breakable_cuda_graph") and not result.get("error")
+        ]
+        eager_hashes = [
+            tuple(result.get("output_sha256", ())) for result in eager_results
+        ]
+        if not eager_hashes or any(not hashes for hashes in eager_hashes):
+            continue
+
+        reference_hashes = eager_hashes[0]
+        if any(hashes != reference_hashes for hashes in eager_hashes[1:]):
+            reason = f"eager {quality} output hashes are unstable"
+            for result in quality_results:
+                result["error"] = True
+                result["output_hash_error"] = reason
+            print(f"  ERROR: {reason}; do not use this matrix as BCG evidence.")
+            continue
+
+        for result in quality_results:
+            if not result.get("breakable_cuda_graph") or result.get("error"):
+                continue
+            output_hashes = tuple(result.get("output_sha256", ()))
+            if not output_hashes or output_hashes == reference_hashes:
+                continue
+            reason = f"BCG {quality} output hash differs from eager"
+            result["error"] = True
+            result["output_hash_error"] = reason
+            print(f"  ERROR: {reason}; do not report this row as BCG performance.")
 
 
 def run_benchmark_once(
@@ -1825,6 +2000,7 @@ def run_quality_bcg_matrix(
                 cuda_visible_devices=cuda_visible_devices,
             )
             results.append(result)
+        _validate_quality_bcg_output_hashes(results)
         exit_reason = (
             "error" if any(result.get("error") for result in results) else "success"
         )

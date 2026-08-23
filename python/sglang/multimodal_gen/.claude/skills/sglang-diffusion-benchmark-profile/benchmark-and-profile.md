@@ -160,8 +160,10 @@ Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
 holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
 whether the combination is actually supported; do not average them when the
 runtime rejects the combination or the helper detects a late quality-fusion
-mount. Cleanup occurs only after all eight runs, including on failure or
-interruption:
+mount. The helper also hashes every generated artifact, first requires the two
+Eager rows at each quality to agree, then rejects any BCG row whose hash differs
+from that Eager reference. Cleanup occurs only after all eight runs, including
+on failure or interruption:
 
 ```bash
 MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
@@ -287,11 +289,16 @@ Use the preset categories this way:
 | `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, `--cfg-parallel-size 2`, 768x512, 121 frames, seed 42 |
 | `ideogram4-fp8` | `ideogram-ai/ideogram-4-fp8` | Yes: `ideogram4_fp8_t2i_2gpu` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, FlashAttention backend; sampling preset owns steps/guidance |
 | `cosmos3-super-t2v` | `nvidia/Cosmos3-Super` | Yes: `cosmos3_super_t2v_2gpu` | Prompt, 1280x720, 81 frames, seed 42, 2 GPUs, TP size 2, guardrails disabled for benchmark isolation |
+| `cosmos3-super-t2v-cfg2tp2` | `nvidia/Cosmos3-Super` | No | Explicit four-GPU TP2 x CFG2 throughput comparator. On H200 it was 48.00% faster end to end than TP2, but the topology changed the deterministic output (SSIM 0.914244, PSNR 29.469771 dB), so do not treat it as lossless-equivalent or select it automatically. |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
 | `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
 | `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
 | `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
+| `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
+| `lingbot-world` | `robbyant/lingbot-world-fast-diffusers` | No | One-H200 offline single-chunk profile for the registered causal DMD path: 832x480x9, four steps, guidance 1.0, the shared image fixture, and forward-camera actions for all nine frames. Keep stateful websocket latency as a separate metric. |
+| `lingbot-world-v2` | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | No | Matching controlled single-chunk profile for the separately registered v2 checkpoint. The fixed shape, action program, and schedule make v1/v2 hotspot comparisons reproducible without presenting one-chunk e2e as stateful realtime latency. |
 | `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/high comparisons do not measure an offload-policy change. |
 | `wan21-t2v-1.3b` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU 832x480, 81-frame Wan2.1 baseline at 50 steps and guidance 3.0. Keep it separate from FastWan and TurboWan because the longer schedule changes the end-to-end weight of VAE optimizations. |
 | `wan21-t2v-14b` | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | No | Cookbook-aligned four-GPU CFG/Ulysses baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Text encoding stays CPU-offloaded as in the documented deployment command. |
@@ -315,6 +322,7 @@ Use the preset categories this way:
 | `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
 | `cosmos3-edge-t2v` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2V baseline at Edge's native 832x480 video shape, 81 frames, 35 steps, and guidance 5.0. |
 | `cosmos3-edge-i2v` | `nvidia/Cosmos3-Edge` | No | Matching one-GPU I2V baseline with the shared cat fixture; keep it separate because image conditioning adds the VAE encode and latent-mask paths. |
+| `cosmos3-super-i2v` | `nvidia/Cosmos3-Super-Image2Video` | No | Registered specialized I2V checkpoint with the shared cat fixture; 1280x720, 81 frames, 35 steps, guidance 6.0, flow shift 10.0, seed 42, 2 GPUs, TP size 2, and guardrails disabled for benchmark isolation. |
 | `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
 | `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
 | `ltx25-diffusion-decoder` | `Lightricks/LTX-2.5-Diffusers` | No | Same fixed DiT workload with `--use-diffusion-decoder`; attribute decoder time separately and confirm NATTEN `na3d` is active. |
@@ -330,6 +338,7 @@ Use the preset categories this way:
 | `glm-image` | `zai-org/GLM-Image` | No | Current-source extra for GLM-Image |
 | `sana-1.5-1.6b` | `Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers` | No | Current-source extra for a SANA native image path |
 | `fastwan22-ti2v-5b` | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | No | Current-source extra matching the FastWan2.2 TI2V registered path |
+| `wan22-t2v-nvfp4` | `nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4` | No | Blackwell-only one-GPU ModelOpt NVFP4 T2V baseline at 832x480 and 81 frames. Manual mode keeps the DiT resident so the trace measures FP4 kernels instead of layerwise transfer. |
 | `ltx23-hq-two-stage` | `Lightricks/LTX-2.3` | No | Current-source extra for `LTX2TwoStageHQPipeline` with `--ltx2-two-stage-device-mode=original`; high-resolution and VRAM-heavy |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |

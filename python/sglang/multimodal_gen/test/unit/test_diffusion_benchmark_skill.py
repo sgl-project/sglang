@@ -88,8 +88,13 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             expected = {
                 "longcat-image",
                 "sana-video",
+                "sana-wm-bidirectional",
+                "sana-wm-streaming",
                 "lingbot-video-moe",
+                "lingbot-world",
+                "lingbot-world-v2",
                 "fastwan21-t2v-1.3b",
+                "wan22-t2v-nvfp4",
                 "krea2-turbo",
                 "krea2-raw",
                 "ideogram4-fast",
@@ -102,6 +107,8 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "helios-distilled",
                 "joy-echo",
                 "cosmos3-edge-t2i",
+                "cosmos3-super-t2v-cfg2tp2",
+                "cosmos3-super-i2v",
                 "cosmos3-super-t2i-distilled",
                 "ltx25",
                 "ltx25-diffusion-decoder",
@@ -124,9 +131,65 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertIn("--num-inference-steps=3", fastwan_cmd)
             self.assertIn("--dit-layerwise-offload=false", fastwan_cmd)
 
+            wan_nvfp4_cmd = module.build_sglang_cmd("wan22-t2v-nvfp4")
+            self.assertIn(
+                "--model-path=nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+                wan_nvfp4_cmd,
+            )
+            self.assertIn("--num-frames=81", wan_nvfp4_cmd)
+            self.assertIn("--dit-layerwise-offload=false", wan_nvfp4_cmd)
+            self.assertEqual(module.required_gpus_for_model("wan22-t2v-nvfp4"), 1)
+
             krea_raw_cmd = module.build_sglang_cmd("krea2-raw")
             self.assertIn("--num-inference-steps=50", krea_raw_cmd)
             self.assertIn("--guidance-scale=4.5", krea_raw_cmd)
+
+            cosmos_i2v_cmd = module.build_sglang_cmd("cosmos3-super-i2v")
+            self.assertIn(
+                "--model-path=nvidia/Cosmos3-Super-Image2Video", cosmos_i2v_cmd
+            )
+            self.assertIn("--num-gpus=2", cosmos_i2v_cmd)
+            self.assertIn("--tp-size=2", cosmos_i2v_cmd)
+            self.assertIn("--num-frames=81", cosmos_i2v_cmd)
+
+            cosmos_cfg_cmd = module.build_sglang_cmd("cosmos3-super-t2v-cfg2tp2")
+            self.assertIn("--model-path=nvidia/Cosmos3-Super", cosmos_cfg_cmd)
+            self.assertIn("--num-gpus=4", cosmos_cfg_cmd)
+            self.assertIn("--tp-size=2", cosmos_cfg_cmd)
+
+            sana_wm_dense_cmd = module.build_sglang_cmd("sana-wm-bidirectional")
+            self.assertIn(
+                "--model-path=Efficient-Large-Model/SANA-WM_bidirectional",
+                sana_wm_dense_cmd,
+            )
+            self.assertIn("--num-inference-steps=20", sana_wm_dense_cmd)
+            self.assertNotIn("--streaming", sana_wm_dense_cmd)
+
+            sana_wm_streaming_cmd = module.build_sglang_cmd("sana-wm-streaming")
+            self.assertIn("--streaming", sana_wm_streaming_cmd)
+            self.assertIn("--refiner-chunked", sana_wm_streaming_cmd)
+            self.assertIn("--action=w-16,wl-16,l-16", sana_wm_streaming_cmd)
+
+            lingbot_world_cmd = module.build_sglang_cmd("lingbot-world")
+            self.assertIn(
+                "--model-path=robbyant/lingbot-world-fast-diffusers",
+                lingbot_world_cmd,
+            )
+            self.assertIn("--num-frames=9", lingbot_world_cmd)
+            self.assertIn("--warmup-mode=off", lingbot_world_cmd)
+            self.assertIn("--config=", " ".join(lingbot_world_cmd))
+            self.assertEqual(
+                module.MODELS["lingbot-world"]["config_overrides"]["actions"],
+                [["w"] for _ in range(9)],
+            )
+
+            lingbot_world_v2_cmd = module.build_sglang_cmd("lingbot-world-v2")
+            self.assertIn(
+                "--model-path=robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+                lingbot_world_v2_cmd,
+            )
+            self.assertIn("--num-frames=9", lingbot_world_v2_cmd)
+            self.assertIn("--num-inference-steps=4", lingbot_world_v2_cmd)
 
             ideogram_cmd = module.build_sglang_cmd("ideogram4-instant")
             self.assertFalse(
@@ -395,6 +458,33 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertEqual(ledger["exit_reason"], "success")
             self.assertEqual(ledger["before"]["weight_file_count"], 1)
             self.assertEqual(ledger["after"]["weight_file_count"], 0)
+
+    def test_quality_bcg_matrix_rejects_output_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module = _load_benchmark_module(Path(tmpdir))
+            results = [
+                {
+                    "quality": "lossless",
+                    "breakable_cuda_graph": False,
+                    "output_sha256": ["eager"],
+                    "error": False,
+                },
+                {
+                    "quality": "lossless",
+                    "breakable_cuda_graph": True,
+                    "output_sha256": ["bcg"],
+                    "error": False,
+                },
+            ]
+
+            module._validate_quality_bcg_output_hashes(results)
+
+            self.assertFalse(results[0]["error"])
+            self.assertTrue(results[1]["error"])
+            self.assertEqual(
+                results[1]["output_hash_error"],
+                "BCG lossless output hash differs from eager",
+            )
 
 
 if __name__ == "__main__":
