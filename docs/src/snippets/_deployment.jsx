@@ -9,7 +9,7 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd.
+//                      vendor picks the selector group: blackwell | hopper | amd | npu.
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -135,7 +135,7 @@ export const Deployment = ({ config, benchmarks }) => {
     ],
     // Atlas 800I A3 (910C): 1 card = 2 dies, so --tp-size is 2× the card
     // count (32 cards -> --tp-size 64).
-    ascend: [
+    npu: [
       { id: "a3", label: "Atlas 800I A3", vram: "64GB/die" },
     ],
   };
@@ -805,9 +805,9 @@ export const Deployment = ({ config, benchmarks }) => {
             "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
             "  --shm-size 32g",
           ]
-        : vendorOf(sel.hw) === "ascend"
+        : vendorOf(sel.hw) === "npu"
         ? [
-            // Ascend NPU: --privileged grants the davinci devices (16 dies on an
+            // NPU: --privileged grants the davinci devices (16 dies on an
             // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
             // must be mounted in.
             "docker run --privileged --shm-size=16g",
@@ -835,8 +835,8 @@ export const Deployment = ({ config, benchmarks }) => {
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
-        // Ascend's device block already mounts ~/.cache/.
-        ...(vendorOf(sel.hw) === "ascend"
+        // The NPU device block already mounts ~/.cache/.
+        ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.

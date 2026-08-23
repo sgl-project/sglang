@@ -298,7 +298,7 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Kimi-K3-DSpark",
             "--speculative-dspark-block-size 7",
-            // The NPU recipe adds the Ascend draft path's own knobs (draft
+            // The NPU recipe adds the NPU draft path's own knobs (draft
             // attention backend, topk 1, unquantized draft weights) on top of
             // the common trio.
             ...(s.hw === "a3"
@@ -605,10 +605,10 @@ export const config = {
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
             requiresHw: ["b200", "b300", "gb200", "gb300"],
             disable: [{ when: { hw: ["a3"] },
-              reason: "FlashInfer is a CUDA kernel and is not supported on Ascend." }] },
+              reason: "FlashInfer is a CUDA kernel and is not supported on NPU." }] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"],
             disable: [{ when: { hw: ["a3"] },
-              reason: "Marlin is a CUDA kernel and is not supported on Ascend." }] },
+              reason: "Marlin is a CUDA kernel and is not supported on NPU." }] },
         ],
       },
       // MegaMoE quantization sub-select — shown only when backend === "megamoe".
@@ -2401,7 +2401,7 @@ export const config = {
     ],
     a3: [
       "Run the same command on all four nodes with --node-rank 0/1/2/3.",
-      "Ascend collectives use HCCL. Pin the cross-node NIC on EVERY node:",
+      "NPU collectives use HCCL. Pin the cross-node NIC on EVERY node:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
       "  HCCL_SOCKET_IFNAME=<your-nic>   # HCCL transport interface",
       "  SGLANG_HOST_IP=<this-node-ip>   # this node's IP on that NIC",
