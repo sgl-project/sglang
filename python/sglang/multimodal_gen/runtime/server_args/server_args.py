@@ -77,6 +77,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -146,7 +149,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -159,6 +164,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-ai/ideogram-4-nf4",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "meituan-longcat/longcat-image",
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
@@ -181,9 +187,11 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
+        "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -296,6 +304,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Exact weight-file overrides retain the base component configuration.
+    component_weights_paths: dict[str, str] = field(default_factory=dict)
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -308,12 +318,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
-    # Per-component transformer weight overrides (key = model_index.json component name).
-    # Pipelines use this when a checkpoint ships separate quantized weights for
-    # secondary DiT components; the generic loader consumes it without model-specific
-    # filename logic.
-    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
-
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -642,8 +646,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -1693,6 +1698,30 @@ class ServerArgs(DisaggServerArgsMixin):
         # configure logger before use
         configure_logger(server_args=self)
 
+        component_paths: dict[str, str] = {}
+        component_weights_paths = dict(self.component_weights_paths)
+        for component, path in self.component_paths.items():
+            supports_weight_file_override = (
+                is_dit_component_name(component)
+                or is_text_encoder_component_name(component)
+                or is_image_encoder_component_name(component)
+            )
+            if (
+                not supports_weight_file_override
+                or not is_explicit_weight_file_reference(path)
+            ):
+                component_paths[component] = path
+                continue
+            existing = component_weights_paths.get(component)
+            if existing is not None and existing != path:
+                raise ValueError(
+                    f"Conflicting weight overrides for component {component!r}: "
+                    f"{existing!r} and {path!r}"
+                )
+            component_weights_paths[component] = path
+        self.component_paths = component_paths
+        self.component_weights_paths = component_weights_paths
+
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
@@ -1820,10 +1849,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
