@@ -24,6 +24,7 @@ from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
+    LoRAAdaptor,
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
@@ -76,6 +77,32 @@ class TestLoRATP(CustomTestCase):
         self._run_tp_on_model_cases(
             CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
         )
+
+    def test_lora_overlap_loading_single_lora_tp2(self):
+        """TP=2 single LoRA pipelined loading with max 1 LoRA in GPU."""
+        model_case = LoRAModelCase(
+            base="meta-llama/Llama-3.1-8B-Instruct",
+            adaptors=[
+                LoRAAdaptor(
+                    name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+                )
+            ],
+            tp_size=2,
+            max_loras_per_batch=1,
+            max_loaded_loras=1,
+        )
+        for torch_dtype in TORCH_DTYPES:
+            run_lora_test_one_by_one(
+                [DEFAULT_PROMPTS[0]],
+                model_case,
+                torch_dtype,
+                max_new_tokens=32,
+                enable_lora_overlap_loading=True,
+                disable_cuda_graph=True,
+                disable_radix_cache=True,
+                test_tag="overlap_tp2_single_lora_max1",
+                attention_backend="fa3",
+            )
 
     def test_all_lora_models(self):
         if is_in_ci():
