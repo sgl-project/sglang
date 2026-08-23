@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -19,7 +20,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -82,6 +89,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
+        draft_worker_cls: type[TpModelWorker] = TpModelWorker,
     ):
         super().__init__()
 
@@ -96,14 +104,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
-            server_args.enable_dp_attention and not self._draft_is_moe
+            get_parallel().enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
         ):
@@ -124,6 +132,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                draft_worker_cls=draft_worker_cls,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -182,13 +191,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
                 lm_head=lm_head,
             )
 
@@ -202,7 +213,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
@@ -228,7 +239,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
         if (
@@ -813,7 +824,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval

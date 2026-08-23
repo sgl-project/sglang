@@ -39,6 +39,7 @@ SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
 SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
+SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES = 25
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
 
@@ -245,7 +246,15 @@ def _resolve_warmup_num_frames(
     ):
         warmup_num_frames = num_frames
     else:
-        warmup_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+        # Multi-GPU LTX two-stage aligns a one-second request to 25 frames;
+        # cover its latent shape during warmup
+        frame_budget = (
+            SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES
+            if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            and server_args.num_gpus > 1
+            else SERVER_WARMUP_MAX_VIDEO_FRAMES
+        )
+        warmup_num_frames = min(num_frames, frame_budget)
 
     return server_args.pipeline_config.adjust_num_frames(warmup_num_frames)
 

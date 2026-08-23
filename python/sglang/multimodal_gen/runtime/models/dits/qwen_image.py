@@ -14,8 +14,8 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
@@ -641,7 +641,8 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
-        # Scaled dot product attention
+        # Despite the historical class name, this is joint text-image
+        # self-attention: Q/K/V are concatenated before the kernel call.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self.head_dim,
@@ -842,7 +843,7 @@ class QwenImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
