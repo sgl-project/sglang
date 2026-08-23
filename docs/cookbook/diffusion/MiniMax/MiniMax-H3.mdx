@@ -310,6 +310,8 @@ compute capability 10.0 or newer. Pass a pruned FL2VA / Ref2VA file such as
 `Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/MiniMax_H3_FL2VA_pruned_nvfp4.safetensors`
 to `--transformer-weights-path` and omit `--quantization`. SGLang infers the
 packed group size and Comfy scale layout from the checkpoint; FSDP is rejected.
+Mixed files may mark selected linears as `int8_tensorwise`; SGLang dispatches
+those layers to the serialized Kitchen INT8 ConvRot path automatically.
 
 ### Advanced: precomputed AdaLN cache
 
