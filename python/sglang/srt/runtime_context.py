@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import os
 import sys
@@ -56,6 +57,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -1304,7 +1307,18 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    discarded = _CONTEXT.overrides_log()
     _CONTEXT.set_server_args(server_args)
+    if discarded:
+        logger.warning(
+            "publish(role=%s) re-projected the config bags and dropped %d "
+            "override(s) taken since the last publish: %s",
+            role,
+            len(discarded),
+            ", ".join(
+                f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
+            ),
+        )
     _CONTEXT._publish_role = role
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
@@ -1318,6 +1332,31 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def ensure_published(server_args, *, role: str) -> RuntimeContext:
+    """Publish unless this exact record is already published under this role.
+
+    Three constructors publish defensively, because each can be built with
+    nothing published before it -- `ModelRunner` (a benchmark harness, the
+    manual runner tests), `TokenizerManager`, and `MMEncoder` (spawned encoder
+    workers). Inside a process that already published the same record,
+    publishing again re-projects the bags: every `override()` taken between the
+    two calls is discarded, and the provenance log with it.
+
+    No override sits in one of those windows today, so this removes a hazard
+    rather than a live bug. It is worth removing anyway: the drop is silent, it
+    depends on where a constructor happens to sit relative to the overrides
+    around it, and `publish` now says what a re-projection discarded so the
+    next one is loud.
+
+    So these callers ask for the end state -- this record, this role, published
+    -- and get a no-op when that already holds. An engine rebuild still calls
+    `publish` directly, because there the reset is the point.
+    """
+    if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
+        return _CONTEXT
+    return publish(server_args, role=role)
 
 
 def publish_role() -> str | None:
