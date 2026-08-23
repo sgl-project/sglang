@@ -495,6 +495,8 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        self._envelope_layout = envelope_layout
+        self._envelope_entry_bytes = 0
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -525,6 +527,7 @@ class MambaPool:
                     temporal_state_shape=temporal_state_shape,
                     temporal_dtype=ssm_dtype,
                 )
+                self._envelope_entry_bytes = entry_bytes
                 self._raw = torch.zeros(
                     max_slots * entry_bytes, dtype=torch.uint8, device=device
                 )
@@ -1062,6 +1065,13 @@ class MambaPool:
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
+        if self._envelope_layout:
+            return (
+                [self._raw.data_ptr()],
+                [self._raw.nbytes],
+                [self._envelope_entry_bytes],
+            )
+
         data_ptrs, data_lens, item_lens = [], [], []
 
         for _, state_tensor, _ in self._iter_transfer_state_tensors():
@@ -1080,6 +1090,9 @@ class MambaPool:
         The slice axis is tensor-specific: normally the first per-slot axis,
         while Kimi conv state uses the second per-slot axis.
         """
+        if self._envelope_layout:
+            return []
+
         dim_per_tensor = []
         for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
@@ -1097,11 +1110,17 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
+        if self._envelope_layout:
+            return []
+
         state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
         return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
+        if self._envelope_layout:
+            return []
+
         outer_counts = []
         for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
@@ -1119,6 +1138,9 @@ class MambaPool:
         (single head-sharded axis) and whenever no descriptor is available, so
         those tensors keep the single contiguous slice.
         """
+        if self._envelope_layout:
+            return []
+
         subdims_per_tensor = []
         for field, _, _ in self._iter_transfer_state_tensors():
             # Only conv_state carries a q/k/v decomposition.

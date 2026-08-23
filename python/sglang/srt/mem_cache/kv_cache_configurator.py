@@ -737,7 +737,10 @@ class KVCacheConfigurator:
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
-            mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
+            mamba_envelope_layout=(
+                get_memory().enable_page_major_kv_layout
+                or get_memory().enable_mamba_page_major_layout
+            ),
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
             # fold); activate the pool machinery only for those, so any other
             # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
@@ -823,7 +826,10 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
-            mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
+            mamba_envelope_layout=(
+                get_memory().enable_page_major_kv_layout
+                or get_memory().enable_mamba_page_major_layout
+            ),
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
             # fold); activate the pool machinery only for those, so any other
             # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
