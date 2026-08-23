@@ -447,7 +447,16 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            json.dump(
+                {
+                    "model_path": "/from/config",
+                    "num_gpus": 2,
+                    "component_weights_paths": {
+                        "transformer": "owner/repo/transformer.safetensors"
+                    },
+                },
+                config_file,
+            )
             config_file.flush()
             parser = FlexibleArgumentParser()
             add_multimodal_gen_serve_args(parser)
@@ -458,6 +467,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "/from/cli",
                 "--vae-path",
                 "/custom/vae",
+                "--component-weights-paths.text_encoder",
+                "owner/repo/text_encoder.safetensors",
+                "--image-encoder-weights-path=/custom/image_encoder.safetensors",
                 "--component-attention-backends.transformer",
                 "fa3",
             ]
@@ -488,6 +500,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual("/from/cli", server_args.model_path)
         self.assertEqual(2, server_args.num_gpus)
         self.assertEqual("/custom/vae", server_args.component_paths["vae"])
+        self.assertEqual(
+            {
+                "transformer": "owner/repo/transformer.safetensors",
+                "text_encoder": "owner/repo/text_encoder.safetensors",
+                "image_encoder": "/custom/image_encoder.safetensors",
+            },
+            server_args.component_weights_paths,
+        )
         self.assertEqual(
             {"transformer": "fa"},
             server_args.component_attention_backends,
