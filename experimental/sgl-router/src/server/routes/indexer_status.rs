@@ -13,14 +13,13 @@ pub async fn report(
     State(ctx): State<Arc<AppContext>>,
     Json(report): Json<IndexerStatusReport>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let Some(index) = ctx.prefix_index.as_ref() else {
+    let Some(registry) = ctx.indexer_status_registry.as_ref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "external KV Indexer is not configured".into(),
         ));
     };
-    index
-        .status_registry()
+    registry
         .record(report)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -28,6 +27,8 @@ pub async fn report(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -46,5 +47,30 @@ mod tests {
             serde_json::from_str::<IndexerStatusReport>(&json).unwrap(),
             report
         );
+    }
+
+    #[tokio::test]
+    async fn status_report_uses_the_decoupled_kv_indexer_registry() {
+        let registry = Arc::new(sgl_kv_indexer::IndexerStatusRegistry::new(
+            Vec::new(),
+            Duration::from_secs(1),
+        ));
+        let mut ctx = AppContext::stub();
+        ctx.indexer_status_registry = Some(Arc::clone(&registry));
+        let status = IndexerStatusReport {
+            indexer_id: "i-1".into(),
+            endpoint: "http://127.0.0.1:50051".into(),
+            ready: true,
+            normalized_load: 0.25,
+            ready_workers: 2,
+            total_workers: 2,
+            streams: Vec::new(),
+        };
+
+        assert_eq!(
+            report(State(Arc::new(ctx)), Json(status)).await,
+            Ok(StatusCode::NO_CONTENT)
+        );
+        assert_eq!(registry.candidates()[0].indexer_id, "i-1");
     }
 }

@@ -12,6 +12,7 @@ pub mod config;
 pub mod discovery;
 pub mod health;
 pub mod policies;
+pub mod prefix_provider;
 pub mod proxy;
 pub mod server;
 pub mod tokenizer;

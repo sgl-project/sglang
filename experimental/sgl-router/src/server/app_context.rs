@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
+use crate::prefix_provider::PrefixMatchProvider;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
@@ -31,7 +32,10 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
-    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    pub prefix_provider: Option<Arc<dyn PrefixMatchProvider>>,
+    /// Present for the default gRPC KV Indexer provider, whose replicas push
+    /// dynamic readiness reports into the Router.
+    pub indexer_status_registry: Option<Arc<sgl_kv_indexer::IndexerStatusRegistry>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Fresh `/v1/loads` aggregates used for generation-fenced external
     /// placement scoring. Empty when the external Indexer mode is disabled.
@@ -88,7 +92,8 @@ impl AppContext {
             policies,
             active_load,
             metrics,
-            prefix_index: None,
+            prefix_provider: None,
+            indexer_status_registry: None,
             block_size_oracle: BlockSizeOracle::new(),
             worker_loads: Arc::new(WorkerLoadRegistry::default()),
             ready: AtomicBool::new(false),
@@ -136,7 +141,8 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
-            prefix_index: None,
+            prefix_provider: None,
+            indexer_status_registry: None,
             block_size_oracle: BlockSizeOracle::new(),
             worker_loads: Arc::new(WorkerLoadRegistry::default()),
             ready: AtomicBool::new(false),

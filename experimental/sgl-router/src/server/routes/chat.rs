@@ -17,7 +17,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
-use sgl_kv_indexer::PrefixIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -170,7 +169,7 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
     let external_prefix = match (
-        ctx.prefix_index.as_ref(),
+        ctx.prefix_provider.as_ref(),
         request_tokens.as_ref(),
         ctx.block_size_oracle.get(),
     ) {
@@ -194,6 +193,12 @@ pub async fn chat_completions(
                     &model_str,
                 )?
             };
+            tracing::debug!(
+                provider = index.provider_name(),
+                query_blocks,
+                ?outcome,
+                "external prefix signal resolved"
+            );
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,

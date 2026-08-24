@@ -142,7 +142,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
         registry,
         policies,
     );
-    ctx.prefix_index = Some(Arc::new(
+    ctx.prefix_provider = Some(Arc::new(
         GrpcPrefixIndex::new(PrefixIndexConfig {
             endpoint,
             query_deadline: Duration::from_secs(1),
