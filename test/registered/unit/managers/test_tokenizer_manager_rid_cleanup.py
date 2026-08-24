@@ -613,5 +613,26 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
 
 
+class TestWaitOneResponseAfterTerminalCleanup(CustomTestCase):
+    def test_waiter_uses_the_captured_state_after_the_rid_is_removed(self):
+        tm = _make_tokenizer_manager()
+        state = _make_req_state("finished-before-wait")
+        state.finished = True
+        state.out_list.append({"text": "done", "meta_info": {}})
+        state.event.set()
+        tm.rid_to_state[state.obj.rid] = state
+        tm.request_logger = MagicMock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+
+        waiter = tm._wait_one_response(state.obj, state)
+        del tm.rid_to_state[state.obj.rid]
+
+        async def drive():
+            return await waiter.__anext__()
+
+        self.assertEqual(asyncio.run(drive())["text"], "done")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
