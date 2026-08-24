@@ -1322,8 +1322,11 @@ class UnifiedRadixCacheSuite:
     def test_swa_unfinished_recovery_preserves_locked_full_value(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
-        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
-            self.skipTest("requires page_size=1, sliding_window_size=4")
+        if (self.cfg.page_size, self.cfg.sliding_window_size) not in {
+            (1, 4),
+            (4, 4),
+        }:
+            self.skipTest("requires page_size/window_size of 1/4 or 4/4")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         tokens = self._make_seq(1, 4)
@@ -1340,6 +1343,9 @@ class UnifiedRadixCacheSuite:
         swa_component = cache.components[ComponentType.SWA]
         tracker = {ct: 0 for ct in cache.tree_components}
         device_frees = defaultdict(list)
+        # Batch-result processing defers allocator frees across cache updates.
+        # The recovery below replaces this Full slot's SWA mapping in that group.
+        allocator.free_group_begin()
         cache.tree_core._evict_component_and_detach_lru(
             node,
             swa_component,
@@ -1369,6 +1375,7 @@ class UnifiedRadixCacheSuite:
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
         cache.cache_unfinished_req(req)
+        allocator.free_group_end()
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -1388,6 +1395,12 @@ class UnifiedRadixCacheSuite:
                 swa_value,
             )
         )
+        mapped = allocator.full_to_swa_index_mapping
+        mapped_pages = torch.unique(mapped[mapped > 0] // self.cfg.page_size).numel()
+        physical_used_pages = (
+            allocator.size_swa - allocator.swa_available_size()
+        ) // self.cfg.page_size
+        self.assertEqual(physical_used_pages, mapped_pages)
         self.assertEqual(req.cache_protected_len, len(tokens))
 
         cache.dec_lock_ref(
