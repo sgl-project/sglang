@@ -370,6 +370,7 @@ class TransformerLoader(ComponentLoader):
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
                     or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )
         )
