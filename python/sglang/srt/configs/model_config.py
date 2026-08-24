@@ -268,11 +268,18 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
-def draft_model_override_args_json(*, server_args: ServerArgs) -> str:
-    """The draft model's config override, falling back to the target's when unset."""
-    if server_args.speculative_draft_json_model_override_args is not None:
-        return server_args.speculative_draft_json_model_override_args
-    return server_args.json_model_override_args
+def draft_model_override_args_json(
+    *, draft_override_args: Optional[str], target_override_args: str
+) -> str:
+    """The draft model's config override, falling back to the target's when unset.
+
+    Takes the two values rather than a config object: the draft leaf lives in the
+    `spec` namespace and the target leaf in `model`, so post-publish callers read
+    them off different bags while the resolution pipeline reads a resolving view.
+    """
+    if draft_override_args is not None:
+        return draft_override_args
+    return target_override_args
 
 
 class ModelConfig:
@@ -604,7 +611,10 @@ class ModelConfig:
             else server_args.decrypted_config_file
         )
         model_override_args = (
-            draft_model_override_args_json(server_args=server_args)
+            draft_model_override_args_json(
+                draft_override_args=server_args.speculative_draft_json_model_override_args,
+                target_override_args=server_args.json_model_override_args,
+            )
             if is_draft_model
             else server_args.json_model_override_args
         )

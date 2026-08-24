@@ -175,14 +175,26 @@ class TestPrepareServerArgs(CustomTestCase):
 
         inherited = ServerArgs(model_path="dummy", json_model_override_args=target)
         self.assertIsNone(inherited.speculative_draft_json_model_override_args)
-        self.assertEqual(draft_model_override_args_json(server_args=inherited), target)
+        self.assertEqual(
+            draft_model_override_args_json(
+                draft_override_args=inherited.speculative_draft_json_model_override_args,
+                target_override_args=inherited.json_model_override_args,
+            ),
+            target,
+        )
 
         explicit = ServerArgs(
             model_path="dummy",
             json_model_override_args=target,
             speculative_draft_json_model_override_args=draft,
         )
-        self.assertEqual(draft_model_override_args_json(server_args=explicit), draft)
+        self.assertEqual(
+            draft_model_override_args_json(
+                draft_override_args=explicit.speculative_draft_json_model_override_args,
+                target_override_args=explicit.json_model_override_args,
+            ),
+            draft,
+        )
         self.assertEqual(explicit.json_model_override_args, target)
 
         parser = server_args_module.argparse.ArgumentParser()
