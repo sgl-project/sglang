@@ -1180,10 +1180,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         fresh = (
             resolved.generation.to(torch.int64) == current_generation.to(torch.int64)
         ) & (current_generation.to(torch.int64) >= 1)
-        if not bool(fresh.all()):
-            return
+        # Keep the relay plan useful for stable rows in a continuously batched
+        # request set. A stale row gets survival=1 and therefore only its floor.
+        confidence = torch.where(
+            fresh.unsqueeze(1), resolved.confidence, torch.ones_like(resolved.confidence)
+        )
         verify_lens, deferred_tokens, low_confidence_tokens = (
-            self._plan_confidence_verify_prefixes(resolved.confidence)
+            self._plan_confidence_verify_prefixes(confidence)
         )
         draft_input.verify_token_budget = int(verify_lens.sum().item())
         draft_input.confidence_verify_lens_cpu = verify_lens.to(torch.int32).tolist()
@@ -2192,6 +2195,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verification suffix has no target logits, so use the complete
             # target verify path whenever callers requested logprobs.
             and not batch.return_logprob
+            # Compact verify is incompatible with uniform-width LoRA segments.
+            and self.model_runner.lora_manager is None
             and (
                 int(self.server_args.speculative_dflash_confidence_target_verify_tokens)
                 > 0
@@ -2222,41 +2227,64 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_lens_cpu = verify_lens.cpu().tolist()
                 confidence_reason = "confidence_ragged"
             graph_buckets = self._ragged_verify_graph_buckets()
-            confidence_layout = RaggedVerifyLayout.from_verify_lens(
-                verify_lens_cpu=verify_lens_cpu,
-                device=device,
-                grid=graph_buckets or [sum(verify_lens_cpu)],
+            runner = self.model_runner.decode_cuda_graph_runner
+            exceeds_graph_grid = graph_buckets and sum(verify_lens_cpu) > graph_buckets[-1]
+            exceeds_graph_slots = (
+                graph_buckets
+                and runner is not None
+                and getattr(runner, "ragged_verify_mode", False)
+                and bs > min(getattr(runner, "max_bs", bs), graph_buckets[-1])
             )
-            # Observer collection is intentionally omitted for overlap: its
-            # current-confidence histogram requires D2H and would defeat the
-            # relay. The lagged plan metadata remains available in info dumps.
-            if not batch.enable_overlap:
-                self._confidence_observer.observe(
-                    confidence=self._selector_confidence,
-                    verify_lens=confidence_layout.verify_lens,
-                    reason=confidence_reason,
-                    deferred_tokens=deferred_tokens,
-                    low_confidence_tokens=low_confidence_tokens,
+            if exceeds_graph_grid or exceeds_graph_slots:
+                # Do not let RaggedVerifyLayout raise for a batch larger than
+                # the captured grid. The fixed-width verify path is lossless.
+                confidence_reason = "full_verify_exceeds_graph_grid"
+                use_confidence_ragged = False
+            else:
+                confidence_layout = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=verify_lens_cpu,
+                    device=device,
+                    grid=graph_buckets or [sum(verify_lens_cpu)],
                 )
-            ragged_window = BuildRaggedVerifyWindow.execute(
-                batch=batch,
-                layout=confidence_layout,
-                # BuildRaggedVerifyWindow's Triton gather indexes both inputs
-                # with the proposed-token stride. Keep the anchor in column 0
-                # of the full block so every request row has that same stride.
-                draft_block_ids=draft_tokens,
-                draft_tokens=draft_tokens[:, 1:],
-                bs=bs,
-                device=device,
-                verify_num_draft_tokens=block_size,
-                model_runner=self.model_runner,
-            )
-            verify_input_ids = ragged_window.verify_ids
-            verify_positions = ragged_window.positions
-            batch.out_cache_loc = ragged_window.verify_cache_loc
-        else:
+                if batch.enable_overlap:
+                    # All fields are already host-side N-2 relay metadata.
+                    # Record planning without copying current GPU confidence.
+                    self._confidence_observer.observe(
+                        confidence=None,
+                        verify_lens=torch.tensor(verify_lens_cpu, dtype=torch.int32),
+                        reason=confidence_reason,
+                        deferred_tokens=deferred_tokens,
+                        low_confidence_tokens=low_confidence_tokens,
+                    )
+                else:
+                    self._confidence_observer.observe(
+                        confidence=self._selector_confidence,
+                        verify_lens=confidence_layout.verify_lens,
+                        reason=confidence_reason,
+                        deferred_tokens=deferred_tokens,
+                        low_confidence_tokens=low_confidence_tokens,
+                    )
+                ragged_window = BuildRaggedVerifyWindow.execute(
+                    batch=batch,
+                    layout=confidence_layout,
+                    # BuildRaggedVerifyWindow's Triton gather indexes both inputs
+                    # with the proposed-token stride. Keep the anchor in column 0
+                    # of the full block so every request row has that same stride.
+                    draft_block_ids=draft_tokens,
+                    draft_tokens=draft_tokens[:, 1:],
+                    bs=bs,
+                    device=device,
+                    verify_num_draft_tokens=block_size,
+                    model_runner=self.model_runner,
+                )
+                verify_input_ids = ragged_window.verify_ids
+                verify_positions = ragged_window.positions
+                batch.out_cache_loc = ragged_window.verify_cache_loc
+        if confidence_layout is None:
             if self._uses_confidence_scheduling():
-                if self._selector_confidence is None:
+                if confidence_reason == "full_verify_exceeds_graph_grid":
+                    pass
+                elif self._selector_confidence is None:
                     confidence_reason = "full_verify_no_selector_confidence"
                 elif not _is_all_greedy(batch.sampling_info):
                     confidence_reason = "full_verify_sampling"
@@ -2269,7 +2297,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # Observing current GPU confidence performs a D2H copy. Overlap
                 # instead publishes it to ConfidenceRelay below and deliberately
                 # keeps the hot path synchronization-free.
-                if not batch.enable_overlap:
+                if batch.enable_overlap:
+                    self._confidence_observer.observe(
+                        confidence=None, verify_lens=None, reason=confidence_reason
+                    )
+                else:
                     self._confidence_observer.observe(
                         confidence=self._selector_confidence,
                         verify_lens=None,
@@ -2278,6 +2310,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_input_ids = draft_tokens.reshape(-1)
             verify_positions = positions
             batch.out_cache_loc = verify_out_cache_loc
+            runner = self.model_runner.decode_cuda_graph_runner
+            graph_buckets = self._ragged_verify_graph_buckets()
+            if (
+                runner is not None
+                and getattr(runner, "ragged_verify_mode", False)
+                # Logprob collection requires the native rectangular output.
+                and not batch.return_logprob
+                and graph_buckets
+                and bs * block_size <= graph_buckets[-1]
+            ):
+                # A uniform layout lets a ragged-mode runner replay a normal
+                # full verify through its token-bucket graph rather than eager.
+                confidence_layout = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=[block_size] * bs,
+                    device=device,
+                    grid=graph_buckets,
+                )
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
@@ -2486,7 +2535,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.return_logprob:
             # `return_logprob` forces full verification above, preserving the
             # rectangular per-request layout required by compute_spec_logprobs.
-            assert confidence_layout is None
+            if confidence_layout is not None:
+                raise RuntimeError(
+                    "DFLASH logprob verification requires a full-width layout."
+                )
             compute_spec_logprobs(
                 batch,
                 logits_output,

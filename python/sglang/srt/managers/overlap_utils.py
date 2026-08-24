@@ -61,10 +61,15 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    # DSpark and DFLASH_CONFIDENCE both use the relay to avoid synchronizing
-    # current-step confidence to the host. DFLASH_CONFIDENCE consumes the
-    # N-2 snapshot to prepare the current batch's approximate verify plan.
-    if not (algo.is_dspark() or algo.is_dflash_confidence()):
+    # DFLASH_CONFIDENCE enables compact planning through its server arguments,
+    # independently from the runner's ragged graph mode. It still needs the
+    # N-2 relay snapshot under the default static graph configuration.
+    if algo.is_dflash_confidence():
+        return (
+            int(server_args.speculative_dflash_confidence_target_verify_tokens) > 0
+            or server_args.speculative_dflash_confidence_sps_table_path is not None
+        )
+    if not algo.is_dspark():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
