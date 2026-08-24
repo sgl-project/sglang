@@ -85,6 +85,20 @@ class SchedulerProfilerManager:
         self.nsys_pulse_capture_per_step = os.getenv(
             "SGLANG_NSYS_PULSE_CAPTURE_PER_STEP", "0"
         ).strip().lower() in {"1", "true", "yes"}
+        prime_only_rank_spec = os.getenv(
+            "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS", ""
+        ).strip()
+        try:
+            self.nsys_pulse_prime_only_ranks = {
+                int(rank.strip())
+                for rank in prime_only_rank_spec.split(",")
+                if rank.strip()
+            }
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS must be a comma-separated "
+                "list of integer GPU ranks"
+            ) from exc
         self.nsys_exact_batch = int(
             os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
         )
@@ -363,6 +377,17 @@ class SchedulerProfilerManager:
             or not self.profile_in_progress
             or self.nsys_nvtx_capture_active
             or "CUDA_PROFILER" not in (self.profiler_activities or [])
+        ):
+            return
+        # Some distributed CUDA Graphs cannot tolerate only one rank paying
+        # Nsight's first graph-node instrumentation cost.  Allow every rank to
+        # record the setup-contaminated first pulse, then leave selected peer
+        # ranks under an inactive Nsight wrapper while the representative rank
+        # records the clean pulses.  The first range is already open from
+        # _start_profile(), so this applies only after that priming step.
+        if (
+            self.nsys_exact_decode_batches_seen > 0
+            and self.ps.gpu_id in self.nsys_pulse_prime_only_ranks
         ):
             return
         capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()

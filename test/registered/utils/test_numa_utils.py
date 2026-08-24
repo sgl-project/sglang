@@ -623,6 +623,36 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
         os.environ,
         {
             "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+            "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR": "/logs/profiles/decode",
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+            "SGLANG_NSYS_NVTX_CAPTURE_REPETITIONS": "17",
+            "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS": "0,1,2",
+        },
+        clear=True,
+    )
+    @patch("sglang.srt.utils.numa_utils._mp_set_executable")
+    @patch("sglang.srt.utils.numa_utils._create_nsys_scheduler_executable")
+    def test_prime_only_rank_uses_one_capture(self, create_executable, set_executable):
+        create_executable.return_value = ("/tmp/nsys-rank2", "debug")
+
+        with configure_nsys_scheduler_subprocess(2):
+            pass
+
+        create_executable.assert_called_once_with(
+            nsys_binary="nsys",
+            output_dir="/logs/profiles/decode",
+            capture_range="agentx_decode_capture",
+            capture_repetitions=1,
+            gpu_id=2,
+        )
+        set_executable.assert_called_once_with(
+            executable="/tmp/nsys-rank2", debug_str="debug"
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
             "SGLANG_NSYS_SCHEDULER_RANKS": "0",
         },
         clear=True,

@@ -117,6 +117,22 @@ def configure_nsys_scheduler_subprocess(gpu_id: int):
         raise ValueError(
             "SGLANG_NSYS_NVTX_CAPTURE_REPETITIONS must be a positive integer"
         )
+    prime_only_rank_spec = os.getenv(
+        "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS", ""
+    ).strip()
+    try:
+        prime_only_ranks = {
+            int(rank.strip())
+            for rank in prime_only_rank_spec.split(",")
+            if rank.strip()
+        }
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS must be a comma-separated "
+            "list of integer GPU ranks"
+        ) from exc
+    if gpu_id in prime_only_ranks:
+        capture_repetitions = 1
     executable, debug_str = _create_nsys_scheduler_executable(
         nsys_binary=nsys_binary,
         output_dir=output_dir,

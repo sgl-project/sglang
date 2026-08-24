@@ -132,6 +132,61 @@ def test_rank_local_nsys_can_pulse_one_nvtx_range_per_step(tmp_path):
     cudart.assert_not_called()
 
 
+def test_rank_local_nsys_can_prime_peer_then_leave_capture_inactive(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+            "SGLANG_NSYS_PULSE_CAPTURE_PER_STEP": "1",
+            "SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS": "0,1,2",
+            "SGLANG_NSYS_EXACT_DECODE_BATCHES": "17",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=1),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+        manager.torch_profiler_output_dir = tmp_path
+        manager.torch_profiler_with_stack = None
+        manager.torch_profiler_record_shapes = None
+        manager.profiler_activities = ["CUDA_PROFILER"]
+        manager.profile_id = "nsys-prime-only-test"
+        manager.profile_prefix = ""
+
+        with (
+            patch("torch.cuda.nvtx.range_start", return_value=91) as range_start,
+            patch("torch.cuda.nvtx.range_end") as range_end,
+            patch("torch.cuda.synchronize") as synchronize,
+        ):
+            assert manager._start_profile().success
+            manager.nsys_exact_decode_batches_seen = 1
+            manager.finish_nsys_pulse_capture_step()
+            manager._start_nsys_pulse_capture_step()
+            manager.finish_nsys_pulse_capture_step()
+            assert manager._stop_profile().success
+
+    range_start.assert_called_once_with("agentx_decode_capture")
+    range_end.assert_called_once_with(91)
+    synchronize.assert_called_once_with()
+
+
+def test_nsys_prime_only_rank_selection_rejects_invalid_value():
+    with (
+        patch.dict(
+            "os.environ",
+            {"SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS": "rank-zero"},
+        ),
+        pytest.raises(ValueError, match="comma-separated"),
+    ):
+        SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+
+
 def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
     forward_ct = 100
     ps = SimpleNamespace(gpu_id=0)
