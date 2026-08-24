@@ -229,7 +229,12 @@ class FlashinferDispatcher(BaseDispatcher):
                     x.shape[0], self.hidden_size // 32
                 )
             else:
-                x = torch.zeros(0, self.hidden_size, dtype=torch.uint8, device=x.device)
+                x = torch.zeros(
+                    0,
+                    self.hidden_size,
+                    dtype=torch.float8_e4m3fn,
+                    device=x.device,
+                )
                 x_sf = torch.zeros(
                     0, self.hidden_size // 32, dtype=torch.uint8, device=x.device
                 )

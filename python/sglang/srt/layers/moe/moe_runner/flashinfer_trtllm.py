@@ -680,13 +680,16 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
-    dispatch_output: StandardDispatchOutput,
+    dispatch_output: StandardDispatchOutput | FlashinferDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -699,7 +702,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     assert not runner_config.no_combine, "no_combine is not supported for flashinfer."
 
     hidden_states = dispatch_output.hidden_states
-    output_dtype = getattr(dispatch_output, "output_dtype", None) or hidden_states.dtype
+    output_dtype = (
+        dispatch_output.output_dtype
+        if isinstance(dispatch_output, FlashinferDispatchOutput)
+        else hidden_states.dtype
+    )
     topk_output = dispatch_output.topk_output
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits

@@ -23,7 +23,8 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 from __future__ import annotations
 
 import logging
-import os
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -73,10 +74,8 @@ if TYPE_CHECKING:
     )
 
 
-_UE8M0_PACK_PATCHED = False
-
-
-def _install_capture_safe_ue8m0_pack() -> None:
+@contextmanager
+def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
     """Make deep_gemm's UE8M0 scale packing safe under CUDA graph capture.
 
     The deep_gemm mega staging path (block-FP8 models such as DeepSeek-V4-Flash)
@@ -87,16 +86,14 @@ def _install_capture_safe_ue8m0_pack() -> None:
         assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
 
     ``.all()`` forces a device->host sync, which is illegal while a CUDA graph is
-    capturing and aborts sglang's decode cuda-graph capture with
-    ``cudaErrorStreamCaptureUnsupported``. The assertions are pure sanity checks;
-    the packing (``x_int >> 23``) is deterministic and unaffected by dropping
-    them, so we swap in a capture-safe variant.
+    capturing. Replace the helper only around the mega forward that runs during
+    capture, then restore the exact upstream function.
 
-    TODO(flashinfer/deep_gemm): remove once upstream gates these asserts behind a
-    debug env or moves them off the capture path.
+    TODO(deepseek-ai/DeepGEMM#414): remove once upstream provides a capture-safe
+    helper: https://github.com/deepseek-ai/DeepGEMM/issues/414
     """
-    global _UE8M0_PACK_PATCHED
-    if _UE8M0_PACK_PATCHED:
+    if not torch.cuda.is_available() or not torch.cuda.is_current_stream_capturing():
+        yield
         return
 
     try:
@@ -104,19 +101,19 @@ def _install_capture_safe_ue8m0_pack() -> None:
     except ImportError:
         # deep_gemm is only needed by the block-FP8 mega path; NVFP4/MXFP8 mega
         # runs on cutedsl and does not import it. Nothing to patch here.
+        yield
         return
 
     def _pack_ue8m0_to_int(x: torch.Tensor) -> torch.Tensor:
         x_int = x.view(torch.int)
         return (x_int >> 23).to(torch.uint8).view(torch.int)
 
+    original = _dgm.pack_ue8m0_to_int
     _dgm.pack_ue8m0_to_int = _pack_ue8m0_to_int
-    _UE8M0_PACK_PATCHED = True
-
-
-# Selecting the flashinfer_megamoe backend imports this module (see MoeRunner /
-# the fp8 / modelopt quant methods), so install the capture-safe shim here.
-_install_capture_safe_ue8m0_pack()
+    try:
+        yield
+    finally:
+        _dgm.pack_ue8m0_to_int = original
 
 
 @dataclass
@@ -143,28 +140,6 @@ def _resolve_max_tokens_per_rank() -> int:
 
     derived = cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
-
-
-def _keep_topk_ids_int32() -> bool:
-    """Whether to keep int32 router IDs for fused staging.
-
-    The opt-out is a benchmark control for comparing the old adapter behavior;
-    production defaults to the copy-free int32 path.
-    """
-    return os.environ.get("SGLANG_FLASHINFER_MEGA_KEEP_TOPK_INT32", "1") not in (
-        "0",
-        "false",
-        "False",
-    )
-
-
-def _use_output_workspace_view() -> bool:
-    """Whether to request the opt-in workspace output view."""
-    return os.environ.get("SGLANG_FLASHINFER_MEGA_OUTPUT_VIEW", "1") not in (
-        "0",
-        "false",
-        "False",
-    )
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -502,17 +477,8 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
-# One symmetric-memory workspace shared across all mega layers. FlashInfer's
-# MoEEpMegaLayer allocates a workspace per instance; MoE layers run
-# sequentially and the workspace is weight-independent, so a per-layer buffer
-# would multiply device memory by the layer count (and OOM). Keyed by the
-# durable sizing so distinct shapes still get distinct buffers. Mirrors the
-# shared symm-buffer cache in the deepgemm mega_moe path.
-_SHARED_MEGA_WORKSPACE: dict = {}
-
-
 def _ensure_shared_workspace(mega) -> None:
-    """Point this layer's workspace at the process-wide shared symm buffer.
+    """Point this layer at a runtime-context-owned shared symmetric buffer.
 
     The first mega layer's first forward creates it (collective; safe because
     warmup runs the same layer on all ranks in lockstep); later layers reuse it.
@@ -522,6 +488,8 @@ def _ensure_shared_workspace(mega) -> None:
     fp = mega._fleet_params
     kc = mega._megakernel_config
     mc = mega._mega_config
+    from sglang.srt.runtime_context import get_resources
+
     key = (
         getattr(kc, "kernel_name", kc.__class__.__name__),
         mega._bootstrap.world_size,
@@ -535,13 +503,15 @@ def _ensure_shared_workspace(mega) -> None:
         getattr(kc, "apply_topk_in_fc1", None),
         getattr(kc, "kind", None),
         getattr(kc, "in_kernel_fc2_reduce", None),
+        getattr(kc, "combine_dtype", None),
         getattr(kc, "token_back_by_dispatch", None),
         getattr(kc, "fast_math", None),
         mc.quantize_input,
     )
-    shared = _SHARED_MEGA_WORKSPACE.get(key)
+    workspaces = get_resources().flashinfer_megamoe_workspaces
+    shared = workspaces.get(key)
     if shared is None:
-        _SHARED_MEGA_WORKSPACE[key] = mega._ensure_workspace()
+        workspaces[key] = mega._ensure_workspace()
     else:
         mega._workspace = shared
 
@@ -569,9 +539,6 @@ def run_flashinfer_megamoe(
     mega = quant_info.mega
     _ensure_shared_workspace(mega)
 
-    if not _keep_topk_ids_int32():
-        topk_ids = topk_ids.to(torch.int64)
-
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
         # FlashInfer's fused staging accepts the int32 router output and widens
@@ -582,12 +549,13 @@ def run_flashinfer_megamoe(
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
     )
-    if _use_output_workspace_view() and getattr(mega, "supports_output_view", False):
-        y = mega.forward(t, return_workspace_view=True)
-    else:
-        # Keep compatibility with older MegaMoE implementations that do
-        # not expose the workspace-view capability.
-        y = mega.forward(t)
+    with _capture_safe_ue8m0_pack():
+        if getattr(mega, "supports_output_view", False):
+            y = mega.forward(t, return_workspace_view=True)
+        else:
+            # Keep compatibility with older MegaMoE implementations that do
+            # not expose the workspace-view capability.
+            y = mega.forward(t)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor

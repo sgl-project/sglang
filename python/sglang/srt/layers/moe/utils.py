@@ -16,7 +16,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
-    get_model,
     get_parallel,
 )
 from sglang.srt.utils import is_cuda, is_npu
@@ -259,17 +258,10 @@ def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
     if dispatch_type != "auto":
         return FlashinferA2ADispatchType(dispatch_type)
 
-    assert not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
-
-    quantization = get_model().quantization
-    if quantization == "mxfp8":
-        dispatch_type = "mxfp8"
-    elif quantization == "modelopt_fp4":
-        dispatch_type = "nvfp4"
-    else:
-        dispatch_type = "bf16"
-
-    return FlashinferA2ADispatchType(dispatch_type)
+    raise RuntimeError(
+        "flashinfer_a2a_dispatch_type='auto' reached the published runtime "
+        "configuration; ServerArgs must resolve it before publication"
+    )
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:

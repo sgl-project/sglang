@@ -1060,6 +1060,13 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
                 FlashinferA2ADispatchType.BF16,
             )
 
+    def test_runtime_getter_rejects_unresolved_auto(self):
+        with get_context().override_server_args(
+            flashinfer_a2a_dispatch_type="auto",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must resolve it"):
+                get_flashinfer_a2a_dispatch_type()
+
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
         server_args.get_model_config = MagicMock(
@@ -1111,7 +1118,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             server_args._handle_a2a_moe()
 
 
-class TestFlashinferMegaMoeEnvKnobs(CustomTestCase):
+class TestFlashinferMegaMoeConfig(CustomTestCase):
     def setUp(self):
         self._combine_dtype_backup = os.environ.get(
             "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
@@ -1136,8 +1143,8 @@ class TestFlashinferMegaMoeEnvKnobs(CustomTestCase):
                 self._ikr_backup
             )
 
-    def _make_args(self):
-        return ServerArgs(
+    def _make_args(self, architecture="DeepseekV4ForCausalLM"):
+        server_args = ServerArgs(
             model_path="dummy",
             quantization="modelopt_fp4",
             moe_a2a_backend="flashinfer_megamoe",
@@ -1146,6 +1153,37 @@ class TestFlashinferMegaMoeEnvKnobs(CustomTestCase):
             dp_size=4,
             tp_size=4,
         )
+        server_args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture]),
+                nvfp4_moe_meta=None,
+            )
+        )
+        return server_args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_audited_model_architectures(self, _):
+        supported = (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Glm4MoeForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen2MoeForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+        for architecture in supported:
+            with self.subTest(architecture=architecture):
+                self._make_args(architecture)._handle_a2a_moe()
+
+    def test_megamoe_rejects_unaudited_model_architecture(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "not validated for model architectures.*UnsupportedMoeForCausalLM",
+        ):
+            self._make_args("UnsupportedMoeForCausalLM")._handle_a2a_moe()
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
