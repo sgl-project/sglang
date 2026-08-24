@@ -1,6 +1,7 @@
 """Unit tests for UnifiedRadixCache"""
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -92,6 +93,60 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+
+class TestUnifiedCacheEnvDefaults(CustomTestCase):
+    def test_eager_swa_slot_freeing_is_opt_in(self):
+        flag = envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(flag.name, None)
+            self.assertFalse(flag.get())
+
+    def test_default_preserves_unaligned_swa_prefix_branch(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        tokens = list(range(1, 21))
+        req = Req(
+            rid="unaligned-branch",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        req.kv_committed_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+
+        flag = envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(flag.name, None)
+            cache.cache_unfinished_req(req)
+
+        # Branch before the inserted chunk's retained SWA tail. Eager freeing
+        # used to make this fall all the way back to an earlier tree boundary.
+        branch = tokens[:18]
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", branch))))
+        self.assertEqual(len(match.device_indices), len(branch))
+
+        cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        cache.sanity_check()
+
 
 register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
