@@ -39,9 +39,10 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_supports_iq_mmq = False
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -51,7 +52,17 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 
+    try:
+        from sgl_kernel.quantization import ggml_supports_iq_mmq
+    except ImportError:
+        pass
+    else:
+        _supports_iq_mmq = ggml_supports_iq_mmq()
+
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -141,7 +152,6 @@ STANDARD_QUANT_TYPES = {
     WeightType.Q5_0,
     WeightType.Q5_1,
     WeightType.Q8_0,
-    WeightType.Q8_1,
 }
 KQUANT_TYPES = {
     WeightType.Q2_K,
@@ -161,12 +171,130 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
-# TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
-# Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
-# MMQ kernel for I-Matrix quantization.
+MMQ_IMATRIX_QUANT_TYPES = {
+    WeightType.IQ1_S,
+    WeightType.IQ2_XXS,
+    WeightType.IQ2_XS,
+    WeightType.IQ2_S,
+    WeightType.IQ3_XXS,
+    WeightType.IQ3_S,
+    WeightType.IQ4_XS,
+    WeightType.IQ4_NL,
+}
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+
+
+def _build_mmq_quant_types(supports_iq_mmq: bool) -> set[WeightType]:
+    quant_types = STANDARD_QUANT_TYPES | KQUANT_TYPES
+    if supports_iq_mmq:
+        quant_types |= MMQ_IMATRIX_QUANT_TYPES
+    return quant_types
+
+
+MMQ_QUANT_TYPES = _build_mmq_quant_types(_is_cuda and _supports_iq_mmq)
+
+IQ_MMQ_MAX_BATCH_SIZE = 16
+IQ_MMQ_NARROW_MAX_BATCH_SIZE = 16
+IQ_MMQ_NARROW_MAX_OUTPUT_ROWS = 5120
+IQ_MOE_MMQ_MIN_TOKENS = 128
+IQ_MOE_MMQ_MIN_ASSIGNMENTS_PER_EXPERT = 2
+IQ_MOE_MMQ_MAX_EXPERTS = 256
+IQ_MOE_MMQ_BLOCK_SIZE = 4
+CUDA_MAX_GRID_Y = 65535
+MMQ_K_ALIGNMENTS = {
+    WeightType.Q4_0: 256,
+    WeightType.Q4_1: 256,
+    WeightType.Q5_0: 256,
+    WeightType.Q5_1: 256,
+    WeightType.Q8_0: 128,
+    WeightType.Q2_K: 512,
+    WeightType.Q3_K: 512,
+    WeightType.Q4_K: 256,
+    WeightType.Q5_K: 256,
+    WeightType.Q6_K: 256,
+    **{qweight_type: 256 for qweight_type in MMQ_IMATRIX_QUANT_TYPES},
+}
+
+
+def _is_iq_mmq_batch_size(num_tokens: int, num_output_rows: int) -> bool:
+    max_batch_size = (
+        IQ_MMQ_NARROW_MAX_BATCH_SIZE
+        if num_output_rows <= IQ_MMQ_NARROW_MAX_OUTPUT_ROWS
+        else IQ_MMQ_MAX_BATCH_SIZE
+    )
+    return num_tokens <= max_batch_size
+
+
+def _is_iq_moe_mmq_shape(num_tokens: int, num_experts: int, top_k: int) -> bool:
+    # moe_align_block_size allocates this conservative capacity, and the IQ
+    # kernels launch one four-assignment block along grid.y.
+    max_num_tokens_padded = num_tokens * top_k + (num_experts + 1) * (
+        IQ_MOE_MMQ_BLOCK_SIZE - 1
+    )
+    return (
+        num_tokens >= IQ_MOE_MMQ_MIN_TOKENS
+        and num_experts <= IQ_MOE_MMQ_MAX_EXPERTS
+        and num_tokens * top_k >= IQ_MOE_MMQ_MIN_ASSIGNMENTS_PER_EXPERT * num_experts
+        and max_num_tokens_padded <= CUDA_MAX_GRID_Y * IQ_MOE_MMQ_BLOCK_SIZE
+    )
+
+
+def _is_mmq_input_size(qweight_type: int, input_size: int) -> bool:
+    alignment = MMQ_K_ALIGNMENTS.get(qweight_type)
+    return alignment is not None and input_size % alignment == 0
+
+
+def _select_gguf_matmul_kernel(
+    num_tokens: int, num_output_rows: int, qweight_type: int, input_size: int
+) -> str:
+    if qweight_type in UNQUANTIZED_TYPES:
+        return "unquantized"
+
+    if qweight_type in IMATRIX_QUANT_TYPES:
+        mmvq_safe = 8 if num_output_rows > 5120 else 16
+    else:
+        mmvq_safe = 2 if num_output_rows > 5120 else 6
+
+    if num_tokens <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+        return "mmvq"
+    if (
+        qweight_type in MMQ_QUANT_TYPES
+        and (
+            qweight_type not in MMQ_IMATRIX_QUANT_TYPES
+            or _is_iq_mmq_batch_size(num_tokens, num_output_rows)
+        )
+        and _is_mmq_input_size(qweight_type, input_size)
+    ):
+        return "mmq"
+    if qweight_type in DEQUANT_TYPES:
+        return "dequantize"
+    return "unsupported"
+
+
+def _should_use_moe_mmq(
+    qweight_type: int,
+    qweight_type2: int,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    input_size: int,
+    intermediate_size: int,
+) -> bool:
+    if qweight_type not in MMQ_QUANT_TYPES or qweight_type2 not in MMQ_QUANT_TYPES:
+        return False
+    if not _is_mmq_input_size(qweight_type, input_size) or not _is_mmq_input_size(
+        qweight_type2, intermediate_size
+    ):
+        return False
+
+    uses_iq_mmq = (
+        qweight_type in MMQ_IMATRIX_QUANT_TYPES
+        or qweight_type2 in MMQ_IMATRIX_QUANT_TYPES
+    )
+    if not uses_iq_mmq:
+        return num_tokens > 64
+    return _is_iq_moe_mmq_shape(num_tokens, num_experts, top_k)
 
 
 def dequantize_gguf_weight(
@@ -181,25 +309,21 @@ def dequantize_gguf_weight(
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
-    if qweight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
-    else:
-        mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
     # HACK: when doing chunked prefill we don't generate output tokens
     # so input to logits generator is empty which causes invalid parameter
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
-    # there is no need to call any kernel for fp16/bf16
-    if qweight_type in UNQUANTIZED_TYPES:
+
+    kernel = _select_gguf_matmul_kernel(
+        x.shape[0], qweight.shape[0], qweight_type, x.shape[1]
+    )
+    if kernel == "unquantized":
         return x @ qweight.T
-    # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    if kernel == "mmvq":
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    elif kernel == "mmq":
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    # If there is no available MMQ kernel, fallback to dequantize
-    elif qweight_type in DEQUANT_TYPES:
+    elif kernel == "dequantize":
         weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
         y = x @ weight.T
     else:
@@ -229,19 +353,23 @@ def fused_moe_gguf(
         raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
-    # unless we decent expert reuse we are better off running moe_vec kernel
-    if (
-        qweight_type2 in MMQ_QUANT_TYPES
-        and qweight_type in MMQ_QUANT_TYPES
-        and x.shape[0] > 64
+    num_tokens, _ = x.shape
+    num_experts, N, _ = w1.shape
+    top_k = topk_ids.shape[1]
+    # The batched kernel needs enough work per expert to amortize alignment.
+    if _should_use_moe_mmq(
+        qweight_type,
+        qweight_type2,
+        num_tokens,
+        num_experts,
+        top_k,
+        x.shape[1],
+        N // 2,
     ):
-        num_tokens, _ = x.shape
-        E, N, _ = w1.shape
-        top_k = topk_ids.shape[1]
         BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, BLOCK_SIZE, E
+            topk_ids, BLOCK_SIZE, num_experts
         )
         out = ggml_moe_a8(
             x,
@@ -272,10 +400,6 @@ def fused_moe_gguf(
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
-        num_tokens, _ = x.shape
-        E, N, _ = w1.shape
-        top_k = topk_ids.shape[1]
-
         out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
         out = act(out)
 

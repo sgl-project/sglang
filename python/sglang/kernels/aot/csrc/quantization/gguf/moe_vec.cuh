@@ -17,7 +17,7 @@ static __global__ void moe_vec_q(
   const auto token = blockIdx.z / topk;
   const auto expert = (topk_ids)[blockIdx.z];
 
-  if (row >= nrows) {
+  if (row >= nrows || expert < 0) {
     return;
   }
 

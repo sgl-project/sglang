@@ -103,6 +103,7 @@ else:
         ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
+        ggml_supports_iq_mmq,
     )
     from sgl_kernel.sampling import (
         top_k_renorm_prob,

@@ -18,6 +18,49 @@
 #include "moe_vec.cuh"
 // clang-format off
 
+#if !defined(USE_MUSA)
+static int64_t ggml_mmq_k_alignment(const int64_t type) {
+  switch (type) {
+    case 8:
+      return 128;
+    case 10:
+    case 11:
+      return 512;
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+    case 12:
+    case 13:
+    case 14:
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 20:
+    case 21:
+    case 22:
+    case 23:
+      return 256;
+    default:
+      return 0;
+  }
+}
+
+static void check_ggml_mmq_input_size(const int64_t type, const int64_t input_size) {
+  const int64_t alignment = ggml_mmq_k_alignment(type);
+  TORCH_CHECK(alignment > 0, "Unsupported GGUF MMQ quantization type: ", type);
+  TORCH_CHECK(
+      input_size % alignment == 0,
+      "GGUF MMQ quantization type ",
+      type,
+      " requires an input size divisible by ",
+      alignment,
+      ", got ",
+      input_size);
+}
+#endif
+
 // Q8 gemv
 template <typename scalar_t>
 static __global__ void
@@ -85,6 +128,7 @@ torch::Tensor ggml_dequantize(
 
   DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+    TORCH_CHECK(to_cuda != nullptr, "Unsupported GGUF dequantization type: ", type);
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
 
@@ -184,6 +228,8 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      default:
+        TORCH_CHECK(false, "Unsupported GGUF MMVQ quantization type: ", type);
     }
   });
   return Y;
@@ -195,6 +241,9 @@ torch::Tensor ggml_mul_mat_a8(
     int64_t type,
     int64_t row) {
   int col = X.sizes()[1];
+#if !defined(USE_MUSA)
+  check_ggml_mmq_input_size(type, col);
+#endif
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
@@ -327,6 +376,104 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+#if !defined(USE_MUSA)
+      case 16:
+        ggml_mul_mat_iq2_xxs_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 17:
+        ggml_mul_mat_iq2_xs_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 18:
+        ggml_mul_mat_iq3_xxs_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 19:
+        ggml_mul_mat_iq1_s_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 20:
+        ggml_mul_mat_iq4_nl_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 21:
+        ggml_mul_mat_iq3_s_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 22:
+        ggml_mul_mat_iq2_s_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 23:
+        ggml_mul_mat_iq4_xs_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+#endif
     }
   });
   return Y;
@@ -343,6 +490,9 @@ torch::Tensor ggml_moe_a8(
     int64_t top_k,
     int64_t tokens) {
   int col = X.sizes()[1];
+#if !defined(USE_MUSA)
+  check_ggml_mmq_input_size(type, col);
+#endif
   int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
@@ -533,6 +683,152 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+#if !defined(USE_MUSA)
+      case 16:
+        ggml_moe_iq2_xxs_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 17:
+        ggml_moe_iq2_xs_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 18:
+        ggml_moe_iq3_xxs_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 19:
+        ggml_moe_iq1_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 20:
+        ggml_moe_iq4_nl_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 21:
+        ggml_moe_iq3_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 22:
+        ggml_moe_iq2_s_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 23:
+        ggml_moe_iq4_xs_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+#endif
     }
   });
   return Y;
@@ -804,6 +1100,8 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "Unsupported GGUF MoE vector quantization type: ", type);
     }
   });
   return Y;
@@ -831,6 +1129,32 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_K;
     case 14:
       return MOE_X_Q6_K;
+#if !defined(USE_MUSA)
+    case 16:
+      return MOE_X_IQ2_XXS;
+    case 17:
+      return MOE_X_IQ2_XS;
+    case 18:
+      return MOE_X_IQ3_XXS;
+    case 19:
+      return MOE_X_IQ1_S;
+    case 20:
+      return MOE_X_IQ4_NL;
+    case 21:
+      return MOE_X_IQ3_S;
+    case 22:
+      return MOE_X_IQ2_S;
+    case 23:
+      return MOE_X_IQ4_XS;
+#endif
   }
   return 0;
+}
+
+bool ggml_supports_iq_mmq() {
+#if defined(USE_MUSA)
+  return false;
+#else
+  return true;
+#endif
 }
