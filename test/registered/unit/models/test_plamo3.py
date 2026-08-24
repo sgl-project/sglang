@@ -74,17 +74,29 @@ class TestPlamo3Config(CustomTestCase):
         cfg = self._make(num_hidden_layers=4)
         self.assertEqual(cfg.layers_block_type, ["attention"] * 4)
 
-    def test_rope_scaling_none_when_factor_is_one(self):
+    def test_rope_parameters_default_when_factor_is_one(self):
         cfg = self._make(rope_scaling_factor=1)
-        self.assertIsNone(cfg.rope_scaling)
+        self.assertEqual(
+            cfg.rope_parameters,
+            {
+                "full_attention": {
+                    "rope_theta": cfg.rope_theta,
+                    "rope_type": "default",
+                },
+                "sliding_attention": {
+                    "rope_theta": cfg.rope_local_theta,
+                    "rope_type": "default",
+                },
+            },
+        )
 
-    def test_rope_scaling_yarn_dict(self):
+    def test_rope_parameters_yarn_dict(self):
         cfg = self._make(
             rope_scaling_factor=64.0,
             initial_context_length=4096,
             max_position_embeddings=262144,
         )
-        rs = cfg.rope_scaling
+        rs = cfg.rope_parameters
         self.assertIsNotNone(rs)
         full = rs["full_attention"]
         self.assertEqual(full["rope_type"], "yarn")
@@ -96,10 +108,13 @@ class TestPlamo3Config(CustomTestCase):
         sliding = rs["sliding_attention"]
         self.assertEqual(sliding["rope_type"], "default")
 
-    def test_rope_scaling_requires_initial_context_length(self):
-        cfg = self._make(rope_scaling_factor=64.0, initial_context_length=None)
+    def test_rope_parameters_requires_initial_context_length(self):
         with self.assertRaises(AssertionError):
-            _ = cfg.rope_scaling
+            self._make(rope_scaling_factor=64.0, initial_context_length=None)
+
+    def test_default_rope_rejects_initial_context_length(self):
+        with self.assertRaises(AssertionError):
+            self._make(rope_scaling_factor=1, initial_context_length=4096)
 
     def test_rope_local_base_freq(self):
         cfg = self._make(rope_local_theta=12345)

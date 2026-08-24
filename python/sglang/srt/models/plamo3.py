@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -137,20 +136,13 @@ class Plamo3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
-        self.rope_theta = (
-            config.rope_local_theta if self.is_sliding else config.rope_theta
-        )
+        layer_type = config.layer_types[layer_id]
+        self.is_sliding = layer_type == "sliding_attention"
+        rope_parameters = dict(config.rope_parameters[layer_type])
+        self.rope_theta = rope_parameters.pop("rope_theta")
         rope_scaling = (
-            None if self.is_sliding else getattr(config, "rope_scaling", None)
+            None if rope_parameters.get("rope_type") == "default" else rope_parameters
         )
-        if rope_scaling is not None:
-            # PLaMo3 config returns a nested dict keyed by attention type.
-            key = "sliding_attention" if self.is_sliding else "full_attention"
-            rope_scaling = dict(rope_scaling.get(key, {}))
-            rope_scaling.pop("rope_theta", None)
-            if rope_scaling.get("rope_type") == "default":
-                rope_scaling = None
         self.rope_scaling = rope_scaling
         self.sliding_window = (
             get_attention_sliding_window_size(config) if self.is_sliding else None
@@ -372,7 +364,6 @@ class Plamo3TextModel(nn.Module):
 
 
 class Plamo3ForCausalLM(nn.Module):
-    config_class = Plamo3Config
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}

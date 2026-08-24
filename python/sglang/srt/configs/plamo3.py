@@ -1,12 +1,8 @@
-# SPDX-License-Identifier: Apache-2.0
 """PLaMo3 model configuration."""
 
-import logging
 from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
-
-logger = logging.getLogger(__name__)
 
 
 def is_full_attn(sliding_window_pattern: int, layer_idx: int) -> bool:
@@ -27,9 +23,9 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
         num_key_value_heads: int = 4,
         head_dim: int = 128,
         max_position_embeddings: int = 2048,
-        window_size: int = 2048,
+        window_size: int = 128,
         sliding_window_pattern: int = 8,
-        rope_theta: int = 1_000_000,
+        rope_theta: int = 150_000,
         rope_local_theta: int = 10_000,
         rope_scaling_factor: float = 1,
         initial_context_length: Optional[int] = None,
@@ -98,12 +94,23 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
         return ["attention" for _ in range(self.num_hidden_layers)]
 
     @property
-    def rope_scaling(self) -> dict[str, Any] | None:
+    def rope_parameters(self) -> dict[str, Any]:
+        rope_parameters_all = {
+            "full_attention": {},
+            "sliding_attention": {
+                "rope_theta": self.rope_local_theta,
+                "rope_type": "default",
+            },
+        }
         if self.rope_scaling_factor == 1:
-            return None
-        assert self.initial_context_length is not None
-        return {
-            "full_attention": {
+            assert self.initial_context_length is None
+            rope_parameters_all["full_attention"] = {
+                "rope_theta": self.rope_theta,
+                "rope_type": "default",
+            }
+        else:
+            assert self.initial_context_length is not None
+            rope_parameters_all["full_attention"] = {
                 "rope_theta": self.rope_theta,
                 "beta_fast": 32.0,
                 "beta_slow": 1.0,
@@ -111,12 +118,16 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
                 "original_max_position_embeddings": self.initial_context_length,
                 "rope_type": "yarn",
                 "truncate": False,
-            },
-            "sliding_attention": {
-                "rope_theta": self.rope_local_theta,
-                "rope_type": "default",
-            },
+            }
+        return {
+            layer_type: rope_parameters_all[layer_type]
+            for layer_type in set(self.layer_types)
         }
+
+    @rope_parameters.setter
+    def rope_parameters(self, rope_parameters: dict[str, Any]) -> None:
+        # Transformers may normalize this property during config initialization.
+        pass
 
     @property
     def rope_local_base_freq(self) -> int:
