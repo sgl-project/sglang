@@ -15,7 +15,11 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -42,7 +46,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -271,88 +275,6 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
-@dataclass(frozen=True)
-class DSAIndexerMetadata(BaseIndexerMetadata):
-    attn_metadata: DSAMetadata
-    topk_transform_method: TopkTransformMethod
-    topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
-    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
-    force_unfused_topk: bool = False
-
-    def get_seqlens_int32(self) -> torch.Tensor:
-        return self.attn_metadata.cache_seqlens_int32
-
-    def get_page_table_64(self) -> torch.Tensor:
-        return self.attn_metadata.real_page_table
-
-    def get_page_table_1(self) -> torch.Tensor:
-        return self.attn_metadata.page_table_1
-
-    def get_seqlens_expanded(self) -> torch.Tensor:
-        return self.attn_metadata.dsa_seqlens_expanded
-
-    def get_cu_seqlens_k(self) -> torch.Tensor:
-        return self.attn_metadata.cu_seqlens_k
-
-    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.attn_metadata.indexer_k_start_end
-
-    def get_indexer_seq_len(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens
-
-    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens_cpu
-
-    def get_dsa_extend_len_cpu(self) -> List[int]:
-        return self.attn_metadata.dsa_extend_seq_lens_list
-
-    def get_token_to_batch_idx(self) -> torch.Tensor:
-        return self.attn_metadata.token_to_batch_idx
-
-    def topk_transform(
-        self,
-        logits: torch.Tensor,
-        topk: int,
-        ks: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        ke_offset: Optional[torch.Tensor] = None,
-        batch_idx_list: Optional[List[int]] = None,
-        topk_indices_offset_override: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if topk_indices_offset_override is not None:
-            cu_topk_indices_offset = topk_indices_offset_override
-            cu_seqlens_q_topk = None
-        elif cu_seqlens_q is not None:
-            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
-            cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-                # Avoid reading sum(cu_seqlens_q) back to the host.
-                output_size=logits.shape[0],
-            )
-        else:
-            cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
-            cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
-        if ke_offset is not None:
-            seq_lens_topk = ke_offset
-        else:
-            seq_lens_topk = self.get_seqlens_expanded()
-        return self.topk_backend.topk_transform(
-            logits=logits,
-            lengths=seq_lens_topk,
-            topk=topk,
-            topk_transform_method=self.topk_transform_method,
-            attn_metadata=self.attn_metadata,
-            cu_seqlens_q_topk=cu_seqlens_q_topk,
-            topk_indices_offset=cu_topk_indices_offset,
-            row_starts=ks,
-            batch_idx_list=batch_idx_list,
-            force_unfused_topk=self.force_unfused_topk,
-        )
-
-
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -367,6 +289,10 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
+
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
@@ -387,7 +313,7 @@ class DeepseekSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
@@ -411,10 +337,9 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.dsa_prefill_impl: _DSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
-        )
-        self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.supports_mha_one_shot: bool = True
+        self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
+        self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -467,15 +392,11 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
-            model_runner.server_args, seed_dsa_topk_from_draft_extend
-        )
+        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -2960,7 +2881,9 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
+        # branch and falls through to the aiter flash_attn_varlen_func path below.
         if self.device_sm_major >= 10:
             import flashinfer
 
@@ -3220,9 +3143,14 @@ class DeepseekSparseAttnBackend(
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
-                rope_positions = cp_split_and_rebuild_position(
-                    forward_batch, rope_positions
-                )
+                if is_cp_v2_active(forward_batch):
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
+                else:
+                    rope_positions = cp_split_and_rebuild_position(
+                        forward_batch, rope_positions
+                    )
 
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
@@ -3398,11 +3326,14 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                self.supports_mha_one_shot
+                and (
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or _IS_GFX95
+                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]

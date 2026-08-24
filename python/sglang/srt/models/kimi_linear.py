@@ -49,7 +49,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import is_xpu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -113,6 +113,9 @@ class KimiMoE(nn.Module):
             layer_id=self.layer_idx,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            activation=config.hidden_act,
+            gemm1_alpha=config.activation_situ_beta,
+            gemm1_clamp_limit=config.activation_situ_linear_beta,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -405,7 +408,10 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
+            if not forward_batch.forward_mode.is_target_verify():
+                # Only chunk_kda (extend) wants pre-activated beta; the verify
+                # kernel sigmoids it in-kernel like decode.
+                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -544,7 +550,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = get_stream("alt")
+        self.alt_stream = None if is_xpu() else get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -866,6 +872,12 @@ class KimiLinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        # Derive the absorbed MLA weights. Also called by the dummy loader
+        # (`_post_load_weights`), which never runs `load_weights` — keeping the
+        # derivation only there left `w_kc` None under --load-format dummy.
         for layer_id in self.config.full_attention_layer_ids:
             if not self.model.start_layer <= layer_id < self.model.end_layer:
                 continue

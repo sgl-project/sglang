@@ -11,7 +11,7 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import msgspec
 
@@ -44,6 +44,14 @@ class CacheConfig(msgspec.Struct):
     pp_rank: int
     dp_size: int
     ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    enable_dp_attention: bool
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
@@ -327,6 +335,34 @@ class DaemonModelSpec(NamedTuple):
         return format_daemon_role(self.is_draft_model, self.draft_model_idx)
 
 
+def resolve_daemon_model_identity(
+    *,
+    is_draft_model: bool,
+    model_path: str,
+    quantization: Optional[str],
+    revision: Optional[str],
+    speculative_draft_model_path: Optional[str] = None,
+    speculative_draft_model_quantization: Optional[str] = None,
+    speculative_draft_model_revision: Optional[str] = None,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Resolve (model_path, quantization, revision) for one daemon role.
+
+    The draft fallbacks mirror ``ModelConfig.from_server_args``, which resolves
+    the draft model as ``speculative_draft_model_path or model_path``, its
+    quantization as ``speculative_draft_model_quantization`` (no fallback to the
+    target's) and its revision as ``speculative_draft_model_revision or
+    revision``. Both the launchers' spec list and the daemon itself go through
+    this so the CacheConfig fingerprint cannot drift from the draft worker's.
+    """
+    if not is_draft_model:
+        return model_path, quantization, revision
+    return (
+        speculative_draft_model_path or model_path,
+        speculative_draft_model_quantization,
+        speculative_draft_model_revision or revision,
+    )
+
+
 def build_daemon_model_specs(
     *,
     model_path: str,
@@ -342,11 +378,9 @@ def build_daemon_model_specs(
     """Build the per-rank daemon set: the target model, plus the draft model
     when speculative decoding is enabled.
 
-    The draft fallbacks mirror ``ModelConfig.from_server_args``, which resolves
-    the draft model as ``speculative_draft_model_path or model_path`` and its
-    revision as ``speculative_draft_model_revision or revision``. Keeping the
-    same fallbacks here is what makes the daemon's CacheConfig fingerprint match
-    the one the draft worker computes.
+    Model identity per role comes from ``resolve_daemon_model_identity``, the
+    same helper the daemon uses, so the launcher's view and the daemon's load
+    always describe the same checkpoint.
     """
     specs = [
         DaemonModelSpec(
@@ -369,12 +403,23 @@ def build_daemon_model_specs(
             "share the target daemons' rendezvous endpoint."
         )
 
+    draft_model_path, draft_quantization, draft_revision = (
+        resolve_daemon_model_identity(
+            is_draft_model=True,
+            model_path=model_path,
+            quantization=quantization,
+            revision=revision,
+            speculative_draft_model_path=speculative_draft_model_path,
+            speculative_draft_model_quantization=speculative_draft_model_quantization,
+            speculative_draft_model_revision=speculative_draft_model_revision,
+        )
+    )
     specs.append(
         DaemonModelSpec(
             is_draft_model=True,
-            model_path=speculative_draft_model_path or model_path,
-            quantization=speculative_draft_model_quantization,
-            revision=speculative_draft_model_revision or revision,
+            model_path=draft_model_path,
+            quantization=draft_quantization,
+            revision=draft_revision,
             draft_model_idx=None,
             speculative_algorithm=speculative_algorithm,
             dist_init_method=draft_dist_init_method,

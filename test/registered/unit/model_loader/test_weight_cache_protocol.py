@@ -7,7 +7,7 @@ These cover the pure-Python logic that the GPU end-to-end test
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig fingerprint matching / (de)serialization
   - quant-config hashing and method-name extraction
-  - the daemon rank formula and socket/ready path derivation
+  - daemon spawn configuration and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
     quant methods off the zero-copy path)
   - stale-vs-live daemon file cleanup
@@ -21,6 +21,9 @@ import os
 import socket
 import struct
 import unittest
+from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
@@ -39,7 +42,13 @@ from sglang.srt.weight_cache.protocol import (
     is_ipc_quant_supported,
     normalize_draft_model_idx,
     recv_msg,
+    resolve_daemon_model_identity,
     send_msg,
+)
+from sglang.srt.weight_cache.transport import (
+    TORCH_IPC_BACKEND,
+    TorchIpcTransportBackend,
+    get_client_transport_backend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -57,6 +66,14 @@ def _make_cache_config(**overrides) -> CacheConfig:
         pp_rank=0,
         dp_size=1,
         ep_size=1,
+        moe_dp_size=1,
+        moe_dp_rank=0,
+        moe_ep_rank=0,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        attn_cp_size=1,
+        moe_dense_tp_size=None,
+        moe_a2a_backend="none",
         quant_method="",
         quant_config_hash="",
         dtype="torch.float16",
@@ -115,6 +132,38 @@ class TestProtocolFraming(CustomTestCase):
             b.close()
 
 
+class TestTransportBackend(CustomTestCase):
+    def test_default_backend_is_torch_ipc(self):
+        backend = get_client_transport_backend(None)
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_unknown_backend_raises(self):
+        with self.assertRaises(RuntimeError):
+            get_client_transport_backend("does_not_exist")
+
+    def test_torch_ipc_backend_round_trip(self):
+        backend = TorchIpcTransportBackend()
+        state_tensors = {"x": (torch.arange(8, dtype=torch.float32), True)}
+        entries = backend.prepare_export(state_tensors)
+
+        a, b = socket.socketpair()
+        try:
+            backend.send_fetch_state_response(
+                a,
+                config={"k": "v"},
+                entries=entries,
+                pid=123,
+            )
+            resp = recv_msg(b)
+            resp = backend.recv_fetch_state_response(b, resp)
+            imported = backend.import_tensor(resp["entries"]["x"])
+            self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
+            self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
+        finally:
+            a.close()
+            b.close()
+
+
 class TestCacheConfig(CustomTestCase):
     def test_identical_configs_match(self):
         self.assertTrue(_make_cache_config().matches(_make_cache_config()))
@@ -123,6 +172,11 @@ class TestCacheConfig(CustomTestCase):
         base = _make_cache_config()
         for field, value in (
             ("tp_rank", 1),
+            ("moe_dp_rank", 1),
+            ("moe_ep_rank", 1),
+            ("enable_dp_attention", True),
+            ("moe_dense_tp_size", 1),
+            ("moe_a2a_backend", "mooncake"),
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
             ("model_path", "/models/other"),
@@ -287,6 +341,132 @@ class TestDaemonModelSpecs(CustomTestCase):
                 target_dist_init_method="tcp://127.0.0.1:1000",
                 speculative_algorithm="EAGLE",
             )
+
+    def test_draft_identity_resolution_matches_spec(self):
+        # The daemon resolves its own identity through the same helper, so the
+        # launcher's spec and the daemon's load always name one checkpoint.
+        self.assertEqual(
+            resolve_daemon_model_identity(
+                is_draft_model=True,
+                model_path="/models/demo",
+                quantization="fp8",
+                revision="v1",
+                speculative_draft_model_quantization="fp8",
+            ),
+            ("/models/demo", "fp8", "v1"),
+        )
+        # The target role passes its own values through untouched.
+        self.assertEqual(
+            resolve_daemon_model_identity(
+                is_draft_model=False,
+                model_path="/models/demo",
+                quantization="fp8",
+                revision="v1",
+                speculative_draft_model_path="/models/draft",
+            ),
+            ("/models/demo", "fp8", "v1"),
+        )
+
+
+class TestDaemonLaunchConfiguration(CustomTestCase):
+    def test_spawn_forwards_complete_server_args_without_projection(self):
+        from sglang.srt.weight_cache import daemon
+
+        # The spawn helper receives Engine's already-resolved ServerArgs. A
+        # minimal namespace keeps this projection test CPU-only and
+        # model-independent; importantly, no EPLB configuration is involved.
+        server_args = SimpleNamespace(
+            model_path="/models/demo",
+            tp_size=8,
+            pp_size=1,
+            dp_size=8,
+            ep_size=8,
+            moe_dp_size=2,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            attn_cp_size=2,
+            moe_dense_tp_size=1,
+            moe_a2a_backend="mooncake",
+            deepep_mode="low_latency",
+            load_format="safetensors",
+            dtype="bfloat16",
+            quantization="fp8",
+            model_loader_extra_config='{"key": "value"}',
+            trust_remote_code=True,
+            revision="test-revision",
+        )
+
+        class FakeProcess:
+            pid = 1234
+
+            def start(self):
+                pass
+
+        class FakeContext:
+            def Process(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeProcess()
+
+        fake_context = FakeContext()
+        from unittest import mock
+
+        with mock.patch.object(
+            daemon.multiprocessing, "get_context", return_value=fake_context
+        ) as get_context:
+            result = daemon.spawn_weight_cache_daemon(
+                server_args,
+                gpu_id=3,
+                tp_rank=3,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29500",
+            )
+
+        get_context.assert_called_once_with("spawn")
+        self.assertIsInstance(result, FakeProcess)
+        self.assertIs(fake_context.kwargs["target"], daemon.run_weight_cache_daemon)
+        self.assertEqual(
+            fake_context.kwargs["args"],
+            (server_args, 3, 3, 0, "tcp://127.0.0.1:29500", False, None),
+        )
+
+    def test_spawn_forwards_draft_role(self):
+        from sglang.srt.weight_cache import daemon
+
+        # A draft daemon shares the resolved ServerArgs with the target and is
+        # distinguished only by its role, which selects its socket and the draft
+        # branch of the model identity resolution.
+        server_args = SimpleNamespace(model_path="/models/demo")
+
+        class FakeProcess:
+            pid = 1234
+
+            def start(self):
+                pass
+
+        class FakeContext:
+            def Process(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeProcess()
+
+        fake_context = FakeContext()
+        from unittest import mock
+
+        with mock.patch.object(
+            daemon.multiprocessing, "get_context", return_value=fake_context
+        ):
+            daemon.spawn_weight_cache_daemon(
+                server_args,
+                gpu_id=3,
+                tp_rank=3,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29501",
+                is_draft_model=True,
+            )
+
+        self.assertEqual(
+            fake_context.kwargs["args"],
+            (server_args, 3, 3, 0, "tcp://127.0.0.1:29501", True, None),
+        )
 
 
 class TestIpcQuantAllowlist(CustomTestCase):

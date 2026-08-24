@@ -130,6 +130,7 @@ def _slice_rollout_trajectory_for_sample(
         dit_trajectory = RolloutDitTrajectory(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
+            sigmas=dit.sigmas,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -143,6 +144,7 @@ def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
     *,
     serialized_dit_timesteps: dict | None = None,
+    serialized_dit_sigmas: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     """Return order: rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory."""
     if rtd is None:
@@ -182,6 +184,7 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(dit.latents) if dit.latents is not None else None
             ),
             "timesteps": serialized_dit_timesteps,
+            "sigmas": serialized_dit_sigmas,
         }
     return (
         serialized_log_probs,
@@ -211,9 +214,13 @@ def _build_response(
         ), "rollout_trajectory_data must be present when rollout=True"
 
     serialized_dit_timesteps = None
+    serialized_dit_sigmas = None
     if rollout and rollout_trajectory_data and rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(
             rollout_trajectory_data.dit_trajectory.timesteps
+        )
+        serialized_dit_sigmas = _maybe_serialize(
+            rollout_trajectory_data.dit_trajectory.sigmas
         )
 
     responses: list[RolloutResponse] = []
@@ -245,6 +252,7 @@ def _build_response(
         ) = _serialize_rollout_trajectory(
             per_sample_trajectory,
             serialized_dit_timesteps=serialized_dit_timesteps,
+            serialized_dit_sigmas=serialized_dit_sigmas,
         )
         responses.append(
             RolloutResponse(

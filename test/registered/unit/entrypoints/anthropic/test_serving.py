@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 from fastapi.responses import JSONResponse  # noqa: E402
+from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
@@ -27,12 +28,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
+    native_reasoning_history = False
+
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
+
+    def supports_native_reasoning_history(self):
+        return self.native_reasoning_history
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
@@ -140,6 +146,22 @@ class TestAnthropicServing(unittest.TestCase):
         "{{- message.role }}: {{ message.content }}\n"
         "{%- endfor %}"
     )
+    GLM_TOOL_RESULT_TEMPLATE = """
+{%- for message in messages if message.role == "tool" -%}
+{%- if loop.first -%}<|observation|>{%- endif -%}
+{%- if message.content is string -%}
+<tool_response>{{ message.content }}</tool_response>
+{%- elif message.content.0.type == "tool_reference" -%}
+<tool_response><tools>
+{%- for reference in message.content -%}
+{%- for tool in tools if tool.function.name == reference.name -%}
+{{ tool.function.name }}
+{%- endfor -%}
+{%- endfor -%}
+</tools></tool_response>
+{%- endif -%}
+{%- endfor -%}
+"""
 
     def _serving(self, stream_lines=None, chat_template=None):
         return AnthropicServing(_FakeOpenAIServingChat(stream_lines, chat_template))
@@ -153,6 +175,26 @@ class TestAnthropicServing(unittest.TestCase):
         }
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
+
+    def _tool_result_request(self, content, tools=None):
+        overrides = {
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": content,
+                        }
+                    ],
+                }
+            ],
+        }
+        if tools is not None:
+            overrides["tools"] = tools
+        return self._anthropic_request(**overrides)
 
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
@@ -372,6 +414,74 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("SGLang docs", tool_message["content"])
         self.assertIn("https://docs.sglang.ai", tool_message["content"])
         self.assertIn("Anthropic API notes", tool_message["content"])
+
+    def test_mixed_tool_reference_content_preserves_part_order(self):
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "text", "text": "Ready"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual([message["role"] for message in messages], ["tool"] * 3)
+        self.assertEqual(
+            [message["tool_call_id"] for message in messages], ["call_1"] * 3
+        )
+        self.assertEqual(messages[0]["content"], "Tool loaded: Bash")
+        self.assertEqual(
+            messages[1]["content"],
+            [{"type": "tool_reference", "name": "Bash"}],
+        )
+        self.assertEqual(messages[2]["content"], "Ready")
+
+    def test_mixed_tool_reference_content_renders_text_and_schema(self):
+        template = Environment().from_string(self.GLM_TOOL_RESULT_TEMPLATE)
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+            ],
+            tools=[
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": True,
+                }
+            ],
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        payload = chat_request.model_dump(exclude_none=True)
+        prompt = template.render(messages=payload["messages"], tools=payload["tools"])
+
+        self.assertIn("<tool_response>Tool loaded: Bash</tool_response>", prompt)
+        self.assertIn("<tools>Bash</tools>", prompt)
+        self.assertEqual(prompt.count("<|observation|>"), 1)
+
+    def test_reference_only_tool_result_remains_one_message(self):
+        request = self._tool_result_request(
+            [
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "tool_reference", "tool_name": "Read"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "tool_reference", "name": "Bash"},
+                {"type": "tool_reference", "name": "Read"},
+            ],
+        )
 
     def test_builtin_web_search_tool_without_schema_is_skipped(self):
         request = AnthropicMessagesRequest.model_validate(
@@ -854,6 +964,63 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("<think>", joined)
         self.assertIn("ponder", joined)
         self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+
+    def test_assistant_thinking_history_uses_native_reasoning_content(self):
+        """Channel-framing encoders take thinking history as ``reasoning_content``.
+
+        Splicing the detector's markers into content would nest a reasoning block
+        inside the content channel and leave the real one empty, training the
+        model to emit raw markers as visible text.
+        """
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+            def wrap_reasoning_history(self, text):
+                raise AssertionError("must not rewrap for a native-history encoder")
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+
+    def test_thinking_only_turn_keeps_native_reasoning_content(self):
+        """An assistant turn that is only thinking still carries its reasoning."""
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "ponder"}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""
