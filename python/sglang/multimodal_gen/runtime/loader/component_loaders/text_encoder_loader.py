@@ -43,6 +43,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_conf
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
+    QuantoInt8Config,
+    inspect_quanto_int8_checkpoint,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
+    normalize_quanto_int8_weights,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
@@ -91,8 +98,14 @@ from sglang.multimodal_gen.runtime.weights.source import (
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod as SrtUnquantizedLinearMethod,
+)
 
 logger = init_logger(__name__)
+
+_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
 
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
@@ -126,6 +139,23 @@ def _get_encoder_quant_config(
     model_cls: type[nn.Module] | None = None,
 ):
     quant_config = get_quant_config(component_config, component_model_path)
+    name_mapper = None
+    if model_cls is not None:
+        mapping = vars(model_cls).get("param_names_mapping", {})
+        if mapping:
+            mapping_fn = get_param_names_mapping(mapping)
+
+            def name_mapper(name: str) -> str:
+                # Layer-prefix metadata omits the suffix that many model
+                # mappings use to delimit a parameter name.
+                mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
+                if merge_index is not None:
+                    raise ValueError(
+                        "Serialized quantized component weights cannot use a "
+                        "stacked parameter-name mapping"
+                    )
+                return mapped_name.removesuffix(".weight")
+
     if (
         quant_config is None
         and component_weights_path != component_model_path
@@ -135,26 +165,16 @@ def _get_encoder_quant_config(
             component_weights_path
         )
     if quant_config is None and component_weights_path.endswith(".safetensors"):
-        name_mapper = None
-        if model_cls is not None:
-            mapping = vars(model_cls).get("param_names_mapping", {})
-            if mapping:
-                mapping_fn = get_param_names_mapping(mapping)
-
-                def name_mapper(name: str) -> str:
-                    mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
-                    if merge_index is not None:
-                        raise ValueError(
-                            "Comfy quantized component weights cannot use a "
-                            "stacked parameter-name mapping"
-                        )
-                    return mapped_name.removesuffix(".weight")
-
-        markers = inspect_comfy_quant_markers(
-            [component_weights_path],
+        quant_config = inspect_quanto_int8_checkpoint(
+            component_weights_path,
             param_name_mapper=name_mapper,
         )
-        quant_config = resolve_comfy_checkpoint_quantization(markers)
+        if quant_config is None:
+            markers = inspect_comfy_quant_markers(
+                [component_weights_path],
+                param_name_mapper=name_mapper,
+            )
+            quant_config = resolve_comfy_checkpoint_quantization(markers)
     return quant_config
 
 
@@ -165,8 +185,14 @@ def _configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
+        if explicit_quantization is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} manages its own checkpoint quantization and "
+                "does not support an online quantization override"
+            )
         # Preserve model-owned formats such as Ideogram's bitsandbytes state.
         # Those models parse metadata, construct layers, and attach quant states
         # themselves; running the generic lifecycle as well would process twice.
@@ -188,6 +214,24 @@ def _configure_encoder_quantization(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
     model_config.quant_config = quant_config
+    if explicit_quantization is not None:
+        if quant_config is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} already declares checkpoint quantization; "
+                "drop the explicit online quantization override"
+            )
+        if explicit_quantization not in _ONLINE_ENCODER_QUANTIZATIONS:
+            raise ComponentCheckpointUnsupportedError(
+                f"Online quantization {explicit_quantization!r} is not supported "
+                f"for native encoders; choose one of "
+                f"{sorted(_ONLINE_ENCODER_QUANTIZATIONS)}"
+            )
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            get_quantization_config,
+        )
+
+        model_config.quant_config = get_quantization_config(explicit_quantization)()
+        quant_config = model_config.quant_config
     if quant_config is None:
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
@@ -204,6 +248,7 @@ def _resolve_and_configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
@@ -224,6 +269,11 @@ def _resolve_and_configure_encoder_quantization(
                 f"Cannot parse checkpoint quantization for {component_name!r}: "
                 f"{quantization_error}"
             ) from quantization_error
+        if explicit_quantization is not None and quant_config is None:
+            raise ComponentCheckpointUnsupportedError(
+                f"Online quantization for {component_name!r} requires an in-tree "
+                f"native encoder; unsupported architectures: {architectures}"
+            ) from resolution_error
         if quant_config is None:
             raise
         raise ComponentCheckpointUnsupportedError(
@@ -238,6 +288,7 @@ def _resolve_and_configure_encoder_quantization(
         component_model_path,
         component_weights_path,
         component_name,
+        explicit_quantization,
     )
     return model_cls
 
@@ -271,10 +322,13 @@ def _process_quantized_encoder_weights(
 ) -> int:
     processed_layers = 0
     for module in model.modules():
-        if not isinstance(module, LinearBase):
+        if not isinstance(module, (LinearBase, SrtLinearBase)):
             continue
         quant_method = module.quant_method
-        if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
+        if quant_method is None or isinstance(
+            quant_method,
+            (UnquantizedLinearMethod, SrtUnquantizedLinearMethod),
+        ):
             continue
 
         origin_device = _module_tensor_device(module)
@@ -307,9 +361,12 @@ def _require_quantized_encoder_layers(
     quant_config: QuantizationConfig | None = None,
 ) -> None:
     has_quantized_layers = any(
-        isinstance(module, LinearBase)
+        isinstance(module, (LinearBase, SrtLinearBase))
         and module.quant_method is not None
-        and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        and not isinstance(
+            module.quant_method,
+            (UnquantizedLinearMethod, SrtUnquantizedLinearMethod),
+        )
         for module in model.modules()
     )
     if not has_quantized_layers:
@@ -327,11 +384,20 @@ def _require_quantized_encoder_layers(
             KitchenW4A8Config,
         ),
     ):
-        missing = set(quant_config.layer_markers) - set(quant_config.selected)
+        expected = set(quant_config.layer_markers)
+        selected = set(quant_config.selected)
+    elif isinstance(quant_config, QuantoInt8Config):
+        expected = quant_config.layer_prefixes
+        selected = quant_config.selected
+    else:
+        expected = set()
+        selected = set()
+    if expected:
+        missing = expected - selected
         if missing:
             raise ComponentCheckpointUnsupportedError(
                 f"The native {type(model).__name__} implementation did not consume "
-                f"Comfy quantization markers for {component_name!r}: "
+                f"serialized quantization markers for {component_name!r}: "
                 f"{sorted(missing)[:5]}"
             )
 
@@ -371,6 +437,15 @@ class TextEncoderLoader(ComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
+    supports_online_quantization_override = True
+
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        return (
+            super().should_raise_customized_load_error(server_args, component_name)
+            or component_name in server_args.component_quantizations
+        )
 
     @staticmethod
     def resolve_model_weights_path(
@@ -617,7 +692,13 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             component_weights_path,
             component_name,
+            server_args.component_quantizations.get(component_name),
         )
+        if issubclass(model_cls, EncoderTensorParallelMixin):
+            model_cls.configure_component_paths(
+                encoder_config,
+                server_args.component_paths,
+            )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (
             server_args.batching_max_size > 1
@@ -785,17 +866,18 @@ class TextEncoderLoader(ComponentLoader):
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
-            loaded_weights = model.load_weights(
-                self._get_all_weights(
-                    model,
-                    model_path,
-                    to_cpu=component_starts_on_cpu,
-                )
+            checkpoint_weights = self._get_all_weights(
+                model,
+                model_path,
+                to_cpu=component_starts_on_cpu,
             )
+            if isinstance(quant_config, QuantoInt8Config):
+                checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
+            loaded_weights = model.load_weights(checkpoint_weights)
 
             if quant_config is not None:
                 postprocess_device: torch.device | None = local_torch_device
-                if isinstance(quant_config, ComfyNvfp4Config) or (
+                if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
                     isinstance(quant_config, KitchenInt8Config)
                     and quant_config.is_checkpoint_int8_serialized
                 ):

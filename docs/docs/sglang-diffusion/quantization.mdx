@@ -50,9 +50,11 @@ directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
-MiniMax-H3 has public Comfy safetensors with per-layer metadata,
+MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
 including `pruned_fp8_scaled`, serialized ConvRot formats, and the official
-NVFP4-AWQ Qwen3-VL encoder. Pass one selected component file by local path,
+NVFP4-AWQ Qwen3-VL encoder. Other Comfy FP8 exports are also auto-detected: the
+presence of an input scale selects static activation scaling, while its absence
+selects dynamic scaling. Pass one selected DiT or component file by local path,
 `owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do not
 combine it with an explicit quantization option. Its GGUF usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
@@ -143,6 +145,14 @@ backend.
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
     <tr>
+      <td><code>auto-round</code> W4A16</td>
+      <td>Transformer component repo with a self-describing <code>quantization_config</code> and <code>auto_round:auto_gptq</code> packing</td>
+      <td><code>--transformer-path</code></td>
+      <td>Native dense DiTs with compatible component parameter mappings; MiniMax-H3 Diffusers components are supported</td>
+      <td>None</td>
+      <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
       <td><code>modelopt-nvfp4</code></td>
       <td>Mixed transformer directory/repo with <code>config.json</code>, raw or Comfy layer-marked NVFP4 safetensors, or full ModelOpt Diffusers repo</td>
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
@@ -175,6 +185,14 @@ backend.
       <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
+      <td><code>mxfp8</code></td>
+      <td>Self-describing serialized weights, or BF16/FP16 weights for online quantization</td>
+      <td><code>--transformer-weights-path</code>, or <code>--quantization mxfp8</code> for online quantization</td>
+      <td>Native diffusion linears; mixed MiniMax-H3 checkpoints are selected per layer</td>
+      <td>SRT's platform MXFP8 backend</td>
+      <td>Serialized metadata is auto-detected. NVIDIA and ROCm reuse SRT's dense MXFP8 kernels; Ascend keeps its native online path. Mixed per-layer checkpoints do not support FSDP.</td>
+    </tr>
+    <tr>
       <td><code>comfy-w4a8-convrot</code></td>
       <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
       <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
@@ -197,6 +215,14 @@ backend.
       <td>MiniMax-H3 native Qwen3-VL encoder</td>
       <td>None</td>
       <td>Auto-detected; omit explicit quantization. Preserves packed storage, high-nibble-first weights, swizzled block scales, and AWQ input pre-scales. Each active NVFP4 matrix is dequantized for BF16/FP16 compute, so this is a memory path rather than a native FP4 speed path.</td>
+    </tr>
+    <tr>
+      <td><code>quanto-int8</code></td>
+      <td>One native encoder safetensors file with an embedded Quanto quantization map</td>
+      <td>An explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native encoders whose mapped linear layers consume every declared qint8 entry; MiniMax-H3's Qwen3-VL encoder is supported</td>
+      <td>None</td>
+      <td>Auto-detected weight-only qint8 storage. Each active matrix is dequantized to the compute dtype for the ordinary linear operation, so this reduces stored/resident weight memory rather than promising INT8 GEMM speed. TP and offload are supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -1146,11 +1172,13 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
     - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
 
-## MXFP8 Online Quantization
+## MXFP8 Quantization
 
-For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
-Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
-during inference with `npu_quant_matmul` (block_size=32).
+Self-describing serialized MXFP8 transformers are inferred from their
+checkpoint metadata. For online MXFP8 quantization, load the original
+FP16/BF16 model and add `--quantization mxfp8`. NVIDIA and ROCm reuse SRT's
+dense MXFP8 implementation; Ascend uses `npu_dynamic_mx_quant` and
+`npu_quant_matmul` with a block size of 32.
 
 ```bash
 sglang generate \
@@ -1160,7 +1188,9 @@ sglang generate \
   --save-output
 ```
 
-> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
+The selected SRT backend must provide an MXFP8 kernel on NVIDIA or ROCm. On
+Ascend, the hardware requirement remains A5 series or newer;
+`npu_dynamic_mx_quant` is not available on A2/A3.
 
 ## MXFP8 Offline Quantization (msmodelslim)
 
