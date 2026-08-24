@@ -19,6 +19,9 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import ( 
     _kv_splits_heuristic,
     _prev_pow2,
 )
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # MI355X. Passed explicitly so the tests are device-independent and run on CPU.
 NUM_CU = 256
@@ -107,3 +110,9 @@ def test_scales_with_device_width(num_cu):
     splits = _kv_splits_heuristic(32, HEADS, BLOCK_H, num_cu=num_cu)
     assert 1 <= splits <= _MAX_KV_SPLITS
     assert splits & (splits - 1) == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
