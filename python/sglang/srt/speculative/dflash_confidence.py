@@ -85,10 +85,12 @@ def select_sps_verify_token_budget(
 
     survival = torch.cumprod(confidence.float().clamp(0.0, 1.0), dim=1)
     candidates = torch.sort(survival.reshape(-1).double(), descending=True).values
-    expected = torch.cat((
-        torch.tensor([float(bs)], dtype=torch.float64),
-        float(bs) + torch.cumsum(candidates, dim=0),
-    ))
+    expected = torch.cat(
+        (
+            torch.tensor([float(bs)], dtype=torch.float64),
+            float(bs) + torch.cumsum(candidates, dim=0),
+        )
+    )
     budgets = range(expected.numel())
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_seconds = torch.tensor(

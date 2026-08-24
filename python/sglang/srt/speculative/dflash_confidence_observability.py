@@ -57,8 +57,12 @@ class DFlashConfidenceObserver:
             return float("nan")
         # Use the lower empirical rank. It is stable across Python versions
         # (unlike banker's rounding) and makes percentile reporting conservative.
-        rank = max(0, min(self._confidence_count - 1, int(q * (self._confidence_count - 1))))
-        index = int(torch.searchsorted(torch.cumsum(self._confidence_hist, 0), rank + 1))
+        rank = max(
+            0, min(self._confidence_count - 1, int(q * (self._confidence_count - 1)))
+        )
+        index = int(
+            torch.searchsorted(torch.cumsum(self._confidence_hist, 0), rank + 1)
+        )
         return index / (self._HIST_BINS - 1)
 
     def dump(self) -> dict:
