@@ -1032,6 +1032,12 @@ class Envs:
     # it to trade that away for disk (1 keeps only the most recent build).
     SGLANG_JIT_CACHE_KEEP = EnvInt(None)
 
+    # Root of a MoE LoRA config tree overriding the packaged configs/
+    # directory per file (see sglang/srt/lora/moe/configs/README.md); the
+    # deployment surface for tables written by
+    # benchmark/kernels/lora_moe/tune_lora_config.py.
+    SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
+
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================
