@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -116,7 +116,21 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
+        # KV buffer uses hisparse device indices; index-K cache uses logical indices.
+        # Bypass DSATokenToKVPool to avoid double-wrapping and wrong index space.
+        if len(indices) == 0:
+            return {"kv": [], "index_k": []}
+        hisparse_indices = self.translate_loc_to_hisparse_device(indices)
+        kv_cache_cpu = MLATokenToKVPool.get_cpu_copy(
+            self, hisparse_indices, mamba_indices=mamba_indices
+        )
+        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+        if len(indices) == 0:
+            return
+        hisparse_indices = self.translate_loc_to_hisparse_device(indices)
+        MLATokenToKVPool.load_cpu_copy(
+            self, kv_cache_cpu_dict["kv"], hisparse_indices, mamba_indices=mamba_indices
+        )
+        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
