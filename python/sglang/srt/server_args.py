@@ -9203,12 +9203,9 @@ class ServerArgs:
         return max(candidate_steps) + 1
 
     @property
-    def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
-        if not hasattr(self, "_mamba_cache_chunk_size"):
-
+    def mamba_state_chunk_size(self) -> int:
+        """Chunk size used by the linear-attention kernel's intermediate states."""
+        if not hasattr(self, "_mamba_state_chunk_size"):
             try:
                 from sglang.kernels.ops.attention.fla.chunk_delta_h import (
                     CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -9218,7 +9215,16 @@ class ServerArgs:
                 FLA_CHUNK_SIZE = 64
 
             hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            self._mamba_state_chunk_size = getattr(
+                hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE
+            )
+        return self._mamba_state_chunk_size
+
+    @property
+    def mamba_cache_chunk_size(self) -> int:
+        """Radix checkpoint grid aligned to both state chunks and KV pages."""
+        if not hasattr(self, "_mamba_cache_chunk_size"):
+            chunk_size = self.mamba_state_chunk_size
             page_size = resolved_view(self).page_size
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
