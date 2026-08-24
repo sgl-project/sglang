@@ -16,7 +16,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
@@ -472,7 +476,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
 
     # In PD, prefill-only nodes never decode (indexer would OOM at large
     # bs) and decode-only nodes never extend.
-    disagg_mode = model_runner.server_args.disaggregation_mode
+    disagg_mode = get_disagg().disaggregation_mode
     run_decode = model_runner.is_generation and disagg_mode != "prefill"
     run_extend = disagg_mode != "decode"
 

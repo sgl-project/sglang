@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 
 """
 end to end attention solution with aiter kernels
@@ -152,7 +156,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
 
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
@@ -2957,7 +2961,7 @@ class AiterMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
