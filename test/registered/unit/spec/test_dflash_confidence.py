@@ -102,11 +102,33 @@ class TestDFlashConfidence(unittest.TestCase):
             target_verify_tokens=6,
         )
         # Both requests receive anchor + one proposal. The remaining two tokens
-        # are assigned to the lower-confidence request, while every request's
-        # selection remains a contiguous prefix.
-        self.assertEqual(decision.verify_lens.tolist(), [2, 4])
+        # are assigned to the higher-survival request, matching DSpark's top-k
+        # scheduler while preserving each request's contiguous prefix.
+        self.assertEqual(decision.verify_lens.tolist(), [4, 2])
         self.assertEqual(decision.deferred_tokens, 2)
         self.assertEqual(decision.low_confidence_tokens, 3)
+
+    def test_higher_survival_receives_remaining_budget_like_dspark(self):
+        decision = plan_verify_prefixes(
+            torch.tensor([[0.99, 0.99, 0.99], [0.10, 0.10, 0.10]]),
+            verify_num_draft_tokens=4,
+            confidence_threshold=0.5,
+            min_verify_len=2,
+            target_verify_tokens=6,
+        )
+        self.assertEqual(decision.verify_lens.tolist(), [4, 2])
+
+    def test_planner_does_not_mutate_confidence_input(self):
+        confidence = torch.tensor([[1.2, -0.1]])
+        original = confidence.clone()
+        plan_verify_prefixes(
+            confidence,
+            verify_num_draft_tokens=3,
+            confidence_threshold=0.5,
+            min_verify_len=1,
+            target_verify_tokens=2,
+        )
+        torch.testing.assert_close(confidence, original)
 
     def test_zero_target_budget_keeps_safe_minimum_floor(self):
         decision = plan_verify_prefixes(
@@ -148,7 +170,7 @@ class TestDFlashConfidence(unittest.TestCase):
         second = plan_verify_prefixes(confidence, **kwargs)
 
         self.assertTrue(torch.equal(first.verify_lens, second.verify_lens))
-        self.assertEqual(first.verify_lens.tolist(), [2, 5, 2])
+        self.assertEqual(first.verify_lens.tolist(), [5, 2, 2])
         self.assertTrue(
             bool(((first.verify_lens >= 2) & (first.verify_lens <= 5)).all())
         )
@@ -169,7 +191,7 @@ class TestDFlashConfidence(unittest.TestCase):
                         target_verify_tokens=target_budget,
                     )
                     survival = torch.cumprod(confidence, dim=1)
-                    priority = (survival < 0.5).float() * 2.0 + (1.0 - survival)
+                    priority = survival
                     expected = torch.full(
                         (batch_size,), min_verify_len, dtype=torch.int32
                     )
@@ -177,15 +199,19 @@ class TestDFlashConfidence(unittest.TestCase):
                         max(batch_size * min_verify_len, target_budget)
                         - batch_size * min_verify_len
                     )
-                    for _ in range(remaining):
-                        next_index = expected.to(torch.long) - 1
-                        eligible = next_index < confidence.shape[1]
-                        if not bool(eligible.any()):
-                            break
-                        score = torch.full((batch_size,), float("-inf"))
-                        active = torch.nonzero(eligible, as_tuple=False).flatten()
-                        score[active] = priority[active, next_index[active]]
-                        expected[torch.argmax(score)] += 1
+                    candidates = []
+                    for request_index in range(batch_size):
+                        for position_index in range(min_verify_len - 1, confidence.shape[1]):
+                            candidates.append(
+                                (
+                                    float(priority[request_index, position_index]),
+                                    position_index,
+                                    request_index,
+                                )
+                            )
+                    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+                    for _, _, request_index in candidates[:remaining]:
+                        expected[request_index] += 1
                     self.assertEqual(decision.verify_lens.tolist(), expected.tolist())
 
     def test_verify_prefix_contains_the_bonus_logit_for_every_request(self):

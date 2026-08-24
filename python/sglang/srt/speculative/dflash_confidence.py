@@ -131,10 +131,10 @@ def plan_verify_prefixes(
 
     Every request verifies at least its anchor. An anchor-only window still
     commits the target bonus, preserving progress without forcing a proposal.
-    Optional positions compete globally by
-    uncertainty (``1 - cumulative_confidence``), so lower-confidence paths are
-    verified earlier.  Prefix expansion is performed one round at a time to keep
-    every selected per-request set contiguous.
+    Optional positions compete globally by cumulative survival probability, so
+    higher-confidence paths are verified first, matching DSpark's top-k
+    scheduling objective. Prefix expansion is performed one request at a time
+    to keep every selected per-request set contiguous.
     """
 
     if confidence.ndim != 2:
@@ -153,14 +153,14 @@ def plan_verify_prefixes(
             f"{min_verify_len} for verify width {verify_num_draft_tokens}"
         )
 
-    confidence = confidence.float().clamp_(0.0, 1.0)
+    # Do not mutate the selector-confidence buffer: in overlap mode it may be
+    # published to the asynchronous relay after this planner returns.
+    confidence = confidence.float().clamp(0.0, 1.0)
     survival = torch.cumprod(confidence, dim=1)
-    # A lower survival is less trustworthy and should be verified sooner. The
-    # threshold forms an explicit urgency class; within each class uncertainty
-    # retains a stable, interpretable ordering.
-    uncertainty = 1.0 - survival
-    urgency = (survival < confidence_threshold).to(uncertainty.dtype)
-    priority = urgency * 2.0 + uncertainty
+    # DSpark's ScheduleVerifyLensTopk selects the largest cumulative-survival
+    # probabilities. Since survival is non-increasing along every request,
+    # allocating winning request runs preserves its prefix semantics.
+    priority = survival
     required_extra = min_verify_len - 1
     max_extra = gamma
     requested_total = max(bs * min_verify_len, int(target_verify_tokens))
@@ -173,22 +173,25 @@ def plan_verify_prefixes(
     remaining = budget_extra - bs * required_extra
     low_confidence_tokens = int((survival < confidence_threshold).sum().item())
 
-    # Per-request priority is monotonic along its chain because survival only
-    # decreases as confidence is multiplied. Consequently, after a request wins
-    # its next-position comparison, it remains at least as urgent as every
-    # request it beat until its prefix is full. Allocate whole winning runs,
-    # rather than launching one device-wide argmax per token. Stable sorting
-    # preserves the original request-index tie break of the token-by-token form.
+    # A global top-k over survival values is prefix-safe: survival is
+    # non-increasing along every request, so choosing position n also chooses
+    # every earlier position in that request. Match DSpark's deterministic
+    # descending order: survival, then position, then request index.
     if remaining:
-        capacity_per_request = max_extra - required_extra
-        next_priority = priority[:, required_extra]
-        request_order = torch.argsort(next_priority, descending=True, stable=True)
-        rank = torch.arange(bs, device=confidence.device, dtype=torch.int32)
-        rank = rank.unsqueeze(1)
-        starts = rank * capacity_per_request
-        extras = (remaining - starts).clamp_(min=0, max=capacity_per_request)
-        allocations = extras.squeeze(1).to(torch.int32)
-        lengths += allocations[request_order.argsort(stable=True)]
+        candidate_priority = priority[:, required_extra:]
+        request_index = torch.arange(bs, device=confidence.device).view(-1, 1)
+        request_index = request_index.expand_as(candidate_priority).reshape(-1)
+        position_index = torch.arange(
+            candidate_priority.shape[1], device=confidence.device
+        ).view(1, -1)
+        position_index = position_index.expand_as(candidate_priority).reshape(-1)
+        flat_priority = candidate_priority.reshape(-1)
+        order = torch.arange(flat_priority.numel(), device=confidence.device)
+        order = order[torch.argsort(request_index[order], stable=True)]
+        order = order[torch.argsort(position_index[order], stable=True)]
+        order = order[torch.argsort(-flat_priority[order], stable=True)]
+        chosen_requests = request_index[order[:remaining]]
+        lengths += torch.bincount(chosen_requests, minlength=bs).to(torch.int32)
 
     deferred_tokens = int((verify_num_draft_tokens - lengths).sum().item())
     return DFlashConfidenceDecision(
