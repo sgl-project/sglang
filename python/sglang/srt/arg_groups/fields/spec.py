@@ -36,7 +36,7 @@ class Spec:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DFLASH_CONFIDENCE, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[
@@ -73,6 +73,30 @@ class Spec:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_confidence_threshold: A[
+        float,
+        "DFLASH_CONFIDENCE only. Selected-path confidence threshold used for diagnostics and verify-prefix planning.",
+    ] = 0.5
+    speculative_dflash_confidence_min_verify_len: A[
+        int,
+        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token.",
+    ] = 2
+    speculative_dflash_confidence_target_verify_tokens: A[
+        int,
+        "DFLASH_CONFIDENCE only. Fixed total target-verify token target; zero preserves full verification without an SPS table.",
+    ] = 0
+    speculative_dflash_confidence_sps_table_path: A[
+        Optional[str],
+        "DFLASH_CONFIDENCE only. Path to a DSpark-format pre-profiled SPS cost table JSON.",
+    ] = None
+    speculative_dflash_confidence_sts_path: A[
+        Optional[str],
+        "DFLASH_CONFIDENCE only. Path to a per-position sequential temperature scaling calibration JSON for the trained confidence head.",
+    ] = None
+    speculative_dflash_confidence_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DFLASH_CONFIDENCE only. Fill compact ragged verification to its CUDA Graph token bucket.",
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

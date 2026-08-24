@@ -38,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DFLASH_CONFIDENCE = auto()
     UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -118,6 +119,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dflash_confidence(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH_CONFIDENCE
+
     def is_uno(self) -> bool:
         return self == SpeculativeAlgorithm.UNO
 
@@ -125,7 +129,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self.is_dflash() or self.is_dflash_confidence() or self.is_dspark()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -153,7 +157,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        return self.is_dspark() or self.is_dflash_confidence()
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
@@ -236,7 +240,7 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_dflash() or self.is_dflash_confidence():
             _handle_dflash(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
@@ -307,9 +311,9 @@ class SpeculativeAlgorithm(Enum):
             "Cannot create worker for NONE speculative algorithm."
         )
 
-        if self.is_dflash():
-            # V2 worker drives both overlap and non-overlap (scheduler runs it
-            # synchronously when overlap is disabled), same as EAGLE.
+        if self.is_dflash() or self.is_dflash_confidence():
+            # Both modes use the DFlash2 worker; DFLASH_CONFIDENCE only changes
+            # target-verify prefix scheduling and leaves draft/accept semantics intact.
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
