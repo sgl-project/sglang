@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
+    SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION: bool = False
+    SGLANG_DIFFUSION_FP8_MIXED_PRECISION_FIRST_STEPS: int = 3
+    SGLANG_DIFFUSION_FP8_MIXED_PRECISION_LAST_STEPS: int = 3
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -349,6 +352,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory is low or when this flag is disabled.
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
+    ),
+    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) DiT as
+    # W8A16: the same FP8 weights are dequantized per call and fed to a
+    # 16-bit GEMM, skipping activation quantization on the steps most
+    # sensitive to it. Middle steps keep the checkpoint's W8A8 path.
+    "SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION"
+    ),
+    "SGLANG_DIFFUSION_FP8_MIXED_PRECISION_FIRST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_FP8_MIXED_PRECISION_FIRST_STEPS", 3
+    ),
+    "SGLANG_DIFFUSION_FP8_MIXED_PRECISION_LAST_STEPS": _lazy_int(
+        "SGLANG_DIFFUSION_FP8_MIXED_PRECISION_LAST_STEPS", 3
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

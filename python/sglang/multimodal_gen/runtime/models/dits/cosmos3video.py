@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import sglang.multimodal_gen.envs as envs
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
@@ -42,6 +43,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    StepMixedPrecisionController,
+    install_step_mixed_precision,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
@@ -1265,6 +1270,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
+        # Installed in post_load_weights when step mixed precision is enabled.
+        self.step_precision_controller: StepMixedPrecisionController | None = None
+
         self.__post_init__()
 
         self.layer_names = ["gen_layers", "language_model.layers"]
@@ -1892,6 +1900,53 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        self._maybe_install_step_mixed_precision()
+
+    def _maybe_install_step_mixed_precision(self) -> None:
+        """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
+
+        Runs at the end of post_load_weights so the base quant method has
+        already transposed weights and collapsed scales. The UND pathway runs
+        once per request, at step 0, so with first_steps >= 1 it naturally
+        executes in W8A16.
+        """
+        if not envs.SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION:
+            return
+        controller = StepMixedPrecisionController(
+            first_steps=envs.SGLANG_DIFFUSION_FP8_MIXED_PRECISION_FIRST_STEPS,
+            last_steps=envs.SGLANG_DIFFUSION_FP8_MIXED_PRECISION_LAST_STEPS,
+        )
+        wrapped = install_step_mixed_precision(
+            module_lists=[self.language_model.layers, self.gen_layers],
+            controller=controller,
+        )
+        if wrapped == 0:
+            logger.warning(
+                "SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION is set but no "
+                "ModelOpt FP8 linears were found; running without step mixed "
+                "precision."
+            )
+            return
+        self.step_precision_controller = controller
+        logger.info(
+            "Step mixed precision enabled: %d FP8 linears run W8A16 on the "
+            "first %d and last %d denoising steps.",
+            wrapped,
+            controller.first_steps,
+            controller.last_steps,
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's precision before any transformer call for it."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(
+                step_index=step_index, num_steps=num_steps
+            )
+
+    def reset_denoising_step(self) -> None:
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()
 
 
 EntryClass = Cosmos3OmniTransformer
