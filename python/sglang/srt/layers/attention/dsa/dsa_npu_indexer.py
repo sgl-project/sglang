@@ -4,7 +4,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
-from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -370,6 +374,23 @@ def scattered_to_tp_attn_full(
             device=hidden_states.device,
         ),
         hidden_states,
+    )
+    # Sized-from-local-metadata discriminator (see layers/cp/size_log.py): the
+    # destination rows come from THIS rank's forward_batch.input_ids while the
+    # collective writes attn_tp_size * local rows -- the attn-tp variant of the
+    # locally-sized-destination pattern (the CP pair sits inside attn_tp).
+    # Local import per the size_log cycle note.
+    from sglang.srt.layers.cp.size_log import log_cp_collective
+
+    log_cp_collective(
+        "dsa-gather",
+        get_attn_tensor_model_parallel_rank(),
+        get_attn_tensor_model_parallel_world_size(),
+        max_len=forward_batch.input_ids.shape[0],
+        local_len=local_hidden_states.shape[0],
+        x_rows=local_hidden_states.shape[0],
+        out_rows=hidden_states.shape[0],
+        forward_batch=forward_batch,
     )
     attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
     return hidden_states

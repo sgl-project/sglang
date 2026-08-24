@@ -68,7 +68,9 @@ def maybe_prefetch_next_full_attention_kv(
         prefetch_kv_buffer(next_full_attention_layer_id)
 
 
-def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
+def dsa_cp_gather_hidden_states(
+    hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -76,11 +78,29 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
         get_local_dp_buffer(get_parallel().attn_cp_group),
         hidden_states,
     )
+    # Sized-from-local-tensor discriminator (see layers/cp/size_log.py): the
+    # destination is the PERSISTENT local dp buffer sized for the FULL token
+    # stream, while each rank sends its own local rows. Local import: this
+    # module is reached early through the layers.cp package-init chain.
+    from sglang.srt.layers.cp.size_log import log_cp_size_event
+
+    log_cp_size_event(
+        "dsa-cp-ag",
+        get_parallel().attn_cp_rank,
+        get_parallel().attn_cp_size,
+        {
+            "in_rows": int(local_hidden_states.shape[0]),
+            "out_rows": int(hidden_states.shape[0]),
+        },
+        forward_batch,
+    )
     attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def dsa_cp_reduce_scatter_hidden_states(
+    hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -88,6 +108,23 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     cp_rank = get_parallel().attn_cp_rank
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    # Sized-from-local-tensor discriminator (see layers/cp/size_log.py):
+    # equal-chunk reduce_scatter over the full-stream rows. Overflow
+    # precondition: input rows not divisible by cp_size, or disagreeing with
+    # the paired dsa-cp-ag out_rows (single-rank invariant in the analyzer).
+    from sglang.srt.layers.cp.size_log import log_cp_size_event
+
+    log_cp_size_event(
+        "dsa-cp-rs",
+        cp_rank,
+        cp_size,
+        {
+            "in_rows": int(input_hidden_states.shape[0]),
+            "split_rows": int(hidden_states.shape[0]),
+            "out_rows": int(input_hidden_states.shape[0]) // cp_size,
+        },
+        forward_batch,
+    )
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
     return hidden_states
 
@@ -198,7 +235,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+            hidden_states = dsa_cp_gather_hidden_states(hidden_states, forward_batch)
         return hidden_states, residual
 
 
@@ -243,5 +280,7 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(
+                hidden_states, forward_batch
+            )
         return hidden_states, residual

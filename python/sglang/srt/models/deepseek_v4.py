@@ -2272,7 +2272,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(
+                hidden_states, forward_batch
+            )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

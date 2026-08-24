@@ -79,7 +79,10 @@ def log_cp_size_event(
     (``DP<d> ATTN_CP<c> TP<t>``): CP partners are same-DP/different-CP, so
     no global-rank field is needed here.
     """
-    if os.getenv("SGLANG_CP_SIZE_LOG", "0") != "1":
+    if os.getenv("SGLANG_CP_SIZE_LOG", "0") not in ("1", "2"):
+        # =2 (gather fingerprints) implies the =1 baseline lines: the
+        # analyzer's pairing / flight-recorder sections need them, and they
+        # double as the env-reached liveness marker.
         return
     if ctx is None:
         ctx = _ext_key(forward_batch)

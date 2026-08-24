@@ -88,6 +88,11 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
+# [mf-fp] probe-raised dedup: log each failing candidate name once per
+# process -- a broken matcher otherwise floods (263-line run 11:41) and
+# each raise also triggers noisy ACL ERROR dumps from torch_npu.
+_mf_fp_raised: set = set()
+
 
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
@@ -1373,13 +1378,29 @@ class SchedulerDisaggregationPrefillMixin:
                         return int(m.sum().item())
 
                     def _seq_hits_pairs(buf):
+                        # aclnnRoll rejects DT_INT16 (Run 11:41 probe-raised
+                        # flood) but supports bf16/fp16/int32: roll in the
+                        # buffer's native dtype and compare int16 views; if
+                        # int16 eq is unsupported too, cast both sides to
+                        # int32 (sign-extension preserves bitwise equality).
                         if buf is None or buf.numel() < 8:
                             return 0
-                        b = buf.view(-1).view(_t.int16)
+                        b = buf.view(-1)
                         h = _kv.view(_t.int16)  # 8 halves from 4 int32
-                        m = b == h[0]
+                        if buf.dtype in (_t.bfloat16, _t.float16):
+                            try:
+                                bi = b.view(_t.int16)
+                                m = bi == h[0]
+                                for k in range(1, 8):
+                                    m &= _t.roll(b, -k).view(_t.int16) == h[k]
+                                return int(m.sum().item())
+                            except Exception:
+                                pass
+                        bi32 = b.view(_t.int16).to(_t.int32)
+                        h32 = h.to(_t.int32)
+                        m = bi32 == h32[0]
                         for k in range(1, 8):
-                            m &= _t.roll(b, -k) == h[k]
+                            m &= _t.roll(bi32, -k) == h32[k]
                         return int(m.sum().item())
 
                     def _stride_hits(buf):
@@ -1568,17 +1589,24 @@ class SchedulerDisaggregationPrefillMixin:
                                 _s, _sc, _sr = (
                                     _stride_hits_ring(_buf) if _stride_ok else (0, -1, -1)
                                 )
-                            except Exception:
+                            except Exception as _pe:
                                 _s, _sc, _sr = 0, -1, -1
+                                if _name not in _mf_fp_raised:
+                                    _mf_fp_raised.add(_name)
+                                    logger.error(
+                                        "[mf-fp] probe raised on %s: %s", _name, _pe
+                                    )
                         else:
                             try:
                                 _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)
                             except Exception as _pe:
                                 # A probe exception must not read as "no hit".
                                 _n = 0
-                                logger.error(
-                                    "[mf-fp] probe raised on %s: %s", _name, _pe
-                                )
+                                if _name not in _mf_fp_raised:
+                                    _mf_fp_raised.add(_name)
+                                    logger.error(
+                                        "[mf-fp] probe raised on %s: %s", _name, _pe
+                                    )
                             if _n:
                                 logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
                             try:
@@ -1587,9 +1615,11 @@ class SchedulerDisaggregationPrefillMixin:
                                 )
                             except Exception as _pe:
                                 _s, _sc, _sr = 0, -1, -1
-                                logger.error(
-                                    "[mf-fp] probe raised on %s: %s", _name, _pe
-                                )
+                                if _name not in _mf_fp_raised:
+                                    _mf_fp_raised.add(_name)
+                                    logger.error(
+                                        "[mf-fp] probe raised on %s: %s", _name, _pe
+                                    )
                         if _s:
                             logger.error(
                                 "[mf-fp] payload stride FOUND x%d col=%d row=%d in %s",
