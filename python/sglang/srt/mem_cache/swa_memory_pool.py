@@ -123,6 +123,9 @@ class SWAKVPool(BaseSWAKVPool):
             f"SWAKVPool {'VA upper bound' if self.post_capture_active else 'mem usage'}: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
+    def supports_host_pool_retraction(self, is_speculative: bool = False) -> bool:
+        return self.swa_kv_pool is not None
+
     @property
     def post_capture_active(self) -> bool:
         """True iff the sub-pools took the post-capture VA-backed path (both share the flag)."""

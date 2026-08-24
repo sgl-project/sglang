@@ -35,6 +35,7 @@ class RetractionBackup(NamedTuple):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None
     pool_transfers: Optional[list[PoolTransfer]] = None
+    swa_window_start: Optional[int] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -148,7 +149,16 @@ def retraction_backup(
     """Returns False when the host pool cannot hold the backup; the caller
     aborts the request since its KV cannot be preserved."""
     if backend == "cpu_tensor":
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        try:
+            req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        except NotImplementedError:
+            req.retraction_backup = None
+            logger.error(
+                "CPU-tensor retraction backup is unsupported for request %s; "
+                "aborting the request instead of crashing the scheduler.",
+                req.rid,
+            )
+            return False
         return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
@@ -166,19 +176,20 @@ def retraction_restore(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
-) -> None:
+) -> bool:
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-        return
+        return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
-        return
+        return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.retraction_backup)
+    restored = unified_cache.retraction_restore(req, req.retraction_backup)
     req.retraction_backup = None
+    return restored
 
 
 def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:

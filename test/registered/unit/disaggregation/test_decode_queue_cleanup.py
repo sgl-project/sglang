@@ -32,6 +32,45 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    @patch("sglang.srt.disaggregation.decode.retraction_restore", return_value=False)
+    def test_restore_failure_releases_preallocation_and_aborts_request(
+        self, mock_restore, mock_prepare_abort, mock_release_kv_cache
+    ):
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="host_pool"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        req = SimpleNamespace(
+            rid="restore-failed",
+            is_retracted=True,
+            return_logprob=False,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.retracted_queue = [req]
+        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.tree_cache = MagicMock()
+        queue.scheduler = SimpleNamespace(output_streamer=MagicMock())
+        queue._uses_swa_tail_prealloc = lambda: False
+        queue._allocatable_token_budgets = lambda **_kwargs: 16
+        queue._prealloc_required_tokens = lambda _req: (4, 4)
+        queue._pre_alloc = MagicMock()
+
+        self.assertEqual(queue.resume_retracted_reqs(), [])
+        self.assertEqual(queue.retracted_queue, [])
+        mock_restore.assert_called_once()
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, is_insert=False
+        )
+        mock_prepare_abort.assert_called_once()
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], False
+        )
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.

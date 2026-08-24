@@ -94,11 +94,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -821,24 +817,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            full_allocatable_tokens -= full_required
-            if uses_swa_tail_prealloc:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
-                    count_retracted=False,
-                    extra_reserved_reqs=len(resumed_reqs),
-                )
-
-            retraction_restore(
+            restored = retraction_restore(
                 req,
                 self.tree_cache,
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            indices_to_remove.add(i)
+            if not restored:
+                error_message = "Retraction KV restore failed. Aborting the request."
+                prepare_abort(
+                    req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                continue
+
+            resumed_reqs.append(req)
+            full_allocatable_tokens -= full_required
+            if uses_swa_tail_prealloc:
+                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                    count_retracted=False,
+                    extra_reserved_reqs=len(resumed_reqs),
+                )
 
         self.retracted_queue = [
             entry

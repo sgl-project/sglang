@@ -16,6 +16,10 @@ class BaseSWAKVPool(KVCache):
 
     swa_kv_pool: KVCache
 
+    def supports_host_pool_retraction(self, is_speculative: bool = False) -> bool:
+        """Whether the pool's complete live state is represented in HiCache."""
+        return False
+
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
         raise NotImplementedError()

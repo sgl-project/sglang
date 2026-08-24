@@ -34,10 +34,10 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 
 if TYPE_CHECKING:
@@ -103,10 +104,7 @@ def _register_legacy_hicache_draft(
     server_args: ServerArgs,
     page_size: int,
 ) -> None:
-    from sglang.srt.mem_cache.memory_pool import (
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-    )
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -146,6 +144,21 @@ def _register_legacy_hicache_draft(
 BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 
+def _supports_host_pool_retraction(
+    kv_cache: KVCache,
+    full_tokens_per_layer: Optional[int],
+    is_speculative: bool = False,
+) -> bool:
+    if isinstance(kv_cache, MHATokenToKVPool):
+        return True
+    return (
+        isinstance(kv_cache, BaseSWAKVPool)
+        and full_tokens_per_layer is not None
+        and full_tokens_per_layer > 0
+        and kv_cache.supports_host_pool_retraction(is_speculative)
+    )
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -165,8 +178,10 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        supports_host_pool = _supports_host_pool_retraction(
+            kv_cache,
+            full_tokens_per_layer,
+            get_spec().speculative_algorithm is not None,
         )
         schedule = get_schedule()
         priority_preemption = (
