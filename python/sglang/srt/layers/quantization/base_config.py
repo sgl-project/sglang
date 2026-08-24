@@ -128,6 +128,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    weight_block_size: Optional[List[int]] = None
+
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize

@@ -52,7 +52,7 @@ class TestBuildNativeMm(CustomTestCase):
         features = np.arange(30, dtype=np.float32)
         output = NativeMmHost.build_native_mm(
             self.spec,
-            SimpleNamespace(  # the shape of Rust's MmHandoff
+            SimpleNamespace(  # the shape of Rust's MmEncodeResult
                 grids=self.GRIDS,
                 hashes=self.HASHES,
                 offsets=self.OFFSETS,
