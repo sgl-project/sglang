@@ -73,7 +73,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         else:
             self.ssm_state_indices = cache_indices
         if forward_mode.is_prefill():
-            self.actual_seq_lengths = torch.diff(self.forward_metadata.query_start_loc).to(torch.int32)
+            self.actual_seq_lengths = torch.diff(
+                self.forward_metadata.query_start_loc
+            ).to(torch.int32)
 
     def init_forward_metadata_out_graph(
         self,
@@ -302,12 +304,20 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
             actual_seq_len = query.shape[0]
-            query = query.view(actual_seq_len, layer.num_q_heads, layer.head_q_dim).contiguous()
-            key = key.view(actual_seq_len, layer.num_k_heads, layer.head_k_dim).contiguous()
-            value = value.view(actual_seq_len, layer.num_v_heads, layer.head_v_dim).contiguous()
+            query = query.view(
+                actual_seq_len, layer.num_q_heads, layer.head_q_dim
+            ).contiguous()
+            key = key.view(
+                actual_seq_len, layer.num_k_heads, layer.head_k_dim
+            ).contiguous()
+            value = value.view(
+                actual_seq_len, layer.num_v_heads, layer.head_v_dim
+            ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-            core_attn_out, last_recurrent_state, h = self.chunk_gdn(query, key, value, g, beta, ssm_states[cache_indices], query_start_loc)
+            core_attn_out, last_recurrent_state, h = self.chunk_gdn(
+                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
+            )
 
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
@@ -331,17 +341,20 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         initial_state,
         cu_seqlens,
     ):
-        q = l2norm_fwd(q) # [T, Nk, Dk]
-        k = l2norm_fwd(k)# [T, Nk, Dk]
+        q = l2norm_fwd(q)  # [T, Nk, Dk]
+        k = l2norm_fwd(k)  # [T, Nk, Dk]
         g = g.to(torch.float32)  # [T, Nv]
         scale = k.shape[-1] ** -0.5
 
         chunk_size = 64
-        chunk_indices = (prepare_chunk_indices(cu_seqlens, chunk_size)
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, chunk_size)
             if cu_seqlens is not None
             else None
         )
-        h = k.new_empty(len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]) # [NT, NH, DV, Dk]
+        h = k.new_empty(
+            len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
+        )  # [NT, NH, DV, Dk]
 
         core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
             q,
