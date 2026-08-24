@@ -1398,8 +1398,11 @@ Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
 figures are anchored at 480P — activations grow with the pixel count, so at
 768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
 decode still collides. And the host convention holds the weights in page
-cache; a physical 32 GB machine re-reads them from disk each step (a real
-desktop 4090 measured ~38 s/step at 480P from NVMe). The
+cache; a physical 32 GB machine re-reads them from disk each step, so the
+drive holding the checkpoint sets the step time — roughly 15–20 s/step from a
+good NVMe, 35–50 from a SATA or fatigued QLC drive (a real desktop 4090
+measured 38), unusable from a spinning archive drive. Put the checkpoint on
+the fastest drive in the machine, not the biggest. The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
 and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
 22 GiB cap so a desktop's own allocations fit; a headless card can raise it
