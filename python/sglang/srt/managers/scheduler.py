@@ -3298,6 +3298,14 @@ class Scheduler(
         else:
             req.init_next_round_input(self.tree_cache)
 
+    def _pp_batched_chunk_reuses_req_slot(self, req: Req) -> bool:
+        """Return whether a waiting PP continuation already owns its slot."""
+        return (
+            self.pp_batch_independent_chunks
+            and req.pp_batched_chunk_requeued
+            and req.req_pool_idx is not None
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3322,10 +3330,14 @@ class Scheduler(
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
+        has_reusable_pp_chunk = any(
+            self._pp_batched_chunk_reuses_req_slot(req) for req in self.waiting_queue
+        )
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
+            and not has_reusable_pp_chunk
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
@@ -3342,6 +3354,7 @@ class Scheduler(
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
+            and not has_reusable_pp_chunk
         ):
             running_batch.batch_is_full = True
             return None, running_batch
@@ -3421,12 +3434,19 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            reuses_req_slot = self._pp_batched_chunk_reuses_req_slot(req)
+            new_req_count = sum(r.req_pool_idx is None for r in adder.can_run_list)
+            if not reuses_req_slot and new_req_count >= self.get_num_allocatable_reqs(
+                running_bs
+            ):
                 running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if (
+                not reuses_req_slot
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if new_req_count >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:

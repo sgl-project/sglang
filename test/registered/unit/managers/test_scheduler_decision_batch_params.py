@@ -82,6 +82,17 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
 
         req.init_next_round_input.assert_called_once_with()
 
+    def test_requeued_batched_chunk_reuses_request_pool_slot(self):
+        scheduler = SimpleNamespace(pp_batch_independent_chunks=True)
+        req = SimpleNamespace(
+            pp_batched_chunk_requeued=True,
+            req_pool_idx=7,
+        )
+
+        self.assertTrue(Scheduler._pp_batched_chunk_reuses_req_slot(scheduler, req))
+        req.req_pool_idx = None
+        self.assertFalse(Scheduler._pp_batched_chunk_reuses_req_slot(scheduler, req))
+
 
 if __name__ == "__main__":
     unittest.main()
