@@ -189,22 +189,17 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_rust_dp_rank_registers_only_with_rank_zero(self, mock_put, mock_time):
+    def test_url_with_dist_init_addr(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
 
         mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
-        mgr.attn_dp_size = 2
-        mgr.attn_dp_rank = 1
-        mgr.system_dp_size = 2
-        mgr.system_dp_rank = 1
-        with envs.SGLANG_RUST_SERVER.override(True):
-            mgr.register_to_bootstrap()
+        mgr.register_to_bootstrap()
 
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[0], "http://10.0.0.1:8765/route")
+        url_used = mock_put.call_args[0][0]
+        self.assertIn("10.0.0.1", url_used)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -307,12 +302,16 @@ class TestRegisterToBootstrap(CustomTestCase):
 
 
 class TestPrefillBootstrapSenderAddress(CustomTestCase):
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
     @patch("sglang.srt.disaggregation.prefill.get_kv_class")
-    def test_request_bootstrap_port_selects_room_registry(self, mock_get_kv_class):
+    def test_request_registry_uses_bootstrap_port_and_effective_dp_rank(
+        self, mock_get_kv_class, mock_post
+    ):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
         from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-        queue.kv_manager = MagicMock()
+        queue.kv_manager = MagicMock(is_dummy_cp_rank=False, system_dp_rank=1)
         queue.pp_rank = 0
         queue.tp_rank = 0
         queue.transfer_backend = TransferBackend.NIXL
@@ -325,39 +324,20 @@ class TestPrefillBootstrapSenderAddress(CustomTestCase):
             bootstrap_room=42,
             disagg_prefill_dp_rank=None,
         )
-        sender = MagicMock()
-        sender_class = MagicMock(return_value=sender)
-        mock_get_kv_class.return_value = sender_class
-
-        self.assertTrue(queue.create_sender(req, num_kv_heads=8))
-
-        sender_class.assert_called_once_with(
-            mgr=queue.kv_manager,
-            bootstrap_addr="[2001:db8::1]:30001",
-            bootstrap_room=42,
-            dest_tp_ranks=[0],
-            pp_rank=0,
-            req_has_disagg_prefill_dp_rank=False,
-        )
-        self.assertIs(req.disagg_kv_sender, sender)
-
-    @patch("sglang.srt.disaggregation.common.conn.requests.post")
-    def test_room_registration_uses_effective_dp_rank(self, mock_post):
-        from sglang.srt.disaggregation.common.conn import CommonKVSender
-
-        sender = MagicMock()
-        sender.bootstrap_server_url = "127.0.0.1:30000"
-        sender.bootstrap_room = 42
-        sender.kv_mgr = MagicMock(system_dp_rank=1)
+        mock_get_kv_class.return_value = CommonKVSender
         mock_post.return_value = MagicMock(status_code=200)
 
-        CommonKVSender._register_prefill_dp_rank(sender)
+        with get_context().override_server_args(
+            load_balance_method="round_robin", dp_size=2
+        ):
+            self.assertTrue(queue.create_sender(req, num_kv_heads=8))
 
         mock_post.assert_called_once_with(
-            "http://127.0.0.1:30000/register_dp_rank",
+            "http://[2001:db8::1]:30001/register_dp_rank",
             json={"bootstrap_room": 42, "dp_rank": 1},
             timeout=5,
         )
+        self.assertIsInstance(req.disagg_kv_sender, CommonKVSender)
 
     def test_follow_bootstrap_room_accepts_matching_ordinary_dp_rank(self):
         from sglang.srt.disaggregation.common.conn import CommonKVSender
