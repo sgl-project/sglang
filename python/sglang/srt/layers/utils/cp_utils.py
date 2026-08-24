@@ -227,6 +227,22 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
     Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
+    # Sized-from-local-metadata discriminator (see layers/cp/size_log.py):
+    # destination rows = max_len*cp_size from THIS rank's metadata, but the
+    # collective writes the SUM of the per-rank sends. Local import: layers.cp's
+    # package init imports this module's neighbors through zigzag -> dp_attention.
+    from sglang.srt.layers.cp.size_log import log_cp_collective
+
+    log_cp_collective(
+        "reorg",
+        get_parallel().attn_cp_rank,
+        cp_size,
+        max_len=max_len,
+        local_len=input_tensor.shape[0],
+        x_rows=input_tensor.shape[0],
+        out_rows=max_len * cp_size,
+        forward_batch=forward_batch,
+    )
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
         padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
@@ -268,6 +284,19 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     Handles multi-dimensional tensors (e.g., [seq_len, num_heads, head_dim]).
     """
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
+    # Sized-from-local-metadata discriminator (see layers/cp/size_log.py).
+    from sglang.srt.layers.cp.size_log import log_cp_collective
+
+    log_cp_collective(
+        "reorg-kv",
+        get_parallel().attn_cp_rank,
+        cp_size,
+        max_len=max_len,
+        local_len=input_tensor.shape[0],
+        x_rows=input_tensor.shape[0],
+        out_rows=max_len * cp_size,
+        forward_batch=forward_batch,
+    )
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
         # Pad the first dimension (seq_len). F.pad expects padding in reverse dimension order.
@@ -334,6 +363,22 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
         output_tensor = input_tensor.new_empty(
             (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
         )
+    # Sized-from-local-metadata discriminator (see layers/cp/size_log.py).
+    # output rows = local send rows * cp_size; the collective writes the SUM
+    # of the per-rank sends, so any cross-rank send-row difference overflows
+    # the smaller rank's output. Runs on the comm stream: this variant is the
+    # async-writer candidate for the req_to_token row overwrite.
+    from sglang.srt.layers.cp.size_log import log_cp_collective
+
+    log_cp_collective(
+        f"overlap:{event_key[0] if isinstance(event_key, tuple) else event_key}",
+        get_parallel().attn_cp_rank,
+        cp_size,
+        max_len=input_tensor.shape[0],
+        local_len=input_tensor.shape[0],
+        x_rows=input_tensor.shape[0],
+        out_rows=output_tensor.shape[0],
+    )
     comm_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(comm_stream):
         attn_cp_overlap_all_gather_into_tensor(output_tensor, input_tensor)
@@ -390,6 +435,21 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         return strategy.gather_hidden_states(input_tensor, forward_batch, stream)
 
     if is_dsa_prefill_cp_round_robin_split():
+        # Sized-from-LOCAL-TENSOR discriminator: destination rows = this
+        # rank's own rows * cp_size, with no metadata max at all -- the most
+        # overflow-prone variant of the pattern (see layers/cp/size_log.py).
+        from sglang.srt.layers.cp.size_log import log_cp_collective
+
+        log_cp_collective(
+            "rr",
+            get_parallel().attn_cp_rank,
+            cp_size,
+            max_len=input_tensor.shape[0],
+            local_len=input_tensor.shape[0],
+            x_rows=input_tensor.shape[0],
+            out_rows=input_tensor.shape[0] * cp_size,
+            forward_batch=forward_batch,
+        )
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):

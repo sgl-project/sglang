@@ -43,6 +43,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
 )
 from sglang.srt.layers.cp.padding import pad_local_rows
+from sglang.srt.layers.cp.size_log import log_cp_collective
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     is_allocation_symmetric,
@@ -203,6 +204,19 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         physical_rank_len = max(metadata.per_rank_actual_token)
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
+
+        # Sized-from-local-metadata discriminator (see size_log.py); pair the
+        # two CP ranks' lines by seq and diff.
+        log_cp_collective(
+            "interleave",
+            self.cp_rank,
+            self.cp_size,
+            max_len=physical_rank_len,
+            local_len=local_logical_len,
+            x_rows=x.shape[0],
+            out_rows=self.cp_size * physical_rank_len,
+            forward_batch=forward_batch,
+        )
 
         padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
         padded_x[:local_logical_len] = x[:local_logical_len]

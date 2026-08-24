@@ -2283,10 +2283,29 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
+                # Discriminator (layers/cp/size_log.py): `hidden_states` is the
+                # PERSISTENT local dp buffer -- max(sizes) > out_rows is the
+                # overflow precondition. Local import to dodge the layers.cp
+                # package-init cycle.
+                from sglang.srt.layers.cp.size_log import log_cp_size_event
+
+                _sizes = get_dp_global_num_tokens()
+                log_cp_size_event(
+                    "dsv4-combine",
+                    get_parallel().attn_dp_rank,
+                    get_parallel().attn_dp_size,
+                    {
+                        "out_rows": int(hidden_states.shape[0]),
+                        "in_rows": int(global_hidden_states.shape[0]),
+                        "sum": sum(int(s) for s in _sizes),
+                        "sizes": ",".join(str(int(s)) for s in _sizes),
+                    },
+                    forward_batch,
+                )
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
+                    sizes=_sizes,
                 )
             elif _use_reduce_scatter:
                 # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial

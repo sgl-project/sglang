@@ -486,6 +486,22 @@ def memcpy(dst, src, dim, offset, sz, offset_src):
     memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
+def _log_dp_size(tag: str, fields: dict, forward_batch=None) -> None:
+    """Host-only DP-collective size log (see layers/cp/size_log.py and the
+    row-overwrite case doc §24). Local import: the layers.cp package init
+    imports this module through zigzag, so a module-level import would cycle.
+    """
+    from sglang.srt.layers.cp.size_log import log_cp_size_event
+
+    log_cp_size_event(
+        tag,
+        get_attention_dp_rank(),
+        get_attention_dp_size(),
+        fields,
+        forward_batch,
+    )
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -493,6 +509,23 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
+    # Discriminator: the memcpy below writes num rows at start (both from the
+    # COMMUNICATED counts) while the buffer was sized from the aligned sum of
+    # the same counts -- an in_rows != num divergence here means this rank's
+    # real token count disagrees with what it reported. Host values only: the
+    # GPU twins (local_start_pos/local_num_tokens) must not be int()-cast,
+    # that would sync and perturb the racing-writer timing.
+    _cpu_sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+    _dp_ar_fields = {
+        "in_rows": int(local_tokens.shape[0]),
+        "buf_rows": int(global_tokens.shape[0]),
+    }
+    if _cpu_sizes is not None:
+        _r = get_attention_dp_rank()
+        _dp_ar_fields["num"] = int(_cpu_sizes[_r])
+        _dp_ar_fields["start"] = int(sum(_cpu_sizes[:_r]))
+    _log_dp_size("dp-ar", _dp_ar_fields, forward_batch)
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -535,6 +568,18 @@ def _dp_gather_via_all_gather(
     is_partial: bool,
 ):
     use_world = world_dp_gather_enabled()
+
+    # Discriminator (layers/cp/size_log.py): MAX_LEN-padding gather; the
+    # collective writes world_size * padded local rows into global_tokens.
+    _log_dp_size(
+        "dp-ag",
+        {
+            "in_rows": int(local_tokens.shape[0]),
+            "buf_rows": int(global_tokens.shape[0]),
+            "attn_tp": get_attn_tensor_model_parallel_world_size(),
+        },
+        forward_batch,
+    )
 
     if get_attn_tensor_model_parallel_world_size() == 1:
         if use_world:
@@ -758,6 +803,22 @@ def _dp_gather_via_all_gatherv(
     # is no uninitialized tail for the MoE to read.
     rank = get_attention_dp_rank()
     local_rows = sizes[rank]
+    # Discriminator (layers/cp/size_log.py): sizes is the COMMUNICATED list
+    # (identical on every rank by construction), so the interesting signals
+    # are local -- mine != in_rows (this rank's real rows disagree with its
+    # report) and sum != buf_rows (collective writes more rows than the
+    # buffer holds).
+    _log_dp_size(
+        "dp-agv",
+        {
+            "mine": int(local_rows),
+            "in_rows": int(local_tokens.shape[0]),
+            "buf_rows": int(global_tokens.shape[0]),
+            "sum": sum(int(s) for s in sizes),
+            "sizes": ",".join(str(int(s)) for s in sizes),
+        },
+        forward_batch,
+    )
     if local_tokens.shape[0] == local_rows:
         local_real = local_tokens
     elif local_tokens.shape[0] > local_rows:
@@ -870,6 +931,18 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         # the default reduce-scatter path if per-rank sizes are unavailable.
         sizes = get_dp_global_num_tokens()
         if sizes is not None:
+            # Discriminator (layers/cp/size_log.py): each rank receives
+            # sizes[its rank] rows into `output`; max(sizes) > out_rows is the
+            # overflow precondition regardless of the rank-index mapping.
+            _log_dp_size(
+                "dp-rs",
+                {
+                    "out_rows": int(output.shape[0]),
+                    "in_rows": int(input.shape[0]),
+                    "sum": sum(int(s) for s in sizes),
+                    "sizes": ",".join(str(int(s)) for s in sizes),
+                },
+            )
             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
@@ -977,6 +1050,18 @@ def dp_reduce_scatterv_async(
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
+    # Discriminator (layers/cp/size_log.py): async combine on the shared TBO
+    # comm stream -- an async writer in the post-write window. max(sizes) >
+    # out_rows is the overflow precondition.
+    _log_dp_size(
+        "dp-rsv-async",
+        {
+            "out_rows": int(output_local.shape[0]),
+            "in_rows": int(global_tokens.shape[0]),
+            "sum": sum(int(s) for s in sizes),
+            "sizes": ",".join(str(int(s)) for s in sizes),
+        },
+    )
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
         get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)

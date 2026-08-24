@@ -48,6 +48,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
 )
 from sglang.srt.layers.cp.padding import pad_local_rows
+from sglang.srt.layers.cp.size_log import log_cp_collective
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -466,6 +467,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         else:
             local_len = per_rank_token[self.cp_rank]
         assert x.shape[0] >= local_len
+        # Sized-from-local-metadata discriminator: the destination below is
+        # max_len*cp_size rows, the collective writes the SUM of per-rank
+        # sends. Pair this line with the other CP rank's by seq.
+        log_cp_collective(
+            "zigzag",
+            self.cp_rank,
+            self.cp_size,
+            max_len=max_len,
+            local_len=local_len,
+            x_rows=x.shape[0],
+            out_rows=max_len * self.cp_size,
+            forward_batch=forward_batch,
+        )
         x = x[:local_len]
         pad_size = max_len - x.shape[0]
         if pad_size > 0:
