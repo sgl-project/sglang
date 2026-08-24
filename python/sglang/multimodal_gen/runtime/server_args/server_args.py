@@ -306,6 +306,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -1722,6 +1725,22 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -2833,6 +2852,21 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix="-weights-path",
         )
 
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
     @staticmethod
     def _extract_component_attention_backends(
         unknown_args: list[str],
@@ -2880,9 +2914,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if unknown_args is None:
             unknown_args = []
 
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
         # Extract the more specific weights suffix before the generic path alias.
         dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
-            unknown_args
+            remaining
         )
         dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
@@ -2915,6 +2952,11 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_weights_paths)
             provided_args["component_weights_paths"] = existing
             explicit_arg_names.add("component_weights_paths")
+        if dynamic_quantizations:
+            existing = dict(provided_args.get("component_quantizations") or {})
+            existing.update(dynamic_quantizations)
+            provided_args["component_quantizations"] = existing
+            explicit_arg_names.add("component_quantizations")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")

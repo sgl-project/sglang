@@ -130,6 +130,9 @@ class ComponentLoader(ABC):
     # components may fall back when that global choice is incompatible; an
     # explicit --component-attention-backends entry remains strict.
     allow_global_attention_backend_fallback = True
+    # Gates only --component-quantizations.<name>. Quantization declared by a
+    # checkpoint is discovered and admitted by the component's normal loader.
+    supports_online_quantization_override = False
 
     _loaders_registered = False
 
@@ -227,6 +230,17 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
+        component_quantization = server_args.component_quantizations.get(component_name)
+        if (
+            component_quantization is not None
+            and not self.supports_online_quantization_override
+        ):
+            raise ValueError(
+                f"{component_name!r} does not support an explicit quantization "
+                "override; "
+                "use a self-describing quantized component checkpoint when supported"
+            )
+
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",
