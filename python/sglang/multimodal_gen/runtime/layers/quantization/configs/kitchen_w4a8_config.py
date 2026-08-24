@@ -16,7 +16,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8 import (
+    KitchenInt8EmbeddingMethod,
     KitchenW4A8LinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -44,10 +48,15 @@ class KitchenW4A8Config(QuantizationConfig):
         self.selected: list[str] = []
 
         for prefix, marker in layer_markers.items():
-            if marker.get("format") != "asym_w4a8_int8":
+            marker_format = marker.get("format")
+            if marker_format == "int8_tensorwise" and marker.get(
+                "_is_tensorwise_scalar"
+            ):
+                continue
+            if marker_format != "asym_w4a8_int8":
                 raise ValueError(
                     f"Unsupported Comfy W4A8 format for {prefix!r}: "
-                    f"{marker.get('format')!r}"
+                    f"{marker_format!r}"
                 )
             if marker.get("convrot") is not True:
                 raise ValueError(
@@ -80,11 +89,24 @@ class KitchenW4A8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
+        marker = self.layer_markers.get(prefix)
+        if isinstance(layer, VocabParallelEmbedding):
+            if marker is None:
+                return None
+            if marker.get("format") != "int8_tensorwise" or not marker.get(
+                "_is_tensorwise_scalar"
+            ):
+                raise ValueError(
+                    f"Unsupported quantized embedding marker for {prefix!r}: {marker}"
+                )
+            self.selected.append(prefix)
+            return KitchenInt8EmbeddingMethod()
         if not isinstance(layer, LinearBase):
             return None
-        marker = self.layer_markers.get(prefix)
         if marker is None:
             return UnquantizedLinearMethod()
+        if marker.get("format") != "asym_w4a8_int8":
+            raise ValueError(f"Unsupported quantized linear marker for {prefix!r}")
 
         group_size = int(marker.get("group_size", 16))
         convrot_group_size = int(marker.get("convrot_groupsize", 256))
@@ -120,7 +142,7 @@ class KitchenW4A8Config(QuantizationConfig):
         self, prefix: str, input_size_per_partition: int
     ) -> bool:
         marker = self.layer_markers.get(prefix)
-        if marker is None:
+        if marker is None or marker.get("format") != "asym_w4a8_int8":
             return True
         return self._supports_input_size(
             input_size_per_partition,
@@ -130,3 +152,11 @@ class KitchenW4A8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        marker = self.layer_markers.get(prefix)
+        return bool(
+            marker is not None
+            and marker.get("format") == "int8_tensorwise"
+            and marker.get("_is_tensorwise_scalar")
+        )
