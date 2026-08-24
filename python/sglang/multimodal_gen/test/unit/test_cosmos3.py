@@ -1334,11 +1334,10 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertEqual(sp.guidance_scale, base_guidance)
 
     def test_unknown_hint_rejected(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", control_path="x.mp4", control_hint="bogus"
-        )
         with self.assertRaises(ValueError):
-            sp._resolve_control_hints()
+            Cosmos3SamplingParams(
+                prompt="t", control_path="x.mp4", control_hint="bogus"
+            )
 
 
 class TestCosmos3DomainAwareLinear(unittest.TestCase):
