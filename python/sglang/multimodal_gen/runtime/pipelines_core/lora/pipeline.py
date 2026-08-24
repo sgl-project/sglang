@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
+    iter_materialized_weights,
+    refresh_layerwise_targets,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -247,6 +249,28 @@ class LoRAPipeline(ComposedPipelineBase):
         else:
             return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
 
+    def _has_layerwise_offload(
+        self,
+        target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]] | None = None,
+    ) -> bool:
+        names: list[str]
+        if target_modules is not None:
+            names = [module_name for module_name, _ in target_modules]
+        else:
+            names = ["transformer", "transformer_2", "critic"]
+        return any(
+            is_layerwise_offloaded_module(self.modules.get(name)) for name in names
+        )
+
+    def _weight_update_context(
+        self,
+        target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]] | None = None,
+    ):
+        """Do not load_all when layerwise is on."""
+        if self._has_layerwise_offload(target_modules):
+            return nullcontext()
+        return self._temporarily_disable_offload(target_modules=target_modules)
+
     @contextmanager
     def _temporarily_disable_offload(
         self,
@@ -344,6 +368,11 @@ class LoRAPipeline(ComposedPipelineBase):
             The number of layers converted.
         """
         converted_count = 0
+        materialized = (
+            dict(iter_materialized_weights(module))
+            if is_layerwise_offloaded_module(module)
+            else {}
+        )
         for name, layer in module.named_modules():
             if not self.is_target_layer(name):
                 continue
@@ -362,11 +391,61 @@ class LoRAPipeline(ComposedPipelineBase):
                 snapshot_base=snapshot_base,
             )
             if lora_layer is not None:
+                self._bind_lora_offload_view(
+                    module,
+                    name,
+                    lora_layer,
+                    materialized,
+                    snapshot_base=snapshot_base,
+                )
                 target_lora_layers[name] = lora_layer
                 replace_submodule(self.modules[module_name], name, lora_layer)
                 converted_count += 1
 
+        if converted_count and is_layerwise_offloaded_module(module):
+            refresh_layerwise_targets(module)
+            materialized = dict(iter_materialized_weights(module))
+            bound = 0
+            for name, lora_layer in target_lora_layers.items():
+                self._bind_lora_offload_view(
+                    module,
+                    name,
+                    lora_layer,
+                    materialized,
+                    snapshot_base=snapshot_base,
+                )
+                packed = getattr(lora_layer.base_layer, "_packed_weight_cpu", None)
+                if packed is not None and packed.numel() > 1:
+                    bound += 1
+            logger.info(
+                "Layerwise LoRA bind: %d/%d layers have a CPU view after wrap",
+                bound,
+                converted_count,
+            )
+
         return converted_count
+
+    def _bind_lora_offload_view(
+        self,
+        module: torch.nn.Module,
+        name: str,
+        lora_layer: BaseLayerWithLoRA,
+        materialized: dict[str, torch.Tensor],
+        snapshot_base: bool = True,
+    ) -> None:
+        """Bind LoRA to the manager CPU view, not the (1,) GPU placeholder."""
+        if not materialized:
+            return
+        weight = materialized.get(f"{name}.weight")
+        if weight is None:
+            return
+        data = weight.detach()
+        lora_layer.cpu_weight = data.clone() if snapshot_base else data
+        lora_layer._base_is_view = not snapshot_base
+        base = lora_layer.base_layer
+        base._offload_root = module
+        base._offload_param_prefix = name
+        base._packed_weight_cpu = data
 
     def _reject_lora_on_packed_weights(self) -> None:
         """Fail before any layer is replaced if a target has no plain weight.
@@ -963,14 +1042,11 @@ class LoRAPipeline(ComposedPipelineBase):
         # unsupported-LoRA error. Offloaded placeholders still carry the name.
         self._reject_lora_on_packed_weights()
 
-        # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
-        # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,
-        # not from offloaded placeholder tensors
+        # Layerwise keeps manager views; do not load_all.
         if not self.lora_initialized:
-            with self._temporarily_disable_offload(
-                target="all", use_module_names_only=True
-            ):
-                self.convert_to_lora_layers()
+            self.convert_to_lora_layers(
+                snapshot_base=not self._has_layerwise_offload()
+            )
 
         # Check adapter presence and load missing adapters
         adapter_updated = False
@@ -1061,9 +1137,7 @@ class LoRAPipeline(ComposedPipelineBase):
             if self._needs_lora_weight_update_context(
                 target_modules, merge_weights_by_module
             ):
-                weight_update_context = self._temporarily_disable_offload(
-                    target_modules=target_modules
-                )
+                weight_update_context = self._weight_update_context(target_modules)
             else:
                 weight_update_context = nullcontext()
 
@@ -1114,6 +1188,12 @@ class LoRAPipeline(ComposedPipelineBase):
                         tgt_nicknames.copy(),
                         tgt_strengths.copy(),
                     )
+
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            finish_offload_writeback,
+        )
+
+        finish_offload_writeback()
 
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s, merge_mode=%s)",
@@ -1204,9 +1284,7 @@ class LoRAPipeline(ComposedPipelineBase):
             ):
                 modules_requiring_unmerge.append((module_name, lora_layers_dict))
 
-        offload_context = self._temporarily_disable_offload(
-            target_modules=modules_requiring_unmerge
-        )
+        offload_context = self._weight_update_context(modules_requiring_unmerge)
         with offload_context:
             for module_name, lora_layers_dict in target_modules:
                 for layer in lora_layers_dict.values():
@@ -1236,8 +1314,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if not target_modules:
             return
 
-        # Disable layerwise offload if enabled: load all layers to GPU
-        with self._temporarily_disable_offload(target_modules=target_modules):
+        with self._weight_update_context(target_modules):
             for module_name, lora_layers_dict in target_modules:
                 if not self._should_merge_lora_for_layers(
                     module_name, lora_layers_dict, self.server_args.lora_merge_mode
@@ -1286,6 +1363,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 logger.info(
                     "LoRA weights merged for %s (strength: %s)", module_name, strength
                 )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            finish_offload_writeback,
+        )
+
+        finish_offload_writeback()
 
     def unmerge_lora_weights(self, target: str = "all") -> None:
         """
@@ -1320,7 +1402,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         "LoRA weights are not merged for %s, skipping", module_name
                     )
                 continue
-            with self._temporarily_disable_offload(target_modules=target_modules):
+            with self._weight_update_context(target_modules):
                 for name, layer in lora_layers_dict.items():
                     # Check layer-level state to avoid raising exception
                     if hasattr(layer, "merged") and not layer.merged:
@@ -1344,6 +1426,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.cur_adapter_strength.pop(module_name, None)
                 self.cur_adapter_config.pop(module_name, None)
             logger.info("LoRA weights unmerged for %s", module_name)
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            finish_offload_writeback,
+        )
+
+        finish_offload_writeback()
 
     def get_lora_status(self) -> dict[str, Any]:
         """
