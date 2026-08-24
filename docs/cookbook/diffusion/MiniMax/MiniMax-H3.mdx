@@ -298,6 +298,14 @@ layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
 selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
 this mixed per-layer layout.
 
+W4A8 ConvRot DiT files use the same flagless flow. With
+`comfy-kitchen>=0.2.27`, pass a file such as
+`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
+and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
+subject to each row-parallel shard preserving the checkpoint's ConvRot group
+boundary, and FSDP is rejected.
+
 ### Advanced: precomputed AdaLN cache
 
 The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
@@ -949,6 +957,17 @@ fails closed if the native encoder does not support that format. The language
 linear layers use FP8 while embeddings, normalization, and the vision tower
 remain BF16. This is an approximate serve-time choice and is incompatible with
 the strict `quality="high"` deployment contract.
+
+The mixed W4A8 community encoder follows the same component-path contract:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
+```
+
+Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
+loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
+vision tower remains BF16.
 
 </Tab>
 

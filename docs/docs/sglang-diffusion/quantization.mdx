@@ -145,6 +145,14 @@ backend.
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
     <tr>
+      <td><code>auto-round</code> W4A16</td>
+      <td>Transformer component repo with a self-describing <code>quantization_config</code> and <code>auto_round:auto_gptq</code> packing</td>
+      <td><code>--transformer-path</code></td>
+      <td>Native dense DiTs with compatible component parameter mappings; MiniMax-H3 Diffusers components are supported</td>
+      <td>None</td>
+      <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
       <td><code>modelopt-nvfp4</code></td>
       <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
@@ -183,6 +191,14 @@ backend.
       <td>Native diffusion linears; mixed MiniMax-H3 checkpoints are selected per layer</td>
       <td>SRT's platform MXFP8 backend</td>
       <td>Serialized metadata is auto-detected. NVIDIA and ROCm reuse SRT's dense MXFP8 kernels; Ascend keeps its native online path. Mixed per-layer checkpoints do not support FSDP.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-w4a8-convrot</code></td>
+      <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 FL2VA / Ref2VA DiTs and its native Qwen3-VL encoder</td>
+      <td><code>comfy-kitchen&gt;=0.2.27</code></td>
+      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. Mixed encoder files may keep their embedding tensorwise INT8. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>

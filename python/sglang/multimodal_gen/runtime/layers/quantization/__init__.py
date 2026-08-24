@@ -2,6 +2,9 @@
 
 from typing import Literal, get_args
 
+from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
+    AutoRoundConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     BitsAndBytesConfig,
 )
@@ -27,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 
 QuantizationMethods = Literal[
+    "auto-round",
     "fp8",
     "modelopt",
     "modelopt_fp8",
@@ -43,6 +47,7 @@ QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "auto-round": AutoRoundConfig,
     "modelopt": ModelOptFp8DiffusionConfig,
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
