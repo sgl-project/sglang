@@ -40,10 +40,19 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        # Set attention backend for DeepSeek
+        # Pure DSA models use the top-level backend for sparse attention. Hybrid
+        # DSA/SWA models build their sparse backend separately and use this slot
+        # for the dense SWA executor instead.
         if is_attention_backend_not_set(cfg):
-            overrides["attention_backend"] = "dsa"
-            logger.info("Use dsa attention backend for DeepSeek with DSA.")
+            if getattr(hf_config, "is_hybrid_swa", False):
+                overrides["attention_backend"] = "fa3"
+                logger.info(
+                    "Use fa3 as the dense SWA backend for hybrid DSA/SWA; "
+                    "full-attention layers use the separate DSA backend."
+                )
+            else:
+                overrides["attention_backend"] = "dsa"
+                logger.info("Use dsa attention backend for DeepSeek with DSA.")
         if not get_platform().is_npu and not get_platform().is_xpu:  # CUDA or ROCm GPU
             if cfg.enable_prefill_cp:
                 logger.warning(

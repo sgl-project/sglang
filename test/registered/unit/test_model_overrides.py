@@ -2854,6 +2854,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _deepseek_family_overrides(_args(), None),
                             {"attention_backend": "dsa", "page_size": 64},
                         )
+                        self.assertEqual(
+                            _deepseek_family_overrides(
+                                _args(), SimpleNamespace(is_hybrid_swa=True)
+                            ),
+                            {"attention_backend": "fa3", "page_size": 64},
+                        )
                     # HIP without the preshuffle path: page 1
                     with override_platform(is_hip=True):
                         with patch(

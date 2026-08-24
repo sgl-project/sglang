@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dots_hybrid_backend import (
     DotsSWAMLAAttnBackend,
     _metadata_mismatches_dp_padded_batch,
     _normalize_cache_seqlens_rows,
+    _require_dots_swa_backend,
 )
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 from sglang.srt.layers.attention.swa_mla_fallback.ops import (
@@ -99,6 +100,11 @@ def test_normalize_cache_seqlens_truncates_extra_rows():
     normalized = _normalize_cache_seqlens_rows(cache_seqlens, seq_lens, 2)
 
     assert torch.equal(normalized, torch.tensor([17, 23], dtype=torch.int32))
+
+
+def test_dots_swa_backend_rejects_sparse_executor_during_initialization():
+    with pytest.raises(ValueError, match="requires FlashAttention"):
+        _require_dots_swa_backend(SimpleNamespace())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

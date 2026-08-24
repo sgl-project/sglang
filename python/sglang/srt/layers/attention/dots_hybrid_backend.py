@@ -535,13 +535,25 @@ def _wrap_dots_swa_backend(backend: AttentionBackend) -> AttentionBackend:
 
     if isinstance(backend, FlashAttentionBackend) or (
         isinstance(backend, HybridAttnBackend)
-        and (
-            isinstance(backend.prefill_backend, FlashAttentionBackend)
-            or isinstance(backend.decode_backend, FlashAttentionBackend)
+        and all(
+            isinstance(child, FlashAttentionBackend)
+            for child in (backend.prefill_backend, backend.decode_backend)
         )
     ):
         return DotsSWAMLAAttnBackend(backend)
     return backend
+
+
+def _require_dots_swa_backend(backend: AttentionBackend) -> DotsSWAMLAAttnBackend:
+    wrapped = _wrap_dots_swa_backend(backend)
+    if not isinstance(wrapped, DotsSWAMLAAttnBackend):
+        raise ValueError(
+            "Dots hybrid DSA/SWA requires FlashAttention for both prefill and "
+            "decode SWA execution. Configure --attention-backend fa3, or set "
+            "both --prefill-attention-backend and --decode-attention-backend "
+            "to FA3/FA4."
+        )
+    return wrapped
 
 
 def wrap_dots_draft_decode_backend(backend: AttentionBackend) -> AttentionBackend:
@@ -558,16 +570,11 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
         return _wrap_dots_swa_backend(full_attn_backend)
 
     if runner.model_config.hf_text_config.index_topk is None:
-        return DotsSWAMLAAttnBackend(full_attn_backend)
+        return _require_dots_swa_backend(full_attn_backend)
 
     from sglang.srt.layers.attention.attention_registry import create_dsa_backend
 
-    swa_backend = (
-        full_attn_backend.prefill_backend
-        if isinstance(full_attn_backend, HybridAttnBackend)
-        else full_attn_backend
-    )
     return DotsHybridAttnBackend(
         dsa_backend=create_dsa_backend(runner),
-        swa_backend=DotsSWAMLAAttnBackend(swa_backend),
+        swa_backend=_require_dots_swa_backend(full_attn_backend),
     )
