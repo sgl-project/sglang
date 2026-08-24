@@ -37,7 +37,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=3, suite="base-a-test-1-npu-a2")
 
 from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
     _ceil_by_factor,
