@@ -8,16 +8,12 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends import (
-    flash_attn as _fa_backend,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -821,7 +817,7 @@ def _ring_attention_varlen(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    softmax_scale: float,
+    attn_impl: "AttentionImpl",
     real_seq_len: int,
     ring_ws: int,
 ) -> torch.Tensor:
@@ -860,7 +856,6 @@ def _ring_attention_varlen(
     kv_bufs = [kv0, torch.empty_like(kv0)]
     cur = 0
 
-    q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
     out_acc: torch.Tensor | None = None
     lse_acc: torch.Tensor | None = None
     pending_ops = None
@@ -891,27 +886,11 @@ def _ring_attention_varlen(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
         if remote_used > 0:
-            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
-            result = flash_attn_varlen_func(
+            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
                 q,
                 kv_bufs[cur][0, :remote_used],
                 kv_bufs[cur][1, :remote_used],
-                cu_seqlens_q=q_cu,
-                cu_seqlens_k=k_cu,
-                max_seqlen_q=ring_chunk_len,
-                max_seqlen_k=remote_used,
-                softmax_scale=softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
-                return_softmax_lse=True,
             )
-            if not isinstance(result, tuple):
-                raise RuntimeError(
-                    "flash_attn_varlen_func did not return softmax_lse; ring "
-                    "parallelism requires a backend that supports "
-                    "return_softmax_lse=True."
-                )
-            step_out, step_lse, *_ = result
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse
             )
