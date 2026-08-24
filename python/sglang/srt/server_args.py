@@ -96,6 +96,7 @@ from sglang.srt.utils.common import (
     is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_wsl,
     is_xpu,
     json_list_type,
     nullable_str,
@@ -8624,6 +8625,12 @@ class ServerArgs:
             if self.nnodes != 1:
                 raise ValueError(
                     "--mm-feature-transport=cuda_ipc only supports a single node."
+                )
+            if is_wsl():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_ipc is not supported on WSL2 "
+                    "(cudaIpcOpenMemHandle is unavailable). Use "
+                    "--mm-feature-transport=cpu instead."
                 )
 
             pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()

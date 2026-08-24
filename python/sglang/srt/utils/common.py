@@ -869,6 +869,22 @@ def is_mnnvl_fabric_device() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_wsl() -> bool:
+    """Whether the process is running under Windows Subsystem for Linux v2.
+
+    CUDA IPC (cudaIpcOpenMemHandle / cudaIpcGetMemHandle) is unsupported on
+    WSL2, so callers that auto-select or validate ``cuda_ipc`` transport use
+    this to fall back to ``cpu`` or emit an actionable error.
+    """
+    try:
+        with open("/proc/version", "r") as f:
+            version_info = f.read()
+    except OSError:
+        return False
+    return "microsoft" in version_info.lower() or "wsl" in version_info.lower()
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 

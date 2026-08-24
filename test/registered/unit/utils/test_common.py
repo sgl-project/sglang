@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest import mock as unittest_mock  # noqa: F401
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_wsl,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -142,6 +144,48 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+class TestIsWsl(unittest.TestCase):
+    """Tests for the WSL2 detection helper (issue #35385)."""
+
+    def test_returns_bool(self):
+        result = is_wsl()
+        self.assertIsInstance(result, bool)
+
+    def test_detects_wsl_kernel_string(self):
+        import sglang.srt.utils.common as common
+
+        with unittest_mock.patch(
+            "builtins.open",
+            unittest_mock.mock_open(
+                read_data="Linux version 6.6.87.2-microsoft-standard-WSL2"
+            ),
+        ):
+            common.is_wsl.cache_clear()
+            self.assertTrue(common.is_wsl())
+            common.is_wsl.cache_clear()
+
+    def test_returns_false_on_non_wsl_kernel(self):
+        import sglang.srt.utils.common as common
+
+        with unittest_mock.patch(
+            "builtins.open",
+            unittest_mock.mock_open(
+                read_data="Linux version 6.8.0-1014-aws"
+            ),
+        ):
+            common.is_wsl.cache_clear()
+            self.assertFalse(common.is_wsl())
+            common.is_wsl.cache_clear()
+
+    def test_returns_false_when_proc_version_missing(self):
+        import sglang.srt.utils.common as common
+
+        with unittest_mock.patch("builtins.open", side_effect=OSError):
+            common.is_wsl.cache_clear()
+            self.assertFalse(common.is_wsl())
+            common.is_wsl.cache_clear()
 
 
 if __name__ == "__main__":
