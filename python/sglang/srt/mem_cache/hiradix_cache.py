@@ -65,6 +65,11 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_observability,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -86,10 +91,10 @@ class HiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
@@ -104,10 +109,10 @@ class HiRadixCache(RadixCache):
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
                 dcp_size=_parallel.attn_dcp_size,
                 dcp_rank=_parallel.attn_dcp_rank,
@@ -122,9 +127,9 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.enable_storage = server_args.hicache_storage_backend is not None
+        self.enable_storage = get_memory().hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
-        self.extra_metric_labels = server_args.extra_metric_labels
+        self.extra_metric_labels = get_observability().extra_metric_labels
 
         (
             extra_config,
@@ -132,11 +137,11 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
+            get_memory().hicache_storage_backend_extra_config
         )
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
-        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
@@ -173,16 +178,16 @@ class HiRadixCache(RadixCache):
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
                 pp_group=self.pp_group,
-                write_policy=server_args.hicache_write_policy,
-                io_backend=server_args.hicache_io_backend,
-                storage_backend=server_args.hicache_storage_backend,
+                write_policy=get_memory().hicache_write_policy,
+                io_backend=get_memory().hicache_io_backend,
+                storage_backend=get_memory().hicache_storage_backend,
                 prefetch_threshold=prefetch_threshold,
-                model_name=server_args.served_model_name,
+                model_name=get_serving().served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
         self._apply_storage_runtime_config(
-            storage_backend=server_args.hicache_storage_backend,
+            storage_backend=get_memory().hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
             prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
@@ -204,7 +209,7 @@ class HiRadixCache(RadixCache):
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
         # Detach storage backend automatically on process shutdown
@@ -907,7 +912,7 @@ class HiRadixCache(RadixCache):
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             # DMA confirmed -- block is now on host.
-            self._record_store_event(node, medium=StorageMedium.CPU)
+            self.kv_events.record_store(node, medium=StorageMedium.CPU)
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
         if release_lock:
@@ -1263,7 +1268,7 @@ class HiRadixCache(RadixCache):
 
     def _detach_backuped(self, node: TreeNode) -> int:
         # detach nodes from tree while keeping device slots, for write-back eviction
-        self._record_remove_event(node, medium=StorageMedium.GPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
         num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -1284,7 +1289,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
-        self._record_remove_event(node)
+        self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -1310,11 +1315,11 @@ class HiRadixCache(RadixCache):
         freed_device = 0
         for n in nodes:
             if n.host_value is not None:
-                self._record_remove_event(n, medium=StorageMedium.CPU)
+                self.kv_events.record_remove(n, medium=StorageMedium.CPU)
                 self.cache_controller.evict_host(n.host_value)
                 n.host_value = None
             if n.value is not None:
-                self._record_remove_event(n, medium=StorageMedium.GPU)
+                self.kv_events.record_remove(n, medium=StorageMedium.GPU)
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
@@ -1356,7 +1361,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
-            self._record_remove_event(x, medium=StorageMedium.CPU)
+            self.kv_events.record_remove(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = x.key.child_key(self.page_size)
@@ -1437,7 +1442,7 @@ class HiRadixCache(RadixCache):
             offset += len(node.host_value)
             # Block promoted from host to GPU -- emit store(GPU) so downstream
             # indexers see it as device-local again.
-            self._record_store_event(node, medium=StorageMedium.GPU)
+            self.kv_events.record_store(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
@@ -1774,6 +1779,8 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
+        matched_prefix_tokens: Optional[List[int]] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1848,7 +1855,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(node)
             # Publish the newly materialized host suffix immediately so downstream
             # cache indexers can resolve descendants that extend this L2-only prefix.
-            self._record_store_event(new_node, medium=StorageMedium.CPU)
+            self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
 
         return matched_length
 
@@ -1986,11 +1993,11 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(new_node)
 
             # Compute hash_value if storage or kv events are enabled
-            if self.enable_storage or self.enable_kv_cache_events:
+            if self.enable_storage or self.kv_events.enabled:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
             # Emit BlockStored so the router indexes this block.
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
