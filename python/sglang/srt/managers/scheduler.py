@@ -3618,6 +3618,16 @@ class Scheduler(
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
+        try:
+            return self._run_batch_impl(batch, pp_proxy_tensors)
+        finally:
+            self.profiler_manager.finish_nsys_pulse_capture_step()
+
+    def _run_batch_impl(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)

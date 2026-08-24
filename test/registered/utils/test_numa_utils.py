@@ -576,6 +576,7 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
             nsys_binary="nsys",
             output_dir="/logs/profiles/decode",
             capture_range="agentx_decode_capture",
+            capture_repetitions=32,
             gpu_id=3,
         )
         wrapper = Path(executable)
@@ -584,6 +585,7 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
             self.assertIn("exec nsys profile", script)
             self.assertIn("$(hostname)-decode-rank3", script)
             self.assertIn("agentx_decode_capture@*", script)
+            self.assertIn("--capture-range-end repeat:32:async", script)
             self.assertIn('/usr/bin/python3 "$@"', script)
             self.assertNotIn("trace-fork-before-exec", script)
         finally:
@@ -595,6 +597,7 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
             "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
             "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR": "/logs/profiles/decode",
             "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+            "SGLANG_NSYS_NVTX_CAPTURE_REPETITIONS": "32",
         },
     )
     @patch("sglang.srt.utils.numa_utils._mp_set_executable")
@@ -609,6 +612,7 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
             nsys_binary="nsys",
             output_dir="/logs/profiles/decode",
             capture_range="agentx_decode_capture",
+            capture_repetitions=32,
             gpu_id=2,
         )
         set_executable.assert_called_once_with(

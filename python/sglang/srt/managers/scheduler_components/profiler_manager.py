@@ -82,6 +82,9 @@ class SchedulerProfilerManager:
         self.merge_profiles = False
         self.nsys_nvtx_capture_active = False
         self.nsys_nvtx_capture_handle: Optional[int] = None
+        self.nsys_pulse_capture_per_step = os.getenv(
+            "SGLANG_NSYS_PULSE_CAPTURE_PER_STEP", "0"
+        ).strip().lower() in {"1", "true", "yes"}
         self.nsys_exact_batch = int(
             os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
         )
@@ -329,7 +332,9 @@ class SchedulerProfilerManager:
                 "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
             ).strip().lower() in {"1", "true", "yes"}
             if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
-                capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
+                capture_range = os.getenv(
+                    "SGLANG_NSYS_NVTX_CAPTURE_RANGE", ""
+                ).strip()
                 if capture_range:
                     # The scheduler's run_batch NVTX range is already open here.
                     # A push/pop capture would corrupt that nesting: the
@@ -349,6 +354,45 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _start_nsys_pulse_capture_step(self) -> None:
+        """Open the next one-step NVTX capture after scheduler preparation."""
+
+        if (
+            not getattr(self, "nsys_pulse_capture_per_step", False)
+            or not self.profile_in_progress
+            or self.nsys_nvtx_capture_active
+            or "CUDA_PROFILER" not in (self.profiler_activities or [])
+        ):
+            return
+        capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
+        if not capture_range:
+            return
+        self.nsys_nvtx_capture_handle = torch.cuda.nvtx.range_start(capture_range)
+        self.nsys_nvtx_capture_active = True
+        logger.info(
+            "Started Nsight Systems NVTX pulse %d/%d: %s",
+            self.nsys_exact_decode_batches_seen + 1,
+            self.nsys_exact_decode_batches,
+            capture_range,
+        )
+
+    def finish_nsys_pulse_capture_step(self) -> None:
+        """End node tracing before inter-iteration scheduler collectives."""
+
+        if not getattr(self, "nsys_pulse_capture_per_step", False) or not getattr(
+            self, "nsys_nvtx_capture_active", False
+        ):
+            return
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_end(self.nsys_nvtx_capture_handle)
+        self.nsys_nvtx_capture_handle = None
+        self.nsys_nvtx_capture_active = False
+        logger.info(
+            "Finished Nsight Systems NVTX pulse %d/%d",
+            self.nsys_exact_decode_batches_seen,
+            self.nsys_exact_decode_batches,
+        )
 
     def _wait_for_nsys_capture_start(self) -> None:
         """Prime every CUDA context before releasing ranks into model work."""
@@ -515,6 +559,7 @@ class SchedulerProfilerManager:
                 "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
             ).strip().lower() in {"1", "true", "yes"}
             if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
+                capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
                 if self.nsys_nvtx_capture_active:
                     # Finish all work enqueued by the last captured scheduler
                     # step before asking Nsight to finalize asynchronously.
@@ -522,7 +567,7 @@ class SchedulerProfilerManager:
                     torch.cuda.nvtx.range_end(self.nsys_nvtx_capture_handle)
                     self.nsys_nvtx_capture_handle = None
                     self.nsys_nvtx_capture_active = False
-                else:
+                elif not capture_range:
                     torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
@@ -689,6 +734,7 @@ class SchedulerProfilerManager:
                         "Exact-batch Nsight capture lost its fixed shape: "
                         f"expected {self.nsys_exact_batch}, got {len(batch.reqs)}"
                     )
+                self._start_nsys_pulse_capture_step()
                 self.nsys_exact_decode_batches_seen += 1
 
     def _profile(self, recv_req: ProfileReq):

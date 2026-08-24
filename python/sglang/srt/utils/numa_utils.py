@@ -110,10 +110,18 @@ def configure_nsys_scheduler_subprocess(gpu_id: int):
         )
 
     nsys_binary = os.getenv("SGLANG_NSYS_BINARY", "nsys").strip() or "nsys"
+    capture_repetitions = int(
+        os.getenv("SGLANG_NSYS_NVTX_CAPTURE_REPETITIONS", "1") or "1"
+    )
+    if capture_repetitions <= 0:
+        raise ValueError(
+            "SGLANG_NSYS_NVTX_CAPTURE_REPETITIONS must be a positive integer"
+        )
     executable, debug_str = _create_nsys_scheduler_executable(
         nsys_binary=nsys_binary,
         output_dir=output_dir,
         capture_range=capture_range,
+        capture_repetitions=capture_repetitions,
         gpu_id=gpu_id,
     )
     with _mp_set_executable(executable=executable, debug_str=debug_str):
@@ -121,7 +129,12 @@ def configure_nsys_scheduler_subprocess(gpu_id: int):
 
 
 def _create_nsys_scheduler_executable(
-    *, nsys_binary: str, output_dir: str, capture_range: str, gpu_id: int
+    *,
+    nsys_binary: str,
+    output_dir: str,
+    capture_range: str,
+    capture_repetitions: int = 1,
+    gpu_id: int,
 ):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     output_prefix = f'{shlex.quote(output_dir)}/"$(hostname)-decode-rank{gpu_id}"'
@@ -134,7 +147,7 @@ exec {shlex.quote(nsys_binary)} profile \\
   --force-overwrite true \\
   -c nvtx \\
   -p {shlex.quote(capture_range + "@*")} \\
-  --capture-range-end repeat:1:async \\
+  --capture-range-end repeat:{capture_repetitions}:async \\
   --kill none \\
   --wait all \\
   -o {output_prefix} \\
