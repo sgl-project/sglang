@@ -60,6 +60,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    mxfp4_triton: bool = False
+    ep_rank: int = 0
 
 
 @dataclass
@@ -148,6 +150,38 @@ class AiterRunnerCore(MoeRunnerCore):
                     )
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+
+        if quant_info.mxfp4_triton:
+            # aiter.fused_moe below has no gfx942 a4w4 path and aborts; its
+            # Triton MXFP4 GEMMs do run on CDNA3. Gated in the quant method.
+            from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import (
+                fused_moe_mxfp4_triton,
+            )
+
+            out = fused_moe_mxfp4_triton(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                activation=self.config.activation,
+                situ_beta=(
+                    float(self.config.gemm1_alpha)
+                    if self.config.gemm1_alpha is not None
+                    else 4.0
+                ),
+                situ_linear_beta=(
+                    float(self.config.gemm1_clamp_limit)
+                    if self.config.gemm1_clamp_limit is not None
+                    else 25.0
+                ),
+                num_global_experts=self.config.num_experts,
+                ep_rank=quant_info.ep_rank,
+                apply_router_weight_on_input=quant_info.doweight_stage1,
+            )
+            return AiterRunnerOutput(hidden_states=out)
 
         from aiter.fused_moe import fused_moe
 

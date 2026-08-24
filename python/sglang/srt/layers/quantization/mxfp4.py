@@ -41,6 +41,7 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import use_triton_mxfp4_moe
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -922,6 +923,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .view(-1, n)
                     )
 
+            if use_triton_mxfp4_moe():
+                # The Triton kernels read the layout above; the preshuffle below
+                # is for the FlyDSL asm kernels.
+                layer.w13_weight.is_shuffled = False
+                layer.w2_weight.is_shuffled = False
+                return
+
             k3_situ_a8w4 = (
                 os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
                 and getattr(layer.moe_runner_config, "activation", None) == "situ"
@@ -1745,6 +1753,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=AiterQuantType.PER_1X32,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                mxfp4_triton=use_triton_mxfp4_moe(),
+                ep_rank=layer.moe_ep_rank,
                 b13=layer.w13_weight_bias if self.with_bias else None,
                 b2=layer.w2_weight_bias if self.with_bias else None,
                 expert_mask=layer.dispatcher.expert_mask_gpu,
