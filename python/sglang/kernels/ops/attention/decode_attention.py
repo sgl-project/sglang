@@ -1790,7 +1790,7 @@ def lean_decode_seqlen_gate(
     num_q_heads: int,
     kv_group_num: int,
     batch: int,
-    seq_lens_sum: int,
+    seq_lens_sum: Optional[int],
     is_mla: bool = False,
 ) -> bool:
     """Cheap host-side pre-gate for Lean decode (no GPU sync).
@@ -1854,6 +1854,10 @@ def lean_decode_seqlen_gate(
       a single-GPU microbench cannot replicate it, so this tier stays protected.
     """
     if batch <= 0:
+        return False
+    # No CPU length mirror (e.g. gpu-only batches, or the EAGLE draft runner, which leaves
+    # seq_lens_sum unset): we cannot judge context length, so fall back to the standard kernel.
+    if seq_lens_sum is None:
         return False
     avg_len = seq_lens_sum / batch
     if is_mla:

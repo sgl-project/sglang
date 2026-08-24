@@ -378,6 +378,19 @@ class TestLeanSeqlenGate(CustomTestCase):
             "MLA at batch>=8 with long context is a win; gate must enable",
         )
 
+    def test_gate_off_when_seq_lens_sum_missing(self):
+        # The EAGLE draft runner (and gpu-only batches) call decode without a CPU length
+        # mirror, so seq_lens_sum is None. The gate must fall back to the standard kernel
+        # instead of dividing None by batch (which raised TypeError and crashed the
+        # scheduler under EAGLE3 speculative decoding).
+        H_Q, kv_group = 28, 7
+        self.assertFalse(
+            lean_decode_seqlen_gate(
+                H_Q, kv_group, batch=8, seq_lens_sum=None, is_mla=False
+            ),
+            "gate must return False (not raise) when seq_lens_sum is None",
+        )
+
     def test_gate_threshold_falls_with_batch(self):
         # The crossover context falls as batch grows: a context that is below the
         # single-request threshold should still enable Lean at higher batch.
