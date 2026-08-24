@@ -843,22 +843,6 @@ def run_aisbench(
         raise
 
 
-def _metric_float(metrics, key):
-    """Return ``float(metrics[key])`` or fail cleanly when the metric is missing.
-
-    A benchmark that timed out (or was SIGKILLed by the watchdog) leaves its
-    metrics dict entries as ``None``; ``float(None)`` would otherwise raise an
-    opaque ``TypeError`` instead of a meaningful assertion failure.
-    """
-    value = metrics.get(key)
-    if value is None:
-        raise AssertionError(
-            f"Benchmark metric '{key}' is missing; the benchmark likely timed "
-            "out or was killed before producing results."
-        )
-    return float(value)
-
-
 def assert_metrics(self, metrics):
     """Assert benchmark metrics against expected values.
 
@@ -917,27 +901,27 @@ def assert_metrics(self, metrics):
     if self.tpot:
         if self.tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
-                _metric_float(metrics, "mean_tpot"),
+                float(metrics["mean_tpot"]),
                 self.tpot + TPOT_TOLERANCE_LOW,
             )
         else:
             self.assertLessEqual(
-                _metric_float(metrics, "mean_tpot"),
+                float(metrics["mean_tpot"]),
                 self.tpot * TPOT_TOLERANCE_HIGH,
             )
     if self.output_token_throughput:
         self.assertGreaterEqual(
-            _metric_float(metrics, "total_tps"),
+            float(metrics["total_tps"]),
             self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
     if self.ttft:
         self.assertLessEqual(
-            _metric_float(metrics, "mean_ttft"),
+            float(metrics["mean_ttft"]),
             self.ttft * TTFT_TOLERANCE,
         )
     if self.mean_e2e_latency:
         self.assertLessEqual(
-            _metric_float(metrics, "mean_e2e_latency"),
+            float(metrics["mean_e2e_latency"]),
             self.mean_e2e_latency * E2E_TOLERANCE,
         )
 
@@ -958,17 +942,17 @@ def _collect_process_tree(root_pid):
     try:
         root = psutil.Process(root_pid)
     except psutil.NoSuchProcess:
-        logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} not found")
+        logger.warning(f"_collect_process_tree: root_pid {root_pid} not found")
         return procs
     try:
         for proc in [root] + root.children(recursive=True):
             try:
                 procs[proc.pid] = proc.create_time()
             except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-                logger.info(f"[cleanup-debug] _collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})")
+                logger.debug(f"_collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})")
     except psutil.NoSuchProcess:
-        logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} vanished while walking children")
-    logger.info(f"[cleanup-debug] _collect_process_tree: recorded PIDs {sorted(procs)}")
+        logger.warning(f"_collect_process_tree: root_pid {root_pid} vanished while walking children")
+    logger.info(f"_collect_process_tree: recorded {len(procs)} PIDs")
     return procs
 
 
@@ -980,23 +964,25 @@ def _kill_recorded_pids(procs):
     Complements ``kill_process_tree`` so re-parented orphans that still hold
     the runner's stdout pipe (or NPU device memory) do not wedge the suite.
     """
-    logger.info(f"[cleanup-debug] _kill_recorded_pids: attempting SIGKILL on {sorted(procs)}")
+    logger.info(f"_kill_recorded_pids: attempting SIGKILL on {len(procs)} PIDs")
     for pid, create_time in procs.items():
         try:
             if psutil.Process(pid).create_time() != create_time:
-                logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} (create_time mismatch, likely reused)")
+                logger.warning(
+                    f"_kill_recorded_pids: skip PID {pid} (create_time mismatch, likely reused)"
+                )
                 continue
         except psutil.NoSuchProcess:
-            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} (no longer exists)")
+            logger.debug(f"_kill_recorded_pids: skip PID {pid} (no longer exists)")
             continue
         except psutil.AccessDenied as exc:
-            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})")
+            logger.warning(f"_kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})")
             continue
         try:
             os.kill(pid, signal.SIGKILL)
-            logger.info(f"[cleanup-debug] _kill_recorded_pids: SIGKILL sent to PID {pid}")
+            logger.debug(f"_kill_recorded_pids: SIGKILL sent to PID {pid}")
         except (ProcessLookupError, PermissionError, OSError) as e:
-            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})")
+            logger.warning(f"_kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})")
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
