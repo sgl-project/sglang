@@ -4,6 +4,9 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLArchConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
+    QuantoInt8Config,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -84,6 +87,41 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         "merger.linear_fc2.weight",
         "merger.linear_fc2.bias",
     }
+
+
+def test_native_vision_accepts_srt_linear_quantization():
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=1,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=12,
+        deepstack_visual_indexes=[],
+    )
+    prefixes = {
+        "model.visual.blocks.0.attn.qkv_proj",
+        "model.visual.blocks.0.attn.proj",
+        "model.visual.blocks.0.mlp.linear_fc1",
+        "model.visual.blocks.0.mlp.linear_fc2",
+    }
+    quant_config = QuantoInt8Config(prefixes)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(
+            config,
+            quant_config=quant_config,
+            prefix="model.visual",
+        )
+
+    assert quant_config.selected == prefixes
+    for name, parameter in model.blocks[0].named_parameters():
+        if name.endswith("weight") and not name.startswith("norm"):
+            assert parameter.dtype == torch.int8
 
 
 def test_native_vision_keeps_position_math_in_fp32():
