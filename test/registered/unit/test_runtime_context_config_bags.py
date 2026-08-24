@@ -74,7 +74,8 @@ class TestConfigBags(CustomTestCase):
 
     def _publish(self):
         sa = ServerArgs(model_path="dummy")
-        rc.get_context().set_server_args(sa)
+        # Through publish, so the record is resolved the way a process resolves it.
+        rc.publish(sa, role="test")
         return sa
 
     def test_fail_closed_before_publish(self):
@@ -201,7 +202,14 @@ class TestConfigBags(CustomTestCase):
         self.addCleanup(restore_process_state)
 
         def resolve():
-            return ServerArgs(model_path=config_dir, device="cuda", random_seed=42)
+            server_args = ServerArgs(
+                model_path=config_dir, device="cuda", random_seed=42
+            )
+            # The reference has to be *resolved*, not merely constructed:
+            # construction is inert, and the point of the sibling is to be an
+            # independent run of the pipeline over the same raw input.
+            server_args.resolve_once()
+            return server_args
 
         sa = resolve()
         rc.publish(sa, role="scheduler")
@@ -287,7 +295,7 @@ class TestRoleNamespaceEnforcement(CustomTestCase):
             rc.get_mm()
             # A direct set_server_args install is roleless; enforcement only
             # keys off a recorded publish role.
-            rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+            rc.publish(ServerArgs(model_path="dummy"), role="test")
             rc.get_exec()
 
     def test_off_mode_bag_read_traces_under_torch_compile(self):
