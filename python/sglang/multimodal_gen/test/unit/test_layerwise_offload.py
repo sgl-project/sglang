@@ -65,6 +65,9 @@ class _FakeEvent:
     def record(self, _stream) -> None:
         return None
 
+    def synchronize(self) -> None:
+        return None
+
 
 class _FakeDeviceModule:
     Stream = _FakeStream
@@ -202,6 +205,7 @@ def _server_args(**kwargs):
     defaults = dict(
         component_residency=None,
         disagg_role=RoleType.MONOLITHIC,
+        performance_mode="auto",
         _required_resident_components=set(),
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
@@ -794,6 +798,12 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
 
 
+class _ParkableResidentComponent(_ResidentComponent):
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+
+
 class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
 
@@ -981,6 +991,40 @@ def test_configure_resolves_residency_policy(monkeypatch):
     )
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
+    )
+
+
+def test_configure_logs_component_start_and_completion(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    logs = []
+    timestamps = iter((10.0, 12.345))
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "info",
+        lambda message, *args: logs.append(message % args),
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod,
+        "perf_counter",
+        lambda: next(timestamps),
+    )
+
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=2,
+            dit_layerwise_resident_layers=3,
+        ),
+        component_name="transformer",
+    )
+
+    assert logs[0] == (
+        "Configuring layerwise offload for transformer (_ResidentComponent): "
+        "blocks (8 layers)"
+    )
+    assert logs[-1] == (
+        "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
+        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
     )
 
 
@@ -1308,6 +1352,84 @@ class _MixedBlock(torch.nn.Module):
         )
 
 
+def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    model = manager.model
+    # the manager has already swapped the parameter for a placeholder; the
+    # checkpoint file itself holds zeros, so that is the expected content
+    expected = torch.zeros(8, 8)
+
+    manager.prefetch_layer(0, non_blocking=True)
+    assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
+    assert (
+        0 not in manager._gpu_layers
+    ), "the layer is not ready until its tensors are bound on this thread"
+
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert torch.equal(
+        model.blocks[0].weight.detach().cpu(), expected
+    ), "the bytes that went through the courier's slot must be the checkpoint's"
+
+
+def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # The switch is read when the courier would first be built, and
+    # initialization itself prefetches -- so set it before the manager exists,
+    # the way a deployment sets it before starting the server.
+    monkeypatch.setenv("SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER", "1")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager.release_all()
+    manager.prefetch_layer(0, non_blocking=True)
+    assert not manager._courier_inflight and manager._mapped_courier is None
+    assert (
+        0 in manager._gpu_layers
+    ), "with the courier disabled the direct synchronous path serves the layer"
+
+
+def test_release_all_drains_the_courier(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager.prefetch_layer(0, non_blocking=True)
+
+    manager.release_all()
+
+    assert not manager._courier_inflight
+    assert not manager._gpu_layers
+    courier = manager._mapped_courier
+    assert courier is not None and not courier._results, (
+        "an uncollected layer would keep its device tensors alive inside the "
+        "courier for the rest of the process"
+    )
+
+
+def test_a_broken_courier_falls_back_to_the_synchronous_copy(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    model = manager.model
+    expected = torch.zeros(8, 8)
+
+    manager.prefetch_layer(0, non_blocking=True)
+    # the courier dies with the layer still in flight
+    courier = manager._mapped_courier
+    courier._broken = True
+    with courier._ready:
+        courier._results.pop(0, None)
+        courier._pending.discard(0)
+        courier._ready.notify_all()
+
+    manager.prefetch_layer(0, non_blocking=False)
+
+    assert 0 in manager._gpu_layers
+    assert manager._mapped_courier is None, "a failed courier is retired"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected)
+
+
 class _MixedModel(torch.nn.Module):
     def __init__(self, path: pathlib.Path, num_blocks: int) -> None:
         super().__init__()
@@ -1603,3 +1725,97 @@ def test_layerwise_tuning_accepts_json_and_pair_forms():
     assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
     as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
     assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+
+
+def test_non_layer_parking_follows_memory_performance_mode(monkeypatch):
+    """The extra transfer per request only pays for itself under memory mode."""
+    _patch_fake_device(monkeypatch)
+    tight = _ResidentComponent(4)
+    tight.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert tight.park_non_layer_weights_between_uses
+
+    relaxed = _ResidentComponent(4)
+    relaxed.configure_layerwise_offload(_server_args(performance_mode="speed"))
+    assert not relaxed.park_non_layer_weights_between_uses
+
+
+def test_parking_leaves_streamed_layer_weights_alone(monkeypatch):
+    """Only the parameters no manager streams are moved to the host."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    managed = comp._managed_layer_parameter_names()
+    assert managed, "the managers should own the block parameters"
+
+    comp.park_non_layer_weights()
+    parked = comp._parked_non_layer_weights
+    assert not (set(parked) & managed), "a streamed layer weight was parked"
+    for name, host_tensor in parked.items():
+        assert host_tensor.device.type == "cpu", name
+
+    comp.restore_non_layer_weights()
+    restored = dict(comp.named_parameters())
+    for name, host_tensor in parked.items():
+        assert restored[name].shape == host_tensor.shape
+
+
+def test_parking_is_a_no_op_outside_memory_mode(monkeypatch):
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="speed"))
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+
+
+def _headroom(monkeypatch, gib):
+    monkeypatch.setattr(
+        layerwise_offload_mod.current_platform,
+        "get_available_gpu_memory",
+        lambda **_: float(gib),
+    )
+    module = layerwise_offload_mod.torch.get_device_module()
+    monkeypatch.setattr(module, "memory_reserved", lambda *_: 0, raising=False)
+    monkeypatch.setattr(module, "memory_allocated", lambda *_: 0, raising=False)
+
+
+def test_parking_is_skipped_when_the_card_has_room(monkeypatch):
+    """A component holding a sliver of a large headroom is left alone."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+
+
+def test_parking_happens_when_the_headroom_is_small(monkeypatch):
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+
+
+def test_host_copies_are_given_back_when_room_appears(monkeypatch):
+    """Skipping must not leave host memory held for a park that will not happen."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights, "host copies should be released"
+
+
+def test_park_placeholders_are_shared(monkeypatch):
+    """One stand-in per (device, dtype), not one allocation per parked weight."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    managed = comp._managed_layer_parameter_names()
+    stand_ins = {
+        id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
+    }
+    assert len(stand_ins) <= len(comp._park_placeholders)

@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
     NPUMXFP4Config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 
 QuantizationMethods = Literal[
     "fp8",

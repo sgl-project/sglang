@@ -176,6 +176,7 @@ def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
     assert download.call_args.kwargs["revision"] == "immutable-sha"
     assert download.call_args.kwargs["allow_patterns"] == [
         "*.json",
+        "adapters/*.json",
         f"adapters/{weight_name}",
     ]
 
