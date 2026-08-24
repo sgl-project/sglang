@@ -37,7 +37,6 @@ QWEN35_ATTNFP8_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
-# The fusion is accuracy-neutral (~0.94-0.97 here), so 0.92 gates regressions.
 ACCURACY_THRESHOLD = 0.92
 
 # bench_sglang.py is at the repo root (this file is 5 levels below).
@@ -59,7 +58,7 @@ COMMON_ARGS: List[str] = [
     "--mem-fraction-static",
     "0.85",
     "--cuda-graph-max-bs-decode",
-    "256",
+    "128",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true}',
     "--watchdog-timeout",
