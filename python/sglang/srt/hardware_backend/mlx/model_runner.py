@@ -58,6 +58,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.remote_code_gate import (
+    ensure_remote_code_allowed,
+    resolve_model_directory,
+)
 from sglang.srt.hardware_backend.mlx.sampling import (
     GREEDY_PARAMS,
     MlxLazyLogprobs,
@@ -166,12 +170,14 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        revision: str | None = None,
         enable_sampling: bool = False,
         sampling_rng_seed: int = 0,
         deterministic_seeding: bool = False,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
+        self.revision = revision
         self.model = None
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
@@ -195,6 +201,19 @@ class MlxModelRunner:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
         # modules directly.
         self._quantization: str | None = quantization
+
+        # Optionally cap the buffer cache (recycled GPU buffers). MLX never
+        # returns freed buffers to the OS, so without a cap the process
+        # footprint ratchets up to the worst transient — which is model
+        # load/quantization itself, so the cap must be in place before it.
+        cache_limit_gb = envs.SGLANG_MLX_CACHE_LIMIT_GB.get()
+        if cache_limit_gb is not None:
+            if cache_limit_gb < 0:
+                raise ValueError(
+                    f"SGLANG_MLX_CACHE_LIMIT_GB must be >= 0, got {cache_limit_gb}"
+                )
+            mx.set_cache_limit(int(cache_limit_gb * (1024**3)))
+            logger.info(f"MLX buffer cache limit set to {cache_limit_gb:.1f} GB")
 
         self._load_model()
 
@@ -399,6 +418,7 @@ class MlxModelRunner:
                 return
             req.mamba_ping_pong_track_buffer = track_buffer
             req.mamba_next_track_idx = 0
+            req.mamba_last_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
@@ -480,10 +500,18 @@ class MlxModelRunner:
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
+        # Resolve the checkpoint directory once and inspect that exact
+        # directory before mlx-lm can execute any checkpoint-shipped
+        # model_file; the same directory is then handed to mlx_lm_load
+        # (identity resolution for local dirs), so the inspected and
+        # executed snapshots cannot diverge.
+        model_dir = resolve_model_directory(self.model_path, revision=self.revision)
+        ensure_remote_code_allowed(model_dir, self.trust_remote_code)
+
         # We need the config dict to pass into quantize_model so it knows tied/embedding
         # layout. return_config=True is cheap and ignored when no quantization is requested.
         loaded = mlx_lm_load(
-            self.model_path,
+            str(model_dir),
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
             return_config=True,
         )
@@ -699,23 +727,10 @@ class MlxModelRunner:
             return
         num_pool_layers = self._cache_layout.num_full_attention_layers
         if self._cache_layout.has_sliding_window_layers:
-            # The pool exists to serve radix prefix hits, and an SWA prefix hit
-            # recomputes the prefix instead of gathering it (see prefill_start),
-            # so on any SWA model the pool has no reader: its sole consumer is
-            # PoolBackedAttentionKVCache, reachable only when
-            # trusted_prefix_len > 0, which requires no SWA layers. Allocating
-            # it anyway would burn the whole auto-sized KV budget
-            # (_compute_pool_size fills mem_fraction_static) on a buffer that is
-            # only ever written. Skipping it also disables the fused AOT
-            # RoPE + pool-scatter kernel for the full layers, whose scatter half
-            # is dead work here; that kernel is opt-in
-            # (SGLANG_MLX_USE_CUSTOM_ROPE, default off), so the default path
-            # loses nothing.
-            #
-            # Un-gate this together with the window-aware shared SWA pool that
-            # restores fast prefix hits: the seams it needs (the layout
-            # partition, the full-pool index, layer-type dispatch) are already
-            # in place.
+            # Allocating it anyway would burn the whole auto-sized KV budget
+            # (_compute_pool_size fills mem_fraction_static) on a write-only
+            # buffer.  This also disables the fused AOT RoPE + pool-scatter
+            # kernel, which is opt-in (SGLANG_MLX_USE_CUSTOM_ROPE, default off).
             logger.info(
                 "Model has %d sliding-window attention layers; skipping the "
                 "shared attention KV pool (an SWA prefix hit recomputes the "
@@ -1115,11 +1130,9 @@ class MlxModelRunner:
 
         Non-final chunked-prefill chunks discard their next-token output
         (``extend_finalize`` pops it), yet the full model call still computes
-        vocab-sized float32 logits for every chunk position — for a 200K-vocab
-        model that is ~100x the useful head work and the largest transient
-        allocation in the process.  ``self._trunk`` is resolved once at load;
-        returns None when the model exposes no headless trunk (caller falls
-        back to the full forward).
+        vocab-sized float32 logits for every chunk position — the largest
+        transient allocation in the process.  Returns None when the model
+        exposes no headless trunk, and the caller runs the full forward.
         """
         if self._trunk is None:
             return None
@@ -1165,25 +1178,20 @@ class MlxModelRunner:
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 
-        Greedy behavior (sampling disabled, or every row greedy with no
-        logit edits) is exactly the pre-sampling ``mx.argmax`` and consumes
-        no RNG state.  ``edit_rows`` is the worker's pre-combined additive
-        [B, vocab] array (grammar mask + logit_bias), applied before token
-        selection and logprobs, mirroring the CUDA
-        ``ModelRunner._preprocess_logits`` order.  Positions for seeded rows
-        come from the attention cache offsets, which the just-built forward
-        has already advanced past the token being sampled — the same
-        ``seq_len - 1`` the pytorch path feeds its sampler.  They are
-        build-time Python ints, so this is chained-decode safe.
+        Greedy behavior (sampling disabled, or every row greedy with no logit
+        edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
+        worker's pre-combined additive [B, vocab] array (grammar mask +
+        logit_bias), applied before token selection and logprobs, mirroring the
+        CUDA ``ModelRunner._preprocess_logits`` order.  Positions for seeded
+        rows come from the attention cache offsets; they are build-time Python
+        ints, so this is chained-decode safe.
         """
         if not self._enable_sampling:
             return mx.argmax(last_logits, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
         edited = self._edited_logits(last_logits, edit_rows)
         greedy = all_greedy(params)
-        # Built once and shared: sampling and logprobs both start from
-        # logits/temperature, and MLX does not CSE the two identical graphs.
-        # Stays None when neither needs it (the greedy, no-logprob path).
+        # Shared by sampling and logprobs; None when neither needs it.
         scaled = (
             scale_by_temperature(edited, params)
             if not greedy or logprob_spec is not None
@@ -1238,10 +1246,9 @@ class MlxModelRunner:
     def _run_logits_hook(self, last_logits: mx.array, logits_hook) -> mx.array:
         """Materialize logits and let the worker edit them on the CPU.
 
-        Used for custom logit processors (arbitrary torch callables) — the
-        one edit that cannot be expressed lazily.  Synchronizes the graph;
-        callers gate this to fresh, pure-decode launches, so the chained
-        overlap pipeline never pays for it.
+        Used for custom logit processors (arbitrary torch callables) — the one
+        edit that cannot be expressed lazily.  Synchronizes the graph, so
+        callers gate it to fresh, pure-decode launches.
         """
         logits32 = last_logits.astype(mx.float32)
         mx.eval(logits32)
@@ -1279,9 +1286,7 @@ class MlxModelRunner:
         """Materialize a queued forward: token(s), cache writes and logprobs.
 
         One ``mx.eval`` for the whole pending, so the attention
-        write-then-read ordering is materialised in a single kernel
-        submission.  Prefill and extend carry one request's per-layer
-        cache; a decode carries one cache list per request.
+        write-then-read ordering lands in a single kernel submission.
         """
         if isinstance(pending, MlxPendingDecode):
             tokens, caches = pending.lazy_tokens, pending.caches
@@ -1297,11 +1302,10 @@ class MlxModelRunner:
     def _dummy_next_token(hidden: mx.array) -> mx.array:
         """Graph-connected placeholder token for a skipped-head chunk.
 
-        Value is always 0 (a valid vocab id); it is appended and then popped
-        as the "stale intermediate token" by the next chunk's finalize.
-        Deriving it from ``hidden`` keeps the trunk in the lazy graph handed
-        to ``mx.eval``/``mx.async_eval`` (cache arrays are also evaluated
-        explicitly by both call paths).
+        Value is always 0 (a valid vocab id); it is appended and then popped as
+        the "stale intermediate token" by the next chunk's finalize.  Deriving
+        it from ``hidden`` is what keeps the trunk in the lazy graph handed to
+        ``mx.eval`` / ``mx.async_eval``.
         """
         return (hidden[:, -1, 0] * 0).astype(mx.int32)
 

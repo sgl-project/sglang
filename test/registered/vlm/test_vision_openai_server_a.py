@@ -8,6 +8,7 @@ import unittest
 
 import openai
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -45,6 +46,11 @@ class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     extra_args = ["--cuda-graph-max-bs-decode=4"]
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_MM_FEATURE_CACHE_MB.override(512):
+            super().setUpClass()
 
 
 class TestQwen2VLContextLengthServer(CustomTestCase):

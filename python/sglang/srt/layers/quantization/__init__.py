@@ -19,7 +19,12 @@ class DummyConfig:
 CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
+from sglang.srt.layers.quantization.awq import (
+    AWQConfig,
+    AWQCPUConfig,
+    AWQMarlinConfig,
+    AWQXPUConfig,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -33,6 +38,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQAscendConfig,
     GPTQConfig,
     GPTQMarlinConfig,
+    GPTQXPUConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
@@ -61,6 +67,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_mps,
     is_npu,
+    is_xpu,
 )
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -121,6 +128,15 @@ if is_npu():
     )
 
 
+if is_xpu():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQXPUConfig,
+            "awq": AWQXPUConfig,
+        }
+    )
+
+
 if is_mps():
     BASE_QUANTIZATION_METHODS.update(
         {
@@ -137,6 +153,7 @@ CPU_QUANTIZATION_METHODS = {
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
     "mxfp4": Mxfp4Config,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

@@ -25,6 +25,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_spec,
+)
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -33,12 +38,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
-FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
-    skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
+    skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
 
@@ -50,28 +54,29 @@ def should_run_flashinfer_autotune(
     mr = model_runner
     if mr.device != "cuda":
         return False
-    if mr.server_args.disable_flashinfer_autotune:
+    if get_exec().kernel.disable_flashinfer_autotune:
         return False
-    if mr.server_args.enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         # Tuned configs are per problem shape, so the reduction order would follow
         # the batch shape.
         return False
 
-    server_args = mr.server_args
     if for_speculative_draft:
         backend_str = (
-            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+            get_spec().speculative_moe_runner_backend
+            or get_exec().moe.moe_runner_backend
         )
         a2a_backend_str = (
-            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
         )
     else:
-        backend_str = server_args.moe_runner_backend
-        a2a_backend_str = server_args.moe_a2a_backend
+        backend_str = get_exec().moe.moe_runner_backend
+        a2a_backend_str = get_exec().moe.moe_a2a_backend
 
     # Autotune can run before the MoE backend globals are initialized, so read
-    # the target or draft backend from server_args. CuteDSL v1 bypasses
-    # MoeRunner, and its dummy dispatch can exceed DeepEP low-latency's token limit.
+    # the configured backends -- the draft leaves (`get_spec()`) or the target
+    # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
+    # dummy dispatch can exceed DeepEP low-latency's token limit.
     if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 
@@ -100,18 +105,16 @@ def should_run_flashinfer_autotune(
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
-        get_fp8_gemm_runner_backend,
+        flashinfer_per_tensor_fp8_supported,
+        resolve_mxfp8_dense_gemm_backend,
     )
-    from sglang.srt.utils import is_sm100_supported
 
-    model_uses_modelopt_fp8 = model_quantization in (
-        "modelopt",
-        "modelopt_fp8",
-        "modelopt_mixed",
-    )
-    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
-        model_uses_modelopt_fp8 and is_sm100_supported()
-    )
+    if model_quantization == "mxfp8":
+        fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
+    elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+        fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
+    else:
+        fp8_gemm_needs_autotune = False
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
@@ -133,12 +136,11 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     arch = f"sm{major}{minor}"
     flashinfer_version = getattr(flashinfer, "__version__", "unknown")
 
-    server_args = mr.server_args
     model_key_parts = [
-        str(server_args.model_path),
+        str(get_model().model_path),
         str(mr.dtype),
-        str(server_args.quantization),
-        str(server_args.moe_runner_backend),
+        str(get_model().quantization),
+        str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
         str(mr.ps.pp_size),
         str(mr.ps.attn_dp_size),
@@ -168,7 +170,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 
 @contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
+def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer.autotuner import autotune
 
     mr = model_runner
@@ -191,27 +193,24 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        maybe_skip_logits = contextlib.nullcontext()
-        if skip_logits:
-            from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
-            maybe_skip_logits = autotune_dummy_run_mode()
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
         with autotune(
             True,
             cache=str(autotune_cache),
             skip_ops=skip_ops,
-        ), maybe_skip_logits:
+        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
 
 def run_flashinfer_autotune_forward(
-    model_runner: ModelRunner, forward_fn: Callable[[], None], *, skip_logits: bool
+    model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
 ) -> None:
     """Run flashinfer autotune forward."""
-    with flashinfer_autotune_context(model_runner, skip_logits=skip_logits):
+    with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
 
 
@@ -220,7 +219,7 @@ def maybe_flashinfer_autotune_speculative_draft(
     forward_fn: Callable[[], None],
     *,
     post_warmup_hook: Optional[Callable[[], None]] = None,
-    skip_logits: bool = False,
+    run_lm_head: bool = True,
 ) -> None:
     """Run speculative draft flashinfer autotune."""
     mr = runner.model_runner
@@ -243,7 +242,7 @@ def maybe_flashinfer_autotune_speculative_draft(
         if post_warmup_hook is not None:
             post_warmup_hook()
 
-    run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits)
+    run_flashinfer_autotune_forward(mr, run_and_reset, run_lm_head=run_lm_head)
     tuned_phases.add(phase_key)
 
 
@@ -314,7 +313,7 @@ def maybe_flashinfer_autotune_extend(
         f"({batch_size} seqs x {per_req} tokens).",
     )
     try:
-        run_flashinfer_autotune_forward(mr, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
