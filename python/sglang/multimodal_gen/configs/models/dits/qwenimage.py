@@ -25,7 +25,27 @@ class QwenImageArchConfig(DiTArchConfig):
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
     param_names_mapping: dict = field(
+        # Order matters for chained mapping. Put specific rewrites first.
         default_factory=lambda: {
+            # HF -> SGLang: some checkpoints save attention output as 'attn.to_out.weight/bias'
+            # while our modules expose it under a ModuleList index 'attn.to_out.0.{weight,bias}'.
+            r"^(transformer_blocks\.[0-9]+\.attn\.to_out)\.(weight|bias)$": r"\1.0.\2",
+            # Split added_qkv projections into a fused to_added_qkv (merge order: q=0, k=1, v=2)
+            r"^(transformer_blocks\.(\d+)\.attn)\.add_q_proj\.(.+)$": (
+                r"\1.to_added_qkv.\3",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.(\d+)\.attn)\.add_k_proj\.(.+)$": (
+                r"\1.to_added_qkv.\3",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.(\d+)\.attn)\.add_v_proj\.(.+)$": (
+                r"\1.to_added_qkv.\3",
+                2,
+                3,
+            ),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
             # SVDquant mappings
