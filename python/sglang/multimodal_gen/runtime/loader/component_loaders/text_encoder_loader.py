@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_confi
     QuantoInt8Config,
     inspect_quanto_int8_checkpoint,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
     normalize_quanto_int8_weights,
 )
@@ -51,6 +52,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
     NativeComponentLoaderRequired,
     uses_native_transformers_bnb4,
+)
+from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+    gguf_weights_iterator,
+    names_gguf_checkpoint,
+    read_gguf_tensor_meta,
+    remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
@@ -171,21 +178,45 @@ def _get_encoder_quant_config(
 
     quant_config = get_quant_config(component_config, component_model_path)
     name_mapper = None
+    parameter_name_mapper = None
     if model_cls is not None:
         mapping = vars(model_cls).get("param_names_mapping", {})
         if mapping:
             mapping_fn = get_param_names_mapping(mapping)
 
-            def name_mapper(name: str) -> str:
-                # Layer-prefix metadata omits the suffix that many model
-                # mappings use to delimit a parameter name.
-                mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
+            def parameter_name_mapper(name: str) -> str:
+                mapped_name, merge_index, _ = mapping_fn(name)
                 if merge_index is not None:
                     raise ValueError(
                         "Serialized quantized component weights cannot use a "
                         "stacked parameter-name mapping"
                     )
+                return mapped_name
+
+            def name_mapper(name: str) -> str:
+                # Layer-prefix metadata omits the suffix that many model
+                # mappings use to delimit a parameter name.
+                mapped_name = parameter_name_mapper(f"{name}.weight")
                 return mapped_name.removesuffix(".weight")
+
+    if names_gguf_checkpoint(component_weights_path):
+        if quant_config is not None:
+            raise ValueError(
+                "A GGUF encoder checkpoint cannot be combined with a second "
+                "quantization declaration"
+            )
+        tensor_meta = read_gguf_tensor_meta(component_weights_path)
+        dequantize_prefixes = (
+            vars(model_cls).get("gguf_dequantize_prefixes", ())
+            if model_cls is not None
+            else ()
+        )
+        tensor_meta = remap_gguf_tensor_meta(
+            tensor_meta,
+            parameter_name_mapper or (lambda name: name),
+            dequantize_prefixes=dequantize_prefixes,
+        )
+        return GGUFConfig(component_weights_path, tensor_meta)
 
     if (
         quant_config is None
@@ -381,6 +412,9 @@ def _require_quantized_encoder_layers(
     elif isinstance(quant_config, QuantoInt8Config):
         expected = quant_config.layer_prefixes
         selected = quant_config.selected
+    elif isinstance(quant_config, GGUFConfig):
+        expected = quant_config.quantized_prefixes
+        selected = quant_config.selected
     else:
         expected = set()
         selected = set()
@@ -448,6 +482,17 @@ class TextEncoderLoader(ComponentLoader):
         weights_override = server_args.component_weights_paths.get(component_name)
         if weights_override is None:
             return component_model_path
+        if names_gguf_checkpoint(weights_override):
+            if not current_platform.is_cuda():
+                raise ValueError(
+                    "GGUF encoder checkpoints require CUDA; the GGML kernels have "
+                    f"no {current_platform.device_type} implementation"
+                )
+            if server_args.should_use_fsdp_for_component(component_name):
+                raise ValueError(
+                    f"GGUF encoder checkpoint {component_name!r} is incompatible "
+                    "with FSDP; select resident or layerwise placement"
+                )
         model_weights_path = materialize_weight(resolve_weight(weights_override))
         logger.info(
             "Using weight-file override for %s: %s",
@@ -601,19 +646,14 @@ class TextEncoderLoader(ComponentLoader):
 
     def _get_all_weights(
         self,
-        model: nn.Module,
+        model: EncoderTensorParallelMixin,
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        key_filter = cast(
-            Callable[[str], bool] | None,
-            getattr(model, "should_materialize_checkpoint_weight", None),
-        )
+        key_filter = model.should_materialize_checkpoint_weight
 
         def include_checkpoint_weight(name: str) -> bool:
-            return not name.endswith(".comfy_quant") and (
-                key_filter is None or key_filter(name)
-            )
+            return not name.endswith(".comfy_quant") and key_filter(name)
 
         primary_weights = TextEncoderLoader.Source(
             model_path,
@@ -840,6 +880,10 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if isinstance(quant_config, GGUFConfig):
+                quant_config.retain_tensor_meta(
+                    model.should_materialize_checkpoint_weight
+                )
             if quant_config is not None:
                 _require_quantized_encoder_layers(
                     model, component_name, quant_config=quant_config
@@ -858,16 +902,23 @@ class TextEncoderLoader(ComponentLoader):
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
-            checkpoint_weights = self._get_all_weights(
-                model,
-                model_path,
-                to_cpu=component_starts_on_cpu,
-            )
+            if isinstance(quant_config, GGUFConfig):
+                checkpoint_weights = gguf_weights_iterator(
+                    model_path,
+                    quant_config.tensor_meta,
+                    key_filter=model.should_materialize_checkpoint_weight,
+                )
+            else:
+                checkpoint_weights = self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=component_starts_on_cpu,
+                )
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
             loaded_weights = model.load_weights(checkpoint_weights)
 
-            if quant_config is not None:
+            if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
                 if isinstance(quant_config, QuantoInt8Config) or (
                     isinstance(quant_config, KitchenInt8Config)
