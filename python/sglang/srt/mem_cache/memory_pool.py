@@ -3548,13 +3548,73 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 self.k_scale_buffer[idx][tgt_loc] = self.k_scale_buffer[idx][src_loc]
                 self.v_scale_buffer[idx][tgt_loc] = self.v_scale_buffer[idx][src_loc]
 
-    # These paths copy k/v buffers without the scale buffers; fail loudly
-    # instead of silently corrupting dequantization.
+    def _read_scales(self, idx, loc):
+        """Per-token UE8M0 K/V scales at ``loc``, inverse of ``_write_scales``."""
+        if self.mxfp8_sf_interleaved:
+            return (
+                self._read_sf_interleaved(self.k_scale_buffer[idx], loc),
+                self._read_sf_interleaved(self.v_scale_buffer[idx], loc),
+            )
+        return self.k_scale_buffer[idx][loc], self.v_scale_buffer[idx][loc]
+
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
+        # The scales travel with their fp8 payload; a restored slot dequantizes
+        # against mismatched exponents without them.
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_scale, v_scale = self._read_scales(layer_id, chunk_indices)
+                kv_cache_cpu[-1].append(
+                    [
+                        self.k_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        k_scale.to("cpu", non_blocking=True),
+                        v_scale.to("cpu", non_blocking=True),
+                    ]
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
+        assert not self.use_hnd, (
+            "CPU KV offload indexes by slot (NHD); HND KV cache "
+            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
+        )
+        current_platform.synchronize()
+        device = self.k_buffer[0].device
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu, k_scale_cpu, v_scale_cpu = kv_cache_cpu[layer_id][
+                    i // chunk_size
+                ]
+                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
+                self.k_buffer[layer_id][chunk_indices] = k_cpu.to(
+                    device, non_blocking=True
+                )
+                self.v_buffer[layer_id][chunk_indices] = v_cpu.to(
+                    device, non_blocking=True
+                )
+                self._write_scales(
+                    layer_id,
+                    chunk_indices,
+                    k_scale_cpu.to(device, non_blocking=True),
+                    v_scale_cpu.to(device, non_blocking=True),
+                )
+        current_platform.synchronize()
 
     def get_kv_scale_buf_infos(self):
         """(ptrs, lens, item_lens) for the UE8M0 scale buffers, k then v.
@@ -4066,10 +4126,13 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
         if parallel.dcp_enabled:
@@ -4142,6 +4205,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         # loc is widened under DCP; the kernel divides by the world size itself.
         maybe_detect_oob(
@@ -4150,7 +4214,9 @@ class MLATokenToKVPool(KVCache):
             (self.size + self.page_size) * get_parallel().attn_dcp_size,
             "set_mla_kv_buffer (MLA)",
         )
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
             loc,
