@@ -527,6 +527,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        per_request_chunk_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -536,6 +537,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.per_request_chunk_size = per_request_chunk_size
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -550,6 +552,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -621,6 +624,13 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _chunk_tokens_limit(self) -> Optional[int]:
+        if self.rem_chunk_tokens is None:
+            return None
+        if self.per_request_chunk_size is None:
+            return self.rem_chunk_tokens
+        return min(self.rem_chunk_tokens, self.per_request_chunk_size)
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1243,7 +1253,7 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        chunk_tokens_limit = self.rem_chunk_tokens
+        chunk_tokens_limit = self._chunk_tokens_limit()
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
@@ -1263,9 +1273,9 @@ class PrefillAdder:
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
-                if self.rem_chunk_tokens is None or swa_cap <= 0:
+                if chunk_tokens_limit is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
-                chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+                chunk_tokens_limit = min(chunk_tokens_limit, swa_cap)
 
         if (
             self.rem_chunk_tokens is None
@@ -1299,9 +1309,9 @@ class PrefillAdder:
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
-                    if self.rem_chunk_tokens is None or swa_cap <= 0:
+                    if chunk_tokens_limit is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
-                    chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+                    chunk_tokens_limit = min(chunk_tokens_limit, swa_cap)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
@@ -1419,7 +1429,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                if self.per_request_chunk_size is None:
+                    self.new_chunked_req = req
+                else:
+                    self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

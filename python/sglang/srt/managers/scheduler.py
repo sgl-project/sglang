@@ -1198,6 +1198,31 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        self.pp_batch_independent_chunks = envs.SGLANG_PP_BATCH_INDEPENDENT_CHUNKS.get()
+        if self.pp_batch_independent_chunks:
+            if self.ps.pp_size <= 1 or get_disagg().disaggregation_mode != "prefill":
+                raise RuntimeError(
+                    "SGLANG_PP_BATCH_INDEPENDENT_CHUNKS requires PP "
+                    "disaggregated prefill"
+                )
+            if (
+                self.chunked_prefill_size is None
+                or self.max_prefill_tokens <= self.chunked_prefill_size
+            ):
+                raise RuntimeError(
+                    "SGLANG_PP_BATCH_INDEPENDENT_CHUNKS requires "
+                    "max_prefill_tokens > chunked_prefill_size"
+                )
+            if not self.server_args.disable_overlap_schedule:
+                raise RuntimeError(
+                    "SGLANG_PP_BATCH_INDEPENDENT_CHUNKS requires "
+                    "--disable-overlap-schedule"
+                )
+            if not self.tree_cache.is_chunk_cache():
+                raise RuntimeError(
+                    "SGLANG_PP_BATCH_INDEPENDENT_CHUNKS requires "
+                    "--disable-radix-cache"
+                )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3325,6 +3350,10 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        per_request_chunk_size = None
+        if self.pp_batch_independent_chunks:
+            per_request_chunk_size = self.chunked_prefill_size
+            chunked_prefill_size = self.max_prefill_tokens
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
@@ -3356,6 +3385,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            per_request_chunk_size=per_request_chunk_size,
         )
 
         if self.chunked_req is not None:
