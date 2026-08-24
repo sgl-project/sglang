@@ -46,6 +46,10 @@ class QuantizationConfig(SRTQuantizationConfig):
         """Whether a row-parallel shard preserves this format's input layout."""
         return True
 
+    def quantizes_embedding(self, prefix: str) -> bool:
+        """Whether this checkpoint config owns the named embedding table."""
+        return False
+
     def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
         """Translate checkpoint module names to the native model namespace."""
         return
