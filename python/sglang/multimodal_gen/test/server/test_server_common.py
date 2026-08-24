@@ -7,6 +7,7 @@ Each collected request prints a performance log before validation.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import openai
 import pytest
 import requests
@@ -24,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
+    RealtimeChunkStats,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -34,6 +37,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    is_missing_diffusers_pipeline_error,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -41,21 +45,37 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
+    get_perf_baseline_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
+    action_gt_exists,
+    audio_gt_exists,
+    compare_audio_with_gt,
     compare_with_gt,
+    encode_audio_gt_wav,
+    extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
+    get_action_consistency_gt_candidates,
+    get_action_consistency_gt_remote_files,
+    get_audio_consistency_gt_candidates,
+    get_audio_consistency_gt_remote_files,
+    get_audio_consistency_thresholds,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
+    get_consistency_threshold_path,
     get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
+    load_action_consistency_gt,
+    load_audio_consistency_gt,
     load_consistency_gt,
+    save_audio_gt_artifact,
     save_consistency_failure_artifact,
+    save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
 
@@ -79,6 +99,16 @@ _SERVER_FATAL_LOG_PATTERNS = (
     "Segmentation fault",
     "Aborted (core dumped)",
 )
+_CASE_LOG_SEPARATOR = "=" * 88
+
+
+def _print_case_log_separator(case_id: str, state: str) -> None:
+    print(
+        f"\n{_CASE_LOG_SEPARATOR}\n"
+        f"[server-test] {state}: {case_id}\n"
+        f"{_CASE_LOG_SEPARATOR}",
+        flush=True,
+    )
 
 
 @pytest.fixture
@@ -86,6 +116,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     _fixture_start_time = time.perf_counter()
     server_args = case.server_args
+    _print_case_log_separator(case.id, "BEGIN diffusion testcase")
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
@@ -101,7 +132,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
 
@@ -114,7 +144,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
     if server_args.dit_layerwise_offload:
-        extra_args += f" --dit-layerwise-offload true"
+        extra_args += " --dit-layerwise-offload true"
 
     if server_args.dit_offload_prefetch_size:
         extra_args += (
@@ -122,7 +152,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
 
     if server_args.text_encoder_cpu_offload:
-        extra_args += f" --text-encoder-cpu-offload"
+        extra_args += " --text-encoder-cpu-offload"
 
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
@@ -137,22 +167,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
-
-    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
-    # mesh-correctness and must NOT run the paint/texture stages, whose
-    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
-    # that the shape-only path never produces. Inject a pipeline-config override
-    # disabling paint for these cases.
-    if server_args.custom_validator == "mesh":
-        import json as _json
-        import tempfile as _tempfile
-
-        _paint_off_cfg = os.path.join(
-            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
-        )
-        with open(_paint_off_cfg, "w") as _f:
-            _json.dump({"paint_enable": False}, _f)
-        extra_args += f" --config {_paint_off_cfg}"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
@@ -194,25 +208,13 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or (
-            "has no attribute" in msg and "diffusers" in msg.lower()
-        ):
+        if is_missing_diffusers_pipeline_error(msg):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
                 f"Upgrade diffusers to enable this test."
             )
-        raise
-
-    try:
-        # Reconstruct output size for OpenAI API
-        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
-        output_size = os.environ.get(
-            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
-        )
-    except Exception as exc:
-        logger.error("Warm-up failed for %s: %s", case.id, exc)
-        ctx.cleanup()
+        _print_case_log_separator(case.id, "FAILED during server startup")
         raise
 
     try:
@@ -244,13 +246,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             logger.error(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f"File: {get_perf_baseline_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
                 f"    }}\n"
                 f'{"=" * 60}\n'
             )
+        _print_case_log_separator(case.id, "END diffusion testcase")
 
 
 class DiffusionServerBase:
@@ -410,29 +413,15 @@ class DiffusionServerBase:
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         missing_scenario = False
         if scenario is None:
-            # Create dummy scenario to allow metric collection
-            scenario = type(
-                "DummyScenario",
-                (),
-                {
-                    "expected_e2e_ms": 0,
-                    "expected_avg_denoise_ms": 0,
-                    "expected_median_denoise_ms": 0,
-                    "stages_ms": {},
-                    "denoise_step_ms": {},
-                },
-            )()
+            scenario = ScenarioConfig({}, {}, 0, 0, 0)
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
-        # Check for missing estimated_full_test_time_s
-        missing_estimated_time = False
         if (
             not missing_scenario
             and not is_baseline_generation_mode
             and scenario.estimated_full_test_time_s is None
         ):
-            missing_estimated_time = True
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
 
         validator_name = case.server_args.custom_validator or "default"
@@ -456,9 +445,37 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
                     )
                 return
+
+            if current_platform.is_cuda():
+                expected_load_peak_vram_mb = scenario.load_peak_vram_mb
+                expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb
+                if (
+                    expected_load_peak_vram_mb is None
+                    or expected_runtime_peak_vram_mb is None
+                ):
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    pytest.fail(
+                        f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                        f"baseline in {get_perf_baseline_path()}"
+                    )
+                try:
+                    validator.validate_peak_vram(
+                        summary,
+                        expected_load_peak_vram_mb,
+                        expected_runtime_peak_vram_mb,
+                    )
+                    validator.validate_peak_host_anon(
+                        summary,
+                        scenario.load_peak_host_anon_mb,
+                        scenario.runtime_peak_host_anon_mb,
+                    )
+                except AssertionError as e:
+                    logger.error(f"Peak memory validation failed for {case.id}:\n{e}")
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    raise
 
             # only run performance validation if run_perf_check is True
             try:
@@ -468,12 +485,93 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 raise
 
+        self._record_performance_result(case, summary)
+
+    def _validate_realtime_performance(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        chunk_stats: list[RealtimeChunkStats],
+    ) -> None:
+        validate_realtime_perf_stats(
+            case.id,
+            chunk_stats,
+            case.sampling_params.realtime_perf_thresholds,
+            ignore_initial_chunks=(
+                case.sampling_params.realtime_perf_ignore_initial_chunks
+            ),
+        )
+        if not case.run_perf_check or not current_platform.is_cuda():
+            return
+
+        request_id = next(
+            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+            None,
+        )
+        if request_id is None:
+            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+        perf_record = wait_for_req_perf_record(
+            request_id,
+            ctx.perf_log_path,
+            timeout=30,
+        )
+        if perf_record is None:
+            pytest.fail(f"{case.id}: realtime request performance record is missing")
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        if scenario is None:
+            pytest.fail(f"Testcase '{case.id}' not found in {get_perf_baseline_path()}")
+
+        validator = PerformanceValidator(
+            scenario=scenario,
+            tolerances=BASELINE_CONFIG.tolerances,
+            step_fractions=BASELINE_CONFIG.step_fractions,
+        )
+        summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
+        self._record_performance_result(case, summary)
+
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            logger.info(
+                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB",
+                case.id,
+                summary.load_peak_vram_mb,
+                summary.runtime_peak_vram_mb,
+            )
+            return
+
+        if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                f"baseline in {get_perf_baseline_path()}; measured "
+                f"load={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
+            )
+
+        try:
+            validator.validate_peak_vram(
+                summary,
+                scenario.load_peak_vram_mb,
+                scenario.runtime_peak_vram_mb,
+            )
+        except AssertionError as e:
+            logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+            raise
+
+    def _record_performance_result(
+        self,
+        case: DiffusionTestCase,
+        summary: PerformanceSummary,
+    ) -> None:
         result = {
             "test_name": case.id,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
+            "load_peak_vram_mb": summary.load_peak_vram_mb,
+            "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -505,7 +603,9 @@ class DiffusionServerBase:
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
-                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+                f"median_denoise={summary.median_denoise_ms:.2f}ms, "
+                f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -514,6 +614,16 @@ class DiffusionServerBase:
                 f"e2e={scenario.expected_e2e_ms:.2f}ms, "
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
+            )
+        if (
+            scenario is not None
+            and scenario.load_peak_vram_mb is not None
+            and scenario.runtime_peak_vram_mb is not None
+        ):
+            lines.append(
+                "  peak_vram_baseline: "
+                f"load={scenario.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
         if summary.stage_metrics:
             stages = ", ".join(
@@ -554,6 +664,18 @@ class DiffusionServerBase:
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
 
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "runtime_peak_host_anon_mb": round(
+                        summary.runtime_peak_host_anon_mb, 2
+                    ),
+                }
+            )
+
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
@@ -567,7 +689,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of perf_baselines.json:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -593,6 +715,10 @@ class DiffusionServerBase:
             )
             return
 
+        if case.server_args.modality == "action":
+            self._validate_action_consistency(case, content)
+            return
+
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
         output_format = case.sampling_params.output_format
@@ -600,6 +726,33 @@ class DiffusionServerBase:
         if not gt_exists(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         ):
+            if is_video:
+                output_frames = pop_realtime_key_frames(case.id)
+                if output_frames is None:
+                    output_frames = extract_key_frames_from_video(content)
+            else:
+                output_frames = [image_bytes_to_numpy(content)]
+            artifact_path = save_missing_consistency_gt_artifact(
+                artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case_id=case.id,
+                num_gpus=num_gpus,
+                output_frames=output_frames,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            if artifact_path is not None:
+                logger.info(
+                    "[Artifact] Saved missing consistency GT: %s", artifact_path
+                )
+            if case.sampling_params.expect_audio_output:
+                audio_path = save_audio_gt_artifact(
+                    os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                    case.id,
+                    num_gpus,
+                    extract_audio_pcm_from_video_bytes(content),
+                )
+                if audio_path is not None:
+                    logger.info("[Artifact] Saved missing audio GT: %s", audio_path)
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
@@ -616,16 +769,16 @@ class DiffusionServerBase:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
-(Optional) Per-case override in consistency_threshold.json:
+(Optional) Per-case override in {get_consistency_threshold_path()}:
   "cases": {{
     "{case.id}": {{
       "clip_threshold": 0.92,
@@ -727,6 +880,149 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+        if case.sampling_params.expect_audio_output:
+            self._validate_audio_consistency(case, content)
+
+    def _validate_audio_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        num_gpus = case.server_args.num_gpus
+        output_audio = extract_audio_pcm_from_video_bytes(content)
+        if not audio_gt_exists(case.id, num_gpus):
+            artifact_path = save_audio_gt_artifact(
+                os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case.id,
+                num_gpus,
+                output_audio,
+            )
+            if artifact_path is not None:
+                logger.info("[Artifact] Saved missing audio GT: %s", artifact_path)
+            names = ", ".join(get_audio_consistency_gt_candidates(case.id, num_gpus))
+            pytest.fail(f"Audio GT not found for {case.id}. Expected one of: {names}")
+
+        gt_audio = load_audio_consistency_gt(case.id, num_gpus)
+        result = compare_audio_with_gt(
+            output_audio,
+            gt_audio,
+            get_audio_consistency_thresholds(case.id),
+        )
+        if not result.passed:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_audio_consistency_gt_remote_files(
+                    case.id, num_gpus
+                )
+            )
+            pytest.fail(
+                f"Audio consistency check failed for {case.id}:\n"
+                f"  Metrics: spectral_similarity={result.spectral_similarity:.4f}, "
+                f"waveform_correlation={result.waveform_correlation:.4f}, "
+                f"rms_db_diff={result.rms_db_diff:.4f}, "
+                f"duration_diff={result.duration_diff:.4f}s\n"
+                f"  Thresholds: spectral_similarity>="
+                f"{result.thresholds.spectral_similarity_threshold}, "
+                f"waveform_correlation>="
+                f"{result.thresholds.waveform_correlation_threshold}, "
+                f"rms_db_diff<={result.thresholds.rms_db_diff_threshold}, "
+                f"duration_diff<={result.thresholds.duration_diff_threshold}s\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED audio GT check "
+            "(spectral_similarity=%.4f, waveform_correlation=%.4f, "
+            "rms_db_diff=%.4f, duration_diff=%.4fs)",
+            case.id,
+            result.spectral_similarity,
+            result.waveform_correlation,
+            result.rms_db_diff,
+            result.duration_diff,
+        )
+
+    def _extract_action_array(
+        self,
+        payload: dict[str, Any],
+        expected_horizon: int,
+        expected_dim: int,
+    ) -> np.ndarray:
+        action = payload["data"][0]["action"]
+        values = action["values"]
+        assert action["shape"] == [expected_horizon, expected_dim]
+        array = np.asarray(values, dtype=np.float32)
+        assert array.shape == (expected_horizon, expected_dim)
+        assert np.isfinite(array).all()
+        return array
+
+    def _validate_action_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        payload = json.loads(content.decode("utf-8"))
+        expected_horizon = int(case.sampling_params.extras.get("action_horizon", 50))
+        expected_dim = int(case.sampling_params.extras.get("action_dim", 32))
+        output = self._extract_action_array(payload, expected_horizon, expected_dim)
+
+        num_gpus = case.server_args.num_gpus
+        if not action_gt_exists(case.id, num_gpus):
+            names = ", ".join(get_action_consistency_gt_candidates(case.id, num_gpus))
+            logger.error(f"""
+--- MISSING ACTION GROUND TRUTH DETECTED ---
+GT action JSON not found for '{case.id}'.
+
+Add the expected file to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming:
+  Action: {case.id}_{{n}}gpu.json
+
+For this case, expected file(s): {names}
+
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
+""")
+            pytest.fail(
+                f"GT action JSON not found for {case.id}. See logs for instructions to add GT."
+            )
+
+        gt_payload = load_action_consistency_gt(case.id, num_gpus)
+        gt = self._extract_action_array(gt_payload, expected_horizon, expected_dim)
+        abs_diff = np.abs(output - gt)
+        max_abs_diff = float(abs_diff.max())
+        mean_abs_diff = float(abs_diff.mean())
+        max_abs_threshold = float(
+            case.sampling_params.extras.get("action_max_abs_diff_threshold", 0.05)
+        )
+        mean_abs_threshold = float(
+            case.sampling_params.extras.get("action_mean_abs_diff_threshold", 0.005)
+        )
+
+        if max_abs_diff > max_abs_threshold or mean_abs_diff > mean_abs_threshold:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_action_consistency_gt_remote_files(
+                    case.id,
+                    num_gpus,
+                )
+            )
+            pytest.fail(
+                f"Action consistency check failed for {case.id}:\n"
+                f"  max_abs_diff={max_abs_diff:.6f} "
+                f"(threshold {max_abs_threshold:.6f})\n"
+                f"  mean_abs_diff={mean_abs_diff:.6f} "
+                f"(threshold {mean_abs_threshold:.6f})\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED action GT check "
+            "(shape=%sx%s, max_abs_diff=%.6f, mean_abs_diff=%.6f)",
+            case.id,
+            expected_horizon,
+            expected_dim,
+            max_abs_diff,
+            mean_abs_diff,
+        )
+
     def _save_gt_output(
         self,
         case: DiffusionTestCase,
@@ -749,6 +1045,16 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
 
+        if case.server_args.modality == "3d":
+            logger.info("Skipping GT save for mesh (3d) case: %s", case.id)
+            return
+
+        if case.server_args.modality == "action":
+            output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"
+            output_path.write_bytes(content)
+            logger.info(f"Saved GT action JSON: {output_path}")
+            return
+
         if is_video:
             # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
             frames = pop_realtime_key_frames(case.id)
@@ -761,16 +1067,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 logger.warning(
                     f"{case.id}: expected 3 frames, got {len(frames)}, skipping frame save"
                 )
-                return
+            else:
+                # Save frames (reuse naming from _consistency_gt_filenames)
+                filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+                from PIL import Image
 
-            # Save frames (reuse naming from _consistency_gt_filenames)
-            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
-            from PIL import Image
+                for frame, fn in zip(frames, filenames):
+                    frame_path = out_dir / fn
+                    Image.fromarray(frame).save(frame_path)
+                    logger.info(f"Saved GT frame: {frame_path}")
 
-            for frame, fn in zip(frames, filenames):
-                frame_path = out_dir / fn
-                Image.fromarray(frame).save(frame_path)
-                logger.info(f"Saved GT frame: {frame_path}")
+            if case.sampling_params.expect_audio_output:
+                audio_path = out_dir / f"{case.id}_{num_gpus}gpu_audio.wav"
+                audio_path.write_bytes(
+                    encode_audio_gt_wav(extract_audio_pcm_from_video_bytes(content))
+                )
+                logger.info("Saved GT audio: %s", audio_path)
         else:
             # Save image
             from sglang.multimodal_gen.test.test_utils import detect_image_format
@@ -1212,6 +1524,24 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         - test_diffusion_generation[qwen_image_edit]
         - etc.
         """
+        try:
+            self._test_diffusion_generation_impl(case, diffusion_server)
+        except pytest.skip.Exception:
+            _print_case_log_separator(case.id, "SKIPPED diffusion testcase")
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            _print_case_log_separator(case.id, "FAILED diffusion testcase")
+            raise
+        else:
+            _print_case_log_separator(case.id, "PASSED diffusion testcase")
+
+    def _test_diffusion_generation_impl(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 
@@ -1225,14 +1555,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             sampling_params=case.sampling_params,
         )
 
-        # Single generation - output is reused for both validations
+        # Generation - output of the last request is used for both validations.
+        # perf_repeat_requests > 1 asserts a warm second request meets the same
+        # baselines as the first: residency or courier state leaking between
+        # requests shows up here as degradation or an OOM.
         is_realtime_case = case.sampling_params.realtime_num_chunks is not None
-        perf_record, content = self.run_and_collect(
-            diffusion_server,
-            case.id,
-            generate_fn,
-            collect_perf=not is_gt_gen_mode and not is_realtime_case,
-        )
+        for _ in range(max(1, case.perf_repeat_requests)):
+            perf_record, content = self.run_and_collect(
+                diffusion_server,
+                case.id,
+                generate_fn,
+                collect_perf=not is_gt_gen_mode and not is_realtime_case,
+            )
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
@@ -1250,15 +1584,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 failures.append((name, str(exc)))
 
         if is_realtime_case:
+            chunk_stats = pop_realtime_perf_stats(case.id)
             run_case_check(
                 "performance",
-                lambda: validate_realtime_perf_stats(
-                    case.id,
-                    pop_realtime_perf_stats(case.id),
-                    case.sampling_params.realtime_perf_thresholds,
-                    ignore_initial_chunks=(
-                        case.sampling_params.realtime_perf_ignore_initial_chunks
-                    ),
+                lambda: self._validate_realtime_performance(
+                    diffusion_server,
+                    case,
+                    chunk_stats,
                 ),
             )
         else:

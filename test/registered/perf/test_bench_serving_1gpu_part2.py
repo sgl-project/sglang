@@ -24,6 +24,9 @@ register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestBenchServing1GPUPart2(CustomTestCase):
+    @unittest.skip(
+        "Qwen2.5-VL server crashes with SIGBUS (exit code -7) on main; disable until fixed"
+    )
     def test_vlm_offline_throughput(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,

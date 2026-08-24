@@ -8,8 +8,8 @@ import torch
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
-    base64_to_tensor,
-    tensor_to_base64,
+    bytes_to_tensor,
+    tensor_to_bytes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
@@ -20,12 +20,12 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 
 
-class TestTensorToBase64Roundtrip(unittest.TestCase):
+class TestTensorToBytesRoundtrip(unittest.TestCase):
 
     def _roundtrip(self, t: torch.Tensor):
-        encoded = tensor_to_base64(t)
-        self.assertIsInstance(encoded, str)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        self.assertIsInstance(encoded, bytes)
+        decoded = bytes_to_tensor(encoded)
         self.assertTrue(
             torch.equal(t, decoded), f"Mismatch for shape={t.shape} dtype={t.dtype}"
         )
@@ -55,21 +55,21 @@ class TestTensorToBase64Roundtrip(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
         t = torch.randn(4, device="cuda")
-        encoded = tensor_to_base64(t)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        decoded = bytes_to_tensor(encoded)
         self.assertTrue(torch.equal(t.cpu(), decoded))
 
     def test_non_contiguous(self):
         t = torch.randn(4, 6)[:, ::2]
         self.assertFalse(t.is_contiguous())
         self._roundtrip(t.contiguous())
-        decoded = base64_to_tensor(tensor_to_base64(t))
+        decoded = bytes_to_tensor(tensor_to_bytes(t))
         self.assertTrue(torch.equal(t.contiguous(), decoded))
 
     def test_grad_tensor_detaches(self):
         t = torch.randn(3, requires_grad=True)
-        encoded = tensor_to_base64(t)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        decoded = bytes_to_tensor(encoded)
         self.assertFalse(decoded.requires_grad)
         self.assertTrue(torch.equal(t.detach(), decoded))
 
@@ -82,7 +82,7 @@ class TestMaybeSerialize(unittest.TestCase):
         self.assertTrue(result["__tensor__"])
         self.assertEqual(result["shape"], [2, 3])
         self.assertEqual(result["dtype"], "torch.float32")
-        decoded = base64_to_tensor(result["data"])
+        decoded = bytes_to_tensor(result["data"])
         self.assertTrue(torch.equal(t, decoded))
 
     def test_dict_with_tensors(self):
@@ -207,11 +207,13 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(1, 5, 4, 2, 2, 2),
                 timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+                sigmas=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             ),
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(
             rtd,
             serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
+            serialized_dit_sigmas=_maybe_serialize(rtd.dit_trajectory.sigmas),
         )
         self.assertIsNotNone(env)
         self.assertIn("pos_cond_kwargs", env)
@@ -219,8 +221,10 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNotNone(dit_traj)
         self.assertIn("latents", dit_traj)
         self.assertIn("timesteps", dit_traj)
+        self.assertIn("sigmas", dit_traj)
         self.assertTrue(dit_traj["latents"]["__tensor__"])
         self.assertTrue(dit_traj["timesteps"]["__tensor__"])
+        self.assertTrue(dit_traj["sigmas"]["__tensor__"])
 
 
 class TestBuildResponse(unittest.TestCase):
@@ -243,7 +247,7 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(resp.seed, 42)
         self.assertIsNotNone(resp.generated_output)
         self.assertIsNotNone(resp.rollout_log_probs)
-        lp = base64_to_tensor(resp.rollout_log_probs["data"])
+        lp = bytes_to_tensor(resp.rollout_log_probs["data"])
         self.assertEqual(lp.shape, ())
         self.assertAlmostEqual(resp.inference_time_s, 2.5)
 
@@ -308,12 +312,12 @@ class TestBuildResponse(unittest.TestCase):
         batch.metrics = self._make_metrics(1.0)
         resps = _build_response("rb", "p", 0, True, batch)
         self.assertEqual(len(resps), B)
-        lp0 = base64_to_tensor(resps[0].rollout_log_probs["data"])
-        lp1 = base64_to_tensor(resps[1].rollout_log_probs["data"])
+        lp0 = bytes_to_tensor(resps[0].rollout_log_probs["data"])
+        lp1 = bytes_to_tensor(resps[1].rollout_log_probs["data"])
         self.assertEqual(lp0.shape, (T,))
         self.assertEqual(lp1.shape, (T,))
-        g0 = base64_to_tensor(resps[0].generated_output["data"])
-        g1 = base64_to_tensor(resps[1].generated_output["data"])
+        g0 = bytes_to_tensor(resps[0].generated_output["data"])
+        g1 = bytes_to_tensor(resps[1].generated_output["data"])
         self.assertEqual(g0.shape, (1, 8, 8))
         self.assertEqual(g1.shape, (1, 8, 8))
         self.assertFalse(torch.equal(g0, g1))
@@ -327,6 +331,7 @@ class TestBuildResponse(unittest.TestCase):
                 dit_trajectory=RolloutDitTrajectory(
                     latents=torch.randn(B, T + 1, D),
                     timesteps=torch.linspace(1.0, 0.0, T),
+                    sigmas=torch.linspace(1.0, 0.0, T + 1),
                 ),
             ),
         )
@@ -335,10 +340,14 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(len(resps), B)
         self.assertIsNotNone(resps[0].dit_trajectory)
         self.assertIsNotNone(resps[1].dit_trajectory)
-        ts0 = base64_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
-        ts1 = base64_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
+        ts0 = bytes_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
+        ts1 = bytes_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
         self.assertEqual(ts0.shape, (T,))
         self.assertTrue(torch.equal(ts0, ts1))
+        sg0 = bytes_to_tensor(resps[0].dit_trajectory["sigmas"]["data"])
+        sg1 = bytes_to_tensor(resps[1].dit_trajectory["sigmas"]["data"])
+        self.assertEqual(sg0.shape, (T + 1,))
+        self.assertTrue(torch.equal(sg0, sg1))
         self.assertEqual(
             _maybe_deserialize(resps[1].dit_trajectory["latents"]).shape, (T + 1, D)
         )

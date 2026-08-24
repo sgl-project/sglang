@@ -8,10 +8,10 @@ from typing import Dict, List, Optional, Union
 import aiohttp
 import requests
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import (
     REGEX_BOOL,
@@ -384,13 +384,19 @@ class Runtime:
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.utils.network import is_port_available
 
-        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # Pre-allocate ports
-        for port in range(self.server_args.port, 40000):
+        # Pre-allocate a port before building the config, so the config is born
+        # with the port this runtime will serve on.
+        requested_port = kwargs.pop(
+            "port", ServerArgs.__dataclass_fields__["port"].default
+        )
+        for port in range(requested_port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.port = port
+        self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
+        # The spawned server gets a copy of this record, and this object keeps
+        # reading it afterwards -- `get_tokenizer` wants the downloaded GGUF
+        # file and the rewritten ModelScope path, not what the caller typed.
+        self.server_args.resolve_once()
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -453,7 +459,7 @@ class Runtime:
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(
-            self.server_args.tokenizer_path,
+            self.server_args.tokenizer_path or self.server_args.model_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
             revision=self.server_args.revision,

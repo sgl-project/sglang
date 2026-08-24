@@ -32,8 +32,8 @@ class LoRABackendLmHeadMixing:
         Returns None if logprobs chunking is disabled or the pruned token
         count does not exceed the logprobs chunk size.
         """
-        logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
-        enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+        logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         pruned_total = sum(pruned_lens)
 
         if not enable_logprobs_chunk or pruned_total <= logprobs_chunk_size:

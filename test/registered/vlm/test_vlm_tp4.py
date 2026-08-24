@@ -34,7 +34,7 @@ class TestVLMTP4(CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--mem-fraction-static",
                 "0.8",

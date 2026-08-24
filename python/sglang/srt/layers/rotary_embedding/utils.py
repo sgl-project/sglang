@@ -70,8 +70,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def apply_rotary_pos_emb_native(
+def apply_rotary_pos_emb_native_eager(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -92,6 +91,17 @@ def apply_rotary_pos_emb_native(
     k_embed = k_embed.to(orig_k_dtype)
 
     return q_embed, k_embed
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def apply_rotary_pos_emb_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return apply_rotary_pos_emb_native_eager(q, k, cos, sin, unsqueeze_dim)
 
 
 def apply_rotary_pos_emb_npu(

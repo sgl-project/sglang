@@ -2137,7 +2137,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+            from sglang.kernels.ops.diffusion import (
                 fused_bigdn_func,
                 fused_qk_inv_rms,
                 prepare_rope_tables,
@@ -2269,9 +2269,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn_chunkwise import (
-                cam_scan_bidi_chunkwise,
-            )
+            from sglang.kernels.ops.diffusion import cam_scan_bidi_chunkwise
 
             B, heads, _, _ = q.shape
             T, H_sp, W_sp = HW
@@ -2839,11 +2837,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
-        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
         # No RMS downscale here: full post-UCPE q/k/v feed the scan; inflation
@@ -3013,6 +3009,7 @@ class MultiHeadCrossAttention(nn.Module):
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
+            is_cross_attention=True,
         )
 
     def forward(

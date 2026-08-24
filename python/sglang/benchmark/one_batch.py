@@ -69,17 +69,20 @@ from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.model_executor.cuda_graph_config import Phase
+from sglang.srt.model_executor.cuda_graph_config import Phase, cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -94,7 +97,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 
 def start_profile(
@@ -300,16 +302,41 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+        compute_dp_attention_world_info(
+            server_args.enable_dp_attention,
+            tp_rank,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.attn_cp_size,
+        )
+    )
+    ps = ParallelState(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=None,
+        dp_size=server_args.dp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=0,
+        attn_cp_size=server_args.attn_cp_size,
+        attn_dcp_rank=tp_rank % server_args.dcp_size,
+        attn_dcp_size=server_args.dcp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_dp_size=attn_dp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        moe_dp_rank=None,
+        moe_dp_size=server_args.moe_dp_size,
+        gpu_id=gpu_id,
+    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
-        pp_rank=0,
-        pp_size=1,
+        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -323,9 +350,13 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
         model_runner = ModelRunner(**runner_kwargs)
+        if server_args.is_startup_weight_load_overlap:
+            model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
+        if server_args.is_startup_weight_load_overlap:
+            model_runner.finalize_startup_weight_load()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
@@ -456,7 +487,7 @@ class TreeCacheNamespace(SimpleNamespace):
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
     dummy_tree_cache = TreeCacheNamespace(
-        page_size=model_runner.server_args.page_size,
+        page_size=get_schedule().page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
@@ -481,7 +512,11 @@ def extend(reqs, model_runner):
         )
         batch.prefill_input_ids_cpu = None
 
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -492,7 +527,11 @@ def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -502,14 +541,15 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
         prepare_mlp_sync_batch_raw(
             batch,
-            dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
-            attn_cp_size=model_runner.attn_cp_size,
+            model_runner=model_runner,
+            dp_size=get_parallel().dp_size,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
-            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+            disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
-            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )
 
@@ -949,8 +989,10 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    # Post-init write to the legacy cuda_graph_max_bs_decode field would
-    # not propagate to cuda_graph_config; update the decode phase directly.
+    server_args.resolve_once()
+
+    # The legacy cuda_graph_max_bs_decode field does not propagate; set the
+    # decode phase.
     if server_args.cuda_graph_config is not None:
         server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
 
