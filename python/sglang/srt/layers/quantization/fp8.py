@@ -2406,6 +2406,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 
@@ -2421,7 +2422,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if use_intel_xpu_backend():
+        if use_intel_xpu_backend() and not (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_triton()
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 

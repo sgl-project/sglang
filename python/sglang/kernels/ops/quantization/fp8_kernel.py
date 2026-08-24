@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -44,6 +45,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -54,6 +56,8 @@ if _is_cuda:
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+elif _is_xpu:
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
 if _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
@@ -272,7 +276,10 @@ def _per_token_group_quant_8bit_raw(
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
-            bit8_max = 224.0
+            # fp8 range is device-dependent on ROCm: e4m3fnuz (max 224.0) on
+            # gfx94x vs e4m3fn (max 448.0) on gfx95x. Use the device-resolved
+            # module constant instead of hardcoding the gfx94x value.
+            bit8_max = fp8_max
         bit8_min = -bit8_max  # TODO incorrect for int8
     else:
         if dtype == torch.int8:

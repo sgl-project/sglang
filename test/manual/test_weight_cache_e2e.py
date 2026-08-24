@@ -54,20 +54,24 @@ def run_single_daemon(
     """Run a single daemon process for one (pp_rank, tp_rank)."""
     import traceback
 
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.weight_cache.daemon import WeightCacheDaemon
 
-    daemon = WeightCacheDaemon(
+    server_args = ServerArgs(
         model_path=model_path,
-        gpu_id=gpu_id,
         tp_size=tp_size,
-        tp_rank=tp_rank,
         pp_size=pp_size,
-        pp_rank=pp_rank,
         dp_size=1,
         load_format=load_format,
         dtype=dtype,
         quantization=quantization,
         trust_remote_code=trust_remote_code,
+    )
+    daemon = WeightCacheDaemon(
+        server_args=server_args,
+        gpu_id=gpu_id,
+        tp_rank=tp_rank,
+        pp_rank=pp_rank,
         dist_init_method=dist_init_method,
     )
     daemon.socket_path = socket_path

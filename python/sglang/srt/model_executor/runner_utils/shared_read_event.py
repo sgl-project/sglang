@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_cuda
 
@@ -36,10 +36,8 @@ def maybe_publish_prefill_shared_read_done(
     if not model_runner.spec_algorithm.is_none():
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
-    boundary = model_runner.attn_backend.shared_read_boundary(
-        forward_batch.forward_mode
-    )
-    if boundary is not SharedReadBoundary.PRE_REPLAY:
+    declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
+    if declared is not SharedReadEnds.PRE_REPLAY:
         return
     logger.info_once(
         "Prefill shared-read-done fastpath active (%s)",
