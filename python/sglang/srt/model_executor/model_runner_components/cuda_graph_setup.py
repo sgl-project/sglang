@@ -203,7 +203,7 @@ def capture_cuda_graphs(
                 runner=region_runner,
                 memory_phase=decode_phase,
                 memory_usage_gb=0,
-                capture_time=0,
+                capture_time=region_runner.startup_export_seconds,
             )
             prefill = GraphCapture(
                 runner=region_runner,

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import MlxRegionStartupExport, envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -54,6 +55,19 @@ _PREFILL_TOKEN_BUCKETS = (128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
 # is allocatable, so pad rows would overwrite a live request's K/V with no
 # error once the pool neared exhaustion.
 _PAD_SINK_SLOT = 0
+
+# Decode shapes exported at startup under SGLANG_MLX_REGION_STARTUP_EXPORT.
+# Mirrors the spirit of the CUDA-graph capture ladder; sizes off the ladder
+# still export lazily at their first batch.
+_STARTUP_DECODE_BATCH_SIZES = (1, 2, 4, 8, 16)
+
+
+def _clear_mlx_cache() -> None:
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    mx.clear_cache()
 
 
 def _nontrivial_logits_reason(model: Any) -> Optional[str]:
@@ -188,6 +202,114 @@ class MlxRegionRunner(BaseRunner):
                 "eager Torch path.",
                 self._model_reject_reason,
             )
+        self.startup_export_seconds = 0.0
+        if self._model_reject_reason is None:
+            self._export_at_startup()
+
+    def _startup_keys(self) -> list[tuple]:
+        level = envs.SGLANG_MLX_REGION_STARTUP_EXPORT.get()
+        if level <= MlxRegionStartupExport.OFF:
+            return []
+        keys: list[tuple] = [
+            ("decode", batch_size) for batch_size in _STARTUP_DECODE_BATCH_SIZES
+        ]
+        if level >= MlxRegionStartupExport.ALL:
+            keys.extend(("extend", bucket) for bucket in _PREFILL_TOKEN_BUCKETS)
+        return keys
+
+    def _export_at_startup(self) -> None:
+        """Export (and warm) the configured shape ladder before serving.
+
+        Same contract as CUDA-graph capture at startup: each shape pays its
+        export once here instead of on its first request. Shapes whose
+        export fails are blacklisted exactly as they would be at serve time.
+        One warm execution per shape also triggers the MLX graph compile,
+        so the first real batch is a pure cache hit.
+        """
+        keys = self._startup_keys()
+        if not keys:
+            return
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        started = time.perf_counter()
+        exported = 0
+        # Serving installs the forward context before dispatch reaches this
+        # runner; the export trace and the warm execution read the attention
+        # backend through it, so install the same context here.
+        context = ForwardContext(attn_backend=self.model_runner.attn_backend)
+        for key in keys:
+            if self._model_reject_reason is not None:
+                break
+            batch = self._synthetic_batch(key)
+            with forward_context(context):
+                if self._ensure_executor(batch, key) is None:
+                    continue
+                try:
+                    with torch.inference_mode():
+                        self.execute(batch)
+                except Exception:
+                    logger.exception(
+                        "MLX region warm-up execution failed for %s; serving "
+                        "this shape on the eager Torch path.",
+                        key,
+                    )
+                    self._executors.pop(key, None)
+                    self._failed_batch_sizes.add(key)
+                    continue
+            exported += 1
+            # Each export leaves transient buffers in the MLX cache; release
+            # them so the ladder's peak footprint stays that of one shape.
+            _clear_mlx_cache()
+        self.startup_export_seconds = time.perf_counter() - started
+        logger.info(
+            "MLX region: exported %d/%d shapes at startup in %.1f s.",
+            exported,
+            len(keys),
+            self.startup_export_seconds,
+        )
+
+    def _synthetic_batch(self, key: tuple) -> ForwardBatch:
+        """A dummy batch of the key's shape, using the pool's reserved rows.
+
+        Row 0 of req_to_token and slot 0 of the KV pool are the reserved
+        padding entries (the same ones CUDA-graph capture points dummy
+        batches at), so the export trace and the warm execution read and
+        write nothing a request owns. Field dtypes match the serving path
+        exactly: the exported executor binds them into its signature.
+        """
+        device = self.model_runner.device
+        mode, size = key
+        if mode == "decode":
+            zeros = torch.zeros(size, dtype=torch.int64, device=device)
+            return ForwardBatch(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=size,
+                input_ids=zeros,
+                positions=zeros.clone(),
+                req_pool_indices=zeros.clone(),
+                seq_lens=torch.ones(size, dtype=torch.int64, device=device),
+                out_cache_loc=zeros.clone(),
+                seq_lens_sum=size,
+                num_token_non_padded_cpu=size,
+            )
+        return ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.zeros(size, dtype=torch.int64, device=device),
+            positions=torch.arange(size, dtype=torch.int64, device=device),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64, device=device),
+            seq_lens=torch.full((1,), size, dtype=torch.int64, device=device),
+            out_cache_loc=torch.zeros(size, dtype=torch.int64, device=device),
+            seq_lens_sum=size,
+            extend_num_tokens=size,
+            extend_seq_lens=torch.full((1,), size, dtype=torch.int32, device=device),
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device=device),
+            extend_start_loc=torch.zeros(1, dtype=torch.int32, device=device),
+            num_token_non_padded_cpu=size,
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._model_reject_reason is not None:

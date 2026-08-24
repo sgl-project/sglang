@@ -13,6 +13,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import MlxRegionStartupExport, envs
 from sglang.srt.hardware_backend.mlx.export_validation import (
     ServingForwardArg,
     resolve_body_call_kwargs,
@@ -21,6 +22,8 @@ from sglang.srt.hardware_backend.mlx.export_validation import (
 )
 from sglang.srt.hardware_backend.mlx.region_runner import (
     _MAX_REGION_BATCH_SIZE,
+    _PREFILL_TOKEN_BUCKETS,
+    _STARTUP_DECODE_BATCH_SIZES,
     MlxRegionRunner,
     _kernel_contract_reject_reason,
     _nontrivial_logits_reason,
@@ -57,6 +60,8 @@ def _make_runner(*, lora_enabled: bool = False) -> MlxRegionRunner:
         token_to_kv_pool=pool,
         hisparse_coordinator=None,
         model=_make_model(),
+        device="cpu",
+        attn_backend=None,
     )
     runner._lora_enabled = lora_enabled
     runner._executors = {}
@@ -243,6 +248,93 @@ def _radix_block(
     )
     block.self_attn = self_attn
     return block
+
+
+class TestStartupExport(CustomTestCase):
+    """Startup export must reproduce the serve-time path shape for shape.
+
+    The executor binds its input signature (dtypes, arities) at export, so a
+    synthetic batch that differs from a real serving batch would export an
+    executor that the first real batch of that shape cannot use -- the
+    startup pass would then cost boot time and buy nothing. The level knob
+    is the other failure mode: a ladder that silently drifts from the
+    documented levels.
+    """
+
+    def _exported_keys(self, level) -> list:
+        runner = _make_runner()
+        seen = []
+
+        def fake_ensure(self, batch, key):
+            seen.append(key)
+            return object()
+
+        with (
+            envs.SGLANG_MLX_REGION_STARTUP_EXPORT.override(int(level)),
+            mock.patch.object(MlxRegionRunner, "_ensure_executor", fake_ensure),
+            mock.patch.object(MlxRegionRunner, "execute", lambda self, b: None),
+        ):
+            runner._export_at_startup()
+        return seen
+
+    def test_levels_select_the_documented_ladders(self):
+        self.assertEqual(self._exported_keys(MlxRegionStartupExport.OFF), [])
+        self.assertEqual(
+            self._exported_keys(MlxRegionStartupExport.DECODE),
+            [("decode", bs) for bs in _STARTUP_DECODE_BATCH_SIZES],
+        )
+        self.assertEqual(
+            self._exported_keys(MlxRegionStartupExport.ALL),
+            [("decode", bs) for bs in _STARTUP_DECODE_BATCH_SIZES]
+            + [("extend", b) for b in _PREFILL_TOKEN_BUCKETS],
+        )
+
+    def test_synthetic_batches_match_the_serving_signature(self):
+        # Serving-path dtypes, measured on the real ForwardBatch: int64 for
+        # ids/positions/indices/seq_lens/cache slots, int32 for the extend
+        # metadata. The reserved rows (req 0, slot 0) are the only ones a
+        # dummy batch may touch.
+        runner = _make_runner()
+        decode = runner._synthetic_batch(("decode", 4))
+        self.assertEqual(runner._executor_key(decode), ("decode", 4))
+        args = serving_forward_args(decode)
+        for tensor in args[:5]:
+            self.assertEqual(tensor.dtype, torch.int64)
+            self.assertEqual(tensor.shape, (4,))
+        self.assertTrue(bool((decode.req_pool_indices == 0).all()))
+        self.assertTrue(bool((decode.out_cache_loc == 0).all()))
+
+        extend = runner._synthetic_batch(("extend", 256))
+        self.assertEqual(runner._executor_key(extend), ("extend", 256))
+        self.assertEqual(extend.input_ids.shape, (256,))
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(extend, name).dtype, torch.int32)
+        self.assertEqual(int(extend.extend_prefix_lens.max()), 0)
+        # Already bucket-sized: serving must not pad it a second time.
+        self.assertIs(runner._pad_extend_batch(extend, 256), extend)
+
+    def test_warm_up_failure_blacklists_only_that_shape(self):
+        runner = _make_runner()
+
+        def fake_ensure(self, batch, key):
+            self._executors[key] = object()
+            return self._executors[key]
+
+        def fake_execute(self, batch):
+            if batch.batch_size == 2:
+                raise RuntimeError("metal dispatch failed")
+
+        with (
+            envs.SGLANG_MLX_REGION_STARTUP_EXPORT.override(
+                int(MlxRegionStartupExport.DECODE)
+            ),
+            mock.patch.object(MlxRegionRunner, "_ensure_executor", fake_ensure),
+            mock.patch.object(MlxRegionRunner, "execute", fake_execute),
+        ):
+            runner._export_at_startup()
+        self.assertEqual(runner._failed_batch_sizes, {("decode", 2)})
+        self.assertNotIn(("decode", 2), runner._executors)
+        self.assertIn(("decode", 16), runner._executors)
 
 
 class TestDecoderTopologyResolver(CustomTestCase):

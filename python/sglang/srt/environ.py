@@ -218,6 +218,20 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class MlxRegionStartupExport(IntEnum):
+    """
+    Which MLX-region executors are exported at startup, before serving.
+
+    OFF: export lazily at the first batch of each shape
+    DECODE: export the decode batch-size ladder at startup (CUDA-graph parity)
+    ALL: also export every prefill token bucket
+    """
+
+    OFF = 0
+    DECODE = 1
+    ALL = 2
+
+
 class InvariantCheckLevel(IntEnum):
     """Signal level for value/index validity checks (see invariants.py).
 
@@ -849,6 +863,9 @@ class Envs:
     # whole-model MLX region on Apple MPS (experimental; anything the
     # region cannot serve falls back to the eager Torch path per batch).
     SGLANG_ENABLE_MLX_WHOLE_REGION = EnvBool(False)
+    # Export region executors at startup like CUDA-graph capture, instead of
+    # at the first batch of each shape (~1.9 s per shape).
+    SGLANG_MLX_REGION_STARTUP_EXPORT = EnvInt(MlxRegionStartupExport.DECODE)
     # Debug hooks for exercising the export path outside torch.export
     # (eager attention reference, KV-delta capture); never set in serving.
     SGLANG_DEBUG_MLX_EXPORT_VALIDATE = EnvBool(False)
