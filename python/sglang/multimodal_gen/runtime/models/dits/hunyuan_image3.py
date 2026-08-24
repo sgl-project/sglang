@@ -783,13 +783,11 @@ class HunYuanSparseMoeBlock(nn.Module):
         #     router_logits=torch.empty(0, device=hidden_states.device),
         # )
         
-        print(f"L[{self.layer_id}] {router_logits.float().detach().mean()} {router_logits.float().detach().std()}")
         # TopK routing: softmax + top-k selection
         topk_output = self.topk(hidden_states, router_logits)
 
         # FusedMoE expert computation
         final_hidden_states = self.experts(hidden_states, topk_output)
-        print(f"L[{self.layer_id}] final_hidden_states {final_hidden_states.float().detach().mean()} {final_hidden_states.float().detach().std()}")
 
         # Shared MLP contribution (always applied to all tokens)
         if self.shared_mlp is not None:

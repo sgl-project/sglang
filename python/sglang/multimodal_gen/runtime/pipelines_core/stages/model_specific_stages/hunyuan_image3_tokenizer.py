@@ -79,7 +79,7 @@ class ImageInfo:
 
     @property
     def meta_info(self):
-        if self.image_type in ["vae", "gen_image"]:
+        if self.image_type in ["vae", "gen_image", "joint_image"]:
             return dict(
                 token_length=self.image_token_length,
                 add_timestep_token=self.add_timestep_token,
@@ -94,6 +94,61 @@ class ImageInfo:
                 image_width=self.image_width,
             )
         raise ValueError(f"Unknown image type '{self.image_type}'")
+
+
+class JointImageInfo:
+    """Stores dual VAE + ViT metadata for a conditional (joint) image.
+
+    Mirrors vllm-omni's ``JointImageInfo``.  The ``meta_info`` property
+    returns ``token_length`` as a list ``[vae_len, vit_len]`` so the
+    tokenizer's ``encode_sequence`` can lay out both VAE and ViT token
+    regions within a single ``joint_image`` section.
+    """
+
+    def __init__(self, vae_image_info: ImageInfo, vision_image_info: ImageInfo,
+                 vision_encoder_kwargs: dict = None):
+        self.vae_image_info = vae_image_info
+        self.vision_image_info = vision_image_info
+        self.vision_encoder_kwargs = vision_encoder_kwargs or {}
+
+        # Uniformity with ImageInfo
+        self.image_type = "joint_image"
+        self.image_token_length = (
+            vae_image_info.image_token_length + vision_image_info.image_token_length
+        )
+        self.add_timestep_token = vae_image_info.add_timestep_token
+        self.use_front_boi_token = vae_image_info.use_front_boi_token
+        self.add_image_shape_token = vae_image_info.add_image_shape_token
+
+    @property
+    def meta_info(self):
+        return dict(
+            token_length=[
+                self.vae_image_info.image_token_length,
+                self.vision_image_info.image_token_length,
+            ],
+            add_timestep_token=self.add_timestep_token,
+            use_front_boi_token=self.use_front_boi_token,
+            add_image_shape_token=self.add_image_shape_token,
+            base_size=self.vae_image_info.base_size,
+            ratio_idx=self.vae_image_info.ratio_index,
+            token_height=[
+                self.vae_image_info.token_height,
+                self.vision_image_info.token_height,
+            ],
+            token_width=[
+                self.vae_image_info.token_width,
+                self.vision_image_info.token_width,
+            ],
+            image_height=[
+                self.vae_image_info.image_height,
+                self.vision_image_info.image_height,
+            ],
+            image_width=[
+                self.vae_image_info.image_width,
+                self.vision_image_info.image_width,
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +170,12 @@ class TokenizerEncodeOutput:
     gen_timestep_scatter_index: torch.Tensor = None
     think_recaption_end_pos: list = None
     uncond_cfg_start_pos: list = None
+    # Conditional (joint) image tracking for TI2I / I2I
+    cond_vae_image_mask: torch.Tensor = None
+    cond_vit_image_mask: torch.Tensor = None
+    cond_vae_image_slices: list = None
+    cond_vit_image_slices: list = None
+    joint_image_slices: list = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +225,7 @@ class HunyuanImage3TokenizerWrapper:
         self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids("</recaption>")
         self.end_think_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         self.ratio_token_offset = self.tokenizer.convert_tokens_to_ids("<img_ratio_0>")
+        self.joint_img_sep_token_id = self.tokenizer.convert_tokens_to_ids("<joint_img_sep>")
         self.special_token_map = self.tokenizer.added_tokens_encoder
 
     # -- padding helper -----------------------------------------------------
@@ -364,6 +426,65 @@ class HunyuanImage3TokenizerWrapper:
                 extra["eoi"].append(token_count)
                 token_count += 1
 
+            elif key == "joint_image":
+                # joint_image has dual layout: VAE tokens + <joint_img_sep> + ViT tokens
+                assert isinstance(source["length"], list) and len(source["length"]) == 2, (
+                    "joint_image length should be a list of two integers [vae_len, vit_len]"
+                )
+                vae_len, vit_len = source["length"]
+                extra_count = (
+                    2  # boi + eoi
+                    + 1  # joint_img_sep
+                    + (1 if source.get("timestep", add_timestep_token) else 0)
+                    + (2 if source.get("image_shape", add_image_shape_token) else 0)
+                )
+                if drop_last is True and total_length is not None and token_count + extra_count + vae_len + vit_len > total_length:
+                    drop_last_break = True
+                    break
+                # <boi>
+                if source.get("front_boi", use_front_boi_token):
+                    token_seq.append(self.boi_token_id)
+                    extra["boi"].append(token_count)
+                    token_count += 1
+                # image meta (timestep, image_shape — no guidance for joint_image)
+                token_count = self._add_image_meta_info_token(
+                    token_seq, token_count, extra,
+                    add_timestep_token=source.get("timestep", add_timestep_token),
+                    add_guidance_token=False,
+                    add_image_shape_token=source.get("image_shape", add_image_shape_token),
+                    base_size=source.get("base_size"),
+                    ratio_idx=source.get("ratio_idx"),
+                    image_type=key,
+                )
+                if not source.get("front_boi", use_front_boi_token):
+                    token_seq.append(self.boi_token_id)
+                    extra["boi"].append(token_count)
+                    token_count += 1
+                # VAE <img> tokens
+                token_seq.extend([self.img_token_id] * vae_len)
+                extra["<vae_img>_start"].append(token_count)
+                extra["<joint_img>_start"].append(token_count)
+                extra["<all_img>_start"].append(token_count)
+                token_count += vae_len
+                extra["<vae_img>_end"].append(token_count - 1)
+                extra["<all_img>_end"].append(token_count - 1)
+                # <joint_img_sep>
+                token_seq.append(self.joint_img_sep_token_id)
+                extra["joint_img_sep"].append(token_count)
+                token_count += 1
+                # ViT <img> tokens
+                token_seq.extend([self.img_token_id] * vit_len)
+                extra["<vit_img>_start"].append(token_count)
+                extra["<all_img>_start"].append(token_count)
+                token_count += vit_len
+                extra["<vit_img>_end"].append(token_count - 1)
+                extra["<joint_img>_end"].append(token_count - 1)
+                extra["<all_img>_end"].append(token_count - 1)
+                # <eoi>
+                token_seq.append(self.eoi_token_id)
+                extra["eoi"].append(token_count)
+                token_count += 1
+
             else:
                 raise ValueError(f"Unsupported key: {key}")
             index_indicator[key] += 1
@@ -384,6 +505,9 @@ class HunyuanImage3TokenizerWrapper:
             if token_count > total_length and drop_last:
                 for sk, ek in [
                     ("<img>_start", "<img>_end"),
+                    ("<joint_img>_start", "<joint_img>_end"),
+                    ("<vae_img>_start", "<vae_img>_end"),
+                    ("<vit_img>_start", "<vit_img>_end"),
                 ]:
                     if sk in extra and ek in extra:
                         assert all(
@@ -415,6 +539,8 @@ class HunyuanImage3TokenizerWrapper:
             extra_token_pos["timestep"].append(token_count)
             if image_type == "gen_image":
                 extra_token_pos["gen_timestep"].append(token_count)
+            elif image_type == "joint_image":
+                extra_token_pos["cond_timestep"].append(token_count)
             token_count += 1
         if add_guidance_token:
             token_seq.extend([self.special_token_map["<guidance>"]])
@@ -457,6 +583,16 @@ class HunyuanImage3TokenizerWrapper:
                     base_size=section.get("base_size"),
                     ratio_idx=section.get("ratio_idx"),
                 ))
+            elif section["type"] == "joint_image":
+                token_source["joint_image"].append(dict(
+                    length=section["token_length"],
+                    timestep=section.get("add_timestep_token", False),
+                    guidance=section.get("add_guidance_token", False),
+                    front_boi=section.get("use_front_boi_token", False),
+                    image_shape=section.get("add_image_shape_token", False),
+                    base_size=section.get("base_size"),
+                    ratio_idx=section.get("ratio_idx"),
+                ))
             else:
                 raise ValueError(f"Invalid section type: {section['type']}")
 
@@ -470,7 +606,8 @@ class HunyuanImage3TokenizerWrapper:
         # Scatter indices
         timestep_idx = torch.tensor(extra["timestep"], dtype=torch.long) if "timestep" in extra else None
         gen_ts_idx = torch.tensor(extra["gen_timestep"], dtype=torch.long) if "gen_timestep" in extra else None
-
+        cond_ts_idx = torch.tensor(extra["cond_timestep"], dtype=torch.long) if "cond_timestep" in extra else None
+        
         # Image slices / mask
         gen_image_slices = []
         gen_image_mask = None
@@ -479,17 +616,36 @@ class HunyuanImage3TokenizerWrapper:
             gen_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
             for sl in gen_image_slices:
                 gen_image_mask[sl] = True
-
+        
+        # Conditional (joint) image slices / mask
+        joint_image_slices = []
+        cond_vae_image_mask = None
+        cond_vit_image_mask = None
+        cond_vae_image_slices = []
+        cond_vit_image_slices = []
+        if "<vae_img>_start" in extra and "<vae_img>_end" in extra:
+            cond_vae_image_slices = [slice(s, e + 1) for s, e in zip(extra["<vae_img>_start"], extra["<vae_img>_end"])]
+            cond_vae_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
+            for sl in cond_vae_image_slices:
+                cond_vae_image_mask[sl] = True
+        if "<vit_img>_start" in extra and "<vit_img>_end" in extra:
+            cond_vit_image_slices = [slice(s, e + 1) for s, e in zip(extra["<vit_img>_start"], extra["<vit_img>_end"])]
+            cond_vit_image_mask = torch.zeros_like(full_tensor, dtype=torch.bool)
+            for sl in cond_vit_image_slices:
+                cond_vit_image_mask[sl] = True
+        if "<joint_img>_start" in extra and "<joint_img>_end" in extra:
+            joint_image_slices = [slice(s, e + 1) for s, e in zip(extra["<joint_img>_start"], extra["<joint_img>_end"])]
+        
         # All image slices
         all_image_slices = []
         if "<all_img>_start" in extra and "<all_img>_end" in extra:
             all_image_slices = [slice(s, e + 1) for s, e in zip(extra["<all_img>_start"], extra["<all_img>_end"])]
-
+        
         # Text slices
         text_slices = []
         if "<text>_start" in extra and "<text>_end" in extra:
             text_slices = [slice(s, e + 1) for s, e in zip(extra["<text>_start"], extra["<text>_end"])]
-
+        
         # Text mask
         text_mask = None
         if use_text_mask:
@@ -498,11 +654,11 @@ class HunyuanImage3TokenizerWrapper:
                 if not spec["ignore"]:
                     real = slice(sl.start + spec["start_offset"], sl.stop + spec["end_offset"])
                     text_mask[real] = 1.0
-
+        
         real_pos = torch.tensor(extra.get("first_pad", [full_tensor.shape[0]]), dtype=torch.long)
         think_end = extra.get("<think>_end", [None])[0]
         recaption_end = extra.get("<recaption>_end", [None])[0]
-
+        
         return TokenizerEncodeOutput(
             tokens=full_tensor,
             timestep_scatter_index=timestep_idx,
@@ -513,6 +669,12 @@ class HunyuanImage3TokenizerWrapper:
             real_pos=real_pos,
             all_image_slices=all_image_slices,
             gen_timestep_scatter_index=gen_ts_idx,
+            cond_timestep_scatter_index=cond_ts_idx,
+            cond_vae_image_mask=cond_vae_image_mask,
+            cond_vit_image_mask=cond_vit_image_mask,
+            cond_vae_image_slices=cond_vae_image_slices,
+            cond_vit_image_slices=cond_vit_image_slices,
+            joint_image_slices=joint_image_slices,
             think_recaption_end_pos=[recaption_end or think_end],
             uncond_cfg_start_pos=[extra.get("<cfg>_start", [None])[0]],
         )
@@ -696,13 +858,16 @@ class HunyuanImage3TokenizerWrapper:
                     sub_sections.append(
                         dict(type="text", text=f"{answer_prefix}{text}{answer_suffix}", **uncond_kwargs)
                     )
-            elif msg["type"] == "gen_image":
+            elif msg["type"] in ("gen_image", "joint_image"):
                 info = msg["content"]
-                assert isinstance(info, ImageInfo), f"Expected ImageInfo, got {type(info)}"
-                if role == "assistant":
+                expected_cls = JointImageInfo if msg["type"] == "joint_image" else ImageInfo
+                assert isinstance(info, expected_cls), (
+                    f"Expected {expected_cls.__name__}, got {type(info).__name__}"
+                )
+                if role == "assistant" and msg["type"] == "gen_image":
                     sub_sections.append(dict(type="text", text=answer_prefix))
                 sub_sections.append(dict(type=msg["type"], **info.meta_info))
-                if role == "assistant":
+                if role == "assistant" and msg["type"] == "gen_image":
                     sub_sections.append(dict(type="text", text=answer_suffix))
             else:
                 raise ValueError(f"Unknown message type: {msg['type']}")

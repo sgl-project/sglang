@@ -73,6 +73,8 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         "processor",
         "transformer",
         "scheduler",
+        "vision_model",
+        "vision_aligner",
     ]
 
     def load_modules(
@@ -167,6 +169,14 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             elif module_name == "processor":
                 modules["processor"] = self._load_processor(
                     server_args, model_path, hf_config
+                )
+            elif module_name == "vision_model":
+                modules["vision_model"] = self._load_vision_model(
+                    server_args, model_path, config_dict
+                )
+            elif module_name == "vision_aligner":
+                modules["vision_aligner"] = self._load_vision_aligner(
+                    server_args, model_path, config_dict
                 )
             else:
                 raise ValueError(f"Unknown required module: {module_name}")
@@ -405,6 +415,114 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
             return None
 
+    def _load_vision_model(
+        self,
+        server_args: ServerArgs,
+        model_path: str,
+        config_dict: dict[str, Any],
+    ) -> torch.nn.Module | None:
+        """Load the SigLIP2 vision model from checkpoint weights.
+
+        Uses the ``vit`` section of config.json and loads weights with
+        the ``vision_model.*`` prefix from the unified checkpoint.
+        """
+        vit_config = config_dict.get("vit")
+        if vit_config is None:
+            logger.warning("No 'vit' config found; skipping vision_model loading.")
+            return None
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3_vision import (
+            Siglip2VisionTransformer,
+        )
+
+        vision_model = Siglip2VisionTransformer(vit_config)
+        state_dict = self._collect_prefixed_weights(model_path, "vision_model.")
+        if state_dict:
+            missing_keys, unexpected_keys = vision_model.load_state_dict(
+                state_dict, strict=False
+            )
+            if missing_keys:
+                logger.warning(
+                    "Missing %d key(s) when loading vision_model, e.g. %s",
+                    len(missing_keys),
+                    missing_keys[:3],
+                )
+        else:
+            logger.warning("No vision_model weights found in checkpoint.")
+
+        device = get_local_torch_device()
+        vision_model.to(device=device)
+        vision_model.eval()
+        self.memory_usages["vision_model"] = _module_memory_gb(vision_model)
+        logger.info("Loaded SigLIP2 vision_model (%.2f GiB)", self.memory_usages["vision_model"])
+        return vision_model
+
+    def _load_vision_aligner(
+        self,
+        server_args: ServerArgs,
+        model_path: str,
+        config_dict: dict[str, Any],
+    ) -> torch.nn.Module | None:
+        """Load the vision aligner (LightProjector) from checkpoint weights.
+
+        Uses the ``vit_aligner`` section of config.json and loads weights
+        with the ``vision_aligner.*`` prefix from the unified checkpoint.
+        """
+        vit_aligner_config = config_dict.get("vit_aligner")
+        if vit_aligner_config is None:
+            logger.warning("No 'vit_aligner' config found; skipping vision_aligner loading.")
+            return None
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3_vision import (
+            LightProjector,
+        )
+
+        vision_aligner = LightProjector(vit_aligner_config)
+        state_dict = self._collect_prefixed_weights(model_path, "vision_aligner.")
+        if state_dict:
+            missing_keys, unexpected_keys = vision_aligner.load_state_dict(
+                state_dict, strict=False
+            )
+            if missing_keys:
+                logger.warning(
+                    "Missing %d key(s) when loading vision_aligner, e.g. %s",
+                    len(missing_keys),
+                    missing_keys[:3],
+                )
+        else:
+            logger.warning("No vision_aligner weights found in checkpoint.")
+
+        device = get_local_torch_device()
+        vision_aligner.to(device=device)
+        vision_aligner.eval()
+        self.memory_usages["vision_aligner"] = _module_memory_gb(vision_aligner)
+        logger.info("Loaded vision_aligner (%.2f GiB)", self.memory_usages["vision_aligner"])
+        return vision_aligner
+
+    @staticmethod
+    def _collect_prefixed_weights(model_path: str, prefix: str) -> dict[str, torch.Tensor]:
+        """Extract weights with a given prefix from the unified checkpoint, stripping it."""
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            shard_names = sorted(
+                {
+                    shard
+                    for key, shard in weight_map.items()
+                    if key.startswith(prefix)
+                }
+            )
+            shard_paths = [os.path.join(model_path, name) for name in shard_names]
+        else:
+            shard_paths = _list_safetensors_files(model_path)
+
+        state_dict: dict[str, torch.Tensor] = {}
+        for name, tensor in safetensors_weights_iterator(shard_paths):
+            if name.startswith(prefix):
+                state_dict[name[len(prefix):]] = tensor
+        return state_dict
+
     @staticmethod
     def _read_flow_shift(model_path: str) -> float:
         """Read flow_shift from generation_config.json, falling back to the official default."""
@@ -435,6 +553,8 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 processor=self.get_module("processor"),
                 scheduler=self.get_module("scheduler"),
                 model_path=self.model_path,
+                vision_model=self.get_module("vision_model"),
+                vision_aligner=self.get_module("vision_aligner"),
             ),
             "hunyuan_image3_ar",
         )

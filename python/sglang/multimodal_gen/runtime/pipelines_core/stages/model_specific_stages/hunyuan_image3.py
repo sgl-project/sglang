@@ -189,33 +189,79 @@ def _build_rope_image_info(
     token_h: int,
     token_w: int,
     image_info: Any = None,
+    sections: list | None = None,
 ) -> list[list[tuple[slice, tuple[int, int]]]]:
     """Build 2D-RoPE image info from tokenizer output and image dimensions.
 
     Returns a per-batch list of ``[(slice, (token_h, token_w)), ...]`` tuples
     describing where image tokens sit in the sequence and their spatial layout.
 
-    Prefers ``token_height`` / ``token_width`` from *image_info* (which matches
-    the vllm-omni ``build_hunyuan_batch_rope_image_info`` that reads from the
-    tokenizer's *sections*).  Falls back to the explicit *token_h* / *token_w*
-    computed from the VAE downsample factor when *image_info* is ``None``.
+    When *sections* is provided (from the tokenizer's output), per-image
+    spatial dims are read from each section's ``token_height`` /
+    ``token_width`` (which may be lists for ``joint_image`` sections).
+    Otherwise falls back to the explicit *token_h* / *token_w*.
     """
     gen_slices = getattr(tokenizer_output, "gen_image_slices", None)
+    joint_slices = getattr(tokenizer_output, "joint_image_slices", None)
+    cond_vae_slices = getattr(tokenizer_output, "cond_vae_image_slices", None)
+    cond_vit_slices = getattr(tokenizer_output, "cond_vit_image_slices", None)
 
-    # Resolve spatial dims: prefer image_info attrs, fall back to explicit args
+    # Resolve spatial dims for gen image: prefer image_info attrs, fall back to args
     if image_info is not None:
         th = getattr(image_info, "token_height", token_h)
         tw = getattr(image_info, "token_width", token_w)
     else:
         th, tw = token_h, token_w
 
+    # Build per-section shape lookup from tokenizer sections
+    section_shapes: list[tuple[int, int]] = []
+    if sections is not None:
+        for section in sections:
+            stype = section.get("type", "")
+            if "image" in stype:
+                t_h = section.get("token_height", th)
+                t_w = section.get("token_width", tw)
+                if isinstance(t_h, list):
+                    # joint_image: list of [vae, vit] dims
+                    for h_i, w_i in zip(t_h, t_w):
+                        section_shapes.append((int(h_i), int(w_i)))
+                else:
+                    section_shapes.append((int(t_h), int(t_w)))
+
     rope_image_info: list[list[tuple[slice, tuple[int, int]]]] = []
     for b in range(batch_size):
         batch_info: list[tuple[slice, tuple[int, int]]] = []
+        # Use section shapes if available, otherwise fall back to gen dims
+        shape_idx = 0
+
+        # Add joint (cond) image slices first (they appear first in the sequence)
+        if cond_vae_slices is not None:
+            slices = cond_vae_slices[b] if isinstance(cond_vae_slices[0], list) else cond_vae_slices
+            for s in slices:
+                if shape_idx < len(section_shapes):
+                    batch_info.append((s, section_shapes[shape_idx]))
+                    shape_idx += 1
+                else:
+                    batch_info.append((s, (token_h, token_w)))
+        if cond_vit_slices is not None:
+            slices = cond_vit_slices[b] if isinstance(cond_vit_slices[0], list) else cond_vit_slices
+            for s in slices:
+                if shape_idx < len(section_shapes):
+                    batch_info.append((s, section_shapes[shape_idx]))
+                    shape_idx += 1
+                else:
+                    batch_info.append((s, (token_h, token_w)))
+
+        # Add gen image slices
         if gen_slices is not None:
             slices = gen_slices[b] if isinstance(gen_slices[0], list) else gen_slices
             for s in slices:
-                batch_info.append((s, (th, tw)))
+                if shape_idx < len(section_shapes):
+                    batch_info.append((s, section_shapes[shape_idx]))
+                    shape_idx += 1
+                else:
+                    batch_info.append((s, (th, tw)))
+
         rope_image_info.append(batch_info)
     return rope_image_info
 
@@ -251,6 +297,8 @@ class HunyuanImage3AR(PipelineStage):
         processor=None,
         scheduler=None,
         model_path: str = "",
+        vision_model=None,
+        vision_aligner=None,
     ):
         super().__init__()
         self.ar_model = ar_model
@@ -259,6 +307,8 @@ class HunyuanImage3AR(PipelineStage):
         self._processor = processor
         self._scheduler = scheduler
         self._model_path = model_path
+        self._vision_model = vision_model
+        self._vision_aligner = vision_aligner
         self._custom_tokenizer = None
         self._sequence_template: str | None = None
         self._drop_think: bool = False
@@ -605,6 +655,262 @@ class HunyuanImage3AR(PipelineStage):
         return pred
 
     # ------------------------------------------------------------------
+    # Conditional image processing helpers (TI2I / I2I)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resize_and_crop_center(image, target_width: int, target_height: int):
+        """Resize with aspect-ratio preservation then center-crop."""
+        from PIL import Image as PILImage
+        tw, th = target_width, target_height
+        w, h = image.size
+        tr = th / tw
+        r = h / w
+        if r < tr:
+            resize_height = th
+            resize_width = int(round(th / h * w))
+        else:
+            resize_width = tw
+            resize_height = int(round(tw / w * h))
+        resized = image.resize((resize_width, resize_height), PILImage.Resampling.LANCZOS)
+        crop_left = int(round((resize_width - tw) / 2.0))
+        crop_top = int(round((resize_height - th) / 2.0))
+        return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
+
+    def _preprocess_cond_image(self, pil_image, processor):
+        """Process a PIL image into VAE tensor + ViT tensor + JointImageInfo.
+
+        Mirrors vllm-omni's ``_build_cond_joint_image``.
+        Returns ``(joint_image_info, vae_tensor, vit_tensor, vit_kwargs)``.
+        """
+        from .hunyuan_image3_tokenizer import ImageInfo, JointImageInfo
+
+        pil_image = pil_image.convert("RGB")
+        orig_width, orig_height = pil_image.size
+
+        # Resolution lookup
+        hf_config = self.ar_model.hf_config
+        vae_factor = getattr(hf_config, "vae_downsample_factor", [16, 16])
+        if isinstance(vae_factor, (list, tuple)):
+            vae_h = vae_factor[0]
+            vae_w = vae_factor[1] if len(vae_factor) > 1 else vae_factor[0]
+        else:
+            vae_h = vae_w = int(vae_factor)
+        vae_w_factor = vae_w
+        vae_h_factor = vae_h
+
+        # Use processor's resolution group if available
+        if processor is not None and hasattr(processor, "reso_group"):
+            base_size, ratio_idx = processor.reso_group.get_base_size_and_ratio_index(
+                orig_width, orig_height
+            )
+            base_size = int(base_size)
+            ratio_idx = int(ratio_idx)
+            reso = processor.reso_group[ratio_idx]
+            target_width = int(reso.width)
+            target_height = int(reso.height)
+        else:
+            base_size = 1024
+            ratio_idx = 0
+            target_width = orig_width
+            target_height = orig_height
+
+        # VAE path: center-crop resize → processor → tensor
+        vae_input = self._resize_and_crop_center(pil_image, target_width, target_height)
+        if processor is not None and hasattr(processor, "vae_processor"):
+            vae_tensor = processor.vae_processor(vae_input)
+        else:
+            import torchvision.transforms as T
+            vae_tensor = T.ToTensor()(vae_input).unsqueeze(0)
+
+        vae_info = ImageInfo(
+            image_type="vae",
+            image_width=target_width,
+            image_height=target_height,
+            token_width=target_width // vae_w_factor,
+            token_height=target_height // vae_h_factor,
+            base_size=base_size,
+            ratio_index=ratio_idx,
+        )
+
+        # ViT path: vision encoder processor
+        vit_patch_size = 1
+        if processor is not None and hasattr(processor, "vision_encoder_processor"):
+            vit_inputs = processor.vision_encoder_processor(pil_image, return_tensors="pt")
+            vit_tensor = vit_inputs["pixel_values"]
+            spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)
+            pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0)
+            vit_token_h = int(spatial_shapes[0].item())
+            vit_token_w = int(spatial_shapes[1].item())
+            vit_patch_size = getattr(processor.vision_encoder_processor, "patch_size", 1)
+            if isinstance(vit_patch_size, (tuple, list)):
+                vit_patch_size = int(vit_patch_size[0])
+        else:
+            # Fallback: create minimal ViT inputs
+            vit_tensor = torch.zeros(1, 1, 3)
+            spatial_shapes = torch.tensor([[1, 1]])
+            vit_token_h = vit_token_w = 1
+
+        vit_info = ImageInfo(
+            image_type="siglip2",
+            image_width=vit_token_w * vit_patch_size,
+            image_height=vit_token_h * vit_patch_size,
+            token_width=vit_token_w,
+            token_height=vit_token_h,
+            image_token_length=int(vit_tensor.shape[1]),
+        )
+
+        joint_info = JointImageInfo(
+            vae_image_info=vae_info,
+            vision_image_info=vit_info,
+            vision_encoder_kwargs={"spatial_shapes": spatial_shapes},
+        )
+        # Attach tensors for downstream encoding
+        vae_info.image_tensor = vae_tensor
+        vit_info.image_tensor = vit_tensor
+        return joint_info, vae_tensor, vit_tensor, joint_info.vision_encoder_kwargs
+
+    def _vae_encode_cond_image(self, vae_tensor, device):
+        """VAE-encode a conditional image tensor → (t, latents).
+
+        Matches vllm-omni's ``vae_encode``: returns t=0 (clean image)
+        and the scaled/shifted latents.
+        """
+        if vae_tensor.ndim == 3:
+            vae_tensor = vae_tensor.unsqueeze(0)
+        if vae_tensor.ndim == 4:
+            vae_tensor = vae_tensor.unsqueeze(2)  # [B, C, 1, H, W]
+
+        vae = self._vae
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+            result = vae.encode(vae_tensor.to(device))
+            if isinstance(result, torch.Tensor):
+                latents = result
+            else:
+                latents = result.latent_dist.sample()
+            config = vae.config
+            if hasattr(config, "shift_factor") and config.shift_factor:
+                latents.sub_(config.shift_factor)
+            if hasattr(config, "scaling_factor") and config.scaling_factor:
+                latents.mul_(config.scaling_factor)
+
+        if hasattr(vae, "ffactor_temporal"):
+            latents = latents.squeeze(2)
+
+        t = torch.zeros((latents.shape[0],))
+        return t, latents.squeeze(0)  # remove batch dim for per-image storage
+
+    def _encode_cond_images(self, cond_image_infos, cfg_factor, device, generator=None):
+        """Encode conditional images through VAE and prepare ViT inputs.
+
+        Returns ``(cond_vae_images, cond_t, cond_vit_images, vit_kwargs)``.
+        Mirrors vllm-omni's ``_encode_cond_image``.
+        """
+        cond_vae_list, cond_t_list, cond_vit_list = [], [], []
+        for info in cond_image_infos:
+            t, latents = self._vae_encode_cond_image(info.vae_image_info.image_tensor, device)
+            cond_vit_list.append(info.vision_image_info.image_tensor)
+            cond_vae_list.append(latents)
+            cond_t_list.append(t)
+
+        cond_t = torch.cat(cond_t_list, dim=0)
+        cond_vit_images = torch.cat(cond_vit_list, dim=0)
+
+        # Stack VAE latents if same shape, else keep as list
+        if all(v.shape == cond_vae_list[0].shape for v in cond_vae_list):
+            cond_vae_images = torch.stack(cond_vae_list, dim=0)
+        else:
+            cond_vae_images = cond_vae_list
+
+        if cfg_factor > 1:
+            cond_t = cond_t.repeat(cfg_factor)
+            if isinstance(cond_vae_images, torch.Tensor):
+                cond_vae_images = cond_vae_images.repeat(cfg_factor, 1, 1, 1)
+            else:
+                cond_vae_images = cond_vae_images * cfg_factor
+            cond_vit_images = cond_vit_images.repeat(cfg_factor, 1, 1)
+
+        # Build vit_kwargs from vision_image_info
+        vit_kwargs = {"spatial_shapes": torch.cat([info.vision_image_info.vision_encoder_kwargs["spatial_shapes"].unsqueeze(0) for info in cond_image_infos], dim=0)}
+        if cfg_factor > 1:
+            vit_kwargs = {k: v.repeat(cfg_factor, *([1] * (v.ndim - 1))) for k, v in vit_kwargs.items()}
+
+        return cond_vae_images, cond_t, cond_vit_images, vit_kwargs
+
+    def _instantiate_cond_vae_tokens(
+        self, hidden_states, cond_vae_images, cond_timesteps, cond_vae_image_mask,
+    ):
+        """Scatter VAE conditional image embeddings at cond_vae_image_mask positions."""
+        bsz, seq_len, n_embd = hidden_states.shape
+        index = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+
+        if isinstance(cond_vae_images, list):
+            t_emb = []
+            for image_i, t_i in zip(cond_vae_images, cond_timesteps):
+                t_i_emb = self.ar_model.time_embed(t_i.unsqueeze(0).to(hidden_states.device))
+                if image_i.dim() == 3:
+                    image_i = image_i.unsqueeze(0)
+                image_i_seq, _, _ = self.ar_model.patch_embed(image_i.to(hidden_states.device), t_i_emb)
+                scatter_idx = index[0:1].masked_select(cond_vae_image_mask[0:1].bool()).reshape(1, -1)
+                hidden_states = hidden_states.clone()
+                hidden_states[0:1].scatter_(
+                    dim=1,
+                    index=scatter_idx.unsqueeze(-1).repeat(1, 1, n_embd),
+                    src=image_i_seq.reshape(1, -1, n_embd),
+                )
+                t_emb.append(t_i_emb)
+        else:
+            t_emb = self.ar_model.time_embed(cond_timesteps.to(hidden_states.device))
+            image_seq, _, _ = self.ar_model.patch_embed(cond_vae_images.to(hidden_states.device), t_emb)
+            scatter_idx = index.masked_select(cond_vae_image_mask.bool()).reshape(bsz, -1)
+            hidden_states = hidden_states.clone()
+            hidden_states.scatter_(
+                dim=1,
+                index=scatter_idx.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=image_seq,
+            )
+        return hidden_states
+
+    def _instantiate_cond_vit_tokens(
+        self, hidden_states, cond_vit_images, cond_vit_image_mask, vit_kwargs,
+    ):
+        """Run ViT + aligner and scatter at cond_vit_image_mask positions."""
+        bsz, seq_len, n_embd = hidden_states.shape
+        index = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+
+        # Forward through ViT + aligner
+        cond_vit_embeds = []
+        for batch_idx in range(cond_vit_images.shape[0]):
+            cur_spatial_shapes = vit_kwargs["spatial_shapes"][batch_idx:batch_idx+1].to(hidden_states.device)
+            image_embed = self._vision_model(
+                cond_vit_images[batch_idx:batch_idx+1].to(hidden_states.device),
+                cur_spatial_shapes,
+            )
+            image_embed = self._vision_aligner(image_embed)
+            n, sl, dim = image_embed.shape
+            image_embed = image_embed.reshape(n * sl, dim)
+            cond_vit_embeds.append(image_embed)
+
+        # Scatter at cond_vit_image_mask positions
+        for i, (embed, mask) in enumerate(zip(cond_vit_embeds, cond_vit_image_mask)):
+            scatter_idx = index[i:i+1].masked_select(mask.bool()).reshape(1, -1)
+            hidden_states = hidden_states.clone()
+            hidden_states[i:i+1].scatter_(
+                dim=1,
+                index=scatter_idx.unsqueeze(-1).repeat(1, 1, n_embd),
+                src=embed.reshape(1, -1, n_embd),
+            )
+        return hidden_states
+
+    def _instantiate_cond_timestep_tokens(
+        self, hidden_states, cond_timesteps, cond_timestep_scatter_index,
+    ):
+        """Scatter conditional timestep embeddings at cond_timestep_scatter_index positions."""
+        return self._instantiate_timestep_tokens(
+            hidden_states, cond_timesteps, cond_timestep_scatter_index,
+        )
+
+    # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
 
@@ -708,6 +1014,32 @@ class HunyuanImage3AR(PipelineStage):
         if image_info is not None:
             tokenizer_kwargs["batch_gen_image_info"] = [image_info]
 
+        # --- Conditional (joint) image handling for TI2I / I2I ---
+        cond_image_infos_list = None  # per-sample list of JointImageInfo
+        raw_cond_images = getattr(batch, "condition_image", None)
+        if raw_cond_images is not None:
+            if not isinstance(raw_cond_images, (list, tuple)):
+                raw_cond_images = [raw_cond_images]
+            # Preprocess each conditional image
+            cond_joint_infos = []
+            for raw_img in raw_cond_images:
+                from PIL import Image as PILImage
+                if not isinstance(raw_img, PILImage.Image):
+                    if isinstance(raw_img, str):
+                        raw_img = PILImage.open(raw_img)
+                    elif isinstance(raw_img, torch.Tensor):
+                        raw_img = PILImage.fromarray(
+                            raw_img.cpu().permute(1, 2, 0).numpy()
+                        )
+                joint_info, _, _, _ = self._preprocess_cond_image(raw_img, processor)
+                cond_joint_infos.append(joint_info)
+            cond_image_infos_list = [cond_joint_infos]  # batch of 1
+            tokenizer_kwargs["batch_cond_image_info"] = cond_image_infos_list
+            logger.info(
+                "TI2I/I2I mode: %d conditional image(s) provided",
+                len(cond_joint_infos),
+            )
+
         tokenizer_output_dict = tokenizer.apply_chat_template(**tokenizer_kwargs)
         # The output format: dict with 'output' and 'sections'
         if isinstance(tokenizer_output_dict, dict):
@@ -742,6 +1074,36 @@ class HunyuanImage3AR(PipelineStage):
             if timestep_index is not None:
                 timestep_index = timestep_index.to(device)
 
+        # --- Conditional image masks / indices from tokenizer ---
+        cond_vae_image_mask = None
+        cond_vit_image_mask = None
+        cond_timestep_scatter_index = None
+        if cond_image_infos_list is not None:
+            if hasattr(tokenizer_output, "cond_vae_image_mask"):
+                cond_vae_image_mask = tokenizer_output.cond_vae_image_mask.to(device)
+            if hasattr(tokenizer_output, "cond_vit_image_mask"):
+                cond_vit_image_mask = tokenizer_output.cond_vit_image_mask.to(device)
+            if hasattr(tokenizer_output, "cond_timestep_scatter_index"):
+                cond_timestep_scatter_index = tokenizer_output.cond_timestep_scatter_index.to(device)
+
+            # Expand cond masks for CFG (tokenizer produces per-sample masks)
+            if do_cfg and actual_batch_size > 1:
+                if cond_vae_image_mask is not None:
+                    if cond_vae_image_mask.ndim == 1:
+                        cond_vae_image_mask = cond_vae_image_mask.unsqueeze(0).expand(actual_batch_size, -1)
+                    elif cond_vae_image_mask.shape[0] == 1:
+                        cond_vae_image_mask = cond_vae_image_mask.expand(actual_batch_size, -1)
+                if cond_vit_image_mask is not None:
+                    if cond_vit_image_mask.ndim == 1:
+                        cond_vit_image_mask = cond_vit_image_mask.unsqueeze(0).expand(actual_batch_size, -1)
+                    elif cond_vit_image_mask.shape[0] == 1:
+                        cond_vit_image_mask = cond_vit_image_mask.expand(actual_batch_size, -1)
+                if cond_timestep_scatter_index is not None:
+                    if cond_timestep_scatter_index.ndim == 1:
+                        cond_timestep_scatter_index = cond_timestep_scatter_index.unsqueeze(0).expand(actual_batch_size, -1)
+                    elif cond_timestep_scatter_index.shape[0] == 1:
+                        cond_timestep_scatter_index = cond_timestep_scatter_index.expand(actual_batch_size, -1)
+
         # 4. Build attention mask (4D causal + full attn at image positions)
         # Matches vllm-omni: combine joint_image_slices + gen_image_slices
         gen_slices = getattr(tokenizer_output, "gen_image_slices", [[] for _ in range(actual_batch_size)])
@@ -766,8 +1128,13 @@ class HunyuanImage3AR(PipelineStage):
         )
 
         # 5. Build 2D RoPE image info and compute cached cos/sin
+        # Extract sections from tokenizer output for per-image RoPE dims
+        tokenizer_sections = None
+        if isinstance(tokenizer_output_dict, dict):
+            tokenizer_sections = tokenizer_output_dict.get("sections")
         rope_image_info = _build_rope_image_info(
-            tokenizer_output, actual_batch_size, token_h, token_w, image_info
+            tokenizer_output, actual_batch_size, token_h, token_w, image_info,
+            sections=tokenizer_sections,
         )
         cos, sin = self.ar_model.cached_rope(seq_len, device, rope_image_info=rope_image_info)
 
@@ -845,6 +1212,33 @@ class HunyuanImage3AR(PipelineStage):
         # Backbone forward agent (bound to num_image_tokens for KV cache)
         backbone_fn = partial(self._backbone_forward, num_image_tokens)
 
+        # 7b. Encode conditional images (TI2I / I2I)
+        cond_vae_images = None
+        cond_vit_images = None
+        cond_t = None
+        vit_kwargs = None
+        if cond_image_infos_list is not None and cond_image_infos_list[0]:
+            # Move vision components to device
+            if self._vision_model is not None:
+                if not isinstance(self._vision_model, torch.nn.Module):
+                    logger.info("Moving vision_model to %s", device)
+                    self._vision_model.to(device)
+                self._vision_model.eval()
+            if self._vision_aligner is not None:
+                if not isinstance(self._vision_aligner, torch.nn.Module):
+                    logger.info("Moving vision_aligner to %s", device)
+                    self._vision_aligner.to(device)
+                self._vision_aligner.eval()
+
+            cond_vae_images, cond_t, cond_vit_images, vit_kwargs = self._encode_cond_images(
+                cond_image_infos_list[0], cfg_factor, device, generator,
+            )
+            logger.info(
+                "Encoded conditional images: VAE=%s, ViT=%s",
+                cond_vae_images.shape if isinstance(cond_vae_images, torch.Tensor) else "list",
+                cond_vit_images.shape,
+            )
+
         # 8. Diffusion sampling loop
         # Keep a reference to the original input_ids so that every denoising
         # step can rebuild the full sequence (text + image + special tokens).
@@ -881,6 +1275,20 @@ class HunyuanImage3AR(PipelineStage):
                 if timestep_index is not None:
                     hidden_states = self._instantiate_timestep_tokens(
                         hidden_states, t_expand, timestep_index,
+                    )
+
+                # --- Scatter conditional image embeddings (TI2I / I2I) ---
+                if cond_vae_images is not None and cond_vae_image_mask is not None:
+                    hidden_states = self._instantiate_cond_vae_tokens(
+                        hidden_states, cond_vae_images, cond_t, cond_vae_image_mask,
+                    )
+                if cond_vit_images is not None and cond_vit_image_mask is not None:
+                    hidden_states = self._instantiate_cond_vit_tokens(
+                        hidden_states, cond_vit_images, cond_vit_image_mask, vit_kwargs,
+                    )
+                if cond_timestep_scatter_index is not None and cond_t is not None:
+                    hidden_states = self._instantiate_cond_timestep_tokens(
+                        hidden_states, cond_t, cond_timestep_scatter_index,
                     )
 
                 # Use the same RoPE and attention mask on every step
