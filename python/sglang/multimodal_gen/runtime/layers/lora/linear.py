@@ -278,6 +278,7 @@ class BaseWeightEntry:
     def __init__(self, lora_path: str | None = None, strength: float = 1.0):
         self.lora_path = lora_path
         self.strength = strength
+        self.weights = None
 
     @staticmethod
     def create_weight_from_layer(
@@ -293,6 +294,9 @@ class BaseWeightEntry:
                 return cls(weight, lora_path, strength)
 
         return None
+
+    def has_weights(self) -> bool:
+        return self.weights is not None
 
 
 @BaseWeightEntry.register()
@@ -424,28 +428,19 @@ class BaseLayerWithLoRA(nn.Module):
         self.global_strength: float = 1.0
         self.lora_weights_list: list[BaseWeightEntry] = []
 
-    @property
     def has_weight(self) -> bool:
         return (
-            self.lora_weights_list[-1].has_weight if self.lora_weights_list else False
+            self.lora_weights_list[-1].has_weight() if self.lora_weights_list else False
         )
 
-    @property
     def lora_path(self) -> str | None:
         return self.lora_weights_list[-1].lora_path if self.lora_weights_list else None
 
-    @property
     def strength(self) -> float | None:
         return (
             self.lora_weights_list[-1].strength
             if self.lora_weights_list
             else self.global_strength
-        )
-
-    @property
-    def weights(self):
-        last_strength = (
-            self.lora_weights_list[-1].weights if self.lora_weights_list else None
         )
 
     @property
@@ -548,7 +543,6 @@ class BaseLayerWithLoRA(nn.Module):
             # has_adapter_weights
             # adapter_params
             scale = adapter.strength
-            print("@@@ ", scale)
 
             lora_delta = weight_sliced.delta()
             if isinstance(lora_delta, torch.Tensor) and lora_delta.dim() > 2:

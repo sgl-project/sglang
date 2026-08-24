@@ -512,9 +512,9 @@ class LoRAPipeline(ComposedPipelineBase):
             if not has_any_registered_adapter(_filter_weights_by_layer(name, adapter)):
                 continue
             if (
-                not layer.has_weight
-                or layer.lora_path != path
-                or layer.strength != strength
+                not layer.has_weight()
+                or layer.lora_path() != path
+                or layer.strength() != strength
             ):
                 return None
             active_count += 1
@@ -633,7 +633,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     ]
                     # TODO: rework for using weight class for adapter
                     # Use stack instead of cat because it needs to be compatible with TP.
-                    weight = sorted_tensors
+                    weight = torch.stack(sorted_tensors, dim=0)
                     del to_merge_params[target_name]
                 else:
                     continue
@@ -875,7 +875,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name, lora_layers_dict, self.server_args.lora_merge_mode
                 ):
                     for layer in lora_layers_dict.values():
-                        if not layer.has_weight:
+                        if not layer.has_weight():
                             continue
                         if layer.merged:
                             layer.unmerge_lora_weights()
@@ -905,7 +905,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
                 for name, layer in lora_layers_dict.items():
                     # Only re-enable LoRA for layers that actually have LoRA weights
-                    if not layer.has_weight:
+                    if not layer.has_weight():
                         continue
                     layer.disable_lora = False
                     try:

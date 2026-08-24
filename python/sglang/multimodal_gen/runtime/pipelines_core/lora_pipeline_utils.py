@@ -28,7 +28,7 @@ def _has_active_unmerged_lora(
     lora_layers: dict[str, BaseLayerWithLoRA],
 ) -> bool:
     return any(
-        not layer.merged and not layer.disable_adapter for layer in lora_layers.values()
+        not layer.merged and not layer.disable_lora for layer in lora_layers.values()
     )
 
 
