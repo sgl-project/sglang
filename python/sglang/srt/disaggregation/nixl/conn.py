@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -465,9 +465,10 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        self.enable_transfer_queue_pipeline = (
-            envs.SGLANG_NIXL_TRANSFER_QUEUE_PIPELINE.get()
+        self.max_inflight_tokens = max(
+            0, envs.SGLANG_NIXL_MAX_INFLIGHT_TOKENS.get()
         )
+        self.enable_transfer_queue_pipeline = self.max_inflight_tokens > 0
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
@@ -492,6 +493,7 @@ class NixlKVManager(CommonKVManager):
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
             self._transfer_condition = threading.Condition()
+            self._pipeline_tokens_inflight = 0
             self._pending_abort_acks = defaultdict(set)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
@@ -1159,7 +1161,20 @@ class NixlKVManager(CommonKVManager):
                     e,
                 )
 
-    def _complete_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+    def _try_reserve_pipeline_tokens(self, num_tokens: int) -> bool:
+        with self._transfer_condition:
+            if (
+                self._pipeline_tokens_inflight > 0
+                and self._pipeline_tokens_inflight + num_tokens
+                > self.max_inflight_tokens
+            ):
+                return False
+            self._pipeline_tokens_inflight += num_tokens
+            return True
+
+    def _complete_transfer_chunk(
+        self, kv_chunk: TransferKVChunk, reserved_tokens: int = 0
+    ) -> None:
         if not self.enable_transfer_queue_pipeline:
             self._staging_outstanding[kv_chunk.room] -= 1
             kv_chunk.staging_counted = False
@@ -1170,6 +1185,7 @@ class NixlKVManager(CommonKVManager):
             if kv_chunk.staging_counted:
                 self._staging_outstanding[room] -= 1
                 kv_chunk.staging_counted = False
+            self._pipeline_tokens_inflight -= reserved_tokens
             if self._staging_outstanding.get(room, 0) <= 0:
                 self._staging_outstanding.pop(room, None)
                 peers = self._pending_abort_acks.pop(room, ())
@@ -1177,7 +1193,10 @@ class NixlKVManager(CommonKVManager):
         self._send_drained_abort_acks(room, peers)
 
     def _finalize_transfer_chunk(
-        self, kv_chunk: TransferKVChunk, handles: List[Any]
+        self,
+        kv_chunk: TransferKVChunk,
+        handles: List[Any],
+        reserved_tokens: int = 0,
     ) -> None:
         room = kv_chunk.room
         error = None
@@ -1206,7 +1225,7 @@ class NixlKVManager(CommonKVManager):
             elif self.check_status(room) != KVPoll.Success:
                 self.update_status(room, KVPoll.Transferring)
 
-        self._complete_transfer_chunk(kv_chunk)
+        self._complete_transfer_chunk(kv_chunk, reserved_tokens)
         if self._staging_outstanding.get(room, 0) <= 0 and (
             self.check_status(room) == KVPoll.Success
             or (kv_chunk.is_last_chunk and self.check_status(room) == KVPoll.Failed)
@@ -1266,23 +1285,20 @@ class NixlKVManager(CommonKVManager):
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
 
-        pending_completion = None
+        pending_completions = deque()
         while True:
-            if pending_completion is None:
+            if not pending_completions:
                 kv_chunk: TransferKVChunk = queue.get()
             else:
                 kv_chunk = queue.get(block=False)
                 if kv_chunk is None:
-                    self._finalize_transfer_chunk(*pending_completion)
-                    pending_completion = None
+                    self._finalize_transfer_chunk(*pending_completions.popleft())
                     continue
             room = kv_chunk.room
             handles: List[Any] = []
+            reserved_tokens = 0
             try:
                 if not self._claim_transfer_chunk(kv_chunk):
-                    if pending_completion is not None:
-                        self._finalize_transfer_chunk(*pending_completion)
-                        pending_completion = None
                     continue
 
                 assert room in self.transfer_infos
@@ -1291,16 +1307,41 @@ class NixlKVManager(CommonKVManager):
                 pipeline_this_chunk = (
                     self.enable_transfer_queue_pipeline
                     and not self.enable_staging
-                    and kv_chunk.is_last_chunk
                     and len(reqs_to_be_processed) == 1
                     and not reqs_to_be_processed[0].is_dummy()
-                    and reqs_to_be_processed[0].completion_pipeline_depth == 2
+                    and reqs_to_be_processed[0].completion_pipeline_depth > 1
                 )
-                if pending_completion is not None and (
-                    not pipeline_this_chunk or room == pending_completion[0].room
-                ):
-                    self._finalize_transfer_chunk(*pending_completion)
-                    pending_completion = None
+                if not pipeline_this_chunk:
+                    while pending_completions:
+                        self._finalize_transfer_chunk(*pending_completions.popleft())
+                else:
+                    num_tokens = max(
+                        1,
+                        kv_chunk.num_kv_tokens
+                        if kv_chunk.num_kv_tokens is not None
+                        else len(kv_chunk.prefill_kv_indices),
+                    )
+                    while not self._try_reserve_pipeline_tokens(num_tokens):
+                        if pending_completions:
+                            self._finalize_transfer_chunk(
+                                *pending_completions.popleft()
+                            )
+                        else:
+                            with self._transfer_condition:
+                                while (
+                                    self._pipeline_tokens_inflight > 0
+                                    and self._pipeline_tokens_inflight + num_tokens
+                                    > self.max_inflight_tokens
+                                    and self.check_status(room) != KVPoll.Failed
+                                ):
+                                    self._transfer_condition.wait()
+                        if self.check_status(room) == KVPoll.Failed:
+                            break
+                    else:
+                        reserved_tokens = num_tokens
+                    if self.check_status(room) == KVPoll.Failed:
+                        self._complete_transfer_chunk(kv_chunk, reserved_tokens)
+                        continue
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1497,9 +1538,9 @@ class NixlKVManager(CommonKVManager):
                     continue
 
                 if pipeline_this_chunk:
-                    if pending_completion is not None:
-                        self._finalize_transfer_chunk(*pending_completion)
-                    pending_completion = (kv_chunk, handles)
+                    pending_completions.append(
+                        (kv_chunk, handles, reserved_tokens)
+                    )
                 else:
                     self._finalize_transfer_chunk(kv_chunk, handles)
             except Exception as e:
@@ -1509,7 +1550,9 @@ class NixlKVManager(CommonKVManager):
                 # Never release source/destination ownership while submitted
                 # NIXL operations may still be in flight.
                 if kv_chunk.staging_counted:
-                    self._finalize_transfer_chunk(kv_chunk, handles)
+                    self._finalize_transfer_chunk(
+                        kv_chunk, handles, reserved_tokens
+                    )
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):

@@ -537,6 +537,22 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Success)
         self.assertNotIn(room, mgr.transfer_infos)
 
+    def test_pipeline_token_budget_is_released_on_completion(self):
+        room = 24
+        mgr = self._make_manager(room)
+        mgr.enable_transfer_queue_pipeline = True
+        mgr.max_inflight_tokens = 10
+        mgr._pipeline_tokens_inflight = 0
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.staging_counted = True
+        mgr._staging_outstanding[room] = 1
+        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+
+        self.assertTrue(mgr._try_reserve_pipeline_tokens(8))
+        self.assertFalse(mgr._try_reserve_pipeline_tokens(3))
+        mgr._finalize_transfer_chunk(chunk, ["handle"], reserved_tokens=8)
+        self.assertEqual(mgr._pipeline_tokens_inflight, 0)
+
     def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
         return TransferKVChunk(
             room=room,
