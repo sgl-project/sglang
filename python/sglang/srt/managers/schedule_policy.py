@@ -1083,6 +1083,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        chunk_tokens_limit = self._chunk_tokens_limit()
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
@@ -1169,8 +1170,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req, 0)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_tokens_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1190,21 +1191,25 @@ class PrefillAdder:
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if chunk_tokens_limit <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_tokens_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
-            assert len(req.prefix_indices) == 0
+            if self.per_request_chunk_size is None:
+                assert len(req.prefix_indices) == 0
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            if self.per_request_chunk_size is None:
+                self.new_chunked_req = req
+            else:
+                self.new_chunked_reqs.append(req)
             self._update_prefill_budget(
                 0,
                 trunc_len,

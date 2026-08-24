@@ -505,6 +505,52 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertEqual([req.extend_range.length for req in reqs], [2048, 2048])
 
+    def test_per_request_chunk_cap_batches_ignore_eos_requests(self):
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=8192,
+            rem_chunk_tokens=4096,
+            per_request_chunk_size=2048,
+        )
+
+        reqs = []
+        for rid in ("req1", "req2"):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+            req.origin_input_ids = list(range(8192))
+            req.prefix_indices = list(range(2048))
+            req.full_untruncated_fill_ids = list(range(8192))
+            req.sampling_params.ignore_eos = True
+            req.set_extend_range = MagicMock(
+                side_effect=lambda start, end, req=req: setattr(
+                    req, "extend_range", Range(start, end)
+                )
+            )
+            reqs.append(req)
+
+        self.assertEqual(
+            adder.add_one_req(
+                reqs[0], has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(
+            adder.add_one_req(
+                reqs[1], has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+
+        self.assertEqual(adder.can_run_list, reqs)
+        self.assertEqual(adder.new_chunked_reqs, reqs)
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        self.assertEqual(
+            [(req.extend_range.start, req.extend_range.end) for req in reqs],
+            [(2048, 4096), (2048, 4096)],
+        )
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,
