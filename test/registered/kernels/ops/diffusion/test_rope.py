@@ -7,7 +7,8 @@ Two families with different oracles:
   sgl_kernel RoPE).  In the default mode the two differ by about one bf16
   rounding step, so those cases use a tolerance; with
   ``round_norm_before_rope=True`` the fused kernel reproduces the split
-  rounding exactly and ``torch.equal`` applies.
+  rounding exactly and ``torch.equal`` applies. Full-width interleaved caches
+  use the Diffusers float32 RoPE chain as their oracle.
 The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``: it is validated on
 B200 and registered on that lane alone, which the cases here cannot share --
 their oracle is the *split* baseline (a separate qknorm kernel plus sgl_kernel
@@ -261,6 +262,51 @@ def test_qknorm_rope_preserves_full_width_neox_cache() -> None:
         cache,
         positions,
         is_neox=True,
+        eps=1e-6,
+        round_norm_before_rope=True,
+        cache_has_full_width=True,
+    )
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qknorm_rope_preserves_full_width_interleaved_cache(
+    dtype: torch.dtype,
+) -> None:
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+
+    num_tokens, num_heads, head_dim = 257, 24, 128
+    q = torch.randn(num_tokens, num_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randperm(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos = torch.randn(num_tokens, head_dim, device=DEVICE)
+    sin = torch.randn_like(cos)
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+
+    def apply_interleaved_rope(x: torch.Tensor) -> torch.Tensor:
+        x_real, x_imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
+        x_rotated = torch.stack((-x_imag, x_real), dim=-1).flatten(-2)
+        selected_cos = cos[positions, None]
+        selected_sin = sin[positions, None]
+        return (x.float() * selected_cos + x_rotated * selected_sin).to(dtype)
+
+    q_ref, k_ref = q.clone(), k.clone()
+    fused_inplace_qknorm(q_ref, k_ref, q_weight, k_weight, eps=1e-6)
+    q_ref = apply_interleaved_rope(q_ref)
+    k_ref = apply_interleaved_rope(k_ref)
+
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cache,
+        positions,
+        is_neox=False,
         eps=1e-6,
         round_norm_before_rope=True,
         cache_has_full_width=True,
