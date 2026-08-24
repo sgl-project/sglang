@@ -25,7 +25,7 @@ from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProces
 from sglang.srt.multimodal.processors.paddleocr_vlm import PaddleOCRVLImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_processor_opts_into_concurrency():

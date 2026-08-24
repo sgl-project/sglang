@@ -18,7 +18,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE, is_in_ci
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=354, stage="extra-b", runner_config="8-gpu-h200")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
 

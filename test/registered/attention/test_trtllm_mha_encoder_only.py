@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 32

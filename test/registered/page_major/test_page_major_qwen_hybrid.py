@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=84, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestPageMajorQwenHybrid(DefaultServerBase):

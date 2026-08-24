@@ -43,7 +43,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=38, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 requires_cuda = pytest.mark.skipif(

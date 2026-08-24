@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=201, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 GSM8K_SCORE_THRESHOLD = 0.88

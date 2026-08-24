@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 BUILD_AND_RUN_TIMEOUT_S = 900
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
 
-register_cpu_ci(est_time=900, suite="base-a-test-cpu")
+register_cpu_ci(est_time=150, suite="base-a-test-cpu")
 
 
 # Exported by _pr-test-stage-cpu.yml as the negation of the check-changes

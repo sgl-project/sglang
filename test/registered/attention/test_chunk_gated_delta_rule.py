@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large-amd")
 register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
 

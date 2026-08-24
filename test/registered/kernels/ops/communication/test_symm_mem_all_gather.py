@@ -34,7 +34,7 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=240, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=48, stage="extra-b", runner_config="8-gpu-h200")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=70, stage="nightly", runner_config="8-gpu-h200")
 
