@@ -271,6 +271,34 @@ class TestSWA(unittest.TestCase):
         allocator.swa_attn_allocator.free(other_swa_index)
         self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
 
+    def test_swa_paged_free_keeps_cross_call_shared_page_live(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+        full_indices = allocator.full_attn_allocator.alloc(2 * page_size)
+        swa_page = allocator.swa_attn_allocator.alloc(page_size)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_page)
+        allocator.set_full_to_swa_mapping(full_indices, swa_page.repeat(2))
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa - page_size)
+
+        other_swa_page = allocator.swa_attn_allocator.alloc(page_size)
+        self.assertIsNotNone(other_swa_page)
+        self.assertNotEqual(other_swa_page[0].item(), swa_page[0].item())
+
+        allocator.free_swa(full_indices[page_size : page_size + 1])
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa - page_size)
+
+        allocator.swa_attn_allocator.free(other_swa_page)
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10
