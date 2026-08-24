@@ -82,7 +82,7 @@ class TestQwenE2eParity(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
             PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
         )
-        # The shape of Rust's MmHandoff, inline transport (test_build_native_mm
+        # The shape of Rust's MmEncodeResult, inline transport (test_build_native_mm
         # pins the shm shape).
         handoff = SimpleNamespace(
             features=features,
