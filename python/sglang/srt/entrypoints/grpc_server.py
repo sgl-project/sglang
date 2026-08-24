@@ -213,7 +213,7 @@ async def serve_grpc(server_args, model_info=None):
             )
         try:
             sidecar_runner = await _start_sidecar_server(
-                server_args.host, sidecar_port, sidecar_app
+                cfg.host, sidecar_port, sidecar_app
             )
         except OSError as e:
             logger.error(

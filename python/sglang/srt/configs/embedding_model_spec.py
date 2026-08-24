@@ -228,8 +228,7 @@ def resolved_embedding_plan(
     This boundary deliberately accepts duck-typed arguments so the declarative
     registry remains independent of ServerArgs and ModelConfig import cycles.
     `config` must answer with the *resolved* configuration -- the readback
-    callers pass `resolving_view(record)`, since the record's fields are the raw
-    input.
+    callers pass `resolving_view(record)`, which is where a decision lives.
     """
 
     prefill_graph = getattr(getattr(config, "cuda_graph_config", None), "prefill", None)
