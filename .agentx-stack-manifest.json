@@ -94,6 +94,19 @@
       "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
     }
   },
+  "flashinfer_nsys_peer_wait_overlay": {
+    "local_commit": "a8d098f569fc1e35bb50d8fcd38382fb9154403c",
+    "init_file": "python/sglang/__init__.py",
+    "init_sha256": "2478bab560301dd170038193509d74935b218675a7793623173932bdb7bf500a",
+    "patch_file": "python/sglang/_flashinfer_nsys_patch.py",
+    "patch_sha256": "c5e7c93e02740946c5c346686275279b647d757c878f7959614c6e7a66423473",
+    "change": "When and only when SGLANG_NSYS_DISABLE_FLASHINFER_MOE_A2A_TIMEOUT is enabled, build the same FlashInfer MNNVL MoE all-to-all source under a profiling-only JIT module name with DISABLE_TIMEOUT=1. This removes the 300-second device-side trap when CUDA Graph node tracing delays one rank; the communication algorithm, inputs, outputs, and successful path are unchanged.",
+    "targeted_validation": {
+      "py_compile": "pass",
+      "direct_spec_test": "pass: preserves ENABLE_BF16, adds DISABLE_TIMEOUT=1 once, and selects a JIT-only module name",
+      "default_behavior": "unchanged when SGLANG_NSYS_DISABLE_FLASHINFER_MOE_A2A_TIMEOUT is unset"
+    }
+  },
   "srt_slurm": {
     "commit": "ebf9b696269c484713bd25b58feead000ca120d1",
     "tree": "0357423d9ab17cd60e63d320783999c784760e4d",
