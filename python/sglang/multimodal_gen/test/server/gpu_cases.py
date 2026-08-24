@@ -1250,7 +1250,14 @@ def _select_xpu_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
     missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
     if missing:
         raise RuntimeError(f"Unknown XPU diffusion case(s): {missing}")
-    return [cases_by_id[case_id] for case_id in case_ids]
+    # Consistency GT images are H100-generated; XPU output diverges at the
+    # pixel level (different attention kernels + fp reductions on Xe2) so
+    # SSIM/PSNR against the H100 golden always fails. Turn the check off
+    # until per-device GT images land in ci-data-diffusion.
+    return [
+        replace(cases_by_id[case_id], run_consistency_check=False)
+        for case_id in case_ids
+    ]
 
 
 ONE_GPU_XPU_CASES = _select_xpu_cases(ONE_GPU_XPU_CASE_IDS)

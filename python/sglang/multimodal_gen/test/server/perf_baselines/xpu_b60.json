@@ -40,6 +40,7 @@
     },
     "scenarios": {
         "zimage_image_t2i": {
+            "estimated_full_test_time_s": 65.1,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 87.64,
@@ -64,6 +65,7 @@
             "expected_median_denoise_ms": 927.61
         },
         "flux_2_klein_image_t2i": {
+            "estimated_full_test_time_s": 106.8,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 37.83,
@@ -148,6 +150,73 @@
             "expected_e2e_ms": 56248.35,
             "expected_avg_denoise_ms": 36.83,
             "expected_median_denoise_ms": 34.84
+        },
+        "wan2_1_t2v_1.3b": {
+            "estimated_full_test_time_s": 331.5,
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 704.97,
+                "LatentPreparationStage": 0.89,
+                "TimestepPreparationStage": 2.71,
+                "DenoisingStage": 114601.91,
+                "DecodingStage": 73.74,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 208.34,
+                "1": 80.0,
+                "2": 84.33,
+                "3": 85.37,
+                "4": 92.98,
+                "5": 85.51,
+                "6": 84.71,
+                "7": 85.0,
+                "8": 84.82,
+                "9": 85.45,
+                "10": 85.89,
+                "11": 86.33,
+                "12": 85.68,
+                "13": 86.51,
+                "14": 94.06,
+                "15": 86.65,
+                "16": 86.39,
+                "17": 86.15,
+                "18": 86.54,
+                "19": 86.88,
+                "20": 87.36,
+                "21": 85.66,
+                "22": 86.22,
+                "23": 85.45,
+                "24": 94.66,
+                "25": 86.44,
+                "26": 86.3,
+                "27": 86.35,
+                "28": 85.29,
+                "29": 86.31,
+                "30": 85.8,
+                "31": 86.12,
+                "32": 86.03,
+                "33": 86.42,
+                "34": 91.27,
+                "35": 85.84,
+                "36": 86.3,
+                "37": 85.04,
+                "38": 84.99,
+                "39": 85.46,
+                "40": 85.72,
+                "41": 84.76,
+                "42": 88.92,
+                "43": 85.58,
+                "44": 86.57,
+                "45": 85.42,
+                "46": 87.03,
+                "47": 85.65,
+                "48": 86.77,
+                "49": 84.42
+            },
+            "expected_e2e_ms": 116299.31,
+            "expected_avg_denoise_ms": 88.83,
+            "expected_median_denoise_ms": 86.07
         }
     }
 }
