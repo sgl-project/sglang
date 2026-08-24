@@ -153,8 +153,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         image_path = batch.image_path
-        if isinstance(image_path, list):
-            image_path = image_path[0] if image_path else None
         video_path = batch.video_path
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
@@ -168,10 +166,21 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         target_h, target_w = batch.height, batch.width
 
         if image_path is not None:
-            image = load_image(image_path)
-            image = _resize_crop_pil(image, target_w, target_h)
-            batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
-            self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
+            image_sources = (
+                list(image_path) if isinstance(image_path, (list, tuple)) else [image_path]
+            )
+            if not image_sources:
+                raise ValueError("Cosmos3 I2V image list is empty")
+            tensors: list[torch.Tensor] = []
+            for src in image_sources:
+                image = load_image(src)
+                image = _resize_crop_pil(image, target_w, target_h)
+                tensors.append(_pil_to_normalized_tensor(image))
+            batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
+            self.log_info(
+                f"Preprocessed {len(tensors)} conditioning image(s) to "
+                f"{target_w}x{target_h}"
+            )
             return batch
 
         if isinstance(video_path, str) and video_path:
@@ -265,7 +274,7 @@ class Cosmos3TokenizationStage(PipelineStage):
 
     def _tokenize_prompt(
         self,
-        text: str,
+        text: str | list[str],
         max_sequence_length: int,
         device: torch.device,
         use_system_prompt: bool = False,
@@ -273,58 +282,62 @@ class Cosmos3TokenizationStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Tokenize a prompt using Qwen2 chat template.
 
-        Returns (input_ids, attention_mask, seq_len) as [1, S] tensors.
+        Returns (input_ids, attention_mask, seq_len) as [B, S] tensors.
         """
-        conversations = []
-        if use_system_prompt:
-            conversations.append(
-                {
-                    "role": "system",
-                    "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
-                }
-            )
-        conversations.append({"role": "user", "content": text})
-
-        result = self.tokenizer.apply_chat_template(
-            conversations,
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-
-        # Handle different return types from apply_chat_template
-        # Fast tokenizer returns BatchEncoding, slow tokenizer returns list[int]
-        if hasattr(result, "input_ids"):
-            # BatchEncoding from fast tokenizer
-            token_ids = list(result.input_ids)
-        elif isinstance(result, list):
-            # Already a list from slow tokenizer
-            token_ids = list(result)
-        else:
-            raise TypeError(
-                f"Unexpected return type from apply_chat_template: {type(result)}"
-            )
-
-        # Reserve room for the two special tokens (EOS + vision_start) so the
-        # final length cannot exceed ``max_sequence_length``.
-        token_ids = token_ids[: max_sequence_length - 2]
-
-        # Add EOS and vision_start tokens
-        token_ids.append(self.tokenizer.eos_token_id)
-        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        if vision_start_id is not None:
-            token_ids.append(vision_start_id)
-
-        seq_len = len(token_ids)
-
-        # Pad to max_sequence_length
-        pad_len = max_sequence_length - seq_len
-        attention_mask = [1] * seq_len + [0] * pad_len
+        texts = text if isinstance(text, (list, tuple)) else [text]
+        input_id_lists: list[list[int]] = []
+        attention_mask_lists: list[list[int]] = []
+        seq_lens: list[int] = []
         pad_token_id = self.tokenizer.pad_token_id or 0
-        token_ids = token_ids + [pad_token_id] * pad_len
+        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        for text_item in texts:
+            conversations = []
+            if use_system_prompt:
+                conversations.append(
+                    {
+                        "role": "system",
+                        "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
+                    }
+                )
+            conversations.append({"role": "user", "content": text_item})
 
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-        attention_mask = torch.tensor([attention_mask], dtype=torch.long, device=device)
-        return input_ids, attention_mask, seq_len
+            result = self.tokenizer.apply_chat_template(
+                conversations,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            # Handle different return types from apply_chat_template
+            # Fast tokenizer returns BatchEncoding, slow tokenizer returns list[int]
+            if hasattr(result, "input_ids"):
+                # BatchEncoding from fast tokenizer
+                token_ids = list(result.input_ids)
+            elif isinstance(result, list):
+                # Already a list from slow tokenizer
+                token_ids = list(result)
+            else:
+                raise TypeError(
+                    f"Unexpected return type from apply_chat_template: {type(result)}"
+                )
+
+            # Reserve room for the two special tokens (EOS + vision_start) so the
+            # final length cannot exceed ``max_sequence_length``.
+            token_ids = token_ids[: max_sequence_length - 2]
+            # Add EOS and vision_start tokens
+            token_ids.append(self.tokenizer.eos_token_id)
+            if vision_start_id is not None:
+                token_ids.append(vision_start_id)
+
+            seq_len = len(token_ids)
+            pad_len = max_sequence_length - seq_len
+            attention_mask = [1] * seq_len + [0] * pad_len
+            token_ids = token_ids + [pad_token_id] * pad_len
+            input_id_lists.append(token_ids)
+            attention_mask_lists.append(attention_mask)
+            seq_lens.append(seq_len)
+
+        input_ids = torch.tensor(input_id_lists, dtype=torch.long, device=device)
+        attention_mask = torch.tensor(attention_mask_lists, dtype=torch.long, device=device)
+        return input_ids, attention_mask, max(seq_lens)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Tokenize prompt and negative prompt."""
@@ -383,6 +396,9 @@ class Cosmos3TokenizationStage(PipelineStage):
             self.log_info(f"Prompt with duration: '{prompt}'")
 
         # Tokenize prompts
+        if isinstance(prompt, list) and not isinstance(negative_prompt, list):
+            negative_prompt = [negative_prompt] * len(prompt)
+
         cond_ids, cond_mask, cond_seq_len = self._tokenize_prompt(
             prompt, max_sequence_length, device, use_system_prompt, system_prompt
         )
@@ -473,8 +489,13 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         height_latent = batch.height // vae_scale_factor_spatial
         width_latent = batch.width // vae_scale_factor_spatial
 
+        if batch.preprocessed_image is not None:
+            batch_dim = int(batch.preprocessed_image.shape[0])
+        else:
+            batch_dim = 1
+
         shape = (
-            1,
+            batch_dim,
             num_channels_latents,
             num_latent_frames,
             height_latent,
@@ -523,7 +544,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
             condition_latents = torch.zeros_like(noise)
             condition_mask = torch.zeros(
-                1, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
+                batch_dim, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
             )
             for idx in cond_indexes:
                 src = min(idx, cond_latent.shape[2] - 1)
@@ -637,6 +658,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         action_offset = 1 if action_chunk_size == num_frames - 1 else 0
 
         domain_id = self._resolve_domain_id(batch)
+        batch_dim = (
+            int(batch.raw_latent_shape[0])
+            if getattr(batch, "raw_latent_shape", None)
+            else 1
+        )
         raw_action_dim = getattr(sp, "raw_action_dim", None)
         if raw_action_dim is None:
             embodiment = getattr(sp, "domain_name", None)
@@ -678,7 +704,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             if raw_action_dim is None:
                 raise ValueError(f"action_mode={mode!r} requires --raw-action-dim.")
             clean_action = torch.zeros(
-                1, action_chunk_size, action_dim, device=device, dtype=dtype
+                batch_dim, action_chunk_size, action_dim, device=device, dtype=dtype
             )
 
         raw_action_dim = int(raw_action_dim)
@@ -690,13 +716,13 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         # condition_mask marks clean (given) action tokens. forward_dynamics
         # conditions on the whole action sequence; the others denoise it fully.
         condition_mask = torch.zeros(
-            1, action_chunk_size, 1, device=device, dtype=dtype
+            batch_dim, action_chunk_size, 1, device=device, dtype=dtype
         )
         if mode == ACTION_MODE_FORWARD_DYNAMICS:
             condition_mask[:] = 1.0
 
         noise = torch.randn(
-            1,
+            batch_dim,
             action_chunk_size,
             action_dim,
             generator=generator,
@@ -709,7 +735,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         batch.action_latents = action_latents
         batch.extra["action_domain_ids"] = torch.tensor(
-            [domain_id], dtype=torch.long, device=device
+            [domain_id] * batch_dim, dtype=torch.long, device=device
         )
         batch.extra["action_velocity_mask"] = 1.0 - condition_mask
         batch.extra["action_condition_latents"] = clean_action
@@ -1092,7 +1118,8 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         for i, t in progress_bar:
-            timestep = t.unsqueeze(0) if t.dim() == 0 else t
+            batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
+            timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).
             effective_scale = (
@@ -1647,7 +1674,7 @@ class Cosmos3DecodingStage(PipelineStage):
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
             payload = {
                 "request_id": batch.request_id,
-                "actions": action_pred[0].numpy(),
+                "actions": action_pred.numpy(),
                 "action_mode": action_metadata["action_mode"],
                 "domain_id": action_metadata["action_domain_id"],
                 "raw_action_dim": action_metadata["action_raw_action_dim"],

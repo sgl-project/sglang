@@ -189,7 +189,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
                 "action_modes": ["policy", "inverse_dynamics"],
                 "realtime_websocket": True,
                 "openpi_websocket": False,
-                "batch_inputs": False,
+                "batch_inputs": True,
                 "multiple_candidates": False,
             },
         }
@@ -439,11 +439,25 @@ def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
                 "Cosmos3 policy input requires exactly one observation image"
             )
         image = next(iter(images.values()))
-    if isinstance(image, np.ndarray):
-        if image.dtype != np.uint8:
-            raise ValueError("Cosmos3 observation image arrays must use uint8 dtype")
-        return Image.fromarray(image)
-    return image
+
+    if isinstance(image, (list, tuple)):
+        raw_images = list(image)
+    elif isinstance(image, np.ndarray) and image.ndim >= 4 and image.shape[0] > 1:
+        raw_images = [image[i] for i in range(image.shape[0])]
+    else:
+        raw_images = [image]
+
+    out: list[Any] = []
+    for im in raw_images:
+        if isinstance(im, np.ndarray):
+            if im.dtype != np.uint8:
+                raise ValueError(
+                    "Cosmos3 observation image arrays must use uint8 dtype"
+                )
+            out.append(Image.fromarray(im))
+        else:
+            out.append(im)
+    return out
 
 
 def _build_cosmos3_action_sampling_params(
