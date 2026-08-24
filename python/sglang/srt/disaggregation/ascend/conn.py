@@ -67,9 +67,17 @@ class AscendKVManager(MooncakeKVManager):
         # Anchor the engine-registered set to this startup batch so late
         # kv_args appends (e.g. the draft SWA pool) are detectable and can be
         # registered on first use; see MooncakeKVManager._sync_engine_registration.
-        self._mf_engine_regions = set(ptrs)
+        # Regions the engine REFUSED (batch_register bisect, [mf-reg] FAIL)
+        # stay out: admitting them would let _drop_unregistered_src_blocks
+        # pass their transfers into an SDMA smmu-terminate.
+        failed = {
+            p for p, _l in getattr(self.engine, "last_failed_regions", [])
+        }
+        self._mf_engine_regions = set(ptrs) - failed
         self._mf_engine_ranges = sorted(
-            (p, p + l) for p, l in zip(ptrs, lens) if l > 0
+            (p, p + l)
+            for p, l in zip(ptrs, lens)
+            if l > 0 and p in self._mf_engine_regions
         )
 
     def get_mla_kv_ptrs_with_pp(

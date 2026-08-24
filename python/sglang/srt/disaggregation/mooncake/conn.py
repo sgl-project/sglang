@@ -699,9 +699,19 @@ class MooncakeKVManager(CommonKVManager):
                 [(hex(p), l) for p, l in missing[:4]],
             )
             self.engine.batch_register([p for p, _l in missing], [l for _p, l in missing])
-            engine.update(p for p, _l in missing)
+            # AscendTransferEngine bisects a failed batch into per-region
+            # results in last_failed_regions; regions the engine REFUSED
+            # must not enter the known set, or _drop_unregistered_src_blocks
+            # would pass their blocks through into an smmu-terminate.
+            failed = {
+                p
+                for p, _l in getattr(self.engine, "last_failed_regions", [])
+            }
+            engine.update(p for p, _l in missing if p not in failed)
             self._mf_engine_ranges = sorted(
-                (p, p + l) for p, l in current
+                (p, e)
+                for p, e, _l in current
+                if p in engine
             )
 
     def _kv_args_ptr_list(self):

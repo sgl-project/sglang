@@ -84,6 +84,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
+        # Regions the ENGINE confirmed failed, for the caller's bookkeeping
+        # (strict exclusion, VA confrontation in logs). Reset per call.
+        self.last_failed_regions: List[tuple] = []
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception as e:
@@ -106,6 +109,32 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 len(ptrs),
                 sum(lengths),
             )
+            # Bisect the failure: a batch register is all-or-nothing in the
+            # engine, so re-register every region individually. Succeeded
+            # ones are now explicitly in; the failures are pinned to exact
+            # VA ranges -- the [mf-reg] lines let the offline analyzer
+            # confront them with the dirty-row addresses / r2t pool VA.
+            for p, l in zip(ptrs, lengths):
+                try:
+                    r = self.engine.batch_register_memory([p], [l])
+                except Exception:
+                    r = -1
+                if r != 0:
+                    self.last_failed_regions.append((p, l))
+                    logger.error(
+                        "[mf-reg] FAIL ptr=0x%x len=%d end=0x%x", p, l, p + l
+                    )
+                else:
+                    logger.info(
+                        "[mf-reg] ok(ptr) ptr=0x%x len=%d end=0x%x", p, l, p + l
+                    )
+            if self.last_failed_regions:
+                logger.error(
+                    "[mf-reg] summary failed=%d/%d bytes_failed=%d",
+                    len(self.last_failed_regions),
+                    len(ptrs),
+                    sum(l for _p, l in self.last_failed_regions),
+                )
         else:
             logger.info(
                 "Ascend memory registration ok: %d regions, %d bytes total, "
