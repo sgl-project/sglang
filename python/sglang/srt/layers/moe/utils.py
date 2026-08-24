@@ -539,9 +539,20 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Check if the MoE backend is DeepEP-family (DeepEP, DeepEP v2, Mooncake,
+    Mori, or PPLX).
+
+    These backends combine across EP inside the dispatcher, so a caller must
+    take the a2a forward path and must not add a post-experts all-reduce.
+    """
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_deepep_v2()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

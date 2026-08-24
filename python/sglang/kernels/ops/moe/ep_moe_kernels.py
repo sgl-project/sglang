@@ -2159,17 +2159,10 @@ def fp8_per_token_to_per_tensor_quant_triton(
     )
 
 
-# ---------------------------------------------------------------------------
-# DeepEP v2 decode masked-GEMM bridge: repack the expanded expert-packed
-# dispatch buffer into a regular [E_local, max_m, hidden] slab so DeepGEMM's
-# *masked* grouped GEMM can bound compute by per-expert real counts (masked_m)
-# instead of the dispatch capacity. All-GPU, static shapes -> cuda-graph safe.
-# Expanded psum semantics (DeepEP v2): psum[e] = align(psum[e-1], ALIGN) + count_e,
-# so expert e occupies recv rows [align(psum[e-1]) : psum[e]); count_e real tokens.
-# Non-expand (contiguous) psum semantics differ: psum[e] is the inclusive prefix
-# sum of alignment-PADDED counts, so every psum[e] is a multiple of ALIGN and
-# psum[e-1] is expert e's aligned group start (consumed by ep_scatter_from_psum).
-# ---------------------------------------------------------------------------
+# psum semantics differ by layout. Expanded: psum[e] = align(psum[e-1], ALIGN)
+# + count_e, so expert e owns rows [align(psum[e-1]) : psum[e]). Contiguous:
+# psum[e] is the prefix sum of alignment-PADDED counts, so psum[e-1] is already
+# expert e's aligned group start.
 
 _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT = 64
 

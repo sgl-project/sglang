@@ -169,14 +169,9 @@ class DeepEPv2Buffer:
         if cls._buffer is not None:
             cls.destroy()
 
-        # DeepEP reuses the torch process group's internal NCCL communicator
-        # when EP_REUSE_NCCL_COMM=1 (its default). That path requires the group
-        # to be device-bound at init_process_group time (eager comm init),
-        # which SGLang's shared init does not do -- reusing then reads an
-        # uninitialized communicator and ElasticBuffer sizing segfaults in
-        # ncclTeamWorld. Default to letting DeepEP create its own communicator
-        # (it binds to the already-set current device); setdefault keeps any
-        # explicit user override.
+        # Reusing the process group's NCCL communicator (DeepEP's default) needs a
+        # device-bound group, which SGLang's shared init does not give: it segfaults
+        # in ncclTeamWorld. Let DeepEP create its own; a user value still wins.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
         cls._buffer = ElasticBuffer(
             group,
@@ -244,16 +239,9 @@ class _DeepEPv2Impl:
         )
 
     def _resolve_num_sms_qps(self, buffer: ElasticBuffer) -> Tuple[int, int]:
-        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0
-        # (0 means "0 SMs / 0 QPs"). Resolve both from the theoretical helpers
-        # (matches the DeepEP elastic test harness): num_sms from
-        # SGLANG_DEEPEP_V2_NUM_SMS or get_theoretical_num_sms, and num_qps always
-        # from get_theoretical_num_qps(num_sms). Multi-node RDMA dispatch needs
-        # the real QPs; single-node NVLink is unaffected by the extra QPs.
-        # Both helpers are host-only: get_theoretical_num_sms is cached in DeepEP
-        # for the fixed inputs here (and first runs during eager warmup), and
-        # get_theoretical_num_qps is plain arithmetic. On the CUDA-graph decode
-        # path this costs no device work, so it is capture-safe.
+        # ElasticBuffer reads 0 as "zero SMs/QPs", not "auto", so resolve both.
+        # Multi-node RDMA needs the real QPs. Both helpers are host-only and cached,
+        # so this stays capture-safe on the decode path.
         num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
         if num_sms == 0:
             num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
@@ -299,13 +287,9 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # DeepEP v2's native expanded layout is profitable for decode-like DeepGEMM
-        # FP8 workloads but regresses prefill-like ones, so layout is chosen by
-        # inference PHASE, independently of the comm mode (direct/hybrid is a topology
-        # knob fixed at server init): decode (non-extend) -> native expanded layout;
-        # prefill/extend -> non-expanded contiguous layout. This decouples the
-        # masked-GEMM + CUDA-graph decode fast path from the comm mode, so it is
-        # available under multi-node `hybrid` too.
+        # Layout follows inference phase, not comm mode: expanded wins on decode and
+        # regresses prefill. Keeping it off the comm mode is what makes the
+        # masked-GEMM + CUDA-graph decode path available under hybrid too.
         use_expand_layout = not get_is_extend_in_batch()
         # masked GEMM is built from the expanded layout (expand_to_masked_slab), so
         # masked <=> expanded. async dispatch (cpu_sync=False) gives a static
@@ -313,15 +297,10 @@ class _DeepEPv2Impl:
         # full (safe) cap costs no extra GEMM.
         use_masked = use_expand_layout
 
-        # ElasticBuffer requires >=1 token per rank on the non-masked (contiguous /
-        # extend) path: DeepEP's own ElasticBuffer test pads every rank to
-        # `max(1, num_tokens)` (tests/elastic/test_ep.py). An idle DP rank with 0
-        # tokens never fires the dispatch notify / scale-up-reduction warps, so no
-        # rank's recv count becomes "ready" and the do_cpu_sync CPU readback times
-        # out ("Dispatch CPU wait", buffer.hpp:1032). Pad an empty local batch to a
-        # single dummy token; combine() slices that row back off so this rank's
-        # output is empty again. The masked decode path tolerates empty
-        # (do_cpu_sync=False), so it is left untouched.
+        # An idle rank with 0 tokens never fires the dispatch notify warps, so no
+        # rank's recv count becomes ready and the do_cpu_sync readback hangs. Pad to
+        # one dummy token; combine() slices it back off. The masked path does not
+        # read counts back, so it tolerates empty.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
@@ -357,20 +336,12 @@ class _DeepEPv2Impl:
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
-        # num_max_tokens_per_rank is a COLLECTIVE dispatch arg (ElasticBuffer
-        # requires the same value on all ranks). Keep it at the fixed buffer cap
-        # (class-level, cross-rank-consistent), matching DeepEP LL which uses a
-        # fixed _num_max_dispatch_tokens_per_rank rather than a per-forward token
-        # count. Do NOT derive it from the local hidden_states.shape[0]: under
-        # ragged DP load (or TP attention) the ranks would disagree on this
-        # collective arg.
+        # Collective arg: every rank must pass the same value, so use the fixed cap.
+        # Deriving it from the local batch would disagree across ranks under ragged DP.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        # Non-masked (extend/prefill) path reads exact per-expert
-        # recv
-        # counts on the CPU, so it must wait for the GPU to finish writing them
-        # (matches the DeepEP elastic test which passes do_cpu_sync=1). Leaving
-        # it None lets the CPU read zeros on multi-node (scaleup) dispatch. Only
-        # the masked decode path keeps do_cpu_sync=False for graph capturability.
+        # The contiguous path reads exact per-expert counts on the CPU and must wait
+        # for the GPU to write them; without this the CPU reads zeros on multi-node
+        # dispatch. The masked path stays async so it can be captured.
         do_cpu_sync_val = True
         if use_masked:
             do_cpu_sync_val = False
@@ -430,27 +401,17 @@ class _DeepEPv2Impl:
         masked_max_m = 0
         total_expanded = 0
         if use_masked:
-            # expected_m: average tokens-per-expert across the EP group, a
-            # per-rank-local schedule hint for the masked GEMM (NOT a hard bound;
-            # the real per-expert bound is masked_m on the GPU). Derive it from
-            # the actual local batch * EP group size, matching DeepEP LL
-            # (deepep.py dispatch_a uses hidden_states.shape[0]). Per-rank-local,
-            # so the actual batch is safe here even under ragged DP. group size
-            # == ep world size == num_experts // num_local_experts.
+            # expected_m is a schedule hint, not a bound -- masked_m on the GPU is the
+            # real per-expert bound -- so deriving it from the local batch is safe.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(
                 1,
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # Size the masked slab to the FIXED worst case cap * ep_group_size,
-            # matching DeepEP LL's fixed buffer. A local expert receives the sum
-            # over all ranks of the tokens routed to it; each rank sends at most
-            # `cap` tokens (enforced by the dispatch-entry assert), so the count
-            # is bounded by cap * ep_group_size regardless of DP padding mode
-            # (MAX_LEN / SUM_LEN / skewed). Using the local batch for the slab
-            # would be unsafe: under skewed SUM_LEN decode another rank's larger
-            # batch could overflow this rank's slab.
+            # A local expert receives from every rank and each sends at most `cap`, so
+            # cap * ep_group_size is the worst case. Sizing the slab from the local batch
+            # would overflow under skewed DP.
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
@@ -531,10 +492,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
 
-    # This backend intentionally exposes only single-shot dispatch()/combine():
-    # TBO/SBO are rejected at server start, and our overlap PoC showed the naive
-    # two-phase split cannot overlap anyway (ElasticBuffer.dispatch is
-    # host-blocking); a split API will land together with real TBO support.
+    # Single-shot only: TBO/SBO are rejected at server start.
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:

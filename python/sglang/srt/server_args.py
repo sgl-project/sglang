@@ -7479,22 +7479,19 @@ class ServerArgs:
                 cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "deepep_v2":
+            # ElasticBuffer needs NCCL symmetric memory; seeding it here avoids
+            # --enable-symm-mem's NVLS and 4GB prealloc. A user value still wins.
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
             if self.moe_runner_backend == "auto":
-                # The generic auto -> runner resolution above only fires for
-                # moe_a2a_backend "none", so deepep_v2 would otherwise reach the
-                # check below still holding "auto" and fail. deepep_v2 dispatches
-                # FP8 activations plus scales, which only deep_gemm consumes.
+                # deepep_v2 dispatches FP8 activations plus scales, which only
+                # deep_gemm consumes.
                 self.moe_runner_backend = "deep_gemm"
                 logger.warning(
                     "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
                 )
-            # Validate the FINAL resolved runner, not the raw field. A model
-            # declaration (e.g. mxfp8 + auto -> flashinfer_trtllm) is
-            # materialized after this handler, so self.moe_runner_backend set
-            # above is not necessarily what the runtime will use. resolved_view
-            # reflects those pending declarations: validate and drive the graph
-            # decision off it, so an unsupported resolved runner fails fast here
-            # instead of being silently restored at materialize time.
+            # Model declarations materialize after this handler, so validate
+            # the resolved runner rather than the raw field.
+
             resolved_runner = resolved_view(self).moe_runner_backend
             if resolved_runner != "deep_gemm":
                 raise ValueError(
@@ -7515,19 +7512,10 @@ class ServerArgs:
                     "Remove --enforce-shared-experts-fusion when using "
                     "--moe-a2a-backend deepep_v2."
                 )
-            # Prefill capacity pre-check: the ElasticBuffer per-rank capacity
-            # must cover the largest extend forward, which is bounded by the
-            # chunked prefill budget. self.chunked_prefill_size is already the
-            # per-rank value here (_handle_data_parallelism divides the CLI
-            # value by dp_size under DP attention and runs before this
-            # handler). Without this check the server boots and only fails at
-            # the first full prefill chunk (the dispatcher's runtime capacity
-            # guard), which small smoke traffic may never trigger. Decode does
-            # not need a boot check: with CUDA graphs the padded capture batch
-            # goes through the same runtime guard during startup, and without
-            # graphs the guard still fails fast at runtime. Mirrors the MoRI and
-            # pplx chunk checks later in this handler, and the CuteDSL
-            # token-budget check in its own __post_init__ slot.
+            # The per-rank buffer must cover the largest extend forward, which
+            # the chunked prefill budget bounds. chunked_prefill_size is already
+            # per-rank here. Without this the server only fails at the first
+            # full chunk, which smoke traffic may never reach.
             if (
                 self.chunked_prefill_size
                 and self.chunked_prefill_size > 0
@@ -7546,11 +7534,8 @@ class ServerArgs:
                         f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
                         "communication buffer) or lower --chunked-prefill-size."
                     )
-            # The decode graph stays enabled under ANY comm mode (direct or
-            # hybrid): the masked layout is chosen per batch by inference phase
-            # (decode), not by the comm mode, giving static shapes with no host
-            # readback. The prefill/extend contiguous path reads exact per-expert
-            # counts back on the host, so it is never capturable.
+            # Decode is capturable under either comm mode: the masked layout is
+            # chosen by phase. Prefill reads exact counts back on the host.
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."

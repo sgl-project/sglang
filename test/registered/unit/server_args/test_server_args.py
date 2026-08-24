@@ -2181,11 +2181,10 @@ class TestDeepEPv2Args(CustomTestCase):
             args._handle_a2a_moe()
 
     # --- prefill capacity pre-check (per-rank chunk vs dispatch buffer cap) ---
-    _CAP_ENV = "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
 
     def test_prefill_chunk_exceeding_cap_rejected(self):
         args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=2048)
-        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
             with self.assertRaisesRegex(ValueError, "NUM_MAX_DISPATCH_TOKENS_PER_RANK"):
                 args._handle_a2a_moe()
 
@@ -2193,7 +2192,7 @@ class TestDeepEPv2Args(CustomTestCase):
         # chunk == cap is the documented (and currently benchmarked) edge; the
         # guard must be strict-greater-than.
         args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=1024)
-        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
             args._handle_a2a_moe()
         self.assertEqual(args.moe_runner_backend, "deep_gemm")
 
