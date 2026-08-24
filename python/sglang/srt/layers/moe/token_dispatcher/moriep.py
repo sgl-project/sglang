@@ -150,6 +150,7 @@ class DispatchDtype(Enum):
     bf16 = "bfloat16"
     fp8 = "float8_blockwise"
     fp4 = "mxfp4_blockwise"
+    mxfp8 = "mxfp8_blockwise"
 
 
 class CombineDtype(Enum):
@@ -272,6 +273,11 @@ def init_mori_op(
         scale_dim = 0
     elif dispatch_dtype == DispatchDtype.fp8:
         scale_dim = hidden_size // FP8_BLOCK_SIZE
+    elif dispatch_dtype == DispatchDtype.mxfp8:
+        # fp8 payload with group-32 e8m0 microscales: exactly what the per_1x32
+        # MoE kernels consume, so the receive side needs no quant at all.
+        scale_dim = hidden_size // MXFP4_BLOCK_SIZE
+        scale_type_size = torch.float8_e8m0fnu.itemsize
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
         # internally, so hidden_dim is not reduced. The reason is that for FP4
@@ -451,6 +457,8 @@ class _MoriEPDispatcherImplBase:
                     self.dispatch_dtype = DispatchDtype.fp8
                 elif dispatch_dtype == "fp4":
                     self.dispatch_dtype = DispatchDtype.fp4
+                elif dispatch_dtype == "mxfp8":
+                    self.dispatch_dtype = DispatchDtype.mxfp8
         elif (
             "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
         ):
@@ -545,6 +553,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
@@ -569,7 +579,28 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == DispatchDtype.fp8:
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_token > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -824,6 +855,8 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+        # Same MX entry point; quant_dtype selects fp4x2 vs fp8.
+        self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
 
     def dispatch_a(
         self,
@@ -841,7 +874,28 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == DispatchDtype.fp8:
+        if self.dispatch_dtype == DispatchDtype.mxfp8:
+            # MXFP8 quant on live tokens, before the wire.
+            if num_tokens > 0:
+                # scale_type must be set explicitly: per_1x32_mx_quant_hip still
+                # defaults fp8 output to continuous fp32 scales for backward
+                # compatibility, but the MoE kernels (and the 1-byte scale_dim
+                # configured above) need the e8m0 byte layout.
+                hidden_states, scale = self.mxfp8_quant_func(
+                    hidden_states,
+                    quant_dtype=fp8_dtype,
+                    scale_type=torch.float8_e8m0fnu,
+                )
+            else:
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
+                    dtype=torch.float8_e8m0fnu,
+                    device=hidden_states.device,
+                )
+        elif self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
