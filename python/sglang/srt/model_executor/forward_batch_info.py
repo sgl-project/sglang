@@ -478,6 +478,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
 
     # === Derived from ScheduleBatch.reqs ===
+    # For input logprobs
+    input_logprob_temperatures: Optional[List[float]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -799,6 +801,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
+            input_logprob_temperatures=(
+                [req.logprob.input_logprob_temperature for req in batch.reqs]
+                if batch.return_logprob
+                else None
+            ),
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,

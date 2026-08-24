@@ -318,6 +318,24 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
         self.assertIn(rid, tm.rid_to_state)
 
+    def test_batch_output_reports_input_logprob_temperature(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "input_logprob_temperature_rid"
+        state = _make_req_state(rid)
+        state.obj.return_logprob = True
+        state.obj.input_logprob_temperature = 0.7
+        state.obj.top_logprobs_num = 0
+        state.obj.token_ids_logprob = None
+        state.obj.return_text_in_logprobs = False
+        tm.convert_logprob_style = Mock()
+        tm.rid_to_state[rid] = state
+
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+
+        self.assertEqual(
+            state.out_list[0]["meta_info"]["input_logprob_temperature"], 0.7
+        )
+
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
     """Test that _init_req_state raises ValueError for duplicate rids."""

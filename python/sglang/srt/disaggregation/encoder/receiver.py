@@ -2242,6 +2242,7 @@ class MMReceiverBase(ABC):
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,
+            input_logprob_temperature=recv_req.input_logprob_temperature,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,

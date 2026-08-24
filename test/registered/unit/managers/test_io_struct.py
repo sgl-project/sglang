@@ -917,12 +917,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             text="Hello",
             return_logprob=True,
             logprob_start_len=10,
+            input_logprob_temperature=0.7,
             top_logprobs_num=5,
             token_ids_logprob=[7, 8, 9],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, True)
         self.assertEqual(req.logprob_start_len, 10)
+        self.assertEqual(req.input_logprob_temperature, 0.7)
         self.assertEqual(req.top_logprobs_num, 5)
         self.assertEqual(req.token_ids_logprob, [7, 8, 9])
 
@@ -931,12 +933,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             text=["Hello", "World"],
             return_logprob=True,
             logprob_start_len=10,
+            input_logprob_temperature=0.7,
             top_logprobs_num=5,
             token_ids_logprob=[7, 8, 9],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, True])
         self.assertEqual(req.logprob_start_len, [10, 10])
+        self.assertEqual(req.input_logprob_temperature, [0.7, 0.7])
         self.assertEqual(req.top_logprobs_num, [5, 5])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [7, 8, 9]])
 
@@ -945,6 +949,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             text=["Hello", "World"],
             return_logprob=[True, False],
             logprob_start_len=[10, 5],
+            input_logprob_temperature=[0.5, 2.0],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
             return_hidden_states=[False, True],
@@ -952,9 +957,26 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, False])
         self.assertEqual(req.logprob_start_len, [10, 5])
+        self.assertEqual(req.input_logprob_temperature, [0.5, 2.0])
         self.assertEqual(req.top_logprobs_num, [5, 3])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [4, 5, 6]])
         self.assertEqual(req.return_hidden_states, [False, True])
+
+    def test_input_logprob_temperature_validation(self):
+        for temperature in (0, -1, float("inf"), float("nan"), True, "0.7"):
+            with self.subTest(temperature=temperature):
+                req = GenerateReqInput(
+                    text="Hello", input_logprob_temperature=temperature
+                )
+                with self.assertRaisesRegex(ValueError, "positive finite"):
+                    req.normalize_batch_and_arguments()
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            input_logprob_temperature=[0.7],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
 
     def test_custom_logit_processor_normalization(self):
         """Test normalization of custom_logit_processor."""
@@ -1019,6 +1041,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
             return_logprob=[True, False],
             logprob_start_len=[10, 5],
+            input_logprob_temperature=[0.5, 2.0],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
             stream=True,
@@ -1039,6 +1062,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.rid, "id1")
         self.assertEqual(item0.return_logprob, True)
         self.assertEqual(item0.logprob_start_len, 10)
+        self.assertEqual(item0.input_logprob_temperature, 0.5)
         self.assertEqual(item0.top_logprobs_num, 5)
         self.assertEqual(item0.token_ids_logprob, [7, 8, 9])
         self.assertEqual(item0.stream, True)

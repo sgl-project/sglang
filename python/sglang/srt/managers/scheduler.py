@@ -2459,6 +2459,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
+                input_logprob_temperature=recv_req.input_logprob_temperature,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,

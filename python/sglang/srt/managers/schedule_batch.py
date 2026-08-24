@@ -783,6 +783,7 @@ class MultimodalInputs:
 class ReqLogprob:
     top_logprobs_num: int
     token_ids_logprob: Optional[List[int]]
+    input_logprob_temperature: float = 1.0
     input_token_logprobs_val: Optional[List[float]] = None
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
@@ -866,6 +867,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        input_logprob_temperature: float = 1.0,
     ):
         # Input and output info
         self.rid = rid
@@ -1059,6 +1061,7 @@ class Req(ReqDllmMixin):
         self.logprob = ReqLogprob(
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            input_logprob_temperature=input_logprob_temperature,
         )
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False

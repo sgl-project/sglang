@@ -120,6 +120,8 @@ class HttpServerEngineAdapter(EngineBase):
         custom_logit_processor=None,
         priority=None,
         session_id=None,
+        *,
+        input_logprob_temperature=None,
     ):
         payload = {
             "text": prompt,
@@ -128,6 +130,7 @@ class HttpServerEngineAdapter(EngineBase):
             "image_data": image_data,
             "return_logprob": return_logprob,
             "logprob_start_len": logprob_start_len,
+            "input_logprob_temperature": input_logprob_temperature,
             "top_logprobs_num": top_logprobs_num,
             "token_ids_logprob": token_ids_logprob,
             "lora_path": lora_path,

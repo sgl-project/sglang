@@ -1381,6 +1381,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
+                input_logprob_temperature=obj.input_logprob_temperature,
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
@@ -2207,6 +2208,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
+                meta_info["input_logprob_temperature"] = getattr(
+                    state.obj, "input_logprob_temperature", 1.0
+                )
                 self.convert_logprob_style(
                     meta_info,
                     state,

@@ -166,6 +166,7 @@ class LogitsMetadata:
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
+    input_logprob_temperatures: Optional[List[float]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -238,6 +239,7 @@ class LogitsMetadata:
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
+            input_logprob_temperatures=forward_batch.input_logprob_temperatures,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
@@ -377,6 +379,7 @@ class LogitsProcessor(nn.Module):
             aux_pruned_states,
             sample_indices,
             input_logprob_indices,
+            input_logprob_temperatures,
             token_to_seq_idx,
         ) = self._get_pruned_states(
             hidden_states,
@@ -415,6 +418,7 @@ class LogitsProcessor(nn.Module):
             pruned_states=pruned_states,
             sample_indices=sample_indices,
             input_logprob_indices=input_logprob_indices,
+            input_logprob_temperatures=input_logprob_temperatures,
             token_to_seq_idx=token_to_seq_idx,
             lm_head=lm_head,
             get_logits_fn=self._get_logits,
@@ -439,6 +443,7 @@ class LogitsProcessor(nn.Module):
     ):
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
+        input_logprob_temperatures = None
         token_to_seq_idx = []
 
         if (
@@ -507,6 +512,11 @@ class LogitsProcessor(nn.Module):
             sample_indices = []
             input_logprob_indices_pt = 0
             input_logprob_indices = []
+            temperature_values = logits_metadata.input_logprob_temperatures
+            scale_input_logprobs = temperature_values is not None and any(
+                temperature != 1.0 for temperature in temperature_values
+            )
+            input_logprob_temperature_values = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
             is_packed_aux_hidden_states = isinstance(aux_hidden_states, torch.Tensor)
             aux_pruned_states_lists = None
@@ -562,6 +572,11 @@ class LogitsProcessor(nn.Module):
                         for i in range(extend_len - extend_logprob_start_len)
                     ]
                 )
+                if scale_input_logprobs:
+                    input_logprob_temperature_values.extend(
+                        [temperature_values[idx]]
+                        * (extend_len - extend_logprob_start_len)
+                    )
                 input_logprob_indices_pt += extend_len - start_len
 
             pruned_states = torch.cat(pruned_states_list)
@@ -586,6 +601,12 @@ class LogitsProcessor(nn.Module):
                 dtype=torch.int64,
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
+            if scale_input_logprobs:
+                input_logprob_temperatures = torch.tensor(
+                    input_logprob_temperature_values,
+                    dtype=torch.float32,
+                    pin_memory=is_pin_memory_available(),
+                ).to(pruned_states.device, non_blocking=True)
 
         return (
             pruned_states,
@@ -593,6 +614,7 @@ class LogitsProcessor(nn.Module):
             aux_pruned_states,
             sample_indices,
             input_logprob_indices,
+            input_logprob_temperatures,
             token_to_seq_idx,
         )
 
@@ -950,6 +972,25 @@ class LogitsProcessor(nn.Module):
         sliced_hidden = hidden_states[multi_item_indices]
 
         sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
+        temperatures = logits_metadata.input_logprob_temperatures
+        if temperatures is not None and any(
+            temperature != 1.0 for temperature in temperatures
+        ):
+            row_temperatures = [
+                temperature
+                for temperature, delimiter_indices in zip(
+                    temperatures, multi_item_delimiter_indices
+                )
+                for _ in delimiter_indices
+            ]
+            sliced_logits = (
+                sliced_logits
+                / torch.tensor(
+                    row_temperatures,
+                    dtype=torch.float32,
+                    device=sliced_logits.device,
+                )[:, None]
+            )
         sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
 
         # Initialize return values
