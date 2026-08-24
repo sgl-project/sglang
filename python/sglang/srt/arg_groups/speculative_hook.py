@@ -5,6 +5,11 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.overrides import (
+    declare_direct_writes,
+    declare_resolution,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -15,7 +20,11 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     if server_args.device != "cpu" or server_args.disable_overlap_schedule:
         return
 
-    server_args.disable_overlap_schedule = True
+    declare_resolution(
+        server_args,
+        "_disable_overlap_schedule_for_cpu",
+        disable_overlap_schedule=True,
+    )
     logger.warning(
         "Overlap schedule is not implemented for speculative decoding on CPU."
     )
@@ -66,7 +75,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         server_args.speculative_draft_model_path is not None
         and server_args.speculative_draft_model_revision is None
     ):
-        server_args.speculative_draft_model_revision = "main"
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_model_revision="main",
+        )
 
     # Moved to the resolution pipeline (arg_groups/overrides.py:
     # _speculative_moe_runner_default), invoked here at its legacy slot.
@@ -78,7 +91,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if server_args.speculative_algorithm is not None:
-        server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_algorithm=server_args.speculative_algorithm.upper(),
+        )
 
     # Removal notice for the retired env var; raw os.getenv on purpose -- the
     # Envs descriptor is gone. Drop this check after one release.
@@ -95,11 +112,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if override_config_file and override_config_file.strip():
         kwargs["_configuration_file"] = override_config_file.strip()
 
-    server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
-        server_args.speculative_algorithm,
-        server_args.speculative_draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        kwargs=kwargs,
+    declare_resolution(
+        server_args,
+        "handle_speculative_decoding",
+        speculative_algorithm=_resolve_speculative_algorithm_alias(
+            server_args.speculative_algorithm,
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            kwargs=kwargs,
+        ),
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -110,7 +131,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             raise ValueError(
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
-        server_args.speculative_draft_window_size = window_size
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_window_size=window_size,
+        )
         if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
@@ -127,7 +152,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
-            algo.validate_server_args(server_args)
+            declare_direct_writes(
+                server_args,
+                "handle_speculative_decoding.custom_validate",
+                algo.validate_server_args,
+            )
 
     if server_args.speculative_skip_dp_mlp_sync:
         assert server_args.speculative_algorithm == "EAGLE", (
@@ -141,7 +170,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
-        algo.handle_server_args(server_args)
+        # A registered algorithm's callback lives outside this tree and sets
+        # fields on the record, so the writes are captured around the call.
+        declare_direct_writes(
+            server_args,
+            "handle_speculative_decoding.custom_algo",
+            algo.handle_server_args,
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
@@ -173,22 +208,38 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     #
     # For DFlash, the natural unit is `block_size` (verify window length).
     if server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = 1
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_num_steps=1,
+        )
     elif int(server_args.speculative_num_steps) != 1:
         logger.warning(
             "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
             server_args.speculative_num_steps,
         )
-        server_args.speculative_num_steps = 1
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_num_steps=1,
+        )
 
     if server_args.speculative_eagle_topk is None:
-        server_args.speculative_eagle_topk = 1
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_eagle_topk=1,
+        )
     elif int(server_args.speculative_eagle_topk) != 1:
         logger.warning(
             "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
             server_args.speculative_eagle_topk,
         )
-        server_args.speculative_eagle_topk = 1
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_eagle_topk=1,
+        )
 
     if server_args.speculative_dflash_block_size is not None:
         if int(server_args.speculative_dflash_block_size) <= 0:
@@ -205,8 +256,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
                 f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
             )
-        server_args.speculative_num_draft_tokens = int(
-            server_args.speculative_dflash_block_size
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_num_draft_tokens=int(server_args.speculative_dflash_block_size),
         )
 
     if server_args.speculative_num_draft_tokens is None:
@@ -241,7 +294,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
                 inferred_block_size,
             )
-        server_args.speculative_num_draft_tokens = inferred_block_size
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_num_draft_tokens=inferred_block_size,
+        )
 
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)
@@ -255,13 +312,21 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     _resolve_dflash_draft_attention_backend(server_args)
 
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            max_running_requests=48,
+        )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            enable_mixed_chunk=False,
+        )
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
@@ -327,8 +392,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
-            server_args.speculative_draft_model_path = server_args.model_path
-            server_args.speculative_draft_model_revision = server_args.revision
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_draft_model_path=server_args.model_path,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_draft_model_revision=server_args.revision,
+            )
             logger.info(
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
@@ -341,22 +414,38 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = 1
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_num_steps=1,
+        )
     elif int(server_args.speculative_num_steps) != 1:
         logger.warning(
             "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
             server_args.speculative_num_steps,
         )
-        server_args.speculative_num_steps = 1
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_num_steps=1,
+        )
 
     if server_args.speculative_eagle_topk is None:
-        server_args.speculative_eagle_topk = 1
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_eagle_topk=1,
+        )
     elif int(server_args.speculative_eagle_topk) != 1:
         logger.warning(
             "DSpark only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
             server_args.speculative_eagle_topk,
         )
-        server_args.speculative_eagle_topk = 1
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_eagle_topk=1,
+        )
 
     gamma: Optional[int] = None
     if server_args.speculative_dspark_block_size is not None:
@@ -398,7 +487,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(= {verify_window} for gamma={gamma}), but got "
                 f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
             )
-        server_args.speculative_num_draft_tokens = verify_window
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_num_draft_tokens=verify_window,
+        )
 
     if server_args.speculative_num_draft_tokens is None:
         raise ValueError(
@@ -412,13 +505,21 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            max_running_requests=48,
+        )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            enable_mixed_chunk=False,
+        )
         logger.warning(
             "Mixed chunked prefill is disabled because of using dspark speculative decoding."
         )
@@ -522,18 +623,30 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
-    server_args.speculative_draft_attention_backend = draft_backend
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_attention_backend",
+        speculative_draft_attention_backend=draft_backend,
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
+        declare_resolution(
+            server_args,
+            "_handle_frozen_kv_mtp",
+            max_running_requests=48,
+        )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
+        declare_resolution(
+            server_args,
+            "_handle_frozen_kv_mtp",
+            enable_mixed_chunk=False,
+        )
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
             "Frozen-KV MTP speculative decoding."
@@ -556,7 +669,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            max_running_requests=48,
+        )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
@@ -570,7 +687,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            enable_mixed_chunk=False,
+        )
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
             "eagle speculative decoding."
@@ -592,8 +713,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV3ForCausalLM",
     ]:
         if server_args.speculative_draft_model_path is None:
-            server_args.speculative_draft_model_path = server_args.model_path
-            server_args.speculative_draft_model_revision = server_args.revision
+            declare_resolution(
+                server_args,
+                "_handle_eagle_family",
+                speculative_draft_model_path=server_args.model_path,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_eagle_family",
+                speculative_draft_model_revision=server_args.revision,
+            )
         else:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
@@ -612,11 +741,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             and server_args.speculative_num_draft_tokens is None
         )
 
-        (
-            server_args.speculative_num_steps,
-            server_args.speculative_eagle_topk,
-            server_args.speculative_num_draft_tokens,
-        ) = _auto_choose_speculative_params(server_args, model_arch)
+        steps, topk, draft_tokens = _auto_choose_speculative_params(
+            server_args, model_arch
+        )
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family.auto_params",
+            speculative_num_steps=steps,
+            speculative_eagle_topk=topk,
+            speculative_num_draft_tokens=draft_tokens,
+        )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:
@@ -680,7 +814,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         logger.warning(
             "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
         )
-        server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_num_draft_tokens=server_args.speculative_num_steps + 1,
+        )
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
@@ -708,23 +846,41 @@ def _handle_ngram(server_args: ServerArgs) -> None:
     _disable_overlap_schedule_for_cpu(server_args)
 
     if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            max_running_requests=48,
+        )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.enable_mixed_chunk = False
-    server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
+    declare_resolution(
+        server_args,
+        "_handle_ngram",
+        enable_mixed_chunk=False,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_ngram",
+        speculative_eagle_topk=server_args.speculative_ngram_max_bfs_breadth,
+    )
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = 12
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            speculative_num_draft_tokens=12,
+        )
         logger.warning(
             "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
             "You can override this by explicitly setting --speculative-num-draft-tokens."
         )
     if server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = (
-            server_args.speculative_num_draft_tokens
-            // server_args.speculative_eagle_topk
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            speculative_num_steps=server_args.speculative_num_draft_tokens
+            // server_args.speculative_eagle_topk,
         )
     if server_args.speculative_ngram_external_corpus_path is not None:
         if server_args.speculative_ngram_external_sam_budget <= 0:
@@ -782,7 +938,11 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
             f"speculative_adaptive disabled: {reason}. "
             "Falling back to static speculative params."
         )
-        server_args.speculative_adaptive = False
+        declare_resolution(
+            server_args,
+            "_maybe_disable_adaptive",
+            speculative_adaptive=False,
+        )
 
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
@@ -795,10 +955,18 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     )
 
     if server_args.speculative_eagle_topk is None:
-        server_args.speculative_eagle_topk = 1
+        declare_resolution(
+            server_args,
+            "_init_adaptive_speculative_params",
+            speculative_eagle_topk=1,
+        )
 
     if server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = candidate_steps[len(candidate_steps) // 2]
+        declare_resolution(
+            server_args,
+            "_init_adaptive_speculative_params",
+            speculative_num_steps=candidate_steps[len(candidate_steps) // 2],
+        )
 
     if server_args.speculative_num_steps not in candidate_steps:
         raise ValueError(
@@ -807,7 +975,11 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
             "Pass one of those values."
         )
 
-    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+    declare_resolution(
+        server_args,
+        "_init_adaptive_speculative_params",
+        speculative_num_draft_tokens=server_args.speculative_num_steps + 1,
+    )
 
 
 def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) -> tuple:
