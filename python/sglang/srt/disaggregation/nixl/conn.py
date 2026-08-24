@@ -1212,7 +1212,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def _validate_peer_rows_chunk(
         self, kv_chunk: TransferKVChunk, req: TransferInfo, dst_info: KVArgsRegisterInfo
     ) -> None:
-        if not self.enable_dcp_peer_rows:
+        if not getattr(self, "enable_dcp_peer_rows", False):
             return
         if (
             not self.is_mla_backend

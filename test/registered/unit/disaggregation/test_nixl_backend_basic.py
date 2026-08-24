@@ -135,6 +135,7 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
             gpu_id=0,
         )
         mgr.src_mem_kind = "VRAM"
+        mgr._publish_ready_epoch = MagicMock(return_value=0x3000)
         mgr._send_kvcache_generic = MagicMock(return_value="transfer")
         dst_info = SimpleNamespace(
             dst_homogeneous_mem_kind="VRAM",
@@ -144,6 +145,9 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
             dst_kv_ptrs=[0x2000],
             dcp_dst_region_indices=[0],
             gpu_id=0,
+            ready_enabled=True,
+            ready_slot_count=8,
+            ready_base_ptr=0x4000,
         )
 
         with patch(
@@ -159,6 +163,8 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
                 num_kv_tokens=256,
                 notif="ready",
                 pack_buffer=mgr._dcp_pack_buffer_for_worker(0),
+                ready_slot=1,
+                ready_epoch=7,
             )
 
         self.assertEqual(result, "transfer")
@@ -170,6 +176,7 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
         np.testing.assert_array_equal(
             args["dst_data_indices"], np.arange(448, 512, dtype=np.int32)
         )
+        self.assertEqual(args["ready_tail"], (0x3000, 0x4008))
 
 
 class TestNixlTransferInfo(CustomTestCase):
