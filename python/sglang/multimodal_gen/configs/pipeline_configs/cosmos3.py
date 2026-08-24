@@ -19,6 +19,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
@@ -165,3 +168,12 @@ class Cosmos3Config(PipelineConfig):
         # and action-capable checkpoints. The loaded transformer validates that
         # an action head is actually present when an action request is submitted.
         return True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        if "cosmos3-nano" not in self.model_path.lower():
+            return ModelDeploymentConfig()
+
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
+        )
