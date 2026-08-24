@@ -101,7 +101,9 @@ class TestTransformPatchesToFlatten(unittest.TestCase):
         patches = self._make_input(2, 2, 2, 3, 2, 2, 2)
         out = transform_patches_to_flatten(patches, 2, 2, 2, 3, 2, 2, 2, 1)
         self.assertEqual(out.numel(), patches.numel())
-        self.assertTrue(torch.equal(out.flatten().sort().values, patches.flatten().sort().values))
+        self.assertTrue(
+            torch.equal(out.flatten().sort().values, patches.flatten().sort().values)
+        )
 
     def test_all_zeros_input(self):
         patches = torch.zeros(1, 1, 3, 4, 4)
@@ -131,7 +133,9 @@ class TestTransformPatchesToFlatten(unittest.TestCase):
         patches = self._make_input(1, 1, 1, 3, 2, 4, 2)
         out = transform_patches_to_flatten(patches, 1, 1, 1, 3, 2, 4, 2, 2)
         self.assertEqual(out.numel(), patches.numel())
-        self.assertTrue(torch.equal(out.flatten().sort().values, patches.flatten().sort().values))
+        self.assertTrue(
+            torch.equal(out.flatten().sort().values, patches.flatten().sort().values)
+        )
 
 
 # ===========================================================================
@@ -304,9 +308,7 @@ class TestNpuWrapperVideoPreprocess(unittest.TestCase):
 
     def test_multiple_videos_same_shape(self):
         proc = _make_processor()
-        result = self._call(
-            proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)]
-        )
+        result = self._call(proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)])
         self.assertEqual(result["pixel_values_videos"].shape, (8, 12))
 
     # -- L269: video_grid_thw values --
@@ -337,6 +339,7 @@ class TestNpuWrapperVideoPreprocess(unittest.TestCase):
 class TestNpuApplyQwenImagePreprocessPatch(unittest.TestCase):
     def setUp(self):
         import sglang.srt.hardware_backend.npu.modules.qwen_vl_processor as mod
+
         self._mod = mod
         self._original_flag = mod._npu_preprocess_patched
         mod._npu_preprocess_patched = False
@@ -345,7 +348,9 @@ class TestNpuApplyQwenImagePreprocessPatch(unittest.TestCase):
         self._mod._npu_preprocess_patched = self._original_flag
 
     # -- L294-303: calls apply_module_patch for both image and video --
-    @patch("sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch"
+    )
     def test_calls_apply_module_patch(self, mock_apply):
         npu_apply_qwen_image_preprocess_patch()
         self.assertEqual(mock_apply.call_count, 2)
@@ -360,20 +365,26 @@ class TestNpuApplyQwenImagePreprocessPatch(unittest.TestCase):
         )
 
     # -- L304: sets global flag --
-    @patch("sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch"
+    )
     def test_sets_global_flag(self, mock_apply):
         npu_apply_qwen_image_preprocess_patch()
         self.assertTrue(self._mod._npu_preprocess_patched)
 
     # -- L292-293: idempotent — second call is a no-op --
-    @patch("sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch"
+    )
     def test_idempotent(self, mock_apply):
         npu_apply_qwen_image_preprocess_patch()
         npu_apply_qwen_image_preprocess_patch()
         self.assertEqual(mock_apply.call_count, 2)
 
     # -- L292: already patched → apply_module_patch NOT called --
-    @patch("sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.qwen_vl_processor.apply_module_patch"
+    )
     def test_does_not_call_when_already_patched(self, mock_apply):
         self._mod._npu_preprocess_patched = True
         npu_apply_qwen_image_preprocess_patch()

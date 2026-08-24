@@ -12,7 +12,6 @@ Tests are ordered to match the source file:
   8. npu_apply_minimax_m3_video_preprocess_patch   (L296)
 """
 
-import math
 import sys
 from unittest.mock import MagicMock
 
@@ -31,7 +30,6 @@ for _ in (
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -384,9 +382,7 @@ class TestNpuWrapperMinimaxM3VideoPreprocess(unittest.TestCase):
 
     def test_multiple_videos_same_shape(self):
         proc = _make_processor()
-        result = self._call(
-            proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)]
-        )
+        result = self._call(proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)])
         self.assertEqual(result["pixel_values_videos"].shape, (8, 12))
 
     # -- L268: video_grid_thw values --

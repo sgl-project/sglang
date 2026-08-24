@@ -214,9 +214,7 @@ class TestNpuWrapperGlm46vVideoPreprocess(unittest.TestCase):
 
     def test_multiple_videos_same_shape(self):
         proc = _make_image_processor()
-        result = self._call(
-            proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)]
-        )
+        result = self._call(proc, [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)])
         self.assertEqual(result["pixel_values_videos"].shape, (8, 12))
 
     # -- L250: video_grid_thw values --
@@ -241,6 +239,7 @@ class TestNpuWrapperGlm46vVideoPreprocess(unittest.TestCase):
 class TestNpuApplyGlm46vImagePreprocessPatch(unittest.TestCase):
     def setUp(self):
         import sglang.srt.hardware_backend.npu.modules.glm46v_processor as mod
+
         self._mod = mod
         self._original_flag = mod._npu_glm46v_preprocess_patched
         mod._npu_glm46v_preprocess_patched = False
@@ -249,7 +248,9 @@ class TestNpuApplyGlm46vImagePreprocessPatch(unittest.TestCase):
         self._mod._npu_glm46v_preprocess_patched = self._original_flag
 
     # -- L275-284: calls apply_module_patch for both image and video --
-    @patch("sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch"
+    )
     def test_calls_apply_module_patch(self, mock_apply):
         npu_apply_glm46v_image_preprocess_patch()
         self.assertEqual(mock_apply.call_count, 2)
@@ -264,20 +265,26 @@ class TestNpuApplyGlm46vImagePreprocessPatch(unittest.TestCase):
         )
 
     # -- L285: sets global flag --
-    @patch("sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch"
+    )
     def test_sets_global_flag(self, mock_apply):
         npu_apply_glm46v_image_preprocess_patch()
         self.assertTrue(self._mod._npu_glm46v_preprocess_patched)
 
     # -- L273-274: idempotent — second call is a no-op --
-    @patch("sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch"
+    )
     def test_idempotent(self, mock_apply):
         npu_apply_glm46v_image_preprocess_patch()
         npu_apply_glm46v_image_preprocess_patch()
         self.assertEqual(mock_apply.call_count, 2)
 
     # -- L273: already patched → apply_module_patch NOT called --
-    @patch("sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch")
+    @patch(
+        "sglang.srt.hardware_backend.npu.modules.glm46v_processor.apply_module_patch"
+    )
     def test_does_not_call_when_already_patched(self, mock_apply):
         self._mod._npu_glm46v_preprocess_patched = True
         npu_apply_glm46v_image_preprocess_patch()
