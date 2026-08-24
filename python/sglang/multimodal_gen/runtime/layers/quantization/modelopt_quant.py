@@ -236,6 +236,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
         checkpoint_weight_scale_layout: str = "linear",
+        checkpoint_uses_comfy_quantization: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -248,6 +249,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
+        self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
 
     @classmethod
     def get_name(cls) -> str:
@@ -347,6 +349,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             swap_weight_nibbles=swap_weight_nibbles,
             checkpoint_weight_scale_layout=config.get(
                 "checkpoint_weight_scale_layout", "linear"
+            ),
+            checkpoint_uses_comfy_quantization=config.get(
+                "checkpoint_uses_comfy_quantization", False
             ),
         )
 

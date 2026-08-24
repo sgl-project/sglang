@@ -15,6 +15,7 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -44,6 +45,8 @@ def hybrid_lightning_config(model_config: ModelConfig):
     # linear attention, Ling-V3 uses KDA. use_kda separates them -- see
     # kimi_linear_config below, which claims the KDA half.
     if isinstance(config, BailingHybridConfig) and not config.use_kda:
+        return config
+    if isinstance(config, MiniCPMHybridConfig) and config.has_lightning_layers:
         return config
     return None
 
