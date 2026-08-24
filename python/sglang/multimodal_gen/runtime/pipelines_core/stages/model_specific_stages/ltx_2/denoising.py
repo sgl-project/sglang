@@ -566,7 +566,11 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float32 if current_platform.is_float64_supported() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_float64_supported()
+                else torch.float64
+            ),
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()

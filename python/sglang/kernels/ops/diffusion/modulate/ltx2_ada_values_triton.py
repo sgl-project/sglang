@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 
+
 @triton.jit
 def _ltx2_ada_values9_kernel(
     temb_ptr,
@@ -144,7 +145,10 @@ def ltx2_ada_values9(
 ) -> tuple[torch.Tensor, ...]:
     if timestep.ndim != 3:
         raise ValueError("timestep must have shape [B, S, 9 * D]")
-    if not current_platform.tensor_on_device(timestep) or timestep.dtype != torch.bfloat16:
+    if (
+        not current_platform.tensor_on_device(timestep)
+        or timestep.dtype != torch.bfloat16
+    ):
         raise ValueError("timestep must be a CUDA bfloat16 tensor")
     if not timestep.is_contiguous():
         raise ValueError("timestep must be contiguous")
