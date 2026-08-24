@@ -112,6 +112,27 @@ class ServingCompletionTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single request"):
             internal.normalize_batch_and_arguments()
 
+    # ---------- rid pass-through ----------
+    def test_rid_from_header_overrides_body(self):
+        """x-request-id header takes precedence over the body rid field."""
+        req = CompletionRequest(
+            model="x", prompt=[1, 2, 3, 4], max_tokens=1, rid="body-rid"
+        )
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "header-rid"}
+        internal, _ = self.sc._convert_to_internal_request(req, raw)
+        self.assertEqual(internal.rid, "header-rid")
+
+    def test_rid_falls_back_to_body_without_header(self):
+        """Without an x-request-id header, rid falls back to the body value."""
+        req = CompletionRequest(
+            model="x", prompt=[1, 2, 3, 4], max_tokens=1, rid="body-rid"
+        )
+        raw = Mock(spec=Request)
+        raw.headers = {}
+        internal, _ = self.sc._convert_to_internal_request(req, raw)
+        self.assertEqual(internal.rid, "body-rid")
+
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(

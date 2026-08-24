@@ -1070,7 +1070,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
-            rid=request.rid,
+            rid=self.extract_rid_from_header(raw_request, request.rid),
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
