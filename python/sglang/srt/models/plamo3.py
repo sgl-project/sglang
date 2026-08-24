@@ -1,4 +1,4 @@
-from typing import Any, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -6,7 +6,6 @@ from torch import nn
 from sglang.srt.configs.plamo3 import Plamo3Config
 from sglang.srt.distributed import (
     get_pp_group,
-    get_pp_indices,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -199,12 +198,12 @@ class Plamo3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Plamo3Attention(
+        self.mixer = Plamo3Attention(
             layer_id=layer_id,
             config=config,  # type: ignore[arg-type]
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+            prefix=add_prefix("mixer", prefix),
         )
         self.mlp = Plamo3MLP(
             hidden_size=self.hidden_size,
@@ -224,7 +223,7 @@ class Plamo3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
             offset=PLAMO3_POST_MLP_NORM_OFFSET,
         )
-        self.is_sliding = self.self_attn.is_sliding
+        self.is_sliding = self.mixer.is_sliding
         self.layer_id = layer_id
 
     def forward(
@@ -241,7 +240,7 @@ class Plamo3DecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.pre_mixer_norm(hidden_states)
-        attn_hidden_states = self.self_attn(
+        attn_hidden_states = self.mixer(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -257,6 +256,63 @@ class Plamo3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states, hidden_states
+
+
+class Plamo3Decoder(nn.Module):
+    def __init__(
+        self,
+        config: Plamo3Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        pp_group = get_pp_group()
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Plamo3DecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            pp_rank=pp_group.rank_in_group,
+            pp_size=pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
+        )
+
+    def __getitem__(self, layer_idx: int) -> nn.Module:
+        return self.layers[layer_idx]
+
+    def __iter__(self) -> Iterator[nn.Module]:
+        return iter(self.layers)
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
+        layers_to_capture: Optional[Set[int]] = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        aux_hidden_states: List[torch.Tensor] = []
+        for i in range(self.start_layer, self.end_layer):
+            if layers_to_capture is not None and i in layers_to_capture:
+                aux_hidden_states.append(hidden_states)
+            hidden_states, residual = self.layers[i](
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+                **kwargs,
+            )
+
+        if layers_to_capture is not None and self.end_layer in layers_to_capture:
+            aux_hidden_states.append(hidden_states)
+        return hidden_states, residual, aux_hidden_states
 
 
 class Plamo3Model(nn.Module):
@@ -283,23 +339,13 @@ class Plamo3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        pp_start_layer, _ = get_pp_indices(
-            config.num_hidden_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
+        self.layers = Plamo3Decoder(
+            config,
+            quant_config,
+            prefix=add_prefix("layers", prefix),
         )
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: Plamo3DecoderLayer(
-                layer_id=idx,
-                config=config,
-                quant_config=quant_config,
-                prefix=prefix,
-            ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
-            prefix="model.layers",
-        )
+        self.start_layer = self.layers.start_layer
+        self.end_layer = self.layers.end_layer
 
         if self.pp_group.is_last_rank:
             self.norm = Plamo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -328,22 +374,14 @@ class Plamo3Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states: List[torch.Tensor] = []
-
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
-            layer_outputs = self.layers[i](
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                residual=residual,
-                **kwargs,
-            )
-            hidden_states, residual = layer_outputs
-
-        if self.end_layer in self.layers_to_capture:
-            aux_hidden_states.append(hidden_states)
+        hidden_states, residual, aux_hidden_states = self.layers(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+            layers_to_capture=set(self.layers_to_capture),
+            **kwargs,
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -514,9 +552,14 @@ class Plamo3ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         def _layer_idx_from_name(name: str) -> Optional[int]:
             parts = name.split(".")
-            if len(parts) >= 4 and parts[0] == "model" and parts[1] == "layers":
+            if (
+                len(parts) >= 5
+                and parts[0] == "model"
+                and parts[1] == "layers"
+                and parts[2] == "layers"
+            ):
                 try:
-                    return int(parts[2])
+                    return int(parts[3])
                 except ValueError:
                     pass
             return None
@@ -531,8 +574,6 @@ class Plamo3ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            name = name.replace("model.layers.layers.", "model.layers.")
-
             # Skip layer weights that do not belong to this PP rank.
             layer_idx = _layer_idx_from_name(name)
             if layer_idx is not None and (
@@ -553,7 +594,6 @@ class Plamo3ForCausalLM(nn.Module):
                     else:
                         continue
 
-            name = name.replace(".mixer.", ".self_attn.")
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
             if remapped_name is None:
                 continue

@@ -159,33 +159,6 @@ class TestPlamo3RMSNorm(CustomTestCase):
         torch.testing.assert_close(norm.forward_native(x), expected)
 
 
-class TestPlamo3WeightNameMapping(CustomTestCase):
-    """Verify the checkpoint-name normalization used by ``Plamo3ForCausalLM.load_weights``.
-
-    PLaMo3 checkpoints store layer weights under ``model.layers.layers.<i>``
-    and attention weights under ``.mixer.``. The SGLang module tree uses the
-    flattened ``model.layers.<i>`` path (like other SGLang text models), so
-    ``load_weights`` remaps both the double layer prefix and the attention
-    submodule name.
-    """
-
-    def test_remap_layer_prefix(self):
-        name = "model.layers.layers.0.self_attn.o_proj.weight"
-        name = name.replace("model.layers.layers.", "model.layers.")
-        self.assertEqual(name, "model.layers.0.self_attn.o_proj.weight")
-
-    def test_remap_mixer_to_self_attn(self):
-        name = "model.layers.layers.0.mixer.q_proj.weight"
-        name = name.replace(".mixer.", ".self_attn.")
-        self.assertEqual(name, "model.layers.layers.0.self_attn.q_proj.weight")
-
-    def test_combined_remap(self):
-        name = "model.layers.layers.0.mixer.q_proj.weight"
-        name = name.replace("model.layers.layers.", "model.layers.")
-        name = name.replace(".mixer.", ".self_attn.")
-        self.assertEqual(name, "model.layers.0.self_attn.q_proj.weight")
-
-
 class TestPlamo3Eagle3(CustomTestCase):
     def test_eagle3_capture_raises(self):
         # Instantiating the model requires TP runtime; call the classmethod
