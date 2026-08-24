@@ -28,6 +28,7 @@ class _FakeFlashInferComm:
 
     def __init__(self):
         self.calls = []
+        self.fusion_kwargs = None
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
@@ -45,6 +46,7 @@ class _FakeFlashInferComm:
         rms_eps,
         **_kwargs,
     ):
+        self.fusion_kwargs = _kwargs
         allreduced = input * workspace.world_size
         expected_residual = allreduced + residual_in
         variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -192,6 +194,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
                     world_size = 4
                     manager = fusion.FlashInferWorkspaceManager()
                     manager.workspace = _FakeWorkspace(backend, world_size)
+                    manager.backend = backend
                     manager.initialized = True
                     buffers[manager_key] = manager
                     if not torch.cuda.is_available():
@@ -230,6 +233,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
 
                     torch.testing.assert_close(norm_out, expected_norm)
                     torch.testing.assert_close(residual_out, expected_residual)
+                    self.assertEqual(
+                        fake_comm.fusion_kwargs.get("fp32_acc", False),
+                        backend == "trtllm",
+                    )
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create

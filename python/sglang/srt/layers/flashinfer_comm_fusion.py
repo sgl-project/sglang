@@ -383,6 +383,7 @@ class FlashInferWorkspaceManager:
 
     def __init__(self):
         self.workspace = None
+        self.backend = None
         self.world_size = None
         self.rank = None
         self.group = None
@@ -517,6 +518,7 @@ class FlashInferWorkspaceManager:
                 create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
             self._configure_workspace_size_check()
+            self.backend = backend
             self.world_size = world_size
             self.rank = rank
             self.group = (device_group, cpu_group)
@@ -525,17 +527,16 @@ class FlashInferWorkspaceManager:
             self.dtype = dtype or torch.bfloat16
             self.initialized = True
 
-            backend_name = getattr(self.workspace, "backend", "unknown")
             if not self._logged_init:
                 logger.info(
                     f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
-                    f"backend={backend_name}, rank={rank}, world_size={world_size}, "
+                    f"backend={self.backend}, rank={rank}, world_size={world_size}, "
                     f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
             else:
                 logger.debug(
-                    f"FlashInfer workspace re-initialized: backend={backend_name}, "
+                    f"FlashInfer workspace re-initialized: backend={self.backend}, "
                     f"rank={rank}, world_size={world_size}"
                 )
         except Exception as e:
@@ -605,6 +606,7 @@ class FlashInferWorkspaceManager:
                 self._workspace_size_check_kwarg = None
                 self._workspace_size_check_strategy_type = None
                 self.initialized = False
+                self.backend = None
                 self.world_size = None
                 self.rank = None
                 self.group = None
@@ -751,7 +753,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
@@ -771,7 +773,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -787,7 +789,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         max_token_num: Maximum token number
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
-        fp32_acc: Whether to use fp32 precision
+        fp32_acc: Accumulate the allreduce in fp32 (trtllm backend only; the
+            mnnvl backends always accumulate in fp32)
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
@@ -851,8 +854,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         rms_gamma=weight,
         rms_eps=eps,
         use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     _flashinfer_comm.allreduce_fusion(**kwargs)
