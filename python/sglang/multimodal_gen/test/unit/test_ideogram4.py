@@ -511,9 +511,6 @@ class TestIdeogram4(unittest.TestCase):
             nunchaku_config={"enabled": True},
             component_weights_paths={},
             component_quantizations={},
-            component_quantization_ignored_layers={},
-            resolve_component_quantization=lambda _name: None,
-            resolve_component_quantization_ignored_layers=lambda _name: None,
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -534,10 +531,7 @@ class TestIdeogram4(unittest.TestCase):
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
                 )
             },
-            component_quantizations={},
-            component_quantization_ignored_layers={},
-            resolve_component_quantization=lambda _name: None,
-            resolve_component_quantization_ignored_layers=lambda _name: None,
+            component_quantizations={"unconditional_transformer": "fp8"},
         )
 
         component_args = _server_args_for_transformer_component(
@@ -551,30 +545,7 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
-
-    def test_transformer_component_uses_per_component_quantization(self):
-        server_args = SimpleNamespace(
-            transformer_weights_path=None,
-            nunchaku_config=None,
-            quantization="fp8",
-            quantization_ignored_layers=None,
-            component_weights_paths={},
-            resolve_component_quantization=lambda name: (
-                "kitchen_int8" if name == "unconditional_transformer" else None
-            ),
-            resolve_component_quantization_ignored_layers=lambda name: (
-                ["lm_head"] if name == "unconditional_transformer" else None
-            ),
-        )
-
-        component_args = _server_args_for_transformer_component(
-            server_args,
-            "unconditional_transformer",
-        )
-
-        self.assertEqual(component_args.quantization, "kitchen_int8")
-        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
-        self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
 
     def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
         self.assertEqual(

@@ -15,7 +15,6 @@ logger = init_logger(__name__)
 class ImageEncoderLoader(TextEncoderLoader):
     component_names = ["image_encoder"]
     expected_library = "transformers"
-    supports_component_quantization_override = False
 
     def load_customized(
         self,
@@ -47,6 +46,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             component_model_path,
             component_weights_path,
             component_name,
+            server_args.component_quantizations.get(component_name),
         )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(

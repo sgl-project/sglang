@@ -306,9 +306,10 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
-    # explicit per-component quantization intent; serialized formats are
-    # auto-detected and normally leave this unset
-    component_quantizations: dict[str, str] | str | None = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Component-local layer name patterns to skip during online quantization.
     component_quantization_ignored_layers: dict[str, list[str]] = field(
         default_factory=dict
     )
@@ -707,25 +708,11 @@ class ServerArgs(DisaggServerArgsMixin):
             self.input_save_path = None
 
     def _adjust_quant_config(self):
-        """Normalize component overrides and resolve Nunchaku config."""
+        """
+        resolve, validate and adjust quantization config
 
-        self.component_quantizations = self._normalize_component_quantizations(
-            self.component_quantizations
-        )
-        self.component_quantization_ignored_layers = (
-            self._normalize_component_quantization_ignored_layers(
-                self.component_quantization_ignored_layers
-            )
-        )
-        missing_quantization = set(self.component_quantization_ignored_layers) - set(
-            self.component_quantizations
-        )
-        if missing_quantization:
-            raise ValueError(
-                "component_quantization_ignored_layers requires a matching "
-                "component_quantizations entry for: "
-                f"{', '.join(sorted(missing_quantization))}"
-            )
+        handles only nunchaku for now
+        """
 
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
@@ -1086,8 +1073,8 @@ class ServerArgs(DisaggServerArgsMixin):
         return prefetch, resident, policy
 
     @staticmethod
-    def _parse_component_string_map(
-        value: dict[str, str] | str | None, option_name: str
+    def _parse_component_attention_backend_map(
+        value: dict[str, str] | str | None,
     ) -> dict[str, str]:
         if value is None or value == "":
             return {}
@@ -1095,8 +1082,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return dict(value)
         if not isinstance(value, str):
             raise ValueError(
-                f"{option_name} must be a dict or a comma-separated "
-                "component=value string"
+                "component_attention_backends must be a dict or a comma-separated component=backend string"
             )
 
         try:
@@ -1113,77 +1099,12 @@ class ServerArgs(DisaggServerArgsMixin):
             if not pair:
                 continue
             if "=" not in pair:
-                raise ValueError(f"{option_name} must use component=value entries")
-            component, selected_value = pair.split("=", 1)
-            result[component.strip()] = selected_value.strip()
+                raise ValueError(
+                    "component_attention_backends must use component=backend entries"
+                )
+            component, backend = pair.split("=", 1)
+            result[component.strip()] = backend.strip()
         return result
-
-    @classmethod
-    def _parse_component_attention_backend_map(
-        cls, value: dict[str, str] | str | None
-    ) -> dict[str, str]:
-        return cls._parse_component_string_map(value, "component_attention_backends")
-
-    @staticmethod
-    def _normalize_component_option_key(component: object, option_name: str) -> str:
-        if not isinstance(component, str):
-            raise ValueError(f"{option_name} keys must be strings")
-        component_name = component.strip().replace("-", "_")
-        if not component_name:
-            raise ValueError(f"{option_name} keys must not be empty")
-        return component_name
-
-    @classmethod
-    def _normalize_component_quantizations(
-        cls, value: dict[str, str] | str | None
-    ) -> dict[str, str]:
-        raw = cls._parse_component_string_map(value, "component_quantizations")
-        normalized: dict[str, str] = {}
-        for component, quantization in raw.items():
-            component_name = cls._normalize_component_option_key(
-                component, "component_quantizations"
-            )
-            if not isinstance(quantization, str) or not quantization.strip():
-                raise ValueError(
-                    "component_quantizations values must be non-empty strings"
-                )
-            normalized[component_name] = quantization.strip().lower().replace("-", "_")
-        return normalized
-
-    @classmethod
-    def _normalize_component_quantization_ignored_layers(
-        cls, value: dict[str, list[str]] | None
-    ) -> dict[str, list[str]]:
-        if value is None:
-            return {}
-        if not isinstance(value, dict):
-            raise ValueError("component_quantization_ignored_layers must be a dict")
-        normalized: dict[str, list[str]] = {}
-        for component, layers in value.items():
-            component_name = cls._normalize_component_option_key(
-                component, "component_quantization_ignored_layers"
-            )
-            if isinstance(layers, str):
-                layers = [layers]
-            if not isinstance(layers, (list, tuple)) or not all(
-                isinstance(layer, str) and layer.strip() for layer in layers
-            ):
-                raise ValueError(
-                    "component_quantization_ignored_layers values must be "
-                    "lists of non-empty strings"
-                )
-            normalized[component_name] = [layer.strip() for layer in layers]
-        return normalized
-
-    def resolve_component_quantization(self, component_name: str) -> str | None:
-        key = component_name.replace("-", "_")
-        return self.component_quantizations.get(key)
-
-    def resolve_component_quantization_ignored_layers(
-        self, component_name: str
-    ) -> list[str] | None:
-        key = component_name.replace("-", "_")
-        return self.component_quantization_ignored_layers.get(key)
 
     @classmethod
     def _normalize_component_attention_backends(
@@ -1192,9 +1113,11 @@ class ServerArgs(DisaggServerArgsMixin):
         raw = cls._parse_component_attention_backend_map(value)
         normalized: dict[str, str] = {}
         for component, backend in raw.items():
-            component_name = cls._normalize_component_option_key(
-                component, "component_attention_backends"
-            )
+            if not isinstance(component, str):
+                raise ValueError("Component attention backend key must be a string")
+            component_name = component.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
             normalized[component_name] = cls._normalize_attention_backend_name(backend)
         return normalized
 
@@ -1789,6 +1712,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 is_dit_component_name(component)
                 or is_text_encoder_component_name(component)
                 or is_image_encoder_component_name(component)
+                or is_vae_component_name(component)
             )
             if (
                 not supports_weight_file_override
@@ -1805,6 +1729,47 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
+        normalized_ignored_layers: dict[str, list[str]] = {}
+        for component, layers in self.component_quantization_ignored_layers.items():
+            component = str(component).strip().replace("-", "_")
+            if isinstance(layers, str):
+                layers = [layers]
+            if (
+                not component
+                or not isinstance(layers, (list, tuple))
+                or not all(isinstance(layer, str) and layer.strip() for layer in layers)
+            ):
+                raise ValueError(
+                    "Component quantization ignored layers require a component "
+                    "and non-empty layer patterns"
+                )
+            normalized_ignored_layers[component] = [layer.strip() for layer in layers]
+        missing_quantization = set(normalized_ignored_layers) - set(
+            self.component_quantizations
+        )
+        if missing_quantization:
+            raise ValueError(
+                "Component quantization ignored layers require a matching "
+                "quantization override for: "
+                f"{', '.join(sorted(missing_quantization))}"
+            )
+        self.component_quantization_ignored_layers = normalized_ignored_layers
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -2522,19 +2487,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
-        parser.add_argument(
-            "--component-quantizations",
-            type=str,
-            default=None,
-            help=(
-                "Explicit per-component quantization overrides, primarily for "
-                "online quantization of unquantized checkpoints. Pre-quantized "
-                "checkpoints are auto-detected from metadata and should normally "
-                "omit this option. Example: "
-                "'text_encoder=fp8,transformer=kitchen_int8'. The dotted form "
-                "--component-quantizations.<component> is also supported."
-            ),
-        )
 
         # Nunchaku SVDQuant quantization parameters
         NunchakuSVDQuantArgs.add_cli_args(parser)
@@ -2929,6 +2881,61 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix="-weights-path",
         )
 
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
+    @staticmethod
+    def _extract_component_quantization_ignored_layers(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        ignored_layers: dict[str, list[str]] = {}
+        remaining: list[str] = []
+        i = 0
+        prefixes = (
+            "--component-quantization-ignored-layers.",
+            "--component_quantization_ignored_layers.",
+        )
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            if "=" in arg:
+                values = [arg.split("=", 1)[1]]
+            else:
+                values = []
+                while i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    values.append(unknown_args[i])
+            if component and values:
+                ignored_layers[component] = values
+            else:
+                remaining.append(arg)
+            i += 1
+        return ignored_layers, remaining
+
     @staticmethod
     def _extract_component_attention_backends(
         unknown_args: list[str],
@@ -2966,71 +2973,6 @@ class ServerArgs(DisaggServerArgsMixin):
             i += 1
         return component_attention_backends, remaining
 
-    @staticmethod
-    def _extract_component_quantizations(
-        unknown_args: list[str],
-    ) -> tuple[dict[str, str], dict[str, list[str]], list[str]]:
-        component_quantizations: dict[str, str] = {}
-        ignored_layers: dict[str, list[str]] = {}
-        remaining: list[str] = []
-        i = 0
-        while i < len(unknown_args):
-            arg = unknown_args[i]
-            key_part = arg.split("=", 1)[0] if "=" in arg else arg
-            quantization_prefix = next(
-                (
-                    prefix
-                    for prefix in (
-                        "--component-quantizations.",
-                        "--component_quantizations.",
-                    )
-                    if key_part.startswith(prefix)
-                ),
-                None,
-            )
-            ignored_prefix = next(
-                (
-                    prefix
-                    for prefix in (
-                        "--component-quantization-ignored-layers.",
-                        "--component_quantization_ignored_layers.",
-                    )
-                    if key_part.startswith(prefix)
-                ),
-                None,
-            )
-
-            if quantization_prefix is not None:
-                component = key_part[len(quantization_prefix) :].replace("-", "_")
-                if "=" in arg:
-                    component_quantizations[component] = arg.split("=", 1)[1]
-                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
-                    "-"
-                ):
-                    i += 1
-                    component_quantizations[component] = unknown_args[i]
-                else:
-                    remaining.append(arg)
-            elif ignored_prefix is not None:
-                component = key_part[len(ignored_prefix) :].replace("-", "_")
-                if "=" in arg:
-                    values = [arg.split("=", 1)[1]]
-                else:
-                    values = []
-                    while i + 1 < len(unknown_args) and not unknown_args[
-                        i + 1
-                    ].startswith("-"):
-                        i += 1
-                        values.append(unknown_args[i])
-                if values:
-                    ignored_layers[component] = values
-                else:
-                    remaining.append(arg)
-            else:
-                remaining.append(arg)
-            i += 1
-        return component_quantizations, ignored_layers, remaining
-
     @classmethod
     def from_cli_args(
         cls,
@@ -3041,16 +2983,19 @@ class ServerArgs(DisaggServerArgsMixin):
         if unknown_args is None:
             unknown_args = []
 
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
+        dynamic_ignored_layers, remaining = (
+            cls._extract_component_quantization_ignored_layers(remaining)
+        )
         # Extract the more specific weights suffix before the generic path alias.
         dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
-            unknown_args
+            remaining
         )
         dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
             cls._extract_component_attention_backends(remaining)
-        )
-        dynamic_quantizations, dynamic_ignored_layers, remaining = (
-            cls._extract_component_quantizations(remaining)
         )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
@@ -3079,18 +3024,8 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_weights_paths)
             provided_args["component_weights_paths"] = existing
             explicit_arg_names.add("component_weights_paths")
-        if dynamic_attention_backends:
-            existing = cls._parse_component_attention_backend_map(
-                provided_args.get("component_attention_backends")
-            )
-            existing.update(dynamic_attention_backends)
-            provided_args["component_attention_backends"] = existing
-            explicit_arg_names.add("component_attention_backends")
         if dynamic_quantizations:
-            existing = cls._parse_component_string_map(
-                provided_args.get("component_quantizations"),
-                "component_quantizations",
-            )
+            existing = dict(provided_args.get("component_quantizations") or {})
             existing.update(dynamic_quantizations)
             provided_args["component_quantizations"] = existing
             explicit_arg_names.add("component_quantizations")
@@ -3101,6 +3036,13 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_ignored_layers)
             provided_args["component_quantization_ignored_layers"] = existing
             explicit_arg_names.add("component_quantization_ignored_layers")
+        if dynamic_attention_backends:
+            existing = cls._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+            existing.update(dynamic_attention_backends)
+            provided_args["component_attention_backends"] = existing
+            explicit_arg_names.add("component_attention_backends")
 
         provided_args["_explicit_arg_names"] = explicit_arg_names
         return cls.from_dict(provided_args)

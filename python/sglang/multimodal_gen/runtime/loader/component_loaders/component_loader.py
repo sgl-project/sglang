@@ -46,6 +46,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.weights.source import (
+    materialize_weight,
+    resolve_weight,
+)
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -126,9 +130,9 @@ class ComponentLoader(ABC):
     # components may fall back when that global choice is incompatible; an
     # explicit --component-attention-backends entry remains strict.
     allow_global_attention_backend_fallback = True
-
-    # loaders opt in only after they consume component-scoped overrides
-    supports_component_quantization_override = False
+    # Gates only --component-quantizations.<name>. Quantization declared by a
+    # checkpoint is discovered and admitted by the component's normal loader.
+    supports_online_quantization_override = False
 
     _loaders_registered = False
 
@@ -226,18 +230,17 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        requested_quantization = server_args.resolve_component_quantization(
-            component_name
-        )
+        component_quantization = server_args.component_quantizations.get(component_name)
         if (
-            requested_quantization is not None
-            and not self.supports_component_quantization_override
+            component_quantization is not None
+            and not self.supports_online_quantization_override
         ):
-            raise ComponentCheckpointUnsupportedError(
-                f"{component_name!r} does not support an explicit component "
-                f"quantization override ({requested_quantization!r}); use a "
-                "checkpoint format that its loader can auto-detect"
+            raise ValueError(
+                f"{component_name!r} does not support an explicit quantization "
+                "override; "
+                "use a self-describing quantized component checkpoint when supported"
             )
+
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",
@@ -532,6 +535,19 @@ class PlainStateDictComponentLoader(ComponentLoader):
         config = get_diffusers_component_config(component_path=component_model_path)
         self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
+
+    def resolve_component_weights_path(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> str:
+        override = server_args.component_weights_paths.get(component_name)
+        if override is None:
+            return component_model_path
+        weights_path = materialize_weight(resolve_weight(override))
+        logger.info("Using weight override for %s: %s", component_name, weights_path)
+        return weights_path
 
 
 class ImageProcessorLoader(ComponentLoader):
