@@ -262,11 +262,21 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill
     # capture is not. Guard when the user opts into it.
     _cg_cfg = cfg.cuda_graph_config
-    if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
-        raise ValueError(
-            "--enable-unified-memory supports monolithic (decode) "
-            "cuda-graph capture only; disable piecewise prefill capture "
-            "(e.g. --cuda-graph-backend-prefill=disabled)."
+    if _cg_cfg is not None and _cg_cfg.prefill.backend != Backend.DISABLED:
+        if cfg.cuda_graph_backend_prefill is not None:
+            raise ValueError(
+                "--enable-unified-memory supports decode cuda-graph "
+                "capture only; prefill capture is not wired (the prefill "
+                "graph runner bypasses the unified virtual->physical loc "
+                "rebind). Got --cuda-graph-backend-prefill="
+                f"{cfg.cuda_graph_backend_prefill!r}; pass "
+                "--cuda-graph-backend-prefill=disabled."
+            )
+        _cg_cfg.prefill.backend = Backend.DISABLED
+        logger.warning(
+            "--enable-unified-memory: disabling prefill cuda-graph "
+            "capture (not wired for the unified pool's loc rebind); "
+            "decode capture is unaffected."
         )
 
 
