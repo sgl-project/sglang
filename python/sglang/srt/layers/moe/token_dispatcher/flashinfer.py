@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import NamedTuple, Optional
 
@@ -191,6 +192,18 @@ class FlashinferDispatcher(BaseDispatcher):
             workspace_size_per_rank=self.workspace_size,
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
+        self.use_low_precision_combine = (
+            envs.SGLANG_FLASHINFER_LOW_PRECISION_MOE_COMBINE.get()
+        )
+        if self.use_low_precision_combine and (
+            "use_low_precision"
+            not in inspect.signature(self.moe_a2a.combine).parameters
+        ):
+            raise RuntimeError(
+                "SGLANG_FLASHINFER_LOW_PRECISION_MOE_COMBINE requires a "
+                "FlashInfer MoeAlltoAll.combine implementation with "
+                "use_low_precision support."
+            )
 
     @debug_kernel_api
     def dispatch(
@@ -349,13 +362,22 @@ class FlashinferDispatcher(BaseDispatcher):
     def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]
-        hidden_states = self.moe_a2a.combine(
-            hidden_states.view(
-                self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
-            ),
-            self.runtime_max_tokens_per_rank,
-            payload_in_workspace=self.payload_in_workspace,
+        hidden_states = hidden_states.view(
+            self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
         )
+        if self.use_low_precision_combine:
+            hidden_states = self.moe_a2a.combine(
+                hidden_states,
+                self.runtime_max_tokens_per_rank,
+                payload_in_workspace=self.payload_in_workspace,
+                use_low_precision=True,
+            )
+        else:
+            hidden_states = self.moe_a2a.combine(
+                hidden_states,
+                self.runtime_max_tokens_per_rank,
+                payload_in_workspace=self.payload_in_workspace,
+            )
 
         del self.runtime_max_tokens_per_rank
         return hidden_states
