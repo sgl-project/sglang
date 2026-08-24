@@ -2221,13 +2221,15 @@ def kill_process_tree(
     include_parent: bool = True,
     skip_pid: int = None,
     wait_timeout: Optional[float] = None,
+    exit_code: int = 0,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
     raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    `parent_pid == os.getpid()` branch calls `sys.exit(exit_code)` and cannot
+    wait for itself -- use `include_parent=False` if child reap must finish
+    first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2258,7 +2260,7 @@ def kill_process_tree(
         try:
             if parent_pid == os.getpid():
                 itself.kill()
-                sys.exit(0)
+                sys.exit(exit_code)
 
             itself.kill()
 
