@@ -1097,6 +1097,7 @@ class ModelRunner:
         )
 
         logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
+        receive_error = None
         try:
             tensors = {}
             handles = []
@@ -1117,22 +1118,26 @@ class ModelRunner:
             for handle in handles:
                 handle.wait()
         except Exception as e:
-            error_msg = f"Failed to receive LoRA adapter weights from distributed: {e}."
-            logger.error(error_msg)
-            return LoRAUpdateOutput(success=False, error_message=error_msg)
-
-        checksum_error = None
-        try:
-            verify_lora_tensor_checksums(
-                tensors,
-                expected_checksums,
-                self.ps.tp_rank,
+            receive_error = (
+                f"Failed to receive LoRA adapter weights from distributed: {e}."
             )
-        except Exception as e:
-            checksum_error = str(e)
+            if expected_checksums is None:
+                logger.error(receive_error)
+                return LoRAUpdateOutput(success=False, error_message=receive_error)
+
+        validation_error = receive_error
+        if validation_error is None:
+            try:
+                verify_lora_tensor_checksums(
+                    tensors,
+                    expected_checksums,
+                    self.ps.tp_rank,
+                )
+            except Exception as e:
+                validation_error = str(e)
         if expected_checksums is not None and self.ps.tp_size > 1:
             checksums_ok = torch.tensor(
-                checksum_error is None,
+                validation_error is None,
                 dtype=torch.int32,
             )
             torch.distributed.all_reduce(
@@ -1140,13 +1145,11 @@ class ModelRunner:
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group.cpu_group,
             )
-            if not checksums_ok.item() and checksum_error is None:
-                checksum_error = (
-                    "LoRA checksum verification failed on another tensor-parallel rank."
-                )
-        if checksum_error is not None:
-            logger.error(checksum_error)
-            return LoRAUpdateOutput(success=False, error_message=checksum_error)
+            if not checksums_ok.item() and validation_error is None:
+                validation_error = "LoRA distributed-load validation failed on another tensor-parallel rank."
+        if validation_error is not None:
+            logger.error(validation_error)
+            return LoRAUpdateOutput(success=False, error_message=validation_error)
         if expected_checksums is not None:
             logger.info(
                 f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: "

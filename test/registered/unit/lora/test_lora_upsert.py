@@ -44,7 +44,12 @@ CONFIG_DICT = {"target_modules": ["q_proj"], "r": 8, "lora_alpha": 16}
 
 class TestDistributedLoRAChecksums(CustomTestCase):
     @staticmethod
-    def _run(expected_checksum: str, *, peer_checksum_matches: bool = True):
+    def _run(
+        expected_checksum: str,
+        *,
+        peer_checksum_matches: bool = True,
+        receive_succeeds: bool = True,
+    ):
         received = torch.tensor([1.0, 2.0])
         handle = MagicMock()
         runner = SimpleNamespace(
@@ -62,12 +67,17 @@ class TestDistributedLoRAChecksums(CustomTestCase):
             assert src == 0
             assert group is runner.weight_updater._model_update_group["group"]
             assert async_op
+            if not receive_succeeds:
+                raise OSError("broadcast failed")
             output.copy_(received)
             return handle
+
+        consensus_calls = []
 
         def all_reduce(output, *, op, group):
             assert op is torch.distributed.ReduceOp.MIN
             assert group is runner.tp_group.cpu_group
+            consensus_calls.append(output.item())
             if not peer_checksum_matches:
                 output.zero_()
 
@@ -85,7 +95,11 @@ class TestDistributedLoRAChecksums(CustomTestCase):
                 group_name="group",
                 expected_checksums={"weight": expected_checksum},
             )
-        handle.wait.assert_called_once()
+        if receive_succeeds:
+            handle.wait.assert_called_once()
+        else:
+            handle.wait.assert_not_called()
+        runner.lora_manager.consensus_calls = consensus_calls
         return result, runner.lora_manager
 
     def test_matching_checksum_loads_adapter(self):
@@ -115,6 +129,14 @@ class TestDistributedLoRAChecksums(CustomTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("another tensor-parallel rank", result.error_message)
+        manager.load_lora_adapter_from_tensors.assert_not_called()
+
+    def test_receive_failure_reaches_consensus_before_load(self):
+        result, manager = self._run("unused", receive_succeeds=False)
+
+        self.assertFalse(result.success)
+        self.assertIn("Failed to receive", result.error_message)
+        self.assertEqual(manager.consensus_calls, [0])
         manager.load_lora_adapter_from_tensors.assert_not_called()
 
 
