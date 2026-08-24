@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
@@ -368,7 +371,10 @@ def _require_quantized_encoder_layers(
             f"The native {type(model).__name__} implementation does not construct "
             f"quantized linear layers for {component_name!r}"
         )
-    if isinstance(quant_config, (ComfyFp8Config, KitchenInt8Config, KitchenW4A8Config)):
+    if isinstance(
+        quant_config,
+        (ComfyFp8Config, KitchenInt8Config, KitchenW4A4Config, KitchenW4A8Config),
+    ):
         expected = set(quant_config.layer_markers)
         selected = set(quant_config.selected)
     elif isinstance(quant_config, QuantoInt8Config):

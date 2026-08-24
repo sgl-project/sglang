@@ -60,6 +60,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
@@ -459,6 +462,62 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(layer.weight_s_channel.shape, (3,))
         self.assertEqual(layer.weight_codebook.shape, (16,))
         self.assertIsNone(layer.weight_correction)
+
+    def test_minimax_h3_w4a4_marker_resolves_packed_kitchen(self):
+        marker = json.dumps(
+            {
+                "format": "convrot_w4a4",
+                "convrot_groupsize": 256,
+                "linear_dtype": "int8",
+            }
+        ).encode()
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones((2, 128), dtype=torch.int8),
+                    "blocks.0.mlp.fc1.weight_scale": torch.ones(2),
+                    "blocks.0.mlp.fc1.comfy_quant": torch.tensor(
+                        list(marker), dtype=torch.uint8
+                    ),
+                },
+                checkpoint.name,
+            )
+
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+
+        config = resolve_minimax_h3_checkpoint_quantization(markers)
+        self.assertIsInstance(config, KitchenW4A4Config)
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
+        self.assertFalse(_needs_device_weight_postprocess(config))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4."
+        "convrot_w4a4_linear",
+        new=object(),
+    )
+    def test_serialized_w4a4_constructs_packed_weight_and_row_scale(self):
+        config = KitchenW4A4Config(
+            {
+                "proj": {
+                    "format": "convrot_w4a4",
+                    "convrot_groupsize": 256,
+                }
+            }
+        )
+        layer = ReplicatedLinear(
+            256,
+            3,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="proj",
+        )
+
+        self.assertEqual(layer.weight.shape, (3, 128))
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight_scale.shape, (3,))
+        self.assertEqual(layer.weight_scale.dtype, torch.float32)
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
