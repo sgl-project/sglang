@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -184,12 +184,27 @@ def handle_attention_tokenspeed_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
+    # CP-v2 shards model inputs at the runner boundary and needs the absorbed
+    # MLA path so Aiter can gather the latent KV and apply zigzag causality.
+    if mla_use_prefill_cp(forward_batch):
+        return AttnForwardMethod.MLA
+    # Under a CP topology, non-CP batches slice the replicated absorbed-MLA
+    # weights into an effective TP layout. The expanded MHA path still owns
+    # full-head KV weights and cannot consume that sliced query.
+    from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+
+    if get_cp_decode_attn_tp_ctx().should_use_attn_tp(forward_batch):
+        return AttnForwardMethod.MLA
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        # MHA's concat kernel assumes a power-of-2 local head count, which K3
+        # (12 at tp8) violates; absorbed MLA also matches the DCP KV layout.
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MLA
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA

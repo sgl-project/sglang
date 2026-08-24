@@ -36,6 +36,11 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.attn_parallel import (
+    AttnParallelMode,
+    KvResidency,
+    resolve_kv_residency,
+)
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -542,14 +547,46 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        attn_parallel_mode=None,
+        kv_residency=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            attn_parallel_mode=(
+                int(attn_parallel_mode) if attn_parallel_mode is not None else None
+            ),
+            kv_residency=(int(kv_residency) if kv_residency is not None else None),
         )
+
+    def _resolve_attn_parallel_mode(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> AttnParallelMode:
+        if forward_batch is not None and forward_batch.attn_parallel_mode is not None:
+            return AttnParallelMode(forward_batch.attn_parallel_mode)
+        capture_mode = getattr(self, "_capture_attn_parallel_mode", None)
+        if capture_mode is not None:
+            return AttnParallelMode(capture_mode)
+        return (
+            AttnParallelMode.DCP if get_parallel().dcp_enabled else AttnParallelMode.TP
+        )
+
+    def _resolve_kv_residency(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> KvResidency:
+        if forward_batch is not None and forward_batch.kv_residency is not None:
+            return KvResidency(forward_batch.kv_residency)
+        capture_residency = getattr(self, "_capture_kv_residency", None)
+        if capture_residency is not None:
+            return KvResidency(capture_residency)
+        return resolve_kv_residency(get_parallel())
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
@@ -685,6 +722,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            dsa_variant=self._resolve_dsa_variant(forward_batch),
+            attn_parallel_mode=self._resolve_attn_parallel_mode(forward_batch),
+            kv_residency=self._resolve_kv_residency(forward_batch),
         )
 
         is_bs_supported = (
@@ -983,6 +1023,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
+            attn_parallel_mode=self._resolve_attn_parallel_mode(),
+            kv_residency=self._resolve_kv_residency(),
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
@@ -1089,6 +1131,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        attn_parallel_variants = (
+            [
+                (AttnParallelMode.TP, KvResidency.REPLICATED),
+                (AttnParallelMode.DCP, KvResidency.REPLICATED),
+                (AttnParallelMode.DCP, KvResidency.STRIPED),
+            ]
+            if getattr(
+                self.model_runner.server_args,
+                "enable_dynamic_attn_parallel",
+                False,
+            )
+            and getattr(
+                self.model_runner.server_args,
+                "dynamic_attn_parallel_enable_dcp",
+                False,
+            )
+            else [
+                (
+                    self._resolve_attn_parallel_mode(),
+                    self._resolve_kv_residency(),
+                )
+            ]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1104,21 +1169,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                    for attn_parallel_mode, kv_residency in attn_parallel_variants:
+                        self._capture_attn_parallel_mode = attn_parallel_mode
+                        self._capture_kv_residency = kv_residency
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if dsa_variant is None:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    dsa_variant,
+                                )
         _set_capture_dsa_variant(None)
+        self._capture_attn_parallel_mode = None
+        self._capture_kv_residency = None
 
     def capture_one_shape(
         self,
@@ -1216,6 +1290,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    self._resolve_attn_parallel_mode(forward_batch),
+                    self._resolve_kv_residency(forward_batch),
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1287,7 +1363,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dsa_variant = self._resolve_dsa_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                dsa_variant,
+                self._resolve_attn_parallel_mode(forward_batch),
+                self._resolve_kv_residency(forward_batch),
             )
             return
 
@@ -1380,7 +1461,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            dsa_variant,
+            self._resolve_attn_parallel_mode(forward_batch),
+            self._resolve_kv_residency(forward_batch),
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

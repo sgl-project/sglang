@@ -79,6 +79,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.attn_parallel import AttnParallelMode, KvResidency
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -943,6 +944,8 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+        self.kv_residency: Optional[KvResidency] = None
+        self.kv_layout_tagged = False
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
@@ -2138,6 +2141,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+    # Stamped once after the scheduler finalizes this batch. Geometry-changing
+    # operations invalidate it back to None.
+    attn_parallel_mode: Optional[AttnParallelMode] = None
+    attn_parallel_veto_reason: Optional[str] = None
+    kv_residency: Optional[KvResidency] = None
 
     # For DP attention
     is_extend_in_batch: bool = False
@@ -2220,6 +2228,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+        residencies = {
+            KvResidency(req.kv_residency)
+            for req in reqs
+            if req.kv_residency is not None
+        }
+        if len(residencies) > 1:
+            raise RuntimeError("A ScheduleBatch cannot mix KV residencies")
 
         batch = cls(
             reqs=reqs,
@@ -2241,6 +2256,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            kv_residency=(next(iter(residencies)) if residencies else None),
         )
         return batch
 
@@ -2386,6 +2402,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
 
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
@@ -2772,6 +2790,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
@@ -2965,6 +2985,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
@@ -3074,6 +3096,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3182,6 +3206,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.reqs = []
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
+            self.attn_parallel_mode = None
+            self.attn_parallel_veto_reason = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -3208,6 +3234,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
 
         if self.input_ids is not None:
             self.input_ids = self.input_ids[keep_indices_device]
@@ -3246,6 +3274,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        if (
+            self.kv_residency is not None
+            and other.kv_residency is not None
+            and self.kv_residency != other.kv_residency
+        ):
+            raise RuntimeError("Cannot merge batches with different KV residencies")
+        if self.kv_residency is None:
+            self.kv_residency = other.kv_residency
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -3266,6 +3302,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
+        self.attn_parallel_mode = None
+        self.attn_parallel_veto_reason = None
         # Cat only when both sides hold a real token tensor; otherwise drop to
         # None and let resolve_forward_inputs rebuild from the merged
         # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
@@ -3325,6 +3363,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
+            attn_parallel_mode=self.attn_parallel_mode,
+            attn_parallel_veto_reason=self.attn_parallel_veto_reason,
+            kv_residency=self.kv_residency,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             has_grammar=self.has_grammar,

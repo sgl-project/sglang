@@ -1173,6 +1173,43 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    enable_dynamic_attn_parallel: A[
+        bool,
+        "Stamp one deterministic attention-parallel mode on each finalized batch. "
+        "Prefill batches choose TP or CP; decode remains TP unless the experimental "
+        "DCP option is enabled.",
+        NS("parallel"),
+    ] = False
+    dynamic_attn_parallel_min_prefill_tokens: A[
+        Optional[int],
+        "Minimum total uncached prefill tokens required to select CP. The default "
+        "is the selected strategy's correctness floor.",
+        NS("parallel"),
+    ] = None
+    dynamic_attn_parallel_allow_mixed: A[
+        bool,
+        "Allow CP on MIXED prefill/decode batches. Disabled by default because "
+        "the CP-v2 layouts do not support mixed token semantics.",
+        NS("parallel"),
+    ] = False
+    dynamic_attn_parallel_enable_dcp: A[
+        bool,
+        "Experimental: allow the batch selector to choose decode DCP when the "
+        "configured KV residency supports it.",
+        NS("parallel"),
+    ] = False
+    dynamic_attn_parallel_dcp_min_context: A[
+        int,
+        "Minimum maximum sequence length in a decode batch before dynamic DCP "
+        "engages.",
+        NS("parallel"),
+    ] = 8192
+    dynamic_attn_parallel_replicated_kv_fraction: A[
+        float,
+        "Fraction of the physical MLA KV pool reserved for TP-readable replicated "
+        "residency; the remainder backs compact DCP-striped residency.",
+        NS("parallel"),
+    ] = 0.5
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -4235,6 +4272,34 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
+        # Resolve the decode backend the way the model overrides do: gating on
+        # self.attention_backend alone misses --decode-attention-backend aiter.
+        if self.dcp_size > 1 and is_hip():
+            from sglang.srt.arg_groups.overrides import attention_backends_of
+
+            _, decode_backend = attention_backends_of(self)
+            if decode_backend == "aiter":
+                self._validate_aiter_mla_dcp()
+
+    def _validate_aiter_mla_dcp(self):
+        """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA:
+            return
+
+        if "fp8" in (self.kv_cache_dtype or "") and not (
+            envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
+        ):
+            raise ValueError(
+                "aiter MLA decode context parallel (--dcp-size > 1) defaults to "
+                "bf16 kv-cache. fp8 kv-cache has been validated for Kimi-K3 on "
+                "gfx950 only (gsm8k within the run-to-run band of bf16, KV pool "
+                "exactly 2x); it stays opt-in pending broader coverage. Set "
+                "SGLANG_EXPERIMENTAL_AITER_DCP_FP8=1 to enable it."
+            )
+
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
             raise ValueError(
@@ -6968,6 +7033,29 @@ class ServerArgs:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
             )
+        if self.enable_dynamic_attn_parallel and not self.enable_prefill_cp:
+            raise ValueError(
+                "--enable-dynamic-attn-parallel requires --enable-prefill-cp."
+            )
+        if (
+            self.dynamic_attn_parallel_min_prefill_tokens is not None
+            and self.dynamic_attn_parallel_min_prefill_tokens <= 0
+        ):
+            raise ValueError(
+                "--dynamic-attn-parallel-min-prefill-tokens must be positive."
+            )
+        if self.dynamic_attn_parallel_enable_dcp and self.dcp_size <= 1:
+            raise ValueError(
+                "--dynamic-attn-parallel-enable-dcp requires --dcp-size > 1."
+            )
+        if self.dynamic_attn_parallel_dcp_min_context <= 0:
+            raise ValueError(
+                "--dynamic-attn-parallel-dcp-min-context must be positive."
+            )
+        if not (0.0 < self.dynamic_attn_parallel_replicated_kv_fraction < 1.0):
+            raise ValueError(
+                "--dynamic-attn-parallel-replicated-kv-fraction must be in (0, 1)."
+            )
 
         if (
             self.enable_prefill_context_parallel
@@ -6983,7 +7071,82 @@ class ServerArgs:
             )
 
         view = self._resolved()
+        prefill_backend, _ = self._resolved_attention_backends()
+        if (
+            is_hip()
+            and self.enable_prefill_cp
+            and prefill_backend == "aiter"
+            and self.use_mla_backend()
+        ):
+            if self.cp_strategy != "zigzag":
+                raise ValueError(
+                    "Aiter MLA prefill CP currently supports --cp-strategy "
+                    "zigzag only."
+                )
+            if self.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+                raise ValueError(
+                    "Aiter MLA prefill CP currently requires BF16 KV cache; "
+                    f"got --kv-cache-dtype={self.kv_cache_dtype}."
+                )
+            if view.page_size != 1:
+                raise ValueError(
+                    "Aiter MLA prefill CP currently requires --page-size 1."
+                )
+            attn_tp_size = self.tp_size // self.dp_size // view.attn_cp_size
+            local_heads = self.get_model_config().num_attention_heads // attn_tp_size
+            if local_heads not in (16, 128):
+                raise ValueError(
+                    "Aiter MLA prefill CP requires 16 or 128 local query heads; "
+                    f"got {local_heads}."
+                )
+        if self.dynamic_attn_parallel_enable_dcp:
+            from sglang.srt.configs.model_config import AttentionArch
+
+            if self.get_model_config().attention_arch != AttentionArch.MLA:
+                raise ValueError("Dynamic TP/DCP currently supports MLA models only.")
+            if view.attn_cp_size != self.dcp_size:
+                raise ValueError(
+                    "Dynamic TP/DCP requires attn_cp_size == dcp_size so runtime "
+                    "attention-TP slices align with DCP ranks."
+                )
+            if not self.enable_cp_decode_attn_tp:
+                raise ValueError("Dynamic TP/DCP requires --enable-cp-decode-attn-tp.")
+            if view.page_size != 1:
+                raise ValueError(
+                    "The replicated-KV dynamic DCP PoC requires --page-size 1."
+                )
+            if self.dcp_replicate_q_proj:
+                raise ValueError(
+                    "Dynamic TP/DCP is incompatible with --dcp-replicate-q-proj."
+                )
+            if self.speculative_algorithm not in (None, "NONE"):
+                raise ValueError(
+                    "Dynamic TP/DCP does not yet support speculative decoding."
+                )
+            if not self.disable_overlap_schedule:
+                raise ValueError(
+                    "Residency-aware dynamic TP/DCP currently requires "
+                    "--disable-overlap-schedule."
+                )
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "Residency-aware dynamic TP/DCP does not yet support HiCache; "
+                    "its host pools need the same per-layout address translation."
+                )
         if view.attn_cp_size > 1:
+            if self.cp_strategy is not None:
+                from sglang.srt.attn_parallel import strategy_min_tokens
+
+                strategy_floor, _ = strategy_min_tokens(
+                    self.cp_strategy, view.attn_cp_size
+                )
+                configured_floor = self.dynamic_attn_parallel_min_prefill_tokens
+                if configured_floor is not None and configured_floor < strategy_floor:
+                    raise ValueError(
+                        "--dynamic-attn-parallel-min-prefill-tokens cannot be "
+                        f"smaller than the {self.cp_strategy} correctness floor "
+                        f"({strategy_floor})."
+                    )
             # The tp_size is the world size, not the real tensor parallel size
             assert (
                 self.tp_size % view.attn_cp_size == 0

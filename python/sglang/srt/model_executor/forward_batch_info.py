@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Un
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.attn_parallel import AttnParallelMode, KvResidency
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
@@ -449,6 +450,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
+    attn_parallel_mode: Optional[AttnParallelMode] = None
+    kv_residency: Optional[KvResidency] = None
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
@@ -791,6 +794,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            attn_parallel_mode=(
+                batch.attn_parallel_mode
+                if batch.attn_parallel_mode is not None
+                else AttnParallelMode.TP
+            ),
+            kv_residency=batch.kv_residency,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
@@ -1729,6 +1738,8 @@ def build_inner_fb_view(
         batch_size=bs,
         forward_mode=forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
+        attn_parallel_mode=forward_batch.attn_parallel_mode,
+        kv_residency=forward_batch.kv_residency,
         input_ids=getattr(forward_batch, "input_ids", None),
         positions=getattr(forward_batch, "positions", None),
         req_pool_indices=forward_batch.req_pool_indices,

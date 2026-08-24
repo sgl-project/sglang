@@ -49,6 +49,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.attn_parallel import KvResidency, kv_storage_dcp_size
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -4149,6 +4150,16 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def _active_storage_dcp_size(self) -> int:
+        allocator = getattr(self, "residency_allocator", None)
+        if allocator is not None:
+            return (
+                allocator.dcp_size
+                if allocator.active_residency is KvResidency.STRIPED
+                else 1
+            )
+        return kv_storage_dcp_size(get_parallel())
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4158,17 +4169,24 @@ class MLATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+        storage_dcp_size = self._active_storage_dcp_size()
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * storage_dcp_size,
+            "set_kv_buffer (MLA)",
+        )
+        if storage_dcp_size > 1:
+            valid_mask = loc % storage_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
+            loc = loc // storage_dcp_size
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4185,8 +4203,11 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        storage_dcp_size: int,
     ) -> None:
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+            if storage_dcp_size > 1:
+                raise RuntimeError("ROCm FP8 MLA KV write does not support striped DCP")
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
@@ -4212,6 +4233,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
+                dcp_world_size=storage_dcp_size,
+                dcp_rank=get_parallel().attn_dcp_rank,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
@@ -4226,6 +4249,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                dcp_world_size=storage_dcp_size,
+                dcp_rank=get_parallel().attn_dcp_rank,
             )
 
     def set_mla_kv_buffer(
@@ -4236,11 +4261,11 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
+        storage_dcp_size = self._active_storage_dcp_size()
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.page_size) * storage_dcp_size,
             "set_mla_kv_buffer (MLA)",
         )
         layer_id = (
@@ -4251,6 +4276,7 @@ class MLATokenToKVPool(KVCache):
             loc,
             cache_k_nope,
             cache_k_rope,
+            storage_dcp_size,
         )
 
     def get_mla_kv_buffer(
@@ -4278,7 +4304,8 @@ class MLATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
-        size_limit = self.size + self.page_size
+        storage_dcp_size = self._active_storage_dcp_size()
+        size_limit = (self.size + self.page_size) * storage_dcp_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
@@ -4287,6 +4314,17 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if storage_dcp_size > 1:
+            rank = get_parallel().attn_dcp_rank
+            tgt_owner = tgt_loc_flat % storage_dcp_size == rank
+            src_owner = src_loc_flat % storage_dcp_size == rank
+            if not torch.equal(tgt_owner, src_owner):
+                raise RuntimeError(
+                    "DCP KV relocation changed token ownership between source "
+                    "and destination"
+                )
+            tgt_loc_flat = tgt_loc_flat[tgt_owner] // storage_dcp_size
+            src_loc_flat = src_loc_flat[src_owner] // storage_dcp_size
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 

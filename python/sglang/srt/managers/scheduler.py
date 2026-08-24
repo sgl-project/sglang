@@ -59,6 +59,14 @@ import torch
 import torch.distributed
 from torch.distributed import barrier
 
+from sglang.srt.attn_parallel import (
+    AttnParallelDecision,
+    AttnParallelMode,
+    KvResidency,
+    kv_storage_dcp_size,
+    select_attn_parallel_mode,
+)
+
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
@@ -106,6 +114,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -2114,7 +2123,7 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            * kv_storage_dcp_size(get_parallel()),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2263,7 +2272,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self.max_total_num_tokens * kv_storage_dcp_size(get_parallel())
                 - paged_input_len
                 - self.page_size
                 - 1,
@@ -3093,6 +3102,82 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _stamp_attn_parallel_mode(self, batch: ScheduleBatch) -> None:
+        strategy = get_cp_strategy() if envs.SGLANG_ENABLE_CP_V2.get() else None
+        decision = select_attn_parallel_mode(
+            forward_mode=batch.forward_mode,
+            extend_seq_lens=(
+                batch.extend_lens
+                if not batch.forward_mode.is_decode_or_idle()
+                else None
+            ),
+            num_tokens=int(batch.extend_num_tokens or 0),
+            strategy=(strategy.name if strategy is not None else None),
+            cp_size=self.ps.attn_cp_size,
+            min_prefill_tokens=(
+                self.server_args.dynamic_attn_parallel_min_prefill_tokens
+                if self.server_args.enable_dynamic_attn_parallel
+                else None
+            ),
+            allow_mixed=self.server_args.dynamic_attn_parallel_allow_mixed,
+            enable_decode_dcp=(
+                self.ps.attn_dcp_size > 1
+                and (
+                    not self.server_args.enable_dynamic_attn_parallel
+                    or self.server_args.dynamic_attn_parallel_enable_dcp
+                )
+            ),
+            dcp_size=self.ps.attn_dcp_size,
+            decode_seq_lens=(
+                batch.seq_lens_cpu.tolist()
+                if batch.forward_mode.is_decode()
+                and batch.seq_lens_cpu is not None
+                and hasattr(batch.seq_lens_cpu, "tolist")
+                else batch.seq_lens_cpu if batch.forward_mode.is_decode() else None
+            ),
+            min_decode_context=(
+                self.server_args.dynamic_attn_parallel_dcp_min_context
+                if self.server_args.enable_dynamic_attn_parallel
+                else 1
+            ),
+            kv_residency=batch.kv_residency,
+        )
+        if (
+            not self.server_args.enable_dynamic_attn_parallel
+            and self.ps.attn_dcp_size > 1
+            and (
+                batch.forward_mode.is_target_verify()
+                or batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            decision = AttnParallelDecision(AttnParallelMode.DCP)
+        batch.attn_parallel_mode = decision.mode
+        batch.attn_parallel_veto_reason = decision.veto_reason
+
+    def _ensure_req_kv_residency(self, req: Req) -> None:
+        if req.kv_residency is not None:
+            return
+        if self.server_args.dynamic_attn_parallel_enable_dcp:
+            prompt_len = len(req.full_untruncated_fill_ids or req.origin_input_ids)
+            req.kv_residency = (
+                KvResidency.STRIPED
+                if prompt_len >= self.server_args.dynamic_attn_parallel_dcp_min_context
+                else KvResidency.REPLICATED
+            )
+            if not req.kv_layout_tagged:
+                layout_tag = (
+                    f"|sglang-kv:{req.kv_residency.name.lower()}:"
+                    f"dcp{self.ps.attn_dcp_size}:epoch0"
+                )
+                req.extra_key = (req.extra_key or "") + layout_tag
+                req.kv_layout_tagged = True
+        else:
+            req.kv_residency = (
+                KvResidency.STRIPED
+                if self.ps.attn_dcp_size > 1
+                else KvResidency.REPLICATED
+            )
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -3202,6 +3287,8 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            if new_batch is not None and new_batch.attn_parallel_mode is None:
+                self._stamp_attn_parallel_mode(new_batch)
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
@@ -3216,6 +3303,11 @@ class Scheduler(
             else:
                 ret = None
 
+        # Stamp before the DP-attention sync so the existing all-gather can
+        # apply a rank-wide veto without introducing a new collective.
+        if ret is not None and ret.attn_parallel_mode is None:
+            self._stamp_attn_parallel_mode(ret)
+
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
@@ -3228,6 +3320,17 @@ class Scheduler(
         )
 
         if ret:
+            if ret.attn_parallel_mode is None:
+                self._stamp_attn_parallel_mode(ret)
+            if (
+                self.server_args.enable_dynamic_attn_parallel
+                and self.metrics_collector is not None
+            ):
+                self.metrics_collector.increment_dynamic_attn_parallel_batch(
+                    mode=ret.attn_parallel_mode.name.lower(),
+                    veto_reason=ret.attn_parallel_veto_reason,
+                    vote_mismatch=ret.attn_parallel_veto_reason == "rank_veto",
+                )
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
@@ -3289,6 +3392,18 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        for running_req in running_batch.reqs:
+            self._ensure_req_kv_residency(running_req)
+        if running_batch.reqs and running_batch.kv_residency is None:
+            running_batch.kv_residency = running_batch.reqs[0].kv_residency
+        if self.chunked_req is not None:
+            self._ensure_req_kv_residency(self.chunked_req)
+
+        target_kv_residency = (
+            running_batch.kv_residency
+            if not running_batch.is_empty()
+            else self.chunked_req.kv_residency if self.chunked_req is not None else None
+        )
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -3314,8 +3429,19 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # Residency is part of the radix namespace, so stamp it before LPM or
+        # any prefix-sensitive policy inspects the waiting queue.
+        for waiting_req in self.waiting_queue:
+            self._ensure_req_kv_residency(waiting_req)
+
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        if target_kv_residency is None and self.waiting_queue:
+            target_kv_residency = self.waiting_queue[0].kv_residency
+        if target_kv_residency is not None and hasattr(
+            self.token_to_kv_pool_allocator, "set_active_residency"
+        ):
+            self.token_to_kv_pool_allocator.set_active_residency(target_kv_residency)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3340,7 +3466,11 @@ class Scheduler(
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
         adder = PrefillAdder(
-            self.page_size,
+            (
+                self.token_to_kv_pool_allocator.page_size
+                if self.server_args.dynamic_attn_parallel_enable_dcp
+                else self.page_size
+            ),
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
@@ -3381,6 +3511,11 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                continue
+            self._ensure_req_kv_residency(req)
+            if target_kv_residency is None:
+                target_kv_residency = req.kv_residency
+            if req.kv_residency != target_kv_residency:
                 continue
 
             running_bs = len(running_batch.reqs)

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.attn_parallel import kv_storage_dcp_size
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_contex
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
+    ResidencyAwarePagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -1773,15 +1775,32 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
-                            page_size=get_schedule().page_size
-                            * get_parallel().attn_dcp_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if get_parallel().dynamic_attn_parallel_enable_dcp:
+                            token_to_kv_pool_allocator = ResidencyAwarePagedTokenToKVPoolAllocator(
+                                physical_size=sizes.max_total_num_tokens,
+                                physical_page_size=get_schedule().page_size,
+                                dcp_size=get_parallel().attn_dcp_size,
+                                replicated_fraction=(
+                                    get_parallel().dynamic_attn_parallel_replicated_kv_fraction
+                                ),
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                            token_to_kv_pool.residency_allocator = (
+                                token_to_kv_pool_allocator
+                            )
+                        else:
+                            loc_scale = kv_storage_dcp_size(get_parallel())
+                            token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                                sizes.max_total_num_tokens * loc_scale,
+                                page_size=get_schedule().page_size * loc_scale,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
 
             if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."

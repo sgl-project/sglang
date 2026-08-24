@@ -13,6 +13,7 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.attn_parallel import KvResidency
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -49,6 +50,15 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 logger = logging.getLogger(__name__)
+
+
+def _activate_batch_residency(batch: ScheduleBatch) -> None:
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if not hasattr(allocator, "set_active_residency"):
+        return
+    if batch.kv_residency is None:
+        raise RuntimeError("Residency-aware allocation requires a stamped batch")
+    allocator.set_active_residency(KvResidency(batch.kv_residency))
 
 
 def write_cache_indices(
@@ -288,6 +298,8 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
+    _activate_batch_residency(batch)
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -525,6 +537,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc: allocated cache locations
     """
 
+    _activate_batch_residency(batch)
     batch.maybe_evict_swa()
 
     seq_lens_gpu = batch.seq_lens

@@ -112,6 +112,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
             return False
+        if getattr(forward_mode, "name", None) == "MIXED":
+            return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
@@ -338,6 +340,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.AITER,
         ]
 
     def run_attention(

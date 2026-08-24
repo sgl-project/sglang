@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.attn_parallel import AttnParallelMode
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -89,6 +90,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    local_attn_parallel_mode: int
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -96,6 +98,8 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    attn_parallel_mode: int = None
+    attn_parallel_vote_mismatch: bool = False
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -108,6 +112,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.local_attn_parallel_mode,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +128,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                AttnParallelMode.DCP.value,  # permissive idle-rank sentinel
             ],
             device=device,
             dtype=dtype,
@@ -194,6 +200,18 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        active_modes = tp0_info_cpu[tp0_info_cpu[:, 5] != ForwardMode.IDLE.value, 7]
+        if active_modes.numel() == 0:
+            self.attn_parallel_mode = self.local_attn_parallel_mode
+            self.attn_parallel_vote_mismatch = False
+        else:
+            first_mode = int(active_modes[0])
+            self.attn_parallel_vote_mismatch = bool((active_modes != first_mode).any())
+            self.attn_parallel_mode = (
+                AttnParallelMode.TP.value
+                if self.attn_parallel_vote_mismatch
+                else first_mode
+            )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -223,6 +241,12 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.attn_parallel_mode = AttnParallelMode(mlp_sync_info.attn_parallel_mode)
+    if (
+        mlp_sync_info.attn_parallel_vote_mismatch
+        and batch.attn_parallel_mode is AttnParallelMode.TP
+    ):
+        batch.attn_parallel_veto_reason = "rank_veto"
 
 
 def prepare_mlp_sync_batch_raw(
@@ -341,7 +365,13 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_attn_parallel_mode=(
+            int(local_batch.attn_parallel_mode)
+            if local_batch is not None and local_batch.attn_parallel_mode is not None
+            else AttnParallelMode.DCP.value
+        ),
     )
+    mlp_sync_info.attn_parallel_mode = mlp_sync_info.local_attn_parallel_mode
 
     if not skip_all_gather:
         mlp_sync_info.all_gather(
