@@ -184,12 +184,6 @@ baseline; everything else stays identical. GPU peak stays about 18 GB
 either way because streaming offload is set by the offload buffers and VAE
 decode, not the weight dtype.
 
-For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager.
-The current `torch.compile` path changes the model's numerical output, so it is
-not enabled implicitly by any recommended lossless preset. An explicit
-`--enable-torch-compile true` remains available for controlled experiments, but
-it should not be used to generate consistency ground truth.
-
 ### Pre-quantized GGUF transformer
 
 Use `--transformer-weights-path` to replace only the DiT with a GGUF file; the
