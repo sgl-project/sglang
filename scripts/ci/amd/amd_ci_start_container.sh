@@ -22,19 +22,12 @@ VERSION_RESOLVE_SECONDS=$SECONDS
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-# In-network mirror of rocm/sgl-dev, reachable from the mi30x fleet, so it is
-# enabled per architecture once the GPU arch is known below.
-# AMD_CI_DOCKER_REGISTRY_MIRROR overrides that either way: a host:port to
-# retarget it, or the empty string to always pull from Docker Hub.
-DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
-# Cap the mirror attempt so a degraded registry cannot cost more than the
-# Docker Hub pull it is meant to replace.
-MIRROR_PULL_TIMEOUT="${AMD_CI_MIRROR_PULL_TIMEOUT:-900}"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -56,7 +49,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
@@ -64,8 +57,6 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
-      echo "  AMD_CI_DOCKER_REGISTRY_MIRROR=HOST:PORT"
-      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${DEFAULT_DOCKER_REGISTRY_MIRROR} on mi30x and to none elsewhere. Set to the empty string to always use Docker Hub."
       echo "  AMD_CI_IMAGE_TARBALL_CACHE=1|0"
       echo "      Cache the image as a tarball on the persistent volume so later jobs load instead of pulling. Defaults to on for mi30x, off elsewhere."
       exit 0
@@ -102,22 +93,6 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
-
-# The mirror lives in the mi30x fleet's network. Other pools sit in a different
-# CSP and cannot route to it, where the attempt only adds a 15s connect timeout
-# ahead of the Docker Hub pull that has to happen anyway.
-if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
-  LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
-elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
-  LOCAL_DOCKER_REGISTRY="${DEFAULT_DOCKER_REGISTRY_MIRROR}"
-else
-  LOCAL_DOCKER_REGISTRY=""
-fi
-if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-  echo "Registry mirror for ${GPU_ARCH}: ${LOCAL_DOCKER_REGISTRY}"
-else
-  echo "No registry mirror for ${GPU_ARCH}; pulling from Docker Hub."
-fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
@@ -187,15 +162,7 @@ find_latest_image() {
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry.
-  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
-  # `docker manifest inspect --insecure` because that command runs in the
-  # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 10.44.14.109:5000 (every probe either fast-fails with TLS
-  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
-  # The actual local-registry pull still happens in the call site below via
-  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
-  # docker daemon on the host and inherits its insecure-registries config.
+  # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -317,7 +284,7 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   IMAGE="${CUSTOM_IMAGE}"
   IMAGE_SOURCE="custom-image"
   echo "Using custom image: ${IMAGE}"
-  if [[ -n "${LOCAL_DOCKER_REGISTRY}" && "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
   else
     retry_with_backoff 6 docker pull "${IMAGE}"
@@ -352,35 +319,15 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  pulled_from_mirror=0
-  loaded_from_cache=0
   # Cheapest source first: a tarball on the persistent volume, seeded by
-  # whichever job missed before this one.
+  # whichever job missed before this one. Otherwise pull from Docker Hub, which
+  # #36171 made the only remote source, and seed the tarball so the next job on
+  # this volume does not repeat the pull.
   if image_cache_load "${IMAGE}"; then
-    loaded_from_cache=1
     IMAGE_SOURCE="local-tarball"
-  elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-    # Try the in-network mirror before Docker Hub, but bounded: it is not
-    # reliably the faster source. In run 32437655302 this pull moved 68GB at
-    # 4.3 MB/s and took 4.4h, against a Docker Hub p50 of ~7min, and the output
-    # was streamed nowhere because it used to be captured into a variable.
-    mirror_started=$SECONDS
-    if timeout "${MIRROR_PULL_TIMEOUT}" docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"; then
-      echo "Pulled from local docker registry in $(( SECONDS - mirror_started ))s: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-      docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-      pulled_from_mirror=1
-    else
-      echo "Local docker registry pull gave up after $(( SECONDS - mirror_started ))s (budget ${MIRROR_PULL_TIMEOUT}s); falling back to public registry: ${IMAGE}" >&2
-    fi
-  fi
-  if (( loaded_from_cache == 0 )); then
-    if (( pulled_from_mirror == 0 )); then
-      IMAGE_SOURCE="docker-hub"
-      retry_with_backoff 6 docker pull "${IMAGE}"
-    else
-      IMAGE_SOURCE="registry-mirror"
-    fi
-    # Whatever this job had to fetch, the next one on this volume should not.
+  else
+    IMAGE_SOURCE="docker-hub"
+    retry_with_backoff 6 docker pull "${IMAGE}"
     image_cache_save "${IMAGE}"
   fi
 fi
