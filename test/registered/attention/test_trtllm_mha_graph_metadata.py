@@ -121,47 +121,55 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
-    """Hybrid wrappers must forward init_forward_metadata_in_graph to the
-    wrapped backend(s) — the inherited no-op would leave the fused metadata
-    rebuild out of the captured graph (stale page table on every replay)."""
-    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-    )
+    # The hybrid backend reads the mode from the published configuration.
+    from sglang.srt.runtime_context import get_context
 
-    def make_fake(name, calls):
-        return SimpleNamespace(
-            token_to_kv_pool=None,
-            req_to_token_pool=None,
-            needs_cpu_seq_lens=False,
-            init_forward_metadata_in_graph=lambda fb: calls.append(name),
+    override = get_context().override_server_args(speculative_attention_mode="decode")
+    override.install()
+    try:
+        """Hybrid wrappers must forward init_forward_metadata_in_graph to the
+        wrapped backend(s) — the inherited no-op would leave the fused metadata
+        rebuild out of the captured graph (stale page table on every replay)."""
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
         )
 
-    fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        def make_fake(name, calls):
+            return SimpleNamespace(
+                token_to_kv_pool=None,
+                req_to_token_pool=None,
+                needs_cpu_seq_lens=False,
+                init_forward_metadata_in_graph=lambda fb: calls.append(name),
+            )
 
-    calls = []
-    hybrid = HybridAttnBackend(
-        SimpleNamespace(
-            kv_cache_dtype=torch.bfloat16,
-            token_to_kv_pool=None,
-            req_to_token_pool=None,
-            server_args=SimpleNamespace(speculative_attention_mode="decode"),
-            model_config=SimpleNamespace(context_len=2048),
-        ),
-        prefill_backend=make_fake("prefill", calls),
-        decode_backend=make_fake("decode", calls),
-    )
-    hybrid.init_forward_metadata_in_graph(fb)
-    assert calls == ["decode"]
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
-    calls = []
-    hybrid_linear = HybridLinearAttnBackend(
-        full_attn_backend=make_fake("full", calls),
-        linear_attn_backend=make_fake("linear", calls),
-        full_attn_layers=[0],
-    )
-    hybrid_linear.init_forward_metadata_in_graph(fb)
-    assert calls == ["full", "linear"]
+        calls = []
+        hybrid = HybridAttnBackend(
+            SimpleNamespace(
+                kv_cache_dtype=torch.bfloat16,
+                token_to_kv_pool=None,
+                req_to_token_pool=None,
+                server_args=SimpleNamespace(speculative_attention_mode="decode"),
+                model_config=SimpleNamespace(context_len=2048),
+            ),
+            prefill_backend=make_fake("prefill", calls),
+            decode_backend=make_fake("decode", calls),
+        )
+        hybrid.init_forward_metadata_in_graph(fb)
+        assert calls == ["decode"]
+
+        calls = []
+        hybrid_linear = HybridLinearAttnBackend(
+            full_attn_backend=make_fake("full", calls),
+            linear_attn_backend=make_fake("linear", calls),
+            full_attn_layers=[0],
+        )
+        hybrid_linear.init_forward_metadata_in_graph(fb)
+        assert calls == ["full", "linear"]
+    finally:
+        override.restore()
 
 
 def test_metadata_update_records_inside_cuda_graph():

@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -75,38 +76,42 @@ def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     return float(imgvid_noise_aug), float(audio_noise_aug)
 
 
-def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
+def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
     """Reject stale/middle/reordered keyframe payloads at the DiT sink."""
 
     task = None if plan is None else str(plan.task)
-    if task != "fl2va":
+    if task not in {"fl2va", "ref2va"}:
         if keyframe is not None:
             raise ValueError(
-                "keyframe condition rows are only valid for plan.task='fl2va'"
+                "keyframe condition rows require plan.task='fl2va' or 'ref2va'"
             )
         return
+    if keyframe is None:
+        if task == "fl2va":
+            raise ValueError("fl2va denoising requires encoded keyframe condition rows")
+        return
     if not isinstance(keyframe, Mapping):
-        raise ValueError("fl2va denoising requires encoded keyframe condition rows")
+        raise ValueError("encoded keyframe condition rows must be a mapping")
 
     semantic_indices = tuple(keyframe.get("semantic_frame_indices") or ())
     if semantic_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
         raise ValueError(
-            "fl2va denoising requires semantic_frame_indices in "
+            "keyframe denoising requires semantic_frame_indices in "
             f"{MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, "
             f"got {semantic_indices!r}"
         )
     frame_count = keyframe.get("frame_count")
     if isinstance(frame_count, bool) or not isinstance(frame_count, int):
-        raise ValueError("fl2va keyframe payload requires an integer frame_count")
+        raise ValueError("keyframe payload requires an integer frame_count")
     if frame_count <= 1:
-        raise ValueError("fl2va keyframe payload frame_count must be greater than one")
+        raise ValueError("keyframe payload frame_count must be greater than one")
     pixel_indices = keyframe.get("pixel_frame_indices")
     expected_pixel_indices = [
         frame_count - 1 if index == -1 else index for index in semantic_indices
     ]
     if pixel_indices != expected_pixel_indices:
         raise ValueError(
-            "fl2va denoising requires pixel_frame_indices resolved from the "
+            "keyframe denoising requires pixel_frame_indices resolved from the "
             "semantic anchors, "
             f"got {pixel_indices!r} for frame_count={frame_count}"
         )
@@ -118,15 +123,15 @@ def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
         or any(not isinstance(entry, Mapping) for entry in entries)
     ):
         raise ValueError(
-            "fl2va denoising requires one encoded keyframe per semantic anchor"
+            "keyframe denoising requires one encoded keyframe per semantic anchor"
         )
     if [entry.get("frame_index") for entry in entries] != list(semantic_indices):
-        raise ValueError("fl2va encoded keyframes must remain in semantic anchor order")
+        raise ValueError("encoded keyframes must remain in semantic anchor order")
     if [
         entry.get("resolved_frame_index") for entry in entries
     ] != expected_pixel_indices:
         raise ValueError(
-            "fl2va encoded keyframes must carry matching resolved_frame_index values"
+            "encoded keyframes must carry matching resolved_frame_index values"
         )
 
     latent_h = int(keyframe.get("latent_h") or 0)
@@ -141,7 +146,7 @@ def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
     ):
         actual_rows = None if not isinstance(rows, torch.Tensor) else int(rows.shape[0])
         raise ValueError(
-            "fl2va encoded keyframe rows do not match target-canvas blocks: "
+            "encoded keyframe rows do not match target-canvas blocks: "
             f"expected={expected_rows}, actual={actual_rows}"
         )
 
@@ -154,8 +159,26 @@ def _imgvid_condition_shapes(
 ) -> list[tuple[int, int, int]]:
     """Return visual-condition ``(T,H,W)`` in packed anchor-row order."""
 
+    shapes = []
+    if isinstance(keyframe, Mapping):
+        entries = keyframe.get("keyframes")
+        if isinstance(entries, list) and entries:
+            shapes.extend(
+                (1, int(entry["latent_h"]), int(entry["latent_w"])) for entry in entries
+            )
+        else:
+            latent_h = int(keyframe["latent_h"])
+            latent_w = int(keyframe["latent_w"])
+            frame_rows = (latent_h // 2) * (latent_w // 2)
+            rows = keyframe["rows"]
+            if frame_rows <= 0 or int(rows.shape[0]) % frame_rows:
+                raise ValueError(
+                    "legacy keyframe rows cannot be split into visual-condition frames"
+                )
+            shapes.extend(
+                [(1, latent_h, latent_w)] * (int(rows.shape[0]) // frame_rows)
+            )
     if ref2va_blocks is not None:
-        shapes = []
         for block in ref2va_blocks:
             kind = str(block["kind"])
             if kind == "image":
@@ -175,23 +198,7 @@ def _imgvid_condition_shapes(
         # supplied above; reaching here indicates an upstream bug.
         raise ValueError("ref2va visual-condition shapes require ordered blocks")
 
-    if not isinstance(keyframe, Mapping):
-        return []
-    entries = keyframe.get("keyframes")
-    if isinstance(entries, list) and entries:
-        return [
-            (1, int(entry["latent_h"]), int(entry["latent_w"])) for entry in entries
-        ]
-
-    latent_h = int(keyframe["latent_h"])
-    latent_w = int(keyframe["latent_w"])
-    frame_rows = (latent_h // 2) * (latent_w // 2)
-    rows = keyframe["rows"]
-    if frame_rows <= 0 or int(rows.shape[0]) % frame_rows:
-        raise ValueError(
-            "legacy keyframe rows cannot be split into visual-condition frames"
-        )
-    return [(1, latent_h, latent_w)] * (int(rows.shape[0]) // frame_rows)
+    return shapes
 
 
 def _ref2va_payload_entry(
@@ -245,6 +252,8 @@ def _ref2va_ordered_blocks_and_rows(
     for material in plan.materials:
         chain = str(material.material_chain)
         condition_index = int(material.condition_index)
+        if chain == "image.target_canvas":
+            continue
         if chain == "image.reference_preserve":
             entry = _ref2va_payload_entry(
                 ref_image,
@@ -404,29 +413,119 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
-        generic_requested = (
-            super()._cache_dit_requested() and "quality" not in explicit_fields
+        enable_override = batch.sampling_params.enable_cache_dit
+        generic_enabled = (
+            super()._cache_dit_requested()
+            if enable_override is None
+            else enable_override
         )
-        desired_mode = (
-            "high" if quality == "high" else ("generic" if generic_requested else None)
-        )
+        generic_requested = generic_enabled and "quality" not in explicit_fields
+        if enable_override is False:
+            # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif quality == "high":
+            desired_mode = "high"
+        else:
+            desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
+
+        if self.server_args.enable_breakable_cuda_graph:
+            if desired_mode is not None:
+                super()._maybe_enable_cache_dit(num_inference_steps, batch)
+            return
 
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
         # makes the process-wide hook transition safe at this batch boundary.
         if self._cache_dit_enabled and current_mode != desired_mode:
-            self.transformer = disable_cache_on_transformer(self.transformer)
-            self._cache_dit_enabled = False
-            self._cached_num_steps = None
+            # Unmount first: the blocks must stay preserved for as long as
+            # Cache-DiT still holds references to their inputs. Settle the state
+            # fields before restoring the in-place path, so a failure there
+            # costs throughput rather than leaving the stage inconsistent.
+            self._unmount_cache_dit()
             self._minimax_h3_cache_mode = None
+            self._set_cache_dit_input_preservation(False)
 
         if desired_mode is None:
             return
-        super()._maybe_enable_cache_dit(num_inference_steps, batch)
+
+        # Arm before delegating whenever this H3 stage requests caching,
+        # without predicting whether the parent will accept the mount.
+        # cache_dit.enable_cache swaps `blocks` for a single CachedBlocks
+        # wrapper, so the real blocks are only reachable beforehand -- and a
+        # wrong prediction would hand Cache-DiT unpreserved blocks, whose
+        # residuals read as zero, which is silent. Arming is one boolean per
+        # block and nothing runs before the parent decides, so guessing
+        # conservatively costs approximately nothing.
+        was_enabled = self._cache_dit_enabled
+        if not was_enabled:
+            self._set_cache_dit_input_preservation(True)
+        try:
+            super()._maybe_enable_cache_dit(num_inference_steps, batch)
+        except Exception:
+            if not was_enabled:
+                self._disarm_after_failed_mount()
+            raise
+
         if self._cache_dit_enabled:
             self._minimax_h3_cache_mode = desired_mode
+        elif not was_enabled:
+            # The parent declined to mount, for example because breakable
+            # CUDA graphs are enabled or this is an ordinary warmup. Nothing
+            # holds the block inputs, so go back to the in-place path.
+            self._set_cache_dit_input_preservation(False)
+
+    def _disarm_after_failed_mount(self) -> None:
+        """Restore the in-place path only once Cache-DiT is confirmed gone.
+
+        cache_dit.enable_cache swaps the block list before the rest of the mount
+        runs, so a later failure can leave caching attached. Disarming then
+        would hand Cache-DiT unpreserved blocks and silently reproduce the
+        zero-residual bug, so if the unmount does not succeed we stay armed and
+        pay throughput instead.
+        """
+        try:
+            self.transformer = disable_cache_on_transformer(self.transformer)
+        except Exception:
+            logger.warning(
+                "Could not unmount Cache-DiT after a failed mount; leaving "
+                "MiniMax-H3 input preservation on",
+                exc_info=True,
+            )
+            return
+        # The parent may have flipped these before failing; leaving them set
+        # would send the next request down the refresh path with nothing
+        # mounted.
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._cache_dit_active_key = None
+        self._minimax_h3_cache_mode = None
+        self._set_cache_dit_input_preservation(False)
+
+    def _set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Flip input preservation on the H3 model, failing closed.
+
+        Skipping this silently would put us back where this stage started: cache
+        mounted, residuals reading as zero, no hits and nothing logged. If the
+        model cannot be reached, that is a wiring bug and should surface here.
+        """
+        model = self.transformer
+        for _ in range(4):  # unwrap compile/parallel wrappers, if any
+            if hasattr(model, "set_cache_dit_input_preservation"):
+                break
+            inner = getattr(model, "_orig_mod", None) or getattr(model, "module", None)
+            if inner is None:
+                break
+            model = inner
+        setter = getattr(model, "set_cache_dit_input_preservation", None)
+        if not callable(setter):
+            raise TypeError(
+                "MiniMax-H3 Cache-DiT requires set_cache_dit_input_preservation() "
+                f"on the transformer, but {type(self.transformer).__name__} does "
+                "not expose it"
+            )
+        setter(enabled)
 
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
@@ -515,9 +614,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        if not (current_platform.is_cuda() or current_platform.is_mps()):
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+        device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
@@ -698,8 +797,7 @@ class _FullLoopContext:
 def _resolve_full_loop_context(batch: Req) -> _FullLoopContext:
     """Read/validate extras and the denoise state into a loop context.
 
-    Enforces the task-payload exclusivity rules (keyframe vs reference
-    exclusivity) and cross-checks the resolved latent dims.
+    Validates task payloads and cross-checks the resolved latent dims.
     """
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
         MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
@@ -728,9 +826,7 @@ def _resolve_full_loop_context(batch: Req) -> _FullLoopContext:
         or ctx.ref_audio is not None
         or ctx.ref_video is not None
     )
-    if ctx.is_ref2va and ctx.keyframe is not None:
-        raise ValueError("keyframe and reference extras are mutually exclusive")
-    _validate_fl2va_keyframe_payload(ctx.plan, ctx.keyframe)
+    _validate_keyframe_payload(ctx.plan, ctx.keyframe)
 
     ctx.latent_t = int(ctx.state["latent_t"])
     ctx.latent_h = int(ctx.state["latent_h"])
@@ -753,7 +849,7 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
                 "ref2va reference extras require a resolved plan; "
                 "plan-less ref2va requests are unsupported"
             )
-        ctx.ref2va_positive_blocks, ctx.cond_rows, ctx.audio_ref_rows = (
+        ctx.ref2va_positive_blocks, ref_rows, ctx.audio_ref_rows = (
             _ref2va_ordered_blocks_and_rows(
                 plan=ctx.plan,
                 ref_image=ctx.ref_image,
@@ -761,6 +857,12 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
                 ref_video=ctx.ref_video,
             )
         )
+        condition_parts = []
+        if ctx.keyframe is not None:
+            condition_parts.append(ctx.keyframe["rows"])
+        if ref_rows is not None:
+            condition_parts.append(ref_rows)
+        ctx.cond_rows = _cat_optional(condition_parts)
         ctx.include_cond = ctx.cond_rows is not None
     else:
         ctx.cond_rows = ctx.keyframe["rows"] if ctx.include_cond else None
@@ -794,6 +896,8 @@ def _build_packed_layout(
             latent_w=ctx.latent_w,
             audio_t=ctx.audio_t,
             ref_blocks=ctx.ref2va_positive_blocks,
+            keyframe_frame_indices=ctx.keyframe_frame_indices,
+            frame_count=ctx.keyframe_frame_count,
         )
     else:
         packed = minimax_h3_packed_sequence(

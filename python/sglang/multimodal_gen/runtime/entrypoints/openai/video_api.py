@@ -390,6 +390,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "use_system_prompt": _extra_value(request, "use_system_prompt"),
         "use_guardrails": _extra_value(request, "use_guardrails"),
         "enable_teacache": request.enable_teacache,
+        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": _extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": _extra_value(
+            request, "attention_backend_override"
+        ),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,

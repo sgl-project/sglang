@@ -8,6 +8,7 @@ import argparse
 import unittest
 
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,7 +24,11 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def _parse(self, args_list):
         args = self.parser.parse_args(["--model", "dummy"] + args_list)
-        return ServerArgs.from_cli_args(args)
+        server_args = ServerArgs.from_cli_args(args)
+        # Parsing hands back the raw record; the cases below read values that
+        # resolution normalises, so resolve here the way a launcher would.
+        server_args.resolve_once()
+        return server_args
 
     def test_aliases_and_dest(self):
         """Field name drives dest; long forms and short aliases both work."""
@@ -79,6 +84,33 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.extra_metric_labels, {"k": "v"})
         self.assertEqual(sa.forward_hooks, [{"type": "test"}])
 
+    def test_media_url_security_args(self):
+        try:
+            sa = self._parse(
+                [
+                    "--allowed-media-domains",
+                    "Media.Example.com.",
+                    "127.0.0.1",
+                    "--media-url-max-file-size-mb",
+                    "32",
+                ]
+            )
+            self.assertEqual(
+                sa.allowed_media_domains, ["127.0.0.1", "media.example.com"]
+            )
+            self.assertEqual(sa.media_url_max_file_size_mb, 32)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
+    def test_media_url_security_args_reject_invalid_values(self):
+        try:
+            with self.assertRaises(ValueError):
+                self._parse(["--allowed-media-domains", "https://media.example.com"])
+            with self.assertRaises(ValueError):
+                self._parse(["--media-url-max-file-size-mb", "-1"])
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
         sa = self._parse(
@@ -92,6 +124,25 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             with self.subTest(backend=backend):
                 sa = self._parse(["--image-processor-backend", backend])
                 self.assertEqual(sa.image_processor_backend, backend)
+
+    def test_startup_weight_load_mode(self):
+        """The startup loading mode keeps serial as the safe default."""
+        serial = self._parse([])
+        overlap = self._parse(["--startup-weight-load-mode", "overlap"])
+        self.assertEqual(serial.startup_weight_load_mode, "serial")
+        self.assertFalse(serial.is_startup_weight_load_overlap)
+        self.assertEqual(overlap.startup_weight_load_mode, "overlap")
+        self.assertTrue(overlap.is_startup_weight_load_overlap)
+
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                [
+                    "--model",
+                    "dummy",
+                    "--startup-weight-load-mode",
+                    "unsupported",
+                ]
+            )
 
     def test_deprecated_flags_still_work(self):
         """Deprecated flags set the correct dest field."""

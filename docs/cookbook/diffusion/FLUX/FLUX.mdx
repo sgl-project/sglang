@@ -7,31 +7,18 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { FluxDeployment } from '/src/snippets/diffusion/flux-deployment.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "image editing", "multi-reference"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "image editing", "multi-reference", "rectified flow"]} />
 
 ## 1. Model Introduction
 
-[FLUX](https://blackforestlabs.ai/) is a family of rectified flow transformer models developed by Black Forest Labs for high-quality image generation from text descriptions.
+[FLUX](https://blackforestlabs.ai/) is Black Forest Labs' rectified-flow image model family. [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is the smaller 12B text-to-image checkpoint; [FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a 32B model that adds instruction-based editing plus single- and multi-reference composition.
 
-[FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions.
+FLUX is a strong default when prompt adherence, polished image quality, or reference consistency matters. The tradeoff is deployment weight: FLUX.2 needs substantially more memory than FLUX.1, and the dev checkpoints use the FLUX non-commercial license, so review the model license before production use.
 
-**Key Features:**
-
-- **Cutting-edge Output Quality**: Second only to the state-of-the-art FLUX.1 [pro] model
-- **Competitive Prompt Following**: Matches the performance of closed-source alternatives
-- **Guidance Distillation**: Trained using guidance distillation for improved efficiency
-- **Open Weights**: Available for personal, scientific, and commercial purposes under the FLUX [dev] Non-Commercial License
-
-[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a 32 billion parameter rectified flow transformer capable of generating, editing, and combining images based on text instructions.
-
-**Key Features:**
-
-- **State-of-the-art Performance**: Leading open model in text-to-image generation, single-reference editing, and multi-reference editing
-- **No Finetuning Required**: Character, object, and style reference without additional training in one model
-- **Guidance Distillation**: Trained using guidance distillation for improved efficiency
-- **Open Weights**: Available for personal, scientific, and commercial purposes under the FLUX [dev] Non-Commercial License
-
-For more details, please refer to the [FLUX.1-dev HuggingFace page](https://huggingface.co/black-forest-labs/FLUX.1-dev), [FLUX.2-dev HuggingFace page](https://huggingface.co/black-forest-labs/FLUX.2-dev), and the [official blog post](https://blackforestlabs.ai/announcing-black-forest-labs/).
+| Checkpoint | Best fit | Main limitation |
+| --- | --- | --- |
+| `black-forest-labs/FLUX.1-dev` | High-quality text-to-image with the lighter FLUX deployment | No native multi-reference editing path |
+| `black-forest-labs/FLUX.2-dev` | Text-to-image, editing, and reference-guided composition in one model | 32B model with a larger memory footprint |
 
 ## 2. SGLang-diffusion Installation
 
@@ -230,17 +217,16 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+        --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
     ================= Serving Benchmark Result =================
-    Backend:                                 sglang-image
     Model:                                   black-forest-labs/FLUX.1-dev
     Dataset:                                 vbench
-    Task:                                    t2v
+    Task:                                    text-to-image
     --------------------------------------------------
     Benchmark duration (s):                  50.97
     Request rate:                            inf
@@ -317,17 +303,16 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+        --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result** :
 
     ```text Output
     ================= Serving Benchmark Result =================
-    Backend:                                 sglang-image
     Model:                                   black-forest-labs/FLUX.1-dev
     Dataset:                                 vbench
-    Task:                                    t2v
+    Task:                                    text-to-image
     --------------------------------------------------
     Benchmark duration (s):                  111.79
     Request rate:                            inf
