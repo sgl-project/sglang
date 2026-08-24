@@ -57,11 +57,6 @@ def _build_inputs(
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
-@unittest.skipIf(
-    get_hip_version()[:2] == (7, 0),
-    "Triton 3.4 on the ROCm 7.0 image aborts gfx950 fp8 KV tl.dot "
-    "(triton-lang/triton#8278). Coverage stays on ROCm 7.2+.",
-)
 class TestVerifySharedKV(CustomTestCase):
     def _run_parity(
         self,
@@ -143,6 +138,11 @@ class TestVerifySharedKV(CustomTestCase):
             with self.subTest(l_ext=l_ext):
                 self._run_parity(head_dim=256, v_head_dim=256, l_ext=l_ext)
 
+    @unittest.skipIf(
+        get_hip_version()[:2] == (7, 0),
+        "Triton 3.4 on the ROCm 7.0 image aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Coverage stays on ROCm 7.2+.",
+    )
     def test_qwen3_5_fp8_kv_cache(self):
         self._run_parity(
             head_dim=256,
