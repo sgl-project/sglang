@@ -19,11 +19,15 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
+    ensure_published,
     get_context,
+    get_exec,
     get_flags,
     get_parallel,
     get_server_args,
     max_speculative_num_draft_tokens,
+    publish,
+    publish_role,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -213,8 +217,8 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
     """V2b: the context owns the slot; the legacy getters are identity shims."""
 
     def test_legacy_setter_publishes_into_context(self):
-        # Identity (not equality) is the contract; publish accepts any object.
-        sentinel = object()
+        # Identity, not equality: the slot holds the very object published.
+        sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
         self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
@@ -236,16 +240,132 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
-        first, second = object(), object()
+        first = ServerArgs(model_path="dummy")
+        second = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(first)
         server_args_module.set_global_server_args_for_scheduler(second)
         self.assertIs(get_server_args(), second)
 
     def test_reset_context_clears_owned_store(self):
-        server_args_module.set_global_server_args_for_scheduler(object())
+        server_args_module.set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy")
+        )
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestEnsurePublished(_IsolatedServerArgs):
+    """A defensive publish must not re-project over a live process.
+
+    Three constructors publish because each can be built with nothing published
+    first: `ModelRunner`, `TokenizerManager`, `MMEncoder`. Inside a process that
+    already published the same record, publishing again re-projects the bags --
+    discarding every `override()` taken since, and the provenance log with it.
+
+    No current override sits in one of those windows, so what these assertions
+    protect is the mechanism, not a reproduction: the drop is silent and depends
+    on where a constructor happens to sit relative to the overrides around it.
+    """
+
+    def _record(self, **fields):
+        return ServerArgs(model_path="dummy", **fields)
+
+    def test_a_second_publish_of_the_same_record_keeps_the_overrides(self):
+        record = self._record(grammar_backend="xgrammar")
+        publish(record, role="scheduler")
+        get_context().override("grammar.import_fallback", grammar_backend="none")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertEqual(
+            get_exec().kernel.grammar_backend,
+            "none",
+            "the constructor's publish re-projected the bags, so the import "
+            "fallback was discarded and the process reports a backend it is "
+            "not using",
+        )
+        self.assertEqual(
+            len(get_context().overrides_log()),
+            1,
+            "the provenance of the override went with it",
+        )
+
+    def test_a_different_record_is_published(self):
+        first = self._record(grammar_backend="xgrammar")
+        publish(first, role="scheduler")
+        second = self._record(grammar_backend="llguidance")
+
+        ensure_published(second, role="scheduler")
+
+        self.assertIs(get_server_args(), second)
+        self.assertEqual(get_exec().kernel.grammar_backend, "llguidance")
+
+    def test_an_empty_slot_is_published(self):
+        """The standalone case the defensive publish exists for."""
+        reset_context()
+        record = self._record(grammar_backend="xgrammar")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertIs(get_server_args(), record)
+        self.assertEqual(publish_role(), "scheduler")
+
+    def test_the_same_record_under_a_different_role_is_republished(self):
+        """The role decides which namespaces this process may read."""
+        record = self._record()
+        publish(record, role="tokenizer")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertEqual(publish_role(), "scheduler")
+
+    def test_every_constructor_that_publishes_is_classified(self):
+        """A new constructor publish has to say which of the two it is.
+
+        Publishing in a constructor is right when the constructor *is* the
+        entry -- a spawned worker, the Ray actor that stands in for
+        `run_scheduler_process`, an `Engine` being (re)built, where resetting
+        the bags is the point -- and wrong when the process is already live
+        with the same record, where it silently drops overrides. The
+        difference is not visible in the syntax, so the census is pinned:
+        adding one fails here until it is classified.
+
+        Both the publisher set and "which `__init__` reaches one" come from
+        `sglang.test.config_publishers`, which derives them from the code --
+        a hand-written spelling list here missed a constructor that publishes
+        one hop away through a helper. The derivation follows helpers defined
+        in the same module; a constructor that publishes through a helper in
+        *another* module is not seen, which is the one hole left here.
+        """
+        import pathlib
+
+        import sglang
+        from sglang.test.config_publishers import constructor_publishers
+
+        srt = pathlib.Path(sglang.__file__).resolve().parent / "srt"
+        self.assertEqual(
+            constructor_publishers(srt),
+            {
+                # Entries: nothing published yet, or a rebuild that must not
+                # inherit the previous engine's runtime overrides.
+                ("entrypoints/engine.py", "Engine", "publish"),
+                ("ray/scheduler_actor.py", "SchedulerActor", "publish"),
+                # Defensive: the process is usually already live with this
+                # record, and `launch_server` publishes before building the
+                # in-process encoder.
+                ("disaggregation/encoder/server.py", "MMEncoder", "ensure_published"),
+                (
+                    "managers/tokenizer_manager.py",
+                    "TokenizerManager",
+                    "ensure_published",
+                ),
+                ("model_executor/model_runner.py", "ModelRunner", "ensure_published"),
+            },
+            "a constructor publishes and this census does not know which kind "
+            "it is; an entry uses publish(), one that may run inside a live "
+            "process with the same record uses ensure_published()",
+        )
 
 
 class TestServerArgsScopedOverride(_IsolatedServerArgs):
@@ -391,6 +511,20 @@ class _FakeResolvedArgs:
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
+    load_format: A[str, Arg(help="lf"), NS("model")] = "auto"
+    remote_instance_weight_loader_backend: A[str, Arg(help="rb"), NS("model")] = "nccl"
+    remote_instance_weight_loader_start_seed_via_transfer_engine: A[
+        bool, Arg(help="rs"), NS("model")
+    ] = False
+    modelexpress_config: A[str | None, Arg(help="mx"), NS("model")] = None
+    disaggregation_mode: A[str, Arg(help="dm"), NS("disagg")] = "null"
+    max_running_requests: A[int | None, Arg(help="mrr"), NS("schedule")] = None
+    chunked_prefill_size: A[int, Arg(help="cps"), NS("schedule")] = -1
+    max_prefill_tokens: A[int, Arg(help="mpt"), NS("schedule")] = 16384
+    enable_dynamic_chunking: A[bool, Arg(help="edc"), NS("schedule")] = False
+    cuda_graph_config: A[object | None, Arg(help="cgc"), NS("exec.graph")] = None
+    tp_size: A[int, Arg(help="tp"), NS("parallel")] = 1
+    pp_size: A[int, Arg(help="pp"), NS("parallel")] = 1
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -1012,6 +1146,99 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         ServerArgs.enable_mamba_extra_buffer_lazy(args),
                         mamba_extra_buffer_lazy_enabled(),
                     )
+
+    def test_prefill_buffer_ceiling_matches_the_member(self):
+        from sglang.srt.runtime_context import max_prefill_buffer_tokens
+
+        for chunked in (-1, 0, 1024, 8192):
+            for dynamic in (False, True):
+                for pp in (1, 4):
+                    for max_prefill in (0, 2048, 16384):
+                        with self.subTest(
+                            chunked=chunked,
+                            dynamic=dynamic,
+                            pp=pp,
+                            max_prefill=max_prefill,
+                        ):
+                            args = _FakeResolvedArgs(
+                                chunked_prefill_size=chunked,
+                                enable_dynamic_chunking=dynamic,
+                                pp_size=pp,
+                                max_prefill_tokens=max_prefill,
+                            )
+                            get_context().set_server_args(args)
+                            self.assertEqual(
+                                ServerArgs.max_prefill_buffer_tokens(args),
+                                max_prefill_buffer_tokens(),
+                            )
+
+    def test_activation_reserve_matches_the_member(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
+
+        graph = SimpleNamespace(decode=SimpleNamespace(max_bs=64))
+        cases = (
+            dict(disaggregation_mode="null", chunked_prefill_size=8192),
+            dict(disaggregation_mode="null", chunked_prefill_size=-1),
+            dict(
+                disaggregation_mode="null",
+                chunked_prefill_size=-1,
+                max_prefill_tokens=1024,
+            ),
+            dict(disaggregation_mode="decode", max_running_requests=32),
+            dict(disaggregation_mode="decode", max_running_requests=None),
+            dict(
+                disaggregation_mode="decode",
+                max_running_requests=None,
+                speculative_num_draft_tokens=4,
+            ),
+            dict(
+                disaggregation_mode="null",
+                chunked_prefill_size=8192,
+                tp_size=8,
+                pp_size=2,
+            ),
+        )
+        for case in cases:
+            for gpu_mem in (None, 20 * 1024, 80 * 1024):
+                with self.subTest(gpu_mem=gpu_mem, **case):
+                    args = _FakeResolvedArgs(cuda_graph_config=graph, **case)
+                    get_context().set_server_args(args)
+                    self.assertEqual(
+                        ServerArgs.pre_capture_activation_reserve_mb(args, gpu_mem),
+                        pre_capture_activation_reserve_mb(gpu_mem),
+                    )
+
+    def test_remote_instance_transfer_engine_matches_the_member(self):
+        from sglang.srt.runtime_context import remote_instance_transfer_engine_enabled
+
+        backends = ("nccl", "transfer_engine", "modelexpress")
+        transports = (None, '{"transport": "transfer_engine"}', '{"transport": "nixl"}')
+        for seed_via_te in (False, True):
+            for load_format in ("auto", "remote_instance"):
+                for backend in backends:
+                    for mx in transports:
+                        with self.subTest(
+                            seed=seed_via_te,
+                            load_format=load_format,
+                            backend=backend,
+                            modelexpress=mx,
+                        ):
+                            args = _FakeResolvedArgs(
+                                load_format=load_format,
+                                remote_instance_weight_loader_backend=backend,
+                                remote_instance_weight_loader_start_seed_via_transfer_engine=seed_via_te,
+                                modelexpress_config=mx,
+                            )
+                            get_context().set_server_args(args)
+                            for override in (None, "remote_instance", "auto"):
+                                self.assertEqual(
+                                    ServerArgs.remote_instance_weight_loader_use_transfer_engine(
+                                        args, override
+                                    ),
+                                    remote_instance_transfer_engine_enabled(override),
+                                )
 
     def test_attention_backends_match_the_member(self):
         from sglang.srt.runtime_context import attention_backends
