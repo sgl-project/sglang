@@ -3,7 +3,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import (
+    Gemma3RMSNorm,
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNorm,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +112,112 @@ class TestGemmaRMSNorm(CustomTestCase):
                 seed=params[4],
             ):
                 self._run_gemma_rms_norm_test(*params)
+
+
+class TestGemma3RMSNorm(CustomTestCase):
+    """Covers 2D/3D/4D inputs, including the non-contiguous ("unflatten")
+    shape that Gemma3's q_norm/k_norm actually feed in: a head slice cut out
+    of a wider qkv-style tensor via .split()+.unflatten(), so the leading
+    dims are not flattenable to 2D."""
+
+    DTYPES = [torch.half, torch.bfloat16]
+    ADD_RESIDUAL = [False, True]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not (torch.cuda.is_available() or torch.xpu.is_available()):
+            raise unittest.SkipTest("Neither CUDA nor XPU is available")
+        device = "cuda" if torch.cuda.is_available() else "xpu"
+        torch.set_default_device(device)
+
+    def _run_gemma3_rms_norm_test(
+        self, shape, add_residual, dtype, seed, non_contiguous=False
+    ):
+        torch.manual_seed(seed)
+        hidden_size = shape[-1]
+        layer = Gemma3RMSNorm(hidden_size).to(dtype=dtype)
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        scale = 1 / (2 * hidden_size)
+
+        if non_contiguous:
+            *lead, num_heads, head_dim = shape
+            total_heads = num_heads + 3
+            full = torch.randn(*lead, total_heads * head_dim, dtype=dtype) * scale
+            x = full[..., : num_heads * head_dim].unflatten(-1, (num_heads, head_dim))
+        else:
+            x = torch.randn(*shape, dtype=dtype) * scale
+
+        residual = torch.randn_like(x) * scale if add_residual else None
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x, residual)
+            out = layer(x, residual)
+
+        if add_residual:
+            self.assertTrue(torch.allclose(out[0], ref_out[0], atol=1e-2, rtol=1e-2))
+            self.assertTrue(torch.allclose(out[1], ref_out[1], atol=1e-2, rtol=1e-2))
+        else:
+            self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
+
+    def test_gemma3_rms_norm_2d(self):
+        for hidden_size, add_residual, dtype, seed in itertools.product(
+            [768, 5120, 8199], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                hidden_size=hidden_size, add_residual=add_residual, dtype=dtype
+            ):
+                self._run_gemma3_rms_norm_test(
+                    (83, hidden_size), add_residual, dtype, seed
+                )
+
+    def test_gemma3_rms_norm_3d(self):
+        for hidden_size, add_residual, dtype, seed in itertools.product(
+            [768, 5120], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                hidden_size=hidden_size, add_residual=add_residual, dtype=dtype
+            ):
+                self._run_gemma3_rms_norm_test(
+                    (4, 19, hidden_size), add_residual, dtype, seed
+                )
+
+    def test_gemma3_rms_norm_4d(self):
+        for head_dim, add_residual, dtype, seed in itertools.product(
+            [128, 256], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                head_dim=head_dim, add_residual=add_residual, dtype=dtype
+            ):
+                self._run_gemma3_rms_norm_test(
+                    (1, 19, 8, head_dim), add_residual, dtype, seed
+                )
+
+    def test_gemma3_rms_norm_3d_unflatten(self):
+        for head_dim, add_residual, dtype, seed in itertools.product(
+            [64, 128], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                head_dim=head_dim, add_residual=add_residual, dtype=dtype
+            ):
+                self._run_gemma3_rms_norm_test(
+                    (19, 4, head_dim), add_residual, dtype, seed, non_contiguous=True
+                )
+
+    def test_gemma3_rms_norm_4d_unflatten(self):
+        for head_dim, add_residual, dtype, seed in itertools.product(
+            [64, 128], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                head_dim=head_dim, add_residual=add_residual, dtype=dtype
+            ):
+                self._run_gemma3_rms_norm_test(
+                    (1, 19, 4, head_dim),
+                    add_residual,
+                    dtype,
+                    seed,
+                    non_contiguous=True,
+                )
 
 
 class TestLayerNorm(CustomTestCase):
