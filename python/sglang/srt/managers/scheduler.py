@@ -1908,6 +1908,11 @@ class Scheduler(
             ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
+            # With Attention-DP the request-plane group is attn-TP (size 1 in
+            # DEP4), so it cannot synchronize the four scheduler ranks. The
+            # exact-batch Nsight boundary must use the worker-wide CPU group;
+            # ordinary profiler coordination keeps its existing group.
+            exact_nsys_cpu_group=self.world_group.cpu_group,
         )
 
     def init_weight_updater(self) -> None:

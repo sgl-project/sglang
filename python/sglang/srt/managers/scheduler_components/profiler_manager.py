@@ -52,8 +52,11 @@ class SchedulerProfilerManager:
     ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    exact_nsys_cpu_group: Any = None
 
     def __post_init__(self) -> None:
+        if self.exact_nsys_cpu_group is None:
+            self.exact_nsys_cpu_group = self.dp_tp_cpu_group
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
@@ -87,6 +90,22 @@ class SchedulerProfilerManager:
         )
         if self.nsys_exact_decode_batches <= 0:
             raise ValueError("SGLANG_NSYS_EXACT_DECODE_BATCHES must be positive")
+        expected_sync_world_size = int(
+            os.getenv("SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE", "0") or "0"
+        )
+        if self.nsys_exact_batch and expected_sync_world_size:
+            actual_sync_world_size = torch.distributed.get_world_size(
+                group=self.exact_nsys_cpu_group
+            )
+            if actual_sync_world_size != expected_sync_world_size:
+                raise ValueError(
+                    "Exact-batch Nsight sync group has world size "
+                    f"{actual_sync_world_size}; expected {expected_sync_world_size}"
+                )
+            logger.info(
+                "Exact-batch Nsight sync group ready: world_size=%d",
+                actual_sync_world_size,
+            )
         self.nsys_exact_decode_batches_seen = 0
 
         # For ROCM
@@ -466,10 +485,10 @@ class SchedulerProfilerManager:
                     # ranks must leave the measured window together: otherwise
                     # rank 0 can block while Nsight flushes its report while a
                     # peer enters the next symmetric-memory collective.
-                    torch.distributed.barrier(self.dp_tp_cpu_group)
+                    torch.distributed.barrier(self.exact_nsys_cpu_group)
                 self._stop_profile()
                 if self.nsys_exact_batch:
-                    torch.distributed.barrier(self.dp_tp_cpu_group)
+                    torch.distributed.barrier(self.exact_nsys_cpu_group)
             if self.profiler_start_forward_ct and not self.profile_in_progress:
                 forward_ct = self.get_forward_ct()
                 start_reached = (
@@ -495,7 +514,7 @@ class SchedulerProfilerManager:
                     torch.distributed.all_reduce(
                         ready,
                         op=torch.distributed.ReduceOp.MIN,
-                        group=self.dp_tp_cpu_group,
+                        group=self.exact_nsys_cpu_group,
                     )
                     exact_worker_ready = bool(ready.item())
                 if exact_worker_ready:
