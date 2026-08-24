@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.diffusion import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,
@@ -284,6 +284,41 @@ class DynamicVarlenMaskMeta:
         return self._meta
 
 
+def prepare_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum
+) -> None:
+    """Build and cache the impl for ``target``; may raise, mutates nothing."""
+    if target in layer._attn_impl_by_backend:
+        return
+    backend_cls = get_attn_backend(
+        layer.head_size,
+        layer.dtype,
+        supported_attention_backends=layer._supported_attention_backends,
+        selected_attention_backend=target,
+    )
+    resolved = backend_cls.get_enum()
+    if resolved is not target:
+        raise ValueError(
+            f"Attention backend override '{target}' resolved to '{resolved}' on "
+            f"{type(layer).__name__}; refusing the request instead of silently "
+            "falling back."
+        )
+    impl = backend_cls.get_impl_cls()(**layer._attn_impl_ctor_kwargs)
+    wrap_attention_impl_forward(impl)
+    layer._attn_impl_by_backend[target] = impl
+
+
+def apply_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum | None
+) -> None:
+    """Flip to a prepared impl (None = construction default); cannot fail."""
+    target = target or layer._default_attn_backend
+    if target is layer.backend:
+        return
+    layer.attn_impl = layer._attn_impl_by_backend[target]
+    layer.backend = target
+
+
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""
 
@@ -321,7 +356,7 @@ class UlyssesAttention(nn.Module):
         )
         impl_cls = attn_backend.get_impl_cls()
 
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -330,11 +365,15 @@ class UlyssesAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -558,6 +597,8 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
+        is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
@@ -571,11 +612,15 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=self.softmax_scale,
@@ -583,11 +628,15 @@ class LocalAttention(nn.Module):
             causal=causal,
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
 
     def forward(
@@ -697,7 +746,8 @@ class USPAttention(nn.Module):
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
             default_attention_backend:
-              fallback used only when no global or component override is active.
+              preferred fallback when the global backend is incompatible with
+              this layer. Explicit component overrides otherwise remain strict.
             is_cross_attention:
               sparse backend preferences may select a compatible dense backend
               for cross-attention while remaining strict for self-attention.
@@ -729,7 +779,7 @@ class USPAttention(nn.Module):
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -738,11 +788,15 @@ class USPAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
@@ -1249,7 +1303,7 @@ class USPAttention(nn.Module):
             q.squeeze(0),
             k.squeeze(0),
             v.squeeze(0),
-            softmax_scale=self.softmax_scale,
+            attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
         )
