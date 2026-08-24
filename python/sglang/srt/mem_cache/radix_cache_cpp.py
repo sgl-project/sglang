@@ -128,7 +128,9 @@ class RadixCacheCpp(BasePrefixCache):
         Returns:
             int: Number of device indices that were already present in the tree before the insertion.
         """
-        ongoing_write, length = self.tree.writing_through(key.token_ids, value)
+        ongoing_write, length, _ = self.tree.writing_through(
+            key.token_ids, value, len(key)
+        )
         if self.cache_controller is None:
             assert len(ongoing_write) == 0, "Implementation error"
             return length

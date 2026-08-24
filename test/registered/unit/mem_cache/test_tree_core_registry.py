@@ -148,6 +148,37 @@ class TreeCoreRegistryTest(CustomTestCase):
         cpp_factory.assert_called_once_with(params, components)
         self.assertIs(result, cpp_core)
 
+    def test_auto_selects_cpp_for_full_swa_device_only(self):
+        params = _cache_init_params(
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+        )
+        components = {
+            ComponentType.FULL: mock.MagicMock(),
+            ComponentType.SWA: mock.MagicMock(),
+        }
+        cpp_core = mock.MagicMock()
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_cache.tree_core_registry._cpp_tree_core_factory",
+            return_value=cpp_core,
+        ) as cpp_factory:
+            result = create_tree_core("auto", params, components)
+        cpp_factory.assert_called_once_with(params, components)
+        self.assertIs(result, cpp_core)
+
+    def test_cpp_compatibility_rejects_swa_without_window_size(self):
+        params = _cache_init_params(
+            tree_components=(ComponentType.FULL, ComponentType.SWA)
+        )
+        reason = cpp_tree_core_unsupported_reason(
+            params,
+            {
+                ComponentType.FULL: mock.MagicMock(),
+                ComponentType.SWA: mock.MagicMock(),
+            },
+        )
+        self.assertIn("sliding_window_size", reason)
+
     def test_auto_falls_back_to_python_for_unsupported_components(self):
         params = _cache_init_params(
             tree_components=(ComponentType.FULL, ComponentType.MAMBA)

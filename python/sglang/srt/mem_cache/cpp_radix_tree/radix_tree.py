@@ -36,6 +36,7 @@ if TYPE_CHECKING:
             host_size: Optional[int],
             page_size: int,
             write_through_threshold: int,
+            sliding_window_size: int = 0,
         ):
             """
             Initializes the RadixTreeCpp instance.
@@ -44,9 +45,14 @@ if TYPE_CHECKING:
                 host_size (Optional[int]): Size of the radix tree on the CPU. None means no CPU tree.
                 page_size (int): Size of the page for the radix tree.
                 write_through_threshold (int): Threshold for writing through from GPU to CPU.
+                sliding_window_size (int): Sliding-window size; zero disables SWA bookkeeping.
             """
             self.tree = radix_tree_cpp.RadixTree(  # type: ignore
-                disabled, host_size, page_size, write_through_threshold
+                disabled,
+                host_size,
+                page_size,
+                write_through_threshold,
+                sliding_window_size,
             )
 
         def match_prefix(
@@ -99,7 +105,8 @@ if TYPE_CHECKING:
                        These IOhandles require write-through to the CPU in python side.
                     1. The number of indices that are matched on device.
             """
-            return self.tree.writing_through(key, indices)
+            pending, prefix_len, _ = self.tree.writing_through(key, indices)
+            return pending, prefix_len
 
         def loading_onboard(
             self,

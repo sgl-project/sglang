@@ -901,9 +901,37 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
+        )
+
+        # The C++ core already knows the exact node returned by insert.  It can
+        # collect that prefix and lock FULL/SWA in one native call, avoiding a
+        # second radix walk and another large-key Python/C++ boundary crossing.
+        fused_match_lock = getattr(
+            self.tree_core, "match_inserted_prefix_and_lock", None
+        )
+        lock_result = None
+        if fused_match_lock is not None:
+            match_result, lock_result = fused_match_lock(
+                result.last_device_node,
+                skip_lock_components=skip_lock_components,
+                inserted_value=values,
+                existing_prefix_len=result.prefix_len,
+                reused_prefix_len=req.cache_protected_len,
+            )
+        else:
+            # SWA insertion retains one extra window before the page-aligned
+            # boundary, so the normal match remains safe to repoint.
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -919,20 +947,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         self._dec_req_lock(req)
-        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
-        # already COW'd to the request's own slot, never read from this node again).
-        # Safe only because any future COW source is the COWing request's own
-        # admission-locked last_node (recorded only if still present, locked before
-        # the next alloc) -- not this evictable node. A scheduler that matched a
-        # whole batch before locking would break that. Off = original full lock.
-        skip_lock_components = (
-            (ComponentType.MAMBA,)
-            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
-            else ()
-        )
-        lock_result = self.inc_lock_ref(
-            new_last_node, skip_lock_components=skip_lock_components
-        )
+        if lock_result is None:
+            lock_result = self.inc_lock_ref(
+                new_last_node, skip_lock_components=skip_lock_components
+            )
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):

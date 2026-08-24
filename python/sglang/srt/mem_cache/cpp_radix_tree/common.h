@@ -9,7 +9,10 @@
 
 namespace radix_tree_v2 {
 
-using token_t = std::int32_t;
+// RadixKey is backed by Python's array("q").  Keeping the native token type
+// identical lets pybind expose that storage as a read-only span instead of
+// materializing a std::vector for every tree operation.
+using token_t = std::int64_t;
 using token_vec_t = std::vector<token_t>;
 using token_slice = std::span<const token_t>;
 using NodeHandle = std::size_t;

@@ -61,7 +61,7 @@ def _python_tree_core_factory(
 def _cpp_tree_core_factory(
     params: CacheInitParams, components: dict[ComponentType, TreeComponent]
 ) -> UnifiedTreeCoreInterface:
-    """The experimental C++ FULL/device-only TreeCore.
+    """The experimental C++ FULL or FULL+SWA device-only TreeCore.
 
     Keep the extension import lazy: selecting the Python backend must not pay
     the C++ JIT build cost.
@@ -78,8 +78,17 @@ def cpp_tree_core_unsupported_reason(
 ) -> Optional[str]:
     """Return why the first-stage C++ core cannot serve this configuration."""
     component_types = tuple(components)
-    if component_types != (ComponentType.FULL,):
-        return f"components={component_types!r} (only FULL is supported)"
+    supported_components = (
+        (ComponentType.FULL,),
+        (ComponentType.FULL, ComponentType.SWA),
+    )
+    if component_types not in supported_components:
+        return (
+            f"components={component_types!r} "
+            "(only FULL and device-only FULL+SWA are supported)"
+        )
+    if ComponentType.SWA in component_types and not params.sliding_window_size:
+        return "SWA component has no sliding_window_size"
     if params.enable_hicache:
         return "HiCache/host-tier caching is enabled"
     if params.enable_session_radix_cache:

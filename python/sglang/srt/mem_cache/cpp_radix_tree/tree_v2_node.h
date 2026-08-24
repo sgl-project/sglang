@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -16,35 +17,64 @@
 namespace radix_tree_v2 {
 
 struct std_vector_hash {
+  using is_transparent = void;
+
   // see https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector
-  std::size_t operator()(const token_vec_t& vec) const {
+  std::size_t operator()(token_slice vec) const {
     std::size_t hash = 0;
     for (const auto& token : vec) {
       hash ^= token + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     }
     return hash;
   }
+
+  std::size_t operator()(const token_vec_t& vec) const {
+    return (*this)(token_slice{vec});
+  }
+};
+
+struct std_vector_equal {
+  using is_transparent = void;
+
+  bool operator()(token_slice lhs, token_slice rhs) const {
+    return std::ranges::equal(lhs, rhs);
+  }
+
+  bool operator()(const token_vec_t& lhs, const token_vec_t& rhs) const {
+    return (*this)(token_slice{lhs}, token_slice{rhs});
+  }
+
+  bool operator()(const token_vec_t& lhs, token_slice rhs) const {
+    return (*this)(token_slice{lhs}, rhs);
+  }
+
+  bool operator()(token_slice lhs, const token_vec_t& rhs) const {
+    return (*this)(lhs, token_slice{rhs});
+  }
 };
 
 struct TreeNode {
  public:
-  using childern_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
+  using childern_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash, std_vector_equal>;
   using iterator_t = typename childern_map_t::iterator;
   using const_iterator_t = typename childern_map_t::const_iterator;
   using timestamp_t = std::chrono::steady_clock::time_point;
 
   TreeNode(std::size_t node_id_)
       : ref_count(0),
+        swa_ref_count(0),
         hit_count(0),
         m_io_locked(std::nullopt),
         m_io_status(IOStatus::None),
         m_io_ticket(),
         m_tokens(),
         m_device_indices(),
+        m_swa_indices(),
         m_host_indices(),
         m_parent(),
         m_children(),
         m_last_access_time(std::chrono::steady_clock::now()),
+        m_swa_last_access_time(std::chrono::steady_clock::now()),
         node_id(node_id_) {}
 
   void access(timestamp_t time = std::chrono::steady_clock::now()) {
@@ -57,6 +87,14 @@ struct TreeNode {
 
   timestamp_t time() const {
     return m_last_access_time;
+  }
+
+  void access_swa(timestamp_t time = std::chrono::steady_clock::now()) {
+    m_swa_last_access_time = time;
+  }
+
+  timestamp_t swa_time() const {
+    return m_swa_last_access_time;
   }
 
   bool on_gpu() const {
@@ -107,7 +145,16 @@ struct TreeNode {
     _assert(m_children.erase(v) > 0, "Child node not found");
   }
 
+  void erase_child(iterator_t it) {
+    _assert(it != m_children.end(), "Child node not found");
+    m_children.erase(it);
+  }
+
   iterator_t find_child(const token_vec_t& v) {
+    return m_children.find(v);
+  }
+
+  iterator_t find_child(token_slice v) {
     return m_children.find(v);
   }
 
@@ -154,10 +201,19 @@ struct TreeNode {
       new_node->m_host_indices = std::move(new_indices[0]);
       old_node->m_host_indices = std::move(new_indices[1]);
     }
+    if (old_node->m_swa_indices.defined()) {
+      auto new_indices = old_node->m_swa_indices.split_with_sizes({new_size, old_size});
+      new_node->m_swa_indices = std::move(new_indices[0]);
+      old_node->m_swa_indices = std::move(new_indices[1]);
+    }
 
     // set up ref counts and hit counts
     new_node->ref_count = old_node->ref_count;
+    new_node->swa_ref_count = old_node->swa_ref_count;
+    new_node->swa_uuid = old_node->swa_uuid;
+    old_node->swa_uuid.reset();
     new_node->hit_count = old_node->hit_count;
+    new_node->m_swa_last_access_time = old_node->m_swa_last_access_time;
 
     // If the old node (child) was locked for IO, the new node (parent) does not need
     // to be locked, since it is naturally protected by the child node's lock.
@@ -172,6 +228,11 @@ struct TreeNode {
   std::size_t diff_key(token_slice key, std::size_t offset) const {
     const auto a = token_slice{key}.subspan(offset);
     const auto b = token_slice{m_tokens}.subspan(offset);
+    const auto common_size = std::min(a.size(), b.size());
+    if (common_size == 0) return 0;
+    if (std::memcmp(a.data(), b.data(), common_size * sizeof(token_t)) == 0) {
+      return common_size;
+    }
     const auto [it_a, it_b] = std::ranges::mismatch(a, b);
     return it_a - a.begin();  // return the index of the first differing token
   }
@@ -181,6 +242,12 @@ struct TreeNode {
   }
   at::Tensor host_indices() const {
     return m_host_indices;
+  }
+  at::Tensor swa_indices() const {
+    return m_swa_indices;
+  }
+  bool has_swa() const {
+    return m_swa_indices.defined();
   }
 
   // visiting tokens are always unsafe (use `diff_key` instead)
@@ -192,6 +259,9 @@ struct TreeNode {
   }
   at::Tensor& _unsafe_host_indices() {
     return m_host_indices;
+  }
+  at::Tensor& _unsafe_swa_indices() {
+    return m_swa_indices;
   }
 
   bool is_io_free() const {
@@ -221,6 +291,8 @@ struct TreeNode {
 
  public:
   std::size_t ref_count;
+  std::size_t swa_ref_count;
+  std::optional<std::size_t> swa_uuid;
   std::size_t hit_count;
 
  private:
@@ -236,10 +308,12 @@ struct TreeNode {
 
   token_vec_t m_tokens;
   at::Tensor m_device_indices;  // indices of device value
+  at::Tensor m_swa_indices;     // physical SWA indices; undefined is a tombstone
   at::Tensor m_host_indices;    // indices of host value
   TreeNode* m_parent;
   childern_map_t m_children;
   timestamp_t m_last_access_time;
+  timestamp_t m_swa_last_access_time;
 
  public:
   const std::size_t node_id;  // unique ID for the node
