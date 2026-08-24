@@ -22,11 +22,14 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
             r"^context_embedder\.(.*)$": r"condition_proj.\1",
             r"^time_embedder\.linear_1\.(.*)$": r"time_embedder.proj_in.\1",
             r"^time_embedder\.linear_2\.(.*)$": r"time_embedder.proj_out.\1",
+            r"^time_embedder\.table$": r"adaln_t_table",
             r"^norm_out\.norm\.(.*)$": r"final_layer.norm.\1",
+            r"^norm_out\.folded_bias$": r"final_layer.adaln_proj.linear.bias",
             r"^norm_out\.linear\.(.*)$": r"final_layer.adaln_proj.linear.\1",
             r"^proj_out\.(.*)$": r"final_layer.video_out.\1",
             r"^audio_proj_out\.(.*)$": r"final_layer.audio_out.\1",
             r"^transformer_blocks\.(\d+)\.adaln_proj\.linear\.(.*)$": r"blocks.\1.adaln_proj.linear.\2",
+            r"^transformer_blocks\.(\d+)\.adaln_proj\.folded_bias$": r"blocks.\1.adaln_proj.linear.bias",
             r"^transformer_blocks\.(\d+)\.attn\.to_q\.(.*)$": (
                 r"blocks.\1.attn.qkv_proj.\2",
                 0,
@@ -95,6 +98,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
     checkpoint_uses_diffusers_layout: bool = False
+    adaln_affine_input_dim: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -119,9 +123,14 @@ class MiniMaxH3DiTConfig(DiTConfig):
             "time_embed_hidden_dim": "time_embed_hidden_size",
             "rope_freq_dim": "rope_inv_freq_len",
         }
-        super().update_model_arch(
-            {aliases.get(key, key): value for key, value in source_model_dict.items()}
-        )
+        model_dict = {
+            aliases.get(key, key): value for key, value in source_model_dict.items()
+        }
+        if source_model_dict.get("_class_name") == "MiniMaxH3PrunedTransformer3DModel":
+            model_dict["adaln_affine_input_dim"] = source_model_dict["time_embed_dim"]
+            model_dict["time_embed_dim"] = source_model_dict["adaln_rank"]
+            model_dict["adaln_curve_grid"] = source_model_dict["time_table_size"]
+        super().update_model_arch(model_dict)
 
 
 __all__ = [

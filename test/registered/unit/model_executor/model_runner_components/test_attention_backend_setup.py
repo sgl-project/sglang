@@ -80,5 +80,42 @@ def test_split_full_attention_applies_model_wrapper_once():
         override.restore()
 
 
+def test_equal_resolved_backends_ignore_stale_global_backend():
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(
+            attention_backend="global-test",
+            speculative_attention_mode="prefill",
+        ),
+        kv_cache_dtype=None,
+        token_to_kv_pool=object(),
+        req_to_token_pool=object(),
+        init_new_workspace=None,
+    )
+    constructors = {
+        "global-test": lambda _runner: _FakeBackend("global"),
+        "resolved-test": lambda _runner: _FakeBackend("resolved"),
+    }
+    resolved = ResolvedAttentionBackendStr(
+        decode="resolved-test",
+        prefill="resolved-test",
+    )
+
+    with (
+        patch.dict(attention_backend_setup.ATTENTION_BACKENDS, constructors),
+        patch.object(
+            attention_backend_setup,
+            "attn_backend_wrapper",
+            side_effect=lambda _runner, backend: backend,
+        ),
+    ):
+        result = attention_backend_setup._build_resolved_backend(
+            model_runner=runner,
+            resolved=resolved,
+            init_new_workspace=False,
+        )
+
+    assert result.name == "resolved"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
