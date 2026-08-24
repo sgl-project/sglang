@@ -1394,7 +1394,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and raw_bs == bs
             and not self.enable_two_batch_overlap
             and not self.enable_pdmux
-            and not self.model_runner.server_args.enable_lora
+            and self.model_runner.lora_manager is None
         ):
             # actual_forward_mode belongs in the key even though the captured
             # graph always targets capture_forward_mode: DSV4's replay prep
