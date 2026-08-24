@@ -175,7 +175,13 @@ def check_lora_speculative_compatibility(server_args: Any):
 
     # These algorithms present a uniform per-request token width during
     # verify, which is what the LoRA segment layout assumes.
-    lora_spec_algorithms = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+    lora_spec_algorithms = (
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+        "DFLASH_CONFIDENCE",
+        "DSPARK",
+    )
     if cfg.speculative_algorithm not in lora_spec_algorithms:
         promoted = (
             " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
@@ -185,7 +191,7 @@ def check_lora_speculative_compatibility(server_args: Any):
         )
         raise ValueError(
             "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
-            "DFLASH, or DSPARK speculative decoding, not "
+            "DFLASH, DFLASH_CONFIDENCE, or DSPARK speculative decoding, not "
             f"{cfg.speculative_algorithm}{promoted}."
         )
 
@@ -195,7 +201,8 @@ def check_lora_speculative_compatibility(server_args: Any):
     # prefix so the message names the combination, not just the flag.
     unsupported = [
         (
-            cfg.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+            cfg.speculative_algorithm in ("DSPARK", "DFLASH_CONFIDENCE")
+            and ragged_mode != "static",
             f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
             "the per-request verify lengths it schedules break the "
             "uniform-width LoRA segment layout",

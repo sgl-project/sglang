@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -12,6 +14,8 @@ from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.dflash_confidence_observability import (
     DFlashConfidenceObserver,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -234,6 +238,20 @@ class TestDFlashConfidence(unittest.TestCase):
         torch.testing.assert_close(
             confidence, torch.sigmoid(torch.tensor([[7.0, 11.0, 13.0]]))
         )
+
+    def test_dflash_confidence_has_dflash_family_capabilities(self):
+        algorithm = SpeculativeAlgorithm.DFLASH_CONFIDENCE
+        self.assertTrue(algorithm.is_dflash_confidence())
+        self.assertTrue(algorithm.is_dflash_family())
+        self.assertTrue(algorithm.supports_target_verify_for_draft())
+        self.assertTrue(algorithm.supports_ragged_verify())
+
+    def test_dflash_confidence_does_not_request_overlap_hidden_states(self):
+        spec = SimpleNamespace(
+            speculative_algorithm="DFLASH_CONFIDENCE", enable_multi_layer_eagle=True
+        )
+        with mock.patch("sglang.srt.speculative.spec_utils.get_spec", return_value=spec):
+            self.assertFalse(spec_need_hidden_states())
 
     def test_planner_rejects_invalid_threshold(self):
         for threshold in (-0.1, 1.1):
