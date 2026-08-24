@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import ctypes
 import logging
-import os
-import tempfile
 from math import prod
 from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
-import torch.utils.cpp_extension
-from torch.cuda.memory import CUDAPluggableAllocator
 
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils.cuda_vmm_utils import (
+    BumpArenaStub,
     VmmReservation,
     align_up,
     allocation_handle_type_name,
@@ -25,58 +21,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Bump allocator: hands back base+cursor, bounded by the RESERVED size (not the
-# committed watermark) so upper-bound tensors can be allocated before physical
-# commit. Allocations are granularity-aligned so each pointer can be committed at
-# its own VA range (cuMemMap requires it; GB300 rejects partial-handle maps).
-# Symbols are SUFFIXED per (process, arena instance) and each instance loads its
-# own .so, so neither multiple arenas per process (hybrid-SWA: full + swa) nor
-# co-located engine processes sharing the tempdir clobber each other.
-def _stub_source(sfx: str) -> str:
-    return f"""
-#include <cstddef>
-#include <cstdint>
-#include <mutex>
-extern "C" {{
-static uintptr_t g_base = 0;
-static size_t g_cursor = 0;
-static size_t g_reserved = 0;
-static size_t g_align = 512;
-static std::mutex g_mu;
-static size_t align_up(size_t v, size_t a){{ return (v + a - 1) / a * a; }}
-void kvarena_set_base_{sfx}(uintptr_t b){{ std::lock_guard<std::mutex> lk(g_mu); g_base=b; g_cursor=0; }}
-void kvarena_set_reserved_{sfx}(size_t r){{ std::lock_guard<std::mutex> lk(g_mu); g_reserved=r; }}
-void kvarena_set_align_{sfx}(size_t a){{ std::lock_guard<std::mutex> lk(g_mu); if (a) g_align=a; }}
-size_t kvarena_cursor_{sfx}(void){{ std::lock_guard<std::mutex> lk(g_mu); return g_cursor; }}
-void* kvarena_malloc_{sfx}(size_t size, int device, void* stream){{
-  std::lock_guard<std::mutex> lk(g_mu);
-  size_t need = g_cursor + align_up(size, g_align);
-  if (need > g_reserved) return 0;   // never exceed the reserved VA range
-  void* p = reinterpret_cast<void*>(g_base + g_cursor);
-  g_cursor = need;
-  return p;
-}}
-void kvarena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{}}
-}}
-"""
-
-
 _DEFAULT_RESERVE_BYTES = 256 * (1024**3)  # 256 GiB virtual; free until committed
 
 
 class KvVmmArena:
     """One device's CUDA virtual-memory reservation exposed as a ``torch.cuda.MemPool``."""
 
-    # Per-instance suffix source -> isolated allocator symbols/state (see _stub_source).
-    _instance_count = 0
-
     def __init__(self, device_id: int, reserve_bytes: int = _DEFAULT_RESERVE_BYTES):
         self.device_id = int(device_id)
-        # Unique per (process, arena instance): the stub .so lives in a host-shared
-        # tempdir, so co-located engine processes must not build the same-named .so
-        # (they race and one loads a half-relinked copy -> undefined symbol crash).
-        self._sfx = f"{os.getpid()}_{KvVmmArena._instance_count}"
-        KvVmmArena._instance_count += 1
         with torch.cuda.device(self.device_id):
             prop = make_device_allocation_prop(self.device_id)
             self.handle_type = prop.requestedHandleTypes
@@ -96,19 +48,15 @@ class KvVmmArena:
             self._range_backed = 0
             self._closed = False
 
-        self._lib = self._build_stub()
-        self._fn_set_base(ctypes.c_void_p(self.base))
-        self._fn_set_reserved(ctypes.c_size_t(self.reserved))
-        self._fn_set_align(ctypes.c_size_t(self.granularity))
-        self._allocator = CUDAPluggableAllocator(
-            self._so_path, f"kvarena_malloc_{self._sfx}", f"kvarena_free_{self._sfx}"
-        ).allocator()
+        self._stub = BumpArenaStub()
+        self._stub.set_extents([(self.base, self.reserved)])
+        self._stub.set_align(self.granularity)
         # no_split so the caching allocator hands our bump pointers back verbatim.
-        self.pool = torch.cuda.MemPool(self._allocator, no_split=True)
+        self.pool = torch.cuda.MemPool(self._stub.allocator, no_split=True)
         logger.info(
             "KvVmmArena[%s] ready: device=%d reserved_va=%.1f GiB "
             "granularity=%d KiB handle_type=%s",
-            self._sfx,
+            self._stub.sfx,
             self.device_id,
             self.reserved / (1024**3),
             self.granularity // 1024,
@@ -117,40 +65,6 @@ class KvVmmArena:
 
     def _align(self, v: int) -> int:
         return align_up(v, self.granularity)
-
-    def _build_stub(self) -> ctypes.CDLL:
-        # Per-arena build dir: load_inline writes every caller's source to the same
-        # main.cpp inside build_directory, so any sharing (across co-located engine
-        # processes under the host tempdir, or across arenas within one process)
-        # can compile another arena's source and link a .so missing this arena's
-        # symbols. One dir per stub means no shared ninja scratch or .so, ever.
-        out_dir = os.path.join(tempfile.gettempdir(), "sgl_kv_vmm_arena", self._sfx)
-        os.makedirs(out_dir, exist_ok=True)
-        libname = f"sgl_kv_vmm_arena_stub_{self._sfx}"
-        torch.utils.cpp_extension.load_inline(
-            name=libname,
-            cpp_sources=_stub_source(self._sfx),
-            with_cuda=False,  # pure arithmetic — no nvcc, no CUDA headers
-            is_python_module=False,
-            verbose=False,
-            build_directory=out_dir,
-            no_implicit_headers=True,
-        )
-        self._so_path = f"{out_dir}/{libname}.so"
-        lib = ctypes.CDLL(self._so_path)
-        self._fn_set_base = lib[f"kvarena_set_base_{self._sfx}"]
-        self._fn_set_base.argtypes = [ctypes.c_void_p]
-        self._fn_set_base.restype = None
-        self._fn_set_reserved = lib[f"kvarena_set_reserved_{self._sfx}"]
-        self._fn_set_reserved.argtypes = [ctypes.c_size_t]
-        self._fn_set_reserved.restype = None
-        self._fn_set_align = lib[f"kvarena_set_align_{self._sfx}"]
-        self._fn_set_align.argtypes = [ctypes.c_size_t]
-        self._fn_set_align.restype = None
-        self._fn_cursor = lib[f"kvarena_cursor_{self._sfx}"]
-        self._fn_cursor.argtypes = []
-        self._fn_cursor.restype = ctypes.c_size_t
-        return lib
 
     def commit_range(self, offset: int, want_bytes: int) -> None:
         """Back ``[base+offset, base+offset+want_bytes)`` (monotonic per offset).
@@ -189,7 +103,7 @@ class KvVmmArena:
 
     @property
     def cursor_bytes(self) -> int:
-        return int(self._fn_cursor())
+        return self._stub.cursor_bytes
 
     def close(self) -> None:
         if self._closed:

@@ -18,12 +18,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_rank_text_encode"
+_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
@@ -55,6 +56,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             try:
                 self._encode_from_plan(batch, plan)
                 self._publish_native_text_conditioning(batch)
+                if current_platform.is_mps():
+                    self._finish_active_component_use()
             except Exception:
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
                     minimax_h3_cleanup_temp_dirs,
@@ -108,13 +111,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Distribute independent H3 presentations over replicated encoders.
+        """Distribute independent H3 presentations over encoder copies.
 
         H3 presentations have variable multimodal layouts, so they cannot be
         stacked into the generic text batch without changing padding/kernels.
-        Assigning one complete request to a rank preserves the exact
-        single-request encoder path, then broadcasts that request's native
-        payload to the other ranks.
+        Assigning one complete request to a copy preserves the exact
+        single-request encoder path. A copy may itself span a TP group; the
+        orthogonal encoder-DP group then broadcasts that request's native
+        payload to the other copies.
         """
         grouped = self._group_requests_by_fingerprint(
             batches,
@@ -142,14 +146,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             payload = None
             if dp_group.rank_in_group == owner:
                 try:
-                    first_batch.extra[_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY] = (
+                    first_batch.extra[_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY] = (
                         True
                     )
                     try:
                         first_result = self(first_batch, server_args)
                     finally:
                         first_batch.extra.pop(
-                            _MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY, None
+                            _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY, None
                         )
                     payload = first_result.extra.get(
                         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY
@@ -191,7 +195,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         self._dp_choice_logged = True
         logger.info(
             "encoder_parallel: distributing %d independent MiniMax H3 "
-            "presentations over %d replicated encoder ranks",
+            "presentations over %d encoder copies",
             batch_size,
             world_size,
         )
@@ -241,11 +245,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         keyframes = [
             m for m in plan.materials if m.material_chain == "image.target_canvas"
         ]
-        if plan.task == "fl2va":
+        if plan.task in {"fl2va", "ref2va"} and keyframes:
             frame_indices = tuple(material.frame_index for material in keyframes)
             if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
                 raise ValueError(
-                    "fl2va text encoding requires an ordered keyframe signature "
+                    "MiniMax H3 text encoding requires an ordered keyframe signature "
                     f"in {MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got "
                     f"{frame_indices!r}"
                 )
@@ -356,7 +360,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
         Per condition in order — image i: '<Picture i>: ' label +
         vision block (prepared reference image); audio j: '<Audio j>: ' label
-        only — then the verbatim prompt.
+        only — then the verbatim prompt. Hybrid keyframes are deliberately
+        omitted: they are guide latents appended after reference presentation.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_ref2va_presentation,
@@ -381,7 +386,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 share_across_replicas=(
                     world > 1
                     and not bool(
-                        batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY)
+                        batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY)
                     )
                 ),
             )
@@ -403,6 +408,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         has_image = False
         has_video = False
         for material in plan.materials:
+            if material.material_chain == "image.target_canvas":
+                continue
             if material.material_chain == "image.reference_preserve":
                 counters["image"] += 1
                 condition_labels.append(("image", counters["image"]))
@@ -536,7 +543,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        if batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY):
+        if batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY):
             batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
         return {
             "positive": {

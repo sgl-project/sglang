@@ -1,7 +1,5 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
-//! ([`GenerateBody`] → [`GenerateRequest`]s), the variant bodies, and the
-//! scheduler ingress encodings (`TokenizedGenerateReqInput` header,
-//! control/abort, `IngressMsg`).
+//! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -11,10 +9,12 @@ use itertools::izip;
 use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
-use crate::environ::env_u64;
-use crate::error::Error;
-use crate::ids::Rid;
+use super::response::ResponseSink;
+use super::sampling::{SamplingParams, SamplingParamsInput};
+use super::types::{OneOrMany, OneOrManyItem, TokenIds};
+use crate::message::ids::Rid;
+use crate::utils::fsm::RequestState;
+use crate::utils::{environ::env_u64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -519,12 +519,12 @@ fn split_mm_column(
 /// plus the owned inputs from [`GenerateRequest::take_mm_work`].
 #[derive(Debug)]
 pub struct MmRequest {
-    pub rid: crate::ids::Rid,
+    pub rid: Rid,
     pub work: MmWorkItem,
 }
 
 /// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`super::mm_payload::to_mm_input`].
+/// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
     pub text: Option<String>,
@@ -541,17 +541,40 @@ pub struct MmWorkItem {
 /// Whether an optional mm field counts as multimodal input, via the same
 /// `value_present` the MM worker's payload parser uses.
 fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    v.as_ref().is_some_and(super::mm_payload::value_present)
+    v.as_ref()
+        .is_some_and(crate::multi_modality::payload::value_present)
 }
 
-/// Request variant — selects the ingress branch, scheduler wire message, and
-/// egress shape. Each owns its body, so generate/control fields stay type-separate.
+/// The owned request as it travels request stages (single owner, so `state` is
+/// mutated lock-free). Common fields here; variant data in [`RequestKind`].
+#[derive(Debug)]
+pub struct Request {
+    /// Client-visible request id (uuid hex) — what the scheduler wire and
+    /// `meta_info.id` carry.
+    pub rid: Rid,
+    pub state: RequestState,
+    /// Back-channel to the client connection for response frames.
+    pub sink: ResponseSink,
+    /// Discriminant + variant body (generate vs control).
+    pub kind: RequestKind,
+}
+
+/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+#[derive(Debug)]
+pub struct SchedulerRequest {
+    pub header: Bytes,
+    pub ids: Bytes,
+}
+
+/// Request variant — selects the request branch, scheduler wire message, and
+/// response shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
-    /// the egress is a single non-streamed JSON result.
+    /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
@@ -595,7 +618,7 @@ pub struct GenerateRequest {
     /// by the pool before the header is built; never reaches the scheduler wire.
     pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
-    /// normalized + verified at ingress, then serialized into the header.
+    /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
@@ -639,13 +662,16 @@ pub struct GenerateRequest {
 }
 
 /// The opaque multimodal fields of one request (see [`GenerateRequest::mm`]).
+///
+/// Constructed directly only by tests: `api_server::prefetch` fills its
+/// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `api_server::prefetch` in `mm_payload::io_sources` order so MM workers
+    /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,
@@ -693,8 +719,8 @@ impl GenerateRequest {
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
-    /// when not tokenized.
+    /// `array("q")` columnar cell — rides the to-scheduler channel outside
+    /// msgpack). Empty when not tokenized.
     pub fn encode_data_buf(&self) -> Bytes {
         let ids = self.input_ids.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(ids.len() * 8);
@@ -882,7 +908,7 @@ mod tests {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization (the ingress step), not here.
+        // at normalization, not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
