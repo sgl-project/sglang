@@ -713,6 +713,37 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        self._finalize_allocation_log(self.swa_size)
+
+    def get_kv_size_bytes(self) -> int:
+        tensors: list[torch.Tensor] = []
+
+        # SWA/C4/C128 main KV data
+        if self._unified_kv:
+            tensors.extend(self.unified_kv_pool.kv_buffer)
+        else:
+            tensors.extend(self.swa_kv_pool.kv_buffer)
+            tensors.extend(self.c4_kv_pool.kv_buffer)
+            tensors.extend(self.c128_kv_pool.kv_buffer)
+
+        # C4 indexer
+        tensors.extend(self.c4_indexer_kv_pool.index_k_with_scale_buffer)
+
+        # Attention compression states
+        for pool in self.compress_state_pools:
+            if pool is not None:
+                tensors.append(pool.kv_score_buffer.kv_score)
+
+        # Indexer compression states
+        for pool in self.indexer_compress_state_pools:
+            if pool is not None:
+                tensors.append(pool.kv_score_buffer.kv_score)
+
+        # Online C128 MTP auxiliary states
+        if self.online_c128_mtp_pending_seq_lens is not None:
+            tensors.append(self.online_c128_mtp_pending_seq_lens)
+
+        return sum(t.numel() * t.element_size() for t in tensors)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this

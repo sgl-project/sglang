@@ -34,6 +34,11 @@ def handle_hicache(server_args: Any):
                 "--enable-unified-cache-external-linker does not use "
                 "--hicache-storage-backend."
             )
+        if cfg.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
