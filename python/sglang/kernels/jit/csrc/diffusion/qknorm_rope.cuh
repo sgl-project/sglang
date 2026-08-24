@@ -163,6 +163,32 @@ SGL_DEVICE T rotary_sub(T x, T cos, T y, T sin) {
 #endif
 }
 
+template <typename T>
+SGL_DEVICE T rotary_add_fp32(T x, float cos, T y, float sin) {
+  const float x_fp32 = device::cast<fp32_t>(x);
+  const float y_fp32 = device::cast<fp32_t>(y);
+#ifdef USE_ROCM
+  return device::cast<T>(x_fp32 * cos + y_fp32 * sin);
+#else
+  const float lhs = __fmul_rn(x_fp32, cos);
+  const float rhs = __fmul_rn(y_fp32, sin);
+  return device::cast<T>(__fadd_rn(lhs, rhs));
+#endif
+}
+
+template <typename T>
+SGL_DEVICE T rotary_sub_fp32(T x, float cos, T y, float sin) {
+  const float x_fp32 = device::cast<fp32_t>(x);
+  const float y_fp32 = device::cast<fp32_t>(y);
+#ifdef USE_ROCM
+  return device::cast<T>(x_fp32 * cos - y_fp32 * sin);
+#else
+  const float lhs = __fmul_rn(x_fp32, cos);
+  const float rhs = __fmul_rn(-y_fp32, sin);
+  return device::cast<T>(__fadd_rn(lhs, rhs));
+#endif
+}
+
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -196,8 +222,8 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
       !kIsNeox || (kRotaryLanes >= 2 && kRotaryLanes % 2 == 0),
       "NeoX fused qknorm+rope requires an even rotary lane count");
   static_assert(
-      !kRoundNormBeforeRope || std::is_same_v<DType, CacheDType>,
-      "Rounded QKNorm+RoPE requires cache and activation dtypes to match");
+      !kRoundNormBeforeRope || std::is_same_v<DType, CacheDType> || std::is_same_v<CacheDType, fp32_t>,
+      "Rounded QKNorm+RoPE requires cache and activation dtypes to match or an FP32 cache");
 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kVecSize>;
@@ -307,8 +333,13 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
                   (kCacheHasFullWidth ? lane_id : lane_id % kHalfRotaryLanes) * kElemsPerThread + 2 * j + i;
               const auto cos = load_cache_value(cos_ptr, cache_idx);
               const auto sin = load_cache_value(sin_ptr, cache_idx);
-              values[i] = lane_id < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
-                                                     : rotary_add(values[i], cos, partner_values[i], sin);
+              if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+                values[i] = lane_id < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
+                                                       : rotary_add_fp32(values[i], cos, partner_values[i], sin);
+              } else {
+                values[i] = lane_id < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                       : rotary_add(values[i], cos, partner_values[i], sin);
+              }
             }
           }
         }
@@ -317,13 +348,22 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
 #pragma unroll
           for (uint32_t j = 0; j < kVecSize; ++j) {
             auto& values = unpack(output_vec[j]);
-            const auto half_idx = lane_id * kElemsPerThread / 2 + j;
-            const auto cos = load_cache_value(cos_ptr, half_idx);
-            const auto sin = load_cache_value(sin_ptr, half_idx);
+            const auto cache_idx_0 =
+                kCacheHasFullWidth ? lane_id * kElemsPerThread + 2 * j : lane_id * kElemsPerThread / 2 + j;
+            const auto cache_idx_1 = kCacheHasFullWidth ? cache_idx_0 + 1 : cache_idx_0;
+            const auto cos_0 = load_cache_value(cos_ptr, cache_idx_0);
+            const auto sin_0 = load_cache_value(sin_ptr, cache_idx_0);
+            const auto cos_1 = load_cache_value(cos_ptr, cache_idx_1);
+            const auto sin_1 = load_cache_value(sin_ptr, cache_idx_1);
             const auto x = values[0];
             const auto y = values[1];
-            values[0] = rotary_sub(x, cos, y, sin);
-            values[1] = rotary_add(y, cos, x, sin);
+            if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+              values[0] = rotary_sub_fp32(x, cos_0, y, sin_0);
+              values[1] = rotary_add_fp32(y, cos_1, x, sin_1);
+            } else {
+              values[0] = rotary_sub(x, cos_0, y, sin_0);
+              values[1] = rotary_add(y, cos_1, x, sin_1);
+            }
           }
         }
       }
@@ -383,11 +423,15 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
         for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
           const float x = elems[i];
           const float y = elems[i + 1];
-          const int half_idx = static_cast<int>(lane_id * kElemsPerThread + i) / 2;
-          const float cos = cast<fp32_t>(load_cache_value(cos_ptr, half_idx));
-          const float sin = cast<fp32_t>(load_cache_value(sin_ptr, half_idx));
-          elems[i] = x * cos - y * sin;
-          elems[i + 1] = y * cos + x * sin;
+          const auto cache_idx_0 =
+              kCacheHasFullWidth ? lane_id * kElemsPerThread + i : (lane_id * kElemsPerThread + i) / 2;
+          const auto cache_idx_1 = kCacheHasFullWidth ? cache_idx_0 + 1 : cache_idx_0;
+          const float cos_0 = cast<fp32_t>(load_cache_value(cos_ptr, cache_idx_0));
+          const float sin_0 = cast<fp32_t>(load_cache_value(sin_ptr, cache_idx_0));
+          const float cos_1 = cast<fp32_t>(load_cache_value(cos_ptr, cache_idx_1));
+          const float sin_1 = cast<fp32_t>(load_cache_value(sin_ptr, cache_idx_1));
+          elems[i] = x * cos_0 - y * sin_0;
+          elems[i + 1] = y * cos_1 + x * sin_1;
         }
       }
     }
