@@ -1093,6 +1093,14 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_indexer)
         del qkv_a
 
+        # qkv_a is consumed on stream_kv (a stream it was not allocated on),
+        # so its reference must outlive the stream join above: dropping it
+        # right after the fork lets the caching allocator hand its block to a
+        # later allocation with no cross-stream dependency edge, and under
+        # CUDA graph capture the recorded overwrite races the side-stream KV
+        # store on replay (silently garbage KV; see the TP bs=1 collapse).
+        del qkv_a
+
         return q
 
     def _forward_prepare_multi_stream_npu(
