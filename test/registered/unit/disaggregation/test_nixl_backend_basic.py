@@ -556,6 +556,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_transfer_queue_pipeline = True
         mgr.max_inflight_tokens = 10
         mgr._pipeline_tokens_inflight = 0
+        mgr._pipeline_chunks_inflight = 0
+        mgr._pipeline_logged_chunk_levels = set()
         chunk = self._make_chunk(room, [1], is_last_chunk=False)
         chunk.staging_counted = True
         mgr._staging_outstanding[room] = 1
@@ -567,6 +569,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertFalse(mgr._try_reserve_pipeline_tokens(3))
         mgr._finalize_transfer_chunk(chunk, ["handle"], reserved_tokens=8)
         self.assertEqual(mgr._pipeline_tokens_inflight, 0)
+        self.assertEqual(mgr._pipeline_chunks_inflight, 0)
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
 
     def test_pipeline_counts_source_lifetime_before_enqueue(self):

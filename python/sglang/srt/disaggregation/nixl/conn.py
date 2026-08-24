@@ -492,6 +492,8 @@ class NixlKVManager(CommonKVManager):
             self._staging_outstanding = defaultdict(int)
             self._transfer_condition = threading.Condition()
             self._pipeline_tokens_inflight = 0
+            self._pipeline_chunks_inflight = 0
+            self._pipeline_logged_chunk_levels = set()
             self._pending_abort_acks = defaultdict(set)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
@@ -1168,6 +1170,18 @@ class NixlKVManager(CommonKVManager):
             ):
                 return False
             self._pipeline_tokens_inflight += num_tokens
+            self._pipeline_chunks_inflight += 1
+            if (
+                self._pipeline_chunks_inflight in (2, 4, 8, 16, 32)
+                and self._pipeline_chunks_inflight
+                not in self._pipeline_logged_chunk_levels
+            ):
+                self._pipeline_logged_chunk_levels.add(self._pipeline_chunks_inflight)
+                logger.info(
+                    "NIXL pipeline reached %s chunks / %s tokens in flight",
+                    self._pipeline_chunks_inflight,
+                    self._pipeline_tokens_inflight,
+                )
             return True
 
     def _complete_transfer_chunk(
@@ -1184,6 +1198,8 @@ class NixlKVManager(CommonKVManager):
                 self._staging_outstanding[room] -= 1
                 kv_chunk.staging_counted = False
             self._pipeline_tokens_inflight -= reserved_tokens
+            if reserved_tokens:
+                self._pipeline_chunks_inflight -= 1
             if self._staging_outstanding.get(room, 0) <= 0:
                 self._staging_outstanding.pop(room, None)
                 peers = self._pending_abort_acks.pop(room, ())
