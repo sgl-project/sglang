@@ -273,7 +273,7 @@ class NativeMmHost:
 
         return (
             self.server_args.tp_size > 1
-            and determine_tensor_transport_mode(self.server_args) != "default"
+            and determine_tensor_transport_mode() != "default"
             and not self.server_args.skip_tokenizer_init
         )
 

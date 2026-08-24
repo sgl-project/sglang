@@ -1826,7 +1826,7 @@ class MMReceiverBase(ABC):
         model_config=None,
     ):
         """Load processor and initialize mm_processor, shared by all backends."""
-        transport_mode = determine_tensor_transport_mode(server_args)
+        transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
 
         extra_kwargs = {}

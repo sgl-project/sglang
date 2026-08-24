@@ -31,7 +31,7 @@ class TestTensorTransportMode(CustomTestCase):
                     return_value=parallel,
                 ):
                     self.assertEqual(
-                        determine_tensor_transport_mode(SimpleNamespace()), expected
+                        determine_tensor_transport_mode(), expected
                     )
 
 

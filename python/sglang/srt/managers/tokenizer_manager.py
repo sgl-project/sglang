@@ -486,7 +486,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper(server_args)
-            transport_mode = determine_tensor_transport_mode(self.server_args)
+            transport_mode = determine_tensor_transport_mode()
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode

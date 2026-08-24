@@ -1335,9 +1335,7 @@ class ShmPointerMMData:
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        _is_default_tensor_transport = (
-            determine_tensor_transport_mode(get_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
 
 
