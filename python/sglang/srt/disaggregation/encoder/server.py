@@ -255,12 +255,206 @@ class ReqState:
     embedding_data: Optional[EmbeddingData] = None
     active_encodes: int = 0
     active_sends: int = 0
+    expected_sends: Optional[int] = None
+    finished_sends: int = 0
     release_requested: bool = False
     preserve_metadata_on_release: bool = False
     embedding_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     lifecycle_condition: asyncio.Condition = field(
         default_factory=asyncio.Condition, repr=False
     )
+
+
+@dataclass
+class PreprocessHandle:
+    """Opaque ownership token for one asynchronous preprocess operation."""
+
+    states: List[Optional[ReqState]]
+    context_future: asyncio.Future[EncodeContext]
+    released: bool = False
+
+
+class PreprocessWorker:
+    """Own asynchronous encoder preprocessing and its request lifecycle.
+
+    The scheduler owns batching and lookahead policy. This worker only turns a
+    submitted batch into a rank-local :class:`EncodeContext`; TP collectives,
+    CUDA work, and embedding staging remain on the main encode thread.
+    """
+
+    def __init__(self, encoder: "MMEncoder"):
+        self.encoder = encoder
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # ThreadPoolExecutor(max_workers=1) keeps every preprocess call on one
+        # worker thread. Reuse that thread's event loop instead of paying for
+        # asyncio.run() setup/teardown on every batch.
+        self._worker_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shutdown = False
+        self._jobs: Dict[int, Tuple[List[dict], Modality, PreprocessHandle]] = {}
+
+    def can_overlap(self, modality: Modality) -> bool:
+        preprocessor = self.encoder.preprocessor
+        return (
+            modality == Modality.IMAGE
+            and not preprocessor.use_image_processor_gpu
+            and (
+                preprocessor._model_preprocessor is None
+                or self.encoder.model_type == "kimi_k3"
+            )
+        )
+
+    def _prepare_context_blocking(
+        self,
+        requests: List[dict],
+        modality: Modality,
+        use_global_cache: bool,
+        is_health_check: bool,
+    ) -> EncodeContext:
+        if self._worker_loop is None:
+            self._worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._worker_loop)
+        return self._worker_loop.run_until_complete(
+            self.encoder._prepare_encode_context(
+                requests,
+                modality,
+                use_global_cache=use_global_cache,
+                is_health_check=is_health_check,
+            )
+        )
+
+    def _close_worker_loop(self) -> None:
+        """Close the persistent loop on the executor thread that owns it."""
+        loop = self._worker_loop
+        if loop is None:
+            return
+
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        asyncio.set_event_loop(None)
+        loop.close()
+        self._worker_loop = None
+
+    async def submit(
+        self, batch_id: int, requests: List[dict], modality: Modality
+    ) -> None:
+        """Start one rank-local preprocess operation and retain its handle."""
+        if batch_id in self._jobs:
+            raise InternalError(f"Duplicate prepared encoder batch: {batch_id}")
+
+        states = [self.encoder._acquire_encode_ref(req["req_id"]) for req in requests]
+        is_health_check = all(
+            is_health_check_request(req["req_id"]) for req in requests
+        )
+        use_global_cache = (
+            self.encoder.mm_global_cache is not None and not is_health_check
+        )
+        try:
+            context_future = asyncio.get_running_loop().run_in_executor(
+                self.executor,
+                self._prepare_context_blocking,
+                requests,
+                modality,
+                use_global_cache,
+                is_health_check,
+            )
+        except Exception:
+            for state in states:
+                await self.encoder._release_encode_ref(state)
+            raise
+
+        self._jobs[batch_id] = (
+            requests,
+            modality,
+            PreprocessHandle(states=states, context_future=context_future),
+        )
+
+    async def wait_ready(self, batch_id: int) -> None:
+        """Wait for completion without consuming the job or hiding its error."""
+        job = self._jobs.get(batch_id)
+        if job is None:
+            raise InternalError(f"Unknown prepared encoder batch: {batch_id}")
+        try:
+            await asyncio.shield(job[2].context_future)
+        except Exception:
+            # Every TP rank must enter resolve() so preprocess failures can be
+            # synchronized before any model collective.
+            pass
+
+    def take(self, batch_id: int) -> Tuple[List[dict], Modality, PreprocessHandle]:
+        job = self._jobs.pop(batch_id, None)
+        if job is None:
+            raise InternalError(f"Unknown prepared encoder batch: {batch_id}")
+        return job
+
+    async def cancel(self, batch_id: int) -> None:
+        job = self._jobs.pop(batch_id, None)
+        if job is not None:
+            await self.release(job[2], cancel=True)
+
+    async def release(self, handle: PreprocessHandle, *, cancel: bool = False) -> None:
+        if handle.released:
+            return
+        handle.released = True
+        if cancel:
+            if handle.context_future.done() and not handle.context_future.cancelled():
+                # Mark a failed, no-longer-observable preparation as consumed.
+                handle.context_future.exception()
+            handle.context_future.cancel()
+        for state in handle.states:
+            await self.encoder._release_encode_ref(state)
+
+    async def resolve(self, handle: PreprocessHandle) -> EncodeContext:
+        """Make preprocessing failure symmetric before any TP model collective."""
+        prepared_context = None
+        local_error = None
+        try:
+            prepared_context = await asyncio.shield(handle.context_future)
+        except asyncio.CancelledError:
+            if not handle.context_future.cancelled():
+                raise
+            local_error = (
+                self.encoder.rank,
+                "Encoder preprocessing was cancelled",
+                int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            )
+        except Exception as exc:
+            local_error = (
+                self.encoder.rank,
+                str(exc),
+                int(getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)),
+            )
+
+        tp_group = get_tp_group()
+        errors = (
+            tp_group.all_gather_object(local_error)
+            if tp_group.world_size > 1
+            else [local_error]
+        )
+        first_error = next((error for error in errors if error is not None), None)
+        if first_error is not None:
+            rank, message, code = first_error
+            raise MMError(
+                f"Rank {rank} failed to prepare encoder inputs: {message}", code=code
+            )
+        if prepared_context is None:
+            raise InternalError("Encoder preprocessing returned no context")
+        return prepared_context
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        try:
+            # Queue loop teardown behind any in-flight preparation so event-loop
+            # ownership remains on the sole executor thread.
+            self.executor.submit(self._close_worker_loop).result()
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass(frozen=True)
@@ -521,6 +715,7 @@ class MMEncoder:
         self.scheduler_send_sockets = {}
         self.scheduler_send_locks = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        self.preprocess_worker = PreprocessWorker(self)
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -668,21 +863,109 @@ class MMEncoder:
         return state.embedding_data
 
     async def send_to_destination(
-        self, state: ReqState, destination: SendDestination
+        self,
+        state: ReqState,
+        destination: SendDestination,
+        *,
+        expected_send_count: Optional[int] = None,
     ) -> None:
+        """Run one transfer and publish its completion to the request fence.
+
+        Mooncake decoder TP ranks call ``/send`` independently.  Recording the
+        expected count when the first call arrives lets the scheduler wait for
+        transfers that have not started yet, rather than racing on
+        ``active_sends == 0`` immediately after encode.
+        """
+        if expected_send_count is None:
+            expected_send_count = 1
+        if expected_send_count < 1:
+            raise BadRequestError(
+                f"expected_send_count must be positive for {state.req_id}: "
+                f"{expected_send_count}"
+            )
         async with state.lifecycle_condition:
             if (
                 self.req_states.get(state.req_id) is not state
                 or state.release_requested
             ):
                 raise InternalError(f"Encoder request was released: {state.req_id}")
+            if state.expected_sends is None:
+                state.expected_sends = expected_send_count
+            elif state.expected_sends != expected_send_count:
+                raise BadRequestError(
+                    f"Inconsistent receive_count for {state.req_id}: "
+                    f"expected={state.expected_sends}, got={expected_send_count}"
+                )
             state.active_sends += 1
+        delivery_task = asyncio.create_task(self.delivery.send(state, destination))
+        transfer_finished = False
         try:
-            await self.delivery.send(state, destination)
+            # Cancelling an await on asyncio.to_thread does not stop Mooncake's
+            # transfer_sync thread.  Keep the lifecycle reference until the
+            # real transfer finishes so release/next-ViT cannot race it.
+            await asyncio.shield(delivery_task)
+            transfer_finished = True
+        except asyncio.CancelledError:
+            try:
+                await delivery_task
+                transfer_finished = True
+            except (Exception, asyncio.CancelledError):
+                # Preserve cancellation after waiting for the real transfer.
+                pass
+            raise
         finally:
             async with state.lifecycle_condition:
                 state.active_sends -= 1
+                if transfer_finished:
+                    state.finished_sends += 1
                 state.lifecycle_condition.notify_all()
+
+    async def wait_for_batch_delivery(self, req_ids: Iterable[str]) -> None:
+        """Fence Mooncake batches before the scheduler starts the next ViT.
+
+        Preprocessing of the lookahead batch is still allowed to overlap the
+        current ViT.  Only publication of its metadata and its ViT execution
+        wait here, until every decoder TP rank has finished the current
+        batch's transfer.  A missing ``/send`` is bounded by the existing
+        encoder send timeout and released through the normal lifecycle path.
+        """
+        if not self.use_mooncake:
+            return
+
+        async def wait_one(req_id: str) -> None:
+            state = self.req_states.get(req_id)
+            if state is None:
+                return
+
+            def delivery_finished() -> bool:
+                return (
+                    self.req_states.get(req_id) is not state
+                    or (
+                        state.release_requested
+                        and state.active_encodes == 0
+                        and state.active_sends == 0
+                    )
+                    or (
+                        state.expected_sends is not None
+                        and state.finished_sends >= state.expected_sends
+                        and state.active_sends == 0
+                    )
+                )
+
+            try:
+                async with state.lifecycle_condition:
+                    await asyncio.wait_for(
+                        state.lifecycle_condition.wait_for(delivery_finished),
+                        timeout=self.send_timeout,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Mooncake delivery fence timed out after {self.send_timeout}s "
+                    f"for req_id={req_id}; releasing the stale request"
+                )
+                await self.release_request(req_id)
+
+        await asyncio.gather(*(wait_one(req_id) for req_id in req_ids))
 
     async def release_request(
         self, req_id: str, *, preserve_metadata: bool = False
@@ -696,6 +979,7 @@ class MMEncoder:
         async with state.lifecycle_condition:
             state.release_requested = True
             state.preserve_metadata_on_release |= preserve_metadata
+            state.lifecycle_condition.notify_all()
             if state.active_encodes > 0:
                 return
             await state.lifecycle_condition.wait_for(lambda: state.active_sends == 0)
@@ -1778,26 +2062,37 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        *,
+        preprocess_handle: Optional[PreprocessHandle] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
         Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
         bypass caches and stage on CPU so completion confirms a model forward.
         """
-        states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
-        is_health_check = all(
-            is_health_check_request(req["req_id"]) for req in requests
-        )
-        keep_on_gpu = self.use_mooncake and not is_health_check
-        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        states = None
+        cancel_preprocess = False
+        if preprocess_handle is None:
+            states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
         try:
-            ctx = await self._prepare_encode_context(
-                requests,
-                modality,
-                use_global_cache=use_global_cache,
-                is_health_check=is_health_check,
-            )
+            if preprocess_handle is None:
+                is_health_check = all(
+                    is_health_check_request(req["req_id"]) for req in requests
+                )
+                ctx = await self._prepare_encode_context(
+                    requests,
+                    modality,
+                    use_global_cache=(
+                        self.mm_global_cache is not None and not is_health_check
+                    ),
+                    is_health_check=is_health_check,
+                )
+            else:
+                ctx = await self.preprocess_worker.resolve(preprocess_handle)
+            keep_on_gpu = self.use_mooncake and not ctx.is_health_check
             await self._publish_preprocess_metadata(ctx, requests)
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
@@ -1808,11 +2103,31 @@ class MMEncoder:
             return self._stage_embeddings(
                 ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
             )
+        except asyncio.CancelledError:
+            cancel_preprocess = True
+            raise
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
-            for state in states:
-                await self._release_encode_ref(state)
+            if preprocess_handle is None:
+                assert states is not None
+                for state in states:
+                    await self._release_encode_ref(state)
+            else:
+                await self.preprocess_worker.release(
+                    preprocess_handle, cancel=cancel_preprocess
+                )
+
+    async def encode_preprocessed_batch(
+        self, batch_id: int
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Consume one worker-owned context through the normal batch path."""
+        requests, modality, preprocess_handle = self.preprocess_worker.take(batch_id)
+        return await self.batch_encode(
+            requests,
+            modality,
+            preprocess_handle=preprocess_handle,
+        )
 
     async def encode(
         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
@@ -1845,7 +2160,13 @@ class MMEncoder:
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_port,
+        session_id=None,
+        buffer_address=None,
+        receive_count=None,
     ):
         state = self.req_states.get(req_id)
         if state is None:
@@ -1864,6 +2185,7 @@ class MMEncoder:
                 session_id=session_id,
                 buffer_address=buffer_address,
             ),
+            expected_send_count=receive_count,
         )
         return True
 
@@ -2017,6 +2339,7 @@ async def run_encoder(
 
 
 async def _handle_encoder_worker_request(encoder: MMEncoder, request):
+    request_type = request.get("type") if isinstance(request, dict) else None
     if isinstance(request, ProfileReq):
         if request.req_type == ProfileReqType.START_PROFILE:
             if encoder.profiler is None:
@@ -2024,7 +2347,15 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()
-    elif isinstance(request, dict) and request.get("type") == "batch_encode":
+    elif request_type == "prepare_batch":
+        batch_id = request["batch_id"]
+        modality = Modality.from_str(request["modality"])
+        await encoder.preprocess_worker.submit(batch_id, request["requests"], modality)
+    elif request_type == "execute_batch":
+        await encoder.encode_preprocessed_batch(request["batch_id"])
+    elif request_type == "cancel_batch":
+        await encoder.preprocess_worker.cancel(request["batch_id"])
+    elif request_type == "batch_encode":
         await encoder.batch_encode(
             request["requests"],
             Modality.from_str(request["modality"]),

@@ -1,5 +1,7 @@
 import asyncio
 import pickle
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -14,7 +16,10 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderDelivery,
     InternalError,
     MMEncoder,
+    MMError,
     MooncakeDelivery,
+    PreprocessHandle,
+    PreprocessWorker,
     ReqState,
     SendDestination,
     ZmqDelivery,
@@ -211,6 +216,111 @@ class TestEncoderDelivery(CustomTestCase):
             )
             await encoder._release_encode_ref(first_state)
             await encoder._release_encode_ref(second_state)
+
+        asyncio.run(run())
+
+    def test_prepare_lane_advances_while_main_event_loop_is_blocked(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 1
+            encoder.use_mooncake = False
+            encoder.mm_global_cache = None
+            encoder.preprocess_worker = PreprocessWorker(encoder)
+            advanced = threading.Event()
+
+            async def prepare_context(*_args, **_kwargs):
+                await asyncio.sleep(0.01)
+                advanced.set()
+                return "prepared-context"
+
+            encoder._prepare_encode_context = prepare_context
+            try:
+                await encoder.preprocess_worker.submit(
+                    7, [{"req_id": "req"}], Modality.IMAGE
+                )
+                # Simulate the synchronous ViT forward occupying the main
+                # encoder loop. The independent prepare loop must still run.
+                time.sleep(0.05)
+                self.assertTrue(advanced.is_set())
+                await encoder.preprocess_worker.wait_ready(7)
+                requests, modality, handle = encoder.preprocess_worker.take(7)
+                self.assertEqual(await handle.context_future, "prepared-context")
+                self.assertEqual(requests, [{"req_id": "req"}])
+                self.assertEqual(modality, Modality.IMAGE)
+                self.assertEqual(handle.states, [None])
+            finally:
+                encoder.preprocess_worker.shutdown()
+
+        asyncio.run(run())
+
+    def test_remote_preprocess_failure_is_raised_before_model_forward(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("local-context")
+            encoder.preprocess_worker = PreprocessWorker(encoder)
+            handle = PreprocessHandle(states=[], context_future=future)
+            tp_group = SimpleNamespace(
+                world_size=2,
+                all_gather_object=lambda _local: [
+                    None,
+                    (1, "owner preprocessing failed", 400),
+                ],
+            )
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                return_value=tp_group,
+            ):
+                with self.assertRaisesRegex(
+                    MMError, "Rank 1 failed to prepare encoder inputs"
+                ) as error:
+                    await encoder.preprocess_worker.resolve(handle)
+
+            self.assertEqual(error.exception.code, 400)
+            encoder.preprocess_worker.shutdown()
+
+        asyncio.run(run())
+
+    def test_batch_encode_reuses_prepared_context(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 1
+            encoder.use_mooncake = False
+            encoder.mm_global_cache = None
+            encoder.profiler = None
+            encoder._prepare_encode_context = AsyncMock(
+                side_effect=AssertionError("preprocess must not run twice")
+            )
+            encoder._publish_preprocess_metadata = AsyncMock()
+            encoder._compute_embedding = AsyncMock(return_value="embedding")
+            encoder._stage_embeddings = lambda *args, **kwargs: ["result"]
+            encoder.preprocess_worker = PreprocessWorker(encoder)
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("prepared-context")
+            handle = PreprocessHandle(states=[], context_future=future)
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ):
+                result = await encoder.batch_encode(
+                    [{"req_id": "req"}],
+                    Modality.IMAGE,
+                    preprocess_handle=handle,
+                )
+
+            self.assertEqual(result, ["result"])
+            encoder._prepare_encode_context.assert_not_awaited()
+            encoder._publish_preprocess_metadata.assert_awaited_once_with(
+                "prepared-context", [{"req_id": "req"}]
+            )
+            encoder._compute_embedding.assert_awaited_once_with(
+                "prepared-context", keep_on_gpu=False
+            )
+            self.assertTrue(handle.released)
+            encoder.preprocess_worker.shutdown()
 
         asyncio.run(run())
 
@@ -480,6 +590,107 @@ class TestEncoderDelivery(CustomTestCase):
 
             self.assertEqual(len(delivered), 1)
             self.assertIs(delivered[0].embedding, embedding)
+
+        asyncio.run(run())
+
+    def test_delivery_fence_waits_for_late_decoder_tp_sends(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.use_mooncake = True
+            encoder.send_timeout = 1
+            encoder.req_states = {}
+            encoder.delivery = SimpleNamespace(
+                send=AsyncMock(),
+                release=AsyncMock(),
+            )
+            state = ReqState(
+                "req",
+                EmbeddingData(
+                    "req",
+                    1,
+                    0,
+                    None,
+                    Modality.IMAGE,
+                    embedding=torch.ones((1, 1)),
+                ),
+            )
+            state.embedding_ready.set()
+            encoder.req_states[state.req_id] = state
+
+            fence = asyncio.create_task(encoder.wait_for_batch_delivery([state.req_id]))
+            await asyncio.sleep(0)
+            self.assertFalse(fence.done())
+
+            await encoder.send_to_destination(
+                state,
+                SendDestination("127.0.0.1:1"),
+                expected_send_count=2,
+            )
+            self.assertEqual(state.finished_sends, 1)
+            self.assertFalse(fence.done())
+
+            await encoder.send_to_destination(
+                state,
+                SendDestination("127.0.0.1:2"),
+                expected_send_count=2,
+            )
+            await asyncio.wait_for(fence, timeout=1)
+            self.assertEqual(state.expected_sends, 2)
+            self.assertEqual(state.finished_sends, 2)
+
+        asyncio.run(run())
+
+    def test_send_fence_tracks_real_transfer_completion(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.use_mooncake = True
+            encoder.send_timeout = 1
+            encoder.req_states = {}
+            transfer_started = asyncio.Event()
+            finish_transfer = asyncio.Event()
+
+            async def send(_state, _destination):
+                transfer_started.set()
+                await finish_transfer.wait()
+
+            encoder.delivery = SimpleNamespace(send=send, release=AsyncMock())
+            state = ReqState("req")
+            encoder.req_states[state.req_id] = state
+
+            send_task = asyncio.create_task(
+                encoder.send_to_destination(
+                    state,
+                    SendDestination("127.0.0.1:1"),
+                )
+            )
+            await transfer_started.wait()
+            fence = asyncio.create_task(encoder.wait_for_batch_delivery([state.req_id]))
+            send_task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(send_task.done())
+            self.assertFalse(fence.done())
+            self.assertEqual(state.active_sends, 1)
+
+            finish_transfer.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await send_task
+            await asyncio.wait_for(fence, timeout=1)
+            self.assertEqual(state.active_sends, 0)
+            self.assertEqual(state.finished_sends, 1)
+
+            async def fail_send(_state, _destination):
+                raise RuntimeError("transfer failed")
+
+            encoder.delivery.send = fail_send
+            failed_state = ReqState("failed")
+            encoder.req_states[failed_state.req_id] = failed_state
+            with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+                await encoder.send_to_destination(
+                    failed_state, SendDestination("127.0.0.1:2")
+                )
+            self.assertEqual(failed_state.active_sends, 0)
+            self.assertEqual(failed_state.finished_sends, 0)
 
         asyncio.run(run())
 

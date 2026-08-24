@@ -379,6 +379,7 @@ async def handle_send_request(request: dict):
         embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
+        receive_count=receive_count,
     )
     if not sent:
         # No transfer happened: fail fast rather than 200 + a phantom count.

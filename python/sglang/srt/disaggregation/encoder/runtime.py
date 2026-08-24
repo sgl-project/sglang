@@ -8,17 +8,16 @@ reuse that backend topology without importing the HTTP server.
 
 import asyncio
 import atexit
-import contextlib
 import logging
 import multiprocessing as mp
 import os
 import time
 import traceback
 import uuid
-from collections import defaultdict
+from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import zmq
 import zmq.asyncio
@@ -76,6 +75,7 @@ class PendingRequest:
 # vary per request and can't merge into one HF processor call.
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
+BatchWork = Tuple[Optional[int], List[PendingRequest], Modality]
 
 
 def _resolve_encoder_batch_policy(
@@ -85,8 +85,8 @@ def _resolve_encoder_batch_policy(
 ) -> Tuple[int, bool]:
     """Return effective batch size and same-turn coalescing policy."""
     max_batch_size = max(1, int(configured_max_batch_size))
-    coalesce_same_turn = model_type == "kimi_k3"
-    if coalesce_same_turn and not max_batch_size_is_explicit:
+    coalesce_same_turn = True
+    if model_type == "kimi_k3" and not max_batch_size_is_explicit:
         max_batch_size = min(max_batch_size, _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE)
     return max_batch_size, coalesce_same_turn
 
@@ -106,32 +106,59 @@ class EncoderScheduler:
         encoder: "MMEncoder",
         send_sockets: List[zmq.Socket],
         max_batch_size: int,
-        coalesce_same_turn: bool = False,
+        coalesce_same_turn: bool = True,
         request_timeout: float = server_module.ENCODER_REQ_TIMEOUT,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
+        # Bound flattened media items with the existing batch budget.
+        self.max_batch_items = self.max_batch_size
         self.coalesce_same_turn = bool(coalesce_same_turn)
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
-        self._worker_task: Optional[asyncio.Task] = None
+        # Contexts and request leases stay inside PreprocessWorker.
+        # join/task_done enforce one-batch lookahead.
+        self.prepared_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        # Ordered modality queues preserve batching and round-robin fairness.
+        self._pending_by_modality: Dict[Modality, Deque[PendingRequest]] = {}
+        self._preprocess_submitted = asyncio.Event()
+        self._next_batch_id = 0
+        self._producer_task: Optional[asyncio.Task] = None
+        self._consumer_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
-        if self._worker_task is None:
-            self._worker_task = asyncio.create_task(self._batch_worker())
+        if self._consumer_task is None:
+            self._producer_task = asyncio.create_task(self._produce_prepared_batches())
+            self._consumer_task = asyncio.create_task(self._consume_prepared_batches())
             logger.info(
                 "EncoderScheduler started with "
                 f"max_batch_size={self.max_batch_size}, "
+                f"max_batch_items={self.max_batch_items}, "
                 f"coalesce_same_turn={self.coalesce_same_turn}"
             )
 
     async def stop(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker_task
-            self._worker_task = None
+        tasks = [
+            task
+            for task in (self._producer_task, self._consumer_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._producer_task = None
+        self._consumer_task = None
+
+        while True:
+            try:
+                work = self.prepared_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.prepared_queue.task_done()
+            await self._fail_work(work, RuntimeError("EncoderScheduler stopped"))
+
         # Reject any requests still queued so their HTTP handlers don't hang.
         while True:
             try:
@@ -140,6 +167,13 @@ class EncoderScheduler:
                 break
             if not pending.future.done():
                 pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+        for group in self._pending_by_modality.values():
+            for pending in group:
+                if not pending.future.done():
+                    pending.future.set_exception(
+                        RuntimeError("EncoderScheduler stopped")
+                    )
+        self._pending_by_modality.clear()
 
     async def submit(self, request: dict) -> Tuple:
         pending = PendingRequest(request, asyncio.get_running_loop())
@@ -158,57 +192,153 @@ class EncoderScheduler:
             )
             raise
 
+    def _stage_pending(self, pending: PendingRequest) -> None:
+        try:
+            modality = Modality.from_str(pending.request.get("modality", "image"))
+        except Exception as error:
+            if not pending.future.done():
+                pending.future.set_exception(
+                    server_module.BadRequestError(f"Invalid modality: {error}")
+                )
+            return
+
+        modality_queue = self._pending_by_modality.setdefault(modality, deque())
+        modality_queue.append(pending)
+
+    def _drain_pending_queue(self) -> None:
+        while True:
+            try:
+                self._stage_pending(self.pending_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                return
+
+    @staticmethod
+    def _request_item_count(pending: PendingRequest) -> int:
+        mm_items = pending.request.get("mm_items")
+        if isinstance(mm_items, (list, tuple)):
+            return max(1, len(mm_items))
+        # Count malformed items as one until validation.
+        return 1
+
     async def _collect_batch(self) -> List[PendingRequest]:
-        batch = [await self.pending_queue.get()]
-        first_modality = Modality.from_str(batch[0].request.get("modality", "image"))
+        while not self._pending_by_modality:
+            self._stage_pending(await self.pending_queue.get())
+
+        first_modality = next(iter(self._pending_by_modality))
         should_yield = (
             self.coalesce_same_turn
             and self.max_batch_size > 1
             and first_modality in _BATCHABLE_MODALITIES
         )
         if should_yield:
-            # Let HTTP handlers that arrived in the same event-loop turn enqueue
-            # before dispatch. Unlike a fixed sleep, this adds no millisecond-scale
-            # tax to an isolated request.
+            # Coalesce requests queued in the same event-loop turn.
             await asyncio.sleep(0)
-        while len(batch) < self.max_batch_size:
-            try:
-                batch.append(self.pending_queue.get_nowait())
-            except asyncio.QueueEmpty:
+
+        # Form one homogeneous batch when the preprocess lease is free.
+        self._drain_pending_queue()
+        modality = next(iter(self._pending_by_modality))
+        modality_queue = self._pending_by_modality.pop(modality)
+        batch = []
+        batch_item_count = 0
+        while modality_queue and len(batch) < self.max_batch_size:
+            candidate = modality_queue[0]
+            candidate_item_count = self._request_item_count(candidate)
+            if (
+                batch
+                and modality in _BATCHABLE_MODALITIES
+                and batch_item_count + candidate_item_count > self.max_batch_items
+            ):
                 break
+            batch.append(modality_queue.popleft())
+            batch_item_count += candidate_item_count
+        if modality_queue:
+            # Reinsert leftovers for modality round-robin.
+            self._pending_by_modality[modality] = modality_queue
         return batch
 
-    async def _batch_worker(self) -> None:
+    def _has_waiting_work(self) -> bool:
+        return bool(self._pending_by_modality) or not self.pending_queue.empty()
+
+    async def _produce_prepared_batches(self) -> None:
+        """Build batches and keep at most one PreprocessWorker result ahead."""
+        work = None
         while True:
-            batch: List[PendingRequest] = []
             try:
-                batch = await self._collect_batch()
-                groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
-                for p in batch:
-                    groups[
-                        Modality.from_str(p.request.get("modality", "image"))
-                    ].append(p)
-                for modality, group in groups.items():
-                    await self._dispatch_group(group, modality)
+                # Wait until the current ready item is dequeued.
+                await self.prepared_queue.join()
+                group = await self._collect_batch()
+                modality = Modality.from_str(group[0].request.get("modality", "image"))
+
+                if not self.encoder.preprocess_worker.can_overlap(modality):
+                    await self.prepared_queue.put((None, group, modality))
+                    self._preprocess_submitted.set()
+                    continue
+
+                work = await self._submit_preprocess_group(group, modality)
+                # Signal after PREPARE submission to overlap preprocess and ViT.
+                self._preprocess_submitted.set()
+                if work is None:
+                    continue
+                await self.encoder.preprocess_worker.wait_ready(work[0])
+                await self.prepared_queue.put(work)
+                work = None
             except asyncio.CancelledError:
-                for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+                self._preprocess_submitted.set()
+                if work is not None:
+                    await self._cancel_prepared_group(work)
                 raise
-            except Exception as e:
+            except Exception as error:
+                self._preprocess_submitted.set()
                 logger.error(
-                    f"Error in EncoderScheduler batch worker: {e}", exc_info=True
+                    f"Error in EncoderScheduler preprocess worker: {error}",
+                    exc_info=True,
                 )
-                for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(e)
+                if work is not None:
+                    await self._cancel_prepared_group(work, error=error)
+                    work = None
+
+    async def _consume_prepared_batches(self) -> None:
+        """Consume scheduler-ready batches and run the existing encode path."""
+        work = None
+        while True:
+            try:
+                work = await self.prepared_queue.get()
+                is_prepared = work[0] is not None
+                has_waiting_work = self._has_waiting_work()
+
+                # Dequeueing releases the one-batch lookahead lease.
+                self._preprocess_submitted.clear()
+                self.prepared_queue.task_done()
+
+                if has_waiting_work:
+                    # Submit PREPARE(next) before starting ViT(current).
+                    await self._preprocess_submitted.wait()
+
+                work_to_dispatch = work
+                work = None
+                await self._dispatch_group(work_to_dispatch)
+                if is_prepared:
+                    # Fence EXECUTE(next) behind delivery(current).
+                    await self.encoder.wait_for_batch_delivery(
+                        [pending.request["req_id"] for pending in work_to_dispatch[1]]
+                    )
+            except asyncio.CancelledError:
+                if work is not None:
+                    await self._fail_work(
+                        work, RuntimeError("EncoderScheduler stopped")
+                    )
+                raise
+            except Exception as error:
+                logger.error(
+                    f"Error in EncoderScheduler batch worker: {error}", exc_info=True
+                )
+                if work is not None:
+                    await self._fail_work(work, error)
+                    work = None
 
     @staticmethod
     def _validate_request_shape(req: dict) -> Optional[str]:
-        # Cheap pre-broadcast checks: shape errors that don't require running
-        # the HF processor. Once a request reaches TP workers they enter
-        # batch_encode and expect to join its collectives — a malformed batch
-        # that makes rank-0 bail mid-flight would deadlock the workers.
+        # Validate before TP broadcast to avoid collective deadlocks.
         if not isinstance(req, dict):
             return f"request is not a dict: {type(req).__name__}"
         if not req.get("req_id"):
@@ -222,91 +352,211 @@ class EncoderScheduler:
             return f"hashes must be list/scalar, got {type(h).__name__}"
         return None
 
-    async def _dispatch_group(
-        self, group: List[PendingRequest], modality: Modality
-    ) -> None:
-        # A request may time out while queued. Never start work that no caller
-        # can observe, or its eventual staged embedding would have no owner.
-        group = [pending for pending in group if not pending.future.done()]
-        if not group:
-            return
-
-        # Video can't fuse (per-video preprocess kwargs vary).
-        if modality not in _BATCHABLE_MODALITIES:
-            await self._dispatch_per_request(group, modality)
-            return
-
-        # Drop structurally-bad requests before broadcasting; otherwise TP
-        # workers would join batch_encode collectives that rank-0 has already
-        # abandoned.
-        valid: List[PendingRequest] = []
-        for p in group:
-            err = self._validate_request_shape(p.request)
-            if err is None:
-                valid.append(p)
+    def _validated_group(self, group: List[PendingRequest]) -> List[PendingRequest]:
+        # Skip timed-out requests before acquiring resources.
+        active = [pending for pending in group if not pending.future.done()]
+        valid = []
+        for pending in active:
+            error = self._validate_request_shape(pending.request)
+            if error is None:
+                valid.append(pending)
                 continue
-            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
-            if not p.future.done():
-                p.future.set_exception(server_module.BadRequestError(err))
-        if not valid:
-            return
-        group = valid
+            logger.error(
+                f"Dropping req_id={pending.request.get('req_id')} from batch: {error}"
+            )
+            pending.future.set_exception(server_module.BadRequestError(error))
+        return valid
 
-        requests = [p.request for p in group]
-        start = time.time()
+    @staticmethod
+    def _observe_queue_wait(
+        group: List[PendingRequest], modality: Modality, start: float
+    ) -> None:
+        if server_module.encoder_metrics_collector is None:
+            return
         modality_str = modality.name.lower()
-        if server_module.encoder_metrics_collector is not None:
-            for p in group:
-                server_module.encoder_metrics_collector.observe_queue_wait(
-                    max(0.0, start - p.submit_time), modality=modality_str
-                )
+        for pending in group:
+            server_module.encoder_metrics_collector.observe_queue_wait(
+                max(0.0, start - pending.submit_time), modality=modality_str
+            )
+
+    async def _submit_preprocess_group(
+        self, group: List[PendingRequest], modality: Modality
+    ) -> Optional[BatchWork]:
+        group = self._validated_group(group)
+        if not group:
+            return None
+
+        requests = [pending.request for pending in group]
+        start = time.time()
+        self._observe_queue_wait(group, modality, start)
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        submitted = False
         try:
-            # The scheduler is the sole owner of batched dispatch order. Keep
-            # the collective broadcast and rank-0 execution under the same
-            # lock, while allowing concurrent HTTP handlers to enqueue before
-            # waiting on their individual futures.
+            # Acquire request leases before the first suspension.
+            await self.encoder.preprocess_worker.submit(batch_id, requests, modality)
+            submitted = True
             async with self.encoder.encode_dispatch_lock:
                 for sock in self.send_sockets:
                     sock_send(
                         sock,
                         wrap_as_pickle(
                             {
-                                "type": "batch_encode",
+                                "type": "prepare_batch",
+                                "batch_id": batch_id,
                                 "modality": modality.name,
                                 "requests": requests,
-                                "enter_time": start,
                             }
                         ),
                     )
+        except asyncio.CancelledError:
+            if submitted:
+                await self._cancel_prepared_group((batch_id, group, modality))
+            else:
+                stop_error = RuntimeError("EncoderScheduler stopped")
+                for pending in group:
+                    if not pending.future.done():
+                        pending.future.set_exception(stop_error)
+            raise
+        except Exception as error:
+            if submitted:
+                await self._cancel_prepared_group(
+                    (batch_id, group, modality), error=error
+                )
+            else:
+                for pending in group:
+                    if not pending.future.done():
+                        pending.future.set_exception(error)
+            logger.error(
+                f"Failed to start preprocessing for encoder batch {batch_id}: {error}",
+                exc_info=True,
+            )
+            return None
 
-                logger.info(
-                    f"Dispatching batch of {len(group)} {modality.name} requests"
-                )
-                results = await self.encoder.batch_encode(requests, modality)
+        logger.info(
+            f"Preparing batch {batch_id} of {len(group)} {modality.name} requests"
+        )
+        return batch_id, group, modality
+
+    async def _cancel_prepared_group(
+        self, work: BatchWork, error: Optional[Exception] = None
+    ) -> None:
+        batch_id, group, _ = work
+        assert batch_id is not None
+        try:
+            async with self.encoder.encode_dispatch_lock:
+                for sock in self.send_sockets:
+                    sock_send(
+                        sock,
+                        wrap_as_pickle({"type": "cancel_batch", "batch_id": batch_id}),
+                    )
+        except Exception:
+            logger.warning(
+                f"Failed to cancel prepared encoder batch {batch_id} on TP workers",
+                exc_info=True,
+            )
+        await self.encoder.preprocess_worker.cancel(batch_id)
+        failure = error or RuntimeError("EncoderScheduler stopped")
+        for pending in group:
+            if not pending.future.done():
+                pending.future.set_exception(failure)
+
+    async def _fail_work(self, work: BatchWork, error: Exception) -> None:
+        if work[0] is None:
+            for pending in work[1]:
+                if not pending.future.done():
+                    pending.future.set_exception(error)
+        else:
+            await self._cancel_prepared_group(work, error=error)
+
+    async def _dispatch_group(self, work: BatchWork) -> None:
+        batch_id, group, modality = work
+        if batch_id is None:
+            group = self._validated_group(group)
+            if not group:
+                return
+
+        # Video can't fuse (per-video preprocess kwargs vary).
+        if batch_id is None and modality not in _BATCHABLE_MODALITIES:
+            try:
+                await self._dispatch_per_request(group, modality)
+            except asyncio.CancelledError:
+                stop_error = RuntimeError("EncoderScheduler stopped")
+                for pending in group:
+                    if not pending.future.done():
+                        pending.future.set_exception(stop_error)
+                raise
+            return
+
+        requests = [p.request for p in group]
+        start = time.time()
+        execute_started = False
+        if batch_id is None:
+            self._observe_queue_wait(group, modality, start)
+        try:
+            # Serialize TP broadcast with rank-0 collective execution.
+            async with self.encoder.encode_dispatch_lock:
+                if batch_id is not None:
+                    for sock in self.send_sockets:
+                        sock_send(
+                            sock,
+                            wrap_as_pickle(
+                                {"type": "execute_batch", "batch_id": batch_id}
+                            ),
+                        )
+                    execute_started = True
+                    results = await self.encoder.encode_preprocessed_batch(batch_id)
+                else:
+                    for sock in self.send_sockets:
+                        sock_send(
+                            sock,
+                            wrap_as_pickle(
+                                {
+                                    "type": "batch_encode",
+                                    "modality": modality.name,
+                                    "requests": requests,
+                                    "enter_time": start,
+                                }
+                            ),
+                        )
+                    logger.info(
+                        f"Dispatching batch of {len(group)} {modality.name} requests"
+                    )
+                    results = await self.encoder.batch_encode(requests, modality)
             if len(group) > 1:
+                batch_label = f"Batch {batch_id}" if batch_id is not None else "Batch"
                 logger.info(
-                    f"Batch of {len(group)} {modality.name} requests completed in "
-                    f"{(time.time() - start) * 1000:.1f}ms"
+                    f"{batch_label} of {len(group)} {modality.name} requests "
+                    f"completed in {(time.time() - start) * 1000:.1f}ms"
                 )
-        except Exception as e:
-            # batch_encode normally catches and returns errors via _stage_errors.
-            # If it raised, rank-0 may have skipped a collective broadcast, leaving
-            # TP workers stuck. Don't try to recover — fail every pending future
-            # and let the client retry. Re-broadcasting would risk a deadlock.
-            logger.error(f"batch_encode raised: {e}", exc_info=True)
-            for p in group:
-                if not p.future.done():
-                    p.future.set_exception(e)
+        except asyncio.CancelledError:
+            if batch_id is not None and not execute_started:
+                await self._cancel_prepared_group(work)
+            else:
+                stop_error = RuntimeError("EncoderScheduler stopped")
+                for pending in group:
+                    if not pending.future.done():
+                        pending.future.set_exception(stop_error)
+            raise
+        except Exception as error:
+            # A raised batch_encode may desync TP; fail without rebroadcasting.
+            if batch_id is not None and not execute_started:
+                await self._cancel_prepared_group(work, error=error)
+            else:
+                for pending in group:
+                    if not pending.future.done():
+                        pending.future.set_exception(error)
+            logger.error(f"batch_encode raised: {error}", exc_info=True)
             return
 
         if len(results) != len(group):
-            err = RuntimeError(
+            error = RuntimeError(
                 f"batch_encode returned {len(results)} results for {len(group)} requests"
             )
-            logger.error(str(err))
-            for p in group:
-                if not p.future.done():
-                    p.future.set_exception(err)
+            logger.error(str(error))
+            for pending in group:
+                if not pending.future.done():
+                    pending.future.set_exception(error)
             return
 
         for p, result in zip(group, results):
@@ -354,8 +604,7 @@ class EncoderRuntime:
     """Current non-DP backend runtime.
 
     The Scheduler and rank-0 MMEncoder remain colocated.  TP followers use the
-    existing ZMQ control path and are intentionally not split behind a new
-    Scheduler/Worker IPC contract in this phase.
+    existing ZMQ control path for PREPARE / EXECUTE ordering.
     """
 
     encoder: MMEncoder
@@ -1288,6 +1537,7 @@ async def _dp_worker_handle_request(
                 embedding_port=request["embedding_port"],
                 session_id=request["session_id"],
                 buffer_address=request["buffer_address"],
+                receive_count=request.get("receive_count"),
             )
             if not sent:
                 # Error envelope, not 200 + phantom count: the decoder must
