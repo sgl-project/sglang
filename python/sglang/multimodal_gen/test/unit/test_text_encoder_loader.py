@@ -334,6 +334,23 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
+    def test_explicit_online_quantization_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="kitchen_int8",
+        )
+
+        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
