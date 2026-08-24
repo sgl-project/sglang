@@ -88,6 +88,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
+    _bump_req_generations,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
@@ -162,6 +163,10 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self.track_req_generation = False
+
+    def enable_req_generation_tracking(self) -> None:
+        self.track_req_generation = True
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -186,11 +191,12 @@ class DecodeReqToTokenPool:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if self.track_req_generation:
+            _bump_req_generations(self.req_generation, select_index)
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 

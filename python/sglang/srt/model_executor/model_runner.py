@@ -834,6 +834,8 @@ class ModelRunner:
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
+        if self.spec_algorithm.is_dspark():
+            self.req_to_token_pool.enable_req_generation_tracking()
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
