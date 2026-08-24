@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -38,12 +39,13 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+    if _use_zbal:
         from zbal.zbal.deepep_adaptor import Config
         from zbal.zbal_buffer import Buffer
     else:
@@ -66,6 +68,18 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+_NVSHMEM_QP_DEPTH_DEFAULT = 1024
+
+
+def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
+    min_qp_depth = 2 * (num_max_dispatch_tokens_per_rank + 1)
+    current_qp_depth = int(
+        os.environ.get("NVSHMEM_QP_DEPTH", _NVSHMEM_QP_DEPTH_DEFAULT)
+    )
+    os.environ["NVSHMEM_QP_DEPTH"] = str(
+        max(current_qp_depth, _NVSHMEM_QP_DEPTH_DEFAULT, min_qp_depth)
+    )
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -219,6 +233,8 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            if not _is_npu:
+                _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -528,6 +544,8 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.NORMAL
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -691,6 +709,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.LOW_LATENCY
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -781,7 +801,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             dispatch_kwargs["x_global_scale"] = input_global_scale
 
         # NPU requires topk_weights during dispatch
-        if _is_npu and topk_weights is not None:
+        if _is_npu and not _use_zbal and topk_weights is not None:
             dispatch_kwargs["topk_weights"] = topk_weights
 
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (

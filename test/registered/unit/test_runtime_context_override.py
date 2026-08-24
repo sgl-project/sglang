@@ -25,7 +25,8 @@ class TestContextOverride(CustomTestCase):
 
     def _publish(self):
         sa = ServerArgs(model_path="dummy")
-        rc.get_context().set_server_args(sa)
+        # Through publish, so the record is resolved the way a process resolves it.
+        rc.publish(sa, role="test")
         return sa
 
     def test_override_writes_bag_not_server_args(self):
@@ -102,8 +103,8 @@ class TestContextOverride(CustomTestCase):
         self.assertEqual(sa.kv_cache_dtype, raw)
 
     def test_bare_server_args_write_raises_after_resolution(self):
-        # server_args is read-only after resolution regardless of the
-        # SGLANG_STRICT_CONFIG_MUTATION env; write via override instead.
+        # server_args is read-only after resolution: resolved config changes go
+        # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
         object.__setattr__(sa, "_declarations_materialized", True)
         with self.assertRaises(AttributeError):
@@ -128,6 +129,13 @@ class TestContextOverride(CustomTestCase):
     def test_reset_clears_role(self):
         rc.publish(ServerArgs(model_path="dummy"), role="test")
         rc.reset_context()
+        self.assertIsNone(rc.publish_role())
+
+    def test_direct_install_clears_role(self):
+        # A role-less set_server_args (test overrides, draft-worker builds)
+        # must not inherit the previous lifecycle's role.
+        rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
+        rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
         self.assertIsNone(rc.publish_role())
 
 

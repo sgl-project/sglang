@@ -74,7 +74,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import (
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -124,6 +128,27 @@ _COMMUNICATOR_SPECS = [
 ]
 
 
+def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
+    """Merge the per-rank replies of a LoRA load/unload fan-out into one result.
+
+    The operation succeeded only if every rank succeeded. Reporting a partial
+    failure as success would let the tokenizer-side LoRA registry drift from
+    the ranks that failed, so failures win: their deduplicated error messages
+    are joined, and loaded_adapters reflects the first failed rank.
+    """
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return results[0]
+    error_messages = list(
+        dict.fromkeys(r.error_message for r in failed if r.error_message)
+    )
+    return LoRAUpdateOutput(
+        success=False,
+        error_message=" | ".join(error_messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -137,7 +162,7 @@ class TokenizerControlMixin:
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
-                server_args.dp_size,
+                get_parallel().dp_size,
                 mode,
             )
             setattr(self, f"{name}_communicator", comm)
@@ -165,7 +190,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: AddExternalCorpusReqInput
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -241,7 +266,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, corpus_id: str
     ) -> RemoveExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return RemoveExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -256,7 +281,7 @@ class TokenizerControlMixin:
         self: TokenizerManager,
     ) -> ListExternalCorporaReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return ListExternalCorporaReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -277,9 +302,12 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        return (
+        result = (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+        if result.success and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        return result
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -323,7 +351,7 @@ class TokenizerControlMixin:
                 )
             if hicache_write_policy is not None:
                 hicache_fields["hicache_write_policy"] = hicache_write_policy
-            self.server_args.override("tokenizer.attach_hicache", **hicache_fields)
+            self.record_config_updates("tokenizer.attach_hicache", **hicache_fields)
         return out
 
     async def detach_hicache_storage(
@@ -339,7 +367,7 @@ class TokenizerControlMixin:
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
-            self.server_args.override(
+            self.record_config_updates(
                 "tokenizer.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
@@ -440,6 +468,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -501,6 +531,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -536,6 +568,8 @@ class TokenizerControlMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -558,7 +592,9 @@ class TokenizerControlMixin:
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
         await self.lora_registry.wait_for_unload(lora_id)
-        result = (await self.update_lora_adapter_communicator(obj))[0]
+        result = _merge_lora_update_results(
+            await self.update_lora_adapter_communicator(obj)
+        )
 
         return result
 
@@ -575,11 +611,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                get_parallel().dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -596,17 +630,19 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
 
-                if get_lora().max_loaded_loras is not None:
+                if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
+                        > self.server_args.max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -620,7 +656,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
+                            f"max allowed: {self.server_args.max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -654,11 +690,15 @@ class TokenizerControlMixin:
                 )
 
             assert (
-                get_parallel().dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
+            )
+
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
             )
 
             async with self.lora_update_lock:
@@ -668,15 +708,17 @@ class TokenizerControlMixin:
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                if get_lora().max_loaded_loras is not None:
+                if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
+                        > self.server_args.max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
@@ -690,7 +732,7 @@ class TokenizerControlMixin:
                         logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
+                            f"max allowed: {self.server_args.max_loaded_loras})"
                         )
 
                         unload_result = await self._unload_lora_adapter_locked(
@@ -727,11 +769,9 @@ class TokenizerControlMixin:
                 obj.lora_name is not None
             ), "lora_name must be provided to unload LoRA adapter"
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                get_parallel().dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
@@ -894,8 +934,6 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            from sglang.srt.runtime_context import get_context
-
-            get_context().override(
+            self.record_config_updates(
                 "tokenizer.weight_version", weight_version=weight_version
             )

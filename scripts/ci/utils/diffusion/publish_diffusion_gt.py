@@ -350,8 +350,7 @@ def validate_gt_files(files_to_upload, changed_files, remote_image_entries, toke
     sys.exit(1)
 
 
-def check_quality(source_dir, target_dir=None):
-    target_dir = target_dir or DEFAULT_TARGET_DIR
+def check_quality(source_dir, target_dir):
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
@@ -372,8 +371,7 @@ def check_quality(source_dir, target_dir=None):
     validate_gt_files(files_to_upload, changed_files, remote_image_entries, token)
 
 
-def publish(source_dir, target_dir=None):
-    target_dir = target_dir or DEFAULT_TARGET_DIR
+def publish(source_dir, target_dir):
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
@@ -478,6 +476,23 @@ def publish(source_dir, target_dir=None):
                 raise
 
 
+def _resolve_target_dir(target_dir: str | None, per_platform: bool) -> str:
+    """Resolve the effective remote target dir.
+
+    With ``per_platform`` set, append the consistency platform subdir
+    (``h100``/``b200``/``5090``) so the publish path matches how the consistency
+    tests resolve GT: ``<target>/<platform>/<file>`` first, bare ``<target>/<file>``
+    only as fallback. Reuses the SAME resolver the tests use so read and write can
+    never drift. Lazy import keeps this script light when the flag is off.
+    """
+    target_dir = target_dir or DEFAULT_TARGET_DIR
+    if per_platform:
+        from sglang.multimodal_gen.test.test_utils import get_consistency_platform
+
+        target_dir = f"{target_dir}/{get_consistency_platform()}"
+    return target_dir
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Publish diffusion GT images to GitHub"
@@ -497,10 +512,13 @@ def main():
         help="Validate generated GT images without publishing them",
     )
     args = parser.parse_args()
+
+    per_platform = os.environ.get("SGLANG_DIFFUSION_GT_PER_PLATFORM") == "1"
+    target_dir = _resolve_target_dir(args.target_dir, per_platform)
     if args.check_only:
-        check_quality(args.source_dir, args.target_dir)
+        check_quality(args.source_dir, target_dir)
     else:
-        publish(args.source_dir, args.target_dir)
+        publish(args.source_dir, target_dir)
 
 
 if __name__ == "__main__":

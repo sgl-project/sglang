@@ -217,6 +217,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             self.quant_method,
             self.moe_runner_config,
             self.moe_tp_rank,
+            self.moe_tp_size,
         )
         self.quant_method.create_weights(
             layer=self,
@@ -382,7 +383,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
 
     def _swiglu(self, y_st2f: torch.Tensor, gammas_st: torch.Tensor) -> torch.Tensor:
         # Helion's kernel can produce NaNs for small shared-expert batches.
-        from sglang.srt.layers.moe.moe_runner.triton_utils.inkling_moe import (
+        from sglang.kernels.ops.moe.inkling_moe import (
             silu_and_mul_triton,
         )
 

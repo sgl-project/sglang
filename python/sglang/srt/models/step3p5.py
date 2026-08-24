@@ -4,13 +4,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -41,12 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None

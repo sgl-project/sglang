@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    List,
+    Optional,
+    Union,
+)
 
 import zmq
 from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -15,14 +23,21 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
 )
-from sglang.srt.managers.mm_utils import has_shm_features, unwrap_shm_features
-from sglang.srt.runtime_context import get_disagg, get_parallel
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.managers.mm_utils import (
+    has_shm_features,
+    unwrap_shm_features,
+)
+from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.utils import (
+    broadcast_pyobj,
+    point_to_point_pyobj,
+)
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.managers.rust_server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -32,7 +47,7 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -90,6 +105,15 @@ class SchedulerRequestReceiver:
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
+
+                # Rust ringbuffer backend: drain the in-process ring fed by the
+                # embedded Rust TokenizerManager instead of a zmq socket. Same
+                # non-blocking, msgpack-decoded contract as the zmq path below.
+                if envs.SGLANG_RUST_SERVER.get():
+                    recv_reqs.extend(
+                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                    )
+                    return recv_reqs
 
                 while True:
                     try:
@@ -157,7 +181,7 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or self.server_args.is_ep_scale_joiner
+                or is_ep_scale_joiner()
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
@@ -214,11 +238,12 @@ class SchedulerRequestReceiver:
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                if error_code is None:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                elif isinstance(error_code, HTTPStatus):
+                    status_code = error_code
+                else:
+                    status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs

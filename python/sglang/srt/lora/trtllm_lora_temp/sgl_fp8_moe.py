@@ -27,7 +27,7 @@ def fused_experts_fp8_sgl(
     # <-> quantization import cycle at load time.
     from flashinfer.fused_moe import Fp8QuantizationType
 
-    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         get_tp_group,
         is_allocation_symmetric,

@@ -34,7 +34,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    get_rope,
+)
 from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.vocab_parallel_embedding import (

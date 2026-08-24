@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -30,6 +31,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     MooncakeEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
+    PplxDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -40,8 +42,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_device,
-    get_exec,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import SpecInput
@@ -450,11 +452,9 @@ class TboDPAttentionPreparer:
 
         return local_can_run_tbo, local_forward_mode
 
-    def compute_output(self, partial_global_info):
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = partial_global_info[:, :2].cpu()
-        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
-        forward_modes = cpu_data[:, 1].tolist()
+    def compute_output(self, partial_global_info_cpu):
+        local_can_run_tbo_aggregated = min(partial_global_info_cpu[:, 0].tolist())
+        forward_modes = partial_global_info_cpu[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -636,8 +636,10 @@ class TboForwardBatchPreparer:
             device_field="extend_prefix_lens",
             sum_field=None,
         )
+        # The prefill half: this computes extend positions.
+        prefill_backend, _ = attention_backends()
         _, child_b.extend_start_loc = compute_position(
-            get_exec().kernel.attention_backend,
+            prefill_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -677,6 +679,12 @@ class TboForwardBatchPreparer:
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        if _is_hip:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
+            n_tokens = end_token_index - start_token_index
+            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
@@ -787,6 +795,7 @@ class TboForwardBatchPreparer:
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,
+                _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -799,6 +808,7 @@ class TboForwardBatchPreparer:
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+                extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
@@ -1092,6 +1102,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_pplx():
+            self._inners = [
+                PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     @property

@@ -18,7 +18,10 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.managers.schedule_batch import MultimodalDataItem

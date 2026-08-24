@@ -46,6 +46,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        use_flat_topology: bool = False,
     ):
         """
         Update experts' physical location after EPLB.
@@ -59,13 +60,14 @@ class ExpertLocationUpdater:
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
+        topology_num_nodes = 1 if use_flat_topology else nnodes
 
         missing_logical_experts_by_layers = _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
-            nnodes=nnodes,
+            nnodes=topology_num_nodes,
             rank=rank,
         )
         old_expert_location_metadata.update(

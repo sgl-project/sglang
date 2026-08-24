@@ -267,6 +267,9 @@ class Ernie4Model(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
     @torch.no_grad()
     def forward(
         self,

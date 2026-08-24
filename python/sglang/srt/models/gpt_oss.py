@@ -34,7 +34,9 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -718,15 +720,25 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Capture hidden-state boundaries: boundary 0 is the embedding output,
+        # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
+        if self.start_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
+                if i + 1 in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -1317,15 +1329,18 @@ class GptOssForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
+        num_layers = self.config.num_hidden_layers
         if layer_ids is None:
             self.capture_aux_hidden_states = True
-            num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # Preserve IDs that already include the final hidden-state
+            # boundary; otherwise retain the legacy output-layer conversion.
+            if layer_ids and max(layer_ids) == num_layers:
+                self.model.layers_to_capture = list(layer_ids)
+            else:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:

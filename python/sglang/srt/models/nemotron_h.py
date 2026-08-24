@@ -36,7 +36,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -86,11 +89,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -262,15 +261,17 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
-        self.use_min_latency_fc1_gemm = (
-            self.use_latent_moe
-            and self.fc1_latent_proj is not None
-            and _is_cuda
-            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
-        )
+        self._use_min_latency_fc1_gemm: bool | None = None
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_min_latency_fc1_gemm:
+        if self._use_min_latency_fc1_gemm is None:
+            self._use_min_latency_fc1_gemm = (
+                self.use_latent_moe
+                and self.fc1_latent_proj is not None
+                and _is_cuda
+                and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
+            )
+        if self._use_min_latency_fc1_gemm:
             return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
         return self.fc1_latent_proj(hidden_states)[0]
 
@@ -278,17 +279,11 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        overlap = _is_cuda and not torch.compiler.is_compiling()
-        if (
-            overlap
-            and get_moe_a2a_backend().is_flashinfer()
-            and not get_is_capture_mode()
+        if _is_cuda and (
+            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            overlap = False
-        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
-        else:
-            return self._forward_core_normal(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
@@ -568,7 +563,16 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
-            output = self._forward_mamba(hidden_states, forward_batch)
+            if is_in_breakable_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                breakable_nemotron_mamba2_with_output(
+                    hidden_states, output, self.layer_id, False
+                )
+            elif is_in_tc_piecewise_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                nemotron_mamba2_with_output(hidden_states, output, self.layer_id, False)
+            else:
+                output = self._forward_mamba(hidden_states, forward_batch)
             return output, residual
 
         hidden_states, residual = input_norm_maybe_fuse_allreduce(

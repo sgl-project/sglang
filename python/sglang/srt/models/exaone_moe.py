@@ -24,12 +24,17 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -57,11 +62,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)

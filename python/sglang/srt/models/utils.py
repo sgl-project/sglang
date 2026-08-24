@@ -24,8 +24,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.jit_kernel.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -590,6 +593,9 @@ def fused_qk_gemma_rmsnorm(
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
 
+    if _is_hip and q_rows == 0:
+        return q_out, k_out
+
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
     _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
@@ -705,6 +711,9 @@ def fused_qk_gemma_rmsnorm_with_gate(
     q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
     gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    if _is_hip and q_rows == 0:
+        return q_out, k_out, gate_out
 
     BLOCK_HD = triton.next_power_of_2(head_dim)
 

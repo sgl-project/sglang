@@ -40,7 +40,7 @@ from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParalleli
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 def _round_trip(obj):
@@ -126,7 +126,7 @@ REGISTRY_TYPE_INSTANCES = {
     "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput(
         lora_name="adapter",
         config_dict={"r": 8, "lora_alpha": 16, "target_modules": ["q_proj", "v_proj"]},
-        serialized_tensors="",
+        serialized_named_tensors=[b"tp0-bytes", b"tp1-bytes"],
         added_tokens_config={"<extra>": 32000},
     ),
     "DumperControlReqInput": DumperControlReqInput(method="start", body={"k": "v"}),

@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -72,12 +73,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -172,11 +168,14 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         # Ref: https://github.com/sgl-project/sglang/issues/17237
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
-        and batch_size > 0
-        and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
+        # Symbolic size checks stay last: under Dynamo tracing they guard on
+        # the dynamic token dim, so statically-off configs must short-circuit
+        # before reaching them.
+        and batch_size > 0
+        and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
     )
 
 
@@ -457,6 +456,8 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
+        enable_fused_ar_quant: bool = False,
+        fused_ar_quant_keep_bf16: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -465,6 +466,8 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
+        self.enable_fused_ar_quant = enable_fused_ar_quant
+        self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -504,7 +507,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
     ):
@@ -523,6 +526,8 @@ class LayerCommunicator:
             )
             if (
                 gathered_last_layer_output is residual
+                # An accumulator that copies on append already holds a snapshot.
+                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
                 and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
@@ -579,11 +584,32 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                    quant_result = None
+                    if (
+                        self.enable_fused_ar_quant
+                        and _use_aiter
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_quant_per_group",
                         )
-                    )
+                    ):
+                        # Try fused AR+RMSNorm+per-group-quant. Internally
+                        # falls back to AR+RMSNorm + separate quant when the
+                        # fully-fused kernel cannot service the shape.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
+                        )
+                    if quant_result is not None:
+                        hidden_states, residual = quant_result
+                    else:
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_allreduce_fusion(
+                                hidden_states, residual, use_attn_tp_group=False
+                            )
+                        )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
@@ -788,6 +814,18 @@ class LayerCommunicator:
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
         if is_enable_moe_cp_allgather():
+            return False
+
+        # Fusing makes the next layer's residual+LN absorb the post-experts
+        # all-reduce, and that fused kernel reduces over a single group. Under
+        # hybrid EP+TP the post-experts reduction spans two disjoint groups
+        # (moe_expert_parallel_all_reduce over _MOE_EP, then
+        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
+        # should_skip_post_experts_all_reduce() skips *both* once fusion is
+        # published -- so the fused reduce would cover only half the peers and
+        # silently return under-reduced activations.
+        parallel = get_parallel()
+        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
             return False
 
         if (
