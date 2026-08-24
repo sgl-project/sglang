@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -40,6 +41,14 @@ def _is_rocm_available() -> bool:
 
 def _is_cpu_available() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
+
+
+def _is_musa_available() -> bool:
+    try:
+        from torchada import Platform, detect_platform
+    except ImportError:
+        return False
+    return detect_platform() == Platform.MUSA
 
 
 def _is_xpu_available() -> bool:
@@ -65,6 +74,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
            (checked first; an explicit opt-in wins over CUDA/ROCm availability,
            so developers on GPU hosts can intentionally exercise the CPU path)
+         - 0 activated + MUSA available → fallback MusaSRTPlatform
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
@@ -122,6 +132,11 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if _is_musa_available():
+            logger.debug(
+                "No platform plugin detected. Using MUSA SRTPlatform defaults."
+            )
+            return MusaSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
