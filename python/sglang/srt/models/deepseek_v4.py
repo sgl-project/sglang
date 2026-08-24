@@ -2154,7 +2154,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        # When CP decode attention TP is off (the default) maybe_use_decode_attn_tp
+        # degrades to a bare `yield`, so skipping it is equivalent -- but it keeps
+        # self_attn out of a _GeneratorContextManager, inside which Dynamo refuses to
+        # graph break and tc_piecewise prefill fails to compile.
+        if get_cp_decode_attn_tp_ctx().is_enabled:
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                hidden_states = self.self_attn(
+                    x=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=x_quant,
+                )
+        else:
             hidden_states = self.self_attn(
                 x=hidden_states,
                 positions=positions,
