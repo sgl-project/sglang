@@ -85,6 +85,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             speed_mode_enable_torch_compile_by_default=False,
+            # 61.73 GB of DiT weights. Every card that is not part of a
+            # 4xH200 set has to stream them, so the DiT has to be eligible for
+            # automatic layerwise offload -- the default here is an empty tuple,
+            # which makes the gate in _should_auto_enable_dit_layerwise_offload
+            # always false and leaves the DiT resident until it fails to load.
+            dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
             auto_enable_cfg_parallel=False,
@@ -132,6 +138,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
             "quantization": server_args.quantization,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "text_encoder_quantization": text_encoder_quantization,
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
@@ -154,6 +161,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": 4,
             "performance_mode": "speed",
             "quantization": None,
+            "transformer_weights_path": None,
             "text_encoder_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
