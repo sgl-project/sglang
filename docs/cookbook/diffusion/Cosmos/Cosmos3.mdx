@@ -62,6 +62,12 @@ sglang serve \
   --num-gpus 1
 ```
 
+With `--performance-mode auto`, a Cosmos3 Nano checkpoint keeps its DiT and
+VAE resident when every selected GPU has at least 120 GiB available at
+startup. Below that threshold, auto mode retains the conservative DiT
+component-offload policy. This high-memory override is limited to Nano;
+Cosmos3 Super checkpoints keep their existing multi-GPU placement defaults.
+
 For `Cosmos3-Super`, split the model across multiple GPUs:
 
 ```bash Command

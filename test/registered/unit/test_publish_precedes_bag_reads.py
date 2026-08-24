@@ -42,6 +42,7 @@ import unittest
 
 import sglang
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.config_publishers import publisher_names
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
@@ -104,6 +105,13 @@ _UNREAD_ENTRIES: dict = {
     ("multimodal_gen/test/unit/test_disagg_trace.py", "_srt_trace_server_args"): (
         "a trace fixture publishing its own context"
     ),
+    (
+        "multimodal_gen/runtime/managers/gpu_worker.py",
+        "init_device_and_model",
+    ): (
+        "a worker installing a placeholder when its process has nothing "
+        "published; it reads its own config, not the srt bags"
+    ),
 }
 
 # `publish` itself and its named wrappers live here; a call inside them is the
@@ -158,6 +166,9 @@ def _calls(fn):
     return out
 
 
+_PUBLISH_NAMES = publisher_names(_PACKAGE_ROOT / "srt")
+
+
 class _Module:
     """One parsed module: what it calls the config API, and what it defines.
 
@@ -183,9 +194,7 @@ class _Module:
                 if node.module in _CONFIG_MODULES:
                     for alias in node.names:
                         local = alias.asname or alias.name
-                        if alias.name == "publish" or alias.name.startswith(
-                            "set_global_server_args"
-                        ):
+                        if alias.name in _PUBLISH_NAMES:
                             self.publishers.add(local)
                         elif alias.name in _ACCESSORS:
                             self.accessors.add(local)

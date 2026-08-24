@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -33,9 +34,13 @@ def inspect_comfy_quant_markers(
     checkpoint_meta: dict[str, tuple[str, tuple[int, ...]]] = {}
     raw_markers: dict[str, dict[str, Any]] = {}
     marked_dtype_weight_prefixes: set[str] = set()
+    global_quant_formats: set[str] = set()
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+            if quant_format := metadata.get("quant_format"):
+                global_quant_formats.add(quant_format.lower())
             for key in checkpoint.keys():
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
@@ -67,6 +72,23 @@ def inspect_comfy_quant_markers(
                     )
                 raw_markers[prefix] = marker
 
+    if global_quant_formats == {"mxfp8"}:
+        for prefix in marked_dtype_weight_prefixes:
+            weight_meta = checkpoint_meta[f"{prefix}.weight"]
+            scale_meta = checkpoint_meta.get(f"{prefix}.weight_scale")
+            weight_dtype, weight_shape = weight_meta
+            if (
+                weight_dtype != "F8_E4M3"
+                or len(weight_shape) != 2
+                or weight_shape[1] % 32 != 0
+                or scale_meta != ("U8", (weight_shape[0], weight_shape[1] // 32))
+            ):
+                raise ValueError(
+                    f"MXFP8 layer {prefix!r} has incompatible weight/scale metadata: "
+                    f"{weight_meta} and {scale_meta}"
+                )
+            raw_markers.setdefault(prefix, {"format": "mxfp8"})
+
     missing_markers = marked_dtype_weight_prefixes - raw_markers.keys()
     if missing_markers:
         raise ValueError(
@@ -77,10 +99,6 @@ def inspect_comfy_quant_markers(
     for prefix, marker in raw_markers.items():
         marker_format = marker.get("format")
         required = {f"{prefix}.weight", f"{prefix}.weight_scale"}
-        if marker_format == "float8_e4m3fn" and not marker.get(
-            "full_precision_matrix_mult", False
-        ):
-            required.add(f"{prefix}.input_scale")
         if marker_format not in ("float8_e4m3fn", "int8_tensorwise"):
             continue
         missing = required - checkpoint_meta.keys()
@@ -89,7 +107,10 @@ def inspect_comfy_quant_markers(
                 f"Comfy layer {prefix!r} is missing checkpoint tensors: "
                 f"{sorted(missing)}"
             )
-        if marker_format != "int8_tensorwise":
+        if marker_format == "float8_e4m3fn":
+            marker["_activation_scheme"] = (
+                "static" if f"{prefix}.input_scale" in checkpoint_meta else "dynamic"
+            )
             continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
         scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
@@ -125,6 +146,11 @@ def resolve_comfy_checkpoint_quantization(
         return KitchenInt8Config(layer_markers=layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
+    if formats == ["mxfp8"]:
+        return MXFP8Config(
+            is_checkpoint_fp8_serialized=True,
+            layer_markers=layer_markers,
+        )
     raise NotImplementedError(
         "Unsupported Comfy quantization format(s): " + ", ".join(formats)
     )

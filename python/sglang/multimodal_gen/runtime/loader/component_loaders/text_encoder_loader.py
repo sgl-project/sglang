@@ -652,6 +652,11 @@ class TextEncoderLoader(ComponentLoader):
             server_args.resolve_component_quantization(component_name),
             server_args.resolve_component_quantization_ignored_layers(component_name),
         )
+        if issubclass(model_cls, EncoderTensorParallelMixin):
+            model_cls.configure_component_paths(
+                encoder_config,
+                server_args.component_paths,
+            )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (
             server_args.batching_max_size > 1
