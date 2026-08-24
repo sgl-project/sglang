@@ -1533,7 +1533,18 @@ class Scheduler(
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
         runner.war_fastpath_read_done_event = None
-        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
+        if self.is_hybrid_ssm:
+            # Hybrid (linear-attention) models re-read shared state during the
+            # decode replay, so the pre-replay read-done snapshot is too early
+            # for the WAR barrier -- and every device-side event coupling to
+            # replay progress we tried (post-replay record, in-graph external
+            # record) intermittently deadlocks multi-node EP under the overlap
+            # scheduler. Host-wait on the forward stream instead: the replay is
+            # fully done, so every shared read has finished, and no dangling
+            # device-side wait remains. Non-hybrid models keep the original
+            # barrier below and are unaffected.
+            self.forward_stream.synchronize()
+        elif ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
