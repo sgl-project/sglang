@@ -845,12 +845,6 @@ class DeepseekV4AscendAttnBackend(
             if pool is not None
         }
 
-    def supports_uniform_cuda_graph_bucket_padding(self) -> bool:
-        # DSpark cannot currently extend the global DP batch to a larger graph
-        # bucket without corrupting DSV4 cache/compressor metadata. Require an
-        # exact captured batch size; otherwise the runner falls back to eager.
-        return not self._is_dspark_algorithm
-
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
         return (
@@ -1560,7 +1554,10 @@ class DeepseekV4AscendAttnBackend(
                 dim=0,
             )
             fm.actual_seq_lengths_q_pa_cpu = torch.cat(
-                [torch.zeros(1, dtype=torch.int32), torch.cumsum(seq_lens_cpu, dim=0).int()],
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(seq_lens_cpu, dim=0).int(),
+                ],
                 dim=0,
             )
         elif forward_batch.forward_mode.is_decode():

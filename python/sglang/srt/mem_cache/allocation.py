@@ -114,7 +114,6 @@ def get_last_loc(
         "torch_native",
     ) and decode_backend not in ("ascend", "torch_native")
 
-
     if (_is_hip or _is_npu) and uses_triton_dispatch:
         # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,

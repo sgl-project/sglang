@@ -238,9 +238,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             _, target_decode_attention_backend = (
                 server_args._resolved_attention_backends()
             )
-            use_npu_dsv4_epilogue_hook = (
-                target_decode_attention_backend == "dsv4"
-            )
+            use_npu_dsv4_epilogue_hook = target_decode_attention_backend == "dsv4"
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
@@ -265,14 +263,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     make_dspark_verify_epilogue_capture_hook,
                 )
 
-                verify_epilogue_capture_hook = (
-                    make_dspark_verify_epilogue_capture_hook(self._verify_epilogue)
+                verify_epilogue_capture_hook = make_dspark_verify_epilogue_capture_hook(
+                    self._verify_epilogue
                 )
             else:
                 verify_epilogue_capture_hook = self._verify_epilogue.capture_hook
-            self.model_runner.capture_tail_hooks.append(
-                verify_epilogue_capture_hook
-            )
+            self.model_runner.capture_tail_hooks.append(verify_epilogue_capture_hook)
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         if (

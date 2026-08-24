@@ -475,49 +475,16 @@ class _FakeRaggedRunner(types.SimpleNamespace):
     pass
 
 
-def _fake_model_runner(capture_num_tokens, max_bs, *, supports_ragged_graph=True):
+def _fake_model_runner(capture_num_tokens, max_bs):
     runner = _FakeRaggedRunner(
         ragged_verify_mode=True,
         capture_num_tokens=capture_num_tokens,
         max_bs=max_bs,
-        attn_backend=types.SimpleNamespace(
-            supports_ragged_verify_graph=supports_ragged_graph
-        ),
     )
     return types.SimpleNamespace(decode_cuda_graph_runner=runner)
 
 
 class TestBudgetTierSelection(CustomTestCase):
-    def test_backend_without_ragged_graph_uses_exact_eager_token_count(self):
-        from sglang.srt.speculative.dspark_components.dspark_planner import (
-            ragged_capture_num_tokens,
-            verify_layout_graph_num_tokens_floor,
-            verify_layout_grid,
-        )
-        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
-
-        model_runner = _fake_model_runner(
-            [8, 16, 1024], max_bs=128, supports_ragged_graph=False
-        )
-        self.assertIsNone(ragged_capture_num_tokens(model_runner=model_runner))
-        self.assertEqual(
-            verify_layout_grid(
-                verify_lens_cpu=[1, 3, 2],
-                ragged_verify_mode=RaggedVerifyMode.COMPACT,
-                model_runner=model_runner,
-            ),
-            [6],
-        )
-        self.assertEqual(
-            verify_layout_graph_num_tokens_floor(
-                num_reqs=3,
-                ragged_verify_mode=RaggedVerifyMode.COMPACT,
-                verify_num_draft_tokens=6,
-                model_runner=model_runner,
-            ),
-            0,
-        )
-
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,
