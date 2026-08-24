@@ -292,6 +292,41 @@ class BaseLayerWithLoRA(nn.Module):
         return True
 
     @torch.no_grad()
+    def compute_merged_weight(self) -> torch.Tensor:
+        """The merged weight as a new CPU tensor; the base is never written.
+
+        Same math as the in-place merge — computed on the device, in fp32
+        when the policy says so, rounded back once — so the bytes are
+        identical to what merge_lora_weights would have left in place.
+        """
+        base = self.weight.data
+        target_dtype = base.dtype
+        work = base.detach().to(get_local_torch_device())
+        if (
+            self._should_merge_in_fp32(self.lora_weights_list)
+            and work.is_floating_point()
+            and work.dtype != torch.float32
+        ):
+            work = work.to(torch.float32)
+        self._merge_lora_into_data(work, self.lora_weights_list)
+        return work.to("cpu", dtype=target_dtype)
+
+    def install_merged_weight(
+        self, merged: torch.Tensor, base_view: torch.Tensor
+    ) -> None:
+        """Adopt an externally held merged weight (e.g. a cache mapping).
+
+        The single place the cached-merge state transition happens: the
+        parameter points at `merged`, the layer counts as merged, and the
+        unmerge snapshot is the untouched base view — zero-copy, because
+        nothing wrote the base storage.
+        """
+        self.weight.data = merged
+        self.merged = True
+        self.cpu_weight = base_view.detach()
+        self._base_is_view = True
+
+    @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
             self.strength = strength

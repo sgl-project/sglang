@@ -85,27 +85,34 @@ class LoraMergeCache:
         self._entries = entries
         return True
 
-    def get(self, name: str, weight: torch.nn.Parameter) -> bool:
-        """Point `weight` at the stored merged tensor, if the store has it."""
+    def get(
+        self, name: str, shape: torch.Size, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """The cached merged tensor for `name`, mapped from its file.
+
+        Purely a lookup: the caller decides what to do with the tensor. A
+        missing or mismatched entry returns None — mismatch also drops the
+        remaining entries, because one wrong file means the whole combination
+        key no longer describes this module.
+        """
         meta = self._entries.get(name)
         if meta is None:
-            return False
+            return None
         mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
         tensor = mapped.get("weight")
         if (
             tensor is None
-            or tuple(tensor.shape) != tuple(weight.shape)
-            or tensor.dtype != weight.dtype
+            or tuple(tensor.shape) != tuple(shape)
+            or tensor.dtype != dtype
         ):
             logger.warning(
                 "LoRA merge cache entry for %s does not match the module; "
-                "ignoring the store",
+                "ignoring the cache",
                 name,
             )
             self._entries = {}
-            return False
-        weight.data = tensor
-        return True
+            return None
+        return tensor
 
     # -- capture (first run) --------------------------------------------------
 
@@ -132,33 +139,27 @@ class LoraMergeCache:
             self._writable = False
         return self._writable
 
-    def put(
-        self,
-        name: str,
-        weight: torch.nn.Parameter,
-        merged: torch.Tensor | None = None,
-    ) -> bool:
-        """Write one merged weight to the store and re-point it at the mapping.
+    def put(self, name: str, merged: torch.Tensor) -> torch.Tensor | None:
+        """Write one merged tensor to its cache file and return the mapping.
 
-        `merged` is the copy-merge product; when omitted, the parameter's own
-        (copy-on-written) data is stored. Either way the parameter ends up on
-        the mapping and the anonymous copy dies here — one layer at a time, so
-        the anonymous high-water mark stays one layer wide.
+        The returned tensor is a view into the file — page cache the kernel
+        can drop — and the only thing the cache hands back; what to install it
+        into is the caller's business. None means the bytes could not be
+        cached (disk shortage, write failure) and the caller should keep its
+        own copy.
         """
         if not self._ensure_writable():
-            return False
-        source = weight.data if merged is None else merged
+            return None
         fname = hashlib.sha1(name.encode()).hexdigest()[:16] + ".safetensors"
         path = os.path.join(self.root, fname)
         try:
             tmp = f"{path}.tmp.{os.getpid()}"
-            safetensors_save_file({"weight": source.contiguous()}, tmp)
+            safetensors_save_file({"weight": merged.contiguous()}, tmp)
             os.replace(tmp, path)
             mapped = safetensors_load_file(path)["weight"]
-            weight.data = mapped
         except Exception as exc:
             logger.warning(
-                "Could not re-home merged weight %s (%s); it stays in "
+                "Could not cache merged weight %s (%s); it stays in "
                 "anonymous host memory",
                 name,
                 exc,
@@ -168,13 +169,13 @@ class LoraMergeCache:
                     os.remove(path)
             except OSError:
                 pass
-            return False
+            return None
         self._entries[name] = {
             "file": fname,
-            "shape": list(weight.shape),
-            "dtype": str(weight.dtype),
+            "shape": list(merged.shape),
+            "dtype": str(merged.dtype),
         }
-        return True
+        return mapped
 
     def finalize(self, extra: dict | None = None) -> None:
         """Write the manifest; only a complete store is ever adopted."""

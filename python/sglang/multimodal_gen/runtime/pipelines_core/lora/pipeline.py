@@ -1130,43 +1130,24 @@ class LoRAPipeline(ComposedPipelineBase):
         )
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
-        """Merge without writing the base storage.
+        """Merge one layer through the cache instead of in place.
 
-        The in-place merge copy-on-writes the checkpoint mapping: the whole
+        The in-place merge copy-on-writes the checkpoint mapping — the whole
         component's bytes become anonymous host memory, and so does the
-        clone() snapshot the layer keeps for unmerging. Merging into a
-        one-layer temporary and parking the result in the file-backed store
-        leaves the base storage untouched — the unmerge snapshot stays a
-        zero-copy view, and the anonymous high-water mark stays one layer
-        wide. If the store cannot take the bytes, fall back to the in-place
-        merge (correctness first, memory second).
+        clone() snapshot the layer keeps for unmerging. Going through the
+        cache leaves the base storage untouched: the layer computes the
+        merged bytes, the cache holds them file-backed, and the layer adopts
+        the mapping. If the cache cannot serve or take the bytes, fall back
+        to the in-place merge — correctness first, memory second.
         """
         base_view = layer.weight.data
-        if merge_cache.get(name, layer.weight):
-            layer.merged = True
-        else:
-            # Same math as merge_lora_weights: compute on the device, in fp32
-            # when the policy says so, and round back once — so the store holds
-            # exactly the bytes the in-place merge would have produced.
-            target_dtype = base_view.dtype
-            work = base_view.detach().to(get_local_torch_device())
-            if (
-                layer._should_merge_in_fp32(layer.lora_weights_list)
-                and work.is_floating_point()
-                and work.dtype != torch.float32
-            ):
-                work = work.to(torch.float32)
-            layer._merge_lora_into_data(work, layer.lora_weights_list)
-            merged = work.to("cpu", dtype=target_dtype)
-            del work
-            if merge_cache.put(name, layer.weight, merged):
-                layer.merged = True
-            else:
-                del merged
-                layer.merge_lora_weights()
-                return
-        layer.cpu_weight = base_view.detach()
-        layer._base_is_view = True
+        mapped = merge_cache.get(name, base_view.shape, base_view.dtype)
+        if mapped is None:
+            mapped = merge_cache.put(name, layer.compute_merged_weight())
+        if mapped is None:
+            layer.merge_lora_weights()
+            return
+        layer.install_merged_weight(mapped, base_view)
 
     def _merge_cache_for(
         self,

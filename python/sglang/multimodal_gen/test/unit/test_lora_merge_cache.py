@@ -1,8 +1,8 @@
-"""Merged LoRA weights end up file-backed instead of anonymous.
+"""The merge cache is a pure byte vault: tensors in, mapped tensors out.
 
-What matters: put round-trips the exact merged bytes and re-points the
-parameter at the mapping, a complete store is adopted (same bytes, no write),
-an incomplete or mismatched store is not adopted, and the key separates
+What matters: put round-trips the exact merged bytes and returns a mapping,
+a complete cache serves the same bytes back, a mismatched entry is refused,
+disk shortage returns None instead of raising, and the key separates
 combinations that must not share files.
 """
 
@@ -20,57 +20,48 @@ def _cache_root(monkeypatch, tmp_path):
     monkeypatch.setenv("SGLANG_DIFFUSION_CACHE_ROOT", str(tmp_path / "cache"))
 
 
-def _param() -> torch.nn.Parameter:
-    return torch.nn.Parameter(torch.randn(16, 16), requires_grad=False)
+def test_put_round_trips_and_returns_a_mapping():
+    merged = torch.randn(16, 16)
+    cache = LoraMergeCache("k1", expected_bytes=merged.numel() * 4)
 
-
-def test_put_round_trips_and_repoints(tmp_path):
-    weight = _param()
-    merged = weight.data.clone()
-    store = LoraMergeCache("k1", expected_bytes=weight.numel() * 4)
-
-    assert store.put("blocks.0.linear", weight)
-    assert torch.equal(weight.data, merged)
-    store.finalize()
+    mapped = cache.put("blocks.0.linear", merged)
+    assert mapped is not None
+    assert torch.equal(mapped, merged)
+    cache.finalize()
 
     second = LoraMergeCache("k1", expected_bytes=0)
     assert second.is_complete()
-    other = torch.nn.Parameter(torch.zeros(16, 16), requires_grad=False)
-    assert second.get("blocks.0.linear", other)
-    assert torch.equal(other.data, merged)
+    served = second.get("blocks.0.linear", merged.shape, merged.dtype)
+    assert served is not None
+    assert torch.equal(served, merged)
 
 
-def test_an_incomplete_store_is_not_adopted():
-    weight = _param()
-    store = LoraMergeCache("k2", expected_bytes=64)
-    assert store.put("a", weight)
+def test_an_incomplete_cache_is_not_complete():
+    cache = LoraMergeCache("k2", expected_bytes=64)
+    assert cache.put("a", torch.randn(4, 4)) is not None
     # no finalize -> no manifest
     assert not LoraMergeCache("k2", expected_bytes=0).is_complete()
 
 
-def test_a_mismatched_entry_refuses_adoption():
-    weight = _param()
-    store = LoraMergeCache("k3", expected_bytes=64)
-    assert store.put("a", weight)
-    store.finalize()
+def test_a_mismatched_entry_is_refused():
+    cache = LoraMergeCache("k3", expected_bytes=64)
+    assert cache.put("a", torch.randn(4, 4)) is not None
+    cache.finalize()
 
     second = LoraMergeCache("k3", expected_bytes=0)
     assert second.is_complete()
-    wrong_shape = torch.nn.Parameter(torch.zeros(8, 8), requires_grad=False)
-    assert not second.get("a", wrong_shape)
+    assert second.get("a", torch.Size([8, 8]), torch.float32) is None
 
 
-def test_disk_shortage_falls_back_to_memory(monkeypatch):
+def test_disk_shortage_returns_none(monkeypatch):
     import shutil as _shutil
     from types import SimpleNamespace
 
     monkeypatch.setattr(
         _shutil, "disk_usage", lambda _: SimpleNamespace(free=1, total=1, used=0)
     )
-    weight = _param()
-    store = LoraMergeCache("k4", expected_bytes=1 << 40)
-    assert not store.put("a", weight)
-    assert weight.data.is_contiguous()  # untouched, still anonymous
+    cache = LoraMergeCache("k4", expected_bytes=1 << 40)
+    assert cache.put("a", torch.randn(4, 4)) is None
 
 
 def test_the_key_separates_combinations(tmp_path):
