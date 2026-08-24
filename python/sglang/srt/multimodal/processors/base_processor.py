@@ -190,6 +190,24 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
+def _image_height_width(image) -> Tuple[int, int]:
+    """Return ``(height, width)`` for a PIL image or a decoded image tensor.
+
+    ``gpu_image_decode`` is on by default and routes JPEG payloads through
+    ``torchvision.io.decode_jpeg``, which yields a CHW ``uint8`` tensor. Such a
+    tensor has no PIL ``height``/``width`` attributes, so callers that assume
+    them raise ``AttributeError`` on the most common image format.
+    """
+    if isinstance(image, torch.Tensor):
+        if image.ndim < 2:
+            raise ValueError(f"Invalid image tensor shape: {tuple(image.shape)}")
+        # Decoded image tensors are channels-first (CHW / NCHW), so the spatial
+        # dimensions are always the trailing two.
+        height, width = image.shape[-2:]
+        return int(height), int(width)
+    return int(image.height), int(image.width)
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -1525,7 +1543,7 @@ class BaseMultimodalProcessor(ABC):
 
         """
         assert images is not None
-        image_sizes = [(image.height, image.width) for image in images]
+        image_sizes = [_image_height_width(image) for image in images]
         num_image_tokens = self._processor._get_num_multimodal_tokens(
             image_sizes=image_sizes
         ).num_image_tokens
