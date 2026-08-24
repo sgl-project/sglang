@@ -511,7 +511,7 @@ def run_bench_serving(
                 return
             # stdout has drained, but the direct child may still be alive:
             # give it a bounded time to exit, otherwise nuke the group.
-            if reader_done.is_set():    
+            if reader_done.is_set():
                 try:
                     process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
                 except subprocess.TimeoutExpired:
