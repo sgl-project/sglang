@@ -31,20 +31,26 @@ class TestLoRAPathAction(CustomTestCase):
         return parser
 
     def test_plain_paths_are_stripped(self):
-        ns = self._make_parser().parse_args(["--lora-paths", " /models/a ", "  /models/b"])
+        ns = self._make_parser().parse_args(
+            ["--lora-paths", " /models/a ", "  /models/b"]
+        )
         self.assertEqual(ns.lora_paths, ["/models/a", "/models/b"])
 
     def test_json_entry_is_parsed(self):
         entry = json.dumps({"lora_path": "/models/a", "lora_name": "lora-a"})
         ns = self._make_parser().parse_args(["--lora-paths", entry])
-        self.assertEqual(ns.lora_paths, [{"lora_path": "/models/a", "lora_name": "lora-a"}])
+        self.assertEqual(
+            ns.lora_paths, [{"lora_path": "/models/a", "lora_name": "lora-a"}]
+        )
 
     def test_mixed_plain_and_json_entries(self):
         entry = json.dumps({"lora_path": "/models/b", "lora_name": "lora-b"})
         ns = self._make_parser().parse_args(["--lora-paths", "/models/a", entry])
         self.assertEqual(len(ns.lora_paths), 2)
         self.assertEqual(ns.lora_paths[0], "/models/a")
-        self.assertEqual(ns.lora_paths[1], {"lora_path": "/models/b", "lora_name": "lora-b"})
+        self.assertEqual(
+            ns.lora_paths[1], {"lora_path": "/models/b", "lora_name": "lora-b"}
+        )
 
     def test_json_missing_required_keys_raises_assertion(self):
         bad = json.dumps({"path": "/models/a"})
@@ -87,7 +93,9 @@ class TestLoRAPathAction(CustomTestCase):
 class TestDeprecatedAction(CustomTestCase):
     def test_error_message_aborts_parse(self):
         parser = argparse.ArgumentParser()
-        parser.add_argument("--old-flag", action=DeprecatedAction, error_message="removed")
+        parser.add_argument(
+            "--old-flag", action=DeprecatedAction, error_message="removed"
+        )
         with self.assertRaises(SystemExit):
             parser.parse_args(["--old-flag"])
 
@@ -166,7 +174,10 @@ class TestDeprecatedAliasStoreAction(CustomTestCase):
     def test_default_survives_when_absent(self):
         parser = argparse.ArgumentParser()
         parser.add_argument(
-            "--old-alias", dest="config", action=DeprecatedAliasStoreAction, default="orig"
+            "--old-alias",
+            dest="config",
+            action=DeprecatedAliasStoreAction,
+            default="orig",
         )
         ns = parser.parse_args([])
         self.assertEqual(ns.config, "orig")
