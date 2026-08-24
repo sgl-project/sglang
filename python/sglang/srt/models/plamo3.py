@@ -649,12 +649,17 @@ class Plamo3ForCausalLM(nn.Module):
     def set_eagle3_layers_to_capture(
         self, layer_ids: Optional[List[int]] = None
     ) -> None:
-        # Plamo3 checkpoints do not implement EAGLE3 aux hidden capture.
-        # Keep the entry point explicit so speculative paths fail fast with a
-        # clear message instead of falling into a CUDA graph capture error.
-        raise NotImplementedError(
-            "Plamo3 does not support EAGLE3 auxiliary hidden state capture."
-        )
+        if not self.model.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            # SGLang captures the input of layer i, which is the output of
+            # layer i - 1. Shift HF-style output layer indices by one.
+            self.model.layers_to_capture = [layer_id + 1 for layer_id in layer_ids]
 
     def get_embed(self):
         return self.model.embed_tokens.weight

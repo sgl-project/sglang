@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.configs.plamo3 import Plamo3Config, is_full_attn
 from sglang.srt.models.plamo3 import (
+    Plamo3Decoder,
     Plamo3ForCausalLM,
     Plamo3Model,
     Plamo3RMSNorm,
@@ -205,15 +206,70 @@ class TestPlamo3Embedding(CustomTestCase):
         torch.testing.assert_close(embeddings, torch.full((2, 4), 2.0))
 
 
-class TestPlamo3Eagle3(CustomTestCase):
-    def test_eagle3_capture_raises(self):
-        # Instantiating the model requires TP runtime; call the classmethod
-        # path indirectly by checking the method raises on a dummy instance.
-        # We verify the method exists and is the raising variant via source.
-        import inspect
+class _AddOneDecoderLayer(torch.nn.Module):
+    def forward(self, positions, hidden_states, forward_batch, residual=None, **kwargs):
+        hidden_states = hidden_states + 1
+        return hidden_states, hidden_states
 
-        src = inspect.getsource(Plamo3ForCausalLM.set_eagle3_layers_to_capture)
-        self.assertIn("NotImplementedError", src)
+
+class TestPlamo3Eagle3(CustomTestCase):
+    @staticmethod
+    def _make_target(*, is_last_rank: bool = True, num_layers: int = 12):
+        class Target:
+            pass
+
+        target = Target()
+        target.config = Plamo3Config(num_hidden_layers=num_layers)
+        target.model = Target()
+        target.model.pp_group = Target()
+        target.model.pp_group.is_last_rank = is_last_rank
+        target.model.layers_to_capture = []
+        target.capture_aux_hidden_states = False
+        return target
+
+    def test_default_eagle3_capture_layers(self):
+        target = self._make_target(num_layers=12)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target)
+
+        self.assertTrue(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [2, 6, 9])
+
+    def test_explicit_eagle3_capture_layers_use_output_indices(self):
+        target = self._make_target(num_layers=12)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target, [0, 4, 11])
+
+        self.assertTrue(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [1, 5, 12])
+
+    def test_non_last_pp_rank_does_not_capture(self):
+        target = self._make_target(is_last_rank=False)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target)
+
+        self.assertFalse(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [])
+
+    def test_decoder_returns_requested_hidden_states(self):
+        decoder = Plamo3Decoder.__new__(Plamo3Decoder)
+        torch.nn.Module.__init__(decoder)
+        decoder.layers = torch.nn.ModuleList([_AddOneDecoderLayer() for _ in range(4)])
+        decoder.start_layer = 0
+        decoder.end_layer = 4
+
+        hidden_states, residual, aux_hidden_states = decoder(
+            positions=torch.empty(0),
+            hidden_states=torch.zeros(1, 2),
+            forward_batch=None,
+            layers_to_capture={1, 3, 4},
+        )
+
+        torch.testing.assert_close(hidden_states, torch.full((1, 2), 4.0))
+        torch.testing.assert_close(residual, hidden_states)
+        self.assertEqual(len(aux_hidden_states), 3)
+        for actual, expected in zip(aux_hidden_states, (1.0, 3.0, 4.0)):
+            torch.testing.assert_close(actual, torch.full((1, 2), expected))
 
 
 if __name__ == "__main__":
