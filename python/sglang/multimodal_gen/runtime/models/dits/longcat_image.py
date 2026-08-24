@@ -11,11 +11,9 @@ and feeds them directly to the timestep embedder. The diffusers pipeline passes
 SGLang's DenoisingStage passes the raw timestep instead, so the value reaching
 the embedder is identical and no division is needed here.
 
-Attention alignment: uses USPAttention (FA3/FA4 on Hopper/Blackwell) with
-SGLang fused RMSNorm (apply_qk_norm). RoPE is applied separately via
-diffusers apply_rotary_emb because LongCat's axes_dims_rope=[16,56,56]
-sums to head_dim=128 (full rotation), which is incompatible with flashinfer's
-cos_sin_cache format that requires rotary_dim <= head_dim.
+Attention alignment: uses USPAttention (FA3/FA4 on Hopper/Blackwell) and the
+SGLang fused QKNorm+RoPE kernel. LongCat's full-width, interleaved RoPE cache is
+handled directly instead of materializing the Diffusers rotate-pair chain.
 """
 
 from typing import List, Optional, Tuple
@@ -34,9 +32,18 @@ from diffusers.models.normalization import (
     AdaLayerNormZeroSingle,
 )
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_inplace_qknorm_rope,
+    tensors_equal,
+)
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm,
+    apply_qk_norm_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -48,6 +55,124 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_LONGCAT_QKNORM_ROPE = BitExactFusionGate("LongCat fused QKNorm+RoPE")
+
+
+def _longcat_qknorm_rope_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+    q = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1)
+    k = apply_rotary_emb(k, image_rotary_emb, sequence_dim=1)
+    return q, k
+
+
+def _apply_longcat_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    cos_sin_cache: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if image_rotary_emb is None:
+        return apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    can_fuse = (
+        cos_sin_cache is not None
+        and positions is not None
+        and q.is_cuda
+        and not torch.compiler.is_compiling()
+        and q_eps == k_eps
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=head_dim,
+            is_neox=False,
+            dtype=q.dtype,
+            cache_dtype=cos_sin_cache.dtype,
+            round_norm_before_rope=True,
+            cache_has_full_width=True,
+        )
+    )
+    verified = _LONGCAT_QKNORM_ROPE.verified
+    if (
+        can_fuse
+        and not _LONGCAT_QKNORM_ROPE.disabled
+        and (verified or _LONGCAT_QKNORM_ROPE.can_attempt_once())
+    ):
+        if q.shape[0] > 1:
+            positions = positions.repeat(q.shape[0])
+        q_input = q.clone() if not verified else q
+        k_input = k.clone() if not verified else k
+        try:
+            out = apply_qk_norm_rope(
+                q=q,
+                k=k,
+                q_norm=q_norm,
+                k_norm=k_norm,
+                head_dim=head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                positions=positions,
+                round_norm_before_rope=True,
+                cache_has_full_width=True,
+            )
+        except Exception as exc:
+            _LONGCAT_QKNORM_ROPE.on_exception(exc, logger=logger)
+            return _longcat_qknorm_rope_reference(
+                q_input,
+                k_input,
+                q_norm,
+                k_norm,
+                head_dim,
+                image_rotary_emb,
+            )
+        else:
+            if verified:
+                return out
+            ref = _longcat_qknorm_rope_reference(
+                q_input,
+                k_input,
+                q_norm,
+                k_norm,
+                head_dim,
+                image_rotary_emb,
+            )
+            return _LONGCAT_QKNORM_ROPE.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "LongCat fused QKNorm+RoPE is not bit-exact on this "
+                    "platform; falling back to the Diffusers chain"
+                ),
+            )
+
+    return _longcat_qknorm_rope_reference(
+        q,
+        k,
+        q_norm,
+        k_norm,
+        head_dim,
+        image_rotary_emb,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +233,9 @@ class _LongCatFFN(nn.Module):
 class _LongCatJointAttention(nn.Module):
     """Double-stream (joint) attention for _TransformerBlock.
 
-    img and txt tokens are projected separately, QK-norm applied via SGLang
-    fused kernel, RoPE applied via diffusers apply_rotary_emb (supports full
-    head_dim rotation), then concatenated (txt first) before USPAttention.
+    img and txt tokens are projected separately, passed through fused QKNorm
+    and full-width interleaved RoPE, then concatenated (txt first) before
+    USPAttention.
 
     TP: Q/K/V and add_q/k/v use ColumnParallelLinear (heads sharded across TP ranks).
     Output projections use RowParallelLinear (all-reduce after matmul).
@@ -200,6 +325,8 @@ class _LongCatJointAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         txt_seq_len = encoder_hidden_states.shape[1]
 
@@ -217,22 +344,40 @@ class _LongCatJointAttention(nn.Module):
         ek = ek.unflatten(-1, (self.num_local_heads, self.head_dim))
         ev = ev.unflatten(-1, (self.num_local_heads, self.head_dim))
 
-        # SGLang fused QK-norm
-        q, k = apply_qk_norm(q, k, self.norm_q, self.norm_k, self.head_dim)
-        eq, ek = apply_qk_norm(
-            eq, ek, self.norm_added_q, self.norm_added_k, self.head_dim
+        if image_rotary_emb is None:
+            image_rotary_emb_txt = image_rotary_emb_img = None
+        else:
+            cos, sin = image_rotary_emb
+            image_rotary_emb_txt = (cos[:txt_seq_len], sin[:txt_seq_len])
+            image_rotary_emb_img = (cos[txt_seq_len:], sin[txt_seq_len:])
+        positions_txt = positions[:txt_seq_len] if positions is not None else None
+        positions_img = positions[txt_seq_len:] if positions is not None else None
+
+        q, k = _apply_longcat_qknorm_rope(
+            q,
+            k,
+            self.norm_q,
+            self.norm_k,
+            self.head_dim,
+            image_rotary_emb_img,
+            cos_sin_cache,
+            positions_img,
+        )
+        eq, ek = _apply_longcat_qknorm_rope(
+            eq,
+            ek,
+            self.norm_added_q,
+            self.norm_added_k,
+            self.head_dim,
+            image_rotary_emb_txt,
+            cos_sin_cache,
+            positions_txt,
         )
 
         # Concatenate: txt first, then img (matches diffusers convention)
         q = torch.cat([eq, q], dim=1)
         k = torch.cat([ek, k], dim=1)
         v = torch.cat([ev, v], dim=1)
-
-        # RoPE applied after concat, over the full [txt+img] sequence.
-        # image_rotary_emb shape: [txt_len+img_len, head_dim] — matches q/k dim=1.
-        if image_rotary_emb is not None:
-            q = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1)
-            k = apply_rotary_emb(k, image_rotary_emb, sequence_dim=1)
 
         x = self.attn(q, k, v, num_replicated_prefix=txt_seq_len)
         x = x.flatten(2, 3).to(q.dtype)
@@ -298,6 +443,8 @@ class _LongCatSingleAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
@@ -306,13 +453,16 @@ class _LongCatSingleAttention(nn.Module):
         k = k.unflatten(-1, (self.num_local_heads, self.head_dim))
         v = v.unflatten(-1, (self.num_local_heads, self.head_dim))
 
-        # SGLang fused QK-norm
-        q, k = apply_qk_norm(q, k, self.norm_q, self.norm_k, self.head_dim)
-
-        # RoPE via diffusers (supports full head_dim rotation, sequence_dim=1)
-        if image_rotary_emb is not None:
-            q = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1)
-            k = apply_rotary_emb(k, image_rotary_emb, sequence_dim=1)
+        q, k = _apply_longcat_qknorm_rope(
+            q,
+            k,
+            self.norm_q,
+            self.norm_k,
+            self.head_dim,
+            image_rotary_emb,
+            cos_sin_cache,
+            positions,
+        )
 
         x = self.attn(q, k, v)
         return x.flatten(2, 3).to(q.dtype)
@@ -400,6 +550,8 @@ class _SingleTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb=None,
+        cos_sin_cache=None,
+        positions=None,
         **kwargs,
     ):
         text_seq_len = encoder_hidden_states.shape[1]
@@ -412,6 +564,8 @@ class _SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
         )
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
@@ -462,6 +616,8 @@ class _TransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb=None,
+        cos_sin_cache=None,
+        positions=None,
         **kwargs,
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
@@ -475,6 +631,8 @@ class _TransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
         )
 
         attn_output = gate_msa.unsqueeze(1) * attn_output
@@ -680,6 +838,9 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         image_rotary_emb = kwargs.get("image_rotary_emb") or self.pos_embed(
             torch.cat((txt_ids, img_ids), dim=0)
         )
+        cos, sin = image_rotary_emb
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).contiguous()
+        positions = torch.arange(cos.shape[0], device=cos.device, dtype=torch.int64)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -687,6 +848,8 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
             )
 
         for block in self.single_transformer_blocks:
@@ -695,6 +858,8 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
