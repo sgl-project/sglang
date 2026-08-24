@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import logging
 import struct
@@ -482,6 +483,7 @@ class NixlKVManager(CommonKVManager):
         self._num_slots_src: int = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._descriptor_diag_counter = itertools.count()
             if self.kv_args.kv_item_lens:
                 self._num_slots_src = (
                     self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
@@ -1482,15 +1484,36 @@ class NixlKVManager(CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V."""
         # Prepped path (KV only; state transfers use the non-prepped path below).
-        if (
+        has_prepped_kv = (
             not bypass_prepped
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
-            and not _has_fewer_contiguous_runs(
-                prefill_data_indices, dst_data_indices
+        )
+        choose_non_prepped = has_prepped_kv and _has_fewer_contiguous_runs(
+            prefill_data_indices, dst_data_indices
+        )
+        if has_prepped_kv and (sample := next(self._descriptor_diag_counter)) < 10:
+            pages = prefill_data_indices.size
+            runs = -1
+            if pages == dst_data_indices.size:
+                runs = int(
+                    np.count_nonzero(
+                        (np.diff(prefill_data_indices) != 1)
+                        | (np.diff(dst_data_indices) != 1)
+                    )
+                    + (pages > 0)
+                )
+            logger.info(
+                "NIXL descriptor choice sample=%d pages=%d runs=%d "
+                "choose_non_prepped=%d descriptors=%d",
+                sample,
+                pages,
+                runs,
+                choose_non_prepped,
+                len(item_lens) * (runs if choose_non_prepped else pages),
             )
-        ):
+        if has_prepped_kv and not choose_non_prepped:
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
             info = self.decode_kv_args_table[peer_name]
