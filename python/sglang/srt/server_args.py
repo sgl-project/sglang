@@ -7880,6 +7880,19 @@ class ServerArgs:
         ):
             return
 
+        if self.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+            raise ValueError(
+                f"--kv-cache-dtype {self.kv_cache_dtype} is not compatible with "
+                "the hierarchical cache (HiCache) host pool: the L2 write-back/"
+                "load-back path only transfers the packed KV data buffers "
+                "(k_data_ptrs/v_data_ptrs) and never the FP4 block scale "
+                "buffers, so reloaded pages would silently lose their scales; "
+                "the host pool also sizes tokens with a full-width dtype "
+                "formula that does not account for FP4's half-width data plus "
+                "separate scale buffers. Please use either HiCache or an FP4 "
+                "KV cache dtype, not both."
+            )
+
         self._validate_hicache_host_memory_mode()
 
         # Step 1: Initial layout-io compatibility normalization.

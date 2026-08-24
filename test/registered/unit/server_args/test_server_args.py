@@ -1333,6 +1333,16 @@ class TestHiCacheArgs(unittest.TestCase):
         if expected_decode_backend is not None:
             self.assertEqual(args.decode_attention_backend, expected_decode_backend)
 
+    def test_hicache_rejects_fp4_kv_cache_dtype(self):
+        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                server_args = self._make_args(enable_hierarchical_cache=True)
+                server_args.kv_cache_dtype = kv_cache_dtype
+                with self.assertRaisesRegex(
+                    ValueError, "not compatible with the hierarchical cache"
+                ):
+                    server_args._handle_hicache()
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
