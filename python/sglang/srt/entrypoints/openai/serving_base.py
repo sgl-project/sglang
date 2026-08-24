@@ -291,3 +291,19 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+
+    def extract_rid_from_header(
+        self, raw_request: Request, body_rid: Optional[str] = None
+    ) -> Optional[str]:
+        """Extract rid from HTTP header, with higher priority than rid in body.
+
+        Header name: x-request-id (case-insensitive in HTTP/1.1/2)
+        """
+        if raw_request is None:
+            return body_rid
+
+        header_value = raw_request.headers.get("x-request-id")
+        if header_value is not None:
+            return header_value
+
+        return body_rid
