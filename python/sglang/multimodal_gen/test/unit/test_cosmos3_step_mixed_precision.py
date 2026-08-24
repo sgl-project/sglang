@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config as HfModelOptFp8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
     StepMixedPrecisionController,
     StepMixedPrecisionFp8LinearMethod,
@@ -103,6 +106,42 @@ class TestInstallAndDispatch(unittest.TestCase):
         self.assertTrue(controller.high_precision)
 
         x = torch.randn(5, layer.input_size, dtype=torch.bfloat16)
+        out, _ = layer(x)
+        expected = torch.nn.functional.linear(
+            x, w_fp8.to(torch.bfloat16) * scale.to(torch.bfloat16)
+        )
+        torch.testing.assert_close(out, expected)
+
+    def test_install_wraps_hf_quant_config_variant(self):
+        # The `modelopt_fp8` hf_quant_config path uses a different
+        # ModelOptFp8LinearMethod class (modelopt_quant.py); the installer
+        # must wrap it too and the shared W8A16 dequant must hold.
+        layer = ReplicatedLinear(
+            32,
+            16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=HfModelOptFp8Config(is_checkpoint_fp8_serialized=True),
+            prefix="gen_layers.0.self_attn.to_qkv",
+        )
+        w16 = torch.randn(16, 32, dtype=torch.float32) / 8
+        scale = (w16.abs().max() / 448.0).reshape(())
+        w_fp8 = (w16 / scale).to(torch.float8_e4m3fn)
+        layer.weight.data.copy_(w_fp8)
+        # Emulate this method's post-load state (its real pass needs CUDA
+        # quant kernels): transposed FP8 view plus collapsed scalar scales.
+        layer.weight.data = layer.weight.data.t()
+        layer.weight_scale.data = scale.clone()
+        layer.input_scale.data = torch.ones(())
+
+        controller = StepMixedPrecisionController(first_steps=1, last_steps=0)
+        wrapped = install_step_mixed_precision(
+            module_lists=[layer], controller=controller
+        )
+        self.assertEqual(wrapped, 1)
+        controller.set_step(step_index=0, num_steps=4)
+
+        x = torch.randn(5, 32, dtype=torch.bfloat16)
         out, _ = layer(x)
         expected = torch.nn.functional.linear(
             x, w_fp8.to(torch.bfloat16) * scale.to(torch.bfloat16)

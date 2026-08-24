@@ -26,10 +26,22 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase, LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
-    ModelOptFp8LinearMethod,
+    ModelOptFp8LinearMethod as FlatModelOptFp8LinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp8LinearMethod as HfModelOptFp8LinearMethod,
 )
 
 logger = logging.getLogger(__name__)
+
+# Two ModelOpt FP8 static per-tensor implementations exist (flat
+# `quant_method=modelopt` exports vs `modelopt_fp8` hf_quant_config ones).
+# Both store the post-load weight as a column-major [in, out] FP8 view with a
+# scalar-or-channelwise weight_scale, so one W8A16 path serves both.
+MODELOPT_FP8_LINEAR_METHODS = (
+    FlatModelOptFp8LinearMethod,
+    HfModelOptFp8LinearMethod,
+)
 
 
 class StepMixedPrecisionController:
@@ -90,7 +102,7 @@ class StepMixedPrecisionFp8LinearMethod(LinearMethodBase):
 
     def __init__(
         self,
-        base_method: ModelOptFp8LinearMethod,
+        base_method: LinearMethodBase,
         controller: StepMixedPrecisionController,
     ) -> None:
         self.base_method = base_method
@@ -128,7 +140,7 @@ def install_step_mixed_precision(
         for module in root.modules():
             if not isinstance(module, LinearBase):
                 continue
-            if not isinstance(module.quant_method, ModelOptFp8LinearMethod):
+            if not isinstance(module.quant_method, MODELOPT_FP8_LINEAR_METHODS):
                 continue
             module.quant_method = StepMixedPrecisionFp8LinearMethod(
                 base_method=module.quant_method,
