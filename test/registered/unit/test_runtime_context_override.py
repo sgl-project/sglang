@@ -25,7 +25,8 @@ class TestContextOverride(CustomTestCase):
 
     def _publish(self):
         sa = ServerArgs(model_path="dummy")
-        rc.get_context().set_server_args(sa)
+        # Through publish, so the record is resolved the way a process resolves it.
+        rc.publish(sa, role="test")
         return sa
 
     def test_override_writes_bag_not_server_args(self):

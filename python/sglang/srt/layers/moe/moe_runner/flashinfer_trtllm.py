@@ -517,6 +517,7 @@ def _compute_g1_scale_c(
     g1_alphas: torch.Tensor,
     g1_alphas_up: torch.Tensor,
     is_gated: bool,
+    activation: Optional[str] = None,
 ) -> torch.Tensor:
     """TRT-LLM GEMM1-output scale for the up (w3) half.
 
@@ -526,6 +527,11 @@ def _compute_g1_scale_c(
     scale passes g1_alphas as g1_alphas_up and recovers the single-scale value;
     non-gated (Relu2) has no gate half, so it is just 1/a2_scale per expert.
     """
+    if activation == "situ":
+        # SiTU consumes both GEMM1 scales before tanh; scale_c carries only
+        # the GEMM2 input requantization factor.
+        num_experts = g1_alphas.shape[0]
+        return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
     if is_gated:
         return (w2_input_scale_quant * g1_alphas_up).to(torch.float32)
     num_experts = g1_alphas.shape[0]
@@ -596,7 +602,11 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
     g1_alphas_up = cast(torch.Tensor, getattr(layer, "g1_alphas_up", g1_alphas))
     g1_scale_c = _compute_g1_scale_c(
-        w2_input_scale_quant, g1_alphas, g1_alphas_up, layer.moe_runner_config.is_gated
+        w2_input_scale_quant,
+        g1_alphas,
+        g1_alphas_up,
+        layer.moe_runner_config.is_gated,
+        activation=layer.moe_runner_config.activation,
     )
     copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
 
@@ -612,6 +622,7 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
+            "situ": ActivationType.Situ,
         }
     else:
         _ACTIVATION_STR_TO_TYPE = {
@@ -956,7 +967,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu", "situ"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."

@@ -31,7 +31,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_exec, get_lora
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -72,6 +75,7 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    GEMV = "gemv"
     TORCH = "torch"
 
     def is_auto(self) -> bool:
@@ -80,10 +84,15 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_hopper_bf16_gemv = None
+_use_hopper_bf16_gemv = None
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
@@ -94,13 +103,27 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
         backend_str = (
-            "torch" if server_args.enable_deterministic_inference else "cutedsl"
+            "torch"
+            if get_exec().deterministic.enable_deterministic_inference
+            else "cutedsl"
         )
 
     backend = Bf16GemmBackend(backend_str)
 
-    if backend.is_cutedsl():
-        if server_args.enable_deterministic_inference:
+    if backend.is_gemv():
+        if torch.cuda.get_device_capability()[0] != 9:
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+
+        global _hopper_bf16_gemv, _use_hopper_bf16_gemv
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            hopper_bf16_gemv,
+            use_hopper_bf16_gemv,
+        )
+
+        _hopper_bf16_gemv = hopper_bf16_gemv
+        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
+    elif backend.is_cutedsl():
+        if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
                 "be combined with --enable-deterministic-inference"
@@ -129,6 +152,16 @@ def _bf16_gemm_dispatch_fake(
 def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
+    if (
+        _use_hopper_bf16_gemv is not None
+        and bias is None
+        and _use_hopper_bf16_gemv(
+            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+        )
+    ):
+        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], -1
+        )
     if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
     ):
