@@ -1121,6 +1121,7 @@ class ModelRunner:
             logger.error(error_msg)
             return LoRAUpdateOutput(success=False, error_message=error_msg)
 
+        checksum_error = None
         try:
             verify_lora_tensor_checksums(
                 tensors,
@@ -1128,8 +1129,24 @@ class ModelRunner:
                 self.ps.tp_rank,
             )
         except Exception as e:
-            logger.error(str(e))
-            return LoRAUpdateOutput(success=False, error_message=str(e))
+            checksum_error = str(e)
+        if expected_checksums is not None and self.ps.tp_size > 1:
+            checksums_ok = torch.tensor(
+                checksum_error is None,
+                dtype=torch.int32,
+            )
+            torch.distributed.all_reduce(
+                checksums_ok,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group.cpu_group,
+            )
+            if not checksums_ok.item() and checksum_error is None:
+                checksum_error = (
+                    "LoRA checksum verification failed on another tensor-parallel rank."
+                )
+        if checksum_error is not None:
+            logger.error(checksum_error)
+            return LoRAUpdateOutput(success=False, error_message=checksum_error)
         if expected_checksums is not None:
             logger.info(
                 f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: "

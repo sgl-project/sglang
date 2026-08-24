@@ -44,13 +44,14 @@ CONFIG_DICT = {"target_modules": ["q_proj"], "r": 8, "lora_alpha": 16}
 
 class TestDistributedLoRAChecksums(CustomTestCase):
     @staticmethod
-    def _run(expected_checksum: str):
+    def _run(expected_checksum: str, *, peer_checksum_matches: bool = True):
         received = torch.tensor([1.0, 2.0])
         handle = MagicMock()
         runner = SimpleNamespace(
             weight_updater=SimpleNamespace(_model_update_group={"group": object()}),
             device=torch.device("cpu"),
-            ps=SimpleNamespace(tp_rank=0),
+            ps=SimpleNamespace(tp_rank=0, tp_size=2),
+            tp_group=SimpleNamespace(cpu_group=object()),
             lora_manager=MagicMock(),
         )
         runner.lora_manager.load_lora_adapter_from_tensors.return_value = (
@@ -64,7 +65,16 @@ class TestDistributedLoRAChecksums(CustomTestCase):
             output.copy_(received)
             return handle
 
-        with patch("torch.distributed.broadcast", side_effect=broadcast):
+        def all_reduce(output, *, op, group):
+            assert op is torch.distributed.ReduceOp.MIN
+            assert group is runner.tp_group.cpu_group
+            if not peer_checksum_matches:
+                output.zero_()
+
+        with (
+            patch("torch.distributed.broadcast", side_effect=broadcast),
+            patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
             result = ModelRunner.load_lora_adapter_from_distributed(
                 runner,
                 LoRARef(lora_name="a", lora_path="__distributed__"),
@@ -94,6 +104,17 @@ class TestDistributedLoRAChecksums(CustomTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("value-diff", result.error_message)
+        manager.load_lora_adapter_from_tensors.assert_not_called()
+
+    def test_peer_mismatch_rejects_before_load(self):
+        checksum = hashlib.sha256(
+            torch.tensor([1.0, 2.0]).view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+
+        result, manager = self._run(checksum, peer_checksum_matches=False)
+
+        self.assertFalse(result.success)
+        self.assertIn("another tensor-parallel rank", result.error_message)
         manager.load_lora_adapter_from_tensors.assert_not_called()
 
 
