@@ -103,7 +103,8 @@ __global__ void build_tree_efficient(
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
     int cur_position = tid - 1;
-    while (true) {
+    // a malformed tree can loop back on itself and never reach the root
+    while (position < depth) {
       position += 1;
       tree_mask[token_tree_idx + cur_position] = true;
       int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
@@ -112,11 +113,21 @@ __global__ void build_tree_efficient(
       }
 
       int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
-        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
+      // selected_index has draft_token_num - 1 entries per request
+      int found = -1;
+      for (int p = 0; p < draft_token_num - 1; ++p) {
+        if (selected_index[bid * (draft_token_num - 1) + p] == token_idx) {
+          found = p;
           break;
         }
       }
+      if (found < 0) {
+        printf(
+            "WARNING: invalid eagle tree!!! Detected a token whose ancestor was not selected. "
+            "Please check if the logprob has nan. The walk stops here to keep proceeding.\n");
+        break;
+      }
+      cur_position = found;
     }
     positions[bid * draft_token_num + tid] = position + seq_len;
   }
