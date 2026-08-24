@@ -291,6 +291,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            # Verify / draft-extend run a UNIFORM number of query tokens per
+            # request (num_draft_tokens); drive the kernel in varlen mode
+            # (cum_seq_lens_q) for those, matching how TRT-LLM invokes it.
+            # Plain decode stays one row per request.
+            q_len_uniform = 1
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                q_len_uniform = self.speculative_num_draft_tokens or 1
             return self._forward_trtllm_decode(
                 q=q,
                 layer=layer,
@@ -300,6 +307,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 swa_page_indices=swa_page_indices,
                 extra_indices=extra_indices,
                 extra_topk_lengths=extra_topk_lengths,
+                q_len_uniform=q_len_uniform,
             )
         assert forward_batch.forward_mode.is_extend_without_speculative(), (
             "uniform-FP8 pool cannot be read by the packed FlashMLA "
@@ -369,10 +377,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         swa_page_indices: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        q_len_uniform: int = 1,
     ) -> torch.Tensor:
         """Sparse MLA decode via ``trtllm_batch_decode_sparse_mla_dsv4``.
 
         The combined sparse table lives in preallocated metadata buffers.
+        ``q_len_uniform > 1`` (target-verify / draft-extend: every request
+        carries exactly that many query tokens) switches the call to varlen
+        mode: ``cum_seq_lens_q`` describes the per-request token runs and
+        ``seq_lens`` becomes per-request totals, while the per-token table
+        rows and lens are consumed in flattened query-token order (kernel
+        contract). Kernel-level A/B: bit-identical outputs, perf within
+        0-5 percent of the one-row-per-request mode at verify shapes.
         """
 
         from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
@@ -454,7 +470,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # RoPE is already applied upstream; at per-tensor scale 1.0 the FP8
         # quantization is a plain e4m3 cast.
-        q_fp8 = q.to(torch.float8_e4m3fn).view(bs, 1, num_heads, 512)
+        q_fp8 = q.to(torch.float8_e4m3fn)
 
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
 
@@ -465,19 +481,49 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
-            query=q_fp8,
-            swa_kv_cache=swa_kv_cache,
-            workspace_buffer=self.trtllm_workspace_buffer,
-            sparse_indices=sparse_indices,
-            compressed_kv_cache=compressed_kv_cache,
-            sparse_topk_lens=sparse_topk_lens,
-            seq_lens=seq_lens,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            sinks=attn_sink,
-            kv_layout="HND",
-        )
+        varlen = q_len_uniform > 1 and bs % q_len_uniform == 0 and bs > 0
+        if varlen:
+            n_req = bs // q_len_uniform
+            # Per-request KV totals = the causal length of each request's
+            # LAST token; per-token causality is derived in-kernel from the
+            # request total and the token's offset within the run.
+            seq_lens_req = seq_lens[q_len_uniform - 1 :: q_len_uniform].contiguous()
+            cum_seq_lens_q = torch.arange(
+                0,
+                (n_req + 1) * q_len_uniform,
+                q_len_uniform,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            out = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q_fp8,
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=self.trtllm_workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens_req,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=attn_sink,
+                kv_layout="HND",
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=q_len_uniform,
+            )
+        else:
+            out = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q_fp8.view(bs, 1, num_heads, 512),
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=self.trtllm_workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=attn_sink,
+                kv_layout="HND",
+            )
         if out_pad_tail is not None:
             out_pad_tail[:bs] = out.view(bs, num_heads, 512)
             return out_pad_tail
