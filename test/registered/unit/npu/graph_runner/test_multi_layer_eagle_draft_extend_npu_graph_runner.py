@@ -34,7 +34,7 @@ sys.modules.setdefault("sglang.test.ci.ci_register", _ci_mod)
 
 from sglang.test.ci.ci_register import register_npu_ci  # noqa: E402
 
-register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=3, suite="base-a-test-1-npu-a2")
 
 # ---------------------------------------------------------------------------
 # Stub cuda_graph_config.
