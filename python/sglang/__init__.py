@@ -8,6 +8,14 @@ from sglang.srt.environ import redirect_third_party_caches
 
 redirect_third_party_caches()
 
+# NSYS CUDA Graph node tracing can delay one rank well beyond FlashInfer's
+# production MoE A2A peer-wait guard.  Keep the workaround strictly opt-in and
+# install it before any SGLang module imports FlashInfer communication APIs.
+from sglang._flashinfer_nsys_patch import apply_flashinfer_nsys_patch
+
+apply_flashinfer_nsys_patch()
+del apply_flashinfer_nsys_patch
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
