@@ -1,5 +1,6 @@
 """PLaMo3 model configuration."""
 
+import warnings
 from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
@@ -128,6 +129,73 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
     def rope_parameters(self, rope_parameters: dict[str, Any]) -> None:
         # Transformers may normalize this property during config initialization.
         pass
+
+    def _validate_yarn_rope_parameters(
+        self,
+        rope_parameters: dict[str, Any],
+        ignore_keys: set[str] | None = None,
+    ) -> None:
+        required_keys = {
+            "rope_type",
+            "factor",
+            "original_max_position_embeddings",
+        }
+        optional_keys = {
+            "rope_theta",
+            "attention_factor",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+            "truncate",
+        }
+        received_keys = set(rope_parameters)
+        rope_type = rope_parameters["rope_type"]
+        self._check_received_keys(
+            rope_type,
+            received_keys,
+            required_keys,
+            optional_keys,
+            ignore_keys=ignore_keys,
+        )
+
+        factor = rope_parameters["factor"]
+        if not isinstance(factor, (float, int)) or factor < 1.0:
+            warnings.warn(
+                f"`rope_parameters`'s factor field must be a float or int >= 1, got {factor}",
+                stacklevel=2,
+            )
+
+        attention_factor = rope_parameters.get("attention_factor")
+        if attention_factor is not None and (
+            not isinstance(attention_factor, float) or attention_factor < 0
+        ):
+            warnings.warn(
+                "`rope_parameters`'s attention_factor field must be a float "
+                f"greater than 0, got {attention_factor}",
+                stacklevel=2,
+            )
+        beta_fast = rope_parameters.get("beta_fast")
+        if beta_fast is not None and not isinstance(beta_fast, (float, int)):
+            warnings.warn(
+                "`rope_parameters`'s beta_fast field must be a float or int, "
+                f"got {beta_fast}",
+                stacklevel=2,
+            )
+        beta_slow = rope_parameters.get("beta_slow")
+        if beta_slow is not None and not isinstance(beta_slow, (float, int)):
+            warnings.warn(
+                "`rope_parameters`'s beta_slow field must be a float or int, "
+                f"got {beta_slow}",
+                stacklevel=2,
+            )
+        if (beta_fast or 32) < (beta_slow or 1):
+            warnings.warn(
+                "`rope_parameters`'s beta_fast field must be greater than "
+                f"beta_slow, got beta_fast={beta_fast} (defaults to 32 if None) "
+                f"and beta_slow={beta_slow} (defaults to 1 if None)",
+                stacklevel=2,
+            )
 
     @property
     def rope_local_base_freq(self) -> int:
