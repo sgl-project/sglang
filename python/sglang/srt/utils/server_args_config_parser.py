@@ -31,6 +31,14 @@ class ConfigArgumentMerger:
                 for action in parser._actions
                 if isinstance(action, argparse._StoreTrueAction)
             ]
+            self.single_value_actions = set()
+            for action in parser._actions:
+                if isinstance(action, argparse._StoreAction) and action.nargs is None:
+                    self.single_value_actions.add(action.dest)
+                    self.single_value_actions.update(
+                        option.lstrip("-").replace("-", "_")
+                        for option in action.option_strings
+                    )
             self.unsupported_actions = {
                 a.dest: a
                 for a in parser._actions
@@ -44,9 +52,11 @@ class ConfigArgumentMerger:
         elif boolean_actions is not None:
             # Legacy interface for compatibility
             self.store_true_actions = boolean_actions
+            self.single_value_actions = set()
             self.unsupported_actions = {}
         else:
             self.store_true_actions = []
+            self.single_value_actions = set()
             self.unsupported_actions = {}
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
@@ -178,7 +188,10 @@ class ConfigArgumentMerger:
 
     def _add_list_arg(self, args: List[str], key: str, value: List[Any]) -> None:
         """Add list argument to the list."""
-        if value:  # Only add if list is not empty
+        key_norm = key.replace("-", "_")
+        if key_norm in self.single_value_actions:
+            self._add_scalar_arg(args, key, json.dumps(value))
+        elif value:  # Only add non-empty lists for multi-value actions
             args.append(f"--{key}")
             args.extend(str(item) for item in value)
 
