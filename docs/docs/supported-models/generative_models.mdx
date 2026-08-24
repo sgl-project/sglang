@@ -199,9 +199,9 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM's open dense foundation models optimized for reasoning, code, and business AI use cases. Integrated with Red Hat and watsonx systems.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Granite 3.0 MoE** (IBM)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`ibm-granite/granite-3.0-3b-a800m-instruct`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM’s Mixture-of-Experts models offering strong performance with cost-efficiency. MoE expert routing designed for enterprise deployment at scale.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Granite 3.0, 3.1 MoE** (IBM)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm-granite/granite-3.1-3b-a800m-instruct`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM’s Mixture-of-Experts models offering strong performance with cost-efficiency. MoE expert routing designed for enterprise deployment at scale. 3.1 adds shared experts.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**GPT-J** (6B)</td>
@@ -277,6 +277,16 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**IBM Granite 4.0 (Hybrid, Dense)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ibm-granite/granite-4.0-h-micro</code>, <code>ibm-granite/granite-4.0-micro</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM Granite 4.0 micro models: hybrid Mamba–MoE (<code>h-micro</code>) and dense (<code>micro</code>) variants. Enterprise-focused reasoning models</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Granite SWA</strong> (IBM)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ibm-granite/granite-swash-2b</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM Granite dense model with per-layer sliding window attention and learnable per-head attention sinks. Served by the Granite implementation; needs transformers ≥ 5.15.</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Granite MoE SWA</strong> (IBM)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ibm-granite/granite-swash-3b-a600m</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>IBM Granite Mixture-of-Experts model with per-layer sliding window attention, learnable attention sinks, and optional shared experts. Served by the GraniteMoE implementation; needs transformers ≥ 5.15.</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Sarvam 2</strong> (30B-A2B, 105B-A10B)</td>

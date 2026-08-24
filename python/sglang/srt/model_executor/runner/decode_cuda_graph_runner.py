@@ -99,7 +99,12 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -233,7 +238,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            model_runner.server_args.enable_dp_attention or self.require_gathered_buffer
+            get_parallel().enable_dp_attention or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
@@ -243,7 +248,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             hf_config = model_runner.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -348,7 +353,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._captured_ragged_layouts: dict[int, object] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
-            or model_runner.server_args.enable_lora
+            or model_runner.lora_manager is not None
             or self.disable_padding
         ):
             raise ValueError(
@@ -381,7 +386,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
-        if self.model_runner.server_args.enable_lora:
+        if self.model_runner.lora_manager is not None:
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
@@ -467,9 +472,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self.device_module.is_current_stream_capturing():
             # Warmup shares this body. Breakable capture still plants: it opens
             # segment 1 on context entry and every segment re-arms the node.
+            # Routed through device_module so XPU (torch.xpu) is picked up
+            # instead of hitting torch.cuda dummy stubs on non-CUDA builds.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
@@ -486,17 +493,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
-        """The backend's declaration, demoted when this runner cannot record
-        there. UNKNOWN records nothing (scheduler keeps the coarse fence)."""
-        if forward_mode.is_target_verify():
-            if not self.model_runner.spec_algorithm.is_last_shared_read_phase(
-                forward_mode
-            ):
-                return SharedReadEnds.UNKNOWN
-        elif not forward_mode.is_decode():
-            return SharedReadEnds.UNKNOWN
         declared = attn_backend.shared_read_ends(forward_mode)
-
         if (
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
@@ -935,7 +932,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info,
         )
 
-        if self.model_runner.server_args.enable_lora:
+        if self.model_runner.lora_manager is not None:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
             lora_ids = [None] * bs
@@ -1135,7 +1132,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
-        if self.model_runner.server_args.debug_cuda_graph:
+        if get_exec().graph.debug_cuda_graph:
             assert isinstance(
                 self.backend, BreakableCudaGraphBackend
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
@@ -1485,7 +1482,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
                     spec_steps=self.speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    topk=get_spec().speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,

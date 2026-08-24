@@ -39,7 +39,14 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_exec,
+    get_flags,
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -178,6 +185,7 @@ def register_fake_ops(tp_size: int):
         "fused_add_layernorm_cpu",
         "multimodal_rotary_embedding_cpu",
         "apply_multidimensional_rope_cpu",
+        "fused_sigmoid_mul_cpu",
     ]
     for op in none_return_ops:
 
@@ -201,6 +209,19 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
+    def _(q, k, q_weight, k_weight, eps, head_dim):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_with_gate_cpu")
+    def _(q_gate, k, q_weight, k_weight, eps, head_dim, num_head):
+        seq_len = q_gate.shape[0]
+        num_head_kv = k.shape[1] // head_dim
+        q_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        k_out = k.new_empty((seq_len * num_head_kv, head_dim))
+        gate_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        return q_out, k_out, gate_out
 
     @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
     def _(q, k, *args, **kwargs):
@@ -567,7 +588,7 @@ class CPUGraphRunner:
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
@@ -585,22 +606,20 @@ class CPUGraphRunner:
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
-        assert (
-            not self.model_runner.server_args.enable_lora
-        ), "CPUGraphRunner does not support LoRA yet."
+        assert not get_lora().enable_lora, "CPUGraphRunner does not support LoRA yet."
         assert (
             not self.enable_two_batch_overlap
         ), "CPUGraphRunner does not support two batch overlap yet."
@@ -991,7 +1010,7 @@ class CPUGraphRunner:
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
                     spec_steps=get_spec().speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    topk=get_spec().speculative_eagle_topk,
                     draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
