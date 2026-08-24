@@ -237,9 +237,12 @@ class EncoderPreprocessor:
                 self.vision_config[modality_str]["device"] = self.device
 
             if modality_str == "video":
-                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
-                for k, v in video_defaults.items():
-                    self.vision_config["video"].setdefault(k, v)
+                # GLM reads its own defaults from the HF video processor
+                # (max_frames=2048); applying the Qwen values here would clobber them.
+                if "glm" not in self.model_type:
+                    video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
+                    for k, v in video_defaults.items():
+                        self.vision_config["video"].setdefault(k, v)
 
             if modality_str == "audio":
                 if "return_attention_mask" not in self.vision_config["audio"]:
