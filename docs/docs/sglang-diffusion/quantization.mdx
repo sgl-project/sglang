@@ -209,6 +209,14 @@ backend.
       <td>Auto-detected; omit <code>--quantization</code>. Packed INT4 weights use the checkpoint's W4A4 ConvRot kernel and <code>linear_dtype</code>. CUDA requires SM75+; TP must preserve the 64-element quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
     </tr>
     <tr>
+      <td><code>quanto-int8</code></td>
+      <td>One native encoder safetensors file with an embedded Quanto quantization map</td>
+      <td>An explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native encoders whose mapped linear layers consume every declared qint8 entry; MiniMax-H3's Qwen3-VL encoder is supported</td>
+      <td>None</td>
+      <td>Auto-detected weight-only qint8 storage. Each active matrix is dequantized to the compute dtype for the ordinary linear operation, so this reduces stored/resident weight memory rather than promising INT8 GEMM speed. TP and offload are supported; FSDP is not.</td>
+    </tr>
+    <tr>
       <td><code>qvg-kv</code></td>
       <td>Unquantized model with runtime causal KV-cache compression</td>
       <td><code>--kv-cache-quant &#123;int4,int2&#125;</code></td>

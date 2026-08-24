@@ -189,7 +189,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             "model.layers.49.self_attn.q_proj.weight": True,
             "model.layers.50.self_attn.q_proj.weight": False,
             "visual.blocks.0.attn.qkv.weight": True,
-            "language_model.layers.63.mlp.down_proj.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": False,
             "module.model.language_model.layers.63.mlp.down_proj.weight": True,
         }
         self.assertEqual(
@@ -337,6 +337,23 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
+    def test_explicit_online_quantization_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="kitchen_int8",
+        )
+
+        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
@@ -369,11 +386,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
             save_file(
                 {
-                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                    "visual.blocks.0.attn.qkv.weight": torch.ones(
                         (2, 256), dtype=torch.int8
                     ),
-                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones((2, 1)),
-                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                    "visual.blocks.0.attn.qkv.weight_scale": torch.ones((2, 1)),
+                    "visual.blocks.0.attn.qkv.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
                 },
@@ -397,7 +414,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
-            {"model.language_model.layers.0.self_attn.q_proj"},
+            {"model.visual.blocks.0.attn.qkv_proj"},
         )
 
     def test_comfy_w4a4_weight_file_configures_native_encoder(self):
