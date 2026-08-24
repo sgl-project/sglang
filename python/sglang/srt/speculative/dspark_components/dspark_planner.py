@@ -840,18 +840,27 @@ def alloc_verify_window(
     verify_num_draft_tokens: int,
     block_pos_offsets: torch.Tensor,
     model_runner,
+    out_buffers: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> VerifyWindow:
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+    if out_buffers is None:
+        positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+        end_offset = prefix_lens + verify_w
+        verify_cache_loc_out = None
+    else:
+        positions_2d, end_offset, verify_cache_loc_out = out_buffers
+        torch.add(prefix_lens.unsqueeze(1), block_pos_offsets, out=positions_2d)
+        torch.add(prefix_lens, verify_w, out=end_offset)
     verify_cache_loc = assign_extend_cache_locs_func(
         req_pool_indices=batch.req_pool_indices,
         req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
+        end_offset=end_offset,
         batch_size=bs,
         draft_token_num=verify_w,
         device=device,
+        out_cache_loc=verify_cache_loc_out,
     )
     verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
     return VerifyWindow(

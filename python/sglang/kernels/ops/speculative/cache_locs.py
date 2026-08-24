@@ -437,6 +437,7 @@ def assign_extend_cache_locs_func(
     batch_size: int,
     draft_token_num: int,
     device,
+    out_cache_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
@@ -457,11 +458,12 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int32,
-            device=device,
-        )
+        if out_cache_loc is None:
+            out_cache_loc = torch.empty(
+                (batch_size * draft_token_num,),
+                dtype=torch.int32,
+                device=device,
+            )
         torch.ops.npu.cache_loc_update(
             req_pool_indices,
             req_to_token,

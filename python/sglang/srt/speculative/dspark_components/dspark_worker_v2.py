@@ -298,6 +298,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
         self._verify_ids_buf: Optional[torch.Tensor] = None
+        self._verify_window_bufs: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
 
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
@@ -598,6 +601,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+        verify_window_out = None
+        if _is_npu:
+            bufs = self._verify_window_bufs
+            if bufs is None or bufs[0].shape[0] < bs:
+                bufs = (
+                    torch.empty(
+                        (bs, self.verify_num_draft_tokens),
+                        dtype=prefix_lens.dtype,
+                        device=device,
+                    ),
+                    torch.empty((bs,), dtype=prefix_lens.dtype, device=device),
+                    torch.empty(
+                        (bs * self.verify_num_draft_tokens,),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                )
+                self._verify_window_bufs = bufs
+            verify_window_out = (
+                bufs[0][:bs],
+                bufs[1][:bs],
+                bufs[2][: bs * self.verify_num_draft_tokens],
+            )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -605,6 +631,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            out_buffers=verify_window_out,
         )
 
         sampling_info = batch.sampling_info
