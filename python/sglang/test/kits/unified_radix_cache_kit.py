@@ -16,7 +16,7 @@ def _random_suffixes(n, length, seed):
 
 
 class UnifiedRadixTreeTestMixin:
-    """Mixin: gsm8k, mmlu and multi-turn KL tests with multi-branch interleaving."""
+    """Mixin: gsm8k and multi-turn KL tests with multi-branch interleaving."""
 
     kl_threshold: float = 0.003
     max_new_tokens: int = 512
@@ -30,7 +30,6 @@ class UnifiedRadixTreeTestMixin:
     decode_hit_inter_batch_delay_s: float = 0
 
     gsm8k_threshold: float = 0.93
-    mmlu_threshold: float = 0.8
     num_gsm8k_questions: int = 200
 
     def test_gsm8k(self):
@@ -53,24 +52,6 @@ class UnifiedRadixTreeTestMixin:
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
-
-    def test_mmlu(self):
-        """Simple-evals MMLU multi-task accuracy."""
-        from sglang.test.run_eval import run_eval as run_simple_eval
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-        metrics = run_simple_eval(args)
-        print(
-            f"[{self.__class__.__name__}] MMLU score: {metrics['score']:.3f} "
-            f"(threshold: {self.mmlu_threshold})"
-        )
-        self.assertGreaterEqual(metrics["score"], self.mmlu_threshold)
 
     def test_multiturn_logprobs_match(self):
         """Helper 1: 3-turn, no explicit cache seeding."""

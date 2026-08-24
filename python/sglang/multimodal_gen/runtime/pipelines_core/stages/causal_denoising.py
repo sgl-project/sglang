@@ -157,12 +157,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self.causal_kv_cache_neg: list | None = None
         self.crossattn_cache_neg: list | None = None
         # Model-dependent constants (aligned with causal_inference.py assumptions)
-        self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
-        self.num_frames_per_block = (
-            self.transformer.config.arch_config.num_frames_per_block
-        )
+        self.num_transformer_blocks = self.transformer.config.num_layers
+        self.num_frames_per_block = self.transformer.config.num_frames_per_block
         self.sliding_window_num_frames = (
-            self.transformer.config.arch_config.sliding_window_num_frames
+            self.transformer.config.sliding_window_num_frames
         )
 
         try:
@@ -171,7 +169,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )  # type: ignore
         except Exception:
             self.local_attn_size = -1
-        self.sink_size = self.transformer.config.arch_config.sink_size
+        self.sink_size = self.transformer.config.sink_size
 
         self._causal_attn_metadata_builder_cls = None
         self._causal_attn_metadata_builder = None
@@ -190,8 +188,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
     def _prepare_frame_seq_length(self, h: int, w: int) -> int:
         patch_ratio = (
-            self.transformer.config.arch_config.patch_size[-1]
-            * self.transformer.config.arch_config.patch_size[-2]
+            self.transformer.config.patch_size[-1]
+            * self.transformer.config.patch_size[-2]
         )
         self.num_token_per_frame = (h * w) // patch_ratio
         return self.num_token_per_frame
@@ -656,6 +654,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         autocast_enabled: bool,
     ) -> torch.Tensor:
+        if self._component_residency_manager is not None:
+            self._manage_dit_use_site(self.transformer, "transformer", batch)
         with (
             precision_autocast_context(
                 target_dtype,
