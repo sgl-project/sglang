@@ -154,3 +154,31 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         target_video_t0 = built["img_position_ids"][built["img_pos"][12], 0]
         target_audio_t0 = built["img_position_ids"][built["audio_pos"][8], 0]
         self.assertEqual(float(target_audio_t0), float(target_video_t0))
+
+    def test_ref2va_hybrid_packs_keyframes_before_references(self):
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}],
+            keyframe_frame_indices=[0, -1],
+            frame_count=5,
+        )
+
+        frame_rows = 4
+        frozen_rows = 2 * frame_rows + frame_rows
+        self.assertEqual(int((~built["update_mask"]).sum()), frozen_rows)
+        keyframe_positions = built["img_pos"][: 2 * frame_rows].reshape(2, -1)
+        keyframe_times = [
+            float(built["img_position_ids"][positions, 0].unique().item())
+            for positions in keyframe_positions
+        ]
+        target_origin = 6.0  # text origin 5 + one reference-image time slot
+        self.assertEqual(keyframe_times[0], target_origin)
+        self.assertAlmostEqual(
+            keyframe_times[1], target_origin + 4 * (5.0 / 3.0), places=12
+        )
+        target_t0 = built["img_position_ids"][built["img_pos"][frozen_rows], 0]
+        self.assertEqual(float(target_t0), target_origin)
