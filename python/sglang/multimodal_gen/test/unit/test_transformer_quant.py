@@ -50,12 +50,18 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
+    AutoRoundConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
     ComfyFp8Config,
     ComfyFullPrecisionFp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -92,6 +98,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -135,6 +142,41 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
+        layer_config = {
+            "bits": 4,
+            "group_size": 128,
+            "sym": True,
+            "data_type": "int",
+            "act_bits": 16,
+        }
+        metadata = {
+            "quant_method": "auto-round",
+            "packing_format": "auto_round:auto_gptq",
+            **layer_config,
+            "block_name_to_quantize": "transformer_blocks",
+            "extra_config": {
+                "context_embedder": {**layer_config, "bits": 16},
+                **{
+                    f"transformer_blocks.0.attn.to_{shard}": layer_config
+                    for shard in ("q", "k", "v")
+                },
+            },
+        }
+
+        config = get_quant_config(
+            {"quantization_config": metadata}, "/unused/component/path"
+        )
+        self.assertIsInstance(config, AutoRoundConfig)
+        config.remap_checkpoint_prefixes(MiniMaxH3DiTModel.param_names_mapping)
+        self.assertEqual(
+            config.srt_config.get_layer_config(object(), "condition_proj")[0], 16
+        )
+        self.assertEqual(
+            config.srt_config.get_layer_config(object(), "blocks.0.attn.qkv_proj")[0],
+            4,
+        )
+
     def test_mps_layerwise_load_uses_residency_api(self):
         server_args = SimpleNamespace(
             should_configure_layerwise_offload_for_lazy_component=lambda name: (
@@ -345,6 +387,78 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertFalse(_needs_device_weight_postprocess(config))
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
+
+    def test_minimax_h3_w4a8_metadata_resolves_serialized_kitchen(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "layers": {
+                        "blocks.0.mlp.fc1": {
+                            "format": "asym_w4a8_int8",
+                            "convrot": True,
+                            "group_size": 16,
+                            "convrot_groupsize": 256,
+                        }
+                    }
+                }
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones((2, 128), dtype=torch.int8),
+                    "blocks.0.mlp.fc1.weight_s_rel": torch.ones(
+                        (2, 16), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_s_channel": torch.ones(2),
+                    "blocks.0.mlp.fc1.weight_codebook": torch.ones(16),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+
+        config = resolve_minimax_h3_checkpoint_quantization(markers)
+        self.assertIsInstance(config, KitchenW4A8Config)
+        self.assertTrue(markers["blocks.0.mlp.fc1"]["_has_codebook"])
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8."
+        "w4a8_int8_linear",
+        new=object(),
+    )
+    def test_serialized_w4a8_constructs_packed_weights_and_scales(self):
+        config = KitchenW4A8Config(
+            {
+                "proj": {
+                    "format": "asym_w4a8_int8",
+                    "convrot": True,
+                    "group_size": 16,
+                    "convrot_groupsize": 256,
+                    "_has_codebook": True,
+                    "_has_correction": False,
+                }
+            }
+        )
+        layer = ReplicatedLinear(
+            256,
+            3,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="proj",
+        )
+
+        self.assertEqual(layer.weight.shape, (3, 128))
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight_s_rel.shape, (3, 16))
+        self.assertEqual(layer.weight_s_rel.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.weight_s_channel.shape, (3,))
+        self.assertEqual(layer.weight_codebook.shape, (16,))
+        self.assertIsNone(layer.weight_correction)
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."

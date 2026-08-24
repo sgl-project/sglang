@@ -756,7 +756,7 @@ class RuntimeContext:
         self.forward = ForwardFlags()
 
     def get_stream(self, name: str) -> Any:
-        """Named process-level CUDA side stream: get-or-create, shared by
+        """Named process-level side stream: get-or-create, shared by
         name (the keyed-lazy pattern of the persistent buffers). Creation is
         a driver call that must stay outside cuda-graph capture — call sites
         lease their stream at init/warmup time."""
@@ -764,7 +764,8 @@ class RuntimeContext:
         if stream is None:
             import torch
 
-            stream = torch.cuda.Stream()
+            device = self._server_args.device if self._server_args else "cuda"
+            stream = torch.get_device_module(device).Stream()
             self.resources.streams[name] = stream
         return stream
 
