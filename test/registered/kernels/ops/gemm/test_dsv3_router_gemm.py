@@ -1,32 +1,42 @@
-"""Integration tests for SGLang's FlashInfer router GEMM adapter."""
+"""Tests for JIT dsv3_router_gemm kernel."""
 
+import itertools
 import sys
 
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.kernels.ops.gemm import dsv3_router_gemm
-from sglang.kernels.ops.gemm.flashinfer_router_gemm import (
-    is_flashinfer_router_gemm_supported,
+from sglang.kernels.jit.utils import (
+    get_ci_test_range,
+    get_jit_cuda_arch,
+    is_hip_runtime,
 )
+from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
+register_cuda_ci(est_time=110, stage="nightly", runner_config="1-gpu-large")
 
-SUPPORTED_DEVICE_SMS = {90, 100, 103, 107}
-ROUTER_GEMM_CASES = [
-    # Existing fixed-shape APIs.
-    (128, 7168, 1, torch.bfloat16),
-    (256, 6144, 4, torch.float32),
-    (256, 7168, 16, torch.float32),
-    # APIs added by flashinfer-ai/flashinfer#4630.
-    (256, 7168, 2, torch.bfloat16),
-    (384, 7168, 8, torch.bfloat16),
-    (384, 7168, 16, torch.float32),
-    (896, 7168, 2, torch.bfloat16),
-    (896, 7168, 4, torch.float32),
-]
+HIDDEN_DIMS = [1024, 4096, 5120, 6144, 7168]
+ROUTER_GEMM_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            [256, 384],
+            HIDDEN_DIMS,
+            list(range(1, 17)),
+            [torch.bfloat16, torch.float32],
+        )
+    ),
+    [
+        (256, 1024, 1, torch.bfloat16),
+        (256, 7168, 6, torch.bfloat16),
+        (256, 6144, 4, torch.float32),
+        (384, 7168, 8, torch.bfloat16),
+        (256, 7168, 16, torch.float32),
+        (384, 5120, 16, torch.float32),
+    ],
+) + [(896, 7168, 1, torch.float32)]
 ATOL = 1e-2
 RTOL = 1e-2
 
@@ -35,33 +45,19 @@ def _ref(hidden_states, router_weights, out_dtype):
     return (hidden_states.float() @ router_weights.float().T).to(out_dtype)
 
 
-def _device_sm() -> int:
-    arch = get_jit_cuda_arch()
-    return arch.major * 10 + arch.minor
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "num_experts,hidden_dim,num_tokens,out_dtype", ROUTER_GEMM_CASES
 )
 def test_dsv3_router_gemm(num_experts, hidden_dim, num_tokens, out_dtype):
-    device_sm = _device_sm()
-    if is_hip_runtime() or device_sm not in SUPPORTED_DEVICE_SMS:
-        pytest.skip("FlashInfer router GEMM requires SM90, SM100, SM103, or SM107")
+    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+        pytest.skip("SM90+ required")
 
-    assert is_flashinfer_router_gemm_supported(
-        num_tokens, hidden_dim, num_experts, out_dtype, device_sm
-    ), "The installed FlashInfer must provide the router GEMM API pinned by this branch"
+    mat_a = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+    mat_b = torch.randn(num_experts, hidden_dim, dtype=torch.bfloat16, device="cuda")
 
-    hidden_states = torch.randn(
-        num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda"
-    )
-    router_weights = torch.randn(
-        num_experts, hidden_dim, dtype=torch.bfloat16, device="cuda"
-    )
-
-    ref = _ref(hidden_states, router_weights, out_dtype)
-    out = dsv3_router_gemm(hidden_states, router_weights, out_dtype=out_dtype)
+    ref = _ref(mat_a, mat_b, out_dtype)
+    out = dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype)
 
     assert out.shape == (num_tokens, num_experts)
     assert out.dtype == out_dtype

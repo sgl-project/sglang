@@ -228,9 +228,8 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm.flashinfer_router_gemm import (
-        flashinfer_router_gemm,
-        is_flashinfer_router_gemm_supported,
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
+        dsv3_router_gemm as dsv3_router_gemm,
     )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
@@ -535,17 +534,19 @@ class MoEGate(nn.Module):
         else:
             if (
                 _is_cuda
-                and hidden_states.dtype == torch.bfloat16
-                and self.weight.dtype == torch.bfloat16
-                and is_flashinfer_router_gemm_supported(
-                    hidden_states.shape[0],
-                    hidden_states.shape[1],
-                    self.weight.shape[0],
-                    torch.float32,
-                    _device_sm,
+                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[1] % 1024 == 0
+                and (
+                    self.weight.shape[0] in (256, 384)
+                    or (
+                        self.weight.shape[0] == 896
+                        and hidden_states.shape[1] == 7168
+                        and _device_sm in (90, 100, 103, 107)
+                    )
                 )
+                and _device_sm >= 90
             ):
-                logits = flashinfer_router_gemm(
+                logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
