@@ -110,22 +110,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_attn_allocator.available_size(),
         )
 
-    @property
-    def _mapping_zero(self) -> torch.Tensor:
-        """Cached device scalar for clearing mapping entries.
-
-        ``mapping[idx] = 0`` wraps the python int in a CPU tensor and stages it
-        through a blocking pageable H2D copy, which on the scheduler stream
-        waits out the in-flight forward.
-        """
-        z = getattr(self, "_mapping_zero_cache", None)
-        if z is None:
-            z = torch.zeros(
-                (), dtype=self.full_to_swa_index_mapping.dtype, device=self.device
-            )
-            self._mapping_zero_cache = z
-        return z
-
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
 
@@ -298,9 +282,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = self._mapping_zero
+            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
         return alloc_full_indices
 
     def alloc_decode(
@@ -363,6 +345,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        if full_indices.numel() == 0:
+            return
+        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
+        # host-resident scalar and blocks until the stream drains.
+        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
+
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -379,7 +368,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = self._mapping_zero
+        self.clear_full_to_swa_mapping(mapping_indices)
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free the full-attention pool only; see free_swa_segment for the rest."""
@@ -438,9 +427,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_offsets = torch.arange(
             self.page_size, dtype=torch.int64, device=reps.device
         )
-        self.full_to_swa_index_mapping[
+        self.clear_full_to_swa_mapping(
             (reps[:, None] + page_offsets[None, :]).reshape(-1)
-        ] = self._mapping_zero
+        )
 
     def free_group_begin(self):
         super().free_group_begin()
