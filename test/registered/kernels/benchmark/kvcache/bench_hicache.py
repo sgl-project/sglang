@@ -200,7 +200,7 @@ if DISABLE_TORCH:
 
 @marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
 @marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
-@marker.benchmark("provider", LINE_VALS)
+@marker.benchmark("provider", LINE_VALS, unit="ms")
 def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
     """One Layer: Host (CPU) -> Device (GPU)."""
     global cache
@@ -282,7 +282,7 @@ def _create_ptr_tensor(tensors, device="cuda"):
 
 @marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
 @marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
-@marker.benchmark("provider", LINE_VALS)
+@marker.benchmark("provider", LINE_VALS, unit="ms")
 def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
     """All Layer: Device (GPU) -> Host (CPU)."""
     global cache
