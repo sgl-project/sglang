@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import os
 import sys
@@ -56,6 +57,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -675,18 +678,22 @@ class _ConfigBag:
 
 
 def _build_config_bags(server_args: Any) -> dict:
-    """Snapshot resolved ``server_args`` into the namespace bag tree, driven by
-    the ``NS(...)`` metadata on the dataclass fields. Returns
+    """Snapshot the resolution result into the namespace bag tree, driven by
+    the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
+    ``resolution_result`` -- the declaration if resolution made one, else what
+    the caller supplied -- rather than from the field, which carries the same
+    value only while declarations still materialize. Returns
     ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
     Only dataclass fields carry ``NS`` markers, so derived properties/methods are
     naturally excluded (they stay on the bag). A name used as both a leaf and a
     subgroup at the same level is a hard error — no silent shadowing."""
     from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.arg_groups.overrides import resolution_result
 
     _MISSING = object()
     tops: dict = {}
     for field, path in namespace_of(type(server_args)).items():
-        value = getattr(server_args, field, _MISSING)
+        value = resolution_result(server_args, field, _MISSING)
         if value is _MISSING:
             # Every NS-declared field is a dataclass field, so a resolved config
             # always carries it; a miss means a malformed/partial config object
@@ -1025,9 +1032,13 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import _apply_fields
+        from sglang.srt.arg_groups.overrides import (
+            _apply_fields,
+            declare_late_resolution,
+        )
 
         server_args = ServerArgs(model_path="dummy")
+        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
@@ -1037,12 +1048,19 @@ class _ServerArgsOverride:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
-        _apply_fields(server_args, self._fields)
-        # The dummy boundary skips materialization, which would leave the
-        # strict mutation guard unarmed on the published object — mark it
-        # materialized so bare post-publish writes raise like they do on a
-        # fully resolved config.
-        object.__setattr__(server_args, "_declarations_materialized", True)
+        # Declared so the projection sees it; late, because the record is
+        # resolved already and not yet published.
+        # Underscore names are not fields at all (they seed private property
+        # caches), so they stay a direct write.
+        declared = {
+            name: value for name, value in self._fields.items() if name[0] != "_"
+        }
+        if declared:
+            declare_late_resolution(server_args, "override_server_args", **declared)
+        _apply_fields(
+            server_args,
+            {name: value for name, value in self._fields.items() if name[0] == "_"},
+        )
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1169,9 +1187,10 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Reads (almost) everything by design — the model-executing process.
     "scheduler": None,
     "test": None,
-    # Audited (record-mode smokes, plain + DP-attention): the DP controller
-    # reads only the elastic-EP gate; its module's static read set agrees.
-    "dp_controller": frozenset({"exec"}),
+    # The DP controller's static read set, checked against the module: the
+    # elastic-EP gate, the load-balance method, the watchdog timeout, and the
+    # disaggregation mode.
+    "dp_controller": frozenset({"exec", "parallel", "device", "disagg"}),
     # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
     # /v1/models): reads exactly {"serving"} — the per-instance managers read
     # self.server_args by design. Still declared full, because that run did not
@@ -1184,6 +1203,9 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     "encoder": None,
     "expert_backup": None,
     "weight_cache_daemon": None,
+    # The diffusion GPU worker runs a model and publishes a placeholder so
+    # shared SRT reads do not fail closed; declared full for that reason.
+    "diffusion_gpu_worker": None,
 }
 
 
@@ -1304,7 +1326,19 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    server_args.resolve_once()
+    discarded = _CONTEXT.overrides_log()
     _CONTEXT.set_server_args(server_args)
+    if discarded:
+        logger.warning(
+            "publish(role=%s) re-projected the config bags and dropped %d "
+            "override(s) taken since the last publish: %s",
+            role,
+            len(discarded),
+            ", ".join(
+                f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
+            ),
+        )
     _CONTEXT._publish_role = role
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
@@ -1318,6 +1352,31 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def ensure_published(server_args, *, role: str) -> RuntimeContext:
+    """Publish unless this exact record is already published under this role.
+
+    Three constructors publish defensively, because each can be built with
+    nothing published before it -- `ModelRunner` (a benchmark harness, the
+    manual runner tests), `TokenizerManager`, and `MMEncoder` (spawned encoder
+    workers). Inside a process that already published the same record,
+    publishing again re-projects the bags: every `override()` taken between the
+    two calls is discarded, and the provenance log with it.
+
+    No override sits in one of those windows today, so this removes a hazard
+    rather than a live bug. It is worth removing anyway: the drop is silent, it
+    depends on where a constructor happens to sit relative to the overrides
+    around it, and `publish` now says what a re-projection discarded so the
+    next one is loud.
+
+    So these callers ask for the end state -- this record, this role, published
+    -- and get a no-op when that already holds. An engine rebuild still calls
+    `publish` directly, because there the reset is the point.
+    """
+    if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
+        return _CONTEXT
+    return publish(server_args, role=role)
 
 
 def publish_role() -> str | None:
@@ -1347,6 +1406,81 @@ def get_global_dwdp_manager() -> Any:
 def set_global_dwdp_manager(manager: Any) -> None:
     global _GLOBAL_DWDP_MANAGER
     _GLOBAL_DWDP_MANAGER = manager
+
+
+def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
+    """The leaf values of a flag group, recursively."""
+    leaves: dict[str, Any] = {}
+    for name in type(group).__dataclass_fields__:
+        value = getattr(group, name)
+        if isinstance(value, _FlagGroupBase):
+            leaves[name] = _group_leaves(value)
+        elif isinstance(value, (dict, list)):
+            leaves[name] = type(value)(value)
+        else:
+            leaves[name] = value
+    return leaves
+
+
+def _restore_leaves(group: _FlagGroupBase, leaves: dict[str, Any]) -> None:
+    for name, value in leaves.items():
+        current = getattr(group, name)
+        if isinstance(current, _FlagGroupBase):
+            _restore_leaves(current, value)
+        elif isinstance(current, dict):
+            current.clear()
+            current.update(value)
+        elif isinstance(current, list):
+            current[:] = value
+        else:
+            setattr(group, name, value)
+
+
+def snapshot_context() -> dict[str, Any]:
+    """Everything a publish replaces, so a failed launch can put it back.
+
+    Enumerated from ``__slots__`` rather than listed by hand: a hand-picked copy
+    of context state is one field behind the day a slot is added, and the copy
+    that silently drops one is worse than none. Flag groups are snapshotted by
+    leaf, not by reference: publish writes *into* the same ``Flags`` object
+    (``capture.enable_torch_compile``), so a reference held here would already
+    carry the failed launch's value by the time it is put back.
+    """
+    state: dict[str, Any] = {}
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = getattr(_CONTEXT, name)
+        if isinstance(value, _FlagGroupBase):
+            state[name] = (value, _group_leaves(value))
+        elif isinstance(value, list):
+            state[name] = list(value)
+        else:
+            state[name] = value
+    state["__parallel__"] = {
+        name: getattr(_CONTEXT.parallel, name)
+        for name in type(_CONTEXT.parallel).__slots__
+    }
+    state["__dwdp__"] = get_global_dwdp_manager()
+    return state
+
+
+def restore_context(state: dict[str, Any]) -> None:
+    """Put back what ``snapshot_context`` captured."""
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = state[name]
+        if isinstance(value, tuple) and isinstance(value[0], _FlagGroupBase):
+            group, leaves = value
+            setattr(_CONTEXT, name, group)
+            _restore_leaves(group, leaves)
+        else:
+            setattr(_CONTEXT, name, value)
+    for name, value in state["__parallel__"].items():
+        setattr(_CONTEXT.parallel, name, value)
+    _adaptive_draft_token_bound.cache_clear()
+    set_global_dwdp_manager(state["__dwdp__"])
 
 
 def reset_context() -> None:
@@ -1621,6 +1755,10 @@ def configured_moe_dp_size() -> int:
 
 def configured_attn_cp_size() -> int:
     return _configured_parallel("attn_cp_size")
+
+
+def configured_dcp_size() -> int:
+    return _configured_parallel("dcp_size")
 
 
 def is_ep_joiner() -> bool:
