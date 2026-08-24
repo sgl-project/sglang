@@ -10,6 +10,7 @@ import triton.language as tl
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import moe_route_radix
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -251,7 +252,30 @@ def _router_triton_kernel(
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
 
 
+def _moe_fused_gate_fake(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+    moe_softcapping: float = 0.0,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_rows = scores.shape[0]
+    weights = torch.empty(num_rows, topk, dtype=torch.float32, device=scores.device)
+    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=scores.device)
+    return weights, indices
+
+
 @debug_kernel_api
+@register_custom_op(
+    op_name="moe_fused_gate",
+    fake_impl=_moe_fused_gate_fake,
+)
 def moe_fused_gate(
     scores: torch.Tensor,
     bias: torch.Tensor,

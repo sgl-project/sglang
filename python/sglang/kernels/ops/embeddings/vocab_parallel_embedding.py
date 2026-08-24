@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.custom_op import register_custom_op
+
 
 @triton.jit
 def _vocab_parallel_embedding_kernel(
@@ -53,6 +55,24 @@ def _vocab_parallel_embedding_kernel(
     tl.store(out_ptr + row * hidden_dim + cols, vals, mask=col_mask)
 
 
+def _vocab_parallel_embedding_fake(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (*input_.shape, weight.shape[1]), dtype=weight.dtype, device=weight.device
+    )
+
+
+@register_custom_op(
+    op_name="vocab_parallel_embedding",
+    fake_impl=_vocab_parallel_embedding_fake,
+)
 def vocab_parallel_embedding(
     input_: torch.Tensor,
     weight: torch.Tensor,
