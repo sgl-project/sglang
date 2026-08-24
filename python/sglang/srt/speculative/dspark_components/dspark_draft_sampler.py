@@ -10,7 +10,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.speculative.dspark_components.dspark_draft import (
-    _select_draft_hidden,
+    select_draft_hidden_without_anchor,
 )
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -106,13 +106,15 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
-        model_hidden, sample_hidden = _select_draft_hidden(
-            hidden_states,
-            bs=bs,
-            query_token_num=self.query_token_num,
-            gamma=self.gamma,
-            sample_from_anchor=self.sample_from_anchor,
-        )
+        if self.sample_from_anchor:
+            model_hidden = hidden_states
+            sample_hidden = hidden_states.view(bs, self.gamma, -1)
+        else:
+            model_hidden, sample_hidden = select_draft_hidden_without_anchor(
+                hidden_states,
+                bs=bs,
+                gamma=self.gamma,
+            )
         base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]

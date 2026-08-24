@@ -1,6 +1,6 @@
-"""B200 E2E coverage for NVIDIA Nemotron 3.5 Lightning.
+"""B200 NVFP4 E2E coverage for NVIDIA Nemotron 3.5 Lightning.
 
-The three cases exercise the production BF16 checkpoint without speculation,
+The three cases exercise the production NVFP4 checkpoint without speculation,
 with DFlash, and with DSpark. MTP is already covered by the Nemotron model
 family tests; the external-draft paths are the new coverage in this file.
 """
@@ -17,9 +17,9 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-b200")
 
-MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 DFLASH_DRAFT_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash"
 DSPARK_DRAFT_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark"
 
@@ -70,13 +70,13 @@ class _Nemotron35LightningServer:
             kill_process_tree(cls.process.pid)
 
 
-class TestNvidiaNemotron35LightningBF16(
+class TestNvidiaNemotron35LightningNVFP4(
     _Nemotron35LightningServer, GSM8KMixin, CustomTestCase
 ):
     """Normal autoregressive serving."""
 
 
-class TestNvidiaNemotron35LightningBF16DFlash(
+class TestNvidiaNemotron35LightningNVFP4DFlash(
     _Nemotron35LightningServer, GSM8KMixin, CustomTestCase
 ):
     """DFlash with the published W4A16 draft checkpoint."""
@@ -91,7 +91,7 @@ class TestNvidiaNemotron35LightningBF16DFlash(
     ]
 
 
-class TestNvidiaNemotron35LightningBF16DSpark(
+class TestNvidiaNemotron35LightningNVFP4DSpark(
     _Nemotron35LightningServer, GSM8KMixin, CustomTestCase
 ):
     """DSpark with the published bonus-anchor W4A16 draft checkpoint."""

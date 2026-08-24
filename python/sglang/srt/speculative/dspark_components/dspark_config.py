@@ -28,6 +28,11 @@ SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 
 
+def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
+    """Return whether a DSpark checkpoint samples the anchor query row."""
+    return not is_nemotron_35_draft_config(draft_hf_config)
+
+
 def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config
@@ -64,7 +69,6 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
-    is_nemotron_35_layout: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -312,5 +316,4 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
-        is_nemotron_35_layout=is_nemotron_35_draft_config(draft_hf_config),
     )

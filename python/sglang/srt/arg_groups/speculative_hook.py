@@ -455,19 +455,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     draft_config = None
     try:
         draft_config = read_draft_checkpoint_config(server_args=server_args)
-        sample_from_anchor = not draft_config.is_nemotron_35_layout
     except Exception as e:
-        sample_from_anchor = True
         logger.warning(
-            "Failed to read DSpark draft layout; preserving the standard "
-            "sample-from-anchor graph sizing. Error: %s",
+            "Failed to read DSpark draft config; preserving explicit/default "
+            "gamma resolution. Error: %s",
             e,
         )
-    declare_resolution(
-        server_args,
-        "_handle_dspark",
-        speculative_dspark_sample_from_anchor=sample_from_anchor,
-    )
 
     gamma: Optional[int] = None
     if server_args.speculative_dspark_block_size is not None:

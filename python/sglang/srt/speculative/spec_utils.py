@@ -118,12 +118,6 @@ def resolve_num_tokens_per_req(
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
-        if (
-            spec_algorithm.is_dspark()
-            and is_draft_worker
-            and spec.speculative_dspark_sample_from_anchor is False
-        ):
-            return num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )

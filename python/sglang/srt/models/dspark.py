@@ -15,6 +15,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -431,8 +432,8 @@ class DSparkDraftMixin:
                 f"got markov_rank={dspark_config.markov_rank}."
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
-        self.sample_from_anchor = not self.is_nemotron_35_draft
-        if self.is_nemotron_35_draft:
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
+        if not self.sample_from_anchor:
             self.markov_head = build_nemotron_35_markov_head(
                 config, quant_config, prefix
             )

@@ -81,14 +81,13 @@ class DraftProposal(msgspec.Struct, frozen=True):
     folded: bool = False
 
 
-def _select_draft_hidden(
+def select_draft_hidden_without_anchor(
     hidden_states: torch.Tensor,
     *,
     bs: int,
-    query_token_num: int,
     gamma: int,
-    sample_from_anchor: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    query_token_num = gamma + 1
     expected_rows = bs * query_token_num
     if hidden_states.shape[0] != expected_rows:
         raise RuntimeError(
@@ -96,8 +95,7 @@ def _select_draft_hidden(
             f"expected {expected_rows}."
         )
     hidden_by_query = hidden_states.view(bs, query_token_num, *hidden_states.shape[1:])
-    sample_offset = 0 if sample_from_anchor else 1
-    selected = hidden_by_query[:, sample_offset : sample_offset + gamma].contiguous()
+    selected = hidden_by_query[:, 1:].contiguous()
     return (
         selected.view(bs * gamma, *hidden_states.shape[1:]),
         selected.view(bs, gamma, -1),
@@ -419,13 +417,21 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        model_hidden, draft_hidden_3d = _select_draft_hidden(
-            raw_hidden,
-            bs=bs,
-            query_token_num=query_token_num,
-            gamma=gamma,
-            sample_from_anchor=self.sample_from_anchor,
-        )
+        if self.sample_from_anchor:
+            expected_rows = bs * gamma
+            if raw_hidden.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"DSpark draft returned {raw_hidden.shape[0]} hidden rows, "
+                    f"expected {expected_rows}."
+                )
+            model_hidden = raw_hidden
+            draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        else:
+            model_hidden, draft_hidden_3d = select_draft_hidden_without_anchor(
+                raw_hidden,
+                bs=bs,
+                gamma=gamma,
+            )
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=model_hidden,
