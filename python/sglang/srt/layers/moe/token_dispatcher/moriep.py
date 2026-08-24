@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import functools
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
@@ -66,6 +67,28 @@ def _should_record_expert_distribution() -> bool:
         return not isinstance(recorder, _ExpertDistributionRecorderNoop)
     return False
 
+
+@functools.lru_cache(maxsize=1)
+def _aiter_supports_mxfp8_dispatch() -> bool:
+    """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
+
+    Probed rather than assumed, because the failure is silent in the worst way:
+    an older per_1x32 quant still returns fp8, but with continuous fp32 scales,
+    which the MoE then reads as e8m0 bytes and produces garbage rather than an
+    exception. Checking the signature keeps this a startup-time fallback instead
+    of a runtime corruption.
+    """
+    try:
+        import inspect
+
+        from aiter import get_hip_quant
+
+        return "scale_type" in inspect.signature(get_hip_quant).parameters or any(
+            "scale_type" in inspect.signature(f).parameters
+            for f in (get_hip_quant(QuantType.per_1x32),)
+        )
+    except Exception:
+        return False
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
 
@@ -458,7 +481,18 @@ class _MoriEPDispatcherImplBase:
                 elif dispatch_dtype == "fp4":
                     self.dispatch_dtype = DispatchDtype.fp4
                 elif dispatch_dtype == "mxfp8":
-                    self.dispatch_dtype = DispatchDtype.mxfp8
+                    if _aiter_supports_mxfp8_dispatch():
+                        self.dispatch_dtype = DispatchDtype.mxfp8
+                    else:
+                        logger.warning_once(
+                            "SGLANG_MORI_DISPATCH_DTYPE=mxfp8 requires an aiter "
+                            "build whose per_1x32 quant accepts scale_type "
+                            "(for the group-32 e8m0 byte layout the MoE kernels "
+                            "consume). This aiter does not, so the send-side "
+                            "quant would emit continuous fp32 scales and the "
+                            "MoE would read them as e8m0 bytes. Falling back to "
+                            "bf16 dispatch."
+                        )
         elif (
             "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
         ):
