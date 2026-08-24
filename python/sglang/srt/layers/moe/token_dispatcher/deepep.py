@@ -443,11 +443,11 @@ class _DeepEPDispatcherImplBase:
         # 3. Always set low-latency quantization flags
         self._apply_low_latency_quantization_flags()
 
-        # 4. NPU quant tensor for normal dispatch (only on Ascend)
+        # 4. NPU normal-dispatch quantization mode (only on Ascend).
         if _is_npu and (self.deepep_mode.enable_normal()):
-            self.npu_quant_tensor = self._get_npu_normal_quant_tensor()
+            self.npu_normal_quant_mode = self._get_npu_normal_quant_mode()
         else:
-            self.npu_quant_tensor = None
+            self.npu_normal_quant_mode = None
 
     def _apply_low_latency_quantization_flags(self) -> None:
         """Set low-latency quantization flags from the resolved output dtype."""
@@ -485,22 +485,17 @@ class _DeepEPDispatcherImplBase:
         else:
             raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
-    def _get_npu_normal_quant_tensor(self):
-        """
-        Build a reference tensor of the quantisation data type used on NPU.
-        Returns None if no quantisation is required (e.g., bf16).
-        """
-        dtype = self.deepep_output_dtype
-        if dtype == DispatcherOutputDtype.BF16:
+    def _get_npu_normal_quant_mode(self) -> Optional[str]:
+        if os.environ.get("DEEP_USE_MODE", "default") == "alltoall":
+            # AllToAllNormalCommStrategy only supports its legacy INT8 env.
             return None
-        elif dtype == DispatcherOutputDtype.INT8:
-            return torch.tensor([], dtype=torch.int8, device="npu")
-        elif dtype == DispatcherOutputDtype.MXFP8:
-            return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
-        elif dtype == DispatcherOutputDtype.MXFP4:
-            return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
-        else:
-            raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
+
+        quant_modes = {
+            DispatcherOutputDtype.INT8: "int8",
+            DispatcherOutputDtype.MXFP8: "mx_fp8_e4m3",
+            DispatcherOutputDtype.MXFP4: "mx_fp4_e2m1",
+        }
+        return quant_modes.get(self.deepep_output_dtype)
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
@@ -514,6 +509,23 @@ class _DeepEPDispatcherImplBase:
             elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
+            elif (
+                os.environ.get("DEEP_USE_MODE", "default") == "alltoall"
+                and self.deepep_output_dtype
+                in (DispatcherOutputDtype.MXFP8, DispatcherOutputDtype.MXFP4)
+            ):
+                raise ValueError(
+                    f"{self.deepep_output_dtype.value} DeepEP dispatch is not "
+                    "supported with DEEP_USE_MODE=alltoall"
+                )
+            elif (
+                self.dispatch_mode == DeepEPMode.LOW_LATENCY
+                and self.deepep_output_dtype == DispatcherOutputDtype.MXFP4
+                and os.environ.get("DEEP_USE_MODE", "default") != "default"
+            ):
+                raise ValueError(
+                    "MXFP4 DeepEP low-latency dispatch requires DEEP_USE_MODE=default"
                 )
         else:
             if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
@@ -620,9 +632,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
-        # Wrap x for NPU quantisation if a quant reference tensor exists
-        x = (x, self.npu_quant_tensor) if self.npu_quant_tensor is not None else x
-
         _deepep_precompile_tp_barrier()
         (
             recv_x,
@@ -644,6 +653,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
+            **(
+                {"quant_mode": self.npu_normal_quant_mode}
+                if self.npu_normal_quant_mode is not None
+                else {}
+            ),
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,

@@ -414,7 +414,7 @@ python3 -m sglang.launch_server \
 
 **DeepEP dispatcher output quantization:**
 
-DeepEP uses the same MXFP dispatcher names as the Ascend MoE path: `mxfp8` is FP8 E4M3 data with an E8M0 block scale, and `mxfp4` is packed FP4 E2M1 data with an E8M0 block scale. E5M2 is not part of the MXFP8 dispatcher API. Both formats are supported in `normal` and `low_latency` modes on compatible Ascend A5 kernels; low-latency MXFP4 requires [sgl-kernel-npu PR #566](https://github.com/sgl-project/sgl-kernel-npu/pull/566).
+DeepEP uses the same MXFP dispatcher names as the Ascend MoE path: `mxfp8` is FP8 E4M3 data with an E8M0 block scale, and `mxfp4` is packed FP4 E2M1 data with an E8M0 block scale. E5M2 is not part of the MXFP8 dispatcher API. Normal-mode MXFP dispatch requires the default (non-all-to-all) strategy. Low-latency MXFP4 requires `DEEP_USE_MODE=default`; the `ops` and `alltoall` strategies do not support its payload and scale contract.
 
 This naming aligns with the `mxfp8` value introduced by [PR #30768](https://github.com/sgl-project/sglang/pull/30768). When both changes are present, its DeepEP path can select `mxfp8` instead of the temporary BF16 fallback. The CLI value takes precedence over automatic selection:
 
