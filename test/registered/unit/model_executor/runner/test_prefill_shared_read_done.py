@@ -12,7 +12,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -41,8 +41,13 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
 _DEVICE_MODULE = SimpleNamespace(Event=_Event)
 
 
-def _batch(mode=ForwardMode.EXTEND):
-    return SimpleNamespace(forward_mode=mode)
+def _batch(mode=ForwardMode.EXTEND, spec_input_type=None):
+    spec_info = (
+        None
+        if spec_input_type is None
+        else SimpleNamespace(spec_input_type=spec_input_type)
+    )
+    return SimpleNamespace(forward_mode=mode, spec_info=spec_info)
 
 
 def test_publishes_recorded_event_when_enabled():
@@ -58,6 +63,29 @@ def test_disabled_when_flag_is_false():
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
         maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
     assert runner.shared_read_done_event is None
+
+
+def test_eagle_draft_extend_does_not_publish():
+    runner = _model_runner(spec_algorithm=SpeculativeAlgorithm.EAGLE)
+    batch = _batch(spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND)
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
+        maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
+    assert runner.shared_read_done_event is None
+
+
+@pytest.mark.parametrize(
+    "algorithm", (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK)
+)
+@pytest.mark.parametrize("enabled", (False, True))
+def test_dflash_family_target_prefill_respects_prefill_flag(algorithm, enabled):
+    runner = _model_runner(spec_algorithm=algorithm)
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    if enabled:
+        published = runner.shared_read_done_event
+        assert isinstance(published, _Event) and published.recorded
+    else:
+        assert runner.shared_read_done_event is None
 
 
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
