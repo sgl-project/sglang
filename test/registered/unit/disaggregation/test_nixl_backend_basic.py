@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    _set_rank_local_gpunetio_oob_port,
 )
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -479,6 +480,13 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
             mgr.reserve_ready_lease(2, 0)
         mgr._ready_leases.pop((1, 0, -1))
         self.assertEqual(mgr.reserve_ready_lease(2, 0), (0, 2))
+
+    def test_peer_rows_requires_rank_local_oob_port(self):
+        params = {"oob_port": "6544"}
+        _set_rank_local_gpunetio_oob_port(params, 3)
+        self.assertEqual(params["oob_port"], "6547")
+        with self.assertRaisesRegex(ValueError, "explicit base"):
+            _set_rank_local_gpunetio_oob_port({}, 0)
 
     def test_peer_rows_require_ready_capability(self):
         mgr = object.__new__(NixlKVManager)

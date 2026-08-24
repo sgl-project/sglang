@@ -73,6 +73,17 @@ _READY_PROTOCOL_VERSION = "1"
 _READY_ITEM_SIZE = 8
 
 
+def _set_rank_local_gpunetio_oob_port(
+    backend_params: Dict[str, str], rank: int
+) -> None:
+    if "oob_port" not in backend_params:
+        raise ValueError("DCP GPUNETIO peer rows require an explicit base oob_port")
+    rank_oob_port = int(backend_params["oob_port"]) + rank
+    if not 0 < rank_oob_port <= 65535:
+        raise ValueError("DCP GPUNETIO peer-row oob_port is out of range")
+    backend_params["oob_port"] = str(rank_oob_port)
+
+
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
     if kinds is None:
         return ["VRAM"] * expected_len
@@ -490,6 +501,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError(
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
+            )
+        if self.enable_dcp_peer_rows:
+            _set_rank_local_gpunetio_oob_port(
+                backend_params, self.transfer_source_rank
             )
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
