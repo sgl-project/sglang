@@ -72,6 +72,13 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the Ray driver sizes the actor placement group; the actors it is about "
         "to create are the ones that will hold the process groups"
     ),
+    ("srt/ray/engine.py", "tp_size"): (
+        "the same placement arithmetic as the stage count: the driver sizes "
+        "the actors that will hold the process groups"
+    ),
+    ("srt/ray/data_parallel_controller.py", "tp_size"): (
+        "the same arithmetic on the DP path, also in the driver"
+    ),
     ("srt/ray/data_parallel_controller.py", "pp_size"): (
         "same placement arithmetic on the DP path -- ranks per TP group, "
         "computed in the driver before the actors start"
