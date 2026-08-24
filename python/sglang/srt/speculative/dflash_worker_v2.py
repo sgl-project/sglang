@@ -1099,6 +1099,70 @@ class DFlashWorkerV2(BaseSpecWorker):
                         break
         return min(target_tokens, confidence.shape[0] * self.block_size)
 
+    def _plan_confidence_verify_prefixes(
+        self, confidence: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        decision = plan_verify_prefixes(
+            confidence,
+            verify_num_draft_tokens=self.block_size,
+            confidence_threshold=float(
+                self.server_args.speculative_dflash_confidence_threshold
+            ),
+            min_verify_len=int(
+                self.server_args.speculative_dflash_confidence_min_verify_len
+            ),
+            target_verify_tokens=self._confidence_target_verify_tokens(confidence),
+        )
+        return (
+            decision.verify_lens,
+            decision.deferred_tokens,
+            decision.low_confidence_tokens,
+        )
+
+    def _prepare_confidence_verify_budget(self, batch, future_map) -> None:
+        """Prepare a zero-sync approximate ragged plan from N-2 confidence.
+
+        `ConfidenceRelay` returns only pinned-host snapshots whose async D2H
+        event has completed. The planner then puts the small per-request plan
+        into the overlap draft input before the GPU forward starts. A missing
+        or stale snapshot leaves this unset and verify falls back to the
+        lossless full-width path.
+        """
+        if not self._uses_confidence_scheduling():
+            return
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return
+        draft_input.verify_token_budget = None
+        draft_input.confidence_verify_lens_cpu = None
+        draft_input.confidence_deferred_tokens = 0
+        draft_input.confidence_low_confidence_tokens = 0
+        resolved = future_map.resolve_confidence_cpu(batch)
+        if resolved is None:
+            return
+        current_generation = self.model_runner.req_to_token_pool.req_generation[
+            batch.req_pool_indices_cpu.to(torch.int64)
+        ]
+        fresh = (
+            resolved.generation.to(torch.int64) == current_generation.to(torch.int64)
+        ) & (current_generation.to(torch.int64) >= 1)
+        if not bool(fresh.all()):
+            return
+        verify_lens, deferred_tokens, low_confidence_tokens = (
+            self._plan_confidence_verify_prefixes(resolved.confidence)
+        )
+        draft_input.verify_token_budget = int(verify_lens.sum().item())
+        draft_input.confidence_verify_lens_cpu = verify_lens.to(torch.int32).tolist()
+        draft_input.confidence_deferred_tokens = deferred_tokens
+        draft_input.confidence_low_confidence_tokens = low_confidence_tokens
+
+    def get_confidence_budget_prepare(self):
+        return (
+            self._prepare_confidence_verify_budget
+            if self._uses_confidence_scheduling()
+            else None
+        )
+
     def dump_info_records(self) -> Optional[dict]:
         if not self._uses_confidence_scheduling():
             return None
@@ -2076,9 +2140,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         custom_mask = None
 
         confidence_layout: Optional[RaggedVerifyLayout] = None
+        overlap_lagged_plan = (
+            batch.enable_overlap
+            and draft_input.confidence_verify_lens_cpu is not None
+            and draft_input.verify_token_budget is not None
+        )
         use_confidence_ragged = (
             self._uses_confidence_scheduling()
-            and self._selector_confidence is not None
             and _is_all_greedy(batch.sampling_info)
             and not batch.has_grammar
             # Spec logprob output is rectangular per request. A compact
@@ -2090,36 +2158,47 @@ class DFlashWorkerV2(BaseSpecWorker):
                 > 0
                 or self._confidence_sps_table is not None
             )
+            and (
+                overlap_lagged_plan
+                if batch.enable_overlap
+                else self._selector_confidence is not None
+            )
         )
         confidence_reason = "full_verify_disabled"
         if use_confidence_ragged:
-            decision = plan_verify_prefixes(
-                self._selector_confidence,
-                verify_num_draft_tokens=block_size,
-                confidence_threshold=float(
-                    self.server_args.speculative_dflash_confidence_threshold
-                ),
-                min_verify_len=int(
-                    self.server_args.speculative_dflash_confidence_min_verify_len
-                ),
-                target_verify_tokens=self._confidence_target_verify_tokens(
-                    self._selector_confidence
-                ),
-            )
+            if overlap_lagged_plan:
+                # The scheduler prepared this from the completed N-2 pinned
+                # snapshot. Do not inspect current GPU confidence here: that
+                # would reintroduce a GPU->CPU synchronization on the hot path.
+                verify_lens_cpu = draft_input.confidence_verify_lens_cpu
+                deferred_tokens = draft_input.confidence_deferred_tokens
+                low_confidence_tokens = draft_input.confidence_low_confidence_tokens
+                confidence_reason = "confidence_ragged_lagged"
+            else:
+                (
+                    verify_lens,
+                    deferred_tokens,
+                    low_confidence_tokens,
+                ) = self._plan_confidence_verify_prefixes(self._selector_confidence)
+                verify_lens_cpu = verify_lens.cpu().tolist()
+                confidence_reason = "confidence_ragged"
             graph_buckets = self._ragged_verify_graph_buckets()
             confidence_layout = RaggedVerifyLayout.from_verify_lens(
-                verify_lens_cpu=decision.verify_lens.cpu().tolist(),
+                verify_lens_cpu=verify_lens_cpu,
                 device=device,
-                grid=graph_buckets or [int(decision.verify_lens.sum())],
+                grid=graph_buckets or [sum(verify_lens_cpu)],
             )
-            confidence_reason = "confidence_ragged"
-            self._confidence_observer.observe(
-                confidence=self._selector_confidence,
-                verify_lens=confidence_layout.verify_lens,
-                reason=confidence_reason,
-                deferred_tokens=decision.deferred_tokens,
-                low_confidence_tokens=decision.low_confidence_tokens,
-            )
+            # Observer collection is intentionally omitted for overlap: its
+            # current-confidence histogram requires D2H and would defeat the
+            # relay. The lagged plan metadata remains available in info dumps.
+            if not batch.enable_overlap:
+                self._confidence_observer.observe(
+                    confidence=self._selector_confidence,
+                    verify_lens=confidence_layout.verify_lens,
+                    reason=confidence_reason,
+                    deferred_tokens=deferred_tokens,
+                    low_confidence_tokens=low_confidence_tokens,
+                )
             ragged_window = BuildRaggedVerifyWindow.execute(
                 batch=batch,
                 layout=confidence_layout,
@@ -2146,11 +2225,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     confidence_reason = "full_verify_grammar"
                 elif batch.return_logprob:
                     confidence_reason = "full_verify_logprob"
-                self._confidence_observer.observe(
-                    confidence=self._selector_confidence,
-                    verify_lens=None,
-                    reason=confidence_reason,
-                )
+                elif batch.enable_overlap:
+                    confidence_reason = "full_verify_lag_snapshot_unavailable"
+                # Observing current GPU confidence performs a D2H copy. Overlap
+                # instead publishes it to ConfidenceRelay below and deliberately
+                # keeps the hot path synchronization-free.
+                if not batch.enable_overlap:
+                    self._confidence_observer.observe(
+                        confidence=self._selector_confidence,
+                        verify_lens=None,
+                        reason=confidence_reason,
+                    )
             verify_input_ids = draft_tokens.reshape(-1)
             verify_positions = positions
             batch.out_cache_loc = verify_out_cache_loc
@@ -2174,7 +2259,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Ragged verify extends each request by its selected prefix; full
             # DFLASH retains the original fixed-block host bound.
             verify_host_seq_lens = (
-                seq_lens_cpu_backup + confidence_layout.verify_lens.cpu()
+                seq_lens_cpu_backup
+                + torch.tensor(
+                    confidence_layout.verify_lens_cpu,
+                    dtype=seq_lens_cpu_backup.dtype,
+                    device="cpu",
+                )
                 if confidence_layout is not None
                 else seq_lens_cpu_backup + block_size
             )
@@ -2377,7 +2467,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
             )
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            # Publish current confidence to FutureMap's async D2H ring. The
+            # overlap scheduler will consume its completed N-2 snapshot to
+            # prepare a later approximate verify plan without a hot-path sync.
+            if (
+                self._uses_confidence_scheduling()
+                and self._selector_confidence is not None
+            ):
+                on_publish(new_seq_lens, confidence=self._selector_confidence)
+            else:
+                on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states

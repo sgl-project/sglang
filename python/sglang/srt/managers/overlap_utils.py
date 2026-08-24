@@ -61,9 +61,10 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    # DFLASH_CONFIDENCE derives its current-batch confidence from the eager
-    # selector draft and does not consume FutureMap's cross-iteration relay.
-    if not algo.is_dspark():
+    # DSpark and DFLASH_CONFIDENCE both use the relay to avoid synchronizing
+    # current-step confidence to the host. DFLASH_CONFIDENCE consumes the
+    # N-2 snapshot to prepare the current batch's approximate verify plan.
+    if not (algo.is_dspark() or algo.is_dflash_confidence()):
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
