@@ -231,6 +231,20 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
+def all_reduce_min_attn_cp_tp_group(
+    values: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """MIN-reduce small per-request int verdicts so every attn rank in a DP
+    shard agrees (e.g. rank-local clock decisions that feed rank-aligned
+    queues)."""
+    tensor_to_reduce = torch.tensor(values, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=attn_tp_cpu_group)
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=attn_cp_cpu_group)
+    return tensor_to_reduce.tolist()
+
+
 def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,
