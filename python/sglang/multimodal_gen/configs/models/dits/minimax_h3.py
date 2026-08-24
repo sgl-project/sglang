@@ -13,6 +13,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     # H3 fuses Q/K/V, so split projections are stacked for the fused LoRA layer
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^(.*)\.weight_scale$": r"\1.weight_scale_inv",
             r"^(.*\.lora_[AB])\.[^.]+$": r"\1",
             r"^base_model\.model\.(.*\.lora_[AB])$": r"\1",
             r"^transformer\.(.*\.lora_[AB])$": r"\1",
