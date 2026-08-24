@@ -6,7 +6,6 @@ import torch
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 

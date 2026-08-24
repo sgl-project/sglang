@@ -3,10 +3,13 @@ import triton
 import triton.language as tl
 
 _UINT32_MASK = 0xFFFFFFFF
+
+
 def _rotl32_torch(x: torch.Tensor, r: int) -> torch.Tensor:
     """Rotate left with uint32 semantics using int64 tensors."""
     x = x & _UINT32_MASK
     return ((x << r) | (x >> (32 - r))) & _UINT32_MASK
+
 
 def _fmix32_torch(h: torch.Tensor) -> torch.Tensor:
     """Torch implementation matching fmix32()."""
@@ -32,6 +35,7 @@ def _murmur3_mix_torch(
     h = (h * 5 + 0xE6546B64) & _UINT32_MASK
 
     return h
+
 
 def _murmur_hash32_torch(
     seed: torch.Tensor,
@@ -66,11 +70,11 @@ def _murmur_hash32_torch(
     col = (col_indices & _UINT32_MASK).view(1, m)
     h = _murmur3_mix_torch(h, col)
 
-
     h = (h ^ 16) & _UINT32_MASK
     h = _fmix32_torch(h)
 
     return h.to(torch.uint32)
+
 
 @triton.jit
 def rotl32(x, r: tl.constexpr) -> tl.uint32:
