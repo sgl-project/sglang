@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -104,6 +105,21 @@ def get_max_retries(datasets):
     return 1
 
 
+def _kill_evalscope_session(process):
+    """Kill the whole evalscope session (process.pid is the leader == pgid)."""
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"run_evalscope killed session pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"run_evalscope session pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(
+            f"run_evalscope no permission to kill session pgid={process.pid}"
+        )
+
+
 def run_evalscope(
     host,
     port,
@@ -177,6 +193,12 @@ def run_evalscope(
         text=True,
         bufsize=1,
         shell=True,
+        start_new_session=True,
+    )
+
+    logger.info(
+        f"run_evalscope spawned: pid={process.pid} "
+        f"pgid={os.getpgid(process.pid)} cmd={cmd}"
     )
 
     output_lines = []
@@ -187,6 +209,13 @@ def run_evalscope(
             output_lines.append(line.strip())
 
         process.wait()
+
+        logger.info(
+            f"run_evalscope finished: pid={process.pid} "
+            f"returncode={process.returncode}"
+        )
+
+        _kill_evalscope_session(process)
 
         if process.returncode != 0:
             logger.error(f"Command failed with return code: {process.returncode}")
@@ -204,12 +233,10 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                for item in report_data:
-                    score = item.get("score")
-                    if score is not None:
-                        metrics["accuracy"] = float(score)
-                        logger.info(f"The Final Accuracy from report: {score}")
-                        break
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
@@ -245,11 +272,14 @@ def run_evalscope(
             logger.warning("Process did not terminate gracefully, killing it...")
             process.kill()
             logger.info("Process killed")
+        _kill_evalscope_session(process)
         raise
+
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
         process.wait(timeout=5)
+        _kill_evalscope_session(process)
         raise
 
 
@@ -311,16 +341,27 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     def _setup_per_case_output(cls):
         """Set up per-case output directories and env vars.
 
-        Extracted from ``nightly-test-npu-e2e-single-node.yml`` so that when a
-        suite is executed, each case writes its metrics/plog to a path derived
-        from the case file rather than the suite name.
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
+        {workflow_name}/{test_type}/{suite}), each case in the suite
+        writes to its own subdirectory under it, so results stay in the
+        structured layout and are keyed by the case id. Falls back to the
+        legacy per-case layout when the env var is not set.
         """
         cls.tc_name = cls._get_tc_name()
-        current_date = datetime.now().strftime("%Y%m%d")
-        test_type = getattr(cls, "test_type", "accuracy")
-        base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
-        os.makedirs(base_output, exist_ok=True)
-        cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+        suite_output = os.environ.get("METRICS_DATA_FILE")
+        if suite_output:
+            # Append the case id under the suite output prefix.
+            cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
+            suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
+            cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            test_type = getattr(cls, "test_type", "accuracy")
+            base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+            cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+            cls.plog_base = f"/root/.cache/tests/logs/plog"
         os.makedirs(cls.metrics_data_file, exist_ok=True)
         # Override env vars so evalscope/dump_metric write to per-case paths.
         os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
@@ -376,6 +417,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             logger.info("Saved per-case metrics to %s", out_path)
         except Exception as e:
             logger.warning("Failed to write metrics.json: %s", e)
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
 
     @classmethod
     def _backup_plog(cls):
@@ -391,7 +438,8 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         if not tc_name:
             return
         hostname = os.getenv("HOSTNAME", "unknown")
-        target = os.path.join("/root/.cache/tests/logs/plog", tc_name, hostname)
+        plog_base = getattr(cls, "plog_base", "/root/.cache/tests/logs/plog")
+        target = os.path.join(plog_base, tc_name, hostname)
         os.makedirs(target, exist_ok=True)
         for name in os.listdir(plog_path):
             src = os.path.join(plog_path, name)

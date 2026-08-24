@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -108,6 +112,26 @@ TARGET = {
                 "video_audio.reference_preserve",
             ],
         ),
+        (
+            "ref2va",
+            [
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                },
+                {
+                    "type": "image",
+                    "uri": "file:///subject.png",
+                    "role": "reference",
+                },
+            ],
+            "ref2va",
+            [0, 1],
+            [],
+            ["image.target_canvas", "image.reference_preserve"],
+        ),
     ],
 )
 def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
@@ -128,9 +152,33 @@ def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
     assert plan.encoders["audio"] == audio
     assert [material.material_chain for material in plan.materials] == chains
     if task == "ref2va":
-        assert plan.materials[1].start_time_seconds == 12.5
+        assert plan.encoders["qwen"]["ordered_condition_indices"] == [
+            index
+            for index, condition in enumerate(conditions)
+            if condition["role"] == "reference"
+        ]
+    for index, condition in enumerate(conditions):
+        if condition.get("start_time_seconds") is not None:
+            assert plan.materials[index].start_time_seconds == 12.5
     assert plan.shape["frame_count"] == 124
     assert plan.shape["video_latent_t"] == 37
+
+
+def test_ref2va_rejects_keyframes_without_a_reference():
+    with pytest.raises(ValueError, match="at least one reference"):
+        minimax_h3_validate_canonical_request(
+            task="ref2va",
+            prompt="contract",
+            conditions=[
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                }
+            ],
+            target=TARGET,
+        )
 
 
 @pytest.mark.parametrize(
@@ -250,6 +298,7 @@ def _quality_server_args():
         is_dit_layerwise_offload_selected=False,
         performance_mode="speed",
         quantization=None,
+        transformer_weights_path=None,
         regional_compile=False,
         ring_degree=1,
         sp_degree=4,
@@ -257,6 +306,24 @@ def _quality_server_args():
         ulysses_degree=4,
         use_fsdp_inference=False,
     )
+
+
+def test_high_quality_deployment_rejects_transformer_weight_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.transformer_weights_path = "model.gguf"
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+        pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
 
 
 def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
@@ -267,6 +334,8 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
         sampling_params=SimpleNamespace(
             quality="high",
             _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
         )
     )
 
@@ -366,4 +435,31 @@ def test_validate_server_args_requires_packed_varlen_backend():
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    modes = {
+        "transformer": LAYERWISE_OFFLOAD,
+        "text_encoder": LAYERWISE_OFFLOAD,
+        "video_vae": LAYERWISE_OFFLOAD,
+        "audio_vae": LAYERWISE_OFFLOAD,
+    }
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=None,
+        enable_torch_compile=False,
+        residency_mode=modes.get,
+    )
+
+    with patch.object(current_platform, "is_mps", return_value=True):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+        modes["audio_vae"] = RESIDENT
+        with pytest.raises(ValueError, match="audio_vae"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
