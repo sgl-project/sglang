@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
@@ -248,6 +248,21 @@ class StreamingSession(BasePrefixCache):
             return None
 
         req = params.req
+
+        # [NPU] When aligned context < page_size, release the slot's KV and
+        # fall back to radix cache (full prefill). Once context >= page_size,
+        # streaming session kicks in with page-aligned KV reuse.
+        if is_npu() and self.page_size > 1:
+            expected_prefix_len = min(slot.kv_committed_len, len(params.key))
+            aligned_prefix_len = (
+                expected_prefix_len // self.page_size
+            ) * self.page_size
+            if aligned_prefix_len < slot.cache_protected_len or aligned_prefix_len == 0:
+                # Release KV to avoid leak and fallback to full prefill.
+                # req remains unassigned, so alloc_for_extend treats it as new.
+                self.release_session(req.session.session_id)
+                return None
+
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -261,6 +276,12 @@ class StreamingSession(BasePrefixCache):
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.cache_protected_len=}"
         )
+
+        # Floor-align prefix_len to page boundary (NPU workaround).
+        if is_npu() and self.page_size > 1:
+            prefix_len = (prefix_len // self.page_size) * self.page_size
+            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range

@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     offloader,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
@@ -418,6 +420,26 @@ if flashinfer_per_tensor_fp8_supported():
         ).view(m, n)
 
 
+def _fake_flashinfer_mxfp8_quantize(
+    input: torch.Tensor,
+    _is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    m = input.numel() // input.shape[-1]
+    k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
+    q_input = input.new_empty((m, k_aligned), dtype=torch.float8_e4m3fn)
+    sf_columns = k_aligned // 32
+    if _is_sf_swizzled_layout:
+        padded_rows = ((m + 127) // 128) * 128
+        padded_sf_columns = ((sf_columns + 3) // 4) * 4
+        scale_size = padded_rows * padded_sf_columns
+    else:
+        scale_size = m * sf_columns
+    scale = input.new_empty((scale_size,), dtype=torch.uint8)
+    return q_input, scale
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -479,21 +501,6 @@ if is_blackwell_supported() and is_flashinfer_available():
 
     # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
     # flashinfer's JIT compilation path (filesystem checks/cubin loader).
-    def _fake_flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        _is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-        backend: str = "cute-dsl",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode only needs dtypes and output rank to propagate compile graph.
-        # The scale tensor shape is not consumed before the following fake mm op.
-        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-        q_input = input.new_empty(
-            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-        )
-        scale = input.new_empty((1,), dtype=torch.uint8)
-        return q_input, scale
-
     @register_custom_op(
         op_name="flashinfer_mxfp8_quantize",
         mutates_args=[],
@@ -1853,7 +1860,9 @@ def apply_fp8_linear(
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
-        if channelwise_cutlass:
+        if channelwise_cutlass or (_is_xpu and weight_scale.numel() == weight.shape[1]):
+            # On XPU, sgl-kernel-xpu's native quant kernels require output_q
+            # to exactly match input's shape; padded output isn't supported.
             num_token_padding = None
         # For static per-tensor activation scales when using inductor compiler,
         # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.

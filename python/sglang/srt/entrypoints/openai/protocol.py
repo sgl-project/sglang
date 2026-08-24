@@ -915,6 +915,7 @@ class ChatCompletionRequest(BaseModel):
     use_audio_in_video: bool = False
 
     images_config: Optional[Dict] = None
+    video_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
