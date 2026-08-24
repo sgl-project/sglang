@@ -48,6 +48,15 @@ The `quality` field in a **video response** body is unrelated. It is Sora-compat
 
 `quality` participates in the dynamic-batch signature, so mixed-quality traffic is batched separately and the transition happens safely at a batch boundary. Mounting is all-or-nothing: if any marked site on a transformer fails its static guards, no site on that transformer is fused.
 
+<Warning>
+Do not combine request-gated DiT fusions with `--enable-breakable-cuda-graph`.
+BCG warmup captures the lossless module branches before a high-quality request
+mounts its DiT fusions, so replay would bypass the requested kernels. SGLang
+rejects this combination for models with eligible DiT quality sites. Models
+whose high-quality path changes only VAE decode remain allowed because BCG
+captures the DiT only.
+</Warning>
+
 These fusion families mount under `quality="high"`:
 
 | Fusion | What it folds |
@@ -147,9 +156,8 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
-| SANA-Video | paired fp64 interleaved RoPE |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; BF16-input linear attention at `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
