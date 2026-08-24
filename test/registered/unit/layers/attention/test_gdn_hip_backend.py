@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import (
     LINEAR_ATTN_DECODE_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
@@ -243,18 +244,16 @@ class TestHipBackendScope(unittest.TestCase):
         )
 
     @staticmethod
-    def make_runner(*, speculative_algorithm=None, is_draft_worker=False):
+    def make_runner(*, is_draft_worker=False):
         return SimpleNamespace(
             model_config=SimpleNamespace(hf_config=sentinel.hf_config),
-            server_args=SimpleNamespace(
-                speculative_algorithm=speculative_algorithm,
-            ),
             is_draft_worker=is_draft_worker,
         )
 
     def test_capability_accepts_qwen35_non_speculative_gfx950(self):
         runner = self.make_runner()
         with (
+            get_context().override_server_args(speculative_algorithm=None),
             patch.object(gdn_backend, "is_hip", return_value=True),
             patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
             patch.object(gdn_backend, "is_qwen3_5", return_value=True),
@@ -263,15 +262,19 @@ class TestHipBackendScope(unittest.TestCase):
 
     def test_capability_rejects_mtp_draft_and_other_models(self):
         with (
+            get_context().override_server_args(speculative_algorithm="EAGLE"),
             patch.object(gdn_backend, "is_hip", return_value=True),
             patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
             patch.object(gdn_backend, "is_qwen3_5", return_value=True),
         ):
-            self.assertFalse(
-                is_hip_gdn_decode_supported(
-                    self.make_runner(speculative_algorithm="EAGLE")
-                )
-            )
+            self.assertFalse(is_hip_gdn_decode_supported(self.make_runner()))
+
+        with (
+            get_context().override_server_args(speculative_algorithm=None),
+            patch.object(gdn_backend, "is_hip", return_value=True),
+            patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
+            patch.object(gdn_backend, "is_qwen3_5", return_value=True),
+        ):
             self.assertFalse(
                 is_hip_gdn_decode_supported(self.make_runner(is_draft_worker=True))
             )
