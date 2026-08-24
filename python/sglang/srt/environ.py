@@ -351,6 +351,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Set to true by the check-changes CI job when a PR touches nothing under
+    # rust/; default false so local and scheduled runs never skip the cargo tests.
+    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
@@ -510,7 +513,13 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # Size the KV pool after CUDA-graph capture.
+
+    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
+    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
+    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
+    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
     # ===================================================================
@@ -681,6 +690,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # Buffer mode: pin a staged prefetch's device anchor from IO commit to
+    # consumption so eviction cannot waste the fetch; cap = fraction of pool.
+    SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK = EnvBool(False)
+    SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -847,9 +860,6 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
-    # Keep K3 shared experts and dense MLPs sharded over attention TP.
-    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
-    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
@@ -1028,6 +1038,7 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
@@ -1048,16 +1059,6 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
-    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
-    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
-    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
-    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
-    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
-    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
-    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
-    # this combination on the host side.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1073,6 +1074,11 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # MiniCPM sparse attention developer switches
+    SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
+    SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
+    SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
@@ -1231,6 +1237,7 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
@@ -1481,6 +1488,8 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Use the ROCm radix-4 router for covered K3 top-k workloads.
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -1626,6 +1635,12 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
         note="Please use '--moe-runner-backend=cutlass' and/or "
         "'--speculative-moe-runner-backend=cutlass' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
     ),
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
         note="DFlash now auto-enables the min-free-slots delay; unset this env. "
