@@ -3135,6 +3135,24 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    }
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,
