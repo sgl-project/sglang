@@ -9,6 +9,7 @@ from .gptq import (
     GPTQMarlinLinearMethod,
     GPTQMarlinMoEMethod,
     GPTQMoEMethod,
+    GPTQXPUConfig,
     check_marlin_format,
 )
 from .schemes import (
@@ -19,6 +20,7 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQXPULinearScheme,
 )
 
 __all__ = [
@@ -32,6 +34,8 @@ __all__ = [
     "GPTQMarlinMoEMethod",
     "GPTQLinearScheme",
     "GPTQAscendLinearScheme",
+    "GPTQXPULinearScheme",
+    "GPTQXPUConfig",
     "GPTQIntelAMXLinearScheme",
     "GPTQIntelAMXMoEScheme",
     "GPTQMarlinLinearScheme",
