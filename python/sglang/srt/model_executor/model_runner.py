@@ -178,6 +178,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     is_ep_joiner,
     is_ep_scale_joiner,
+    max_speculative_num_draft_tokens,
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
@@ -795,12 +796,15 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        draft_token_counts = [self.server_args.max_speculative_num_draft_tokens]
-        if self.server_args.speculative_adaptive:
+        # Resolution can turn speculative_adaptive off, so the effective value
+        # lives in the bags while the startup record keeps the CLI input.
+        spec = get_spec()
+        draft_token_counts = [max_speculative_num_draft_tokens()]
+        if spec.speculative_adaptive:
             draft_token_counts.extend(
                 steps + 1
                 for steps in resolve_candidate_steps_from_config(
-                    self.server_args.speculative_adaptive_config
+                    spec.speculative_adaptive_config
                 )
             )
 

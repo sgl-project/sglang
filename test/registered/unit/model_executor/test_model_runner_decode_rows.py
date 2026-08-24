@@ -12,20 +12,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _FakeModelRunner:
     max_decode_logits_rows = ModelRunner.max_decode_logits_rows
 
-    def __init__(
-        self,
-        *,
-        config_path: str,
-        initial_width: int,
-        cuda_graph_bs: list[int],
-        max_draft_tokens: int,
-    ):
+    def __init__(self, *, initial_width: int, cuda_graph_bs: list[int]):
         self.initial_width = initial_width
-        self.server_args = SimpleNamespace(
-            speculative_adaptive=True,
-            speculative_adaptive_config=config_path,
-            max_speculative_num_draft_tokens=max_draft_tokens,
-        )
         self.cuda_graph_bs = cuda_graph_bs
 
     def decode_num_tokens_per_req(self, *, num_draft_tokens=None):
@@ -40,16 +28,19 @@ class TestModelRunnerDecodeRows(unittest.TestCase):
     def test_adaptive_sizing_covers_a_wider_candidate_width(self):
         """The shared logits buffer is sized for the widest adaptive candidate
         width: bs 12 at width 6 needs 72 rows."""
+        runner = _FakeModelRunner(initial_width=4, cuda_graph_bs=[4, 8, 12])
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             f.write('{"1":{"candidate_steps":[3,5]}}')
             f.flush()
-            runner = _FakeModelRunner(
-                config_path=f.name,
-                initial_width=4,
-                cuda_graph_bs=[4, 8, 12],
-                max_draft_tokens=6,
+            spec = SimpleNamespace(
+                speculative_adaptive=True, speculative_adaptive_config=f.name
             )
             with patch(
+                "sglang.srt.model_executor.model_runner.get_spec", return_value=spec
+            ), patch(
+                "sglang.srt.model_executor.model_runner.max_speculative_num_draft_tokens",
+                return_value=6,
+            ), patch(
                 "sglang.srt.model_executor.model_runner.get_batch_sizes_to_capture",
                 side_effect=_alignment_8_capture_bs,
             ):
