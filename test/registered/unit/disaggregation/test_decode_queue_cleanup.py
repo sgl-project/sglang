@@ -7,6 +7,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -30,6 +31,22 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_transfer_drain_admits_ready_requests(self):
+        req = object()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            pop_transferred=MagicMock(return_value=[req])
+        )
+        scheduler.enable_hisparse = False
+        scheduler.waiting_queue = []
+
+        transferred = SchedulerDisaggregationDecodeMixin._drain_decode_transfer_queue(
+            scheduler
+        )
+
+        self.assertEqual(transferred, [req])
+        self.assertEqual(scheduler.waiting_queue, [req])
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         page_size = 128
         fill_len = 574

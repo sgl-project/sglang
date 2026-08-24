@@ -2396,7 +2396,9 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             self._mark_symm_dp_scheduler_stage("after_bottom_prefetch_ns")
-            self.process_decode_queue()
+            # Admit completed transfers after launch so their consensus and
+            # metadata commit can overlap the in-flight graph.
+            drain_transfers = self.process_decode_queue(defer_transfer_drain=True)
             self._mark_symm_dp_scheduler_stage("after_process_decode_queue_ns")
             self._mark_symm_dp_scheduler_queue_state()
 
@@ -2425,6 +2427,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+
+            if drain_transfers:
+                self._drain_decode_transfer_queue()
 
             # Process the last batch
             if self.last_batch:
@@ -2588,7 +2593,9 @@ class SchedulerDisaggregationDecodeMixin:
             self._mark_symm_dp_scheduler_stage(name)
 
     @scheduler_nvtx_method("scheduler.pd.process_decode_queue")
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(
+        self: Scheduler, defer_transfer_drain: bool = False
+    ) -> bool:
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -2600,7 +2607,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return
+            return False
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -2611,14 +2618,9 @@ class SchedulerDisaggregationDecodeMixin:
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
-            if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            if defer_transfer_drain:
+                return True
+            transferred_reqs = self._drain_decode_transfer_queue()
             if NVTX_SCHEDULER_ENABLED:
                 with scheduler_nvtx_range(
                     "scheduler.pd.queue_state."
@@ -2629,3 +2631,13 @@ class SchedulerDisaggregationDecodeMixin:
                     f"waiting={len(self.waiting_queue)}"
                 ):
                     pass
+        return False
+
+    def _drain_decode_transfer_queue(self: Scheduler) -> List[Req]:
+        transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+        if self.enable_hisparse:
+            for req in transferred_reqs:
+                # Direct-to-host: KV data already in host pool, skip staging
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(transferred_reqs)
+        return transferred_reqs
