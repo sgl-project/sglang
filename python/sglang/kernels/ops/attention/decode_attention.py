@@ -1490,9 +1490,9 @@ def _lean_attention_decode_kernel(
         ) + high_load_wgs * max_tiles_per_wg
         cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
 
-    for i in tl.static_range(max_output_tile_cnt + 1):
-        if iter >= cta_end_tile_gid:
-            return
+    # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
+    # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
+    while iter < cta_end_tile_gid:
 
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
