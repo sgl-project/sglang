@@ -21,7 +21,8 @@ from sglang.utils import logger
 
 
 async def preprocess_video(vr, video_config: Optional[dict] = None):
-    """Sample video frames and defer spatial processing to the model processor."""
+    # Spatial resize stays with the model-native processor; pre-resizing here
+    # (as the Qwen2 path does) double-resizes with the wrong geometry.
     if not isinstance(vr, VideoDecoderWrapper):
         return vr, None
 
@@ -52,8 +53,6 @@ async def preprocess_video(vr, video_config: Optional[dict] = None):
 
 
 class Qwen3VLImageProcessor(QwenVLImageProcessor):
-    """Qwen3-family processor with model-specific video preprocessing."""
-
     models = [
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
