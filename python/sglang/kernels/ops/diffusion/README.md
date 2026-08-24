@@ -21,7 +21,7 @@ free to move; the facade is not. `test_import_surface.py` enforces this, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
-(Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager
+(Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager
 re-export would make all of them import-time requirements everywhere.
 
 ## Layout
@@ -104,7 +104,7 @@ Several norms look interchangeable and are not. Start here.
 |---|---|---|---|
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
-| `wan_rmsnorm_silu` | Triton | close | `channels_last_3d` 5D, Wan VAE channel-first RMSNorm + SiLU |
+| `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
@@ -114,9 +114,10 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
-| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact |
+| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `ltx2_qknorm_split_rope_cuda` | JIT CUDA | close; **validated on B200** |
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |

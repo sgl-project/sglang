@@ -99,25 +99,29 @@ def _server_args_for_transformer_component(
     server_args: ServerArgs, component_name: str
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
+    component_weights_path = server_args.component_weights_paths.get(component_name)
+    component_quantization = server_args.component_quantizations.get(component_name)
+    if component_weights_path is not None or component_quantization is not None:
+        component_server_args = copy.copy(server_args)
+        if component_weights_path is not None:
+            component_server_args.transformer_weights_path = component_weights_path
+            component_server_args.nunchaku_config = None
+            logger.info(
+                "Using transformer_weights_path override for %s: %s",
+                component_name,
+                component_weights_path,
+            )
+        if component_quantization is not None:
+            component_server_args.quantization = component_quantization
+            logger.info(
+                "Using quantization override %s for %s",
+                component_quantization,
+                component_name,
+            )
+        return component_server_args
+
     if component_name not in ("transformer_2", "unconditional_transformer"):
         return server_args
-
-    # Some pipelines have secondary DiT components with their own quantized
-    # weight file. Keep the mapping model-owned and the loader generic.
-    component_weights_paths = getattr(
-        server_args, "component_transformer_weights_paths", {}
-    )
-    component_weights_path = component_weights_paths.get(component_name)
-    if component_weights_path is not None:
-        component_server_args = copy.copy(server_args)
-        component_server_args.transformer_weights_path = component_weights_path
-        component_server_args.nunchaku_config = None
-        logger.info(
-            "Using transformer_weights_path override for %s: %s",
-            component_name,
-            component_weights_path,
-        )
-        return component_server_args
 
     if (
         server_args.transformer_weights_path is None
@@ -140,6 +144,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     allow_global_attention_backend_fallback = False
+    supports_online_quantization_override = True
 
     component_names = [
         "transformer",
@@ -152,8 +157,11 @@ class TransformerLoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
-            server_args, component_name
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
         ):
             logger.info(
                 "Loading %s on CPU first for MPS layerwise offload", component_name
@@ -221,9 +229,14 @@ class TransformerLoader(ComponentLoader):
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+        is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
+        if is_minimax_h3:
+            dit_config.arch_config.checkpoint_uses_diffusers_layout = (
+                cls_name != model_cls.__name__
+            )
 
         checkpoint_quant_config = None
-        if cls_name == "MiniMaxH3DiTModel":
+        if is_minimax_h3:
             selected_variant = str(component_server_args.model_variant or "fl2va")
             if gguf_file is not None:
                 validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
@@ -262,7 +275,7 @@ class TransformerLoader(ComponentLoader):
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
         )
-        if quant_spec.gguf_file is not None and cls_name == "MiniMaxH3DiTModel":
+        if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
             curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")
             if curve is not None:
@@ -282,10 +295,19 @@ class TransformerLoader(ComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
-        if quant_spec.is_comfy_fp8 and use_fsdp:
+        if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
-                "MiniMax-H3 Comfy FP8 does not support FSDP inference; use TP "
-                "and/or sequence parallelism instead"
+                "Comfy quantized checkpoints do not support FSDP "
+                "inference; use TP and/or sequence parallelism instead"
+            )
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name() == "auto-round"
+        ):
+            raise ValueError(
+                "AutoRound checkpoints do not support diffusion FSDP inference; "
+                "use TP and/or sequence parallelism instead"
             )
 
         if quant_spec.gguf_file is not None:
@@ -310,11 +332,11 @@ class TransformerLoader(ComponentLoader):
             "quant_config": quant_spec.runtime_quant_config,
         }
         checkpoint_key_filter: Callable[[str], bool] | None = (
-            comfy_quant_key_filter if quant_spec.is_comfy_fp8 else None
+            comfy_quant_key_filter if quant_spec.uses_comfy_layer_markers else None
         )
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:
-            if cls_name != "MiniMaxH3DiTModel":
+            if not is_minimax_h3:
                 raise ValueError(
                     "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
                 )
@@ -328,7 +350,7 @@ class TransformerLoader(ComponentLoader):
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if component_server_args.minimax_h3_adaln_online:
-            if cls_name != "MiniMaxH3DiTModel":
+            if not is_minimax_h3:
                 raise ValueError(
                     "--minimax-h3-adaln-online is only supported by MiniMax H3"
                 )
@@ -345,16 +367,16 @@ class TransformerLoader(ComponentLoader):
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
-        if (
-            init_params["quant_config"] is None
-            and component_server_args.transformer_weights_path is not None
-        ):
+        runtime_quant_config = init_params["quant_config"]
+        if runtime_quant_config is not None:
+            logger.debug(
+                "Runtime quantization: %s", type(runtime_quant_config).__name__
+            )
+        elif component_server_args.transformer_weights_path is not None:
             logger.info(
                 "Using an unquantized transformer weight override from %s",
                 component_server_args.transformer_weights_path,
             )
-        else:
-            logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
         checkpoint_load_device = (
@@ -364,7 +386,11 @@ class TransformerLoader(ComponentLoader):
                 local_torch_device,
                 component_starts_on_cpu=component_starts_on_cpu,
                 runtime_quant_config=quant_spec.runtime_quant_config,
-                quantized_cpu_load_supported=quant_spec.gguf_file is not None,
+                quantized_cpu_load_supported=(
+                    quant_spec.gguf_file is not None
+                    or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_serialized_kitchen_w4a8
+                ),
             )
         )
         direct_gpu_weight_loading = bool(

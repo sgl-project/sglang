@@ -261,13 +261,14 @@ class SchedulerPoolStatsObserver:
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
-            full_available_size + full_evictable_size
+        full_capacity = self.req_to_token_pool.schedulable_token_capacity(
+            self.token_to_kv_pool_allocator.size
         )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
             mamba_available_size + mamba_evictable_size
         )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
+        full_token_usage = full_num_used / full_capacity
         mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
 
         return PoolStats(
