@@ -608,7 +608,7 @@ class TextEncoderLoader(ComponentLoader):
 
     def _get_all_weights(
         self,
-        model: TextEncoder,
+        model: EncoderTensorParallelMixin,
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:

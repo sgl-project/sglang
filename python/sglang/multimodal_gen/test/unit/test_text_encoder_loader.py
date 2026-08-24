@@ -31,7 +31,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
     _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+    TextEncoder,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
@@ -124,6 +127,13 @@ class TestTextEncoderClassResolution(unittest.TestCase):
 
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
+
+    def test_tensor_parallel_encoder_keeps_checkpoint_weights_by_default(self):
+        self.assertTrue(
+            EncoderTensorParallelMixin.should_materialize_checkpoint_weight(
+                "model.layers.0.self_attn.q_proj.weight"
+            )
+        )
 
     def test_bitsandbytes_native_load_requires_resident_encoder(self):
         loaded_encoder = nn.Linear(1, 1)
