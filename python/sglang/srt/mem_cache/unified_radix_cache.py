@@ -1748,7 +1748,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
-            self._revoke_pending_prefetch(req_id)
+            self.revoke_pending_prefetch(req_id)
         else:
             self._handle_prefetch_result(operation)
         return True
