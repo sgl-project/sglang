@@ -36,7 +36,7 @@
     {
       "type": "stat",
       "title": "Request rate",
-      "description": "Chat-completions dispatched to workers per second.",
+      "description": "Non-infra requests answered at the edge, per second — every route, and including requests rejected before a worker was chosen. Edge intake vs dispatched separates those two populations.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -89,7 +89,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum(rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -100,7 +100,7 @@
     {
       "type": "stat",
       "title": "Error ratio",
-      "description": "Share of dispatches whose outcome=error.",
+      "description": "Share of non-infra edge requests whose outcome is error. Requests rejected before routing (404s, body-limit, backpressure) count here, so this is an edge error ratio rather than a worker one.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -161,7 +161,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "100 * sum(rate(sgl_router_worker_requests_total{outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
+          "expr": "100 * sum(rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",outcome=\"error\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])) / clamp_min(sum(rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -233,7 +233,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -244,7 +244,7 @@
     {
       "type": "stat",
       "title": "Healthy workers",
-      "description": "Workers whose circuit breaker currently admits requests.",
+      "description": "Distinct workers whose circuit breaker admits requests. Every router replica exports the whole worker set with its own breaker state, so this takes the per-worker maximum first — a plain sum would report the fleet once per replica. A worker counts as healthy if any replica admits it; Worker health breaks the disagreement out per replica.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -301,7 +301,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(sgl_router_worker_health)",
+          "expr": "sum(max by (worker_url) (sgl_router_worker_health{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}))",
           "range": true,
           "refId": "A",
           "legendFormat": "__auto",
@@ -407,7 +407,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
@@ -500,7 +500,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (mode) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (mode) (rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{mode}}",
@@ -510,8 +510,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Responses by HTTP status",
-      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel).",
+      "title": "Request rate by cluster / namespace",
+      "description": "How the selected endpoint's traffic splits across the deployments serving it. Every other panel on this board is a rollup over that split; this is where an uneven or shifting split becomes visible without changing the variables.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -522,7 +522,7 @@
         "w": 12,
         "h": 8
       },
-      "id": 9,
+      "id": 62,
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
@@ -554,7 +554,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -593,10 +593,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (status_code) (rate(sgl_router_responses_total[$__rate_interval]))",
+          "expr": "sum by (cluster, namespace) (rate(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{status_code}}",
+          "legendFormat": "{{cluster}} / {{namespace}}",
           "format": "time_series"
         }
       ]
@@ -604,7 +604,7 @@
     {
       "type": "timeseries",
       "title": "Request rate by worker",
-      "description": "Per-worker dispatch rate \u2014 reveals routing imbalance.",
+      "description": "Per-worker dispatch rate — reveals routing imbalance. Restricted to a non-empty worker_url so requests that never reached a worker do not appear here as an unlabelled series.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -686,10 +686,675 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (worker_url) (rate(sgl_router_worker_requests_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (worker_url) (rate(sgl_router_worker_requests_total{worker_url!=\"\",serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Responses by HTTP status",
+      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel). Kubelet and scrape probes are excluded — the counter covers every route, and on a quiet deployment they are otherwise the only traffic shown.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "id": 9,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status_code) (rate(sgl_router_responses_total{route!~\"/metrics|/readyz|/healthz\",serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{status_code}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Response rate by route",
+      "description": "Response rate per HTTP route, excluding the health and discovery polling that would otherwise dominate every other route.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "id": 32,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (route) (rate(sgl_router_responses_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",route!~\"/metrics|/readyz|/healthz|/v1/models\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{route}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Response code distribution",
+      "description": "Responses per status code as counts rather than a rate, stacked, so a short burst of one code stays legible next to steady-state traffic. Excludes probe routes, as above.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "id": 60,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status_code) (increase(sgl_router_responses_total{route!~\"/metrics|/readyz|/healthz\",serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{status_code}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Admission & Backpressure",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 1
+      },
+      "id": 61,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Edge intake vs dispatched",
+      "description": "Chat-completions received at the HTTP edge against those that reached a worker. The gap is everything dropped before dispatch — backpressure rejections, early 4xx, client cancellations — which no per-worker panel can show. Dispatches are identified by a non-empty worker_url: the counter is written for every non-infra request and records an empty worker_url when nothing was dispatched. Deliberately unfiltered by model and worker, which are unknown at intake.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 6,
+        "h": 8
+      },
+      "id": 63,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sgl_router_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",route=\"/v1/chat/completions\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "intake (edge)",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(sgl_router_worker_requests_total{worker_url!=\"\",serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "dispatched to a worker",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queued requests by replica",
+      "description": "Requests parked in the admission queue, per router replica. Sustained depth on one replica alone is a routing imbalance, not engine slowness.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 31,
+        "w": 6,
+        "h": 8
+      },
+      "id": 30,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sgl_router_queued_requests{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission wait quantiles",
+      "description": "Time spent parked in the admission queue before dispatch, among the requests that parked at all. Requests admitted straight through contribute no sample and do not pull the quantiles down, and requests that parked and were then shed contribute none either — so read this beside Queued requests, not as typical request delay. Whatever shows here is already lost to TTFT.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 31,
+        "w": 6,
+        "h": 8
+      },
+      "id": 33,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_admission_wait_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p50",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_admission_wait_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p90",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_admission_wait_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "C",
+          "legendFormat": "p99",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backpressure rejections",
+      "description": "Requests shed at admission because the queue was full, by model. These never reach a worker, so they are invisible to every per-worker panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 31,
+        "w": 6,
+        "h": 8
+      },
+      "id": 34,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_backpressure_rejected_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}}",
           "format": "time_series"
         }
       ]
@@ -700,7 +1365,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 22,
+        "y": 39,
         "w": 24,
         "h": 1
       },
@@ -717,7 +1382,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 23,
+        "y": 40,
         "w": 8,
         "h": 8
       },
@@ -792,7 +1457,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p50",
@@ -804,7 +1469,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p90",
@@ -816,7 +1481,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_request_duration_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "C",
           "legendFormat": "p99",
@@ -834,7 +1499,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 23,
+        "y": 40,
         "w": 8,
         "h": 8
       },
@@ -909,7 +1574,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_ttft_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_ttft_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p50",
@@ -921,7 +1586,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_ttft_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_ttft_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p90",
@@ -933,7 +1598,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_ttft_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_ttft_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "C",
           "legendFormat": "p99",
@@ -951,7 +1616,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 23,
+        "y": 40,
         "w": 8,
         "h": 8
       },
@@ -995,7 +1660,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (le) (rate(sgl_router_request_duration_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "expr": "sum by (le) (rate(sgl_router_request_duration_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))",
           "format": "heatmap",
           "legendFormat": "{{le}}",
           "range": true,
@@ -1013,7 +1678,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 31,
+        "y": 48,
         "w": 8,
         "h": 8
       },
@@ -1088,7 +1753,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_itl_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p50",
@@ -1100,7 +1765,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sgl_router_itl_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p90",
@@ -1112,7 +1777,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_itl_seconds_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_itl_seconds_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "C",
           "legendFormat": "p99",
@@ -1123,14 +1788,14 @@
     {
       "type": "timeseries",
       "title": "Stream outcomes (end-of-stream truth)",
-      "description": "End-of-stream classification for 2xx streaming responses: ok / inband_error / upstream_error / client_disconnect. inband_error is an engine that committed 200 OK then failed in-band \u2014 invisible to every headers-time metric.",
+      "description": "End-of-stream classification for 2xx streaming responses: ok / inband_error / upstream_error / client_disconnect. inband_error is an engine that committed 200 OK then failed in-band — invisible to every headers-time metric.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "x": 8,
-        "y": 31,
+        "y": 48,
         "w": 8,
         "h": 8
       },
@@ -1205,10 +1870,75 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_stream_outcome_total{model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_stream_outcome_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",worker_url=~\"$worker_url\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT overhead share (router-attributable)",
+      "description": "Share of time-to-first-token the router itself accounts for (tokenize + admission wait + request build); the rest is engine prefill. Above 100% does not mean the router took longer than the whole request — the overhead histogram also samples 2xx streams that returned headers but no first token, which contribute no TTFT, so an excursion above 1 counts first-byteless streams rather than router slowness. Read a rising share below 1 as the router becoming the bottleneck; read a jump past 1 as streams dying before their first token.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "id": 35,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_ttft_overhead_seconds_sum{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_ttft_seconds_sum{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}}",
           "format": "time_series"
         }
       ]
@@ -1219,7 +1949,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 39,
+        "y": 56,
         "w": 24,
         "h": 1
       },
@@ -1236,7 +1966,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 57,
         "w": 6,
         "h": 8
       },
@@ -1311,7 +2041,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_workers",
+          "expr": "sgl_router_workers{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{mode}}",
@@ -1329,7 +2059,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 40,
+        "y": 57,
         "w": 6,
         "h": 8
       },
@@ -1404,7 +2134,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_worker_health{worker_url=~\"$worker_url\"}",
+          "expr": "sgl_router_worker_health{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",worker_url=~\"$worker_url\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1422,7 +2152,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 40,
+        "y": 57,
         "w": 6,
         "h": 8
       },
@@ -1515,7 +2245,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_worker_cb_state{worker_url=~\"$worker_url\"}",
+          "expr": "sgl_router_worker_cb_state{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",worker_url=~\"$worker_url\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1533,7 +2263,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 40,
+        "y": 57,
         "w": 6,
         "h": 8
       },
@@ -1608,7 +2338,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_worker_inflight_requests{worker_url=~\"$worker_url\"}",
+          "expr": "sgl_router_worker_inflight_requests{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",worker_url=~\"$worker_url\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1622,7 +2352,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 65,
         "w": 24,
         "h": 1
       },
@@ -1631,7 +2361,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Active load \u2014 prefill tokens",
+      "title": "Active load — prefill tokens",
       "description": "Per-worker prefill-token load tracked by the active-load policy.",
       "datasource": {
         "type": "prometheus",
@@ -1639,7 +2369,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1714,7 +2444,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_active_load{kind=\"prefill_tokens\",worker_url=~\"$worker_url\"}",
+          "expr": "sgl_router_active_load{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",kind=\"prefill_tokens\",worker_url=~\"$worker_url\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1724,7 +2454,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Active load \u2014 decode blocks",
+      "title": "Active load — decode blocks",
       "description": "Per-worker decode-block load tracked by the active-load policy.",
       "datasource": {
         "type": "prometheus",
@@ -1732,7 +2462,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 49,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1807,7 +2537,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_active_load{kind=\"decode_blocks\",worker_url=~\"$worker_url\"}",
+          "expr": "sgl_router_active_load{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",kind=\"decode_blocks\",worker_url=~\"$worker_url\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
@@ -1825,7 +2555,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 49,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -1900,7 +2630,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sgl_router_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p50",
@@ -1912,7 +2642,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sgl_router_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p99",
@@ -1930,7 +2660,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 74,
         "w": 12,
         "h": 8
       },
@@ -1977,7 +2707,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (model_id) (rate(sgl_router_overlap_blocks_sum{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "A",
           "legendFormat": "{{model_id}} match (ceiling)",
@@ -1989,7 +2719,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (model_id) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (model_id) (rate(sgl_router_selected_overlap_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "S",
           "legendFormat": "{{model_id}} selected (vs engine)",
@@ -2001,57 +2731,11 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "(sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "B",
           "legendFormat": "{{model_id}} lookup coverage",
           "format": "time_series"
-        }
-      ]
-    },
-    {
-      "id": 54,
-      "type": "timeseries",
-      "title": "Queue gate: prefix given up vs prefix available (p50 blocks)",
-      "description": "The queue gate is a binary test on num_waiting_reqs and ignores how much cached prefix a request would lose, so these two curves are how you tell whether that simplification is costing anything. Blue is the overlap of every cache-aware selection; orange is the overlap of just the ones the gate sent elsewhere (cache_worker_queued). Tracking together means the gate diverts a representative sample and the simple test is fine. Orange sitting materially above blue means it is trading large cached prefixes to dodge short queues \u2014 the signal to weigh forgone prefill against expected wait instead of thresholding on the queue alone, not to retune --worker-queue-limit.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 65
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 0
-          }
-        },
-        "overrides": []
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
-          "legendFormat": "all selections \u2014 {{model_id}}",
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        },
-        {
-          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_diverted_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
-          "legendFormat": "diverted by gate \u2014 {{model_id}}",
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
         }
       ]
     },
@@ -2065,7 +2749,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 57,
+        "y": 74,
         "w": 12,
         "h": 8
       },
@@ -2116,7 +2800,118 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "expr": "sum by (decision) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{decision}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Queue gate: prefix given up vs prefix available (p50 blocks)",
+      "description": "The queue gate is a binary test on num_waiting_reqs and ignores how much cached prefix a request would lose, so these two curves are how you tell whether that simplification is costing anything. Blue is the overlap of every cache-aware selection; orange is the overlap of just the ones the gate sent elsewhere (cache_worker_queued). Tracking together means the gate diverts a representative sample and the simple test is fine. Orange sitting materially above blue means it is trading large cached prefixes to dodge short queues — the signal to weigh forgone prefill against expected wait instead of thresholding on the queue alone, not to retune --worker-queue-limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 82,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
+          "legendFormat": "all selections — {{model_id}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_diverted_overlap_blocks_bucket{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])))",
+          "legendFormat": "diverted by gate — {{model_id}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Locality loss by decision",
+      "description": "Blocks the best-matching worker held minus the blocks the worker actually selected held, over query blocks — the prefix locality each routing decision gave up. Zero means the decision cost nothing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 82,
+        "w": 12,
+        "h": 8
+      },
+      "id": 58,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum by (decision) (rate(sgl_router_matched_overlap_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) - sum by (decision) (rate(sgl_router_selected_overlap_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))) / scalar(sum(rate(sgl_router_cache_aware_query_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "A",
           "legendFormat": "{{decision}}",
@@ -2134,7 +2929,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 90,
         "w": 6,
         "h": 8
       },
@@ -2174,7 +2969,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (instance, model_id) (rate(sgl_router_overlap_blocks_sum{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "A",
           "legendFormat": "{{instance}} {{model_id}} match (ceiling)",
@@ -2186,7 +2981,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, model_id) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "sum by (instance, model_id) (rate(sgl_router_selected_overlap_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "S",
           "legendFormat": "{{instance}} {{model_id}} selected (vs engine)",
@@ -2198,7 +2993,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "(sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "B",
           "legendFormat": "{{instance}} {{model_id}} lookup coverage",
@@ -2209,14 +3004,14 @@
     {
       "type": "timeseries",
       "title": "Cache-aware policy evaluations by replica",
-      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; cache_worker_queued means every worker holding the prefix was over --worker-queue-limit and the request went elsewhere; cache_hit_all_queued means EVERY worker in the fleet was over it \u2014 the pick goes among queueing workers and under sampled min-load picks usually does NOT land on the cache home (saturation signal, not locality \u2014 alert on it); matched_workers_ineligible means the owners were not candidates at all (wrong pool, unhealthy, breaker open, or already at the router admission cap); hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
+      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; cache_worker_queued means every worker holding the prefix was over --worker-queue-limit and the request went elsewhere; cache_hit_all_queued means EVERY worker in the fleet was over it — the pick goes among queueing workers and under sampled min-load picks usually does NOT land on the cache home (saturation signal, not locality — alert on it); matched_workers_ineligible means the owners were not candidates at all (wrong pool, unhealthy, breaker open, or already at the router admission cap); hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "x": 6,
-        "y": 65,
+        "y": 90,
         "w": 6,
         "h": 8
       },
@@ -2267,7 +3062,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "expr": "sum by (instance, decision) (rate(sgl_router_cache_aware_decisions_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\",model_id=~\"$model_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{instance}} {{decision}}",
@@ -2285,7 +3080,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 65,
+        "y": 90,
         "w": 6,
         "h": 8
       },
@@ -2324,7 +3119,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_kv_tree_nodes",
+          "expr": "sgl_router_kv_tree_nodes{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{instance}}",
@@ -2342,7 +3137,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 65,
+        "y": 90,
         "w": 6,
         "h": 8
       },
@@ -2396,10 +3191,326 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sgl_router_kv_bootstrap_settled",
+          "expr": "sgl_router_kv_bootstrap_settled{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
           "range": true,
           "refId": "A",
           "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV fleet bimodal by replica",
+      "description": "1 while the fleet carries both KV-block hashing modes, so every selection dual-hashes. Expected across a rolling update; a stuck 1 means some worker never finished the switch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 98,
+        "w": 6,
+        "h": 8
+      },
+      "id": 59,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sgl_router_kv_fleet_bimodal{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV bootstrap peers by replica",
+      "description": "Sibling router replicas visible to peer bootstrap. Zero on a fresh replica means it must rebuild its tree from live events alone.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 98,
+        "w": 6,
+        "h": 8
+      },
+      "id": 57,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sgl_router_kv_peers{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV bootstrap rank outcomes",
+      "description": "Engine ranks by final bootstrap verdict. Counts ranks, not fetches — one accepted fetch can settle several ranks.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 98,
+        "w": 6,
+        "h": 8
+      },
+      "id": 55,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(sgl_router_kv_bootstrap_rank_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV peer snapshot fetch outcomes",
+      "description": "Peer snapshot fetches by outcome. Counts fetches, not ranks — a rank can outlive many rejected fetches.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 98,
+        "w": 6,
+        "h": 8
+      },
+      "id": 56,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(sgl_router_kv_peer_snapshot_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}",
           "format": "time_series"
         }
       ]
@@ -2410,7 +3521,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 73,
+        "y": 106,
         "w": 24,
         "h": 1
       },
@@ -2427,7 +3538,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 107,
         "w": 8,
         "h": 8
       },
@@ -2502,7 +3613,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_sticky_total[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_sticky_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
@@ -2520,7 +3631,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 74,
+        "y": 107,
         "w": 8,
         "h": 8
       },
@@ -2595,7 +3706,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_decode_affinity_total[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(sgl_router_decode_affinity_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
@@ -2613,7 +3724,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 74,
+        "y": 107,
         "w": 8,
         "h": 8
       },
@@ -2688,7 +3799,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(sgl_router_stale_requests_total[$__rate_interval]))",
+          "expr": "sum(rate(sgl_router_stale_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "expired",
@@ -2729,16 +3840,17 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_worker_requests_total, model_id)",
+        "definition": "label_values(sgl_router_requests_total, serving_endpoint)",
+        "description": "Serving endpoint the router pods answer for. Empty unless the scrape config maps a serving-endpoint pod label onto the series.",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
-        "label": "model_id",
+        "label": "endpoint (slug)",
         "multi": true,
-        "name": "model_id",
+        "name": "endpoint",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_worker_requests_total, model_id)",
+          "query": "label_values(sgl_router_requests_total, serving_endpoint)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2755,7 +3867,89 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(sgl_router_worker_requests_total, worker_url)",
+        "definition": "label_values(sgl_router_requests_total{serving_endpoint=~\"$endpoint\"}, cluster)",
+        "description": "Clusters the selected endpoint is served from.",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "cluster",
+        "multi": true,
+        "name": "cluster",
+        "options": [],
+        "query": {
+          "query": "label_values(sgl_router_requests_total{serving_endpoint=~\"$endpoint\"}, cluster)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(sgl_router_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\"}, namespace)",
+        "description": "Namespaces serving the selected endpoint in the selected clusters — one per deployment. Pick one to read a single deployment on its own.",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {
+          "query": "label_values(sgl_router_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\"}, namespace)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}, model_id)",
+        "description": "Models served within the selected scope.",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "model_id",
+        "multi": true,
+        "name": "model_id",
+        "options": [],
+        "query": {
+          "query": "label_values(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}, model_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}, worker_url)",
+        "description": "Workers registered within the selected scope.",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -2764,7 +3958,7 @@
         "name": "worker_url",
         "options": [],
         "query": {
-          "query": "label_values(sgl_router_worker_requests_total, worker_url)",
+          "query": "label_values(sgl_router_worker_requests_total{serving_endpoint=~\"$endpoint\",cluster=~\"$cluster\",namespace=~\"$namespace\"}, worker_url)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
