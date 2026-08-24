@@ -48,6 +48,15 @@ The `quality` field in a **video response** body is unrelated. It is Sora-compat
 
 `quality` participates in the dynamic-batch signature, so mixed-quality traffic is batched separately and the transition happens safely at a batch boundary. Mounting is all-or-nothing: if any marked site on a transformer fails its static guards, no site on that transformer is fused.
 
+<Warning>
+Do not combine request-gated DiT fusions with `--enable-breakable-cuda-graph`.
+BCG warmup captures the lossless module branches before a high-quality request
+mounts its DiT fusions, so replay would bypass the requested kernels. SGLang
+rejects this combination for models with eligible DiT quality sites. Models
+whose high-quality path changes only VAE decode remain allowed because BCG
+captures the DiT only.
+</Warning>
+
 These fusion families mount under `quality="high"`:
 
 | Fusion | What it folds |
