@@ -20,7 +20,7 @@ ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v26.1.0-
 ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.1.0-pytorch2.10.0/torch_npu-2.10.0.post4-cp312-cp312-manylinux_2_28_x86_64.whl"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
-ARG SGLANG_KERNEL_NPU_TAG=20260821
+ARG SGLANG_KERNEL_NPU_TAG=2026.08.21
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
 
