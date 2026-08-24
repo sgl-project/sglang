@@ -190,7 +190,14 @@ if _is_cuda:
     )
 
 if _is_cpu:
-    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
+        _fused_sigmoid_mul_cpu(x, gate)
+        return x
+
     fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
     fused_qk_gemma_rmsnorm_with_gate = (
         torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
@@ -338,6 +345,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)
                 and use_intel_amx_backend(self.in_proj_ba)
+                and (
+                    self.in_proj_qkvz.weight.size(0) % 32 == 0
+                    and self.in_proj_ba.weight.size(0) % 32 == 0
+                )
             )
         )
 
@@ -1293,6 +1304,9 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.k_proj.k_scale": ".attn.k_scale",
         ".self_attn.v_proj.v_scale": ".attn.v_scale",
+        # compressed-tensors stores kv_cache_scheme scales on the attention module.
+        ".self_attn.k_scale": ".attn.k_scale",
+        ".self_attn.v_scale": ".attn.v_scale",
     },
 )
 
