@@ -31,6 +31,19 @@ typedef enum { FULL_MASK = 0, QLEN_ONLY = 1, QLEN_ONLY_BITPACKING = 2 } TreeMask
 // tree_mask [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] =
 // [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token] positions [bs * draft_token] retrive_index [b,
 // draft_token] retrive_next_token [b, draft_token] retrive_next_sibling [b, draft_token]
+// selected_index holds draft_token_num - 1 entries per request. Searching any further reads the
+// next request's row, or past the tensor for the last request. Mirrors find_parent_node in
+// csrc/cpu/spec.cpp, which returns -1 for a token that was not selected.
+__device__ __forceinline__ int find_selected_position(
+    const int64_t* selected_index, int sel_off, int sel_stride, int64_t token_idx) {
+  for (int p = 0; p < sel_stride; ++p) {
+    if (selected_index[sel_off + p] == token_idx) {
+      return p;
+    }
+  }
+  return -1;
+}
+
 __global__ void build_tree_efficient(
     int64_t* parent_list,
     int64_t* selected_index,
@@ -78,18 +91,15 @@ __global__ void build_tree_efficient(
       int parent_position = 0;
       if (parent_tb_idx > 0) {
         int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-        for (; parent_position < draft_token_num; ++parent_position) {
-          if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
-            ++parent_position;
-            break;
-          }
+        const int found = find_selected_position(
+            selected_index, bid * (draft_token_num - 1), draft_token_num - 1, parent_token_idx);
+        if (found < 0) {
+          printf(
+              "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
+              "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
+          continue;
         }
-      }
-      if (parent_position == draft_token_num) {
-        printf(
-            "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
-            "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
-        continue;
+        parent_position = found + 1;
       }
 
       if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
@@ -113,14 +123,8 @@ __global__ void build_tree_efficient(
       }
 
       int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      // selected_index has draft_token_num - 1 entries per request
-      int found = -1;
-      for (int p = 0; p < draft_token_num - 1; ++p) {
-        if (selected_index[bid * (draft_token_num - 1) + p] == token_idx) {
-          found = p;
-          break;
-        }
-      }
+      const int found = find_selected_position(
+          selected_index, bid * (draft_token_num - 1), draft_token_num - 1, token_idx);
       if (found < 0) {
         printf(
             "WARNING: invalid eagle tree!!! Detected a token whose ancestor was not selected. "
@@ -176,18 +180,15 @@ __global__ void build_tree_efficient_partial_packed(
       int parent_position = 0;
       if (parent_tb_idx > 0) {
         int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-        for (; parent_position < draft_token_num; ++parent_position) {
-          if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
-            ++parent_position;
-            break;
-          }
+        const int found = find_selected_position(
+            selected_index, bid * (draft_token_num - 1), draft_token_num - 1, parent_token_idx);
+        if (found < 0) {
+          printf(
+              "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
+              "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
+          continue;
         }
-      }
-      if (parent_position == draft_token_num) {
-        printf(
-            "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
-            "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
-        continue;
+        parent_position = found + 1;
       }
 
       if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
@@ -201,7 +202,8 @@ __global__ void build_tree_efficient_partial_packed(
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
     int cur_position = tid - 1;
-    while (true) {
+    // a malformed tree can loop back on itself and never reach the root
+    while (position < depth) {
       position += 1;
       int byte_idx = (cur_position + 1) / 8;
       int bit_idx = (cur_position + 1) % 8;
@@ -212,11 +214,15 @@ __global__ void build_tree_efficient_partial_packed(
       }
 
       int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
-        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
-          break;
-        }
+      const int found = find_selected_position(
+          selected_index, bid * (draft_token_num - 1), draft_token_num - 1, token_idx);
+      if (found < 0) {
+        printf(
+            "WARNING: invalid eagle tree!!! Detected a token whose ancestor was not selected. "
+            "Please check if the logprob has nan. The walk stops here to keep proceeding.\n");
+        break;
       }
+      cur_position = found;
     }
     positions[bid * draft_token_num + tid] = position + seq_len;
   }
