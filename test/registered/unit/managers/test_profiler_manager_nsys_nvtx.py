@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -169,7 +171,7 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
         stop_profile.assert_not_called()
 
         manager._profile_batch_predicate(
-            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+            SimpleNamespace(reqs=[object()] * 32, forward_mode=decode_mode)
         )
         assert manager.nsys_exact_decode_batches_seen == 2
         stop_profile.assert_not_called()
@@ -181,3 +183,21 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
     start_profile.assert_called_once_with()
     stop_profile.assert_called_once_with()
     assert barrier.call_count == 2
+
+
+def test_nsys_exact_capture_fails_closed_if_batch_shape_changes():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    with patch.dict(
+        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+    manager.profile_in_progress = True
+
+    with pytest.raises(RuntimeError, match="expected 32, got 31"):
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+        )

@@ -90,6 +90,11 @@ class SchedulerProfilerManager:
         )
         if self.nsys_exact_decode_batches <= 0:
             raise ValueError("SGLANG_NSYS_EXACT_DECODE_BATCHES must be positive")
+        self.nsys_exact_warmup_batches = int(
+            os.getenv("SGLANG_NSYS_EXACT_WARMUP_BATCHES", "1") or "1"
+        )
+        if self.nsys_exact_warmup_batches <= 0:
+            raise ValueError("SGLANG_NSYS_EXACT_WARMUP_BATCHES must be positive")
         expected_sync_world_size = int(
             os.getenv("SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE", "0") or "0"
         )
@@ -107,6 +112,7 @@ class SchedulerProfilerManager:
                 actual_sync_world_size,
             )
         self.nsys_exact_decode_batches_seen = 0
+        self.nsys_exact_warmup_batches_seen = 0
 
         # For ROCM
         self.rpd_profiler = None
@@ -161,6 +167,7 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.nsys_exact_warmup_batches_seen = 0
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -500,8 +507,21 @@ class SchedulerProfilerManager:
                     not self.nsys_exact_batch
                     or len(batch.reqs) == self.nsys_exact_batch
                 )
-                exact_worker_ready = start_reached and batch_matches
                 if self.nsys_exact_batch:
+                    local_exact_batch = (
+                        start_reached
+                        and batch_matches
+                        and batch.forward_mode.is_decode()
+                    )
+                    if local_exact_batch:
+                        self.nsys_exact_warmup_batches_seen += 1
+                    else:
+                        self.nsys_exact_warmup_batches_seen = 0
+                    exact_worker_ready = (
+                        local_exact_batch
+                        and self.nsys_exact_warmup_batches_seen
+                        >= self.nsys_exact_warmup_batches
+                    )
                     # The control request is broadcast to every rank.  Poll a
                     # worker-wide readiness bit before capture so an early DP
                     # rank cannot start a report while another rank is still
@@ -517,6 +537,8 @@ class SchedulerProfilerManager:
                         group=self.exact_nsys_cpu_group,
                     )
                     exact_worker_ready = bool(ready.item())
+                else:
+                    exact_worker_ready = start_reached
                 if exact_worker_ready:
                     if self.nsys_exact_batch and self.profiler_target_forward_ct:
                         capture_width = (
@@ -526,9 +548,10 @@ class SchedulerProfilerManager:
                         self.profiler_target_forward_ct = forward_ct + capture_width
                         logger.info(
                             "All-DP exact running-batch Nsight gate matched: "
-                            "batch=%d forward_ct=%d",
+                            "batch=%d forward_ct=%d warmup_batches=%d",
                             self.nsys_exact_batch,
                             forward_ct,
+                            self.nsys_exact_warmup_batches_seen,
                         )
                     self._start_profile()
             if (
@@ -536,6 +559,11 @@ class SchedulerProfilerManager:
                 and self.profile_in_progress
                 and batch.forward_mode.is_decode()
             ):
+                if len(batch.reqs) != self.nsys_exact_batch:
+                    raise RuntimeError(
+                        "Exact-batch Nsight capture lost its fixed shape: "
+                        f"expected {self.nsys_exact_batch}, got {len(batch.reqs)}"
+                    )
                 self.nsys_exact_decode_batches_seen += 1
 
     def _profile(self, recv_req: ProfileReq):
