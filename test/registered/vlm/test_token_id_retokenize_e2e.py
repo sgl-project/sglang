@@ -27,7 +27,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,6 +36,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=123, suite="base-c-test-cpu")
 
 
 def _data_uri():
