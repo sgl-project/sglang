@@ -146,37 +146,13 @@ _PASSED = frozenset({"model_path", "device", "random_seed"})
 #       the auto-parser detection is late resolution: it runs in the launcher's
 #       validation stage, decides these fields and writes them *in place*,
 #       before the publish that would give it a bag.
+# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# its process publishes -- and cannot use `resolving_view` either. The launcher's
+# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
+# late-resolution detection it calls all read the declarations now, so nothing
+# qualifies. A new entry needs that kind of reason next to it.
 _EXPOSED = {
     ("disaggregation/encoder/server.py", "model_loader_extra_config"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "disable_shared_experts_fusion"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("entrypoints/engine.py", "enable_symm_mem"),
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("weight_cache/daemon.py", "attn_cp_size"),
-    ("weight_cache/daemon.py", "deepep_mode"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "enable_dp_attention"),
-    ("weight_cache/daemon.py", "enable_dp_lm_head"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_loader_extra_config"),
-    ("weight_cache/daemon.py", "model_path"),
-    ("weight_cache/daemon.py", "moe_a2a_backend"),
-    ("weight_cache/daemon.py", "moe_dense_tp_size"),
-    ("weight_cache/daemon.py", "moe_dp_size"),
-    ("weight_cache/daemon.py", "pp_size"),
-    ("weight_cache/daemon.py", "quantization"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -190,20 +166,7 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
-_OVERRIDDEN_AND_READ = {
-    ("entrypoints/engine.py", "reasoning_parser"),
-    ("entrypoints/engine.py", "tool_call_parser"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_path"),
-    ("weight_cache/daemon.py", "dp_size"),
-    ("weight_cache/daemon.py", "dtype"),
-    ("weight_cache/daemon.py", "ep_size"),
-    ("weight_cache/daemon.py", "load_format"),
-    ("weight_cache/daemon.py", "model_path"),
-}
+_OVERRIDDEN_AND_READ: frozenset = frozenset()
 
 
 def _expanded_override_keys(rel, tree, call, kw) -> set:

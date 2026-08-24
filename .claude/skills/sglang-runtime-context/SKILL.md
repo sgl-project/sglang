@@ -411,7 +411,8 @@ probes, swappable ACTIVE values. Not for config mirrors (read the bag leaf inste
 
 - Groups are typed dataclasses on `Flags` (`capture` / `moe` / `dp`): typo-safe writes,
   transactional test-only `override(**kw)` context manager.
-- `flags.moe` is materialized by `initialize_moe_config(server_args)` at scheduler init;
+- `flags.moe` is materialized by `initialize_moe_config()` at scheduler init (it
+  reads `exec.moe` / `spec` / `model`, and takes no record);
   accessors (`get_moe_a2a_backend` etc.) are thin shims with lazy defaults. The speculative
   contexts (`speculative_moe_backend_context`) swap the ACTIVE leaves around draft forwards.
 - `flags.dp` is materialized by `initialize_dp_attention`; `is_dp_attention_enabled()` is a

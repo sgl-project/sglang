@@ -903,11 +903,11 @@ class Scheduler(
             "moe_topk",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
-            initialize_moe_config(self.server_args)
+            initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
-        initialize_fp8_gemm_config(self.server_args)
-        initialize_fp4_gemm_config(self.server_args)
+        initialize_fp8_gemm_config()
+        initialize_fp4_gemm_config()
         initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config

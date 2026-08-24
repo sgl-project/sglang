@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -116,7 +117,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
-        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
+        self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
+            resolving_view(runner.server_args)
+        )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
                 "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "

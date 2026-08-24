@@ -775,8 +775,8 @@ async def model_info():
     if embedding_model_spec is not None:
         result["embedding"] = resolved_embedding_plan(
             embedding_model_spec,
-            # Through the declarations: the plan reports the *effective* config,
-            # and the fields hold the raw input.
+            # Through the declarations: the plan reports the *effective*
+            # config, which is what the declarations carry.
             config=resolving_view(_global_state.tokenizer_manager.server_args),
             model_config=model_config,
         )
