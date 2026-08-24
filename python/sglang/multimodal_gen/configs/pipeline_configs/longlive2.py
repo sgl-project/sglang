@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -27,6 +30,13 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
     expand_timesteps: bool = False
 
     dit_config: DiTConfig = field(default_factory=LongLive2VideoConfig)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "text_encoder", "vae"),
+        )
 
     def adjust_num_frames(self, num_frames: int) -> int:
         num_frames = super().adjust_num_frames(num_frames)
