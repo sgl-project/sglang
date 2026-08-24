@@ -6,13 +6,17 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "prompt rewriting"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "prompt rewriting", "Qwen2.5-VL"]} />
 
-## 1. Model introduction
+## 1. Model Introduction
 
 [LongCat-Image](https://huggingface.co/meituan-longcat/LongCat-Image) is a
 text-to-image model from Meituan. SGLang runs its Qwen2.5-VL prompt rewriter
 in process with the native SGLang runtime before text encoding and denoising.
+
+The native pipeline keeps prompt rewriting and diffusion behind one OpenAI-compatible
+image endpoint. Rewriting is enabled by default for stronger prompt expansion, but
+each request can disable it when lower latency matters more than the rewritten prompt.
 
 ## 2. Installation
 
