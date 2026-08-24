@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -162,6 +163,43 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
+
+    def test_component_weight_file_keeps_base_component_config(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_paths": {
+                    "text_encoder": "owner/repo/text_encoder/model.safetensors",
+                    "audio_vae": "owner/repo/vae/audio.safetensors",
+                    "vae": "owner/repo/vae",
+                },
+            }
+        )
+
+        self.assertEqual(args.component_paths, {"vae": "owner/repo/vae"})
+        self.assertEqual(
+            args.component_weights_paths,
+            {
+                "text_encoder": "owner/repo/text_encoder/model.safetensors",
+                "audio_vae": "owner/repo/vae/audio.safetensors",
+            },
+        )
+
+    def test_supplemental_weight_file_remains_a_component_path(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_paths": {
+                    "conditioning_projection": "owner/repo/projection.safetensors"
+                },
+            }
+        )
+
+        self.assertEqual(
+            args.component_paths,
+            {"conditioning_projection": "owner/repo/projection.safetensors"},
+        )
+        self.assertEqual(args.component_weights_paths, {})
 
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(
@@ -430,7 +468,16 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            json.dump(
+                {
+                    "model_path": "/from/config",
+                    "num_gpus": 2,
+                    "component_weights_paths": {
+                        "transformer": "owner/repo/transformer.safetensors"
+                    },
+                },
+                config_file,
+            )
             config_file.flush()
             parser = FlexibleArgumentParser()
             add_multimodal_gen_serve_args(parser)
@@ -441,6 +488,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "/from/cli",
                 "--vae-path",
                 "/custom/vae",
+                "--component-weights-paths.text_encoder",
+                "owner/repo/text_encoder.safetensors",
+                "--image-encoder-weights-path=/custom/image_encoder.safetensors",
                 "--component-attention-backends.transformer",
                 "fa3",
             ]
@@ -471,6 +521,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual("/from/cli", server_args.model_path)
         self.assertEqual(2, server_args.num_gpus)
         self.assertEqual("/custom/vae", server_args.component_paths["vae"])
+        self.assertEqual(
+            {
+                "transformer": "owner/repo/transformer.safetensors",
+                "text_encoder": "owner/repo/text_encoder.safetensors",
+                "image_encoder": "/custom/image_encoder.safetensors",
+            },
+            server_args.component_weights_paths,
+        )
         self.assertEqual(
             {"transformer": "fa"},
             server_args.component_attention_backends,
@@ -1350,6 +1408,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
+        cosmos3_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Nano"
+        ).get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
@@ -1360,6 +1421,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
+
+        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
@@ -1808,6 +1872,49 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
         )
+
+    def test_auto_cosmos3_keeps_dit_resident_on_high_memory_gpu(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
+            available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Nano",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+
+    def test_auto_cosmos3_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
+            available_memory_gb=100,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Nano",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_cosmos3_super_keeps_default_offload_policy(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
+            available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Super",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_memory_sana_wm_layerwise_offload_adds_dit(self):
         args = self._from_dict_with_pipeline_config(

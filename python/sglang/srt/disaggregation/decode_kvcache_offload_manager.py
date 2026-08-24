@@ -21,7 +21,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_schedule,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -68,10 +72,10 @@ class DecodeKVCacheOffloadManager:
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
+        if get_memory().hicache_storage_backend_extra_config:
             try:
                 hicache_storage_backend_extra_config = json.loads(
-                    server_args.hicache_storage_backend_extra_config
+                    get_memory().hicache_storage_backend_extra_config
                 )
             except json.JSONDecodeError as e:
                 raise ValueError(
@@ -83,10 +87,10 @@ class DecodeKVCacheOffloadManager:
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
             tp_group=tp_group,
-            io_backend=server_args.hicache_io_backend,
+            io_backend=get_memory().hicache_io_backend,
             load_cache_event=threading.Event(),
-            storage_backend=server_args.hicache_storage_backend,
-            model_name=server_args.served_model_name,
+            storage_backend=get_memory().hicache_storage_backend,
+            model_name=get_serving().served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
 

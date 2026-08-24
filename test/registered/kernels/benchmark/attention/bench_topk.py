@@ -5,6 +5,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
+    topk_transform_ragged_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -14,6 +15,8 @@ register_cuda_ci(
 
 # Compressed page size used by the DSA indexer (real value is 256 // 4 = 64).
 PAGE_SIZE = 64
+# NOTE: currently torch baseline is disabled, since it's too slow
+DISABLE_TORCH = True
 
 
 def _make_inputs(batch_size: int, seq_len: int, k: int):
@@ -44,7 +47,7 @@ def _make_p1_table(batch_size: int, seq_len: int):
     return src_page_table, lengths
 
 
-def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
+def _build_paged_fn(provider: str, batch_size: int, seq_len: int, k: int):
     scores, seq_lens, page_table, out = _make_inputs(batch_size, seq_len, k)
     N = PAGE_SIZE
 
@@ -72,19 +75,67 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
     return fn, (scores, seq_lens, page_table)
 
 
+def _build_ragged_fn(provider: str, batch_size: int, seq_len: int, k: int):
+    scores, seq_lens, _, out = _make_inputs(batch_size, seq_len, k)
+    offsets = torch.arange(batch_size, dtype=torch.int32, device="cuda") * seq_len
+
+    def fn(scores, seq_lens, offsets):
+        if provider == "jit_v1":
+            from sgl_kernel import fast_topk_transform_ragged_fused
+
+            return fast_topk_transform_ragged_fused(scores, seq_lens, offsets, k)
+        elif provider == "jit_v2":
+            topk_transform_ragged_v2(
+                scores, seq_lens, out_offsets=offsets, out_indices=out
+            )
+            return out
+        elif provider == "flashinfer":
+            from flashinfer import top_k_ragged_transform
+
+            return top_k_ragged_transform(scores, offsets, seq_lens, k)
+        elif provider == "torch":
+            idx = scores.topk(k, dim=-1).indices.to(torch.int32)  # (batch, k)
+            return idx + offsets.unsqueeze(1)
+        else:
+            raise ValueError(f"unknown provider {provider}")
+
+    return fn, (scores, seq_lens, offsets)
+
+
+PRROVIDERS = ["jit_v1", "jit_v2", "flashinfer"]
+if not DISABLE_TORCH:
+    PRROVIDERS.append("torch")
+
+
 @marker.parametrize("k", [512, 1024, 2048], [512])
 @marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
-@marker.benchmark("provider", ["jit_v1", "jit_v2", "flashinfer", "torch"])
-def benchmark(seq_len: int, batch_size: int, k: int, provider: str):
+@marker.benchmark("provider", PRROVIDERS)
+def benchmark_paged(seq_len: int, batch_size: int, k: int, provider: str):
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k == 2048 and provider == "jit_v1":
         marker.skip("jit_v1 does not support k=2048")
 
-    fn, input_args = _build_fn(provider, batch_size, seq_len, k)
+    fn, input_args = _build_paged_fn(provider, batch_size, seq_len, k)
+    return marker.do_bench(fn, input_args=input_args, memory_args=input_args[:2])
+
+
+@marker.parametrize("k", [512, 1024, 2048], [2048])
+@marker.parametrize("seq_len", [2**x for x in range(10, 19)], [4096, 65536])
+# NOTE: prefill workload should be heavier than decode; not common for short extend
+@marker.parametrize("batch_size", [2**x for x in range(7, 14)], [128, 1024])
+@marker.benchmark("provider", PRROVIDERS)
+def benchmark_ragged(seq_len: int, batch_size: int, k: int, provider: str):
+    if k > seq_len:
+        marker.skip("k cannot be larger than seq_len")
+    if k != 2048 and provider == "jit_v1":
+        marker.skip("jit_v1 (here, sgl-AOT) only support k=2048")
+
+    fn, input_args = _build_ragged_fn(provider, batch_size, seq_len, k)
     return marker.do_bench(fn, input_args=input_args, memory_args=input_args[:2])
 
 
 if __name__ == "__main__":
-    benchmark.run()
+    benchmark_paged.run()
+    benchmark_ragged.run()
