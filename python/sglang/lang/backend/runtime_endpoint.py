@@ -8,10 +8,10 @@ from typing import Dict, List, Optional, Union
 import aiohttp
 import requests
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.lang.choices import ChoicesDecision, ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import (
     REGEX_BOOL,
@@ -384,13 +384,19 @@ class Runtime:
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.utils.network import is_port_available
 
-        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # Pre-allocate ports
-        for port in range(self.server_args.port, 40000):
+        # Pre-allocate a port before building the config, so the config is born
+        # with the port this runtime will serve on.
+        requested_port = kwargs.pop(
+            "port", ServerArgs.__dataclass_fields__["port"].default
+        )
+        for port in range(requested_port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.port = port
+        self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
+        # The spawned server gets a copy of this record, and this object keeps
+        # reading it afterwards -- `get_tokenizer` wants the downloaded GGUF
+        # file and the rewritten ModelScope path, not what the caller typed.
+        self.server_args.resolve_once()
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -453,7 +459,7 @@ class Runtime:
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(
-            self.server_args.tokenizer_path,
+            self.server_args.tokenizer_path or self.server_args.model_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
             revision=self.server_args.revision,
@@ -463,18 +469,21 @@ class Runtime:
         self,
         prompt: str,
         sampling_params: Optional[Dict] = None,
+        session_id: Optional[str] = None,
     ):
         if self.server_args.skip_tokenizer_init:
             json_data = {
                 "input_ids": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         else:
             json_data = {
                 "text": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         pos = 0
 
@@ -505,6 +514,7 @@ class Runtime:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        session_id: Optional[str] = None,
     ):
         json_data = {
             "text": prompt,
@@ -513,6 +523,7 @@ class Runtime:
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
             "lora_path": lora_path,
+            "session_id": session_id,
         }
         assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(

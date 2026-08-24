@@ -34,10 +34,13 @@ from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_tokenizer, has_native_gguf_support
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
+    is_bare_tekken_checkpoint,
     patch_mistral_common_tokenizer,
     retry_without_mistral_common_kwargs,
 )
@@ -129,6 +132,15 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
+_tokenizer_warnings_filter = TokenizerWarningsFilter()
+
+
+def _install_tokenizer_warnings_filter(tokenizer):
+    logging.getLogger(tokenizer.__class__.__module__).addFilter(
+        _tokenizer_warnings_filter
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers for get_tokenizer
 # ---------------------------------------------------------------------------
@@ -143,7 +155,8 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        kwargs["gguf_file"] = tokenizer_name
+        if gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None:
+            kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
@@ -159,49 +172,14 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
-# TODO: Remove after bumping huggingface transformers to v5.12
-def _retry_auto_tokenizer_with_glm_moe_dsa_config(
-    tokenizer_name, args, common_kwargs, error
-):
-    from .config import (
-        _is_legacy_glm_moe_dsa_layer_types_error,
-        _load_glm_moe_dsa_config_without_legacy_layer_types,
-    )
-
-    if not _is_legacy_glm_moe_dsa_layer_types_error(error):
-        return None
-
-    config = _load_glm_moe_dsa_config_without_legacy_layer_types(
-        tokenizer_name, revision=common_kwargs.get("tokenizer_revision")
-    )
-    if config is None:
-        return None
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name, *args, **{**common_kwargs, "config": config}
-    )
-    logging.getLogger(tokenizer.__class__.__module__).addFilter(
-        TokenizerWarningsFilter()
-    )
-    return tokenizer
-
-
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     """Call ``AutoTokenizer.from_pretrained`` with error handling."""
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
         )
-        logging.getLogger(tokenizer.__class__.__module__).addFilter(
-            TokenizerWarningsFilter()
-        )
         return tokenizer
     except TypeError as e:
-        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
-            tokenizer_name, args, common_kwargs, e
-        )
-        if tokenizer is not None:
-            return tokenizer
         err_msg = (
             "Failed to load the tokenizer. If you are using a LLaMA V1 model "
             f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
@@ -209,11 +187,6 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
-        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
-            tokenizer_name, args, common_kwargs, e
-        )
-        if tokenizer is not None:
-            return tokenizer
         # MistralCommon tokenizers reject standard HF kwargs like
         # trust_remote_code, use_fast etc. Retry without them.
         if "are not supported by" in str(e) and "MistralCommon" in str(e):
@@ -233,13 +206,6 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
-        raise
-    except Exception as e:
-        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
-            tokenizer_name, args, common_kwargs, e
-        )
-        if tokenizer is not None:
-            return tokenizer
         raise
 
 
@@ -262,16 +228,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
         )
-    except Exception as e:
-        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
-            tokenizer_name, args, common_kwargs, e
-        )
-        if tokenizer is not None:
-            return tokenizer
-        if not isinstance(
-            e, (ValueError, TypeError, OSError, ImportError, RuntimeError)
-        ):
-            raise
+    except (ValueError, TypeError, OSError, ImportError, RuntimeError) as e:
         raise RuntimeError(
             f"Retry with use_fast=False for {tokenizer_name} also failed "
             f"(initial load returned TokenizersBackend): {e}"
@@ -468,6 +425,7 @@ def _fix_special_tokens_pattern(tokenizer):
 
 def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     """Apply all post-load patches and return the final tokenizer."""
+    _install_tokenizer_warnings_filter(tokenizer)
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
@@ -539,6 +497,17 @@ def get_tokenizer(
         if "use_fast" not in kwargs:
             kwargs["use_fast"] = True
 
+    if (
+        check_gguf_file(tokenizer_name)
+        and gguf_sidecar_dir(tokenizer_name, "tokenizer_config.json") is None
+        and has_native_gguf_support(tokenizer_name)
+    ):
+        _ensure_gguf_version()
+        tokenizer = build_gguf_tokenizer(tokenizer_name)
+        _fix_special_tokens_pattern(tokenizer)
+        attach_additional_stop_token_ids(tokenizer)
+        return patch_tokenizer(tokenizer)
+
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
     common_kwargs = dict(
@@ -549,20 +518,37 @@ def get_tokenizer(
     )
 
     try:
-        tokenizer = _auto_tokenizer_from_pretrained(
-            tokenizer_name, *args, **common_kwargs
-        )
+        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+            from transformers.tokenization_mistral_common import (
+                MistralCommonTokenizer,
+            )
 
-        # With fastokens, the patched TokenizersBackend.from_pretrained already
-        # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-        # the declared class (e.g. Qwen2Tokenizer) would discard that work.
-        if (
-            type(tokenizer).__name__ == _TOKENIZERS_BACKEND
-            and tokenizer_backend != "fastokens"
-        ):
-            tokenizer = _resolve_tokenizers_backend(
+            logger.info(
+                "Detected bare-tekken checkpoint %s (tekken.json, no "
+                "tokenizer.json); loading via mistral-common MistralCommonTokenizer, "
+                "ignoring tokenizer_backend=%r.",
+                tokenizer_name,
+                tokenizer_backend,
+            )
+
+            tokenizer = MistralCommonTokenizer.from_pretrained(
+                tokenizer_name, revision=tokenizer_revision
+            )
+        else:
+            tokenizer = _auto_tokenizer_from_pretrained(
                 tokenizer_name, *args, **common_kwargs
             )
+
+            # With fastokens, the patched TokenizersBackend.from_pretrained already
+            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            if (
+                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                and tokenizer_backend != "fastokens"
+            ):
+                tokenizer = _resolve_tokenizers_backend(
+                    tokenizer_name, *args, **common_kwargs
+                )
 
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:

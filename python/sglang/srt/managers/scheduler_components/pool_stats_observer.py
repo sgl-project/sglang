@@ -261,13 +261,14 @@ class SchedulerPoolStatsObserver:
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
-            full_available_size + full_evictable_size
+        full_capacity = self.req_to_token_pool.schedulable_token_capacity(
+            self.token_to_kv_pool_allocator.size
         )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
             mamba_available_size + mamba_evictable_size
         )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
+        full_token_usage = full_num_used / full_capacity
         mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
 
         return PoolStats(
@@ -300,7 +301,12 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        full_token_usage = full_num_used / self.full_tokens_per_layer
+        if not self.full_tokens_per_layer:
+            full_num_used = 0
+            full_available_size = 0
+            full_token_usage = 0.0
+        else:
+            full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
         return PoolStats(

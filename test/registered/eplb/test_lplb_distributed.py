@@ -82,7 +82,7 @@ def test_dispatch_probability_matches_torch_reference():
     """The fused CUDA `dispatch_probability` and the pure-torch reference
     must produce identical outputs for the same ``random_vals``. Single-rank,
     runs on any CUDA GPU."""
-    from sglang.jit_kernel.lplb.cuda_solver import (
+    from sglang.kernels.ops.lplb.cuda_solver import (
         dispatch_probability,
         dispatch_probability_torch_reference,
     )
@@ -135,8 +135,8 @@ def test_solve_ipm_matches_torch_reference():
     convergence test (the Big-M slack must reach ~0) and both backends would
     just return the 0.5 non-convergence sentinel — agreeing trivially without
     exercising the solve. Single-rank, any CUDA GPU."""
-    from sglang.jit_kernel.lplb.cuda_solver import solve_ipm as cuda_solve_ipm
-    from sglang.jit_kernel.lplb.torch_solver import solve_ipm_torch_reference
+    from sglang.kernels.ops.lplb.cuda_solver import solve_ipm as cuda_solve_ipm
+    from sglang.kernels.ops.lplb.torch_solver import solve_ipm_torch_reference
     from sglang.srt.eplb.lplb_solver import LPLBSolver
 
     torch.manual_seed(0)

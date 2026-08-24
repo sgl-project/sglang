@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1000, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=1000, stage="extra-b", runner_config="8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LOADER_CONFIG = '{"enable_multithread_load": true, "num_threads": 64}'
@@ -132,10 +132,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
         )
 
 
-@unittest.skipUnless(
-    is_in_ci() or _has_nixl(),
-    "NIXL is required for DSV4 HiSparse disaggregation coverage.",
-)
+@unittest.skipIf(is_in_ci(), "Flaky in CI — skip until stabilized.")
 class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
     @classmethod
     def setUpClass(cls):

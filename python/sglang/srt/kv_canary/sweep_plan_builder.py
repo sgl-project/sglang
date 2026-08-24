@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:

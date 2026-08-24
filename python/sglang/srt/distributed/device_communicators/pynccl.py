@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    ncclConfig_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -33,6 +34,7 @@ class PyNcclCommunicator:
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        is_symmetric_memory_enabled: bool = False,
     ):
         """
         Args:
@@ -42,6 +44,7 @@ class PyNcclCommunicator:
                 it will be bind to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            is_symmetric_memory_enabled: whether symmetric memory is enabled.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -108,9 +111,18 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            if is_symmetric_memory_enabled:
+                # When symmetric memory is enabled, disable internal
+                # NCCL cuda event synchronizations to improve performance.
+                config = ncclConfig_t.create()
+                config.graphUsageMode = 1
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
+                    self.world_size, self.unique_id, self.rank, config
+                )
+            else:
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
             warmup_stream = torch.cuda.Stream()
 
             # A small all_reduce for warmup.
@@ -222,33 +234,6 @@ class PyNcclCommunicator:
                 cudaStream_t(stream.cuda_stream),
             )
 
-    def cp_all_gather_into_tensor(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        stream: torch.cuda.Stream,
-        sizes: Optional[list[int]] = None,
-    ):
-        """
-        Currently, it is mainly used in context parallelism,
-        primarily leveraging pynccl to implement non-blocking allgather communication.
-        """
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
-        assert input_tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {input_tensor.device}"
-        )
-        self.nccl.ncclAllGather(
-            buffer_type(input_tensor.data_ptr()),
-            buffer_type(output_tensor.data_ptr()),
-            input_tensor.numel(),
-            ncclDataTypeEnum.from_torch(input_tensor.dtype),
-            self.comm,
-            cudaStream_t(stream.cuda_stream),
-        )
-
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
@@ -329,6 +314,60 @@ class PyNcclCommunicator:
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ):
+        """All-to-All over the flattened leading dim: each rank sends the i-th
+        equal-sized chunk to rank i and receives rank i's chunk into output
+        position i. Uses ncclGroupStart/End to fuse the sends/recvs into a
+        single NCCL operation, which is CUDA-graph-capturable (used by the DCP
+        a2a communication backend)."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {output_tensor.device}"
+        )
+        stream = self._resolve_stream()
+        # Equal-split all-to-all: fail loudly instead of silently truncating the tail.
+        assert input_tensor.numel() == output_tensor.numel(), (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) != output "
+            f"numel ({output_tensor.numel()})"
+        )
+        assert input_tensor.numel() % self.world_size == 0, (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) not "
+            f"divisible by world_size ({self.world_size})"
+        )
+        chunk_size = input_tensor.numel() // self.world_size
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+        self.nccl.ncclGroupStart()
+        for i in range(self.world_size):
+            send_buf = input_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclSend(
+                buffer_type(send_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            recv_buf = output_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclRecv(
+                buffer_type(recv_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
 
     def broadcast(self, tensor: torch.Tensor, src: int):
         if self.disabled:

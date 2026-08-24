@@ -57,10 +57,31 @@ assert isinstance(MooncakeCombineInput, CombineInput)
 
 
 class EPBuffer:
-    _buffer = None
-    _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
-    _num_experts: Optional[int] = None
+    """Managing facade for the process-wide Mooncake EP buffer; the state
+    itself lives on ``ctx.resources``."""
+
+    @classmethod
+    def _state(cls):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        state = buffers.get("mooncake_ep_state")
+        if state is None:
+            state = SimpleNamespace(
+                buffer=None,
+                hidden_size=None,
+                num_max_dispatch_tokens_per_rank=None,
+                num_experts=None,
+            )
+            buffers["mooncake_ep_state"] = state
+        return state
+
+    @classmethod
+    def get_existing_buffer(cls):
+        """The already-created buffer (elastic-EP membership refresh)."""
+        return cls._state().buffer
 
     @classmethod
     def get_ep_buffer(
@@ -72,15 +93,16 @@ class EPBuffer:
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
     ):
-        if cls._buffer is not None:
-            return cls._buffer
+        state = cls._state()
+        if state.buffer is not None:
+            return state.buffer
 
         # Lazy import Buffer to avoid creating CUDA context at module import time
         from mooncake.mooncake_ep_buffer import Buffer
 
-        cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        cls._num_experts = num_experts
+        state.hidden_size = hidden_size
+        state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        state.num_experts = num_experts
 
         num_ep_buffer_bytes = 0
         if deepep_mode.enable_normal():
@@ -97,8 +119,8 @@ class EPBuffer:
                 num_experts,
             )
 
-        cls._buffer = Buffer(group, num_ep_buffer_bytes)
-        return cls._buffer
+        state.buffer = Buffer(group, num_ep_buffer_bytes)
+        return state.buffer
 
 
 class _MooncakeEPDispatcherImpl:
@@ -209,7 +231,7 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        active_ranks = self._get_active_ranks()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
@@ -249,7 +271,7 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        active_ranks = ElasticEPStateManager.instance().active_ranks
+        active_ranks = self._get_active_ranks()
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
             topk_ids,
@@ -263,6 +285,12 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = False
         self.handle = None
         return combined_hidden_states, event, hook
+
+    def _get_active_ranks(self) -> torch.Tensor:
+        elastic_state = ElasticEPStateManager.instance()
+        if elastic_state is not None:
+            return elastic_state.active_ranks
+        return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
     def _get_buffer(self):
         return EPBuffer.get_ep_buffer(
