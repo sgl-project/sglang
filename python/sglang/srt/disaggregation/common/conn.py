@@ -833,9 +833,13 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
-        logger.error(
-            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        error_message = (
+            f"Prefill instance failed to register to bootstrap server "
+            f"{url} after {max_retries} retries"
         )
+        logger.error(error_message)
+        if envs.SGLANG_RUST_SERVER.get():
+            raise RuntimeError(error_message)
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:

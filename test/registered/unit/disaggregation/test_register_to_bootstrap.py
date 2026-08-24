@@ -203,8 +203,23 @@ class TestRegisterToBootstrap(CustomTestCase):
         with envs.SGLANG_RUST_SERVER.override(True):
             mgr.register_to_bootstrap()
 
-        url_used = mock_put.call_args[0][0]
-        self.assertIn("10.0.0.1", url_used)
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[0], "http://10.0.0.1:8765/route")
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_rust_registry_retry_exhaustion_fails_startup(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=503)
+        mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(RuntimeError, "10.0.0.1:8765"),
+        ):
+            mgr.register_to_bootstrap()
+
+        self.assertEqual(mock_put.call_count, 5)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
