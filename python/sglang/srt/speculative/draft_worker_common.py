@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
@@ -19,18 +19,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-# trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
-# earlier, at arg resolution (speculative_hook.py) -- its draft path needs
-# per-layer DFlash attention -- so it never reaches this gate with it.
-_SUPPORTED_DRAFT_BACKENDS = (
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "ascend",
-    "trtllm_mha",
-)
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
@@ -48,13 +36,13 @@ def _resolve_draft_attention_backend_fallback(
         draft_backend, _ = server_args.get_attention_backends()
     if draft_backend is None:
         return "triton" if torch.version.hip else "flashinfer"
-    if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
+    if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = "triton" if torch.version.hip else "flashinfer"
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
             algo_label,
-            _SUPPORTED_DRAFT_BACKENDS,
+            DRAFT_ATTENTION_BACKEND_CHOICES,
             draft_backend,
             fallback,
         )
