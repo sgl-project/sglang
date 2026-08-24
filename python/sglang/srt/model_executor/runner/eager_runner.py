@@ -206,6 +206,9 @@ class EagerRunner(BaseRunner):
             )
             if coord is not None and not self.model_runner.is_draft_worker:
                 forward_batch.npu_selective_hisparse_coordinator = coord
+        coord = forward_batch.npu_selective_hisparse_coordinator
+        if coord is not None:
+            coord.prepare_eager_forward()
 
         mode = forward_batch.forward_mode
         if mode.is_decode():

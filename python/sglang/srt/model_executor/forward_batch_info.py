@@ -649,7 +649,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Selective HiSparse coordinator (set by ModelRunner / graph runner)
     npu_selective_hisparse_coordinator: Optional[object] = None
-    npu_selective_graph_mode: bool = False
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.

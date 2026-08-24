@@ -17,8 +17,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import logging
-
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -291,6 +289,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+    def _local_selective_layer_ids(self) -> tuple[int, ...]:
+        """Return target-worker selective layers owned by this PP stage."""
+        kvc = self.kvc
+        configured = getattr(
+            kvc.server_args, "npu_selective_hisparse_layer_ids", None
+        )
+        if (
+            not configured
+            or kvc.is_draft_worker
+            or not _is_npu_pool_device(kvc.device)
+        ):
+            return ()
+        return tuple(
+            sorted(
+                {
+                    layer_id
+                    for layer_id in configured
+                    if kvc.layer_info.start_layer
+                    <= layer_id
+                    < kvc.layer_info.end_layer
+                }
+            )
+        )
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
@@ -309,10 +331,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
         # Selective HiSparse: reduce main KV layer count by number of offloaded layers
-        selective_layer_ids = getattr(
-            kvc.server_args, "npu_selective_hisparse_layer_ids", None
-        )
-        num_selective = len(selective_layer_ids) if selective_layer_ids else 0
+        num_selective = len(self._local_selective_layer_ids())
         main_kv_layers = effective_num_layers - num_selective
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -450,10 +469,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         # Selective HiSparse: subtract fixed staging/workspace bias
-        selective_layer_ids = getattr(
-            self.kvc.server_args, "npu_selective_hisparse_layer_ids", None
-        )
-        if selective_layer_ids and _is_npu_pool_device(self.kvc.device):
+        if self._local_selective_layer_ids():
             fixed_bias = self._compute_selective_fixed_bias()
             usable_bytes = max(available_bytes - fixed_bias, 0)
         else:
@@ -474,15 +490,37 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc = self.kvc
         max_running = kvc.server_args.max_running_requests or 256
         attn_dp = get_attention_dp_size()
-        bcap = max_running // attn_dp
-        cuda_graph_bs = getattr(kvc.server_args, "cuda_graph_bs", None)
+        bcap = (max_running + attn_dp - 1) // attn_dp
+        decode_graph_config = getattr(
+            getattr(kvc.server_args, "cuda_graph_config", None),
+            "decode",
+            None,
+        )
+        cuda_graph_bs = getattr(decode_graph_config, "bs", None)
         if cuda_graph_bs:
             bcap = max(bcap, max(cuda_graph_bs))
-        verify_width = 6
-        topk = 2048
+        if kvc.spec_algorithm.is_speculative():
+            from sglang.srt.speculative.spec_utils import (
+                resolve_num_tokens_per_req,
+            )
+
+            verify_width = resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=kvc.server_args,
+                spec_algorithm=kvc.spec_algorithm,
+                is_draft_worker=False,
+            )
+        else:
+            verify_width = 1
+        hf_text_config = getattr(
+            kvc.model_config,
+            "hf_text_config",
+            kvc.model_config.hf_config,
+        )
+        topk = int(getattr(hf_text_config, "index_topk", 2048) or 2048)
         record_bytes = 656
-        kv_lora_rank = 512
-        qk_rope_head_dim = 64
+        kv_lora_rank = kvc.model_config.kv_lora_rank
+        qk_rope_head_dim = kvc.model_config.qk_rope_head_dim
 
         tcap = bcap * verify_width
         rcap = tcap * topk
@@ -493,18 +531,35 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         unpack_nope = rcap * kv_lora_rank * 2
         # unpack_k_rope_bf16: [Tcap, K, 64] BF16
         unpack_rope = rcap * qk_rope_head_dim * 2
-        # new_packed_scratch: [Tcap, 656] uint8
-        scratch = tcap * record_bytes
-        # metadata: locs, mask, current_rows, sparse_indices, seq_lens
-        meta = (
+        # publish_new_packed_kv retains one packed output per selected layer.
+        packed_outputs = (
+            len(self._local_selective_layer_ids()) * tcap * record_bytes
+        )
+        # Persistent unpack/cast workspaces omitted by the original estimate.
+        fp8_nope = rcap * kv_lora_rank
+        scales = rcap * (kv_lora_rank // 128) * 4
+        # Per-record metadata and mf_offload pointer arrays.
+        record_meta = (
             tcap * topk * 8  # host_locs int64
-            + tcap * topk  # valid_mask bool
             + tcap * topk * 8  # current_source_row int64
             + tcap * topk * 4  # sparse_indices int32
-            + tcap * 4  # actual_seq_lens_kv int32
+            + tcap * topk * (8 + 8 + 4)  # H2D src/dst/lens
+            + tcap * topk * 8  # preset H2D dst pointers
         )
+        token_meta = tcap * (4 + 4 + 4 + 8 + 8 + 4)
+        fixed_meta = topk * 4 + 12  # arange_k + three scalar counters
 
-        total = staging + unpack_nope + unpack_rope + scratch + meta
+        total = (
+            staging
+            + unpack_nope
+            + unpack_rope
+            + fp8_nope
+            + scales
+            + packed_outputs
+            + record_meta
+            + token_meta
+            + fixed_meta
+        )
         logger.info(
             f"Selective HiSparse fixed bias: {total / (1024*1024):.1f} MiB "
             f"(Bcap={bcap}, Tcap={tcap})"

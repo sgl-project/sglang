@@ -900,25 +900,52 @@ class ModelRunner:
             SelectiveHostKVPool,
             validate_npu_selective_hisparse_config,
             RECORD_BYTES,
-            VERIFY_WIDTH,
             DEFAULT_TOPK,
         )
 
         selected_ids = validate_npu_selective_hisparse_config(
             self.server_args, self.model_config
         )
-
-        # Compute local batch capacity
-        from sglang.srt.layers.dp_attention import (
-            get_attention_dp_size,
+        selected_ids = tuple(
+            layer_id
+            for layer_id in selected_ids
+            if self.layer_info.start_layer
+            <= layer_id
+            < self.layer_info.end_layer
         )
+        if not selected_ids:
+            return
+
+        cross_stage = [
+            layer_id
+            for layer_id in selected_ids
+            if layer_id - 3 < self.layer_info.start_layer
+        ]
+        if cross_stage:
+            raise ValueError(
+                "Selective HiSparse requires each selected layer and its "
+                "three-layer-earlier prefetch anchor to be on the same PP "
+                f"stage; local_stage=[{self.layer_info.start_layer}, "
+                f"{self.layer_info.end_layer}), invalid={cross_stage}."
+            )
+
+        # Bound staging independently of the (often much larger) request-pool
+        # metadata capacity; one Selective HiSparse request consumes V*K packed
+        # records, so blindly sizing to the default 2K request pool is not viable.
+        from sglang.srt.layers.dp_attention import get_attention_dp_size
+
         attn_dp_size = get_attention_dp_size()
         max_running = self.server_args.max_running_requests or 256
-        local_batch_capacity = max_running // attn_dp_size
+        local_batch_capacity = (max_running + attn_dp_size - 1) // attn_dp_size
 
         # Graph capture may use batch sizes larger than max_running // attn_dp.
         # The staging buffers must accommodate the largest captured batch.
-        cuda_graph_bs = getattr(self.server_args, "cuda_graph_bs", None)
+        decode_graph_config = getattr(
+            getattr(self.server_args, "cuda_graph_config", None),
+            "decode",
+            None,
+        )
+        cuda_graph_bs = getattr(decode_graph_config, "bs", None)
         if cuda_graph_bs:
             local_batch_capacity = max(
                 local_batch_capacity, max(cuda_graph_bs)
@@ -949,12 +976,16 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             selected_layer_ids=selected_ids,
             local_batch_capacity=local_batch_capacity,
-            verify_width=VERIFY_WIDTH,
-            topk=DEFAULT_TOPK,
+            verify_width=self.decode_num_tokens_per_req(),
+            topk=getattr(
+                self.model_config.hf_text_config,
+                "index_topk",
+                DEFAULT_TOPK,
+            )
+            or DEFAULT_TOPK,
             record_bytes=RECORD_BYTES,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            num_hidden_layers=self.model_config.num_hidden_layers,
         )
 
         # Wire coordinator into pool

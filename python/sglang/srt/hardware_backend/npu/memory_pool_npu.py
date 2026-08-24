@@ -641,8 +641,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         # === Selective HiSparse: resident/selected layer split ===
+        local_layer_end = self.start_layer + self.layer_num
         self.selective_host_layer_ids: frozenset[int] = (
-            frozenset(selective_host_layer_ids) if selective_host_layer_ids else frozenset()
+            frozenset(
+                layer_id
+                for layer_id in selective_host_layer_ids
+                if self.start_layer <= layer_id < local_layer_end
+            )
+            if selective_host_layer_ids
+            else frozenset()
         )
         self.selective_coordinator = None  # set later by ModelRunner
 

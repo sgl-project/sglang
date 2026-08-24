@@ -1341,7 +1341,9 @@ class KVCacheConfigurator:
             ),
             selective_host_layer_ids=getattr(
                 self.server_args, "npu_selective_hisparse_layer_ids", None
-            ),
+            )
+            if not self.is_draft_worker
+            else None,
         )
         return token_to_kv_pool
 

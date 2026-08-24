@@ -38,7 +38,6 @@ def selective_sparse_attention(
     qk_rope_head_dim: int = 64,
     actual_seq_lens_q_buf: torch.Tensor = None,
     arange_k_buf: torch.Tensor = None,
-    sparse_indices_tmp: torch.Tensor = None,
     fp8_nope_buf: torch.Tensor = None,
     scales_buf: torch.Tensor = None,
     graph_mode: bool = False,
@@ -229,6 +228,17 @@ def selective_sparse_attention(
     )
 
     attn_out = ret[0] if isinstance(ret, tuple) else ret
+
+    # Graph bucket padding produces rows with no valid KV.  The SFA API cannot
+    # express a zero KV length, so those rows are submitted with a sentinel
+    # length of one.  Explicitly zero their outputs: otherwise they can read a
+    # stale staging record from the previous replay and affect downstream MoE
+    # routing/reductions even though the runner later slices padded logits.
+    attn_out = torch.where(
+        empty_rows.view(T, 1, 1, 1),
+        torch.zeros_like(attn_out),
+        attn_out,
+    )
 
     if not graph_mode and logger.isEnabledFor(logging.INFO):
         logger.info(

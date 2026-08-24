@@ -297,6 +297,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
+        if self.ragged_verify_mode and getattr(
+            self.model_runner, "npu_selective_hisparse_coordinator", None
+        ) is not None:
+            raise ValueError(
+                "NPU Selective HiSparse requires dense fixed-width target-verify "
+                "graphs and is incompatible with compact ragged verify. Disable "
+                "SGLANG_RAGGED_VERIFY_MODE when selective offload is enabled."
+            )
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
             if self.ragged_verify_mode
@@ -930,14 +938,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.model_runner.is_draft_worker
             else None
         )
-        forward_batch.npu_selective_graph_mode = (
-            forward_batch.npu_selective_hisparse_coordinator is not None
-        )
         if forward_batch.npu_selective_hisparse_coordinator is not None:
             forward_batch.npu_selective_hisparse_coordinator.prepare_graph_capture(
                 capture_bs=bs,
                 capture_tokens=num_tokens,
-                out_cache_loc=out_cache_loc,
             )
 
         if buffers.ngram_embedding_info is not None:
@@ -1167,6 +1171,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+        # Captured graphs retain the graph-mode branches above, while future
+        # eager fallbacks execute coordinator Python again.  Restore eager
+        # synchronization semantics after this shape has finished capture.
+        if _sel_coord is not None:
+            _sel_coord.finish_graph_capture()
+
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
@@ -1230,6 +1240,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     real_batch=forward_batch.batch_size,
                     graph_batch=self.bs,
                     is_idle=forward_batch.forward_mode.is_idle(),
+                    real_num_tokens=(
+                        self.buffers.num_token_non_padded
+                        if forward_batch.num_token_non_padded is not None
+                        else None
+                    ),
                 )
             return
 
@@ -1282,6 +1297,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 real_batch=raw_bs,
                 graph_batch=bs,
                 is_idle=forward_batch.forward_mode.is_idle(),
+                real_num_tokens=(
+                    buffers.num_token_non_padded
+                    if forward_batch.num_token_non_padded is not None
+                    else None
+                ),
             )
 
         if (
