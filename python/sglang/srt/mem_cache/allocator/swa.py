@@ -96,6 +96,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.swa_deferred_free_group = []
 
         self._kvcache = kvcache
         self.clear()
@@ -302,6 +303,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
+        self._snapshot_swa_free_group()
         if _is_npu:
             indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
             torch_npu.npu_scatter_nd_update_(
@@ -341,11 +343,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert full_indices.numel() == swa_indices.numel()
         full_indices = full_indices.to(torch.int64)
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
+        self._snapshot_swa_free_group()
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return
+        self._snapshot_swa_free_group()
+        self._clear_full_to_swa_mapping(full_indices)
+
+    def _clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
         # host-resident scalar and blocks until the stream drains.
         self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
@@ -354,33 +361,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        if not self.is_not_in_free_group:
+            self.swa_free_group.append(self._copy_for_free_group(free_index))
+            return
+
         if self.page_size == 1:
             mapping_indices = free_index
         else:
             mapping_indices = self._expand_to_full_pages(free_index)
 
-        # Snapshot and detach the current SWA ownership before deferring the
-        # physical free. A tombstone recovery in the same free group can remap
-        # these Full slots to newly allocated SWA slots.
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        self.clear_full_to_swa_mapping(mapping_indices)
+        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        self._clear_full_to_swa_mapping(mapping_indices)
 
-        if not self.is_not_in_free_group:
-            self.swa_free_group.append(swa_indices)
+    def _snapshot_swa_free_group(self) -> None:
+        """Detach queued SWA ownership before a mapping update can replace it."""
+        if not self.swa_free_group:
             return
 
-        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        swa_free_group = self.swa_free_group
+        self.swa_free_group = []
+        free_index = torch.cat(swa_free_group)
+        if self.page_size == 1:
+            mapping_indices = free_index
+        else:
+            mapping_indices = self._expand_to_full_pages(free_index)
+
+        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        self._clear_full_to_swa_mapping(mapping_indices)
+        self.swa_deferred_free_group.append(swa_indices)
 
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
+        self.swa_deferred_free_group = []
 
     def free_group_end(self):
+        self._snapshot_swa_free_group()
         super().free_group_end()
-        if self.swa_free_group:
-            swa_free_group = self.swa_free_group
-            self.swa_free_group = []
-            swa_indices = torch.cat(swa_free_group)
+        if self.swa_deferred_free_group:
+            swa_deferred_free_group = self.swa_deferred_free_group
+            self.swa_deferred_free_group = []
+            swa_indices = (
+                swa_deferred_free_group[0]
+                if len(swa_deferred_free_group) == 1
+                else torch.cat(swa_deferred_free_group)
+            )
             self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
@@ -412,6 +438,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.swa_deferred_free_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
