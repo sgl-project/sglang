@@ -164,27 +164,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "(uniform-FP8 KV pool, decode + sparse prefill)."
         )
 
-    # FIXME(follow-up): remove once the overlap+speculative corruption is
-    # root-caused (tracked in the PR #30805 follow-up list).
-    # TEMPORARY containment: trtllm + speculative decoding under the overlap
-    # scheduler intermittently corrupts an int32 table consumed by the
-    # trtllm-gen sparse kernel (illegal memory access in
-    # fmhaSm100fKernel...VarSeq during concurrent GSM8K-style bursts). This
-    # reproduces with both TP-only and DP-attention recipes; disabling overlap
-    # prevents the corruption while the root cause is investigated.
-    if (
-        server_args.dsv4_attn_backend == "trtllm"
-        and server_args.speculative_algorithm is not None
-        and not server_args.disable_overlap_schedule
-    ):
-        logger.warning(
-            "Disabling the overlap scheduler for the trtllm DeepSeek-V4 "
-            "backend with speculative decoding (temporary "
-            "containment for an intermittent trtllm-gen kernel memory fault; "
-            "see the dsv4 trtllm PR discussion)."
-        )
-        server_args.disable_overlap_schedule = True
-
     if cfg.max_running_requests is None:
             declare_resolution(
                 server_args,
