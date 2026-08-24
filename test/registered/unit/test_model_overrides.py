@@ -253,17 +253,21 @@ class TestPublishInstallsSlot(_IsolatedPublish):
     """Publish wiring: set_server_args installs the already-resolved object
     into the context-owned slot (no transformation at publish time)."""
 
-    def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
+    def test_dummy_fixture_publishes_the_object_it_resolved(self):
         from sglang.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
 
-        sa = ServerArgs(model_path="dummy")  # __post_init__ early-returns
-        # The stash is created before the dummy short-circuit and stays empty.
-        self.assertEqual(sa._resolved_overrides, [])
+        sa = ServerArgs(model_path="dummy")  # construction resolves nothing
+        self.assertFalse(hasattr(sa, "_resolved_overrides"))
         set_global_server_args_for_scheduler(sa)
         self.assertIs(get_server_args(), sa)
+        # Publishing is what resolved it; the handlers ahead of the dummy
+        # short-circuit still declare.
+        for source, declared in sa._resolved_overrides:
+            for field, value in declared.items():
+                self.assertEqual(getattr(sa, field), value, f"{source}: {field}")
 
 
 class TestGoldenModelOverrides(_IsolatedPublish):
@@ -302,7 +306,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
             json.dump(config, f)
-        return ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args = ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args.resolve_once()
+        return server_args
 
     def _publish(self, server_args):
         from sglang.srt.server_args import (

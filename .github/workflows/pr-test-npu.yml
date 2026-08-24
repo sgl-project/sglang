@@ -394,6 +394,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
 
   pr-test-npu-finish:
