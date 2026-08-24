@@ -152,11 +152,19 @@ def _num_stages_for_extend_attention(Lq: int) -> int:
     (BLOCK_M=32, BLOCK_N=64, BLOCK_DMODEL=BLOCK_DV=512) needs 299008 bytes of
     shared memory at 3 stages against a 232448 byte limit, so 2 is the ceiling.
 
-    Anything not measured stays at 1. HIP in particular keeps 1: the gfx950
-    specialization already fights register spills (#34741), and raising the
-    pipeline depth there is untested.
+    Anything not measured stays at 1, which is every architecture other than
+    Hopper. That exclusion is deliberate rather than conservative boilerplate:
+
+    - sm120 (workstation Blackwell) picks BLOCK_N=128 for Lq<=128 precisely
+      because it only has 100 KiB of shared memory. Three stages of 128x128 K
+      and V tiles is 192 KiB, so the kernel would fail to compile there.
+    - sm100 (data-center Blackwell) uses its own block sizes to avoid PTX
+      register exhaustion, and deeper pipelining has not been measured against
+      that constraint.
+    - HIP keeps 1: the gfx950 specialization already fights register spills
+      (#34741), and raising the pipeline depth there is untested.
     """
-    if not _is_cuda or CUDA_CAPABILITY[0] < 9:
+    if not _is_cuda or CUDA_CAPABILITY[0] != 9:
         return 1
     return 3 if Lq <= 256 else 2
 
