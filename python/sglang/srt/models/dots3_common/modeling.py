@@ -141,10 +141,14 @@ _device_sm = get_device_sm()
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+    from sglang.kernels.ops.gemm.flashinfer_router_gemm import (
+        flashinfer_router_gemm,
+        is_flashinfer_router_gemm_supported,
+    )
 else:
     merge_state_v2 = None
-    dsv3_router_gemm = None
+    flashinfer_router_gemm = None
+    is_flashinfer_router_gemm_supported = None
 
 
 def _require_cuda() -> None:
@@ -263,13 +267,19 @@ class Dots3MoEGate(nn.Module):
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
         if (
-            hidden_states.shape[0] <= 16
-            and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
-            and _device_sm >= 90
+            _is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and is_flashinfer_router_gemm_supported(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                self.weight.shape[0],
+                torch.bfloat16,
+                _device_sm,
+            )
         ):
-            # router gemm output float32
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+            # Preserve the existing bfloat16 router-logit behavior.
+            logits = flashinfer_router_gemm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 

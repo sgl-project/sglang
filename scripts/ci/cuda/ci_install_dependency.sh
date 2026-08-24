@@ -373,7 +373,24 @@ uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
     # - flashinfer-jit-cache: 1.2+ GB
-    FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    FLASHINFER_PYTHON_SPEC=$(sed -n 's/^[[:space:]]*"\(flashinfer_python[^"]*\)",.*$/\1/p' python/pyproject.toml | head -n 1)
+    FLASHINFER_SOURCE_PINNED=false
+    FLASHINFER_SOURCE_REF=""
+    FLASHINFER_PYTHON_REQUIRED=""
+    if [[ "$FLASHINFER_PYTHON_SPEC" == *" @ git+"* ]]; then
+        FLASHINFER_SOURCE_PINNED=true
+        FLASHINFER_SOURCE_REF="${FLASHINFER_PYTHON_SPEC##*@}"
+        if [[ ! "$FLASHINFER_SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: FlashInfer VCS dependency must use a full 40-character commit SHA"
+            exit 1
+        fi
+    elif [[ "$FLASHINFER_PYTHON_SPEC" == *"=="* ]]; then
+        FLASHINFER_PYTHON_REQUIRED="${FLASHINFER_PYTHON_SPEC##*==}"
+    else
+        echo "ERROR: Could not determine the FlashInfer dependency from python/pyproject.toml"
+        exit 1
+    fi
+
     # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
     FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
     FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
@@ -383,23 +400,27 @@ uninstall_stale_flashinfer() {
     UNINSTALL_CUBIN=true
     UNINSTALL_JIT_CACHE=true
 
-    if [ "$FLASHINFER_CUBIN_INSTALLED" = "$FLASHINFER_CUBIN_REQUIRED" ] && [ -n "$FLASHINFER_CUBIN_REQUIRED" ]; then
-        echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, keeping it"
-        UNINSTALL_CUBIN=false
+    if [ "$FLASHINFER_SOURCE_PINNED" = true ]; then
+        echo "FlashInfer is source-pinned at ${FLASHINFER_SOURCE_REF}; removing binary cache packages"
     else
-        echo "flashinfer-cubin version mismatch (installed: ${FLASHINFER_CUBIN_INSTALLED:-none}, required: ${FLASHINFER_CUBIN_REQUIRED}), reinstalling"
-    fi
+        if [ "$FLASHINFER_CUBIN_INSTALLED" = "$FLASHINFER_CUBIN_REQUIRED" ] && [ -n "$FLASHINFER_CUBIN_REQUIRED" ]; then
+            echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, keeping it"
+            UNINSTALL_CUBIN=false
+        else
+            echo "flashinfer-cubin version mismatch (installed: ${FLASHINFER_CUBIN_INSTALLED:-none}, required: ${FLASHINFER_CUBIN_REQUIRED}), reinstalling"
+        fi
 
-    if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
-        UNINSTALL_JIT_CACHE=false
-    else
-        echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
-    fi
+        if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
+            UNINSTALL_JIT_CACHE=false
+        else
+            echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
+        fi
 
-    if [ "$UNINSTALL_JIT_CACHE" = false ] && [ "$FLASHINFER_JIT_CU_VERSION" != "$CU_VERSION" ]; then
-        echo "flashinfer-jit-cache CUDA version mismatch (installed: ${FLASHINFER_JIT_CU_VERSION:-none}, required: ${CU_VERSION}), will reinstall"
-        UNINSTALL_JIT_CACHE=true
+        if [ "$UNINSTALL_JIT_CACHE" = false ] && [ "$FLASHINFER_JIT_CU_VERSION" != "$CU_VERSION" ]; then
+            echo "flashinfer-jit-cache CUDA version mismatch (installed: ${FLASHINFER_JIT_CU_VERSION:-none}, required: ${CU_VERSION}), will reinstall"
+            UNINSTALL_JIT_CACHE=true
+        fi
     fi
 
     FLASHINFER_UNINSTALL="flashinfer-python"
@@ -491,7 +512,11 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    if [ "$FLASHINFER_SOURCE_PINNED" = true ]; then
+        BUILD_NVEP=0 $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    else
+        $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    fi
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -618,7 +643,9 @@ install_sglang_router() {
 }
 
 install_flashinfer_cubin() {
-    if [ "$UNINSTALL_CUBIN" = false ]; then
+    if [ "$FLASHINFER_SOURCE_PINNED" = true ]; then
+        echo "FlashInfer is source-pinned; skipping flashinfer-cubin"
+    elif [ "$UNINSTALL_CUBIN" = false ]; then
         echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
     else
         # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CU_VERSION} suffix
@@ -629,6 +656,12 @@ install_flashinfer_cubin() {
 }
 
 download_flashinfer_cache() {
+    if [ "$FLASHINFER_SOURCE_PINNED" = true ]; then
+        echo "FlashInfer is source-pinned; skipping flashinfer-jit-cache"
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
         FLASHINFER_PYTHON_REQUIRED="$FLASHINFER_PYTHON_REQUIRED" \
         CU_VERSION="$CU_VERSION" \
@@ -668,7 +701,7 @@ stabilize_flashinfer_jit_paths() {
     FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
     TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
 
-    FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
+    FI_VERSION="${FLASHINFER_SOURCE_REF:-$FLASHINFER_PYTHON_REQUIRED}"
     if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
         rm -rf "$STABLE_FI_DIR"
         mkdir -p "$STABLE_FI_DIR"

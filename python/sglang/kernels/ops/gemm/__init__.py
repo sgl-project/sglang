@@ -71,14 +71,14 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_router_gemm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.dsv3_router_gemm:dsv3_router_gemm",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.gemm.flashinfer_router_gemm:flashinfer_router_gemm",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
-            description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
+            description="Fixed-shape MoE router GEMM; num_tokens in [1, 16]",
         ),
-        description="DeepSeek-V3 router GEMM (sglang.kernels.jit, JIT-only).",
+        description="Small-token MoE router GEMM (FlashInfer, JIT-only).",
     )
 )
 
@@ -126,8 +126,8 @@ def dsv3_router_gemm(
     out_dtype: Optional[torch.dtype] = None,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """DeepSeek-V3 router GEMM (JIT-backed). ``out_dtype`` defaults to bfloat16."""
-    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.JIT)
+    """Small-token MoE router GEMM. ``out_dtype`` defaults to bfloat16."""
+    impl = get_kernel("gemm.dsv3_router_gemm", KernelBackend.FLASHINFER)
     if out_dtype is None:
         return impl(hidden_states, router_weights, output=output)
     return impl(hidden_states, router_weights, out_dtype, output)

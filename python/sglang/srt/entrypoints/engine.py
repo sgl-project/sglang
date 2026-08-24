@@ -1683,10 +1683,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         if "flashinfer" in server_args.get_attention_backends():
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.17",
-                "Please uninstall the old version and "
-                "reinstall the latest version by following the instructions "
-                "at https://docs.flashinfer.ai/installation.html.",
+                "0.6.18",
+                "Install the FlashInfer source revision pinned in "
+                "python/pyproject.toml for this branch.",
             )
         if _is_cuda:
             assert_pkg_version(

@@ -1,7 +1,7 @@
-"""Benchmark for DeepSeek V3 router GEMM (JIT kernel vs torch).
+"""Benchmark for the FlashInfer router GEMM adapter versus torch.
 
-Run on a Hopper (SM90+) GPU:
-    python -m sglang.kernels.jit.benchmark.bench_dsv3_router_gemm
+Run on a supported NVIDIA GPU:
+    python test/registered/kernels/benchmark/gemm/bench_dsv3_router_gemm.py
 """
 
 import torch
@@ -10,13 +10,24 @@ import torch.nn.functional as F
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.kernels.ops.gemm import dsv3_router_gemm
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=5, stage="jit-kernel-benchmark", runner_config="amd")
+
+SUPPORTED_DEVICE_SMS = {90, 100, 103, 107}
+ROUTER_GEMM_CONFIGS = [
+    (128, 7168, torch.bfloat16),
+    (256, 6144, torch.float32),
+    (256, 7168, torch.bfloat16),
+    (256, 7168, torch.float32),
+    (384, 7168, torch.bfloat16),
+    (384, 7168, torch.float32),
+    (896, 7168, torch.bfloat16),
+    (896, 7168, torch.float32),
+]
 
 
 def _torch(mat_a, mat_b, out_dtype):
@@ -24,16 +35,22 @@ def _torch(mat_a, mat_b, out_dtype):
 
 
 FN_MAP = {
-    "jit": dsv3_router_gemm,
+    "flashinfer": dsv3_router_gemm,
     "torch": _torch,
 }
 
 
-@marker.parametrize("num_experts", [256, 384], [256])
-@marker.parametrize("hidden_dim", [6144, 7168], [7168])
+@marker.parametrize(
+    "num_experts,hidden_dim,out_dtype",
+    ROUTER_GEMM_CONFIGS,
+    [
+        (256, 7168, torch.float32),
+        (384, 7168, torch.float32),
+        (896, 7168, torch.float32),
+    ],
+)
 @marker.parametrize("num_tokens", list(range(1, 17)), [1, 8, 16])
-@marker.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-@marker.benchmark("provider", ["jit", "torch"])
+@marker.benchmark("provider", ["flashinfer", "torch"])
 def benchmark(num_experts, hidden_dim, num_tokens, out_dtype, provider):
     mat_a = create_random(num_tokens, hidden_dim)
     mat_b = create_random(num_experts, hidden_dim)
@@ -45,9 +62,12 @@ def benchmark(num_experts, hidden_dim, num_tokens, out_dtype, provider):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    arch = get_jit_cuda_arch()
+    device_sm = arch.major * 10 + arch.minor
+    if is_hip_runtime() or device_sm not in SUPPORTED_DEVICE_SMS:
         print(
-            "dsv3_router_gemm JIT kernel requires SM90+ (Hopper). Skipping benchmark."
+            "FlashInfer router GEMM requires SM90, SM100, SM103, or SM107. "
+            "Skipping benchmark."
         )
     else:
         benchmark.run()

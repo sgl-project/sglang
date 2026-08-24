@@ -26,6 +26,7 @@ EXPECTED = {
     "layernorm.rmsnorm": {"aot", "jit", "aiter", "torch_npu", "torch", "torch_compile"},
     "layernorm.gemma_rmsnorm": {"aot", "jit", "torch_npu", "torch", "torch_compile"},
     "gemm.fp8_scaled_mm": {"aot"},
+    "gemm.dsv3_router_gemm": {"flashinfer"},
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
