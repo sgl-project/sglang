@@ -83,12 +83,14 @@ export const config = {
             ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
-            // Measured on the 5090: bf16 state serves at 0.92, fp32 needs
-            // 0.94 (an fp32 slot is 146.81 MiB vs bf16's 74.81).
+            // Measured on the 5090 at commit 1cf2b8c: fp32 serves at 0.94,
+            // bf16 at 0.93. bf16 moved UP from 0.92 with the dense-lm_head
+            // checkpoint -- the heavier weights need a larger static budget
+            // before the state pool fits.
             ...(sel.hw === "rtx5090"
               ? [sel.ssmDtype === "float32"
                   ? "--mem-fraction-static 0.94"
-                  : "--mem-fraction-static 0.92"]
+                  : "--mem-fraction-static 0.93"]
               : []),
           ],
         },
@@ -107,12 +109,42 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
             "--speculative-draft-attention-backend flashinfer",
-            // Measured on the 5090: bf16 state serves at 0.90, fp32 needs
-            // 0.92 — the opposite correction to EAGLE's (see above).
+            // Measured on the 5090 at commit 1cf2b8c: bf16 serves at 0.88,
+            // below the 0.90 this recipe carried when it was measured on an
+            // older build, because a draft model plus the automatic prefill
+            // CUDA-graph capture no longer fit there. fp32 is greyed out by the
+            // SSM dtype row. EAGLE and no-speculation are unaffected: replayssm
+            // keeps EAGLE's state pool tiny and no-spec loads no draft weights.
+            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
+          ],
+        },
+        {
+          id: "dflash", label: "DFLASH2",
+          // Trained block-diffusion draft, a separate checkpoint. The
+          // selector projects through the target lm_head — including
+          // quantized heads — so it runs on the NVFP4 checkpoint too.
+          // Validated on the SM120 pair (NVFP4 measured end to end; the
+          // RTX PRO 6000 BF16/FP8 cells boot-and-serve). The platforms where
+          // it has not been exercised carry verificationStatus "in-progress"
+          // on their cells.
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disableReason:
+            "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
+          stripPrefixes: (sel) =>
+            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+          flags: (sel) => [
+            "--speculative-algorithm DFLASH",
+            "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
+            "--speculative-num-draft-tokens 8",
+            // Measured on the 5090 at commit 1cf2b8c, the build the Install
+            // accordion pins. This is the only cell on the page that also needs
+            // a prefill chunk smaller than the engine default: at 0.91 the pools
+            // fit but a 2048-token chunk's activations do not. The pair together
+            // is the fastest recipe on this card (4.92ms median TPOT, 4.29
+            // accept length). fp32 is greyed out by the SSM dtype row.
             ...(sel.hw === "rtx5090"
-              ? [sel.ssmDtype === "float32"
-                  ? "--mem-fraction-static 0.92"
-                  : "--mem-fraction-static 0.90"]
+              ? ["--mem-fraction-static 0.91",
+                 "--chunked-prefill-size 1024"]
               : []),
           ],
         },
@@ -148,9 +180,34 @@ export const config = {
       title: "Mamba SSM Dtype",
       default: "float32",
       options: [
-        // Open on every platform, including with DSPARK on the 5090 (serves
-        // at mem-fraction 0.92 with the engine-default 2048 prefill chunk).
-        { id: "float32", label: "float32", flags: ["--mamba-ssm-dtype float32"] },
+        // Open on every platform except the 32GB RTX 5090 under DFLASH2:
+        // there the fp32 state pool and the prefill CUDA-graph capture cannot
+        // both fit, at any mem-fraction. Measured on main (2026-08-21, ratio
+        // pinned at 10 so slots are not the binding term): 0.945 and 0.92 OOM
+        // inside `Capture target prefill CUDA graph`, 0.90 OOMs on the first
+        // request, and 0.88 / 0.86 / 0.84 size the state pool below the 5 (LL)
+        // / 4 (HT) slots one request needs. bf16 state halves the pool and
+        // serves, and is the faster cell there anyway.
+        {
+          id: "float32", label: "float32",
+          // On the 32GB RTX 5090 a draft model plus an fp32 state pool no longer
+          // fit together: the checkpoint's dense lm_head adds ~3.2GB of weights,
+          // which pushes the pools up into the mem-fraction range where prefill
+          // CUDA-graph capture no longer fits. Measured across 0.86-0.96 at both
+          // prefill chunk sizes, plus balanced-ratio overrides up to 20: below
+          // ~0.92 the state pool never reaches the tier's slot count, and at or
+          // above it capture or the first request OOMs. An fp32 slot is 154MB
+          // against bfloat16's 78MB, which is why only fp32 is caught. EAGLE and
+          // no-speculation are unaffected -- replayssm keeps EAGLE's pool tiny
+          // and no-spec loads no draft weights at all.
+          disabled: (sel) =>
+            sel.hw === "rtx5090" &&
+            (sel.spec === "dflash" || sel.spec === "dspark"),
+          disableReason:
+            "On the 32GB RTX 5090 an fp32 GDN state pool and a speculative draft model " +
+            "do not fit together — use bfloat16",
+          flags: ["--mamba-ssm-dtype float32"],
+        },
         {
           id: "bfloat16", label: "bfloat16",
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
@@ -210,11 +267,14 @@ export const config = {
 
   dockerImages: {
     h200:    "lmsysorg/sglang:qwen38-27b",
-    rtx6000: "lmsysorg/sglang:qwen38-27b",
-    rtx5090: "lmsysorg/sglang:qwen38-27b",
+    // Both SM120 cards are validated on this image (built from 1cf2b8c, the
+    // commit every pin on those cards was measured against).
+    rtx6000: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
+    rtx5090: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
     // Multi-arch: this tag ships both linux/amd64 and linux/arm64, so it pulls
     // natively on DGX Spark (GB10 is aarch64).
-    "dgx-spark": "lmsysorg/sglang:qwen38-27b",
+    // Multi-arch (linux/amd64 + linux/arm64), so GB10 pulls it natively.
+    "dgx-spark": "lmsysorg/sglang:dev-qwen38-27b-dflash2",
     gb300:   "lmsysorg/sglang:dev",
   },
 
@@ -260,6 +320,11 @@ export const config = {
           flags: ["--speculative-algorithm DSPARK",
                   "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
                   "--speculative-draft-attention-backend flashinfer"] },
+        { id: "dflash",  label: "DFlash2",
+          // Same trio as the Deploy panel's DFLASH2 option.
+          flags: ["--speculative-algorithm DFLASH",
+                  "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
+                  "--speculative-num-draft-tokens 8"] },
       ],
     },
 
@@ -357,6 +422,10 @@ export const config = {
       // runnable, but not a recipe this page ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -376,6 +445,10 @@ export const config = {
       // H200, BF16 reference checkpoint (~54GB of weights).
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -481,28 +554,41 @@ export const config = {
     },
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
-    // cell. These cells reuse the RTX PRO 6000 recipe verbatim rather than a
-    // separate SM121 operating point: both cards are SM12x Blackwell, and
-    // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
-    // that fits the smaller card has headroom here.
+    // cell. These cells reuse the RTX PRO 6000 recipe at one lower
+    // mem-fraction rather than a separate SM121 operating point: both cards
+    // are SM12x Blackwell, and GB10's 128GB unified pool is larger than the
+    // 6000's 96GB, so a recipe that fits the smaller card has headroom here.
     //
-    // Validated on GB10 (SM121 / aarch64): all 36 configurations booted and
-    // served at ISL 8192 / OSL 1024, concurrency 1. Boot-and-serve only -- no
-    // throughput or acceptance-length numbers were taken, so this is a weaker
-    // standard than the SM120 pair's validation, and the Deploy-panel Note says
-    // so.
+    // Why 0.80 and not the 0.85 every other SM12x cell pins: the pool is
+    // unified, so mem-fraction prices the HOST's memory too. 0.85 of 128GB
+    // leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold —
+    // and the first long prefill or boot-time graph capture dips under it and
+    // gets the scheduler killed (exit code -15, no traceback; check
+    // `journalctl -u earlyoom`). Re-measured on 1cf2b8c (2026-08-21): at 0.85,
+    // 15 of 48 cells were SIGTERMed, and which 15 is margin noise, biased
+    // toward the big-state configs (bfloat16 SSM, DSPARK/DFLASH2 ratios); at
+    // 0.80 every cell served on every attempt.
+    //
+    // Validated on GB10 (SM121 / aarch64) at 1cf2b8c: all 48 configurations —
+    // DFLASH2 included — booted and served at ISL 8192 / OSL 1024,
+    // concurrency 1. Boot-and-serve only -- no throughput or acceptance-length
+    // numbers were taken, so this is a weaker standard than the SM120 pair's
+    // validation, and the Deploy-panel Note says so. NVFP4 was exercised with
+    // the BF16-LMHead export (same as the SM120 re-measurement); the
+    // packed-head export also served its DFLASH2 cells on this platform in the
+    // 12-cell DFLASH2 pass.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
-      // All 12 overlay combinations served on GB10. DSPARK here also
-      // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
-      // error.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included — its selector folded into the draft CUDA graph in all four
+      // of its cells here.
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -513,14 +599,16 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
-      // All 12 overlay combinations served on GB10.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included. This checkpoint held the sweep's most earlyoom-prone cells
+      // at 0.85 (every bfloat16-SSM pick was killed); all clean at 0.80.
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -531,15 +619,16 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
-      // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
-      // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included. Heaviest checkpoint (52GB, ~6.5 min to load its 18 shards
+      // from NVMe — budget ~10 min to READY before calling a boot hung).
       verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -555,6 +644,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -571,6 +664,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -587,6 +684,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",

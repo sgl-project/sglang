@@ -21,8 +21,8 @@ import torch.distributed as dist
 from cuda.bindings import driver as drv
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt import cuda_vmm_utils
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils import cuda_vmm_utils
+from sglang.srt.utils.cuda_vmm_utils import (
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
