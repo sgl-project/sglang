@@ -49,3 +49,7 @@ class QuantizationConfig(SRTQuantizationConfig):
     def quantizes_embedding(self, prefix: str) -> bool:
         """Whether this checkpoint config owns the named embedding table."""
         return False
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        """Translate checkpoint module names to the native model namespace."""
+        return
