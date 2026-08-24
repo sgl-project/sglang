@@ -111,7 +111,9 @@ class TestCPMLADispatch(CustomTestCase):
         )
         with (
             mock.patch.object(abh, "_is_hip", False),
-            mock.patch.object(cp_utils, "enable_cp_v2", return_value=True),
+            mock.patch.object(
+                cp_utils, "supports_generic_prefill_cp", return_value=True
+            ),
             mock.patch.object(cp_base, "_STRATEGY", ZigzagCPStrategy(cp_size=4)),
         ):
             for prefix in (0, 32):

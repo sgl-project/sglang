@@ -304,12 +304,12 @@ def compute_local_num_token_non_padded_cpu(
 def prefill_graph_tolerates_sum_len() -> bool:
     """Whether MegaMoE may replay prefill graphs with local shapes."""
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-    from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
+    from sglang.srt.layers.cp.utils import is_mla_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
+    return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
 
 @dataclass
