@@ -281,6 +281,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -324,12 +325,41 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        if self._aux_cache is not None:
+            self._aux_cache.free(req.req_pool_idx)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        if self._aux_cache is not None:
+            self._aux_cache.clear()
+
+    def attach_aux_cache(self, aux_cache: Any) -> None:
+        assert self._aux_cache is None
+        self._aux_cache = aux_cache
+
+    def reset_aux_cache_allocator(self) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.reset_allocator()
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        if self._aux_cache is None:
+            return physical_capacity
+        return self._aux_cache.dense_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.alloc_to_lengths(
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                target_seq_lens_cpu=target_seq_lens_cpu,
+            )
 
 
 class MambaPool:
@@ -1628,6 +1658,9 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
+    # state lives on the request pool instead, and the caller has to move it.
+    cpu_copy_carries_mamba: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3654,6 +3687,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
+    cpu_copy_carries_mamba = True
+
     def __init__(
         self,
         size: int,
@@ -4125,10 +4160,13 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
         if parallel.dcp_enabled:
@@ -4201,6 +4239,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         # loc is widened under DCP; the kernel divides by the world size itself.
         maybe_detect_oob(
@@ -4209,7 +4248,9 @@ class MLATokenToKVPool(KVCache):
             (self.size + self.page_size) * get_parallel().attn_dcp_size,
             "set_mla_kv_buffer (MLA)",
         )
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
             loc,
