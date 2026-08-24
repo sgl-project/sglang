@@ -525,9 +525,7 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __bfloat1622float2(bf_buf[j]);
-          // Scale down by an exact power of two so that values which overflow
-          // fp16 (and the fp16 accumulator that sums them) stay in range. Undone
-          // on store. See kQRFp16CastScaleLog2 in quick_all_reduce_base.h.
+          // Scale into fp16 range; undone on store. See kQRFp16CastScaleLog2 in quick_all_reduce_base.h.
           f.x *= kQRFp16CastInvScale;
           f.y *= kQRFp16CastInvScale;
           half_buf[j] = __float22half2_rn(f);
@@ -625,8 +623,7 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);
-          // Undo the load-side scale. Exact: a power of two only shifts the
-          // exponent, and the fp32 intermediate cannot overflow.
+          // Undo the load-side scale; exact, and the fp32 intermediate cannot overflow.
           f.x *= kQRFp16CastScale;
           f.y *= kQRFp16CastScale;
           bf16_buf[j] = __float22bfloat162_rn(f);
