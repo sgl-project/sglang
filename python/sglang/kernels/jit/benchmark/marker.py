@@ -1,3 +1,4 @@
+import builtins
 import contextlib
 import inspect
 import itertools
@@ -30,7 +31,7 @@ BENCH_CONFIG: TypeAlias = "List[Tuple[Tuple[str, ...], List[Tuple[Any, ...]]]]"
 UNIT_SCALE = {"us": 1e-6, "ms": 1e-3, "s": 1.0}
 TYPE_LIST = (bool, int, float, str, torch.dtype, torch.device, None.__class__)
 DISABLE_LOG_BANDWIDTH = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH") == "1"
-
+PATTERN: TypeAlias = "Literal['pow2']"
 
 __all__ = [
     "BenchResult",
@@ -172,12 +173,7 @@ class Table:
     def format_latency(r: float) -> str:
         if math.isnan(r):
             return "N/A"
-        length = len(str(int(r)))
-        if length < 5:
-            return f"{r:.4f}"
-        # decrease number of the digits
-        digits = max(0, 4 - (length - 5))
-        return f"{r:.{digits}f}"
+        return f"{r:.4f}"
 
     @staticmethod
     def format_bandwidth(b: float) -> str:
@@ -205,7 +201,7 @@ class Table:
         assert len(cells) == len(self._headers)
         self._rows.append([str(c) for c in cells])
 
-    def print(self) -> None:
+    def print(self, prefix: Optional[str], suffix: Optional[str]) -> None:
         widths = [
             max(max(len(c) + p for c in [h, *(r[i] for r in self._rows)]), mw)
             for i, (h, mw, p) in enumerate(zip(self._headers, self._mins, self._pads))
@@ -220,12 +216,18 @@ class Table:
                 parts.append(f"{cell:{a}{w}}")
             return "".join(parts)
 
+        if prefix is not None:
+            print("=" * total)
+            print(prefix)
         print("=" * total)
         print(fmt(self._headers))
         print("-" * total)
         for r in self._rows:
             print(fmt(r))
         print("=" * total)
+        if suffix is not None:
+            print(suffix)
+            print("=" * total)
 
 
 class Benchmark(Generic[F]):
@@ -292,7 +294,12 @@ class Benchmark(Generic[F]):
             bandwidth_results.append(bandwidths)
         return results, bandwidth_results, should_log_bandwidth
 
-    def run(self) -> None:
+    def run(
+        self,
+        *,
+        print_prefix: Optional[str] = None,
+        print_suffix: Optional[str] = None,
+    ) -> None:
         # Pre-check: every required fn param must be covered.
         flat_names = [n for names, _ in self._configs for n in names]
         kinds = (
@@ -332,7 +339,7 @@ class Benchmark(Generic[F]):
                 cells.extend(table.format_bandwidth(r[row_id]) for r in bandwidths)
             table.row(*cells)
 
-        table.print()
+        table.print(print_prefix, print_suffix)
 
 
 def benchmark(line_arg: str, line_vals: List[Any], *, unit: str = "us"):
@@ -403,14 +410,14 @@ def _do_bench_internal_graph(
 
     graph = torch.cuda.CUDAGraph()
     # NOTE: we rotate the buffer here to avoid L2 cache effect
-    for i in range(1, rotate_count):
+    for i in builtins.range(1, rotate_count):
         input_args_list[i] = tuple(
             (
                 _clone_recursive(input_args[j])
                 if j in graph_clone_args
                 else input_args[j]
             )
-            for j in range(len(input_args))
+            for j in builtins.range(len(input_args))
         )
         input_kwargs_list[i] = dict(
             (k, (_clone_recursive(v) if k in graph_clone_kwargs else v))
@@ -418,7 +425,7 @@ def _do_bench_internal_graph(
         )
     with graph_context:
         with torch.cuda.graph(graph, stream=stream):
-            for i in range(loop_count):
+            for i in builtins.range(loop_count):
                 args = input_args_list[i % rotate_count]
                 kwargs = input_kwargs_list[i % rotate_count]
                 fn(*args, **kwargs)
@@ -428,7 +435,7 @@ def _do_bench_internal_graph(
     # then replay the graph and measure the time
     tic = torch.cuda.Event(enable_timing=True)
     toc = torch.cuda.Event(enable_timing=True)
-    for _ in range(max(replay_iters // loop_count, 10)):
+    for _ in builtins.range(max(replay_iters // loop_count, 10)):
         empty_tensor.zero_()  # cold the L2 cache
         sync_multigpu_fn()  # sync GPU before each iteration for precise timing
         tic.record(stream)
@@ -445,7 +452,7 @@ def do_bench(
     input_args: Tuple[Any, ...] = (),
     input_kwargs: Dict[str, Any] = {},
     use_cuda_graph: bool = True,
-    warmup_iters: int = 50,
+    warmup_iters: int = 20,
     replay_iters: int = 1000,
     metrics: Tuple[Metric, ...] = (0.5, "avg"),
     stream: torch.cuda.Stream | None = None,
@@ -460,6 +467,7 @@ def do_bench(
     extra_memory_footprint: int = 0,
     graph_context_fn: Optional[Callable[[], ContextManager]] = None,
     sync_multigpu_fn: Optional[Callable[[], Any]] = None,
+    estimated_time_ms: Optional[float] = 1.0,
 ) -> BenchResult:
     """
     Benchmark a function using CUDA graph or naive loop.
@@ -489,6 +497,9 @@ def do_bench(
     :param sync_multigpu_fn: A callable to synchronize multiple GPUs before each iteration. For precise
                              benchmark number in multi-GPU benchmark, it should be some synchronization
                              primitive on GPU side (not on CPU side).
+    :param estimated_time_ms: Estimated time in milliseconds for the benchmark without CUDA graph.
+                              This is typically used to control the benchmark time.
+                              Ignored if `use_cuda_graph` is True.
     """
     # first warmup the function
     device_id = torch.cuda.current_device()
@@ -500,12 +511,12 @@ def do_bench(
     with torch.cuda.device(device_id), torch.cuda.stream(stream):
         stream.wait_stream(old_current_stream)
         sync_multigpu_fn()
-        for _ in range(warmup_iters):
+        for _ in builtins.range(warmup_iters):
             fn(*input_args, **input_kwargs)
         if use_cuda_graph:
             # NOTE: by default, reduce all the CPU-side overhead
             if graph_clone_args == "all":
-                graph_clone_args = range(len(input_args))
+                graph_clone_args = builtins.range(len(input_args))
             elif graph_clone_args is None:
                 graph_clone_args = []
             if graph_clone_kwargs == "all":
@@ -532,7 +543,18 @@ def do_bench(
             tic = torch.cuda.Event(enable_timing=True)
             toc = torch.cuda.Event(enable_timing=True)
             empty_tensor = _get_flush_l2_buffer()
-            for _ in range(max(replay_iters, 10)):
+            if estimated_time_ms is not None:
+                empty_tensor.zero_()  # cold the L2 cache
+                sync_multigpu_fn()
+                tic.record(stream)
+                fn(*input_args, **input_kwargs)
+                toc.record(stream)
+                stream.synchronize()
+                duration_ms = tic.elapsed_time(toc)
+                estimted_iters = int(estimated_time_ms / duration_ms)
+                replay_iters = min(replay_iters, estimted_iters)
+
+            for _ in builtins.range(max(replay_iters, 10)):
                 empty_tensor.zero_()  # cold the L2 cache
                 sync_multigpu_fn()
                 tic.record(stream)
@@ -555,3 +577,9 @@ def do_bench(
         memory_footprint += _get_nbytes_recursive(memory_output)
 
     return BenchResult(metrics, result, memory_footprint)
+
+
+def range(*args, pattern: PATTERN) -> List[int]:
+    # TODO: support other patterns
+    assert pattern == "pow2", f"unsupported pattern: {pattern}"
+    return [2**i for i in builtins.range(*args)]

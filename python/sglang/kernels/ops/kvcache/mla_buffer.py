@@ -80,13 +80,6 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# Above this loc count the TMA bulk-store path overtakes the single-CTA-per-loc
-# Triton kernel. Below it, Triton with BLOCK = next_pow2(total_dim) (one CTA
-# does the whole row in one tile, no boundary fan-out) is the winning fallback.
-# Tuned on GB300 with DSv4 row widths.
-_TMA_BULK_STORE_MIN_LOCS = 768
-
-
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
@@ -127,8 +120,7 @@ def set_mla_kv_buffer_triton(
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
     if (
-        n_loc >= _TMA_BULK_STORE_MIN_LOCS
-        and is_arch_support_pdl()
+        is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
         and not get_parallel().dcp_enabled
     ):

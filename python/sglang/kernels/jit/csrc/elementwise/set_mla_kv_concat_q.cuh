@@ -52,9 +52,6 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   constexpr int kQNopeDim = static_cast<int>(kNopeBytes / sizeof(bf16_t));
   constexpr int kQRopeDim = static_cast<int>(kRopeBytes / sizeof(bf16_t));
 
-  // Per-warp smem slots for the KV scatter role; concat warps leave theirs idle.
-  __shared__ alignas(16) uint8_t smem[kNumWarps][kRowBytes];
-
   const uint32_t warp_in_cta = threadIdx.x / kWarpThreads;
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t flat_warp = blockIdx.x * kNumWarps + warp_in_cta;
@@ -64,33 +61,19 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   if (flat_warp < params.batch_size) {
     // --- KV scatter role: one warp per token (smem staging + TMA bulk store) ---
     const uint32_t item_id = flat_warp;
-    const int64_t loc = static_cast<int64_t>(static_cast<const TLoc*>(params.loc)[item_id]);
+    const auto loc = static_cast<const TLoc*>(params.loc)[item_id];
 
     const auto nope_src = pointer::offset(params.k_nope, item_id * params.stride_nope_bytes);
     const auto rope_src = pointer::offset(params.k_rope, item_id * params.stride_rope_bytes);
-    void* const gmem_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
 
-    warp::copy_bytes<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
-    warp::copy_bytes<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
+    using enum warp::LoadStorePattern::type;
+    const auto nope = warp::load_bytes<kNopeBytes, WARP_UNIFORM_16B>(nope_src);
+    const auto rope = warp::load_bytes<kRopeBytes, WARP_UNIFORM_16B>(rope_src);
 
-    // TMA reads smem via the async proxy; fence so it can't observe stale sts.
-    __syncwarp();
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-
-    // elect.sync rather than `lane_id == 0`: the TMA issue must not sit
-    // behind a lane-index predicate (see PR review).
-    if (device::warp::elect_one_lane()) {
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_global,
-          cuda::ptx::space_shared,
-          gmem_dst,
-          &smem[warp_in_cta][0],
-          static_cast<uint32_t>(kRowBytes));
-    }
-
-    // ``wait_group`` (not ``_read``): waits for gmem commit, not just smem reuse.
-    cuda::ptx::cp_async_bulk_commit_group();
-    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    const auto nope_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
+    const auto rope_dst = pointer::offset(nope_dst, kNopeBytes);
+    warp::store_bytes<kNopeBytes, WARP_UNIFORM_16B>(nope_dst, nope);
+    warp::store_bytes<kRopeBytes, WARP_UNIFORM_16B>(rope_dst, rope);
   } else if (flat_warp - params.batch_size < params.num_q_items) {
     // --- Q concat role: one warp per (token, head) row ---
     const uint32_t q_item = flat_warp - params.batch_size;
@@ -223,7 +206,7 @@ struct SetMlaKVConcatQKernel {
     // Alignment tripwires. The device code does 16-byte vector accesses on the
     // kv row / nope rows / q rows and 4-byte accesses on the rope rows; the
     // python-side ``covered()`` mirrors these so uncovered layouts fall back
-    // instead of faulting (do NOT assume "PyTorch tensors are aligned" — views
+    // instead of faulting (do NOT assume "PyTorch tensors are aligned" -- views
     // and odd pool pitches break that).
     const auto aligned = [](const void* ptr, int64_t align) {
       return reinterpret_cast<uintptr_t>(ptr) % static_cast<uintptr_t>(align) == 0;

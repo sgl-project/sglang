@@ -17,7 +17,7 @@ BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
 BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 16399])
 HIDDEN_DIMS = get_ci_test_range(
-    [64, 128, 256, 512, 1024, 96, 98, 100], [64, 512, 1024, 98]
+    [64, 128, 256, 512, 1024, 96, 97, 100], [64, 512, 1024, 97]
 )
 CACHE_SIZE = 1024 * 1024
 DTYPE = torch.bfloat16
@@ -35,7 +35,6 @@ def test_store_cache(batch_size: int, element_dim: int) -> None:
     v_cache = torch.randn((CACHE_SIZE, element_dim), dtype=DTYPE, device=DEVICE)
     indices = torch.randperm(CACHE_SIZE - 1, device=DEVICE)[:batch_size] + 1
 
-    # AOT store cache
     store_cache(k, v, k_cache, v_cache, indices)
 
     assert torch.all(k_cache[indices] == k)
@@ -89,10 +88,7 @@ def test_store_cache_int32_indices(batch_size: int, element_dim: int) -> None:
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("num_split", [1, 2, 4])
-def test_store_cache_reserved_skip_index(
-    index_dtype: torch.dtype, num_split: int
-) -> None:
+def test_store_cache_reserved_skip_index(index_dtype: torch.dtype) -> None:
     element_dim = 1024
     k = torch.randn((4, element_dim), dtype=DTYPE, device=DEVICE)
     v = torch.randn((4, element_dim), dtype=DTYPE, device=DEVICE)
@@ -112,7 +108,6 @@ def test_store_cache_reserved_skip_index(
         k_cache,
         v_cache,
         indices,
-        num_split=num_split,
     )
 
     torch.testing.assert_close(k_cache[0], reserved_k_before, rtol=0.0, atol=0.0)
@@ -135,43 +130,6 @@ def test_store_cache_zero_index_can_be_written_when_skip_disabled() -> None:
 
     torch.testing.assert_close(k_cache[0], k[0], rtol=0.0, atol=0.0)
     torch.testing.assert_close(v_cache[0], v[0], rtol=0.0, atol=0.0)
-
-
-def _valid_num_splits(element_dim: int, dtype: torch.dtype) -> list:
-    """Return the list of valid num_split values for a given element_dim/dtype."""
-    row_bytes = element_dim * dtype.itemsize
-    splits = [1]
-    if row_bytes % (2 * 128) == 0:
-        splits.append(2)
-    if row_bytes % (4 * 128) == 0:
-        splits.append(4)
-    return splits
-
-
-_NUM_SPLIT_CASES = [
-    (_dim, _ns, _dtype)
-    for _dtype in [torch.float16, torch.bfloat16, torch.float32]
-    for _dim in REPR_DIMS
-    for _ns in _valid_num_splits(_dim, _dtype)
-]
-
-
-@pytest.mark.parametrize("element_dim,num_split,dtype", _NUM_SPLIT_CASES)
-def test_store_cache_num_split(
-    element_dim: int, num_split: int, dtype: torch.dtype
-) -> None:
-    batch_size = 128
-    k = torch.randn((batch_size, element_dim), dtype=dtype, device=DEVICE)
-    v = torch.randn((batch_size, element_dim), dtype=dtype, device=DEVICE)
-    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
-    v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
-    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
-
-    # Verify each num_split kernel path (1, 2, 4) produces correct results
-    store_cache(k, v, k_cache, v_cache, indices, num_split=num_split)
-
-    assert torch.all(k_cache[indices] == k)
-    assert torch.all(v_cache[indices] == v)
 
 
 # Asymmetric K/V (head_dim != v_head_dim): different row widths AND cache strides.
@@ -206,55 +164,6 @@ def test_store_cache_asymmetric(k_dim: int, v_dim: int, dtype: torch.dtype) -> N
     untouched[indices] = False
     assert torch.all(k_cache[untouched] == k_before[untouched])
     assert torch.all(v_cache[untouched] == v_before[untouched])
-
-
-def _valid_asym_num_splits(k_dim: int, v_dim: int, dtype: torch.dtype) -> list:
-    """num_split values valid for BOTH rows; a split must divide each of them."""
-    k_bytes, v_bytes = k_dim * dtype.itemsize, v_dim * dtype.itemsize
-    splits = [1]
-    if k_bytes % (2 * 128) == 0 and v_bytes % (2 * 128) == 0:
-        splits.append(2)
-    if k_bytes % (4 * 128) == 0 and v_bytes % (4 * 128) == 0:
-        splits.append(4)
-    return splits
-
-
-def _default_num_split(k_dim: int, v_dim: int, dtype: torch.dtype) -> int:
-    """Mirrors the heuristic in store_cache(); the default is already exercised
-    by test_store_cache_asymmetric, which does not pass num_split."""
-    k_bytes, v_bytes = k_dim * dtype.itemsize, v_dim * dtype.itemsize
-    if k_bytes % 2048 == 0 and v_bytes % 2048 == 0:
-        return 4
-    if k_bytes % 1024 == 0 and v_bytes % 1024 == 0:
-        return 2
-    return 1
-
-
-# Only splits the default heuristic would NOT pick: the split gate is two-sided
-# (K and V must both align), so the off-default branches are what needs pinning.
-_ASYM_NUM_SPLIT_CASES = [
-    (_k, _v, _ns)
-    for _k, _v in ASYM_DIM_PAIRS
-    for _ns in _valid_asym_num_splits(_k, _v, DTYPE)
-    if _ns != _default_num_split(_k, _v, DTYPE)
-]
-
-
-@pytest.mark.parametrize("k_dim,v_dim,num_split", _ASYM_NUM_SPLIT_CASES)
-def test_store_cache_asymmetric_num_split(
-    k_dim: int, v_dim: int, num_split: int
-) -> None:
-    batch_size = 128
-    k = torch.randn((batch_size, k_dim), dtype=DTYPE, device=DEVICE)
-    v = torch.randn((batch_size, v_dim), dtype=DTYPE, device=DEVICE)
-    k_cache = torch.randn((SMALL_CACHE, k_dim), dtype=DTYPE, device=DEVICE)
-    v_cache = torch.randn((SMALL_CACHE, v_dim), dtype=DTYPE, device=DEVICE)
-    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
-
-    store_cache(k, v, k_cache, v_cache, indices, num_split=num_split)
-
-    assert torch.all(k_cache[indices] == k)
-    assert torch.all(v_cache[indices] == v)
 
 
 def test_can_use_store_cache() -> None:
