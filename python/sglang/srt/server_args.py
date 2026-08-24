@@ -5542,8 +5542,8 @@ class ServerArgs:
         else:
             # Spec decoding case: less padding for smaller batch sizes
             capture_bs = (
-                list(range(1, 9, 1))
-                + list(range(10, 33, 2))
+                list(range(1, 17, 1))
+                + list(range(18, 33, 2))
                 + list(range(40, 65, 4))
                 + list(range(72, 257, 8))
                 + list(range(272, max_bs + 1, 16))

@@ -48,6 +48,10 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_speculative_cuda_graph_captures_small_odd_batch(self):
+        args = ServerArgs(model_path="dummy", speculative_algorithm="EAGLE")
+        self.assertIn(9, args._generate_decode_cuda_graph_batch_sizes(32))
+
     def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
