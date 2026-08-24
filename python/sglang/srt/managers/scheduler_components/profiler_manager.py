@@ -570,6 +570,12 @@ class SchedulerProfilerManager:
                             self.nsys_exact_warmup_batches_seen,
                         )
                     self._start_profile()
+                    if self.nsys_exact_batch:
+                        # cudaProfiler/NVTX capture startup is not equally fast
+                        # on every process. Do not let an early rank enter the
+                        # first measured symmetric-memory collective while a
+                        # peer is still arming Nsight.
+                        torch.distributed.barrier(self.exact_nsys_cpu_group)
             if (
                 self.nsys_exact_batch
                 and self.profile_in_progress

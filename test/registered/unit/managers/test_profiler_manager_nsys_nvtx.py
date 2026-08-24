@@ -182,7 +182,8 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
 
     start_profile.assert_called_once_with()
     stop_profile.assert_called_once_with()
-    assert barrier.call_count == 2
+    # One post-start barrier plus the pre/post-stop pair.
+    assert barrier.call_count == 3
 
 
 def test_nsys_exact_capture_fails_closed_if_batch_shape_changes():
@@ -229,7 +230,7 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
         patch.object(manager, "_start_profile") as start_profile,
         patch.object(manager, "_stop_profile") as stop_profile,
         patch("torch.distributed.all_reduce", side_effect=mark_any_rank_ready) as reduce,
-        patch("torch.distributed.barrier"),
+        patch("torch.distributed.barrier") as barrier,
     ):
         start_profile.side_effect = lambda: setattr(
             manager, "profile_in_progress", True
@@ -259,3 +260,4 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
 
     start_profile.assert_called_once_with()
     stop_profile.assert_called_once_with()
+    assert barrier.call_count == 3
