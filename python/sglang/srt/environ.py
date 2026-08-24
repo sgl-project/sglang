@@ -845,6 +845,10 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    # Serve decode and single-request prefill through the exported
+    # whole-model MLX region on Apple MPS (experimental; anything the
+    # region cannot serve falls back to the eager Torch path per batch).
+    SGLANG_ENABLE_MLX_WHOLE_REGION = EnvBool(False)
     # Debug hooks for exercising the export path outside torch.export
     # (eager attention reference, KV-delta capture); never set in serving.
     SGLANG_DEBUG_MLX_EXPORT_VALIDATE = EnvBool(False)
