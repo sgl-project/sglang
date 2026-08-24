@@ -55,7 +55,20 @@ def _apply_dsa_interleave_half_rope(
         )
 
     rope_cache = forward_batch.npu_dsa_interleave_half_rope_cache
-    if rope_cache is None:
+    # Graph-capture safety: the capture flow runs the forward twice on the
+    # SAME forward_batch before capturing. The first warmup latches
+    # rope_cache with warmup-time positions; the capture run then takes the
+    # cached branch, so the index_select(positions) compute chain is NEVER
+    # recorded into the graph and every replay would rotate q_pe/k_pe with
+    # frozen warmup-time angles. Recompute while capturing so the chain IS
+    # recorded and replays with the live positions buffer. Eager keeps the
+    # per-forward latch (fresh ForwardBatch each step).
+    _capturing = False
+    try:
+        _capturing = torch.npu.is_current_stream_capturing()
+    except (AttributeError, RuntimeError):
+        pass
+    if rope_cache is None or _capturing:
         m.rotary_emb.get_cos_sin_with_position(positions)
         rope_cache = (
             m.rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype),

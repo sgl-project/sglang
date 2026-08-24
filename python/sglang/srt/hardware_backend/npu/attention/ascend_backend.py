@@ -923,7 +923,13 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = seq_lens
+        # Own buffer, NOT an alias of forward_batch.seq_lens: all per-step
+        # draft backends receive the SAME runner static buffer, so an alias
+        # would chain-add each backend's replay-time refresh (seq_lens +
+        # step_offset, copied back in place) across backends — every draft
+        # step would read the LAST backend's shifted value and attend past
+        # the valid KV into uninitialized slots.
+        metadata.seq_lens = seq_lens.clone()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -1035,6 +1041,16 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        # Refresh actual_seq_lengths_kv together with seq_lens: the DSA
+        # path bakes this tensor at capture, so without a per-replay
+        # refresh the drafted graph's attention would keep reading the
+        # capture-time KV length and attend past the valid KV into
+        # uninitialized slots.
+        if getattr(metadata, "actual_seq_lengths_kv", None) is not None:
+            metadata.actual_seq_lengths_kv[:bs].copy_(
+                seq_lens[:bs].to(metadata.actual_seq_lengths_kv.dtype)
+            )
 
         self.forward_metadata = metadata
 

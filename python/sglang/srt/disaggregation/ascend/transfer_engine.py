@@ -39,8 +39,13 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.hostname = hostname
         self.npu_id = npu_id
 
-        # Centralized storage address of the AscendTransferEngine
-        self.store_url = os.getenv("ASCEND_MF_STORE_URL")
+        # Centralized storage address of the AscendTransferEngine.
+        # MF_CONFIG_STORE_URL is the C-layer canonical name; fall back to it
+        # so a None never reaches the pybind `const char*` overload (nullptr
+        # -> std::string throws "basic_string::_S_construct null not valid").
+        self.store_url = os.getenv("ASCEND_MF_STORE_URL") or os.getenv(
+            "MF_CONFIG_STORE_URL"
+        )
         if disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = "Prefill"
         elif disaggregation_mode == DisaggregationMode.DECODE:

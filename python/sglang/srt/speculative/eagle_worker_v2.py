@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -559,7 +560,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
-
         return build_eagle_verify_input(
             batch,
             draft_input,

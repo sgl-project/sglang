@@ -9,16 +9,12 @@ See design document Section 9.4 for the full specification.
 
 from __future__ import annotations
 
-import logging
-
 import torch
 
 from sglang.srt.utils.common import is_npu
 
 if is_npu():
     import torch_npu
-
-logger = logging.getLogger(__name__)
 
 DSA_KV_QUANT_TILE_SIZE = 128
 
@@ -195,20 +191,6 @@ def selective_sparse_attention(
         )
 
     # === SFA BSND ===
-    if not graph_mode and logger.isEnabledFor(logging.INFO):
-        n_valid_per_q = valid.sum(dim=1)
-        kv_nope_nonzero = (
-            k_nope_sfa[:T].abs().sum(dim=-1) > 0
-        ).sum().item()
-        logger.info(
-            f"[SFA] T={T} K={K} H={H} "
-            f"valid_kv_per_q=[{n_valid_per_q.min().item()},"
-            f"{n_valid_per_q.max().item()}] "
-            f"kv_nonzero={kv_nope_nonzero}/{T*K} "
-            f"q_nope_norm={q_nope_sfa[:T].abs().mean().item():.6f} "
-            f"k_nope_norm={k_nope_sfa[:T].abs().mean().item():.6f}"
-        )
-
     ret = torch_npu.npu_sparse_flash_attention(
         q_nope_sfa,                  # [T, 1, H, 512]
         k_nope_sfa,                  # [T, K, 1, 512]
@@ -239,13 +221,6 @@ def selective_sparse_attention(
         torch.zeros_like(attn_out),
         attn_out,
     )
-
-    if not graph_mode and logger.isEnabledFor(logging.INFO):
-        logger.info(
-            f"[SFA] out_shape={list(attn_out.shape)} "
-            f"out_norm={attn_out.abs().mean().item():.6f} "
-            f"out_has_nan={torch.isnan(attn_out).any().item()}"
-        )
 
     # [T, 1, H, 512] → [T, H * 512]
     return attn_out[:, 0, :, :].reshape(T, H * kv_lora_rank)

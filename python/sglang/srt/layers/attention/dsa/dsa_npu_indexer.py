@@ -225,10 +225,6 @@ class DSANPUIndexerMixin:
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
-        else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -240,7 +236,14 @@ class DSANPUIndexerMixin:
             and not get_attn_backend().graph_mode
             and forward_batch.forward_mode.is_idle()
         ):
+            # Idle early-return must precede the forward_metadata access:
+            # eager _execute_idle drops forward_metadata (None) for
+            # unpadded idle batches before running the model forward.
             return torch.empty((0, self.index_topk), dtype=torch.int32, device=x.device)
+        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+        else:
+            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
 
         kv_pool = get_token_to_kv_pool()
         use_quant_lightning_indexer = kv_pool.enable_npu_quant_lightning_indexer

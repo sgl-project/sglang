@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -52,7 +53,7 @@ class NPUSelectiveACLCallback:
     """ACL host-callback thread for async H2D under NPUGraph.
 
     A daemon thread per device loops on ``acl.rt.process_report(100)`` so that
-    ``sparse_copy`` H2D async copies work correctly inside captured
+    ``varlen_copy`` H2D async copies work correctly inside captured
     NPU graphs.
     """
 
@@ -141,7 +142,7 @@ class SelectiveHostKVPool:
     in Host DRAM.  The region is registered with memfabric's offload URMA pool
     so that it has both a Host Virtual Address (HVA) and a Device-Visible
     Address (DVA).  The DVA allows NPU DMA to read/write Host memory directly
-    via ``mf_offload.sparse_copy`` (DVA scatter-copy).
+    via ``mf_offload.varlen_copy`` (DVA scatter-copy).
     """
 
     def __init__(
@@ -367,14 +368,22 @@ class NPUSelectiveHiSparseCoordinator:
         # Active prefetch state
         self.active_prefetch: Optional[SelectedPrefetchState] = None
 
-        # Published new packed KV per layer (for current patch)
-        self._published_packed: dict[int, torch.Tensor] = {}
+        # Latest D2H event across ALL selected layers (eager mode only):
+        # new_packed_scratch is shared, so overwriting it must wait for the
+        # latest in-flight D2H read. backup_stream is single-stream
+        # serialized, so the latest event subsumes all earlier ones.
+        self._last_backup_event: Optional[torch.npu.Event] = None
 
         # Graph mode state
         self._graph_mode = False
         self._selective_real_tokens = torch.tensor(
             0, dtype=torch.int32, device=self.device
         )
+
+        # [HiSparse-H2D] logging gate (SGLANG_SELECTIVE_H2D_LOG=1): print
+        # submitted-entry counts for the first selected layers (< 10, i.e.
+        # L5/L9). Host-side values only — safe in both eager and graph.
+        self._h2d_log = os.getenv("SGLANG_SELECTIVE_H2D_LOG", "0") == "1"
 
         logger.info(
             f"NPUSelectiveHiSparseCoordinator: selected={self.selected_layer_ids_sorted}, "
@@ -403,37 +412,96 @@ class NPUSelectiveHiSparseCoordinator:
         K = self.topk
         R = self.record_bytes
 
-        self.packed_staging = torch.zeros(
-            T, K, R, dtype=torch.uint8, device=self.device
+        # Staging ping-pong: slices alternating by the layer's position in
+        # the selected list (~193MB each at Tcap=144, fixed, layer count
+        # independent) — same shape as the workspace ping-pong below.
+        # Safety: adjacent selected layers are 4 apart (5, 9, 13, ...) and
+        # use adjacent sets; a set is re-written only 4*n_slices model
+        # layers later, after its reader's patch/SFA has consumed it. Env
+        # raises isolation above the default 2; pool_configurator reads the
+        # same env for the fixed-bias estimate.
+        _staging_slices = int(
+            os.getenv("SGLANG_SELECTIVE_STAGING_SLICES", "2")
         )
-        self.unpack_k_nope_bf16 = torch.zeros(
-            T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
+        self._staging_slices = _staging_slices
+        self.packed_staging_all = torch.zeros(
+            _staging_slices,
+            T,
+            K,
+            R,
+            dtype=torch.uint8,
+            device=self.device,
         )
-        self.unpack_k_rope_bf16 = torch.zeros(
-            T, K, self.qk_rope_head_dim, dtype=torch.bfloat16, device=self.device
+        # Unpack/workspace ping-pong: the unpack chain and SFA share these
+        # buffers across layers — layer L's SFA (compute queue) reads
+        # unpack_k_* while layer L+4's unpack chain (torch ops) may already
+        # overwrite them. Production shape: TWO sets alternating by
+        # selected-layer parity (buffer = ws[_si % 2]). Safety: adjacent
+        # selected layers are 4 apart (5, 9, 13, ...), so when layer L's SFA
+        # still reads set p, the earliest writer is layer L+4 which uses set
+        # p^1 — read and write never share a set. Memory: +510MB total,
+        # independent of layer count. Env raises isolation above 2;
+        # pool_configurator reads the same env for the fixed-bias estimate.
+        self._n_ws = int(
+            os.getenv("SGLANG_SELECTIVE_UNPACK_WS", "2")
         )
+        n_ws = self._n_ws
+        self.unpack_k_nope_bf16_all = torch.zeros(
+            n_ws, T, K, self.kv_lora_rank, dtype=torch.bfloat16, device=self.device
+        )
+        self.unpack_k_rope_bf16_all = torch.zeros(
+            n_ws, T, K, self.qk_rope_head_dim, dtype=torch.bfloat16, device=self.device
+        )
+        # Fixed-address scratch holding the current forward's newly packed
+        # KV: publish_new_packed_kv copies into it and the selected layer's
+        # current-patch reads from it — a stable pre-allocated buffer instead
+        # of a Python-held reference to a graph-pool tensor (already counted
+        # in the pool configurator's selective fixed bias).
+        # PER-LAYER: a single shared scratch would let layer L+4's overwrite
+        # race layer L's in-flight D2H read inside one graph replay. One
+        # [T, R] slice per selected layer removes the cross-layer window;
+        # the extra memory is num_selected * T * R bytes (trivial vs
+        # packed_staging). Layer index resolved in Python at capture time
+        # (bakes a fixed view into the graph).
+        self.new_packed_scratch_all = torch.zeros(
+            len(self.selected_layer_ids_sorted),
+            T,
+            R,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        self._layer_scratch_index: dict[int, int] = {
+            lid: i for i, lid in enumerate(self.selected_layer_ids_sorted)
+        }
         # Contiguous component buffers for safe Cast (avoid non-contiguous FP8→BF16)
+        # — per-workspace-set slices (same ping-pong family as above).
         TK = T * K
-        self.fp8_nope_buf = torch.zeros(
-            TK, self.kv_lora_rank, dtype=torch.float8_e4m3fn, device=self.device
+        self.fp8_nope_buf_all = torch.zeros(
+            n_ws, TK, self.kv_lora_rank, dtype=torch.float8_e4m3fn, device=self.device
         )
-        self.scales_buf = torch.zeros(
-            TK, self.kv_lora_rank // 128, dtype=torch.float32, device=self.device
+        self.scales_buf_all = torch.zeros(
+            n_ws, TK, self.kv_lora_rank // 128, dtype=torch.float32, device=self.device
         )
-        self.host_locs_buf = torch.zeros(
-            T, K, dtype=torch.int64, device=self.device
+        # Per-layer loc-plan buffers: build_loc_plan rewrites these two for
+        # EVERY selected layer while the PREVIOUS layer's H2D copy /
+        # current-patch / SFA still consume its plan (gather_locs feed the
+        # DMA descriptors, current_source_row feeds the patch). int64 [T, K]
+        # x2 per layer is ~4.8MB/layer — cheap, so split fully per layer.
+        _n_lp = len(self.selected_layer_ids_sorted)
+        self.host_locs_buf_all = torch.zeros(
+            _n_lp, T, K, dtype=torch.int64, device=self.device
         )
-        self.current_source_row_buf = torch.full(
-            (T, K), -1, dtype=torch.int64, device=self.device
+        self.current_source_row_buf_all = torch.full(
+            (_n_lp, T, K), -1, dtype=torch.int64, device=self.device
         )
-        self.sparse_indices_buf = torch.zeros(
-            T, 1, 1, K, dtype=torch.int32, device=self.device
+        self.sparse_indices_buf_all = torch.zeros(
+            n_ws, T, 1, 1, K, dtype=torch.int32, device=self.device
         )
-        self.actual_seq_lens_kv_buf = torch.ones(
-            T, dtype=torch.int32, device=self.device
+        self.actual_seq_lens_kv_buf_all = torch.ones(
+            n_ws, T, dtype=torch.int32, device=self.device
         )
-        self.actual_seq_lens_q_buf = torch.ones(
-            T, dtype=torch.int32, device=self.device
+        self.actual_seq_lens_q_buf_all = torch.ones(
+            n_ws, T, dtype=torch.int32, device=self.device
         )
         self.arange_k_buf = torch.arange(
             K, dtype=torch.int32, device=self.device
@@ -442,65 +510,86 @@ class NPUSelectiveHiSparseCoordinator:
             T, dtype=torch.int32, device=self.device
         )
 
-        # Pre-allocated pointer arrays for mf_offload.sparse_copy.
+        # Pre-allocated pointer arrays for mf_offload.varlen_copy.
         # H2D and D2H run on separate streams (prefetch_stream / backup_stream)
         # and MUST have independent pointer buffers to avoid races when both
         # are in flight simultaneously.
+        # PER-LAYER: if all selected layers shared one descriptor set, a
+        # layer's torch writes could overwrite the descriptors while the
+        # previous layer's captured copy kernel is still reading them. One
+        # descriptor set per layer removes the window; layer index resolved
+        # in Python at capture time.
+        n_sel = len(self.selected_layer_ids_sorted)
         Rmax = T * K
         # H2D buffers (max entries = Tcap * K)
-        self.h2d_src_ptrs = torch.zeros(
-            Rmax, dtype=torch.int64, device=self.device
+        self.h2d_src_ptrs_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int64, device=self.device
         )
-        self.h2d_dst_ptrs = torch.zeros(
-            Rmax, dtype=torch.int64, device=self.device
+        self.h2d_dst_ptrs_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int64, device=self.device
         )
-        self.h2d_lens = torch.zeros(
-            Rmax, dtype=torch.int32, device=self.device
+        self.h2d_lens_all = torch.zeros(
+            n_sel, Rmax, dtype=torch.int32, device=self.device
         )
         self.h2d_cnt = torch.zeros(
             (), dtype=torch.int32, device=self.device
         )
         # D2H buffers (max entries = Tcap)
-        self.d2h_src_ptrs = torch.zeros(
-            T, dtype=torch.int64, device=self.device
+        self.d2h_src_ptrs_all = torch.zeros(
+            n_sel, T, dtype=torch.int64, device=self.device
         )
-        self.d2h_dst_ptrs = torch.zeros(
-            T, dtype=torch.int64, device=self.device
+        self.d2h_dst_ptrs_all = torch.zeros(
+            n_sel, T, dtype=torch.int64, device=self.device
         )
-        self.d2h_lens = torch.zeros(
-            T, dtype=torch.int32, device=self.device
+        self.d2h_lens_all = torch.zeros(
+            n_sel, T, dtype=torch.int32, device=self.device
         )
         self.d2h_cnt = torch.zeros(
             (), dtype=torch.int32, device=self.device
         )
-        # Pre-compute sequential HBM offsets for H2D dst_ptrs (constant)
-        staging_base = self.packed_staging.data_ptr()
-        self._h2d_dst_ptrs_preset = staging_base + torch.arange(
-            Rmax, device=self.device, dtype=torch.int64
-        ) * R
+        # Pre-compute sequential HBM offsets for H2D dst_ptrs (constant).
+        # Per-layer: each layer's H2D lands in its OWN staging slice.
+        Rmax = T * K
+        _ar = torch.arange(Rmax, device=self.device, dtype=torch.int64) * R
+        self._h2d_dst_ptrs_preset_all = torch.stack(
+            [
+                self.packed_staging_all[i % _staging_slices]
+                .view(-1)
+                .data_ptr()
+                + _ar
+                for i in range(len(self.selected_layer_ids_sorted))
+            ]
+        )
+
+
+        # The completion-flag protocol (sparse_copy_notify + wait_flag) is
+        # retired: graph-mode H2D/D2H use plain notify-free MIX varlen_copy,
+        # ordered before consumers by the compute-queue FIFO. Buffers were
+        # removed with the protocol.
 
         persistent_buffers = (
-            self.packed_staging,
-            self.unpack_k_nope_bf16,
-            self.unpack_k_rope_bf16,
-            self.fp8_nope_buf,
-            self.scales_buf,
-            self.host_locs_buf,
-            self.current_source_row_buf,
-            self.sparse_indices_buf,
-            self.actual_seq_lens_kv_buf,
-            self.actual_seq_lens_q_buf,
+            self.packed_staging_all,
+            self._h2d_dst_ptrs_preset_all,
+            self.unpack_k_nope_bf16_all,
+            self.unpack_k_rope_bf16_all,
+            self.new_packed_scratch_all,
+            self.fp8_nope_buf_all,
+            self.scales_buf_all,
+            self.host_locs_buf_all,
+            self.current_source_row_buf_all,
+            self.sparse_indices_buf_all,
+            self.actual_seq_lens_kv_buf_all,
+            self.actual_seq_lens_q_buf_all,
             self.arange_k_buf,
             self.arange_token_buf,
-            self.h2d_src_ptrs,
-            self.h2d_dst_ptrs,
-            self.h2d_lens,
+            self.h2d_src_ptrs_all,
+            self.h2d_dst_ptrs_all,
+            self.h2d_lens_all,
             self.h2d_cnt,
-            self.d2h_src_ptrs,
-            self.d2h_dst_ptrs,
-            self.d2h_lens,
+            self.d2h_src_ptrs_all,
+            self.d2h_dst_ptrs_all,
+            self.d2h_lens_all,
             self.d2h_cnt,
-            self._h2d_dst_ptrs_preset,
         )
         total_mb = sum(buf.nbytes for buf in persistent_buffers) / (1024 * 1024)
         logger.info(
@@ -523,6 +612,7 @@ class NPUSelectiveHiSparseCoordinator:
         self,
         topk_indices: torch.Tensor,
         forward_batch: "ForwardBatch",
+        selected_layer_id: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert Top-K position indices to Host gather locations.
 
@@ -531,10 +621,21 @@ class NPUSelectiveHiSparseCoordinator:
             valid_mask: [T, K] bool — True for valid historical entries
             current_source_row: [T, K] int64 — row index into new_packed for
                 current-position hits, or -1 for historical entries
+
+        With selected_layer_id the two persistent scratch buffers are this
+        layer's OWN slices (cross-layer plan overwrite eliminated). Without
+        it (legacy callers) the shared slice 0 is used.
         """
         B = forward_batch.batch_size
         T = B * self.verify_width
         K = self.topk
+        if selected_layer_id is not None:
+            _lp = self._layer_scratch_index[selected_layer_id]
+            host_locs_buf = self.host_locs_buf_all[_lp, :T]
+            current_source_row_buf = self.current_source_row_buf_all[_lp, :T]
+        else:
+            host_locs_buf = self.host_locs_buf_all[0, :T]
+            current_source_row_buf = self.current_source_row_buf_all[0, :T]
 
         topk = topk_indices[:T].reshape(T, K).to(torch.int64)
 
@@ -570,7 +671,7 @@ class NPUSelectiveHiSparseCoordinator:
             topk >= req_first_pos_exp.unsqueeze(1)
         )  # [T, K]
 
-        # For current-batch entries, compute row in _published_packed:
+        # For current-batch entries, compute row in new_packed_scratch:
         # row = request_index * V + offset_within_batch
         offset_within_batch = topk - req_first_pos_exp.unsqueeze(1)  # [T, K]
         current_row_idx = (
@@ -579,10 +680,9 @@ class NPUSelectiveHiSparseCoordinator:
 
         # current_source_row: for current-batch hits, row index into
         # new_packed; for historical/invalid → -1
-        current_rows_buf = self.current_source_row_buf[:T]  # [T, K]
-        current_rows_buf.fill_(-1)
+        current_source_row_buf.fill_(-1)
         current_rows = torch.where(
-            is_current, current_row_idx, current_rows_buf
+            is_current, current_row_idx, current_source_row_buf
         )  # [T, K]
 
         # Host locs for historical entries
@@ -594,12 +694,11 @@ class NPUSelectiveHiSparseCoordinator:
 
         # gather_locs: historical → hist_locs, current/invalid → sentinel
         sentinel = self.pool.host_sentinel_loc
-        sentinel_buf = self.host_locs_buf[:T]
-        sentinel_buf.fill_(sentinel)
+        host_locs_buf.fill_(sentinel)
         gather_locs = torch.where(
             causal_ok & ~is_current,
             hist_locs,
-            sentinel_buf,
+            host_locs_buf,
         )
 
         # valid_mask: True for valid historical entries (not current, not invalid)
@@ -635,6 +734,14 @@ class NPUSelectiveHiSparseCoordinator:
                 f"Increase --max-running_requests or decrease verify width."
             )
 
+        # Eager mode keeps the device-side real-token count in sync (harmless
+        # bookkeeping; the eager DMA path submits all N entries with the
+        # valid mask and does not consume this scalar). Graph mode never
+        # writes it here — replay reads the value filled by
+        # prepare_graph_replay (capture sees 0 → DMA no-op).
+        if not self._graph_mode:
+            self._selective_real_tokens.fill_(T)
+
         # Wait for previous staging/scratch/backup to complete.
         # During graph capture, skip cross-iteration event waits — the graph
         # replay enforces ordering implicitly and NPU graph requires every
@@ -644,9 +751,9 @@ class NPUSelectiveHiSparseCoordinator:
             prev_backup = self.backup_done_event.get(selected, self._initial_event)
             self.prefetch_stream.wait_event(prev_backup)
 
-        # Build loc plan
+        # Build loc plan (this layer's own scratch slices)
         locs, valid, current_rows = self.build_loc_plan(
-            topk_indices, forward_batch
+            topk_indices, forward_batch, selected_layer_id=selected
         )
 
         # Eager H2D uses a side stream and needs an explicit hand-off.  Graph
@@ -658,20 +765,6 @@ class NPUSelectiveHiSparseCoordinator:
             if self._graph_mode
             else torch.npu.current_stream().record_event()
         )
-
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            n_hist = valid.sum().item()
-            n_curr = (current_rows >= 0).sum().item()
-            n_invalid = (~(valid | (current_rows >= 0))).sum().item()
-            loc_min = locs[valid].min().item() if n_hist > 0 else -1
-            loc_max = locs[valid].max().item() if n_hist > 0 else -1
-            K = self.topk
-            logger.info(
-                f"[H2D] anchor={anchor_layer_id}→sel={selected} "
-                f"B={B} T={T} K={K} N={T*K} "
-                f"hist={n_hist} curr={n_curr} invalid={n_invalid} "
-                f"loc_range=[{loc_min},{loc_max}]"
-            )
 
         # During graph capture, run on the capture stream (no side streams).
         # During normal execution, use prefetch_stream for H2D/compute overlap.
@@ -687,7 +780,9 @@ class NPUSelectiveHiSparseCoordinator:
             if loc_plan_ready is not None:
                 h2d_stream.wait_event(loc_plan_ready)
 
-            staging_flat = self.packed_staging.view(-1, self.record_bytes)
+            staging_flat = self.packed_staging_all[
+                self._layer_scratch_index[selected] % self._staging_slices
+            ].view(-1, self.record_bytes)
 
             valid_flat = valid.reshape(-1)
             N = T * self.topk
@@ -697,36 +792,56 @@ class NPUSelectiveHiSparseCoordinator:
 
                 base_dva = self.pool.layer_dva(selected)
 
-                self.h2d_src_ptrs[:N] = (
+                # This layer's own descriptor slice — no other layer
+                # writes it, so the previous layer's in-flight copy cannot
+                # read descriptors being overwritten.
+                _si = self._layer_scratch_index[selected]
+                h2d_src = self.h2d_src_ptrs_all[_si]
+                h2d_dst = self.h2d_dst_ptrs_all[_si]
+                h2d_lens = self.h2d_lens_all[_si]
+                h2d_src[:N] = (
                     base_dva
                     + locs.reshape(-1).to(torch.int64) * self.record_bytes
                 )
-                self.h2d_dst_ptrs[:N] = self._h2d_dst_ptrs_preset[:N]
-                self.h2d_lens[:N] = torch.where(
+                # dst into THIS layer's staging slice.
+                h2d_dst[:N] = self._h2d_dst_ptrs_preset_all[_si, :N]
+                # Padded rows never reach here with valid entries: graph
+                # mode gates causal_ok upstream (build_loc_plan) and the
+                # replay-updated h2d_cnt limits submitted entries to the
+                # real rows; eager mode submits all N with the valid mask.
+                h2d_lens[:N] = torch.where(
                     valid_flat, self.record_bytes, 0
                 ).to(torch.int32)
                 if not self._graph_mode:
                     self.h2d_cnt.fill_(N)
+                if self._h2d_log and selected < 10:
+                    # Submitted-entry count (lens>0 entries actually
+                    # move data; the rest are len=0). Eager: N is exact.
+                    # Graph: this runs at capture time — N is the bucket
+                    # cap; per-replay counts come from the
+                    # prepare_graph_replay line below. Host values only,
+                    # no device sync.
+                    logger.info(
+                        f"[HiSparse-H2D] anchor=L{anchor_layer_id} "
+                        f"selected=L{selected}: submitted {N} entries"
+                        + (" (capture cap)" if self._graph_mode else "")
+                    )
 
-                ret = mf_offload.sparse_copy(
-                    self.h2d_src_ptrs[:N],
-                    self.h2d_dst_ptrs[:N],
-                    self.h2d_lens[:N],
+                # Graph mode uses the plain notify-free copy: the all-MIX
+                # compute-queue FIFO orders the copy kernel before patch/SFA,
+                # so no in-graph wait_flag is needed. varlen_copy shares the
+                # sparse_copy C++ entry (flag=1) and its MIX_AIV_1_0 task
+                # type, so queue ordering is unchanged.
+                ret = mf_offload.varlen_copy(
+                    h2d_src[:N],
+                    h2d_dst[:N],
+                    h2d_lens[:N],
                     self.h2d_cnt,
                     self.device,
                 )
                 if ret != 0:
                     raise RuntimeError(
-                        f"sparse_copy H2D failed: ret={ret}"
-                    )
-                if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-                    n_h2d = valid_flat.sum().item()
-                    n_curr = (current_rows >= 0).reshape(-1).sum().item()
-                    logger.info(
-                        f"[H2D] sparse_copy ret={ret} "
-                        f"h2d={n_h2d} curr={n_curr} "
-                        f"total_valid={n_h2d + n_curr}/{N} "
-                        f"dva=0x{base_dva:x}"
+                        f"varlen_copy H2D failed: ret={ret}"
                     )
             except ImportError:
                 host_tensor = self.pool.get_host_tensor(selected)
@@ -761,27 +876,47 @@ class NPUSelectiveHiSparseCoordinator:
         Called on the main stream after packing.  The D2H copy runs on the
         backup stream.
         """
-        # Wait for previous D2H of this layer to complete before overwriting
-        # _published_packed and reusing d2h pointer buffers.
+        # Wait for previous D2H of this layer to complete before reusing the
+        # d2h pointer buffers. Additionally, new_packed_scratch is shared
+        # across all selected layers, so overwriting it must wait for the
+        # latest in-flight D2H read of ANY layer (the latest backup event
+        # subsumes earlier ones because backup_stream is serialized).
         # During graph capture, skip cross-iteration event waits.
         if not self._graph_mode:
             prev_ev = self.backup_done_event.get(layer_id)
             if prev_ev is not None:
                 torch.npu.current_stream().wait_event(prev_ev)
+            if self._last_backup_event is not None:
+                torch.npu.current_stream().wait_event(self._last_backup_event)
+        # Graph mode has NO D2H wait: every layer owns its new_packed_scratch
+        # slice (no cross-layer overwrite to gate), and the MIX copy shares
+        # the compute queue with the scratch writes (FIFO). An in-graph
+        # wait_flag here would stall each layer's publish for a full D2H
+        # completion.
 
         T = packed_kv.shape[0]
-        # Store for current-patch step
-        self._published_packed[layer_id] = packed_kv
 
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            locs_cpu = logical_locs[:T].cpu()
-            logger.info(
-                f"[D2H] layer={layer_id} T={T} "
-                f"locs=[{locs_cpu.min().item()},{locs_cpu.max().item()}] "
-                f"packed_shape={list(packed_kv.shape)} "
-                f"packed_dtype={packed_kv.dtype}"
-            )
+        # Land the new packed KV in the fixed-address scratch so the
+        # current-patch consumer (and the D2H DMA below) read a stable
+        # pre-allocated buffer instead of a Python-held graph-pool tensor.
+        # Same-stream ordering guarantees the copy lands before both
+        # consumers. Per-layer slice (layer_id resolved at capture time):
+        # no other layer ever writes this buffer, so the D2H read below and
+        # this write cannot race a different layer's overwrite.
+        scratch = self.new_packed_scratch_all[
+            self._layer_scratch_index[layer_id]
+        ]
+        scratch[:T].copy_(packed_kv.view(torch.uint8))
+        # Eager mode syncs the device-side real-token count (harmless
+        # bookkeeping, see maybe_start_prefetch). Graph mode reads the
+        # replay-filled value (capture sees 0 → DMA no-op).
+        if not self._graph_mode:
+            self._selective_real_tokens.fill_(T)
 
+        # Record AFTER the scratch copy so the eager D2H stream waits for
+        # it; graph capture keeps everything on the capture stream (stream
+        # order supplies the dependency) and must not record graph-owned
+        # events.
         pack_ready = (
             None
             if self._graph_mode
@@ -804,10 +939,17 @@ class NPUSelectiveHiSparseCoordinator:
             try:
                 from memfabric_hybrid import offload as mf_offload
 
-                base_hbm = packed_kv.data_ptr()
+                # DMA reads from this layer's own fixed-address scratch
+                # (see publish comment above).
+                _si = self._layer_scratch_index[layer_id]
+                base_hbm = self.new_packed_scratch_all[_si].data_ptr()
                 base_dva = self.pool.layer_dva(layer_id)
+                # This layer's own descriptor slice (see H2D comment).
+                d2h_src = self.d2h_src_ptrs_all[_si]
+                d2h_dst = self.d2h_dst_ptrs_all[_si]
+                d2h_lens = self.d2h_lens_all[_si]
 
-                self.d2h_src_ptrs[:N] = (
+                d2h_src[:N] = (
                     base_hbm
                     + torch.arange(
                         N, device=self.device, dtype=torch.int64
@@ -824,30 +966,35 @@ class NPUSelectiveHiSparseCoordinator:
                     real_token_mask = None
                     safe_logical_locs = logical_locs[:N].to(torch.int64)
 
-                self.d2h_dst_ptrs[:N] = (
+                d2h_dst[:N] = (
                     base_dva
                     + safe_logical_locs * self.record_bytes
                 )
                 if real_token_mask is not None:
-                    self.d2h_lens[:N] = torch.where(
+                    d2h_lens[:N] = torch.where(
                         real_token_mask,
                         self.record_bytes,
                         0,
                     ).to(torch.int32)
                 else:
-                    self.d2h_lens[:N] = self.record_bytes
+                    d2h_lens[:N] = self.record_bytes
                     self.d2h_cnt.fill_(N)
 
-                ret = mf_offload.sparse_copy(
-                    self.d2h_src_ptrs[:N],
-                    self.d2h_dst_ptrs[:N],
-                    self.d2h_lens[:N],
+                # Graph mode uses the plain notify-free copy (the notify
+                # tail had no consumer after the flag protocol was retired
+                # and was pure per-core atomic overhead). varlen_copy: same
+                # entry as sparse_copy (flag=1), MIX task type unchanged
+                # (compute-queue FIFO with the scratch writes).
+                ret = mf_offload.varlen_copy(
+                    d2h_src[:N],
+                    d2h_dst[:N],
+                    d2h_lens[:N],
                     self.d2h_cnt,
                     self.device,
                 )
                 if ret != 0:
                     raise RuntimeError(
-                        f"sparse_copy D2H failed: ret={ret}"
+                        f"varlen_copy D2H failed: ret={ret}"
                     )
             except ImportError:
                 host_tensor = self.pool.get_host_tensor(layer_id)
@@ -856,9 +1003,11 @@ class NPUSelectiveHiSparseCoordinator:
             if not self._graph_mode:
                 self.backup_done_event[layer_id] = d2h_stream.record_event()
                 self._eager_async_pending = True
-
-    def get_published_new_packed_kv(self, layer_id: int) -> torch.Tensor:
-        return self._published_packed[layer_id]
+                # Track the latest D2H; the next publish of ANY layer waits
+                # on it before overwriting its scratch (conservative eager
+                # guard — backup_stream is serialized, so the latest event
+                # subsumes earlier ones).
+                self._last_backup_event = self.backup_done_event[layer_id]
 
     # === selected-layer attention ===
 
@@ -901,16 +1050,30 @@ class NPUSelectiveHiSparseCoordinator:
         # 1. Wait for H2D
         if st.h2d_done is not None:
             torch.npu.current_stream().wait_event(st.h2d_done)
+        # Graph mode does not wait on an H2D completion flag: the plain MIX
+        # varlen_copy shares the compute queue with the patch/SFA consumers
+        # and the queue FIFO orders the copy before them.
 
         # 2. Current KV patch (graph-safe: no boolean indexing / nonzero)
-        packed = self.get_published_new_packed_kv(layer_id)  # [T, 656]
+        # Read from the fixed-address scratch written by
+        # publish_new_packed_kv (same-stream ordering on both the eager
+        # main stream and the graph capture stream); this layer's own slice,
+        # stable across replays.
+        packed = self.new_packed_scratch_all[
+            self._layer_scratch_index[layer_id]
+        ][:T]  # [T, 656] uint8
         current_rows = st.current_source_row[:T]  # [T, K]
         mask = (current_rows >= 0).reshape(-1)  # [T*K]
         safe_src = current_rows.reshape(-1).clamp(min=0)  # [T*K]
 
-        staging_flat = self.packed_staging.view(-1, self.record_bytes)
+        # This layer's OWN staging slice — patch and SFA both touch it;
+        # no other layer's H2D ever writes it.
+        staging = self.packed_staging_all[
+            self._layer_scratch_index[layer_id] % self._staging_slices
+        ]
+        staging_flat = staging.view(-1, self.record_bytes)
         N = T * K
-        src_data = packed.view(torch.uint8)[safe_src]  # [T*K, 656]
+        src_data = packed[safe_src]  # [T*K, 656]
         staging_flat[:N] = torch.where(
             mask.unsqueeze(1),
             src_data,
@@ -923,35 +1086,27 @@ class NPUSelectiveHiSparseCoordinator:
             st.valid_mask[:T] | (st.current_source_row[:T] >= 0)
         )
 
-        if not self._graph_mode and logger.isEnabledFor(logging.INFO):
-            n_curr = mask.sum().item()
-            n_hist = st.valid_mask[:T].sum().item()
-            n_all_valid = all_valid_mask.sum().item()
-            staging_nonzero = (
-                staging_flat[:N].sum(dim=1) > 0
-            ).sum().item()
-            logger.info(
-                f"[ATTN] layer={layer_id} T={T} K={K} "
-                f"hist={n_hist} curr={n_curr} all_valid={n_all_valid} "
-                f"staging_nonzero={staging_nonzero}/{N}"
-            )
-
+        # Ping-pong workspace set — parity of the layer's position
+        # in the selected list (see _alloc_staging_buffers). Adjacent
+        # selected layers are 4 apart, so a set is reused only 4 layers
+        # later, after its reader's SFA has long retired.
+        _ws = self._layer_scratch_index[layer_id] % self._n_ws
         out = selective_sparse_attention(
             q_nope=q_nope[:T],
             q_rope=q_rope[:T],
-            packed_staging=self.packed_staging[:T],
+            packed_staging=staging[:T],
             valid_mask=all_valid_mask,
             scale=layer.scaling,
-            unpack_k_nope_bf16=self.unpack_k_nope_bf16,
-            unpack_k_rope_bf16=self.unpack_k_rope_bf16,
-            sparse_indices_buf=self.sparse_indices_buf,
-            actual_seq_lens_kv_buf=self.actual_seq_lens_kv_buf,
+            unpack_k_nope_bf16=self.unpack_k_nope_bf16_all[_ws],
+            unpack_k_rope_bf16=self.unpack_k_rope_bf16_all[_ws],
+            sparse_indices_buf=self.sparse_indices_buf_all[_ws],
+            actual_seq_lens_kv_buf=self.actual_seq_lens_kv_buf_all[_ws],
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            actual_seq_lens_q_buf=self.actual_seq_lens_q_buf,
+            actual_seq_lens_q_buf=self.actual_seq_lens_q_buf_all[_ws],
             arange_k_buf=self.arange_k_buf,
-            fp8_nope_buf=self.fp8_nope_buf,
-            scales_buf=self.scales_buf,
+            fp8_nope_buf=self.fp8_nope_buf_all[_ws],
+            scales_buf=self.scales_buf_all[_ws],
             graph_mode=self._graph_mode,
         )
 
@@ -969,25 +1124,6 @@ class NPUSelectiveHiSparseCoordinator:
             out_padded[:T] = out
             return out_padded
         return out
-
-    # === MTP verify result ===
-
-    def on_verify_result(
-        self,
-        req_pool_indices: torch.Tensor,
-        verify_cache_locs: torch.Tensor,
-        old_seq_lens: torch.Tensor,
-        accept_lens: torch.Tensor,
-        accept_index: torch.Tensor,
-    ):
-        """Called after eagle_sample returns. Records debug metrics."""
-        B = accept_lens.shape[0]
-        logger.debug(
-            f"Selective HiSparse verify result: B={B}, "
-            f"accept_lens={accept_lens.tolist()}"
-        )
-
-    # === drain ===
 
     def drain_all(self):
         """Wait for all pending async D2H writes to complete."""
@@ -1020,6 +1156,14 @@ class NPUSelectiveHiSparseCoordinator:
         for event in self.backup_done_event.values():
             current_stream.wait_event(event)
         self._eager_async_pending = False
+        # Eager DMA used the flagless path, so the monotonic counters stay
+        # paired — but a stream-level wait_event does NOT prove the AIV
+        # copy kernel has fully landed (the very ordering hole the flag
+        # protocol exists to close). The first in-graph D2H-scratch wait
+        # would therefore pass while an eager D2H still reads the shared
+        # scratch. A full sync here is safe: eager fallback is rare (batch
+        # exceeding the graph tier), so this is off the hot path.
+        torch.npu.synchronize()
 
     def prepare_graph_capture(
         self,
@@ -1046,6 +1190,9 @@ class NPUSelectiveHiSparseCoordinator:
         self._selective_real_tokens.fill_(0)
         self.h2d_cnt.fill_(0)
         self.d2h_cnt.fill_(0)
+        # Drain any eager-side in-flight DMA so capture starts from a
+        # consistent state.
+        torch.npu.synchronize()
         logger.info(
             f"SelectiveHiSparse graph capture: bs={capture_bs}, "
             f"tokens={capture_tokens}"
@@ -1060,6 +1207,13 @@ class NPUSelectiveHiSparseCoordinator:
     ):
         """Called before graph replay to update real token count."""
         self._bridge_eager_to_graph()
+        # Subscribe the replay-issuing stream to the ACL callback thread. The
+        # original subscription covers only the capture stream, but graph
+        # replay executes on the issuing (main) stream — in-graph varlen_copy
+        # async DMA completion reports fired there would never be processed
+        # by acl.rt.process_report, so H2D data may not land before the
+        # in-graph SFA read. Idempotent (subscribe() skips known streams).
+        self.register_callback_stream(torch.npu.current_stream(self.device))
         real_tokens = 0 if is_idle else real_batch * self.verify_width
         graph_tokens = graph_batch * self.verify_width
         if real_tokens > graph_tokens:
@@ -1090,6 +1244,20 @@ class NPUSelectiveHiSparseCoordinator:
             self._selective_real_tokens.fill_(real_tokens)
             self.h2d_cnt.fill_(real_tokens * self.topk)
             self.d2h_cnt.fill_(real_tokens)
+        if self._h2d_log:
+            # Per-replay submitted-entry count, from the host-side token
+            # math above (no device sync). With the real_num_tokens branch
+            # this is the cap (the exact localized scalar lives on device);
+            # without DP padding it is exact. Invalid topk rows still
+            # occupy entries with len=0 and move no data.
+            _real = 0 if is_idle else min(real_tokens, graph_tokens)
+            for _sel in self._anchor_to_selected.values():
+                if _sel < 10:
+                    logger.info(
+                        f"[HiSparse-H2D] replay: selected=L{_sel}: "
+                        f"submitted {_real * self.topk} entries "
+                        f"(real_tokens={_real})"
+                    )
 
     def finish_graph_capture(self):
         """Restore eager coordinator semantics after one graph is captured.

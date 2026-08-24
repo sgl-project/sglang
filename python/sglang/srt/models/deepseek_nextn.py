@@ -400,9 +400,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                     )
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

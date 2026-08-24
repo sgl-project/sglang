@@ -1070,9 +1070,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(
-                cache_k, cache_v, loc.numel()
-            )
+            if self.selective_coordinator is not None:
+                packed = self._pack_dsa_fp8_kv_cache(
+                    cache_k, cache_v, loc.numel()
+                )
             if self.selective_coordinator is not None:
                 self.selective_coordinator.publish_new_packed_kv(
                     layer_id=layer_id,
