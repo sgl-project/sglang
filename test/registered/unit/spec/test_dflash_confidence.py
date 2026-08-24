@@ -255,6 +255,23 @@ class TestDFlashConfidence(unittest.TestCase):
         ):
             self.assertFalse(spec_need_hidden_states())
 
+    def test_lagged_cpu_confidence_plan_preserves_prefix_invariants(self):
+        # ConfidenceRelay resolves a pinned CPU N-2 snapshot. Planning from it
+        # must remain host-only and produce a legal current-batch prefix plan.
+        lagged_confidence = torch.tensor(
+            [[0.95, 0.90, 0.85], [0.20, 0.80, 0.90]], device="cpu"
+        )
+        decision = plan_verify_prefixes(
+            lagged_confidence,
+            verify_num_draft_tokens=4,
+            confidence_threshold=0.5,
+            min_verify_len=2,
+            target_verify_tokens=6,
+        )
+        self.assertEqual(decision.verify_lens.device.type, "cpu")
+        self.assertEqual(int(decision.verify_lens.sum()), 6)
+        self.assertTrue(bool(((decision.verify_lens >= 2) & (decision.verify_lens <= 4)).all()))
+
     def test_planner_rejects_invalid_threshold(self):
         for threshold in (-0.1, 1.1):
             with self.assertRaisesRegex(ValueError, "threshold"):

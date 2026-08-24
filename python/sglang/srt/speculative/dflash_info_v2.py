@@ -55,7 +55,13 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    # Prepared by the overlap scheduler from an asynchronously relayed
+    # confidence snapshot. `None` means the N-2 snapshot is not ready yet and
+    # the worker must use lossless full verification.
     verify_token_budget: Optional[int] = None
+    confidence_verify_lens_cpu: Optional[List[int]] = None
+    confidence_deferred_tokens: int = 0
+    confidence_low_confidence_tokens: int = 0
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
