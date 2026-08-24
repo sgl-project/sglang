@@ -234,17 +234,31 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             total_tokens == self.cp_size * physical_rank_len
             and all(int(n) == physical_rank_len for n in actual)
         ):
-            return (
+            result = (
                 gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
                 .transpose(0, 1)
                 .reshape(total_tokens, *x.shape[1:])
             )
+            try:
+                from sglang.srt.layers.cp.gather_fp import record as _gfp_record
+
+                _gfp_record("interleave.gather", result)
+            except Exception:
+                pass
+            return result
 
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, gather_indices)
+        result = gathered.index_select(0, gather_indices)
+        try:
+            from sglang.srt.layers.cp.gather_fp import record as _gfp_record
+
+            _gfp_record("interleave.gather", result)
+        except Exception:
+            pass
+        return result
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]

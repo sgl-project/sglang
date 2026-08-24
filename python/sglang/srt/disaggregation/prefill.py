@@ -1526,6 +1526,16 @@ class SchedulerDisaggregationPrefillMixin:
                         # family (draft outputs, full-hidden capture, embed).
                         # Each tensor is probed in both fp32 and bf16-pair
                         # modes -- the payload's dtype is not known a priori.
+                        # Audit line: which er.* names survived to probe time
+                        # (keep-newest ring) -- a silent verdict is only
+                        # meaningful if the strongest candidates are on it.
+                        from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import (
+                            names as _er_names,
+                        )
+
+                        logger.error(
+                            "[mf-fp] er names=%s", ",".join(_er_names()) or "-"
+                        )
                         for _en, _et in _ep():
                             _cands.append((f"er.{_en}", _et, "f"))
                             _cands.append((f"er.{_en}.pairs", _et, "p"))
@@ -1563,16 +1573,23 @@ class SchedulerDisaggregationPrefillMixin:
                         else:
                             try:
                                 _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)
-                            except Exception:
+                            except Exception as _pe:
+                                # A probe exception must not read as "no hit".
                                 _n = 0
+                                logger.error(
+                                    "[mf-fp] probe raised on %s: %s", _name, _pe
+                                )
                             if _n:
                                 logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
                             try:
                                 _s, _sc, _sr = (
                                     _stride_hits(_buf) if _stride_ok else (0, -1, -1)
                                 )
-                            except Exception:
+                            except Exception as _pe:
                                 _s, _sc, _sr = 0, -1, -1
+                                logger.error(
+                                    "[mf-fp] probe raised on %s: %s", _name, _pe
+                                )
                         if _s:
                             logger.error(
                                 "[mf-fp] payload stride FOUND x%d col=%d row=%d in %s",
@@ -1589,6 +1606,38 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 except Exception as _e:
                     logger.error("[mf-fp] fingerprint probe failed: %s", _e)
+                try:
+                    from sglang.srt.layers.cp.gather_fp import counts as _gfp_counts
+                    from sglang.srt.layers.cp.gather_fp import drain as _gfp_drain
+                    from sglang.srt.layers.cp.gather_fp import recent as _gfp_recent
+
+                    _key16 = [
+                        int(x) for x in _slots[_first : _first + 16].to(_t.int32).tolist()
+                    ]
+                    _gfp_hits = _gfp_drain(_key16)
+                    for _tag, _col, _run in _gfp_hits:
+                        logger.error(
+                            "[cp-fp] FOUND tag=%s col=%d run=%d key=%s",
+                            _tag,
+                            _col,
+                            _run,
+                            ",".join(str(x) for x in _key16[:8]),
+                        )
+                    # Unconditional: the cross-run recent-stream comparison
+                    # (x1.5 scaling verdict) must not depend on a hit.
+                    for _tag, _fp in _gfp_recent():
+                        logger.error(
+                            "[cp-fp] recent tag=%s fp64=%s",
+                            _tag,
+                            ",".join(str(x) for x in _fp),
+                        )
+                    if not _gfp_hits:
+                        logger.error(
+                            "[cp-fp] no match among gather rings entries=%s",
+                            _gfp_counts(),
+                        )
+                except Exception:
+                    pass
                 logger.error(
                     "[mf-raw] rid=%s slot=%s seg=[%d,%d): n_dirty=%d/%d "
                     "n_sentinel=%d first_dirty_off=%d slots[%d:%d]=%s "

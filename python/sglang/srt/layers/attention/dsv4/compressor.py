@@ -449,6 +449,12 @@ class Compressor(BaseFusedOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            try:
+                from sglang.srt.layers.cp.gather_fp import record as _gfp_record
+
+                _gfp_record("kv_score." + ("idx" if self.is_in_indexer else "attn"), kv_score)
+            except Exception:
+                pass
         return kv_score
 
     def forward_native(
@@ -495,5 +501,11 @@ class Compressor(BaseFusedOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            try:
+                from sglang.srt.layers.cp.gather_fp import record as _gfp_record
+
+                _gfp_record("compress.x", x)
+            except Exception:
+                pass
 
         return get_attn_backend().forward_compress(self, x, forward_batch)

@@ -180,6 +180,12 @@ class DSANPUIndexerMixin:
                 forward_batch,
                 torch.npu.current_stream(),
             )
+            try:
+                from sglang.srt.layers.cp.gather_fp import record as _gfp_record
+
+                _gfp_record("indexer.k", k)
+            except Exception:
+                pass
 
         get_token_to_kv_pool().set_index_k_buffer(
             layer_id, forward_batch.out_cache_loc, k
