@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -52,11 +52,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260822`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi30x-20260822`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -66,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710 \
+    lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822 \
     sglang serve <use args below>
 ```
 
@@ -332,14 +332,13 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
 on MoE layers. To enable it, use the **MegaMoE** chip in the Playground
 below — the playground will swap `--moe-a2a-backend deepep` for
-`--moe-a2a-backend megamoe` and add the relevant env vars automatically.
+`--moe-a2a-backend megamoe` and add the relevant launch settings automatically.
 
 Two variants are exposed:
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
-- **W4A4** — adds `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1` and
-  `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1` to run the custom W4A4
-  kernel (FP4 activations). Higher throughput with negligible accuracy drop
-  (~89.5 GPQA on Pro).
+- **W4A4** — adds `--enable-w4a4-mxfp4-megamoe` to run the custom W4A4 kernel
+  (FP4 activations). The flag configures the required DeepGEMM settings.
+  Higher throughput with negligible accuracy drop (~89.5 GPQA on Pro).
 
 Notes:
 - The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.
@@ -356,9 +355,7 @@ stay in **FP8** — keep `SGLANG_DSV4_FP4_EXPERTS=0`. It requires a `sgl-deep-ge
 build with SM90 FP8 MegaMoE support. **Please use the latest image for this
 feature.**
 
-Enable the MegaMoE path with `--moe-a2a-backend megamoe` — or equivalently set
-`SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1`, which auto-configures the same backend:
-
+Enable the MegaMoE path with `--moe-a2a-backend megamoe`
 ```bash Command
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
 SGLANG_DSV4_FP4_EXPERTS=0 \
@@ -604,4 +601,4 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
-DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; turn DSpark off before selecting a prefill or decode role. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.

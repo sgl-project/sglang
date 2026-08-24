@@ -91,6 +91,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
@@ -206,12 +209,50 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # Set externally (see qwen3_5.py) when both projections are NVFP4 and
+        # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
+        # fused path replaces act_fn + the down_proj input quantization with a
+        # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        # Lazily derived after weight load (input_scale_inv does not exist yet
+        # at construction time); the fused kernel requires a 1-D global scale.
+        self._down_input_scale_inv_1d = None
+
+    def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+        if self._down_input_scale_inv_1d is None:
+            self._down_input_scale_inv_1d = self.down_proj.input_scale_inv.reshape(1)
+        num_tokens = gate_up.shape[0]
+        masked_m = self._masked_m_cache.get(num_tokens)
+        if masked_m is None:
+            masked_m = torch.tensor(
+                [num_tokens], dtype=torch.int32, device=gate_up.device
+            )
+            self._masked_m_cache[num_tokens] = masked_m
+        y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+            gate_up.unsqueeze(0),
+            masked_m,
+            self._down_input_scale_inv_1d,
+        )
+        # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
+        # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
+        # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
+        # rounding ties for M in 64..8192).
+        y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
+        m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
+        y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
+        return y_fp4, y_sf
 
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+            x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -495,6 +536,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        enable_cuda_shared_overlap = (
+            _is_cuda
+            and envs.SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP.get()
+            # Breakable CUDA graph joins side streams before the eager DeepEP
+            # break, so this path cannot overlap the two expert computations.
+            and not is_in_breakable_cuda_graph()
+            and self.alt_stream is not None
+            and self.shared_expert is not None
+            and hidden_states.shape[0] > 0
+        )
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -503,6 +554,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
+            elif enable_cuda_shared_overlap:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output.record_stream(self.alt_stream)
+                    shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -525,6 +583,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if enable_dual_stream:
             wait_share_stream()
+        elif enable_cuda_shared_overlap:
+            torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
