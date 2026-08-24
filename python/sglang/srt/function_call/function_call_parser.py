@@ -19,6 +19,7 @@ from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
@@ -37,6 +38,7 @@ from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.muse_glimmer_detector import MuseGlimmerDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -67,6 +69,7 @@ class FunctionCallParser:
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv4": DeepSeekV4Detector,
+        "dots": DotsToolDetector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
@@ -78,6 +81,7 @@ class FunctionCallParser:
         "mimo": MiMoDetector,
         "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
+        "muse": MuseGlimmerDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
@@ -174,6 +178,17 @@ class FunctionCallParser:
             final_normal_text = sp_result.normal_text
 
         return final_normal_text, final_calls
+
+    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush detector state once the stream ends.
+
+        Text a detector held back waiting for a marker (which can no longer
+        arrive) is released as normal text; see BaseFormatDetector.finish().
+        """
+        if not self.tools:
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False

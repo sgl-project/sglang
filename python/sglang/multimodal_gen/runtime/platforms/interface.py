@@ -43,6 +43,8 @@ class AttentionBackendEnum(enum.Enum):
     LASER_ATTN = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
+    SOL_ATTN = enum.auto()
+    SUBBLOCK_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -60,6 +62,8 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.SOL_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
         }
 
 
@@ -409,8 +413,8 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """Whether to enable DIT layerwise offload by default on the current platform."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
 
     @classmethod

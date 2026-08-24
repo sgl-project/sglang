@@ -1,3 +1,5 @@
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -6,7 +8,10 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     _cached_get_attn_backend,
 )
-from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatformBase
+from sglang.multimodal_gen.runtime.platforms.cuda import (
+    CudaPlatformBase,
+    _SageAttentionBackendResolver,
+)
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 
 SDPA_BACKEND_CLS_STR = (
@@ -17,6 +22,7 @@ SDPA_BACKEND_CLS_STR = (
 class FakeCudaPlatform(CudaPlatformBase):
     is_sm120_device = False
     is_blackwell_device = False
+    is_hopper_device = False
     supports_flash_attention = True
 
     @classmethod
@@ -26,6 +32,10 @@ class FakeCudaPlatform(CudaPlatformBase):
     @classmethod
     def is_blackwell(cls):
         return cls.is_blackwell_device
+
+    @classmethod
+    def is_hopper(cls):
+        return cls.is_hopper_device
 
     @classmethod
     def has_device_capability(
@@ -40,6 +50,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
     def setUp(self):
         FakeCudaPlatform.is_sm120_device = False
         FakeCudaPlatform.is_blackwell_device = False
+        FakeCudaPlatform.is_hopper_device = False
         FakeCudaPlatform.supports_flash_attention = True
         _cached_get_attn_backend.cache_clear()
 
@@ -111,6 +122,25 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
+
+    def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
+        FakeCudaPlatform.is_hopper_device = True
+        sageattention = types.ModuleType("sageattention")
+        sageattention.__path__ = []
+        sageattention.sageattn = object()
+        sm90_compile = types.ModuleType("sageattention.sm90_compile")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sageattention": sageattention,
+                "sageattention.sm90_compile": sm90_compile,
+            },
+        ):
+            self.assertEqual(
+                _SageAttentionBackendResolver.resolve(FakeCudaPlatform),
+                AttentionBackendEnum.FA,
+            )
 
     def test_explicit_backend_rejected_by_a_model_fails_closed(self):
         with self.assertRaisesRegex(
