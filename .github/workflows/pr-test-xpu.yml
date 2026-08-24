@@ -300,7 +300,7 @@ jobs:
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
