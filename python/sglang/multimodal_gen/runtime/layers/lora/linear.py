@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    write_dense_weight,
+)
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
 torch._dynamo.config.recompile_limit = 64
@@ -113,8 +116,14 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
-    @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Layerwise rebinds Parameter.data; do not compile the merged path.
+        if self.merged or self.disable_lora:
+            return self.base_layer(x)
+        return self._forward_with_delta(x)
+
+    @torch.compile()
+    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):
@@ -122,26 +131,22 @@ class BaseLayerWithLoRA(nn.Module):
             lora_A = self.lora_A.to_local()
 
         # TODO: Support multiple LoRA adapters when use not merged mode
-        if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            x_lora = x.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=x.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=x.device, non_blocking=True)
-            )
-            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
-            if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta = delta * self.strength
-            out, output_bias = self.base_layer(x)
-            return out + delta.to(dtype=out.dtype), output_bias
-        else:
-            out, output_bias = self.base_layer(x)
-            return out, output_bias
+        lora_dtype = lora_A.dtype
+        x_lora = x.to(dtype=lora_dtype)
+        lora_A_sliced = self.slice_lora_a_weights(
+            lora_A.to(device=x.device, non_blocking=True)
+        )
+        lora_B_sliced = self.slice_lora_b_weights(
+            lora_B.to(device=x.device, non_blocking=True)
+        )
+        delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
+        if self.lora_alpha != self.lora_rank:
+            delta = delta * (
+                self.lora_alpha / self.lora_rank  # type: ignore
+            )  # type: ignore
+        delta = delta * self.strength
+        out, output_bias = self.base_layer(x)
+        return out + delta.to(dtype=out.dtype), output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -214,6 +219,42 @@ class BaseLayerWithLoRA(nn.Module):
             self.merge_lora_weights()
         elif self.merged:
             self.unmerge_lora_weights()
+
+    def _active_lora_list(self) -> list[LoRAWeightEntry]:
+        if self.lora_weights_list:
+            return list(self.lora_weights_list)
+        if self.lora_A is not None and self.lora_B is not None:
+            return [
+                (
+                    self.lora_A,
+                    self.lora_B,
+                    self.lora_path,
+                    self.strength,
+                    self.lora_rank,
+                    self.lora_alpha,
+                )
+            ]
+        return []
+
+    def _materialized_weight_src(self) -> tuple[torch.Tensor, torch.device]:
+        """Layerwise CPU view, or the live GPU weight if it is not a (1,) placeholder."""
+        packed = getattr(self.base_layer, "_packed_weight_cpu", None)
+        if packed is None or packed.numel() <= 1:
+            from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+                _refresh_packed_from_manager,
+            )
+
+            _refresh_packed_from_manager(self.base_layer)
+            packed = getattr(self.base_layer, "_packed_weight_cpu", None)
+        weight = self.base_layer.weight.data
+        if weight.numel() <= 1:
+            if packed is None or packed.numel() <= 1:
+                raise RuntimeError(
+                    "layerwise LoRA saw a (1,) placeholder with no CPU view; "
+                    "convert_to_lora_layers must bind _packed_weight_cpu first."
+                )
+            return packed, torch.device("cpu")
+        return weight, weight.device
 
     def _ensure_base_snapshot_owned(self) -> None:
         """An in-place merge is about to write the base storage; if the
@@ -346,24 +387,13 @@ class BaseLayerWithLoRA(nn.Module):
         if self.disable_lora:
             return
 
-        self._ensure_base_snapshot_owned()
+        # Zero-copy views unmerge by subtracting B@A; do not clone the base.
+        if not self._base_is_view:
+            self._ensure_base_snapshot_owned()
         if self.merged:
             self.unmerge_lora_weights()
 
-        # Use lora_weights_list if available, otherwise fall back to single LoRA for backward compatibility
-        lora_list = self.lora_weights_list if self.lora_weights_list else []
-        if not lora_list and self.lora_A is not None and self.lora_B is not None:
-            lora_list = [
-                (
-                    self.lora_A,
-                    self.lora_B,
-                    self.lora_path,
-                    self.strength,
-                    self.lora_rank,
-                    self.lora_alpha,
-                )
-            ]
-
+        lora_list = self._active_lora_list()
         if not lora_list:
             raise ValueError("LoRA weights not set. Please set them first.")
 
@@ -421,27 +451,39 @@ class BaseLayerWithLoRA(nn.Module):
                 offload_policy=offload_policy,
             )
         else:
-            current_device = self.base_layer.weight.data.device
-            data = self.base_layer.weight.data.to(get_local_torch_device())
-            data = self._as_mutable_tensor(data)
-            target_dtype = data.dtype
-            if (
-                merge_in_fp32
-                and data.is_floating_point()
-                and data.dtype != torch.float32
-            ):
-                data = data.to(torch.float32)
-
-            self._merge_lora_into_data(data, lora_list)
-
-            self.base_layer.weight.data = self._as_mutable_tensor(
-                data.to(current_device, dtype=target_dtype, non_blocking=True)
-            )
+            src, _ = self._materialized_weight_src()
+            data = src.to(get_local_torch_device())
+            self._merge_from_device_data(data, lora_list, merge_in_fp32)
+            return
 
         self.merged = True
 
+    def _merge_from_device_data(
+        self,
+        data: torch.Tensor,
+        lora_list: list[LoRAWeightEntry] | None = None,
+        merge_in_fp32: bool | None = None,
+    ) -> None:
+        """Merge on GPU and write back to the layer store."""
+        lora_list = lora_list if lora_list is not None else self._active_lora_list()
+        if not lora_list:
+            raise ValueError("LoRA weights not set. Please set them first.")
+        if merge_in_fp32 is None:
+            merge_in_fp32 = self._should_merge_in_fp32(lora_list)
+        data = self._as_mutable_tensor(data)
+        target_dtype = data.dtype
+        if (
+            merge_in_fp32
+            and data.is_floating_point()
+            and data.dtype != torch.float32
+        ):
+            data = data.to(torch.float32)
+        self._merge_lora_into_data(data, lora_list)
+        merged = self._as_mutable_tensor(data.to(dtype=target_dtype))
+        write_dense_weight(self.base_layer, merged)
+        self.merged = True
+
     @torch.no_grad()
-    # @torch.compile(dynamic=True)
     def unmerge_lora_weights(self) -> None:
         if self.disable_lora:
             return
@@ -460,6 +502,8 @@ class BaseLayerWithLoRA(nn.Module):
             )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
+        elif self._base_is_view:
+            self._unmerge_by_inverse()
         else:
             current_device = self.base_layer.weight.data.device
             cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
@@ -476,6 +520,39 @@ class BaseLayerWithLoRA(nn.Module):
                 del cpu_weight_on_device
 
         self.merged = False
+
+    @torch.no_grad()
+    def _unmerge_by_inverse(self) -> None:
+        lora_list = self._active_lora_list()
+        if not lora_list:
+            raise ValueError(
+                "LoRA weights not set; cannot unmerge a zero-copy view by inverse."
+            )
+        src, current_device = self._materialized_weight_src()
+        data = self._as_mutable_tensor(src.to(get_local_torch_device()))
+        target_dtype = data.dtype
+        if (
+            self._should_merge_in_fp32(lora_list)
+            and data.is_floating_point()
+            and data.dtype != torch.float32
+        ):
+            data = data.to(torch.float32)
+        inverted = [
+            (lora_A, lora_B, lora_path, -lora_strength, lora_rank, lora_alpha)
+            for (
+                lora_A,
+                lora_B,
+                lora_path,
+                lora_strength,
+                lora_rank,
+                lora_alpha,
+            ) in reversed(lora_list)
+        ]
+        self._merge_lora_into_data(data, inverted)
+        write_dense_weight(
+            self.base_layer,
+            self._as_mutable_tensor(data.to(dtype=target_dtype)),
+        )
 
     @torch.no_grad()
     def commit_merged_as_base(self) -> None:
@@ -786,7 +863,11 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             return out
 
 
-def _use_owned_base_snapshot(snapshot_base: bool, device_type: str) -> bool:
+def _use_owned_base_snapshot(
+    snapshot_base: bool, device_type: str, numel: int | None = None
+) -> bool:
+    if numel is not None and numel <= 1:
+        return snapshot_base
     return snapshot_base or device_type not in ("cpu", "meta")
 
 
@@ -814,7 +895,7 @@ def wrap_with_lora_layer(
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
             effective_snapshot_base = _use_owned_base_snapshot(
-                snapshot_base, layer.weight.device.type
+                snapshot_base, layer.weight.device.type, layer.weight.numel()
             )
             ret = lora_layer_type(
                 layer,

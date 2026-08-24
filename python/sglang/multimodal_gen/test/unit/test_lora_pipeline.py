@@ -79,6 +79,7 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     assert not _use_owned_base_snapshot(False, "cpu")
     assert not _use_owned_base_snapshot(False, "meta")
     assert _use_owned_base_snapshot(False, "cuda")
+    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
     assert _use_owned_base_snapshot(True, "cpu")
 
     cpu_layer = wrap_with_lora_layer(
@@ -262,3 +263,21 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+def test_view_merge_unmerges_by_inverse_without_owned_clone():
+    torch.manual_seed(0)
+    base = torch.nn.Linear(4, 4, bias=False)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    assert layer is not None
+    assert layer._base_is_view
+    A = torch.randn(2, 4)
+    B = torch.randn(4, 2)
+    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
+    assert layer.merged
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.base_layer.weight, original + 0.5 * (B @ A))
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(layer.base_layer.weight, original)
+    assert not layer.merged
