@@ -417,12 +417,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             supports_hip_draft_extend_graph = (
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
-                or isinstance(
-                    self.draft_extend_attn_backend, DeepseekV4HipRadixBackend
-                )
-                or isinstance(
-                    self.draft_extend_attn_backend, DeepseekSparseAttnBackend
-                )
+                or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+                or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
             )
 
         graph_supported_backend_types = [
