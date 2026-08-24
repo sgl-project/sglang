@@ -75,6 +75,9 @@ def log_cp_size_event(
     ``rank``/``size`` are the emitting rank's coordinates in whatever group
     runs the collective (CP pair, DP group, ...); ``fields`` become the
     ``k=v`` tokens the pairing script diffs. Keep every value space-free.
+    Rank identity for offline pairing comes from the log prefix
+    (``DP<d> ATTN_CP<c> TP<t>``): CP partners are same-DP/different-CP, so
+    no global-rank field is needed here.
     """
     if os.getenv("SGLANG_CP_SIZE_LOG", "0") != "1":
         return

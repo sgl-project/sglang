@@ -1425,6 +1425,21 @@ class SchedulerDisaggregationPrefillMixin:
                     except Exception:
                         pass
                     try:
+                        from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import (
+                            payloads as _ep,
+                        )
+
+                        # Empty unless SGLANG_MF_EAGLE_RETAIN=1 (or the
+                        # RETAIN_NOP sham): the freed-intermediate candidate
+                        # family (draft outputs, full-hidden capture, embed).
+                        # Each tensor is probed in both fp32 and bf16-pair
+                        # modes -- the payload's dtype is not known a priori.
+                        for _en, _et in _ep():
+                            _cands.append((f"er.{_en}", _et, "f"))
+                            _cands.append((f"er.{_en}.pairs", _et, "p"))
+                    except Exception:
+                        pass
+                    try:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
                             Dsv4NpuRoPE,
                         )

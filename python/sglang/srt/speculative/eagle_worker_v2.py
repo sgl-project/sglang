@@ -1002,6 +1002,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index,
             ret_hidden_states,
         )
+        # Freed-intermediate candidates for the [mf-fp] probe
+        # (SGLANG_MF_EAGLE_RETAIN=1; no-op when off).
+        from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import retain
+
+        retain("draft.topk_p", ret_topk_p)
+        retain("draft.topk_index", ret_topk_index)
+        retain("draft.hidden", ret_hidden_states)
         if get_spec().speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:

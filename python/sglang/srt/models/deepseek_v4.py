@@ -2958,11 +2958,22 @@ class DeepseekV4Model(nn.Module):
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
+            _mf_embed = None
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
+                _mf_embed = hidden_states
             else:
                 hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            if _mf_embed is not None:
+                # Freed-intermediate candidates for the [mf-fp] probe
+                # (SGLANG_MF_EAGLE_RETAIN=1; no-op when off).
+                from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import (
+                    retain as _mf_retain,
+                )
+
+                _mf_retain("embed.raw", _mf_embed)
+                _mf_retain("embed.mhc", hidden_states)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]

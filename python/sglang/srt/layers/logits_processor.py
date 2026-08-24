@@ -643,6 +643,18 @@ class LogitsProcessor(nn.Module):
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
+        # Freed-intermediate candidate for the [mf-fp] probe
+        # (SGLANG_MF_EAGLE_RETAIN=1; no-op when off). FULL capture runs on
+        # prefill/verify and is per-token natural-order replica-invariant.
+        if hidden_states_to_store is not None:
+            from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import retain
+
+            retain(
+                "cap.full_hidden"
+                if logits_metadata.capture_hidden_mode.is_full()
+                else "cap.last_hidden",
+                hidden_states_to_store,
+            )
         return hidden_states_to_store
 
     def _get_logits(
