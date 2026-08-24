@@ -422,11 +422,11 @@ def _finalize_accept_tree_path(
     move_accept_tokens_to_target_kvcache(
         batch, accept_index, accept_lens - 1, token_to_kv_pool_allocator
     )
-    predict = _compact_accept_to_front(
+    predict = compact_accept_to_front(
         predict, accept_index, bs, num_draft_tokens=num_draft_tokens
     )
     if logits_output.hidden_states is not None:
-        logits_output.hidden_states = _compact_accept_to_front(
+        logits_output.hidden_states = compact_accept_to_front(
             logits_output.hidden_states,
             accept_index,
             bs,
@@ -435,7 +435,7 @@ def _finalize_accept_tree_path(
     return predict
 
 
-def _compact_accept_to_front(
+def compact_accept_to_front(
     x: torch.Tensor,
     accept_index: torch.Tensor,
     bs: int,

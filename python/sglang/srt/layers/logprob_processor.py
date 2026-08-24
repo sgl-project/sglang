@@ -366,7 +366,14 @@ def compute_spec_logprobs(
 
     if accept_index is not None:
         max_accept = accept_index.shape[1]
-        flat_accept_idx = accept_index.long().reshape(-1)
+        # Clamped, not raw: accept_index pads with -1 past each request's accepted run,
+        # and a negative index would wrap to the last row of logits and the last entry
+        # of predict. The wrapped logprob is never read (callers slice each row to the
+        # accept length), but the token id it produces feeds the vocabulary gather
+        # below, and the verify kernel only writes predict at the nodes it visits --
+        # so that slot can hold anything and the gather goes out of bounds. Reading
+        # row 0 instead keeps the same unread garbage in bounds.
+        flat_accept_idx = accept_index.long().reshape(-1).clamp(min=0)
         gathered_logits = next_token_logits[flat_accept_idx]
         accepted_token_ids = predict[flat_accept_idx]
     else:
