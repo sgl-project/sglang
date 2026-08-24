@@ -1235,19 +1235,17 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
             "minicpm_flashinfer": "flashinfer",
         }
-        attention_backend = dense_backends.get(server_args.attention_backend)
-        if attention_backend is not None:
-            overrides["attention_backend"] = attention_backend
-        prefill_attention_backend = dense_backends.get(
-            server_args.prefill_attention_backend
-        )
-        if prefill_attention_backend is not None:
-            overrides["prefill_attention_backend"] = prefill_attention_backend
-        decode_attention_backend = dense_backends.get(
-            server_args.decode_attention_backend
-        )
-        if decode_attention_backend is not None:
-            overrides["decode_attention_backend"] = decode_attention_backend
+        # Literal keys keep the written-field set statically derivable; a loop
+        # variable hides it from the census in test_chain_read_ratchet.py.
+        dense_attention = dense_backends.get(server_args.attention_backend)
+        if dense_attention is not None:
+            overrides["attention_backend"] = dense_attention
+        dense_prefill = dense_backends.get(server_args.prefill_attention_backend)
+        if dense_prefill is not None:
+            overrides["prefill_attention_backend"] = dense_prefill
+        dense_decode = dense_backends.get(server_args.decode_attention_backend)
+        if dense_decode is not None:
+            overrides["decode_attention_backend"] = dense_decode
     elif has_sparse_attention:
         uses_sparse_backend = server_args.is_attention_backend_not_set() or any(
             backend in ("minicpm_flashattn", "minicpm_flashinfer")
