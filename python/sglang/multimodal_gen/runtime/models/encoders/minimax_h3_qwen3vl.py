@@ -32,6 +32,7 @@ MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 _LAYER_WEIGHT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 _PARAM_NAMES_MAPPING = {
     r"^model\.(embed_tokens|layers|norm|rotary_emb)\.": r"model.language_model.\1.",
+    r"^language_model\.": r"model.language_model.",
     r"^visual\.": r"model.visual.",
     r"^(model\.visual\.blocks\.\d+\.attn\.)qkv\.": r"\1qkv_proj.",
 }
