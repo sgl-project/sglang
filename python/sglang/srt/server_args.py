@@ -241,6 +241,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "intel_xpu",
     "triton",
 ]
 
@@ -8185,6 +8186,11 @@ class ServerArgs:
                 "decoding (--speculative-algorithm): the weight cache daemon does "
                 "not export the draft model's weights. Disable one of them "
                 "(--weight-cache-mode off) for this configuration."
+            )
+
+        if self.weight_cache_mode != "off" and self.enable_eplb:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with --enable-eplb."
             )
 
     def _is_mistral_native_format(self) -> bool:
