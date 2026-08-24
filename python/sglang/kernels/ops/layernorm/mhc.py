@@ -16,7 +16,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils import get_device_core_count
 
 logger = logging.getLogger(__name__)
 
@@ -545,9 +544,7 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
 
-    n_sms = get_device_core_count()
-    if n_sms <= 0:
-        n_sms = 1
+    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
