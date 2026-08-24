@@ -40,7 +40,8 @@ def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
 
 
 def _use_fast(hidden_size: int) -> bool:
-    """Use the TMA kernel on SM100+ except SM12x."""
+    """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
+    and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
     if is_npu():
         return False

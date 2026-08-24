@@ -58,7 +58,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
 )
@@ -194,7 +194,13 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
             ]
 
         if offload_managers:
-            weight_dict = dict(weights_iter)
+            entries = list(weights_iter)
+            if any(shard_id is not None for _, _, shard_id in entries):
+                raise NotImplementedError(
+                    "Fused-parameter weight updates are not supported for "
+                    "layerwise-offloaded modules."
+                )
+            weight_dict = {n: w for n, w, _ in entries}
             offloaded_names: set[str] = set()
             for manager in offload_managers:
                 offloaded_names.update(manager.update_cpu_weights(weight_dict))
@@ -267,17 +273,22 @@ def _iter_module_weight_updates(
     weights_iter,
     model_params: dict,
 ):
+    """Yield (mapped_name, weight, shard_id); shard_id is the merge index for
+    weights that map into a fused parameter (e.g. q/k/v -> to_qkv), else None.
+    """
     map_name = _build_module_weight_name_mapper(module)
     module_name = type(module).__name__
 
     for name, loaded_weight in weights_iter:
         if name in model_params:
-            yield name, loaded_weight
+            yield name, loaded_weight, None
             continue
 
-        mapped_name = map_name(name)[0] if map_name is not None else name
+        mapped_name, merge_index = (
+            map_name(name) if map_name is not None else (name, None)
+        )
         if mapped_name in model_params:
-            yield mapped_name, loaded_weight
+            yield mapped_name, loaded_weight, merge_index
             continue
 
         logger.warning(
@@ -291,15 +302,21 @@ def _iter_module_weight_updates(
 def load_weights_into_model(
     weights_iter, model_params: dict, module_name: str | None = None
 ) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
-    for name, loaded_weight in weights_iter:
+    """Copy weights into model_params in-place; entries are (name, weight) or
+    (name, weight, shard_id), shard_id routing fused parts via weight_loader."""
+    for entry in weights_iter:
+        name, loaded_weight, *rest = entry
+        shard_id = rest[0] if rest else None
         if name not in model_params:
             logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
         weight_loader = getattr(param, "weight_loader", None)
         if callable(weight_loader):
-            weight_loader(param, loaded_weight.to(param.dtype))
+            if shard_id is not None:
+                weight_loader(param, loaded_weight.to(param.dtype), shard_id)
+            else:
+                weight_loader(param, loaded_weight.to(param.dtype))
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
             if dtensor_param is None and isinstance(
