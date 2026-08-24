@@ -327,7 +327,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--speculative-dflash-confidence-min-verify-len must be in "
                 f"[2, {block_size}], got {min_verify_len}."
             )
-        target_tokens = int(server_args.speculative_dflash_confidence_target_verify_tokens)
+        target_tokens = int(
+            server_args.speculative_dflash_confidence_target_verify_tokens
+        )
         if target_tokens < 0:
             raise ValueError(
                 "--speculative-dflash-confidence-target-verify-tokens must be "

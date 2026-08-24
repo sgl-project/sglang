@@ -6823,7 +6823,11 @@ class ServerArgs:
                 # refusing those combinations.
                 _algo = (self.speculative_algorithm or "").upper()
                 verify = self.linear_attn_verify_backend
-                if _algo not in ("DSPARK", "DFLASH", "DFLASH_CONFIDENCE") or verify not in (
+                if _algo not in (
+                    "DSPARK",
+                    "DFLASH",
+                    "DFLASH_CONFIDENCE",
+                ) or verify not in (
                     "triton",
                     "nv_cutedsl",
                 ):

@@ -4456,9 +4456,11 @@ class Scheduler(
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret[
-                    "dspark_info_record"
-                    if self.spec_algorithm.is_dspark()
-                    else "dflash_confidence_info_record"
+                    (
+                        "dspark_info_record"
+                        if self.spec_algorithm.is_dspark()
+                        else "dflash_confidence_info_record"
+                    )
                 ] = info_record
 
         # These fields are not msgpack-serializable (a config object and a bound

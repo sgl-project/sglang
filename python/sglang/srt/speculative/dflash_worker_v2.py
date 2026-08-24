@@ -1076,7 +1076,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _confidence_target_verify_tokens(self, confidence: torch.Tensor) -> int:
         if self._confidence_sps_table is None:
-            return int(self.server_args.speculative_dflash_confidence_target_verify_tokens)
+            return int(
+                self.server_args.speculative_dflash_confidence_target_verify_tokens
+            )
         decision = select_sps_verify_token_budget(
             confidence,
             verify_num_draft_tokens=self.block_size,
@@ -1086,7 +1088,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             sps_table=self._confidence_sps_table,
         )
         target_tokens = int(decision.budget)
-        if self.server_args.speculative_dflash_confidence_align_verify_tokens_to_graph_tier:
+        if (
+            self.server_args.speculative_dflash_confidence_align_verify_tokens_to_graph_tier
+        ):
             buckets = self._ragged_verify_graph_buckets()
             if buckets:
                 for bucket in buckets:
@@ -2192,7 +2196,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             compact_logits = logits_output.next_token_logits
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
-                raise RuntimeError("DFLASH_CONFIDENCE verify requires target hidden states.")
+                raise RuntimeError(
+                    "DFLASH_CONFIDENCE verify requires target hidden states."
+                )
             logits_output.next_token_logits = ScatterCompactToStrided.execute(
                 compact=compact_logits,
                 layout=confidence_layout,
@@ -2319,7 +2325,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
 
             else:
-                if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
+                if (
+                    SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+                    and target_predict is None
+                ):
                     # The sampling-verify branch does not materialize the target argmax.
                     target_predict = torch.argmax(
                         logits_output.next_token_logits, dim=-1

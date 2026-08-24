@@ -89,7 +89,9 @@ class TestDFlashConfidence(unittest.TestCase):
 
         self.assertTrue(torch.equal(first.verify_lens, second.verify_lens))
         self.assertEqual(first.verify_lens.tolist(), [2, 5, 2])
-        self.assertTrue(bool(((first.verify_lens >= 2) & (first.verify_lens <= 5)).all()))
+        self.assertTrue(
+            bool(((first.verify_lens >= 2) & (first.verify_lens <= 5)).all())
+        )
         self.assertEqual(int(first.verify_lens.sum()), 9)
         self.assertEqual(first.deferred_tokens, 6)
 
@@ -204,9 +206,7 @@ class TestDFlashConfidence(unittest.TestCase):
             head.proj.weight.copy_(torch.tensor([[1.0, 0.0]]))
             head.proj.bias.zero_()
         head.sts_temperatures = torch.tensor([1.0, 2.0])
-        confidence = head.apply_sts(
-            head(torch.tensor([[[2.0, 9.0], [2.0, -3.0]]]))
-        )
+        confidence = head.apply_sts(head(torch.tensor([[[2.0, 9.0], [2.0, -3.0]]])))
         expected = torch.sigmoid(torch.tensor([[2.0, 1.0]]))
         torch.testing.assert_close(confidence, expected)
         torch.testing.assert_close(
@@ -250,7 +250,9 @@ class TestDFlashConfidence(unittest.TestCase):
         spec = SimpleNamespace(
             speculative_algorithm="DFLASH_CONFIDENCE", enable_multi_layer_eagle=True
         )
-        with mock.patch("sglang.srt.speculative.spec_utils.get_spec", return_value=spec):
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.get_spec", return_value=spec
+        ):
             self.assertFalse(spec_need_hidden_states())
 
     def test_planner_rejects_invalid_threshold(self):
