@@ -2003,9 +2003,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
-                    generators.append(
-                        self._wait_one_response(tmp_obj, state, request)
-                    )
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
