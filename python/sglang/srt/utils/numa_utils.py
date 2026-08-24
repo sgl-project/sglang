@@ -87,6 +87,19 @@ def configure_nsys_scheduler_subprocess(gpu_id: int):
         yield
         return
 
+    rank_spec = os.getenv("SGLANG_NSYS_SCHEDULER_RANKS", "").strip()
+    if rank_spec:
+        try:
+            selected_ranks = {int(rank.strip()) for rank in rank_spec.split(",")}
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_NSYS_SCHEDULER_RANKS must be a comma-separated list "
+                "of integer GPU ranks"
+            ) from exc
+        if gpu_id not in selected_ranks:
+            yield
+            return
+
     output_dir = os.getenv("SGLANG_NSYS_SCHEDULER_OUTPUT_DIR", "").strip()
     capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
     if not output_dir or not capture_range:

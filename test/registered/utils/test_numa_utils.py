@@ -615,6 +615,36 @@ class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
             executable="/tmp/nsys-rank2", debug_str="debug"
         )
 
+    @patch.dict(
+        os.environ,
+        {
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+            "SGLANG_NSYS_SCHEDULER_RANKS": "0",
+        },
+        clear=True,
+    )
+    @patch("sglang.srt.utils.numa_utils._mp_set_executable")
+    @patch("sglang.srt.utils.numa_utils._create_nsys_scheduler_executable")
+    def test_skips_unselected_rank(self, create_executable, set_executable):
+        with configure_nsys_scheduler_subprocess(2):
+            pass
+
+        create_executable.assert_not_called()
+        set_executable.assert_not_called()
+
+    @patch.dict(
+        os.environ,
+        {
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+            "SGLANG_NSYS_SCHEDULER_RANKS": "rank-zero",
+        },
+        clear=True,
+    )
+    def test_rejects_invalid_rank_selection(self):
+        with self.assertRaisesRegex(ValueError, "comma-separated"):
+            with configure_nsys_scheduler_subprocess(0):
+                pass
+
     @patch.dict(os.environ, {"SGLANG_NSYS_SCHEDULER_WRAPPER": "1"}, clear=True)
     def test_requires_output_and_capture_range(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR"):
