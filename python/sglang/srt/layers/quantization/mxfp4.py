@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -51,6 +52,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_device_capability,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -59,7 +61,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    mxfp_supported,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -70,15 +71,63 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
 
+# Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
+# post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
+_UE8M0_ONE = 127
+
+
+@lru_cache(maxsize=1)
+def _is_sm107_supported() -> bool:
+    return get_device_capability() == (10, 7)
+
+
+def _prepare_flashinfer_mxfp8_activations(
+    x: torch.Tensor, hidden_size: int
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    prepared = None
+    if x.shape[-1] == hidden_size:
+        if x.dim() > 2:
+            x = x.view(-1, x.shape[-1])
+        # K3's routing dispatch may already have quantized these rows and
+        # packed the topk ids. Other models use FlashInfer's own activation
+        # preparation so the producer matches the fused-MoE input contract.
+        from sglang.srt.layers.moe import route_quant_handoff
+
+        prepared = route_quant_handoff.take(x)
+
+    if prepared is not None:
+        prepared_packed_topk, x_quant, x_scale = prepared
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mxfp8_quantize,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
+        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+    else:
+        from sglang.kernels.ops.quantization.per_token_group_quant import (
+            per_token_group_quant,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = per_token_group_quant(x, group_size=32, scale_ue8m0=True)
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+
+    return x, prepared_packed_topk, x_quant, x_scale
+
 
 if is_flashinfer_available():
     from flashinfer import (
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe.core import (
-        get_w2_permute_indices_with_cache,
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_routed_moe,
     )
+    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+    from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
     # versions don't ship them; gate at import so unrelated code paths still load.
@@ -166,17 +215,17 @@ if _is_hip:
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    import triton_kernels.matmul_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    value_layout_opts = {}
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
     )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
-    )
+    scale_layout_opts = {}
     if is_sm100_supported():
         constraints = {
             "is_persistent": True,
@@ -256,7 +305,7 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
         if _is_hip:
-            if mxfp_supported():
+            if is_gfx95_supported():
                 return cls(
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
@@ -337,6 +386,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # MegaMoE calls DeepGEMM directly instead of going through the selected
+        # MoE runner, so it needs the same unpadded checkpoint layout and
+        # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
+        self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -387,7 +440,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if self.use_marlin:
+        if self.use_marlin and not self.use_mega_moe:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 128
             )
@@ -397,7 +450,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm:
+        elif self.use_deep_gemm or self.use_mega_moe:
             # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
             # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
             pass
@@ -473,10 +526,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
+            torch.full(
+                (
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    hidden_size // mxfp4_block,
+                ),
+                fill_value=_UE8M0_ONE,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -512,10 +568,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
+            torch.full(
+                (
+                    layer.num_local_experts,
+                    hidden_size,
+                    intermediate_size_per_partition_after_pad // mxfp4_block,
+                ),
+                fill_value=_UE8M0_ONE,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -533,7 +592,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if self.use_marlin:
+        if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
             )
@@ -561,7 +620,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer._mxfp4_backend = "marlin"
             return
 
-        if self.use_deep_gemm:
+        if self.use_deep_gemm or self.use_mega_moe:
             from deep_gemm import transform_sf_into_required_layout
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
@@ -586,7 +645,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_groups=num_experts,
                     disable_ue8m0_cast=False,
                 )
-            if get_moe_a2a_backend().is_megamoe():
+            if self.use_mega_moe:
                 # MegaMoE consumes the same transformed sf, plus its own
                 # interleaved/UTCCP weight layout. K3 routes EVERY batch
                 # through mega (the megamoe backend has no a2a fallback), so
@@ -922,7 +981,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
 
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -940,10 +999,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
             self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
 
             self.w13_weight_triton_tensor = w13_weight
@@ -1402,6 +1461,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.moe_runner_config.gemm1_alpha,
                     layer.moe_runner_config.gemm1_clamp_limit,
                     True,  # is_vnni
+                    layer.moe_runner_config.activation,  # activation
                 )
             else:
                 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
@@ -1423,6 +1483,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self._fi_kernel == "cutlass_sm120":
             return self._apply_sm120_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                trtllm_moe_enable_pdl,
+            )
+
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
@@ -1444,40 +1508,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                if x.shape[-1] == self.hidden_size:
-                    if x.dim() > 2:
-                        x = x.view(-1, x.shape[-1])
-                    # K3 staged fusion (route_quant_handoff): the routing
-                    # dispatch already quantized these rows and packed the
-                    # topk ids in the fused route launch — consume both and
-                    # skip the two standalone kernels. Identity-verified;
-                    # a miss runs the unfused chain below.
-                    from sglang.srt.layers.moe import route_quant_handoff
-
-                    prepared = route_quant_handoff.take(x)
-                    if prepared is not None:
-                        prepared_packed_topk, x_quant, x_scale = prepared
-                        x_scale = x_scale.view(torch.float8_e4m3fn)
-                    else:
-                        from sglang.kernels.ops.quantization.per_token_group_quant import (
-                            per_token_group_quant,
-                        )
-
-                        x_quant, x_scale = per_token_group_quant(
-                            x, group_size=32, scale_ue8m0=True
-                        )
-                        x_scale = x_scale.view(torch.float8_e4m3fn)
-                else:
-                    from sglang.srt.layers.quantization.fp8_utils import (
-                        flashinfer_mxfp8_quantize,
-                    )
-
-                    x_quant, x_scale = flashinfer_mxfp8_quantize(
-                        x, False, alignment=self.hidden_size
-                    )
-                    x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
-                        *x.shape[:-1], -1
-                    )
+                x, prepared_packed_topk, x_quant, x_scale = (
+                    _prepare_flashinfer_mxfp8_activations(x, self.hidden_size)
+                )
             else:
                 raise NotImplementedError()
 
@@ -1522,20 +1555,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
 
             if self.moe_runner_config.activation == "situ":
-                # SiTU is only in the private trtllm-gen cubin pool (the
-                # public artifact bakes swiglu into the fused-act cubins and
-                # silently computes the wrong activation). Routing must also
-                # be noaux_tc (sigmoid + correction bias, DeepSeekV3 method),
-                # not the renormalize-softmax default below.
-                from sglang.kernels.ops.moe import trtllm_gen_moe as situ_moe
-
-                if not situ_moe.available():
-                    raise RuntimeError(
-                        "activation='situ' with the flashinfer_mxfp4 runner "
-                        "needs the SiTU cubin pool: set "
-                        "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL (see "
-                        "sglang/kernels/ops/moe/trtllm_gen_moe.py)."
-                    )
+                # FlashInfer 0.6.17+ ships the SiTU TRT-LLM-gen kernels.
+                # Routing must be noaux_tc (sigmoid + correction bias,
+                # DeepSeekV3), not the renormalize-softmax default below.
                 # EP is cubin-internal: each rank computes its local expert slice
                 # [offset, +num_local) and the caller all-reduces. ep=1 -> TP path.
                 local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
@@ -1559,29 +1581,39 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
 
                     defer_finalize = _deferred_finalize_enabled.get()
-                    result = situ_moe.trtllm_fp4_block_scale_routed_moe(
-                        packed_topk_ids=packed_topk,
+                    result = trtllm_fp4_block_scale_routed_moe(
+                        topk_ids=packed_topk,
+                        routing_bias=None,
                         hidden_states=x_quant,
                         hidden_states_scale=x_scale,
                         gemm1_weights=layer.w13_weight,
                         gemm1_weights_scale=layer.w13_weight_scale,
+                        gemm1_bias=None,
                         gemm1_alpha=layer.gemm1_alpha,
-                        # SiTuGlu: gatedActBeta is the linear-half tanh
-                        # clip; K3 stores it in gemm1_clamp_limit.
+                        # SiTU beta is the linear-half tanh clip; K3 stores it
+                        # in gemm1_clamp_limit.
                         gemm1_beta=layer.gemm1_clamp_limit,
+                        gemm1_clamp_limit=None,
                         gemm2_weights=layer.w2_weight,
                         gemm2_weights_scale=layer.w2_weight_scale,
+                        gemm2_bias=None,
                         output1_scale_scalar=None,
                         output1_scale_gate_scalar=None,
                         output2_scale_scalar=None,
                         num_experts=layer.num_experts,
                         top_k=packed_topk.shape[1],
+                        n_group=None,
+                        topk_group=None,
                         intermediate_size=self.intermediate_size_per_partition,
-                        activation_type=situ_moe.ACTIVATION_SITU,
                         local_expert_offset=local_expert_offset,
                         local_num_experts=layer.num_local_experts,
+                        routed_scaling_factor=None,
+                        routing_method_type=RoutingMethodType.TopK.value,
+                        activation_type=ActivationType.Situ.value,
+                        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                         output=symm_output,
                         do_finalize=not defer_finalize,
+                        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                     )
                     if defer_finalize:
                         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1595,6 +1627,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             expanded_idx_to_permuted_idx=expanded_idx,
                             top_k=packed_topk.shape[1],
                         )
+                    else:
+                        result = result[0]
                     return StandardCombineInput(hidden_states=result)
 
                 # Bypassed topk: route from logits inside the op.
@@ -1603,7 +1637,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if bias_bf16 is None and correction_bias is not None:
                     bias_bf16 = correction_bias.to(torch.bfloat16)
                     layer._situ_routing_bias_bf16 = bias_bf16
-                situ_moe.trtllm_fp4_block_scale_moe(
+                trtllm_fp4_block_scale_moe(
                     # router_logits is a row-strided slice of the K3 fused
                     # front GEMM output; the FFI reads it as dense.
                     routing_logits=router_logits.to(torch.bfloat16).contiguous(),
@@ -1612,12 +1646,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     hidden_states_scale=x_scale,
                     gemm1_weights=layer.w13_weight,
                     gemm1_weights_scale=layer.w13_weight_scale,
+                    gemm1_bias=None,
                     gemm1_alpha=layer.gemm1_alpha,
-                    # SiTuGlu: gatedActBeta is the linear-half tanh clip;
-                    # K3 stores it in gemm1_clamp_limit (situ_linear_beta).
+                    # SiTU beta is the linear-half tanh clip; K3 stores it in
+                    # gemm1_clamp_limit (situ_linear_beta).
                     gemm1_beta=layer.gemm1_clamp_limit,
+                    gemm1_clamp_limit=None,
                     gemm2_weights=layer.w2_weight,
                     gemm2_weights_scale=layer.w2_weight_scale,
+                    gemm2_bias=None,
                     output1_scale_scalar=None,
                     output1_scale_gate_scalar=None,
                     output2_scale_scalar=None,
@@ -1629,12 +1666,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     routed_scaling_factor=(
                         topk_output.topk_config.routed_scaling_factor or 1.0
                     ),
-                    routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
-                    activation_type=situ_moe.ACTIVATION_SITU,
+                    routing_method_type=RoutingMethodType.DeepSeekV3.value,
+                    activation_type=ActivationType.Situ.value,
                     norm_topk_prob=topk_output.topk_config.renormalize,
                     local_expert_offset=local_expert_offset,
                     local_num_experts=layer.num_local_experts,
+                    tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                     output=symm_output,
+                    enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                 )
                 return StandardCombineInput(hidden_states=symm_output)
 
@@ -1667,6 +1706,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
+                enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
         if _use_aiter:

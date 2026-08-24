@@ -16,6 +16,23 @@ from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
+# ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
+# forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
+# handlers keep returning the generic method; the platform swap happens here.
+# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
+# CUDA-only merge_state_v2 kernel.
+_ROCM_FORWARD_METHODS = {
+    AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
+    AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
+}
+
+
+def resolve_rocm_forward_method(method: AttnForwardMethod) -> AttnForwardMethod:
+    if not _is_hip:
+        return method
+    return _ROCM_FORWARD_METHODS.get(method, method)
+
 
 class AttentionBackendRegistry:
     _handlers = {}

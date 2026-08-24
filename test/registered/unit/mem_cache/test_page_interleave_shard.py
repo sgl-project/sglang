@@ -260,6 +260,27 @@ class TestClassedAllocator(CustomTestCase):
         deltas = [a - b for a, b in zip(after, before)]
         self.assertEqual(deltas, [1, 0, 0, 1])  # classes (1+2)%4=3 and (1+3)%4=0
 
+    def test_grouped_free_owns_indices_before_caller_mutation(self):
+        """Deferred frees must snapshot req_to_token views: the scheduler may
+        overwrite the backing row before free_group_end consumes them."""
+        alloc = _make_allocator()
+        out = _alloc_extend(alloc, 0, 2 * PS, rotation_base=2)
+        first_page = out[:PS]
+        owner = int(first_page[0] // PS % N)
+        before = alloc.class_free_page_counts()
+
+        alloc.free_group_begin()
+        alloc.free(first_page)
+        first_page.zero_()
+        alloc.free_group_end()
+
+        after = alloc.class_free_page_counts()
+        self.assertEqual(after[owner], before[owner] + 1)
+        self.assertEqual(
+            [after[r] - before[r] for r in range(N)],
+            [1 if r == owner else 0 for r in range(N)],
+        )
+
     def test_free_segment_returns_pages_to_their_classes(self):
         # The radix cache frees through free_segment/free_segments. The paged
         # base routes those to the stock free_pages list, which this allocator

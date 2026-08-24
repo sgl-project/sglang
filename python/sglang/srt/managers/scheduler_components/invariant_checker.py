@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
     raise_error_or_warn,
@@ -50,7 +49,6 @@ class SchedulerInvariantChecker:
     full_tokens_per_layer: Optional[int]
     swa_tokens_per_layer: Optional[int]
     max_total_num_tokens: int
-    server_args: ServerArgs
     tree_cache: BasePrefixCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
@@ -100,7 +98,9 @@ class SchedulerInvariantChecker:
             else:
                 protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.token_to_kv_pool_allocator.size
+            total = self.req_to_token_pool.schedulable_token_capacity(
+                self.token_to_kv_pool_allocator.size
+            )
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
@@ -109,16 +109,16 @@ class SchedulerInvariantChecker:
         full_available_size = ps.full_available_size
         allocator = self.token_to_kv_pool_allocator
         class_watermark_msg = ""
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
+        kv_shard_size = page_interleave_shard_size(allocator)
         widened_page_alloc = (
-            getattr(self.server_args, "dcp_size", 1) > 1
-            or get_parallel().enable_kv_cache_sharding
+            get_parallel().dcp_enabled or kv_shard_size > 1
         ) and allocator.page_size > 1
         if widened_page_alloc:
-            from sglang.srt.mem_cache.allocator.page_interleave import (
-                page_interleave_shard_size,
-            )
-
-            if page_interleave_shard_size(allocator) > 1:
+            if kv_shard_size > 1:
                 # Rotated owner-classed KV sharding: the accounting identity
                 # needs the AGGREGATE free size — the admission-facing
                 # available_size() is the min-class capacity floor and
@@ -190,12 +190,20 @@ class SchedulerInvariantChecker:
                 return leak, msg
             free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
-            expected_full_pages = set(
-                range(1, self.token_to_kv_pool_allocator.size + 1)
-            )
-            leaked_full_pages = (
-                expected_full_pages - free_full_pages - cached_full_pages
-            )
+            full_page_msg = ""
+            if (
+                self.req_to_token_pool.schedulable_token_capacity(
+                    self.token_to_kv_pool_allocator.size
+                )
+                == self.token_to_kv_pool_allocator.size
+            ):
+                expected_full_pages = set(
+                    range(1, self.token_to_kv_pool_allocator.size + 1)
+                )
+                leaked_full_pages = (
+                    expected_full_pages - free_full_pages - cached_full_pages
+                )
+                full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
             mamba_allocator = self.req_to_token_pool.mamba_allocator
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
@@ -205,10 +213,8 @@ class SchedulerInvariantChecker:
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
-            msg += (
-                f", leaked_full_pages={leaked_full_pages or None}"
-                f", leaked_mamba_pages={leaked_mamba_pages or None}"
-            )
+            msg += full_page_msg
+            msg += f", leaked_mamba_pages={leaked_mamba_pages or None}"
         return leak, msg
 
     def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:

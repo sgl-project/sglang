@@ -322,7 +322,10 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             return
 
         if not self.is_not_in_free_group:
-            self.free_group.append(free_index)
+            # Match the base allocator's ownership contract: callers may
+            # overwrite req_to_token views before free_group_end consumes the
+            # deferred indices.
+            self.free_group.append(self._copy_for_free_group(free_index))
             return
 
         # The tree quantum is the physical page, so every free covers whole

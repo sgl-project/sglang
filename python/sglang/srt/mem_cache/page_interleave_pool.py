@@ -623,14 +623,18 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         with kv_shard_nvtx_range("kv_shard.set_kv_buffer", color="blue"):
             if self._shard_extend_active:
                 # Stage the full chunk into this layer's slot (compute
                 # stream): the absorbed / one-shot readers cover the current
                 # chunk through the translated page table too.
-                slot = self._slots[layer.layer_id % 2]
+                slot = self._slots[layer_id % 2]
                 rows = self._translate_loc_cached(loc)
                 staged_k = cache_k
                 if staged_k.dtype != self.dtype:
@@ -644,6 +648,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
                 local_rows,
                 cache_k.index_select(0, owned_idx),
                 cache_v,
+                layer_id_override=layer_id_override,
             )
 
     def set_mla_kv_buffer(
@@ -652,10 +657,14 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         with kv_shard_nvtx_range("kv_shard.set_kv_buffer", color="blue"):
             if self._shard_extend_active:
-                slot = self._slots[layer.layer_id % 2]
+                slot = self._slots[layer_id % 2]
                 rows = self._translate_loc_cached(loc)
                 staged_nope, staged_rope = cache_k_nope, cache_k_rope
                 if staged_nope.dtype != self.dtype:
@@ -675,6 +684,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
                 local_rows,
                 cache_k_nope.index_select(0, owned_idx),
                 cache_k_rope.index_select(0, owned_idx),
+                layer_id_override=layer_id_override,
             )
 
     def get_kv_buffer_shape(self):

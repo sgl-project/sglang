@@ -8,6 +8,8 @@
 #pragma once
 #include <sgl_kernel/type.cuh>
 
+namespace sglang {
+
 namespace device::math {
 
 /// \brief Constant: log2(e)
@@ -19,7 +21,7 @@ inline constexpr float loge2 = 0.693147180559945309417f;
 /// (gfx942). Mirrors kFP8E4M3Max so fp8 quant scale divisors and clamps in
 /// the dsv4 compute path (indexer Q-quant, MoE silu+mul / dispatch quant,
 /// GEMM per-tensor quant) do not over-saturate fnuz hardware.
-inline constexpr float FP8_E4M3_MAX = ::kFP8E4M3Max;
+inline constexpr float FP8_E4M3_MAX = kFP8E4M3Max;
 static_assert(log2e * loge2 == 1.0f, "log2e * loge2 must be 1");
 
 /// \brief Returns the larger of `a` and `b`.
@@ -105,3 +107,5 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 }
 
 }  // namespace device::math
+
+}  // namespace sglang

@@ -6,6 +6,11 @@ import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+)
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
@@ -313,27 +318,27 @@ def maybe_init_shared_mooncake_transfer_engine(
     """
     use_mooncake_te = (
         (
-            server_args.disaggregation_mode != "null"
-            and server_args.disaggregation_transfer_backend == "mooncake"
+            get_disagg().disaggregation_mode != "null"
+            and get_disagg().disaggregation_transfer_backend == "mooncake"
         )
         or (
-            server_args.enable_hierarchical_cache
-            and server_args.hicache_storage_backend == "mooncake"
+            get_memory().enable_hierarchical_cache
+            and get_memory().hicache_storage_backend == "mooncake"
             and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
         )
         or (
-            server_args.encoder_only
-            and server_args.encoder_transfer_backend == "mooncake"
+            get_disagg().encoder_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
         )
         or (
-            server_args.language_only
-            and server_args.encoder_transfer_backend == "mooncake"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
         )
         or (
-            server_args.enable_elastic_expert_backup
-            and server_args.elastic_ep_backend is not None
+            get_exec().moe.enable_elastic_expert_backup
+            and get_exec().moe.elastic_ep_backend is not None
         )
-        or server_args.elastic_ep_backend == "mooncake"
+        or get_exec().moe.elastic_ep_backend == "mooncake"
     )
 
     if use_mooncake_te:
@@ -341,11 +346,12 @@ def maybe_init_shared_mooncake_transfer_engine(
             hostname=get_local_ip_auto(),
             gpu_id=gpu_id,
             ib_device=(
-                server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+                get_disagg().disaggregation_ib_device
+                or get_exec().moe.mooncake_ib_device
             ),
         )
 
-        if server_args.elastic_ep_backend == "mooncake":
+        if get_exec().moe.elastic_ep_backend == "mooncake":
             try:
                 from mooncake.pg import set_transfer_engine
             except ImportError as e:
