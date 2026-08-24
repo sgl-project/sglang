@@ -30,7 +30,10 @@ Triton kernel is a later CUDA CI pin):
     contents); the returned table is the WHOLE buffer (pointer-stable);
   - the eager-view memo: a single source-resident slot keyed by batch
     identity (same batch shares one build; the next batch replaces it; a
-    dead batch never matches).
+    dead batch never matches);
+  - the two-phase write contract: the rebind touches only the full side, and
+    the sliding-window write loc derives POINTWISE from the kernel-facing values
+    (pads, slices, and fresh copies included), for both pool families.
 
     python -m pytest test/registered/unit/mem_cache/test_kv_index_translator.py -v
 """
@@ -49,6 +52,7 @@ from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 
 _DEV = "cpu"
@@ -467,16 +471,29 @@ class TestCaptureContract(unittest.TestCase):
 
 
 class _FakeForwardBatch:
-    """Weakref-able stand-in (SimpleNamespace is not) carrying the four
-    fields `index_table_for_batch` reads. `seq_lens_sum` defaults to the real
-    sum: it is the signal that the CPU mirror is live, and a real ForwardBatch
-    always carries it (None only when the batch is gpu_only)."""
+    """Weakref-able stand-in (SimpleNamespace is not) carrying the fields
+    `index_table_for_batch` and `rebind_write_loc` read. `seq_lens_sum`
+    defaults to the real sum: it is the signal that the CPU mirror is live,
+    and a real ForwardBatch always carries it (None only when gpu_only)."""
 
-    def __init__(self, *, req_pool_indices, seq_lens, seq_lens_cpu, seq_lens_sum=-1):
+    def __init__(
+        self,
+        *,
+        req_pool_indices=None,
+        seq_lens=None,
+        seq_lens_cpu=None,
+        out_cache_loc=None,
+        seq_lens_sum=-1,
+    ):
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
-        self.seq_lens_sum = int(seq_lens.sum()) if seq_lens_sum == -1 else seq_lens_sum
+        self.out_cache_loc = out_cache_loc
+        self.seq_lens_sum = (
+            (None if seq_lens is None else int(seq_lens.sum()))
+            if seq_lens_sum == -1
+            else seq_lens_sum
+        )
 
 
 class TestViewMemo(unittest.TestCase):
@@ -536,6 +553,147 @@ class TestViewMemo(unittest.TestCase):
         v2 = src.index_table_for_batch(fb2)
         self.assertIsNot(v2, v1)
         self.assertEqual(v2.ids.shape[0], 1)
+
+
+class TestWriteLoc(unittest.TestCase):
+    """The two-phase write contract: phase 1 (`rebind_write_loc`) rebinds the
+    full side once at ForwardBatch construction; phase 2 derives the
+    sliding-window write loc at the per-batch build, POINTWISE from the dense
+    values. Value-based derivation is the property under test: pads, slices,
+    and fresh copies of the loc must all derive correctly with no handover
+    and no stored per-forward state."""
+
+    def _built(self, ps=1, n=4):
+        allocator = _build_composite(ps)
+        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[max(n, 1)])
+        src = _make_source(allocator, req_to_token, ps)
+        virt = allocator.alloc(-(-n // ps) * ps)[:n]
+        want_full = allocator.translate_kv_loc_for_kernel(virt)
+        want_swa = allocator.translate_loc_from_full_to_swa(virt)
+        return src, allocator, rows, seq_lens, virt, want_full, want_swa
+
+    def _field(self, src, rows, seq_lens, kernel_loc):
+        return src.build_index_table(
+            req_pool_indices=rows,
+            seq_lens=seq_lens,
+            max_pages=4,
+            out_cache_loc=kernel_loc,
+        ).sliding_window_write_loc
+
+    def test_rebind_translates_full_side_only(self):
+        for ps in (1, 4):
+            src, _, _, _, virt, want_full, _ = self._built(ps=ps, n=3 * ps)
+            keep = virt.clone()
+            fb = _FakeForwardBatch(out_cache_loc=virt)
+            src.rebind_write_loc(fb)
+            # Full side: rebound to a FRESH kernel-facing tensor; the
+            # ScheduleBatch's aliased virtual tensor is untouched.
+            self.assertIsNot(fb.out_cache_loc, virt)
+            self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
+            self.assertTrue(torch.equal(virt, keep))
+
+    def test_swa_write_loc_round_trips_from_dense(self):
+        """The derived property behind phase 2: for any virtual run t,
+        deriving from the dense full-side values must equal the direct
+        virtual->swa translate — `field(full(t)) == swa(t)` across page sizes
+        and multipliers."""
+        for ps in (1, 4, 64):
+            src, _, rows, seq_lens, _, want_full, want_swa = self._built(
+                ps=ps, n=3 * ps
+            )
+            got = self._field(src, rows, seq_lens, want_full)
+            self.assertTrue(torch.equal(got, want_swa))
+
+    def test_pad_lanes_derive_to_sink(self):
+        """The DP pad appends zeros; dense 0 is the reserved padding slot in
+        every id space, so pad lanes must derive to swa slot 0 with no
+        `num_live` bookkeeping."""
+        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=3)
+        padded = torch.cat([want_full, want_full.new_zeros(2)])
+        got = self._field(src, rows, seq_lens, padded)
+        self.assertTrue(torch.equal(got[:3], want_swa))
+        self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must land on slot 0")
+
+    def test_slice_and_copy_derive_pointwise_without_handover(self):
+        """REGRESSION (design): the retired identity-resolver refused any
+        tensor it had not been handed — a TBO child's re-padded slice or a
+        registry's fresh copy raised. Value-based derivation must accept
+        both, pointwise, with no adopt/handover call."""
+        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=4)
+        padded = torch.cat([want_full, want_full.new_zeros(2)])
+        # TBO-child shape: a slice crossing the pad boundary.
+        got = self._field(src, rows, seq_lens, padded[2:6])
+        self.assertTrue(torch.equal(got[:2], want_swa[2:4]))
+        self.assertTrue(bool((got[2:] == 0).all()))
+        # Registry shape: a fresh equal-value copy.
+        got2 = self._field(src, rows, seq_lens, want_full.clone())
+        self.assertTrue(torch.equal(got2, want_swa))
+
+    def test_tombstoned_swa_page_clamps_to_sink(self):
+        src, allocator, rows, seq_lens, virt, want_full, _ = self._built(ps=1, n=2)
+        allocator.swa_v2p_page_table[int(virt[0])] = -1
+        got = self._field(src, rows, seq_lens, want_full[:1])
+        self.assertEqual(int(got[0]), 0)
+
+    def test_static_swa_pool_derives_via_pool_translate(self):
+        """Static SWA pools: the field is the pool's own legacy full->swa
+        translate, computed at the same build; the rebind stays a no-op."""
+        pool = SWAKVPool.__new__(SWAKVPool)
+        pool.full_to_swa_index_mapping = torch.arange(10, dtype=torch.int64)
+        pool.translate_loc_from_full_to_swa = lambda t: t + 100
+        src = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 4), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=pool,
+            page_size=1,
+            device=_DEV,
+        )
+        loc = torch.tensor([5, 6], dtype=torch.int64)
+        fb = _FakeForwardBatch(out_cache_loc=loc)
+        src.rebind_write_loc(fb)
+        self.assertIs(fb.out_cache_loc, loc, "disabled rebind must be a no-op")
+        view = src.build_index_table(
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            out_cache_loc=loc,
+        )
+        self.assertTrue(torch.equal(view.sliding_window_write_loc, loc + 100))
+
+    def test_no_loc_or_no_swa_side_yields_none(self):
+        # Unified swa composite, but the build was given no write loc.
+        src, _, rows, seq_lens, _, _, _ = self._built(n=2)
+        view = src.build_index_table(
+            req_pool_indices=rows, seq_lens=seq_lens, max_pages=4
+        )
+        self.assertIsNone(view.sliding_window_write_loc)
+        # Passthrough on a non-SWA pool: a loc is given, but there is no swa
+        # id space to derive into.
+        plain = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 4), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device=_DEV,
+        )
+        view = plain.build_index_table(
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            out_cache_loc=torch.tensor([3], dtype=torch.int64),
+        )
+        self.assertIsNone(view.sliding_window_write_loc)
+
+    def test_rebind_retires_the_view_memo(self):
+        ps = 1
+        allocator = _build_composite(ps)
+        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[3, 2])
+        src = _make_source(allocator, req_to_token, ps)
+        fb = _FakeForwardBatch(
+            req_pool_indices=rows, seq_lens=seq_lens, seq_lens_cpu=seq_lens
+        )
+        v1 = src.index_table_for_batch(fb)
+        src.rebind_write_loc(_FakeForwardBatch(out_cache_loc=None))
+        v2 = src.index_table_for_batch(fb)
+        self.assertIsNot(v2, v1, "rebind starts the next forward: stale views die")
 
 
 if __name__ == "__main__":
