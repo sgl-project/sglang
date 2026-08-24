@@ -1044,9 +1044,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Layerwise keeps manager views; do not load_all.
         if not self.lora_initialized:
-            self.convert_to_lora_layers(
-                snapshot_base=not self._has_layerwise_offload()
-            )
+            self.convert_to_lora_layers(snapshot_base=not self._has_layerwise_offload())
 
         # Check adapter presence and load missing adapters
         adapter_updated = False

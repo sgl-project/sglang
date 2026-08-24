@@ -472,11 +472,7 @@ class BaseLayerWithLoRA(nn.Module):
             merge_in_fp32 = self._should_merge_in_fp32(lora_list)
         data = self._as_mutable_tensor(data)
         target_dtype = data.dtype
-        if (
-            merge_in_fp32
-            and data.is_floating_point()
-            and data.dtype != torch.float32
-        ):
+        if merge_in_fp32 and data.is_floating_point() and data.dtype != torch.float32:
             data = data.to(torch.float32)
         self._merge_lora_into_data(data, lora_list)
         merged = self._as_mutable_tensor(data.to(dtype=target_dtype))

@@ -1905,9 +1905,7 @@ def test_offload_param_name_aliases_cover_lora_wrap():
     aliases = offload_param_name_aliases("blocks.0.weight")
     assert "blocks.0.weight" in aliases
     assert "blocks.0.base_layer.weight" in aliases
-    assert "blocks.0.weight" in offload_param_name_aliases(
-        "blocks.0.base_layer.weight"
-    )
+    assert "blocks.0.weight" in offload_param_name_aliases("blocks.0.base_layer.weight")
 
 
 def test_parking_does_not_steal_lora_wrapped_layer_weights(monkeypatch):
