@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -23,7 +24,15 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
 )
-from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    alloc_with_hybm,
+    ascendc_io_enabled,
+    ensure_hybm_capacity,
+    hybm_host_memory_enabled,
+    to_device_no_sync,
+    track_pinned_staging,
+)
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -46,6 +55,23 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+_ASCENDC_LAYER_GROUP_DEFAULT = 8
+
+
+def _ascendc_layer_group_size() -> int:
+    """Layer-group size for the AscendC sparse-copy pipeline (env-tunable)."""
+    raw = os.environ.get("SGLANG_HICACHE_LAYER_GROUP_SIZE", "")
+    try:
+        size = int(raw) if raw else _ASCENDC_LAYER_GROUP_DEFAULT
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_HICACHE_LAYER_GROUP_SIZE=%r; using %d",
+            raw,
+            _ASCENDC_LAYER_GROUP_DEFAULT,
+        )
+        size = _ASCENDC_LAYER_GROUP_DEFAULT
+    return size
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
@@ -218,6 +244,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 k_width = self.device_pool.kv_cache_dim
             else:
                 k_width = self.kv_lora_rank
+            if _is_npu and hybm_host_memory_enabled():
+                # hybm-mapped host DRAM: required by the AIV sparse-copy IO
+                # path (SGLANG_HICACHE_IO_ASCENDC) and usable by the legacy
+                # memcpy2d path unchanged.  Size the GB-aligned reserve with
+                # the combined bytes of all buffers allocated below.
+                total_bytes = (
+                    self.page_num
+                    * self.page_size
+                    * self.layer_num
+                    * (k_width + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                )
+                if self.device_pool.index_head_dim is not None:
+                    total_bytes += (
+                        self.page_num
+                        * self.page_size
+                        * num_indexer_layers
+                        * self.device_pool.index_head_dim
+                        * self.dtype.itemsize
+                    )
+                if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                    # FP32 scale mirror
+                    total_bytes += (
+                        self.page_num * self.page_size * num_indexer_layers * 4
+                    )
+                ensure_hybm_capacity(total_bytes, torch.npu.current_device())
+                alloc_func = alloc_with_hybm
             self.k_buffer = alloc_func(
                 (*base_dims, k_width),
                 dtype=self.dtype,
@@ -301,6 +354,193 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=self.dtype,
             device=self.device_pool.device,
         )
+
+    def _ascendc_layer_group(self, device_pool, device_layer_id):
+        """Layer-group descriptor for the AscendC sparse-copy pipeline.
+
+        Returns ``(layer_start, layer_num, index_k_layer_start,
+        index_k_layer_num)`` when ``device_layer_id`` is the first layer of a
+        group in the device pool's owned-layer space, otherwise None.  The
+        group size comes from SGLANG_HICACHE_LAYER_GROUP_SIZE: 1 means one
+        layer per group (a transfer launch per layer), <1 disables grouping
+        (one-shot), default 8; a size covering all owned layers also
+        degenerates to the one-shot form.
+
+        The indexer range maps the group's absolute layer ids onto the
+        indexer slot space (device_pool.indexer_layer_ids is sorted, so the
+        covered slots form a contiguous range).  A group containing no
+        indexer layers gets index_k_layer_num=0, which skips those
+        components.
+        """
+        start, end = self._device_owned_layer_range(device_pool)
+        span = end - start
+        if span <= 0:
+            return None
+        group = _ascendc_layer_group_size()
+        if group < 1 or group >= span:
+            # group < 1 explicitly disables grouping (one-shot transfer of
+            # the whole owned range); group >= span has no split point
+            # either.  group == 1 is VALID and means one layer per group
+            # (finest-grained pipelining: a kv_exchange launch per layer).
+            group = span
+        if (device_layer_id - start) % group != 0:
+            return None
+        lo = device_layer_id
+        hi = min(lo + group, end)
+
+        index_k_layer_start, index_k_layer_num = 0, -1
+        indexer_layer_ids = getattr(device_pool, "indexer_layer_ids", None)
+        if indexer_layer_ids and self.index_k_buffer is not None:
+            # indexer_layer_ids holds absolute layer ids (PP global space);
+            # the owned range above is in the pool-local layer space, so
+            # convert before matching.  The ids are sorted, so the covered
+            # slots form a contiguous range.
+            start_layer = getattr(device_pool, "start_layer", 0)
+            slot_lo = None
+            slot_hi = None
+            for slot, layer in enumerate(indexer_layer_ids):
+                local = layer - start_layer
+                if lo <= local < hi:
+                    if slot_lo is None:
+                        slot_lo = slot
+                    slot_hi = slot + 1
+            if slot_lo is None:
+                index_k_layer_start, index_k_layer_num = 0, 0
+            else:
+                index_k_layer_start = slot_lo
+                index_k_layer_num = slot_hi - slot_lo
+        return lo, hi - lo, index_k_layer_start, index_k_layer_num
+
+    def _transfer_ascendc_sparse_copy(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        direction: TransferDirection,
+        layer_start: int = 0,
+        layer_num: int = -1,
+        index_k_layer_start: int = 0,
+        index_k_layer_num: int = -1,
+    ) -> None:
+        """One-shot KV transfer via the Memfabric acc_offload fused AIV kernel.
+
+        Sends a compact metadata array (per-component layout pitches and
+        layer ranges) plus the device-resident token indices to the acc_offload
+        ``kv_exchange_copy`` kernel, which derives every (page, layer, split)
+        block address on the device: no (src, dst, len) entry table is built
+        on the host and the indices never round-trip through the CPU, so the
+        transfer launch does not synchronize the load stream.
+
+        The layer range arguments restrict the transfer to one layer group
+        (layer-group pipelining); the defaults transfer everything.
+
+        Requires the host pool to be hybm-backed (SGLANG_HICACHE_IO_ASCENDC
+        implies SGLANG_HICACHE_HOST_MEM=hybm) since the kernel de-references
+        host pointers directly.
+        """
+        from memfabric_hybrid import offload
+
+        device = device_pool.k_buffer.device
+        # The kernel reads the token indices directly from device memory.
+        # Upload without a stream sync: a plain .to(device) from pageable
+        # memory synchronizes the stream and would serialize the pipeline.
+        if host_indices.device.type != "npu":
+            host_indices = to_device_no_sync(host_indices, device)
+        if device_indices.device.type != "npu":
+            device_indices = to_device_no_sync(device_indices, device)
+        # The kernel runs on the current (load) stream while the indices were
+        # allocated on another stream; keep them alive until the copy retires.
+        stream = torch.npu.current_stream()
+        host_indices.record_stream(stream)
+        device_indices.record_stream(stream)
+
+        def comp_meta(dev_t, host_t, lo, hi):
+            # dev_t: (layer, page, page_size, [1,] width) layer-first;
+            # host_t: (page, layer, page_size, [1,] width) page-first.
+            itemsize = dev_t.dtype.itemsize
+            width = 1
+            for dim in dev_t.shape[2:]:
+                width *= dim
+            return (
+                dev_t.data_ptr(),
+                host_t.data_ptr(),
+                dev_t.stride(0) * itemsize,
+                dev_t.stride(1) * itemsize,
+                host_t.stride(0) * itemsize,
+                host_t.stride(1) * itemsize,
+                width * itemsize,
+                lo,
+                hi,
+            )
+
+        k_lo = layer_start
+        if layer_num < 0:
+            k_hi = device_pool.k_buffer.shape[0]
+        else:
+            k_hi = k_lo + layer_num
+        # Both pools must share the layer index space (same limitation as the
+        # legacy memcpy2d exchange op); catches e.g. MTP draft pools, whose
+        # host rows live past the main pool's layers.
+        if k_hi > self.k_buffer.shape[1] or k_hi > device_pool.k_buffer.shape[0]:
+            raise RuntimeError(
+                f"AscendC kv_exchange layer range [{k_lo}, {k_hi}) exceeds the "
+                f"pool layer space (device={device_pool.k_buffer.shape[0]}, "
+                f"host={self.k_buffer.shape[1]})"
+            )
+
+        comps = [
+            comp_meta(device_pool.k_buffer, self.k_buffer, k_lo, k_hi),
+        ]
+        # FP8 DSA packs V into the device k_buffer; the device v_buffer is
+        # empty and must be skipped.
+        if device_pool.v_buffer.numel() > 0 and self.v_buffer.numel() > 0:
+            comps.append(comp_meta(device_pool.v_buffer, self.v_buffer, k_lo, k_hi))
+
+        device_index_k = getattr(device_pool, "index_k_buffer", None)
+        if self.index_k_buffer is not None and device_index_k is not None:
+            if index_k_layer_num < 0:
+                ik_lo, ik_hi = 0, self.index_k_buffer.shape[1]
+            else:
+                ik_lo, ik_hi = index_k_layer_start, index_k_layer_start + index_k_layer_num
+            if ik_hi > ik_lo:
+                comps.append(
+                    comp_meta(device_index_k, self.index_k_buffer, ik_lo, ik_hi)
+                )
+                device_scale = getattr(device_pool, "index_k_scale_buffer", None)
+                if self.index_k_scale_buffer is not None and device_scale is not None:
+                    comps.append(
+                        comp_meta(
+                            device_scale,
+                            self.index_k_scale_buffer,
+                            ik_lo,
+                            ik_hi,
+                        )
+                    )
+        if len(comps) > 4:
+            raise RuntimeError(
+                f"AscendC kv_exchange supports at most 4 components, got {len(comps)}"
+            )
+
+        num_pages = host_indices.numel() // self.page_size
+        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
+        vals = [
+            len(comps),
+            num_pages,
+            self.page_size,
+            direction_value,
+            device_indices.data_ptr(),
+            host_indices.data_ptr(),
+        ]
+        for comp in comps:
+            vals.extend(comp)
+        
+        pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
+        meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
+        meta.copy_(pinned_meta, non_blocking=True)
+        track_pinned_staging(pinned_meta)
+        ret = offload.kv_exchange_copy(meta, device)
+        if ret != 0:
+            raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
     def load_to_device_per_layer(
         self,
@@ -393,7 +633,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                # Ascend-specific: transfer KV data for all layers when layer_id == 0
+                if _is_npu and ascendc_io_enabled():
+                    # AscendC layer-group pipelining: at each group boundary
+                    # layer, launch one fused kv_exchange kernel covering the
+                    # group.  The per-layer complete(i) events recorded by the
+                    # caller then gate compute at group granularity, letting
+                    # later groups' DMA overlap the current group's compute.
+                    group = self._ascendc_layer_group(device_pool, device_layer_id)
+                    if group is not None:
+                        layer_start, layer_num, ik_start, ik_num = group
+                        self._transfer_ascendc_sparse_copy(
+                            device_pool,
+                            host_indices,
+                            device_indices,
+                            TransferDirection.H2D,
+                            layer_start=layer_start,
+                            layer_num=layer_num,
+                            index_k_layer_start=ik_start,
+                            index_k_layer_num=ik_num,
+                        )
+                    return
+                # Ascend-specific: transfer KV data for all layers when
+                # layer_id == 0
                 if device_layer_id == 0:
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
@@ -598,6 +859,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
+                if _is_npu and ascendc_io_enabled():
+                    self._transfer_ascendc_sparse_copy(
+                        device_pool,
+                        host_indices,
+                        device_indices,
+                        TransferDirection.D2H,
+                    )
+                    return
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,

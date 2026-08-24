@@ -257,12 +257,6 @@ def can_use_npu_quant_lightning_indexer(
     kv_cache_dtype: torch.dtype,
     device_id: int = 0,
 ) -> bool:
-    """Whether the A5 quantized Indexer and its scale cache are usable.
-
-    The Indexer FP32 scale cache is transferred through HiCache: the NPU L2
-    path moves it alongside index_k (transfer_kv_dim_exchange scale operand)
-    and the L3 memcache persists it as a per-page ``_scale`` component.
-    """
     return (
         is_deepseek_dsa(config)
         and _hf_attr(config, "index_head_dim") == 128
