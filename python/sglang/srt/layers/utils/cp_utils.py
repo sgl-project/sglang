@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -15,8 +15,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import (
     get_parallel,
     uses_mla_backend,
@@ -62,17 +60,6 @@ class ContextParallelMetadata:
     bs: int = 1
 
 
-def is_prefill_context_parallel_enabled():
-    return get_parallel().enable_prefill_context_parallel
-
-
-def is_prefill_cp_in_seq_split():
-    return (
-        is_prefill_context_parallel_enabled()
-        and get_parallel().prefill_cp_mode == "in-seq-split"
-    )
-
-
 def is_mla_prefill_cp_enabled() -> bool:
     return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
@@ -85,48 +72,6 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
         and mla_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     )
-
-
-def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # Base conditions: CP must be enabled, size > 1, and this must be a
-    # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
-    # the load-balancing split into 2 * cp_size blocks is non-degenerate.
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    cur_cp_seq_len = seq_len // (cp_size * 2)
-    if not (
-        cur_cp_seq_len != 0
-        and cp_size > 1
-        # prepare_context_parallel_metadata hard-codes bs_per_cp_group = 1;
-        # guard explicitly to avoid silent mis-partitioning under continuous batching.
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        # is_context_parallel_extend() returns True for MIXED (prefill+decode
-        # in one step), but the zigzag split only makes sense on pure extend.
-        and forward_batch.forward_mode != ForwardMode.MIXED
-        and is_prefill_context_parallel_enabled()
-    ):
-        return False
-
-    # Per-sequence guards for bs > 1. Every sequence must be long enough for
-    # the 2*cp_size-way split. A sub-threshold request reaching this point
-    # means the scheduler failed to filter it out and a silent non-CP
-    # fallback would have masked the bug -- raise instead. Per-sequence
-    # radix-cache prefix is supported: prefix is baked into kv_len_prev/next
-    # via prefix_offsets[s] inside prepare_context_parallel_metadata.
-    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    if extend_lens is None:
-        return True
-
-    cp_min = cp_size * 2
-    for L in extend_lens:
-        if L < cp_min:
-            # A sub-threshold request cannot be zigzag-split into 2*cp_size
-            # blocks; fall back to a normal (non-CP) prefill for this batch
-            # instead of failing. Happens e.g. when a radix-cache prefix hit
-            # leaves only a few unique extend tokens.
-            return False
-
-    return True
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
@@ -442,81 +387,6 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
-
-
-def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
-    """
-    Allgather KV cache from all CP ranks and write the full result
-    into each rank's local memory pool.
-
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools.
-    """
-    cache_loc = (
-        forward_batch.out_cache_loc
-        if not layer.is_cross_attention
-        else forward_batch.encoder_out_cache_loc
-    )
-
-    k = k.contiguous()
-    v = v.contiguous()
-
-    key_cache_full = cp_all_gather_rerange_kv_cache(
-        k, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-    value_cache_full = cp_all_gather_rerange_kv_cache(
-        v, cp_size, forward_batch, torch.cuda.current_stream()
-    )
-
-    get_token_to_kv_pool().set_kv_buffer(
-        layer,
-        KVWriteLoc(cache_loc, swa_loc),
-        key_cache_full,
-        value_cache_full,
-        layer.k_scale,
-        layer.v_scale,
-    )
-
-
-def cp_attn_forward_extend(
-    forward_batch,
-    q: torch.Tensor,
-    device: torch.device,
-    attn_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
-) -> torch.Tensor:
-    """
-    Split q into prev/next zigzag halves based on CP metadata, call the
-    backend-specific attention function twice with appropriate per-half
-    metadata, and concatenate the results.
-
-    For bs > 1, q is laid out as [all_prev_tokens_across_seqs,
-    all_next_tokens_across_seqs]; the split point is total_q_prev_tokens.
-    cu_seqlens_q_prev/next tensors have shape [bs+1] and carry the
-    per-sequence boundaries through FlashAttention's variable-length API.
-
-    attn_fn signature:
-        attn_fn(q, cu_seqlens_q, cache_seqlens, max_seqlen_q) -> result
-    where only these four CP-varying parameters differ between halves.
-    All other backend-specific args should be captured in the closure.
-    """
-    cp_meta = forward_batch.attn_cp_metadata
-
-    q_prev = q[: cp_meta.total_q_prev_tokens]
-    q_next = q[cp_meta.total_q_prev_tokens :]
-
-    result_prev = attn_fn(
-        q_prev,
-        cp_meta.cu_seqlens_q_prev_tensor,
-        cp_meta.kv_len_prev_tensor,
-        cp_meta.max_seqlen_q_prev,
-    )
-    result_next = attn_fn(
-        q_next,
-        cp_meta.cu_seqlens_q_next_tensor,
-        cp_meta.kv_len_next_tensor,
-        cp_meta.max_seqlen_q_next,
-    )
-
-    return torch.concat([result_prev, result_next], dim=0)
 
 
 def prepare_context_parallel_metadata(

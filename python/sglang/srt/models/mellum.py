@@ -525,14 +525,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
         self.logits_processor = LogitsProcessor(cfg)
         self.capture_aux_hidden_states = False
 
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
-
-        assert self.attn_cp_size % self.moe_dp_size == 0, (
-            f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
-            f"moe_dp_size ({self.moe_dp_size})"
-        )
 
     def _prepare_positions(
         self,

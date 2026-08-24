@@ -47,7 +47,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
-    handle_legacy_cp_runtime_compatibility,
     handle_platform_cp_compatibility,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -1074,27 +1073,21 @@ class TestContextParallelServerArgs(CustomTestCase):
             handle_context_parallelism(server_args)
 
     @override_platform(is_hip=False, is_npu=False)
-    def test_generic_canonical_cp_mirrors_to_transitional_runtime_fields(self):
+    def test_generic_canonical_cp_does_not_enable_platform_runtime_fields(self):
         cases = (
             (
                 "zigzag_mla_or_gqa",
                 "zigzag",
                 "fa3",
-                True,
-                False,
-                "in-seq-split",
             ),
             (
                 "interleave_dsa",
                 "interleave",
                 "dsa",
-                False,
-                True,
-                "round-robin-split",
             ),
         )
 
-        for name, strategy, backend, expect_generic, expect_dsa, mode in cases:
+        for name, strategy, backend in cases:
             with self.subTest(name=name):
                 server_args = self._new_cp_args(
                     enable_prefill_cp=True,
@@ -1111,25 +1104,6 @@ class TestContextParallelServerArgs(CustomTestCase):
                     resolution_result(
                         server_args, "enable_dsa_prefill_context_parallel"
                     )
-                )
-
-                handle_legacy_cp_runtime_compatibility(server_args)
-
-                self.assertEqual(
-                    resolution_result(server_args, "enable_prefill_context_parallel"),
-                    expect_generic,
-                )
-                self.assertEqual(
-                    resolution_result(
-                        server_args, "enable_dsa_prefill_context_parallel"
-                    ),
-                    expect_dsa,
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "dsa_prefill_cp_mode"), mode
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "prefill_cp_mode"), mode
                 )
 
     @override_platform(is_hip=False, is_npu=False)

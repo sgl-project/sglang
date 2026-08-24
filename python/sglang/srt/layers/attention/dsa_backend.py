@@ -117,6 +117,31 @@ def _all_gather_dsa_trtllm_fp8_kv(
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
+def prepare_kv_for_attention(
+    attn_mla,
+    forward_batch: ForwardBatch,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    *,
+    defer_materialization: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize KV needed before attention for the active layout."""
+    if (
+        defer_materialization
+        or not dsa_use_prefill_cp(forward_batch)
+        or not is_cp_v2_active(forward_batch)
+    ):
+        return k_nope, k_pe
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return strategy.materialize_full_mla_kv(
+        forward_batch,
+        attn_mla.attn_mqa,
+        k_nope,
+        k_pe,
+    )
+
+
 def materialize_full_kv_cp(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -124,14 +149,29 @@ def materialize_full_kv_cp(
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility entry point for the unchanged ROCm/NPU MLA paths."""
     if is_cp_v2_active(forward_batch):
-        return get_cp_strategy().materialize_full_mla_kv(
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.materialize_full_mla_kv(
             forward_batch,
             attn_mla.attn_mqa,
             k_nope,
             k_pe,
         )
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
+
+    latent_cache[..., : attn_mla.kv_lora_rank] = k_nope.squeeze(1)
+    latent_cache[..., attn_mla.kv_lora_rank :] = k_pe.squeeze(1)
+    latent_cache_output = cp_all_gather_rerange_output(
+        latent_cache.contiguous(),
+        get_parallel().attn_cp_size,
+        forward_batch,
+        torch.cuda.current_stream(),
+    )
+    return (
+        latent_cache_output[..., : attn_mla.kv_lora_rank].unsqueeze(1),
+        latent_cache_output[..., attn_mla.kv_lora_rank :].unsqueeze(1),
+    )
 
 
 _is_hip = is_hip()

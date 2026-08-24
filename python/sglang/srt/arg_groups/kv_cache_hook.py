@@ -484,9 +484,9 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "radix cache indexes KV pool slots that no longer hold real data."
         )
 
-    # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-    # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-    # raises on writes, so the engine would boot fine but fail on the first request.
+    # Context-parallel prefill writes K/V to the pool via set_kv_buffer.
+    # NoOpMHATokenToKVPool intentionally raises on writes, so the engine would
+    # boot fine but fail on the first request.
     if resolved_view(server_args).attn_cp_size > 1:
         raise ValueError(
             "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
