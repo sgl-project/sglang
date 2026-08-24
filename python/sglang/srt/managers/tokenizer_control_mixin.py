@@ -134,6 +134,27 @@ _COMMUNICATOR_SPECS = [
 ]
 
 
+def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
+    """Merge the per-rank replies of a LoRA load/unload fan-out into one result.
+
+    The operation succeeded only if every rank succeeded. Reporting a partial
+    failure as success would let the tokenizer-side LoRA registry drift from
+    the ranks that failed, so failures win: their deduplicated error messages
+    are joined, and loaded_adapters reflects the first failed rank.
+    """
+    failed = [result for result in results if not result.success]
+    if not failed:
+        return results[0]
+    error_messages = list(
+        dict.fromkeys(result.error_message for result in failed if result.error_message)
+    )
+    return LoRAUpdateOutput(
+        success=False,
+        error_message=" | ".join(error_messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -602,7 +623,9 @@ class TokenizerControlMixin:
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
         await self.lora_registry.wait_for_unload(lora_id)
-        result = (await self.update_lora_adapter_communicator(obj))[0]
+        result = _merge_lora_update_results(
+            await self.update_lora_adapter_communicator(obj)
+        )
 
         return result
 
@@ -638,7 +661,9 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
@@ -738,7 +763,9 @@ class TokenizerControlMixin:
                     reloadable=False,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 if result.success:
                     await self.lora_registry.register(new_adapter)
@@ -793,9 +820,13 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            # Same contract as load_lora_adapter / load_lora_adapter_from_tensors and
+            # update_weights_from_distributed: the tokenizer->scheduler broadcast and
+            # the weight-update NCCL group both cover every dp-attention rank, so dp>1
+            # is fine as long as dp attention is enabled.
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from distributed. Lora name=%s, group=%s",
                 obj.lora_name,
@@ -817,7 +848,9 @@ class TokenizerControlMixin:
                     upsert=obj.upsert,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 if result.success:
                     if reused:
