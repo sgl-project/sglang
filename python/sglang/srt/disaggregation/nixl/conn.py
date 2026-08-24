@@ -3048,7 +3048,15 @@ class NixlKVReceiver(CommonKVReceiver):
         # Match the prefill-side truthy check: an empty list means the
         # model has no state types (e.g. dense LLaMA/Qwen), and prefill
         # won't send state notifs, so we must not expect them.
-        if state_indices:
+        # Semantic emptiness: a zero-delta decode-side radix hit can pass a
+        # non-empty list of empty per-component index arrays (numpy or list).
+        # The truthy check would then set expects_state even though prefill
+        # sends no state notifications for an empty delta, stalling the
+        # transfer in KVPoll.WaitingForInput until timeout. len() works for
+        # both containers and ndarrays without bool ambiguity.
+        if state_indices and any(
+            s is not None and len(s) > 0 for s in state_indices
+        ):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
