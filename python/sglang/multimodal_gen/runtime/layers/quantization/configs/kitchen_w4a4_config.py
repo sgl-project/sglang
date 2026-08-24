@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4 import (
     KitchenW4A4LinearMethod,
 )
@@ -26,7 +29,7 @@ _SUPPORTED_LINEAR_DTYPES = ("int4", "int8")
 
 
 class KitchenW4A4Config(QuantizationConfig):
-    """Dispatch linears carrying serialized ``convrot_w4a4`` markers."""
+    """Dispatch serialized W4A4 linears and their optional INT8 companions."""
 
     def __init__(self, layer_markers: dict[str, dict[str, Any]]) -> None:
         super().__init__()
@@ -46,12 +49,23 @@ class KitchenW4A4Config(QuantizationConfig):
         self.layer_markers = layer_markers
         self.checkpoint_uses_native_qkv_layout = True
         self.selected: list[str] = []
+        int8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "int8_tensorwise"
+        }
+        self._int8_config = (
+            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+        )
 
         for prefix, marker in layer_markers.items():
-            if marker.get("format") != "convrot_w4a4":
+            marker_format = marker.get("format")
+            if marker_format == "int8_tensorwise":
+                continue
+            if marker_format != "convrot_w4a4":
                 raise ValueError(
                     f"Unsupported Comfy W4A4 format for {prefix!r}: "
-                    f"{marker.get('format')!r}"
+                    f"{marker_format!r}"
                 )
             self._parse_marker(prefix, marker)
 
@@ -86,6 +100,11 @@ class KitchenW4A4Config(QuantizationConfig):
         marker = self.layer_markers.get(prefix)
         if marker is None:
             return UnquantizedLinearMethod()
+        if marker.get("format") == "int8_tensorwise":
+            assert self._int8_config is not None
+            method = self._int8_config.get_quant_method(layer, prefix)
+            self.selected.append(prefix)
+            return method
 
         convrot_group_size, linear_dtype = self._parse_marker(prefix, marker)
         if not self._supports_input_size(layer.input_size, convrot_group_size):
@@ -130,6 +149,11 @@ class KitchenW4A4Config(QuantizationConfig):
         marker = self.layer_markers.get(prefix)
         if marker is None:
             return True
+        if marker.get("format") == "int8_tensorwise":
+            assert self._int8_config is not None
+            return self._int8_config.supports_input_partition(
+                prefix, input_size_per_partition
+            )
         convrot_group_size, _ = self._parse_marker(prefix, marker)
         return self._supports_input_size(input_size_per_partition, convrot_group_size)
 
