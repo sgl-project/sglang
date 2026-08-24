@@ -1017,9 +1017,7 @@ def build_dflash_verify_target_probs(
                     - torch.logsumexp(scaled_logits, dim=-1)
                 )
                 adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
-                topk_probs = _dflash_top_p_renorm_prob(
-                    topk_probs, adjusted_top_ps
-                )
+                topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
