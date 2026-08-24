@@ -18,6 +18,8 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
         hidden_size: int = 4096,
         num_hidden_layers: int = 32,
         rms_norm_eps: float = 1e-6,
+        # Embedding
+        scale_embedding: bool = False,
         tie_word_embeddings: bool = True,
         # Attention
         num_attention_heads: int = 32,
@@ -30,10 +32,8 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
         rope_local_theta: int = 10_000,
         rope_scaling_factor: float = 1,
         initial_context_length: Optional[int] = None,
-        attention_bias: bool = False,
         # MLP
         intermediate_size: int = 13312,
-        hidden_activation: str = "swiglu",
         # Tokenizer
         vocab_size: int = 32000,
         tokenizer_class: str = "Plamo3Tokenizer",
@@ -51,28 +51,33 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads
+        legacy_rope_theta = kwargs.pop("rope_global_theta", None)
+        if legacy_rope_theta is not None and rope_theta == 150_000:
+            rope_theta = legacy_rope_theta
+        legacy_sliding_window = kwargs.pop("sliding_window", None)
+        if isinstance(legacy_sliding_window, list):
+            non_full_attention_windows = [
+                value for value in legacy_sliding_window if value is not None
+            ]
+            if non_full_attention_windows:
+                first_window_size = non_full_attention_windows[0]
+                if all(
+                    value == first_window_size for value in non_full_attention_windows
+                ):
+                    window_size = first_window_size
+        elif isinstance(legacy_sliding_window, int):
+            window_size = legacy_sliding_window
+
         self.window_size = window_size
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_theta = rope_theta
         self.rope_local_theta = rope_local_theta
         self.rope_scaling_factor = rope_scaling_factor
         self.initial_context_length = initial_context_length
-        self.attention_bias = attention_bias
         self.intermediate_size = intermediate_size
-        self.hidden_activation = hidden_activation
         self.vocab_size = vocab_size
         self.use_cache = use_cache
-
-        self.interleaved_sliding_window: list[int | None] = []
-        for i in range(self.num_hidden_layers):
-            if is_full_attn(self.sliding_window_pattern, i):
-                self.interleaved_sliding_window.append(None)
-            else:
-                self.interleaved_sliding_window.append(self.window_size)
-        assert len(self.interleaved_sliding_window) == self.num_hidden_layers
-
-        if "architectures" not in kwargs:
-            kwargs["architectures"] = ["Plamo3ForCausalLM"]
+        self.scale_embedding = scale_embedding
 
         super().__init__(
             tokenizer_class=tokenizer_class,
@@ -82,6 +87,21 @@ class Plamo3Config(PretrainedConfig):  # type: ignore[misc]
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    @property
+    def sliding_window(self) -> int:
+        return self.window_size
+
+    @property
+    def interleaved_sliding_window(self) -> list[int | None]:
+        interleaved_sliding_window: list[int | None] = []
+        for i in range(self.num_hidden_layers):
+            if is_full_attn(self.sliding_window_pattern, i):
+                interleaved_sliding_window.append(None)
+            else:
+                interleaved_sliding_window.append(self.window_size)
+        assert len(interleaved_sliding_window) == self.num_hidden_layers
+        return interleaved_sliding_window
 
     @property
     def layer_types(self) -> list[str]:

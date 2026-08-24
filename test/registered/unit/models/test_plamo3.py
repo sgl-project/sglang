@@ -5,7 +5,11 @@ import unittest
 import torch
 
 from sglang.srt.configs.plamo3 import Plamo3Config, is_full_attn
-from sglang.srt.models.plamo3 import Plamo3ForCausalLM, Plamo3RMSNorm
+from sglang.srt.models.plamo3 import (
+    Plamo3ForCausalLM,
+    Plamo3Model,
+    Plamo3RMSNorm,
+)
 from sglang.srt.models.registry import ModelRegistry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,9 +37,9 @@ class TestPlamo3Config(CustomTestCase):
     def test_model_type(self):
         self.assertEqual(Plamo3Config.model_type, "plamo3")
 
-    def test_default_architectures(self):
+    def test_default_architectures_matches_upstream(self):
         cfg = self._make()
-        self.assertEqual(cfg.architectures, ["Plamo3ForCausalLM"])
+        self.assertIsNone(cfg.architectures)
 
     def test_custom_architectures_respected(self):
         cfg = self._make(architectures=["CustomArch"])
@@ -55,6 +59,32 @@ class TestPlamo3Config(CustomTestCase):
         # Layers 3 and 7 are full attention (None), rest are windowed.
         expected = [128, 128, 128, None, 128, 128, 128, None]
         self.assertEqual(cfg.interleaved_sliding_window, expected)
+
+    def test_interleaved_sliding_window_is_derived(self):
+        cfg = self._make(num_hidden_layers=4, sliding_window_pattern=2)
+        self.assertNotIn("interleaved_sliding_window", cfg.to_dict())
+        cfg.window_size = 64
+        self.assertEqual(cfg.interleaved_sliding_window, [64, None, 64, None])
+
+    def test_sliding_window_alias(self):
+        cfg = self._make(window_size=256)
+        self.assertEqual(cfg.sliding_window, 256)
+
+    def test_legacy_rope_global_theta(self):
+        cfg = self._make(rope_global_theta=777_777)
+        self.assertEqual(cfg.rope_theta, 777_777)
+        self.assertFalse(hasattr(cfg, "rope_global_theta"))
+
+    def test_legacy_sliding_window_scalar(self):
+        cfg = self._make(sliding_window=256)
+        self.assertEqual(cfg.window_size, 256)
+
+    def test_legacy_sliding_window_list(self):
+        cfg = self._make(sliding_window=[256, 256, None, 256])
+        self.assertEqual(cfg.window_size, 256)
+
+    def test_scale_embedding_default(self):
+        self.assertFalse(self._make().scale_embedding)
 
     def test_layer_types(self):
         cfg = self._make(num_hidden_layers=8, sliding_window_pattern=4)
@@ -157,6 +187,22 @@ class TestPlamo3RMSNorm(CustomTestCase):
         expected *= loaded_weight + 0.2
 
         torch.testing.assert_close(norm.forward_native(x), expected)
+
+
+class TestPlamo3Embedding(CustomTestCase):
+    def test_scale_embedding_matches_upstream(self):
+        model = Plamo3Model.__new__(Plamo3Model)
+        torch.nn.Module.__init__(model)
+        model.config = Plamo3Config(
+            hidden_size=4,
+            scale_embedding=True,
+        )
+        model.embed_tokens = torch.nn.Embedding(2, 4)
+        torch.nn.init.ones_(model.embed_tokens.weight)
+
+        embeddings = model.embed_input_ids(torch.tensor([0, 1]))
+
+        torch.testing.assert_close(embeddings, torch.full((2, 4), 2.0))
 
 
 class TestPlamo3Eagle3(CustomTestCase):

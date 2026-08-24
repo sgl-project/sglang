@@ -119,14 +119,14 @@ class Plamo3Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=bool(getattr(config, "attention_bias", False)),
+            bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
-            bias=bool(getattr(config, "attention_bias", False)),
+            bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -355,6 +355,12 @@ class Plamo3Model(nn.Module):
         self.gradient_checkpointing = False
         self.layers_to_capture: List[int] = []
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        if self.config.scale_embedding:
+            hidden_states = hidden_states * (self.config.hidden_size**0.5)
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -366,7 +372,9 @@ class Plamo3Model(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = (
-                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+                self.embed_input_ids(input_ids)
+                if input_embeds is None
+                else input_embeds
             )
             residual = None
         else:
@@ -521,7 +529,7 @@ class Plamo3ForCausalLM(nn.Module):
         start, end = split_interval
         if start == 0:
             hidden_states = (
-                self.model.embed_tokens(input_ids)
+                self.model.embed_input_ids(input_ids)
                 if input_embeds is None
                 else input_embeds
             )
