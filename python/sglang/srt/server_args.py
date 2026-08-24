@@ -9600,7 +9600,7 @@ class ServerArgs:
 
     @property
     def should_attempt_startup_weight_load_overlap(self) -> bool:
-        return self.startup_weight_load_mode != "serial"
+        return self.startup_weight_load_mode in ("overlap", "auto")
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.

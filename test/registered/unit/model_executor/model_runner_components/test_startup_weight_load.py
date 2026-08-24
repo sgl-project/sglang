@@ -32,6 +32,8 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadProfile,
     StartupWeightLoadState,
     StartupWeightLoadTimings,
+    _STARTUP_WEIGHT_LOAD_PROFILE_SPECS,
+    _get_startup_weight_load_profile,
     evaluate_startup_weight_load_admission,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
@@ -358,6 +360,48 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             self._create(options=_make_options(tp_size=2)),
             StartupWeightLoadManager,
         )
+
+    def test_profile_registry_is_complete_and_unambiguous(self):
+        expected_profiles_by_architecture = {
+            "LlamaForCausalLM": StartupWeightLoadProfile.NATIVE_DENSE,
+            "Qwen2ForCausalLM": StartupWeightLoadProfile.NATIVE_DENSE,
+            "Qwen3ForCausalLM": StartupWeightLoadProfile.NATIVE_DENSE,
+            "Qwen3_5ForConditionalGeneration": (
+                StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM
+            ),
+            "Qwen3_5MoeForConditionalGeneration": (
+                StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM
+            ),
+            "Qwen3MoeForCausalLM": StartupWeightLoadProfile.QWEN3_MOE_EP,
+            "GlmMoeDsaForCausalLM": StartupWeightLoadProfile.GLM_5_2_DSA_FP8,
+        }
+        registered_architectures = [
+            architecture_spec.architecture
+            for profile_spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS
+            for architecture_spec in profile_spec.architectures
+        ]
+
+        self.assertEqual(
+            {
+                profile_spec.profile
+                for profile_spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS
+            },
+            set(StartupWeightLoadProfile),
+        )
+        self.assertEqual(
+            len(registered_architectures), len(set(registered_architectures))
+        )
+        self.assertEqual(
+            set(registered_architectures), expected_profiles_by_architecture
+        )
+        for architecture, expected_profile in (
+            expected_profiles_by_architecture.items()
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _get_startup_weight_load_profile(architecture), expected_profile
+                )
+        self.assertIsNone(_get_startup_weight_load_profile("UnsupportedForCausalLM"))
 
     def test_auto_mode_falls_back_for_config_rejection(self):
         server_args = SimpleNamespace(startup_weight_load_mode="auto")

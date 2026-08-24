@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import logging
 import time
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -41,58 +41,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_NATIVE_DENSE_ARCHITECTURES = frozenset(
-    {
-        "LlamaForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-    }
-)
-_QWEN3_5_HYBRID_VLM_ARCHITECTURES = frozenset(
-    {
-        # Qwen3.6 dense checkpoints retain the Qwen3.5 implementation
-        # architecture in config.json.
-        "Qwen3_5ForConditionalGeneration",
-    }
-)
-_QWEN3_5_MOE_HYBRID_VLM_ARCHITECTURES = frozenset(
-    {"Qwen3_5MoeForConditionalGeneration"}
-)
-_QWEN3_MOE_ARCHITECTURES = frozenset({"Qwen3MoeForCausalLM"})
-_GLM_MOE_DSA_ARCHITECTURES = frozenset({"GlmMoeDsaForCausalLM"})
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
-def _get_canonical_model_class(architecture: str):
-    if architecture == "LlamaForCausalLM":
-        from sglang.srt.models.llama import LlamaForCausalLM
+def _resolve_llama_model_class():
+    from sglang.srt.models.llama import LlamaForCausalLM
 
-        return LlamaForCausalLM
-    if architecture == "Qwen2ForCausalLM":
-        from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+    return LlamaForCausalLM
 
-        return Qwen2ForCausalLM
-    if architecture == "Qwen3ForCausalLM":
-        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 
-        return Qwen3ForCausalLM
-    if architecture == "Qwen3_5ForConditionalGeneration":
-        from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+def _resolve_qwen2_model_class():
+    from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
-        return Qwen3_5ForConditionalGeneration
-    if architecture == "Qwen3_5MoeForConditionalGeneration":
-        from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+    return Qwen2ForCausalLM
 
-        return Qwen3_5MoeForConditionalGeneration
-    if architecture == "Qwen3MoeForCausalLM":
-        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 
-        return Qwen3MoeForCausalLM
-    if architecture == "GlmMoeDsaForCausalLM":
-        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+def _resolve_qwen3_model_class():
+    from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 
-        return GlmMoeDsaForCausalLM
-    raise ValueError(f"Unsupported startup-overlap architecture: {architecture}")
+    return Qwen3ForCausalLM
+
+
+def _resolve_qwen3_5_model_class():
+    from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+
+    return Qwen3_5ForConditionalGeneration
+
+
+def _resolve_qwen3_5_moe_model_class():
+    from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+
+    return Qwen3_5MoeForConditionalGeneration
+
+
+def _resolve_qwen3_moe_model_class():
+    from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+
+    return Qwen3MoeForCausalLM
+
+
+def _resolve_glm_moe_dsa_model_class():
+    from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+    return GlmMoeDsaForCausalLM
 
 
 class StartupWeightLoadState(str, enum.Enum):
@@ -262,114 +253,123 @@ class StartupWeightLoadAdmission:
         return self.plan is not None
 
 
-def _get_startup_weight_load_profile(
-    architecture: Optional[str],
-) -> Optional[StartupWeightLoadProfile]:
-    if architecture in _NATIVE_DENSE_ARCHITECTURES:
-        return StartupWeightLoadProfile.NATIVE_DENSE
-    if architecture in _QWEN3_5_HYBRID_VLM_ARCHITECTURES:
-        return StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM
-    if architecture in _QWEN3_5_MOE_HYBRID_VLM_ARCHITECTURES:
-        return StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM
-    if architecture in _QWEN3_MOE_ARCHITECTURES:
-        return StartupWeightLoadProfile.QWEN3_MOE_EP
-    if architecture in _GLM_MOE_DSA_ARCHITECTURES:
-        return StartupWeightLoadProfile.GLM_5_2_DSA_FP8
-    return None
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StartupWeightLoadArchitectureSpec:
+    architecture: str
+    resolve_model_class: Callable[[], type]
 
 
-def _get_profile_rejections(
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StartupWeightLoadProfileSpec:
+    profile: StartupWeightLoadProfile
+    architectures: Tuple[_StartupWeightLoadArchitectureSpec, ...]
+    validate: Callable[
+        [ModelConfig, StartupWeightLoadOptions],
+        Tuple[StartupWeightLoadRejection, ...],
+    ]
+
+
+def _rejections_from_rules(
+    rules: Iterable[Tuple[str, bool, str]],
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    return tuple(
+        StartupWeightLoadRejection(code=code, message=message)
+        for code, rejected, message in rules
+        if rejected
+    )
+
+
+def _ep_moe_rules(
     *,
-    profile: StartupWeightLoadProfile,
+    family: str,
+    tp_size: int,
+    ep_size: int,
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[Tuple[str, bool, str], ...]:
+    return (
+        (
+            "tensor_parallelism",
+            options.tp_size != tp_size,
+            f"{family} startup overlap requires TP{tp_size}",
+        ),
+        (
+            "dtype",
+            model_config.dtype != torch.bfloat16,
+            f"{family} startup overlap requires BF16",
+        ),
+        (
+            "quantization",
+            model_config.quantization is not None,
+            "quantization is not supported",
+        ),
+        (
+            "modelopt",
+            bool(getattr(model_config, "modelopt_quant", False)),
+            "ModelOpt is not supported",
+        ),
+        (
+            "expert_parallelism",
+            options.ep_size != ep_size,
+            f"{family} startup overlap requires EP{ep_size}",
+        ),
+        (
+            "moe_data_parallelism",
+            options.moe_dp_size != 1,
+            "MoE data parallelism is not supported",
+        ),
+        (
+            "moe_a2a_backend",
+            options.moe_a2a_backend != "none",
+            f"{family} startup overlap requires the standard EP path",
+        ),
+        (
+            "moe_runner_backend",
+            options.moe_runner_backend != "triton",
+            f"{family} startup overlap requires the Triton MoE runner",
+        ),
+        (
+            "dp_attention",
+            options.enable_dp_attention,
+            "DP attention is not supported",
+        ),
+        (
+            "two_batch_overlap",
+            options.enable_two_batch_overlap,
+            "two-batch overlap is not supported",
+        ),
+        (
+            "eplb",
+            options.enable_eplb,
+            "EPLB is not supported",
+        ),
+        (
+            "redundant_experts",
+            options.ep_num_redundant_experts != 0,
+            "redundant experts are not supported",
+        ),
+        (
+            "expert_placement",
+            options.init_expert_location != "trivial",
+            "non-trivial expert placement is not supported",
+        ),
+        (
+            "elastic_expert_parallelism",
+            options.elastic_ep_backend is not None
+            or options.enable_elastic_expert_backup
+            or options.ep_join_mode is not None
+            or options.max_ep_size is not None,
+            "elastic expert parallelism is not supported",
+        ),
+    )
+
+
+def _validate_native_dense(
     model_config: ModelConfig,
     options: StartupWeightLoadOptions,
 ) -> Tuple[StartupWeightLoadRejection, ...]:
-    linear_attn_decode_backend = (
-        options.linear_attn_decode_backend or options.linear_attn_backend
-    )
-    linear_attn_prefill_backend = (
-        options.linear_attn_prefill_backend or options.linear_attn_backend
-    )
-
-    def ep_moe_rules(*, family: str, tp_size: int, ep_size: int):
-        return (
-            (
-                "tensor_parallelism",
-                options.tp_size != tp_size,
-                f"{family} startup overlap requires TP{tp_size}",
-            ),
-            (
-                "dtype",
-                model_config.dtype != torch.bfloat16,
-                f"{family} startup overlap requires BF16",
-            ),
-            (
-                "quantization",
-                model_config.quantization is not None,
-                "quantization is not supported",
-            ),
-            (
-                "modelopt",
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
-            ),
-            (
-                "expert_parallelism",
-                options.ep_size != ep_size,
-                f"{family} startup overlap requires EP{ep_size}",
-            ),
-            (
-                "moe_data_parallelism",
-                options.moe_dp_size != 1,
-                "MoE data parallelism is not supported",
-            ),
-            (
-                "moe_a2a_backend",
-                options.moe_a2a_backend != "none",
-                f"{family} startup overlap requires the standard EP path",
-            ),
-            (
-                "moe_runner_backend",
-                options.moe_runner_backend != "triton",
-                f"{family} startup overlap requires the Triton MoE runner",
-            ),
-            (
-                "dp_attention",
-                options.enable_dp_attention,
-                "DP attention is not supported",
-            ),
-            (
-                "two_batch_overlap",
-                options.enable_two_batch_overlap,
-                "two-batch overlap is not supported",
-            ),
-            (
-                "eplb",
-                options.enable_eplb,
-                "EPLB is not supported",
-            ),
-            (
-                "redundant_experts",
-                options.ep_num_redundant_experts != 0,
-                "redundant experts are not supported",
-            ),
-            (
-                "expert_placement",
-                options.init_expert_location != "trivial",
-                "non-trivial expert placement is not supported",
-            ),
-            (
-                "elastic_expert_parallelism",
-                options.elastic_ep_backend is not None
-                or options.enable_elastic_expert_backup
-                or options.ep_join_mode is not None
-                or options.max_ep_size is not None,
-                "elastic expert parallelism is not supported",
-            ),
-        )
-
-    if profile == StartupWeightLoadProfile.NATIVE_DENSE:
-        rules = (
+    return _rejections_from_rules(
+        (
             (
                 "tensor_parallelism",
                 options.tp_size not in (1, 2),
@@ -401,8 +401,31 @@ def _get_profile_rejections(
                 "multimodal models are not supported",
             ),
         )
-    elif profile == StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM:
-        rules = (
+    )
+
+
+def _linear_attention_backends(
+    options: StartupWeightLoadOptions,
+) -> Tuple[str, str]:
+    linear_attn_decode_backend = (
+        options.linear_attn_decode_backend or options.linear_attn_backend
+    )
+    linear_attn_prefill_backend = (
+        options.linear_attn_prefill_backend or options.linear_attn_backend
+    )
+
+    return linear_attn_decode_backend, linear_attn_prefill_backend
+
+
+def _validate_qwen3_5_hybrid_vlm(
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    linear_attn_decode_backend, linear_attn_prefill_backend = (
+        _linear_attention_backends(options)
+    )
+    return _rejections_from_rules(
+        (
             (
                 "tensor_parallelism",
                 options.tp_size not in (2, 4),
@@ -460,86 +483,114 @@ def _get_profile_rejections(
                 "Qwen3.5-family hybrid VLM startup overlap does not support full prefill CUDA graphs",
             ),
         )
-    elif profile == StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM:
-        rules = ep_moe_rules(
-            family="Qwen3.5 MoE hybrid VLM",
-            tp_size=2,
-            ep_size=2,
-        ) + (
-            (
-                "multimodal",
-                not model_config.is_multimodal,
-                "Qwen3.5 MoE hybrid VLM startup overlap requires multimodal execution",
-            ),
-            (
-                "encoder_only",
-                bool(getattr(model_config.hf_config, "encoder_only", False)),
-                "encoder-only execution is not supported",
-            ),
-            (
-                "language_only",
-                bool(getattr(model_config.hf_config, "language_only", False)),
-                "language-only encoder disaggregation is not supported",
-            ),
-            (
-                "language_model_only",
-                bool(getattr(model_config.hf_config, "language_model_only", False)),
-                "language-model-only execution is not supported",
-            ),
-            (
-                "linear_attention_backend",
-                linear_attn_decode_backend != "triton"
-                or linear_attn_prefill_backend != "triton",
-                "Qwen3.5 MoE hybrid VLM startup overlap requires Triton linear attention",
-            ),
-            (
-                "full_prefill_cuda_graph",
-                options.prefill_cuda_graph_backend == Backend.FULL,
-                "Qwen3.5 MoE hybrid VLM startup overlap does not support full prefill CUDA graphs",
-            ),
-        )
-    elif profile == StartupWeightLoadProfile.QWEN3_MOE_EP:
-        rules = ep_moe_rules(family="Qwen3 MoE", tp_size=2, ep_size=2) + (
-            (
-                "multimodal",
-                model_config.is_multimodal,
-                "multimodal models are not supported",
-            ),
-        )
-    elif profile == StartupWeightLoadProfile.GLM_5_2_DSA_FP8:
-        quantization_config = getattr(
-            model_config.hf_config, "quantization_config", None
-        )
-        weight_block_size = (
-            tuple(quantization_config.get("weight_block_size") or ())
-            if isinstance(quantization_config, dict)
-            else ()
-        )
-        checkpoint_quant_method = (
-            quantization_config.get("quant_method")
-            if isinstance(quantization_config, dict)
-            else None
-        )
-        checkpoint_activation_scheme = (
-            quantization_config.get("activation_scheme")
-            if isinstance(quantization_config, dict)
-            else None
-        )
-        checkpoint_fp8_format = (
-            quantization_config.get("fmt")
-            if isinstance(quantization_config, dict)
-            else None
-        )
-        cli_factor = getattr(model_config.hf_config, "cli_factor", 1)
-        if cli_factor is None:
-            cli_factor = 1
-        is_glm_5_2 = (
-            cli_factor == 1
-            and getattr(model_config.hf_config, "index_topk_pattern", None) is None
-            and getattr(model_config.hf_config, "index_topk_freq", None) == 4
-            and getattr(model_config.hf_config, "index_skip_topk_offset", None) == 3
-        )
-        rules = (
+    )
+
+
+def _validate_qwen3_5_moe_hybrid_vlm(
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    linear_attn_decode_backend, linear_attn_prefill_backend = (
+        _linear_attention_backends(options)
+    )
+    rules = _ep_moe_rules(
+        family="Qwen3.5 MoE hybrid VLM",
+        tp_size=2,
+        ep_size=2,
+        model_config=model_config,
+        options=options,
+    ) + (
+        (
+            "multimodal",
+            not model_config.is_multimodal,
+            "Qwen3.5 MoE hybrid VLM startup overlap requires multimodal execution",
+        ),
+        (
+            "encoder_only",
+            bool(getattr(model_config.hf_config, "encoder_only", False)),
+            "encoder-only execution is not supported",
+        ),
+        (
+            "language_only",
+            bool(getattr(model_config.hf_config, "language_only", False)),
+            "language-only encoder disaggregation is not supported",
+        ),
+        (
+            "language_model_only",
+            bool(getattr(model_config.hf_config, "language_model_only", False)),
+            "language-model-only execution is not supported",
+        ),
+        (
+            "linear_attention_backend",
+            linear_attn_decode_backend != "triton"
+            or linear_attn_prefill_backend != "triton",
+            "Qwen3.5 MoE hybrid VLM startup overlap requires Triton linear attention",
+        ),
+        (
+            "full_prefill_cuda_graph",
+            options.prefill_cuda_graph_backend == Backend.FULL,
+            "Qwen3.5 MoE hybrid VLM startup overlap does not support full prefill CUDA graphs",
+        ),
+    )
+    return _rejections_from_rules(rules)
+
+
+def _validate_qwen3_moe_ep(
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    rules = _ep_moe_rules(
+        family="Qwen3 MoE",
+        tp_size=2,
+        ep_size=2,
+        model_config=model_config,
+        options=options,
+    ) + (
+        (
+            "multimodal",
+            model_config.is_multimodal,
+            "multimodal models are not supported",
+        ),
+    )
+    return _rejections_from_rules(rules)
+
+
+def _validate_glm_5_2_dsa_fp8(
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    quantization_config = getattr(model_config.hf_config, "quantization_config", None)
+    weight_block_size = (
+        tuple(quantization_config.get("weight_block_size") or ())
+        if isinstance(quantization_config, dict)
+        else ()
+    )
+    checkpoint_quant_method = (
+        quantization_config.get("quant_method")
+        if isinstance(quantization_config, dict)
+        else None
+    )
+    checkpoint_activation_scheme = (
+        quantization_config.get("activation_scheme")
+        if isinstance(quantization_config, dict)
+        else None
+    )
+    checkpoint_fp8_format = (
+        quantization_config.get("fmt")
+        if isinstance(quantization_config, dict)
+        else None
+    )
+    cli_factor = getattr(model_config.hf_config, "cli_factor", 1)
+    if cli_factor is None:
+        cli_factor = 1
+    is_glm_5_2 = (
+        cli_factor == 1
+        and getattr(model_config.hf_config, "index_topk_pattern", None) is None
+        and getattr(model_config.hf_config, "index_topk_freq", None) == 4
+        and getattr(model_config.hf_config, "index_skip_topk_offset", None) == 3
+    )
+    return _rejections_from_rules(
+        (
             (
                 "model_variant",
                 not is_glm_5_2,
@@ -669,14 +720,140 @@ def _get_profile_rejections(
                 "multimodal models are not supported",
             ),
         )
-    else:
-        raise ValueError(f"Unknown startup weight-load profile: {profile}")
-
-    return tuple(
-        StartupWeightLoadRejection(code=code, message=message)
-        for code, rejected, message in rules
-        if rejected
     )
+
+
+_STARTUP_WEIGHT_LOAD_PROFILE_SPECS = (
+    _StartupWeightLoadProfileSpec(
+        profile=StartupWeightLoadProfile.NATIVE_DENSE,
+        architectures=(
+            _StartupWeightLoadArchitectureSpec(
+                "LlamaForCausalLM", _resolve_llama_model_class
+            ),
+            _StartupWeightLoadArchitectureSpec(
+                "Qwen2ForCausalLM", _resolve_qwen2_model_class
+            ),
+            _StartupWeightLoadArchitectureSpec(
+                "Qwen3ForCausalLM", _resolve_qwen3_model_class
+            ),
+        ),
+        validate=_validate_native_dense,
+    ),
+    _StartupWeightLoadProfileSpec(
+        profile=StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM,
+        architectures=(
+            # Qwen3.6 dense checkpoints retain the Qwen3.5 implementation
+            # architecture in config.json.
+            _StartupWeightLoadArchitectureSpec(
+                "Qwen3_5ForConditionalGeneration", _resolve_qwen3_5_model_class
+            ),
+        ),
+        validate=_validate_qwen3_5_hybrid_vlm,
+    ),
+    _StartupWeightLoadProfileSpec(
+        profile=StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM,
+        architectures=(
+            _StartupWeightLoadArchitectureSpec(
+                "Qwen3_5MoeForConditionalGeneration",
+                _resolve_qwen3_5_moe_model_class,
+            ),
+        ),
+        validate=_validate_qwen3_5_moe_hybrid_vlm,
+    ),
+    _StartupWeightLoadProfileSpec(
+        profile=StartupWeightLoadProfile.QWEN3_MOE_EP,
+        architectures=(
+            _StartupWeightLoadArchitectureSpec(
+                "Qwen3MoeForCausalLM", _resolve_qwen3_moe_model_class
+            ),
+        ),
+        validate=_validate_qwen3_moe_ep,
+    ),
+    _StartupWeightLoadProfileSpec(
+        profile=StartupWeightLoadProfile.GLM_5_2_DSA_FP8,
+        architectures=(
+            _StartupWeightLoadArchitectureSpec(
+                "GlmMoeDsaForCausalLM", _resolve_glm_moe_dsa_model_class
+            ),
+        ),
+        validate=_validate_glm_5_2_dsa_fp8,
+    ),
+)
+
+
+def _build_startup_weight_load_profile_indexes():
+    specs_by_profile = {}
+    specs_by_architecture = {}
+    for profile_spec in _STARTUP_WEIGHT_LOAD_PROFILE_SPECS:
+        if profile_spec.profile in specs_by_profile:
+            raise RuntimeError(
+                f"Duplicate startup weight-load profile: {profile_spec.profile.value}"
+            )
+        if not profile_spec.architectures:
+            raise RuntimeError(
+                f"Startup weight-load profile has no architectures: "
+                f"{profile_spec.profile.value}"
+            )
+        if not callable(profile_spec.validate):
+            raise RuntimeError(
+                f"Startup weight-load profile has no validator: "
+                f"{profile_spec.profile.value}"
+            )
+        specs_by_profile[profile_spec.profile] = profile_spec
+        for architecture_spec in profile_spec.architectures:
+            if architecture_spec.architecture in specs_by_architecture:
+                raise RuntimeError(
+                    "Duplicate startup weight-load architecture: "
+                    f"{architecture_spec.architecture}"
+                )
+            if not callable(architecture_spec.resolve_model_class):
+                raise RuntimeError(
+                    "Startup weight-load architecture has no model resolver: "
+                    f"{architecture_spec.architecture}"
+                )
+            specs_by_architecture[architecture_spec.architecture] = (
+                profile_spec,
+                architecture_spec,
+            )
+    missing_profiles = set(StartupWeightLoadProfile) - set(specs_by_profile)
+    if missing_profiles:
+        raise RuntimeError(
+            "Missing startup weight-load profile registrations: "
+            + ", ".join(sorted(profile.value for profile in missing_profiles))
+        )
+    return specs_by_profile, specs_by_architecture
+
+
+(
+    _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_PROFILE,
+    _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE,
+) = _build_startup_weight_load_profile_indexes()
+
+
+def _get_startup_weight_load_profile(
+    architecture: Optional[str],
+) -> Optional[StartupWeightLoadProfile]:
+    registration = _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE.get(architecture)
+    return registration[0].profile if registration is not None else None
+
+
+def _get_canonical_model_class(architecture: str):
+    registration = _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_ARCHITECTURE.get(architecture)
+    if registration is None:
+        raise ValueError(f"Unsupported startup-overlap architecture: {architecture}")
+    return registration[1].resolve_model_class()
+
+
+def _get_profile_rejections(
+    *,
+    profile: StartupWeightLoadProfile,
+    model_config: ModelConfig,
+    options: StartupWeightLoadOptions,
+) -> Tuple[StartupWeightLoadRejection, ...]:
+    profile_spec = _STARTUP_WEIGHT_LOAD_PROFILE_SPEC_BY_PROFILE.get(profile)
+    if profile_spec is None:
+        raise ValueError(f"Unknown startup weight-load profile: {profile}")
+    return profile_spec.validate(model_config, options)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
