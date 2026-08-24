@@ -32,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -120,7 +121,7 @@ def _register_legacy_hicache_draft(
         host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )
