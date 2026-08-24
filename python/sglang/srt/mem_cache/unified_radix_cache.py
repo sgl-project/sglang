@@ -574,13 +574,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if component_type == ComponentType.SWA:
             return self.token_to_kv_pool_allocator.swa_available_size()
         if component_type == ComponentType.MAMBA:
-            allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if allocator is None:
-                allocator = self.req_to_token_pool.mamba_pool
-            schedulable_available_size = getattr(
-                allocator, "schedulable_available_size", allocator.available_size
-            )
-            return schedulable_available_size()
+            return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
