@@ -22,14 +22,16 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(est_time=750, stage="base-c", runner_config="8-gpu-b300")
 
+MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
+
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
-    model = "/data/radixark/model-cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa"
+    model = "nvidia/GLM-5.2-NVFP4"
 
     # Full GSM8K test set (1319 questions) with a tight accuracy floor.
     gsm8k_accuracy_thres = 0.935
     gsm8k_num_questions = 1319
-    gsm8k_num_threads = 200
+    gsm8k_num_threads = 48
     gsm8k_num_shots = 20
 
     # Prefill worker: interleave prefill-CP + DSA cache layer split on 4 GPUs
@@ -49,6 +51,8 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "interleave",
         "--mem-fraction-static",
         "0.85",
+        "--model-loader-extra-config",
+        MODEL_LOADER_EXTRA_CONFIG,
         "--chunked-prefill-size",
         "4096",
         "--max-prefill-tokens",
@@ -73,6 +77,8 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "fp8_e4m3",
         "--mem-fraction-static",
         "0.85",
+        "--model-loader-extra-config",
+        MODEL_LOADER_EXTRA_CONFIG,
         "--speculative-algorithm",
         "EAGLE",
         "--speculative-num-steps",
