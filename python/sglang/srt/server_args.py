@@ -2824,6 +2824,23 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    hicache_storage_prefetch_retry_poll_interval: A[
+        int,
+        Arg(
+            help=(
+                "Scheduling passes a queued request waits after a storage "
+                "prefetch miss before the availability check is retried "
+                "(under load the first check can run before the needed "
+                "backup commits). 0 disables retries."
+            ),
+        ),
+        NS("memory"),
+    ] = 0
+    hicache_storage_prefetch_retry_max_attempts: A[
+        int,
+        "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
+        NS("memory"),
+    ] = 4
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

@@ -199,6 +199,7 @@ class BufferModePipeline:
         cache: UnifiedRadixCache,
         swa_window_pages: int,
         write_backlog_cap: int,
+        max_context_len: int = 0,
     ):
         self._cache = cache
         # SWA window size in KV pages when the SWA component stages through
@@ -214,8 +215,20 @@ class BufferModePipeline:
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
         full_pool = kvcache.full_kv_pool if isinstance(kvcache, SWAKVPool) else kvcache
-        self.anchor_lock_cap_tokens = int(
-            envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size
+        # Clamp by admission headroom: pins must leave room for the largest
+        # allowed request, else a queued hold can wedge admission permanently
+        # (pool full, nothing retractable). No-headroom pools take no pins.
+        self.anchor_lock_cap_tokens = max(
+            0,
+            min(
+                int(envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size),
+                full_pool.size - max_context_len,
+            ),
+        )
+        logger.info(
+            "BufferModePipeline anchor_lock_enabled=%s cap_tokens=%d",
+            self.anchor_lock_enabled,
+            self.anchor_lock_cap_tokens,
         )
         self.reset()
 

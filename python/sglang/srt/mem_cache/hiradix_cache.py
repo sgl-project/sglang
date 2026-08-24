@@ -1739,6 +1739,11 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_storage_prefetch_miss(self, req_id: str) -> bool:
+        """Storage prefetch miss markers are not tracked on the dense path;
+        the scheduler's paced availability-check retry is inert here."""
+        return False
+
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
             return self._empty_match_result
