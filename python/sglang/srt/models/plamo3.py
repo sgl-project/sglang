@@ -259,7 +259,7 @@ class Plamo3DecoderLayer(nn.Module):
         return hidden_states, hidden_states
 
 
-class Plamo3TextModel(nn.Module):
+class Plamo3Model(nn.Module):
     def __init__(
         self,
         config: Plamo3Config,
@@ -400,7 +400,7 @@ class Plamo3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Plamo3TextModel(
+        self.model = Plamo3Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
