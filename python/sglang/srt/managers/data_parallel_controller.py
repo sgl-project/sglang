@@ -720,6 +720,7 @@ class DataParallelController:
                     with (
                         memory_saver_adapter.configure_subprocess(),
                         numa_utils.configure_subprocess(server_args, gpu_id),
+                        numa_utils.configure_nsys_scheduler_subprocess(gpu_id),
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)

@@ -95,13 +95,11 @@ class SchedulerProfilerManager:
         )
         if self.nsys_exact_warmup_batches <= 0:
             raise ValueError("SGLANG_NSYS_EXACT_WARMUP_BATCHES must be positive")
-        self.nsys_exact_gate_reduction = os.getenv(
-            "SGLANG_NSYS_EXACT_GATE_REDUCTION", "all"
-        ).strip().lower()
+        self.nsys_exact_gate_reduction = (
+            os.getenv("SGLANG_NSYS_EXACT_GATE_REDUCTION", "all").strip().lower()
+        )
         if self.nsys_exact_gate_reduction not in {"all", "any"}:
-            raise ValueError(
-                "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all' or 'any'"
-            )
+            raise ValueError("SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all' or 'any'")
         self.nsys_require_fixed_capture = os.getenv(
             "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE", "1"
         ).strip().lower() not in {"0", "false", "no"}
@@ -306,7 +304,10 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            rank_local_nsys = os.getenv(
+                "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
+            ).strip().lower() in {"1", "true", "yes"}
+            if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
                 capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
                 if capture_range:
                     # The scheduler's run_batch NVTX range is already open here.
@@ -489,7 +490,10 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            rank_local_nsys = os.getenv(
+                "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
+            ).strip().lower() in {"1", "true", "yes"}
+            if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
                 if self.nsys_nvtx_capture_active:
                     # Finish all work enqueued by the last captured scheduler
                     # step before asking Nsight to finalize asynchronously.
@@ -544,8 +548,7 @@ class SchedulerProfilerManager:
             # Check profiler
             exact_decode_boundary_ready = (
                 not self.nsys_exact_batch
-                or self.nsys_exact_decode_batches_seen
-                >= self.nsys_exact_decode_batches
+                or self.nsys_exact_decode_batches_seen >= self.nsys_exact_decode_batches
             )
             stop_ready = (
                 self.profiler_target_forward_ct

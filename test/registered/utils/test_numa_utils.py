@@ -2,9 +2,11 @@ import ctypes
 import os
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _create_nsys_scheduler_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -12,6 +14,7 @@ from sglang.srt.utils.numa_utils import (
     _probe_numactl_args,
     _query_numa_node_for_gpu,
     _strip_memory_args,
+    configure_nsys_scheduler_subprocess,
     configure_subprocess,
     get_numa_node_if_available,
     numa_bind_to_node,
@@ -564,6 +567,59 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
+
+
+class TestConfigureNsysSchedulerSubprocess(unittest.TestCase):
+    @patch("multiprocessing.spawn.get_executable", return_value=b"/usr/bin/python3")
+    def test_generated_wrapper_profiles_rank_directly(self, _get_executable):
+        executable, _ = _create_nsys_scheduler_executable(
+            nsys_binary="nsys",
+            output_dir="/logs/profiles/decode",
+            capture_range="agentx_decode_capture",
+            gpu_id=3,
+        )
+        wrapper = Path(executable)
+        try:
+            script = wrapper.read_text()
+            self.assertIn("exec nsys profile", script)
+            self.assertIn("$(hostname)-decode-rank3", script)
+            self.assertIn("agentx_decode_capture@*", script)
+            self.assertIn('/usr/bin/python3 "$@"', script)
+            self.assertNotIn("trace-fork-before-exec", script)
+        finally:
+            wrapper.unlink()
+
+    @patch.dict(
+        os.environ,
+        {
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+            "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR": "/logs/profiles/decode",
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+        },
+    )
+    @patch("sglang.srt.utils.numa_utils._mp_set_executable")
+    @patch("sglang.srt.utils.numa_utils._create_nsys_scheduler_executable")
+    def test_installs_rank_local_wrapper(self, create_executable, set_executable):
+        create_executable.return_value = ("/tmp/nsys-rank2", "debug")
+
+        with configure_nsys_scheduler_subprocess(2):
+            pass
+
+        create_executable.assert_called_once_with(
+            nsys_binary="nsys",
+            output_dir="/logs/profiles/decode",
+            capture_range="agentx_decode_capture",
+            gpu_id=2,
+        )
+        set_executable.assert_called_once_with(
+            executable="/tmp/nsys-rank2", debug_str="debug"
+        )
+
+    @patch.dict(os.environ, {"SGLANG_NSYS_SCHEDULER_WRAPPER": "1"}, clear=True)
+    def test_requires_output_and_capture_range(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR"):
+            with configure_nsys_scheduler_subprocess(0):
+                pass
 
 
 if __name__ == "__main__":

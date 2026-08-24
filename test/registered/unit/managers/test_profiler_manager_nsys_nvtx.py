@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
@@ -50,12 +51,48 @@ def test_cuda_profiler_activity_can_use_nsys_nvtx_capture_range(tmp_path):
     assert manager.nsys_nvtx_capture_handle is None
 
 
+def test_rank_local_nsys_wrapper_opens_nvtx_range_on_nonzero_rank(tmp_path):
+    ps = SimpleNamespace(gpu_id=2)
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=ps,
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+        manager.torch_profiler_output_dir = tmp_path
+        manager.torch_profiler_with_stack = None
+        manager.torch_profiler_record_shapes = None
+        manager.profiler_activities = ["CUDA_PROFILER"]
+        manager.profile_id = "nsys-rank-local-test"
+        manager.profile_prefix = ""
+
+        device = SimpleNamespace(base_gpu_id=0)
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+                return_value=device,
+            ),
+            patch("torch.cuda.nvtx.range_start", return_value=91) as range_start,
+            patch("torch.cuda.nvtx.range_end") as range_end,
+            patch("torch.cuda.synchronize"),
+        ):
+            assert manager._start_profile().success
+            assert manager._stop_profile().success
+
+    range_start.assert_called_once_with("agentx_decode_capture")
+    range_end.assert_called_once_with(91)
+
+
 def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
     forward_ct = 100
     ps = SimpleNamespace(gpu_id=0)
-    with patch.dict(
-        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
-    ):
+    with patch.dict("os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}):
         manager = SchedulerProfilerManager(
             ps=ps,
             dp_tp_cpu_group=MagicMock(),
@@ -120,7 +157,7 @@ def test_nsys_exact_running_batch_waits_for_every_dp_rank():
     with (
         patch.object(manager, "_start_profile") as start_profile,
         patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
-        patch("torch.distributed.all_reduce", side_effect=peer_readiness),
+        patch("torch.distributed.all_reduce", side_effect=peer_readiness) as all_reduce,
     ):
         manager._profile_batch_predicate(batch)
         start_profile.assert_not_called()
@@ -136,9 +173,7 @@ def test_nsys_exact_running_batch_waits_for_every_dp_rank():
 def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps():
     forward_ct = 100
     ps = SimpleNamespace(gpu_id=0)
-    with patch.dict(
-        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
-    ):
+    with patch.dict("os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}):
         manager = SchedulerProfilerManager(
             ps=ps,
             dp_tp_cpu_group=MagicMock(),
@@ -195,9 +230,7 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
 
 def test_nsys_exact_capture_fails_closed_if_batch_shape_changes():
     decode_mode = SimpleNamespace(is_decode=lambda: True)
-    with patch.dict(
-        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
-    ):
+    with patch.dict("os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}):
         manager = SchedulerProfilerManager(
             ps=SimpleNamespace(gpu_id=0),
             dp_tp_cpu_group=MagicMock(),
@@ -237,7 +270,9 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
         patch.object(manager, "_start_profile") as start_profile,
         patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch.object(manager, "_stop_profile") as stop_profile,
-        patch("torch.distributed.all_reduce", side_effect=mark_any_rank_ready) as reduce,
+        patch(
+            "torch.distributed.all_reduce", side_effect=mark_any_rank_ready
+        ) as reduce,
         patch("torch.distributed.barrier") as barrier,
     ):
         start_profile.side_effect = lambda: setattr(
@@ -286,9 +321,7 @@ def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
 
     prime_cuda.assert_called_once_with()
     assert (tmp_path / ".nsys-capture-ready-worker-specific-profile-active").is_file()
-    assert (
-        tmp_path / ".nsys-capture-ready-worker-specific-profile-rank-0"
-    ).is_file()
+    assert (tmp_path / ".nsys-capture-ready-worker-specific-profile-rank-0").is_file()
 
 
 def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):
@@ -316,7 +349,4 @@ def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):
         manager._wait_for_nsys_capture_start()
 
     prime_cuda.assert_called_once_with()
-    assert (
-        len(list(tmp_path.glob(".nsys-capture-ready-all-rank-profile-rank-*")))
-        == 4
-    )
+    assert len(list(tmp_path.glob(".nsys-capture-ready-all-rank-profile-rank-*"))) == 4

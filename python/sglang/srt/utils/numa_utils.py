@@ -5,6 +5,7 @@ import math
 import multiprocessing
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import time
@@ -68,6 +69,69 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     yield
                     return
     yield
+
+
+@contextmanager
+def configure_nsys_scheduler_subprocess(gpu_id: int):
+    """Wrap an individual spawned scheduler rank with Nsight Systems.
+
+    Profiling the outer Dynamo/SGLang worker requires Nsight's unsafe
+    fork-before-exec mode to see scheduler CUDA activity.  A rank-local wrapper
+    attaches after ``multiprocessing`` has selected the spawned child
+    executable, so CUDA is initialized under Nsight without instrumenting the
+    controller's fork interval.
+    """
+
+    enabled = os.getenv("SGLANG_NSYS_SCHEDULER_WRAPPER", "0").strip().lower()
+    if enabled not in {"1", "true", "yes"}:
+        yield
+        return
+
+    output_dir = os.getenv("SGLANG_NSYS_SCHEDULER_OUTPUT_DIR", "").strip()
+    capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
+    if not output_dir or not capture_range:
+        raise ValueError(
+            "SGLANG_NSYS_SCHEDULER_WRAPPER requires "
+            "SGLANG_NSYS_SCHEDULER_OUTPUT_DIR and "
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE"
+        )
+
+    nsys_binary = os.getenv("SGLANG_NSYS_BINARY", "nsys").strip() or "nsys"
+    executable, debug_str = _create_nsys_scheduler_executable(
+        nsys_binary=nsys_binary,
+        output_dir=output_dir,
+        capture_range=capture_range,
+        gpu_id=gpu_id,
+    )
+    with _mp_set_executable(executable=executable, debug_str=debug_str):
+        yield
+
+
+def _create_nsys_scheduler_executable(
+    *, nsys_binary: str, output_dir: str, capture_range: str, gpu_id: int
+):
+    old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
+    output_prefix = f'{shlex.quote(output_dir)}/"$(hostname)-decode-rank{gpu_id}"'
+    script = f'''#!/bin/sh
+set -eu
+exec {shlex.quote(nsys_binary)} profile \\
+  -t cuda,nvtx \\
+  --sample=none \\
+  --cuda-graph-trace=node \\
+  --force-overwrite true \\
+  -c nvtx \\
+  -p {shlex.quote(capture_range + "@*")} \\
+  --capture-range-end repeat:1:async \\
+  --kill none \\
+  --wait all \\
+  -o {output_prefix} \\
+  {shlex.quote(old_executable)} "$@"'''
+    path = Path(
+        f"/tmp/sglang_nsys_scheduler_{time.time()}_{random.randrange(0, 10000000)}.sh"
+    )
+    path.write_text(script)
+    path.chmod(0o777)
+    return str(path), f"rank-local Nsight scheduler wrapper for gpu_id={gpu_id}"
 
 
 def _create_numactl_executable(numactl_args: str):
