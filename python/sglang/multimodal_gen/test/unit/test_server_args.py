@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -1383,6 +1384,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
+        cosmos3_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Nano"
+        ).get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
@@ -1393,6 +1397,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
+
+        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
@@ -1841,6 +1848,49 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
         )
+
+    def test_auto_cosmos3_keeps_dit_resident_on_high_memory_gpu(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
+            available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Nano",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+
+    def test_auto_cosmos3_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
+            available_memory_gb=100,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Nano",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_cosmos3_super_keeps_default_offload_policy(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
+            available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Super",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_memory_sana_wm_layerwise_offload_adds_dit(self):
         args = self._from_dict_with_pipeline_config(
