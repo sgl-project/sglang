@@ -432,3 +432,9 @@ def test_initialize_unknown_backend_is_fail_closed(monkeypatch):
     with pytest.raises(ValueError, match="Unknown mamba backend"):
         ssu_dispatch.initialize_mamba_selective_state_update_backend(args)
     assert ssu_dispatch._mamba_ssu_backend is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
