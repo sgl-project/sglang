@@ -851,6 +851,7 @@ class Envs:
     SGLANG_DEBUG_MLX_EXPORT_EXECUTE = EnvBool(False)
     SGLANG_DEBUG_MLX_EXPORT_SAVE = EnvBool(False)
     SGLANG_DEBUG_MLX_EXPORT_ATTENTION = EnvBool(False)
+    SGLANG_DEBUG_MLX_KV_DELTAS = EnvBool(False)
 
     # ===================================================================
     # Ascend NPU
