@@ -551,7 +551,8 @@ class FutureMap:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
+            device=self.output_tokens_buf.device,
+            dtype=self.output_tokens_buf.dtype,
         )
 
         if self.need_topk:
