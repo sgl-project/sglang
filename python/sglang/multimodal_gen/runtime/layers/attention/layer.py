@@ -1303,7 +1303,7 @@ class USPAttention(nn.Module):
             q.squeeze(0),
             k.squeeze(0),
             v.squeeze(0),
-            softmax_scale=self.softmax_scale,
+            attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
         )

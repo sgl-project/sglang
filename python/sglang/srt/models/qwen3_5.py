@@ -338,6 +338,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)
                 and use_intel_amx_backend(self.in_proj_ba)
+                and (
+                    self.in_proj_qkvz.weight.size(0) % 32 == 0
+                    and self.in_proj_ba.weight.size(0) % 32 == 0
+                )
             )
         )
 

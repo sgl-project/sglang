@@ -121,7 +121,7 @@ def _register_legacy_hicache_draft(
         host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )

@@ -97,7 +97,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
-- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately.
+- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. A `quality=high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only high-quality paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
@@ -139,7 +139,7 @@ or a native pipeline's registered module name.
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
-- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+- Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
 while quantized materialization is capability-based. Native auxiliary loaders
@@ -150,6 +150,9 @@ for the current component matrix.
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.
+For transformer and native encoder loaders, an explicit weight filename keeps
+the base component configuration and replaces only its weights; the selected
+file format must still be supported by that loader.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
@@ -234,9 +237,11 @@ sglang serve --model-path meituan-longcat/LongCat-Image \
   --port 30010
 ```
 
-SANA-Video supports the same path for fixed-resolution serving. Its default
-text stage emits a fixed 300-token prompt shape, so the runtime reuses one
-graph across prompt lengths without padding it to a generic text bucket:
+SANA-Video supports the same path for fixed-shape serving. Its default text
+stage emits a fixed 300-token prompt shape, so the runtime reuses one graph
+across prompt lengths without padding it to a generic text bucket. BCG also
+requires the serving frame count to match warmup; the example captures the
+model's default 81-frame signature:
 
 ```bash Command
 sglang serve \

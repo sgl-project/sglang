@@ -100,12 +100,16 @@ from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_moe_dp_size,
     configured_pp_size,
     get_exec,
     get_model,
     get_parallel,
     get_serving,
     publish,
+    restore_context,
+    snapshot_context,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -1081,52 +1085,71 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Configure global environment
         configure_logger(server_args)
+        server_args.resolve_once()
+
         _set_envs_and_config(server_args)
 
         # Defensive: ensure plugins loaded (may already be loaded by
         # Engine.__init__ or CLI entry).
         load_plugins()
 
+        # Not read-only: the LoRA checks normalize adapter paths through late
+        # resolution, which a published config refuses. Hence before publish --
+        # and before the parser detection below, which consumes the "auto"
+        # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Allocate ports for inter-process communications
-        if port_args is None:
-            port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-        # Start the engine info bootstrap server if per-rank info is needed.
-        engine_info_bootstrap_server = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
-            bootstrap_port = server_args.engine_info_bootstrap_port
-            if not is_port_available(bootstrap_port):
-                raise RuntimeError(
-                    f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
-                    f"When running multiple instances on the same node, each instance must use a "
-                    f"different --engine-info-bootstrap-port."
-                )
-            engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                host=server_args.host, port=bootstrap_port
-            )
-
+        # Needs a tokenizer and a chat template, so it cannot live in the
+        # pipeline; after the plugins, which may register the parser detected.
         if (
             server_args.reasoning_parser == "auto"
             or server_args.tool_call_parser == "auto"
         ):
             resolve_auto_parsers(server_args)
 
-        # Resolution is complete here; this process goes on to host the
-        # tokenizer manager or the multi-tokenizer router, whose own publish
-        # re-projects the same object.
+        # This publish replaces whatever was published before it, so the
+        # rollback below restores that rather than clearing the process: a
+        # caller that catches the launch error still has the context it had.
+        context_before_publish = snapshot_context()
         publish(server_args, role="tokenizer")
 
-        # Launch daemons (daemon mode only). The handles travel back to the
-        # Engine that spawned them; shutdown() reaps from there.
-        weight_cache_daemon_procs: List = []
-        if server_args.weight_cache_mode == "daemon":
-            weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
+        # Nothing below has spawned yet, so a failure here leaves a record the
+        # caller can hand back -- but only once the publication goes with it:
+        # the validation stage writes through late resolution, which refuses a
+        # record that is already published.
+        try:
+            # Allocate ports for inter-process communications
+            if port_args is None:
+                port_args = PortArgs.init_new(server_args)
+            logger.info(f"{server_args=}")
+
+            # Start the engine info bootstrap server if per-rank info is needed.
+            engine_info_bootstrap_server = None
+            if (
+                get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+                and server_args.node_rank == 0
+            ):
+                bootstrap_port = server_args.engine_info_bootstrap_port
+                if not is_port_available(bootstrap_port):
+                    raise RuntimeError(
+                        f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                        f"When running multiple instances on the same node, each instance must use a "
+                        f"different --engine-info-bootstrap-port."
+                    )
+                engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                    host=server_args.host, port=bootstrap_port
+                )
+
+            # Launch daemons (daemon mode only). The handles travel back to the
+            # Engine that spawned them; shutdown() reaps from there.
+            weight_cache_daemon_procs: List = []
+            if server_args.weight_cache_mode == "daemon":
+                weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
+                    server_args
+                )
+        except BaseException:
+            restore_context(context_before_publish)
+            raise
 
         # Launch scheduler processes
         # Passed only when there is one: this hook is an override point, and a
@@ -1859,18 +1882,25 @@ def _calculate_rank_ranges(
 def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
+    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
+
+    Called while the launcher is deciding what to spawn, so the sizes are the
+    configured ones -- the groups this is laying out do not exist yet.
+    """
     attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
+    tp_size = server_args.tp_size
+    attn_cp_size = configured_attn_cp_size()
+    moe_dp_size = configured_moe_dp_size()
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
     # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-    moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
+    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
+    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
+    moe_dp_rank = tp_rank // (tp_size // moe_dp_size)
     moe_ep_rank = (
         tp_rank
-        % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // get_parallel().ep_size)
+        % (tp_size // moe_dp_size)
+        // (tp_size // moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank
