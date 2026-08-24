@@ -265,5 +265,54 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+SPLIT_CONFIGS = [
+    # --- 8-way split band (batch <= 64 & max_seq >= 196608) ---
+    (64, 196608),
+    (64, 262144),
+    # --- 4-way split band (64 < batch <= 74 & max_seq >= 131072) ---
+    (72, 131072),
+    (72, 262144),
+    (74, 262144),  # 4-way batch cap
+    # --- 2-way split band (74 < batch <= 76 & max_seq >= 114688) ---
+    (75, 131072),
+    (76, 262144),  # 2-way batch cap
+    # --- 2-way split, low band (30 < batch <= 64 & 114688 <= max_seq < 196608) ---
+    (48, 114688),  # 2-way seq floor
+    (48, 131072),
+    (64, 163840),
+    # --- fallback (persistent pool + main<3>): just outside every split band ---
+    (77, 262144),  # batch above the 2-way cap
+    (96, 262144),  # well above all caps
+    (72, 98304),  # in a split batch band but seq below its floor
+]
+
+
+@pytest.mark.parametrize("page_mode", ["identity", "perm"])
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("batch,seq", SPLIT_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_split(batch: int, seq: int, k: int, page_mode: str) -> None:
+    """Adaptive cluster-split bands: both the page-transformed output (PAGE_TABLE
+    mode) and the raw index output (INDICES mode) must match torch.topk (set
+    equality, ties aside), across the 8/4/2-way split factors and the
+    persistent-pool fallback."""
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 17)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, page_mode, device)
+
+    ref_raw = _reference(scores, seq_lens, k)
+    scores_cpu, seq_cpu = scores.cpu(), seq_lens.cpu()
+    # PAGE_TABLE mode: transformed output, inverted through the page table
+    inv_out = _run(scores, seq_lens, page_table, inv_cpu, k)
+    _assert_topk_close(scores_cpu, ref_raw, inv_out, batch, seq_cpu, k)
+    # INDICES mode (page_table=None): the raw (pre-transform) selected positions
+    raw_out = _run_raw(scores, seq_lens, k)
+    _assert_topk_close(scores_cpu, ref_raw, raw_out, batch, seq_cpu, k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
@@ -37,11 +38,15 @@ using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
 using Cluster = impl::TopKCluster<8>;
+using Cluster4 = impl::TopKCluster<4>;  // 4-way split for mid-batch long rows
+using Cluster2 = impl::TopKCluster<2>;  // 2-way split for larger-batch long rows
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
 constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
-constexpr uint32_t kClusterSize = Cluster::kClusterSize;
+constexpr uint32_t kClusterSize = Cluster::kClusterSize;    // 8
+constexpr uint32_t kClusterSize4 = Cluster4::kClusterSize;  // 4
+constexpr uint32_t kClusterSize2 = Cluster2::kClusterSize;  // 2
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
@@ -51,6 +56,40 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+
+// --- Small-batch split routing thresholds (sm_100 anchors, rescaled per device) ---
+// An N-way split processes one row with N co-resident blocks. It is profitable
+// within a batch cap (~ SM count / N, since the cluster must be co-resident) and
+// above a seq floor (the two-pass scan stays an L2 re-read up to a length set by
+// L2 size, beyond which a single block turns DRAM-bound). Caps scale with SM
+// count and floors with L2 size at launch (see transform()).
+constexpr uint32_t kCalibSMCount = 152;
+constexpr uint32_t kCalibL2Bytes = 135528448;  // sm_100 reported L2 (129.25 MB)
+
+constexpr uint32_t kSmallBatchClusterCap = 64;       // 8-way batch ceiling
+constexpr uint32_t kSmallBatchSplitMinSeq = 196608;  // 8-way seq floor
+static_assert(kSmallBatchClusterCap >= kNumPersistentClusters);
+static_assert(kSmallBatchSplitMinSeq > kClusterFloor);
+
+// 8-way stays a single co-resident wave only up to (SM count * occupancy / 8)
+// clusters (kBlockSize occupancy is kOccupancy); above that it spills into a 2nd,
+// underutilised wave and a 4-way split -- which fills one wave up to ~2x the batch
+// -- measures faster at seq >= min_seq8. Anchored at kCalibSMCount, rescaled by
+// scale_sm() at launch so it tracks the real single-wave capacity per device.
+constexpr uint32_t kSmallBatch8WaveCap = kCalibSMCount * kOccupancy / kClusterSize;  // 38 @ 152 SM
+static_assert(kSmallBatch8WaveCap >= kNumPersistentClusters);
+static_assert(kSmallBatch8WaveCap <= kSmallBatchClusterCap);
+
+constexpr uint32_t kSmallBatch4Cap = 74;         // 4-way batch ceiling
+constexpr uint32_t kSmallBatch4MinSeq = 131072;  // 4-way seq floor
+static_assert(kSmallBatch4Cap >= kSmallBatchClusterCap);
+static_assert(kSmallBatch4MinSeq > kClusterFloor);
+
+constexpr uint32_t kSmallBatch2Cap = 76;         // 2-way batch ceiling
+constexpr uint32_t kSmallBatch2MinSeq = 114688;  // 2-way seq floor
+static_assert(kSmallBatch2Cap >= kSmallBatch4Cap);
+static_assert(kSmallBatch2MinSeq > kClusterFloor);
+
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -216,11 +255,14 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   }
 }
 
-template <bool kPDL, TopKMode kMode>
-CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
+template <bool kPDL, TopKMode kMode, uint32_t kNumRanks = kClusterSize>
+TOPK_KERNEL __cluster_dims__(1, kNumRanks, 1) void topk_small_batch_kernel(
+    const __grid_constant__ TopKLaunchParams params) {
+  static_assert(kNumRanks == 2 || kNumRanks == 4 || kNumRanks == 8, "small-batch split factor must be 2, 4 or 8");
+  using ClusterT = impl::TopKCluster<kNumRanks>;
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
-  __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
+  __shared__ impl::MaxSmem<Streaming::Smem, typename ClusterT::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL, kMode>(problem);
 
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
@@ -228,7 +270,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   if constexpr (kNeedStaging) problem.out = s_topk_indices;
 
   // randomly elect one worker rank to avoid workload imbalance
-  const auto worker_rank = blockIdx.x % kClusterSize;
+  const auto worker_rank = blockIdx.x % kNumRanks;
 
   // for small batch, we will fuse in the cluster case
   if (problem.seq_len <= kReg4MaxSeqLen) {
@@ -244,7 +286,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
     if constexpr (kNeedStaging) {
       problem.out = cluster.map_shared_rank(s_topk_indices, worker_rank);
     }
-    Cluster::forward<kPDL>(problem, &smem);
+    ClusterT::forward<kPDL>(problem, &smem);
     if constexpr (kNeedStaging) {
       cluster.sync();
       if (blockIdx.y != worker_rank) return;
@@ -470,10 +512,59 @@ struct TopKKernel {
     };
     dispatch([&]<TopKMode kMode>() {
       if (use_cluster) {
-        if (batch_size <= kNumPersistentClusters) {
+        // Rescale the sm_100 anchors to this device: caps by SM count, floors by
+        // L2 size. Queries are cached (static) so they run once, not per launch.
+        static const uint32_t sm_count = std::max(host::runtime::get_sm_count(device.device_id), 1u);
+        static const uint32_t l2_bytes = std::max(host::runtime::get_l2_cache_size(device.device_id), 1u);
+        const auto scale_sm = [&](uint32_t v) {
+          return static_cast<uint32_t>((static_cast<uint64_t>(sm_count) * v) / kCalibSMCount);
+        };
+        const auto scale_l2 = [&](uint32_t v) {
+          return static_cast<uint32_t>((static_cast<uint64_t>(l2_bytes) * v) / kCalibL2Bytes);
+        };
+        const uint32_t cap8 = scale_sm(kSmallBatchClusterCap);
+        const uint32_t cap8_wave = scale_sm(kSmallBatch8WaveCap);
+        const uint32_t cap4 = scale_sm(kSmallBatch4Cap);
+        const uint32_t cap2 = scale_sm(kSmallBatch2Cap);
+        // Clamp so a smaller device cannot scale a cap below its neighbouring band or
+        // a floor at/under kClusterFloor (below which there is no cluster path).
+        const uint32_t cap4_eff = std::max(cap4, kSmallBatchClusterCap);
+        const uint32_t cap2_eff = std::max(cap2, kSmallBatch4Cap);
+        const uint32_t min_seq8 = std::max(scale_l2(kSmallBatchSplitMinSeq), kClusterFloor + 1);
+        const uint32_t min_seq4 = std::max(scale_l2(kSmallBatch4MinSeq), kClusterFloor + 1);
+        const uint32_t min_seq2 = std::max(scale_l2(kSmallBatch2MinSeq), kClusterFloor + 1);
+
+        // 8-way split: the original small-batch path (batch <= kNumPersistentClusters)
+        // plus long rows within a single 8-way wave (batch <= cap8_wave). Batches
+        // above the single-wave cap at high seq are handed to 4-way below, not 8-way,
+        // to avoid the underutilised 2nd-wave regression. Anything unmatched falls
+        // through to the persistent pool + main<3>.
+        const bool route_split8 =
+            (batch_size <= kNumPersistentClusters) || (batch_size <= cap8_wave && max_seq_len >= min_seq8);
+        // 4-way split: the mid-batch band above the 8-way cap, plus the high-seq
+        // (>= min_seq8) slice between the 8-way single-wave cap and cap8 that used to
+        // over-subscribe 8-way -- 4-way keeps that batch in one co-resident wave.
+        const bool route_split4 =
+            !route_split8 &&
+            ((batch_size > cap8 && batch_size <= cap4_eff && max_seq_len >= min_seq4) ||
+             (batch_size > cap8_wave && batch_size <= cap8 && max_seq_len >= min_seq8));
+        // 2-way split: band above the 4-way cap and the mid-long band below the 8-way
+        // seq floor. Lower priority than 8/4-way via the !route_split guards.
+        const bool route_split2 =
+            !route_split8 && !route_split4 &&
+            (batch_size > kNumPersistentClusters && batch_size <= cap2_eff && max_seq_len >= min_seq2);
+        if (route_split8) {
           LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_kernel<kUsePDL, kMode>, params);
+              .launch(topk_small_batch_kernel<kUsePDL, kMode, kClusterSize>, params);
+        } else if (route_split4) {
+          LaunchKernel({batch_size, kClusterSize4}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize4}})
+              .launch(topk_small_batch_kernel<kUsePDL, kMode, kClusterSize4>, params);
+        } else if (route_split2) {
+          LaunchKernel({batch_size, kClusterSize2}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize2}})
+              .launch(topk_small_batch_kernel<kUsePDL, kMode, kClusterSize2>, params);
         } else {
           const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
           LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
