@@ -18,16 +18,16 @@ from safetensors.torch import safe_open
 from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
-try:
-    from runai_model_streamer import SafetensorsStreamer
-
-    HAS_RUNAI_MODEL_STREAMER = True
-except ImportError:
-    HAS_RUNAI_MODEL_STREAMER = False
-
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.loader.weight_readers import (
+    FALLBACK_READER,
+    RunaiStreamerReader,
+    select_weight_reader,
+)
+from sglang.multimodal_gen.runtime.loader.weight_readers.runai_streamer import (
+    HAS_RUNAI_MODEL_STREAMER,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -230,14 +230,28 @@ def safetensors_weights_iterator(
         device = str(checkpoint_device)
     else:
         device = "cpu" if to_cpu else str(get_local_torch_device())
-    if use_runai_model_streamer is None:
-        use_runai_model_streamer = (
-            HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+    # The caller may still pass the old boolean; map it onto a backend name so
+    # there is one place that decides, and it is the place that knows which
+    # backends can skip keys.
+    requested = None
+    if use_runai_model_streamer is not None:
+        requested = (
+            RunaiStreamerReader.name
+            if use_runai_model_streamer
+            else FALLBACK_READER.name
         )
-    if key_filter is not None:
-        # streamer filters after materializing all tensors, so it cannot skip
-        # a checkpoint partition at load time
-        use_runai_model_streamer = False
+    elif to_cpu:
+        # A host-bound load keeps the checkpoint mapping: mapped pages are the
+        # zero-copy optimum there, and everything downstream that budgets host
+        # memory (layerwise offload, pinning, the mapped-weight gate) assumes
+        # them. The streamer materializes anonymous copies instead -- measured
+        # as the whole 61.7 GB DiT landing in host anon on the 5090 CI runner
+        # -- and its strengths (direct-to-GPU, remote streaming) do not apply
+        # to a local file headed for the CPU.
+        requested = FALLBACK_READER.name
+    backend = select_weight_reader(
+        requested=requested, needs_key_filter=key_filter is not None
+    )
 
     # Validate files before loading
     corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
@@ -273,38 +287,14 @@ def safetensors_weights_iterator(
 
     _raise_if_duplicate_safetensors_keys(duplicate_files_by_key)
 
-    if use_runai_model_streamer:
-        logger.info(
-            "Loading safetensors with Run:ai Model Streamer to %s",
-            "cpu" if to_cpu else device,
-        )
-        with SafetensorsStreamer() as streamer:
-            if to_cpu:
-                streamer.stream_files(hf_weights_files)
-            else:
-                streamer.stream_files(hf_weights_files, device=device)
-            for name, tensor in streamer.get_tensors():
-                if key_filter is not None and not key_filter(name):
-                    continue
-                if to_cpu:
-                    yield name, tensor.clone().detach()
-                elif clone_streamed_tensors:
-                    yield name, tensor.clone().detach()
-                else:
-                    yield name, tensor
-    else:
-        for st_file in tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        ):
-            with safe_open(st_file, framework="pt", device=device) as f:
-                for name in f.keys():  # noqa: SIM118
-                    if key_filter is not None and not key_filter(name):
-                        continue
-                    param = f.get_tensor(name)
-                    yield name, param
+    yield from backend.iter_weights(
+        hf_weights_files,
+        device=device,
+        to_cpu=to_cpu,
+        key_filter=key_filter,
+        clone_tensors=clone_streamed_tensors,
+        show_progress=enable_tqdm,
+    )
 
 
 def _load_pt_file(bin_file: str, device: str) -> dict:

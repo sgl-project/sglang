@@ -96,11 +96,13 @@ docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
   local max_attempts=3
-  local cmd="$@"
+  local cmd=("$@")
 
   for attempt in $(seq 1 $max_attempts); do
-    echo "Attempt $attempt/$max_attempts: $cmd"
-    if eval "$cmd"; then
+    printf 'Attempt %s/%s:' "$attempt" "$max_attempts"
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    if "${cmd[@]}"; then
       echo "Success!"
       return 0
     fi
@@ -109,9 +111,11 @@ install_with_retry() {
       echo "Failed, retrying in 5 seconds..."
       sleep 5
       # Try with alternative PyPI index on retry
-      if [[ "$cmd" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
-        cmd="$cmd --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"
-        echo "Using fallback PyPI mirror: $cmd"
+      if [[ " ${cmd[*]} " == *" pip install "* ]] && [ $attempt -eq 2 ]; then
+        cmd+=(--index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com)
+        printf 'Using fallback PyPI mirror:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
       fi
     fi
   done
@@ -261,6 +265,15 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
+  # Only the rocm724 (noble) base is missing libgrpc++-dev; 7.0 and 7.2.0 built
+  # MORI without it for months before this step existed, so skip the apt round
+  # trip there. Where it does run, neither step may be fatal: apt-get update
+  # exits 100 for a single unreachable index while still keeping every index it
+  # did fetch, which under set -e is enough to take out the dependency install
+  # on every AMD runner at once. Six external apt hosts are in play, so the
+  # guard is not specific to the rocm-osdb source that first triggered this.
+  # Retries are already configured image-wide (Acquire::Retries) and do not
+  # help against a 404.
   docker exec ci_sglang bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
@@ -269,8 +282,10 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    apt-get update
-    apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
+    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ]; then
+      apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
+      apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
+    fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig

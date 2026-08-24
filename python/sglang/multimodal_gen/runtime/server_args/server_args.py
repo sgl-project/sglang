@@ -77,6 +77,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -146,7 +149,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -159,6 +164,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-ai/ideogram-4-nf4",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "meituan-longcat/longcat-image",
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
@@ -181,9 +187,11 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
+        "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -296,6 +304,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Exact weight-file overrides retain the base component configuration.
+    component_weights_paths: dict[str, str] = field(default_factory=dict)
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -308,12 +318,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
-    # Per-component transformer weight overrides (key = model_index.json component name).
-    # Pipelines use this when a checkpoint ships separate quantized weights for
-    # secondary DiT components; the generic loader consumes it without model-specific
-    # filename logic.
-    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
-
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -340,6 +344,15 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
+    # Per-component overrides of the three knobs above; an entry wins for that
+    # component.
+    layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
+    layerwise_resident_layers: dict[str, float] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -633,8 +646,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -985,6 +999,71 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Invalid attention backend '{backend}'. "
                 f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
             ) from None
+
+    @staticmethod
+    def _parse_component_value_map(
+        value: dict[str, Any] | str | None, *, option: str
+    ) -> dict[str, str]:
+        """Parse a ``component=value`` map, the same shape as component backends."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{option} must be a dict or a comma-separated component=value string"
+            )
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"{option} must use component=value entries")
+            component, entry = pair.split("=", 1)
+            result[component.strip()] = entry.strip()
+        return result
+
+    def layerwise_tuning_for(
+        self, component_name: str | None, *, dit_group: bool
+    ) -> tuple[float, float, str]:
+        """Prefetch size, resident layers and residency policy for one component."""
+        prefetch_map = self._parse_component_value_map(
+            self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
+        )
+        resident_map = self._parse_component_value_map(
+            self.layerwise_resident_layers, option="--layerwise-resident-layers"
+        )
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+
+        def _pick(mapping: dict[str, str], group_default, aux_default):
+            if component_name is not None and component_name in mapping:
+                return mapping[component_name]
+            return group_default if dit_group else aux_default
+
+        prefetch = float(_pick(prefetch_map, self.dit_offload_prefetch_size, 0.0))
+        resident = float(_pick(resident_map, self.dit_layerwise_resident_layers, 0.0))
+        policy = str(
+            _pick(
+                policy_map,
+                self.dit_layerwise_residency_policy,
+                RESIDENCY_POLICY_LEADING,
+            )
+        )
+        if policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {policy!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
+            )
+        return prefetch, resident, policy
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -1619,6 +1698,30 @@ class ServerArgs(DisaggServerArgsMixin):
         # configure logger before use
         configure_logger(server_args=self)
 
+        component_paths: dict[str, str] = {}
+        component_weights_paths = dict(self.component_weights_paths)
+        for component, path in self.component_paths.items():
+            supports_weight_file_override = (
+                is_dit_component_name(component)
+                or is_text_encoder_component_name(component)
+                or is_image_encoder_component_name(component)
+            )
+            if (
+                not supports_weight_file_override
+                or not is_explicit_weight_file_reference(path)
+            ):
+                component_paths[component] = path
+                continue
+            existing = component_weights_paths.get(component)
+            if existing is not None and existing != path:
+                raise ValueError(
+                    f"Conflicting weight overrides for component {component!r}: "
+                    f"{existing!r} and {path!r}"
+                )
+            component_weights_paths[component] = path
+        self.component_paths = component_paths
+        self.component_weights_paths = component_weights_paths
+
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
@@ -1746,10 +1849,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
@@ -2152,6 +2256,37 @@ class ServerArgs(DisaggServerArgsMixin):
             "count. Unlike raising the prefetch size, resident layers are transferred "
             "once (not re-streamed every step), so this trades VRAM for lower denoise "
             "latency when memory is available.",
+        )
+        parser.add_argument(
+            "--layerwise-prefetch-size",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-offload-prefetch-size, as "
+            "component=value entries, e.g. --layerwise-prefetch-size "
+            "text_encoder=2,vae=2. Same units as the DiT flag. Components with "
+            "no entry keep their group default. Prefetch overlaps a layer's "
+            "transfer with the previous layer's compute, which happens within a "
+            "single pass, so it is worth tuning on any streamed component.",
+        )
+        parser.add_argument(
+            "--layerwise-resident-layers",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-resident-layers, as "
+            "component=value entries, e.g. --layerwise-resident-layers "
+            "text_encoder=4. Resident layers are transferred once at startup "
+            "rather than streamed, so they cut the transfer of every pass "
+            "including the first -- an auxiliary component that runs once per "
+            "request still benefits, it just recovers the VRAM once per request "
+            "instead of once per denoising step.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-policy",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-policy, as "
+            "component=value entries, e.g. --layerwise-residency-policy "
+            "text_encoder=strided.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",

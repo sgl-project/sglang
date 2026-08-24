@@ -9,7 +9,7 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
-Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`) and therefore applies to any model component using these layers (e.g. diffusion transformer / DiT and encoders).
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible component overrides fail unless a sparse backend is being replaced for cross-attention.
 
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
@@ -129,7 +129,14 @@ The selection order in `runtime/layers/attention/selector.py` is:
 1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
 2. Component override from `--component-attention-backends` while that component is being constructed
 3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
-4. Auto selection (platform capability, dtype, and installed packages)
+4. Layer or component default, when declared
+5. Auto selection (platform capability, dtype, and installed packages)
+
+An explicit global backend mismatch fails for DiT self-attention. Auxiliary
+components may fall back to their declared default or another compatible backend.
+Sparse backends selected for self-attention similarly fall back to a compatible
+dense backend for cross-attention. Explicit component overrides are otherwise
+strict.
 
 ## Configuration
 
@@ -631,6 +638,10 @@ sglang generate \
 ```
 
 Component keys match pipeline module names from `model_index.json`, such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`.
+Use this override when the fallback must be pinned: unlike the global backend,
+an incompatible component override raises an error instead of selecting another
+backend. The one role-based exception is a sparse self-attention backend, which
+uses a compatible dense backend for cross-attention layers in the same component.
 
 ### Per-request override (denoise loop)
 

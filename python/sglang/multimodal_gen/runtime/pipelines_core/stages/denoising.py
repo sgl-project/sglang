@@ -26,11 +26,13 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
+    mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -181,6 +183,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
+    ),
+    (
+        "SANA-Video BF16-input linear attention",
+        mount_sana_video_linear_attention,
+        unmount_sana_video_linear_attention,
     ),
 )
 
@@ -652,6 +659,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         mounted_fusions.add(description)
                 else:
                     unmount(transformer)
+
+        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
+                    unmount(transformer)
+            descriptions = ", ".join(sorted(mounted_fusions))
+            raise ValueError(
+                "quality='high' cannot be used with breakable CUDA graphs for "
+                f"this model because its request-scoped DiT fusions "
+                f"({descriptions}) do not match the lossless warmup graphs. "
+                "Disable breakable CUDA graphs or use quality='lossless'."
+            )
+
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
             logger.info("Mounted %s for quality=high", description)
