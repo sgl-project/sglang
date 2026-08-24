@@ -510,10 +510,11 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
-            elif (
-                os.environ.get("DEEP_USE_MODE", "default") == "alltoall"
-                and self.deepep_output_dtype
-                in (DispatcherOutputDtype.MXFP8, DispatcherOutputDtype.MXFP4)
+            elif os.environ.get(
+                "DEEP_USE_MODE", "default"
+            ) == "alltoall" and self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8,
+                DispatcherOutputDtype.MXFP4,
             ):
                 raise ValueError(
                     f"{self.deepep_output_dtype.value} DeepEP dispatch is not "

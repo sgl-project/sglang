@@ -180,7 +180,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             last_indices = (
                 forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
             ).long()
-            input_embeds[last_indices] = self.model.embed_tokens(input_ids[last_indices])
+            input_embeds[last_indices] = self.model.embed_tokens(
+                input_ids[last_indices]
+            )
 
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)

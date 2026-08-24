@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -58,7 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
