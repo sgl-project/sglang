@@ -26,7 +26,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_shard_hidden_states,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_v2_active,
@@ -389,16 +388,16 @@ class EagerRunner(BaseRunner):
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
         with cp_shard_model_inputs(
-            input_embeds, forward_batch.positions, forward_batch
-        ) as (sharded_input_embeds, sharded_positions):
-            sharded_input_ids = cp_shard_hidden_states(
-                forward_batch.input_ids, forward_batch
-            )
+            input_embeds,
+            forward_batch.positions,
+            forward_batch,
+            forward_batch.input_ids,
+        ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
-                sharded_input_ids,
+                model_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,
