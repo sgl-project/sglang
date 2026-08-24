@@ -465,9 +465,7 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        self.max_inflight_tokens = max(
-            0, envs.SGLANG_NIXL_MAX_INFLIGHT_TOKENS.get()
-        )
+        self.max_inflight_tokens = max(0, envs.SGLANG_NIXL_MAX_INFLIGHT_TOKENS.get())
         self.enable_transfer_queue_pipeline = self.max_inflight_tokens > 0
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
@@ -1204,7 +1202,19 @@ class NixlKVManager(CommonKVManager):
         while pending:
             remaining = []
             for handle in pending:
-                state = self.agent.check_xfer_state(handle)
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception as e:
+                    if error is None:
+                        error = e
+                        logger.warning(
+                            "Waiting for NIXL transfer after completion check "
+                            "failed for room %s: %s",
+                            room,
+                            e,
+                        )
+                    remaining.append(handle)
+                    continue
                 if state == "ERR":
                     error = error or RuntimeError(
                         f"NIXL transfer encountered ERR room={room}"
@@ -1213,7 +1223,7 @@ class NixlKVManager(CommonKVManager):
                     remaining.append(handle)
             pending = remaining
             if pending:
-                time.sleep(0)
+                time.sleep(0.001 if error is not None else 0)
 
         if error is not None:
             self.exceptions[room] = error
@@ -1299,6 +1309,10 @@ class NixlKVManager(CommonKVManager):
             reserved_tokens = 0
             try:
                 if not self._claim_transfer_chunk(kv_chunk):
+                    if kv_chunk.staging_counted:
+                        self._complete_transfer_chunk(kv_chunk)
+                    if pending_completions:
+                        self._finalize_transfer_chunk(*pending_completions.popleft())
                     continue
 
                 assert room in self.transfer_infos
@@ -1538,9 +1552,7 @@ class NixlKVManager(CommonKVManager):
                     continue
 
                 if pipeline_this_chunk:
-                    pending_completions.append(
-                        (kv_chunk, handles, reserved_tokens)
-                    )
+                    pending_completions.append((kv_chunk, handles, reserved_tokens))
                 else:
                     self._finalize_transfer_chunk(kv_chunk, handles)
             except Exception as e:
@@ -1550,9 +1562,7 @@ class NixlKVManager(CommonKVManager):
                 # Never release source/destination ownership while submitted
                 # NIXL operations may still be in flight.
                 if kv_chunk.staging_counted:
-                    self._finalize_transfer_chunk(
-                        kv_chunk, handles, reserved_tokens
-                    )
+                    self._finalize_transfer_chunk(kv_chunk, handles, reserved_tokens)
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
@@ -2598,18 +2608,23 @@ class NixlKVManager(CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                chunk_id=chunk_id,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-            )
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            chunk_id=chunk_id,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
         )
+        if self.enable_transfer_queue_pipeline:
+            with self._transfer_condition:
+                if self.check_status(bootstrap_room) == KVPoll.Failed:
+                    return None
+                self._staging_outstanding[bootstrap_room] += 1
+                kv_chunk.staging_counted = True
+        self.transfer_queues[shard_idx].put(kv_chunk)
         return None
 
     def update_transfer_status(self):
@@ -2986,10 +3001,10 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
-        # Hold Success until all staging chunks transferred: a deferred chunk
-        # can still be pending, and concluding now would drop it.
+        # Keep source ownership until every queued or submitted chunk drains.
         if (
-            status == KVPoll.Success
+            self.kv_mgr.enable_transfer_queue_pipeline
+            and status in (KVPoll.Success, KVPoll.Failed)
             and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
         ):
             return KVPoll.Transferring  # type: ignore
@@ -3004,6 +3019,10 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
+        if self.kv_mgr.enable_transfer_queue_pipeline:
+            with self.kv_mgr._transfer_condition:
+                while self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0:
+                    self.kv_mgr._transfer_condition.wait()
         super().clear()
         if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)

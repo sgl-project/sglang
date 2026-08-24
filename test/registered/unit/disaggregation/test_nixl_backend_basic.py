@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -345,6 +346,18 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
+    def test_pipeline_holds_failure_until_source_transfers_drain(self):
+        sender = object.__new__(NixlKVSender)
+        sender.bootstrap_room = 7
+        sender._send_failed = False
+        sender.kv_mgr = SimpleNamespace(
+            enable_transfer_queue_pipeline=True,
+            _staging_outstanding={7: 1},
+            check_status=lambda _room: KVPoll.Failed,
+        )
+
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+
 
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
@@ -537,7 +550,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Success)
         self.assertNotIn(room, mgr.transfer_infos)
 
-    def test_pipeline_token_budget_is_released_on_completion(self):
+    def test_pipeline_completion_error_drains_before_releasing_budget(self):
         room = 24
         mgr = self._make_manager(room)
         mgr.enable_transfer_queue_pipeline = True
@@ -546,12 +559,34 @@ class TestNixlTransferWorker(CustomTestCase):
         chunk = self._make_chunk(room, [1], is_last_chunk=False)
         chunk.staging_counted = True
         mgr._staging_outstanding[room] = 1
-        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.agent.check_xfer_state = MagicMock(
+            side_effect=[RuntimeError("retry"), "DONE"]
+        )
 
         self.assertTrue(mgr._try_reserve_pipeline_tokens(8))
         self.assertFalse(mgr._try_reserve_pipeline_tokens(3))
         mgr._finalize_transfer_chunk(chunk, ["handle"], reserved_tokens=8)
         self.assertEqual(mgr._pipeline_tokens_inflight, 0)
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+
+    def test_pipeline_counts_source_lifetime_before_enqueue(self):
+        room = 25
+        mgr = self._make_manager(room)
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_transfer_queue_pipeline = True
+        mgr.transfer_queues = [FakeQueue()]
+
+        mgr.add_transfer_request(
+            room,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            False,
+            0,
+            num_kv_tokens=64,
+        )
+
+        self.assertEqual(mgr._staging_outstanding[room], 1)
+        self.assertTrue(mgr.transfer_queues[0].items[0].staging_counted)
 
     def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
         return TransferKVChunk(
