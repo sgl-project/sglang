@@ -676,7 +676,9 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey
+    ) -> Tuple[List[torch.Tensor], TreeNode]:
         access_time = time.monotonic()
         node.last_access_time = access_time
 
