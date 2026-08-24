@@ -528,12 +528,8 @@ class HunYuanAttention(nn.Module):
     ):
         q_len, hidden_size = hidden_states.size()
         hidden_states = hidden_states.reshape(-1, hidden_size)
-        #print(f"hidden_states={hidden_states.std()} {hidden_states.shape}")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        #print(f"q={q.std()} k={k.std()} v={v.std()}")
-        
-        #print(f"before rope q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
 
         if attn_meta is not None:
             assert positions is None
@@ -541,49 +537,12 @@ class HunYuanAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k)
 
-        # print(f"image_rope2d_emb q={q.std()} k={k.std()} v={v.std()}")
-
         ori_k = k
-
-        # print(
-        #     "Q weight:",
-        #     self.query_layernorm.weight.float().mean().item(),
-        #     self.query_layernorm.weight.float().std().item(),
-        #     self.query_layernorm.weight.float().min().item(),
-        #     self.query_layernorm.weight.float().max().item(),
-        # )
-
-        # print(
-        #     "K weight:",
-        #     self.key_layernorm.weight.float().mean().item(),
-        #     self.key_layernorm.weight.float().std().item(),
-        #     self.key_layernorm.weight.float().min().item(),
-        #     self.key_layernorm.weight.float().max().item(),
-        # )
-
-        # print(
-        #     "Q/K max diff:",
-        #     (
-        #         self.query_layernorm.weight.float()
-        #         - self.key_layernorm.weight.float()
-        #     ).abs().max().item()
-        # )
 
         if self.use_qk_norm:
             import torch_npu
-            # print(f"{q.shape} {k.shape}")
-            #print(f"before use_qk_norm q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
-
             q = torch_npu.npu_rms_norm(q.view(-1, self.num_heads, self.head_dim).contiguous(), gamma=self.query_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
             k = torch_npu.npu_rms_norm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous(), gamma=self.key_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
-            #q0 = q.view(-1, self.num_heads, self.head_dim).contiguous()
-            #k0 = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-            #q = self.query_layernorm(q0)
-            #k = self.key_layernorm(k0)
-        
-        #print(f"after use_qk_norm q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
-
-        #print(f"after self.rms_norm_eps={self.rms_norm_eps} attn_meta={attn_meta is not None} use_qk_norm={self.use_qk_norm} q={q.std()} k={k.std()} v={v.std()}")
 
         if attn_meta is not None:
             attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask, layer_id=self.layer_id)
@@ -592,8 +551,6 @@ class HunYuanAttention(nn.Module):
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
             attn_output = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
-
-        # print(f"after attn_output attn_output={attn_output.std()}")
 
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -868,8 +825,6 @@ class HunyuanImage3DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
-            print(f"[L{self.layer_id}] mlp {hidden_states.float().detach().std()} {hidden_states.float().detach().mean()}")
-
             hidden_states = residual + hidden_states
         else:
             if residual is None:

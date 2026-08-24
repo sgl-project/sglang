@@ -1429,18 +1429,20 @@ class SamplingParams:
             type=str,
             help=(
                 "Tokenizer bot task (model-specific). For HunyuanImage-3: "
-                "auto, image, think, recaption, img_ratio, none. "
+                "auto, image, think, recaption, think_recaption, img_ratio, none. "
                 "Controls the bot response prefix in the tokenizer."
             ),
         )
         add_argument(
-            "--sys-type",
-            dest="sys_type",
+            "--system-prompt",
+            dest="system_prompt",
             type=str,
             help=(
-                "System prompt type (model-specific). For HunyuanImage-3: "
-                "none, en_unified, en_vanilla, en_recaption, en_think_recaption, auto. "
-                "Controls which system prompt to use."
+                "System prompt: preset name or raw custom text. "
+                "Presets: none, en_unified, en_vanilla, en_recaption, "
+                "en_think_recaption, dynamic, auto. "
+                "Any other string is used directly as the system prompt. "
+                "Default: en_unified."
             ),
         )
         return parser

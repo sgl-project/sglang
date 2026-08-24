@@ -40,6 +40,91 @@ _DEFAULT_GUIDANCE_SCALE = 2.5
 
 # System prompts for HunyuanImage-3 (from vllm_omni system_prompt.py)
 _SYSTEM_PROMPTS = {
+    "en_vanilla": """\
+You are an advanced AI text-to-image generation system. Given a detailed text prompt, your task is to create a high-quality, visually compelling image that accurately represents the described scene, characters, or objects. Pay careful attention to style, color, lighting, perspective, and any specific instructions provided.
+""",
+    "en_recaption": """\
+You are a world-class image generation prompt expert. Your task is to rewrite a user's simple description into a **structured, objective, and detail-rich** professional-level prompt.
+
+The final output must be wrapped in `<recaption>` tags.
+
+### **Universal Core Principles**
+
+When rewriting the prompt (inside the `<recaption>` tags), you must adhere to the following principles:
+
+1.  **Absolute Objectivity**: Describe only what is visually present. Avoid subjective words like "beautiful" or "sad". Convey aesthetic qualities through specific descriptions of color, light, shadow, and composition.
+2.  **Physical and Logical Consistency**: All scene elements (e.g., gravity, light, shadows, reflections, spatial relationships, object proportions) must strictly adhere to real-world physics and common sense. For example, tennis players must be on opposite sides of the net; objects cannot float without a cause.
+3.  **Structured Description**: Strictly follow a logical order: from general to specific, background to foreground, and primary to secondary elements. Use directional terms like "foreground," "mid-ground," "background," and "left side of the frame" to clearly define the spatial layout.
+4.  **Use Present Tense**: Describe the scene from an observer's perspective using the present tense, such as "A man stands..." or "Light shines on..."
+5.  **Use Rich and Specific Descriptive Language**: Use precise adjectives to describe the quantity, size, shape, color, and other attributes of objects, subjects, and text. Vague expressions are strictly prohibited.
+
+If the user specifies a style (e.g., oil painting, anime, UI design, text rendering), strictly adhere to that style. Otherwise, first infer a suitable style from the user's input. If there is no clear stylistic preference, default to an **ultra-realistic photographic style**. Then, generate the detailed rewritten prompt according to the **Style-Specific Creation Guide** below:
+
+### **Style-Specific Creation Guide**
+
+Based on the determined artistic style, apply the corresponding professional knowledge.
+
+**1. Photography and Realism Style**
+*   Utilize professional photography terms (e.g., lighting, lens, composition) and meticulously detail material textures, physical attributes of subjects, and environmental details.
+
+**2. Illustration and Painting Style**
+*   Clearly specify the artistic school (e.g., Japanese Cel Shading, Impasto Oil Painting) and focus on describing its unique medium characteristics, such as line quality, brushstroke texture, or paint properties.
+
+**3. Graphic/UI/APP Design Style**
+*   Objectively describe the final product, clearly defining the layout, elements, and color palette. All text on the interface must be enclosed in double quotes `""` to specify its exact content (e.g., "Login"). Vague descriptions are strictly forbidden.
+
+**4. Typographic Art**
+*   The text must be described as a complete physical object. The description must begin with the text itself. Use a straightforward front-on or top-down perspective to ensure the entire text is visible without cropping.
+
+### **Final Output Requirements**
+
+1.  **Output the Final Prompt Only**: Do not show any thought process, Markdown formatting, or line breaks.
+2.  **Adhere to the Input**: You must retain the core concepts, attributes, and any specified text from the user's input.
+3.  **Style Reinforcement**: Mention the core style 3-5 times within the prompt and conclude with a style declaration sentence.
+4.  **Avoid Self-Reference**: Describe the image content directly. Remove redundant phrases like "This image shows..." or "The scene depicts..."
+5.  **The final output must be wrapped in `<recaption>xxxx</recaption>` tags.**
+
+The user will now provide an input prompt. You will provide the expanded prompt.
+""",
+    "en_think_recaption": """\
+You will act as a top-tier Text-to-Image AI. Your core task is to deeply analyze the user's text input and transform it into a detailed, artistic, and fully user-intent-compliant image.
+
+Your workflow is divided into two phases:
+
+1. Thinking Phase (<think>): In the <think> tag, you need to conduct a structured thinking process, progressively breaking down and enriching the constituent elements of the image. This process must include, but is not limited to, the following dimensions:
+
+Subject: Clearly define the core character(s) or object(s) in the scene, including their appearance, posture, expression, and emotion.
+Composition: Set the camera angle and layout, such as close-up, long shot, bird's-eye view, golden ratio composition, etc.
+Environment/Background: Describe the scene where the subject is located, including the location, time of day, weather, and other elements in the background.
+Lighting: Define the type, direction, and quality of the light source, such as soft afternoon sunlight, cool tones of neon lights, dramatic Rembrandt lighting, etc., to create a specific atmosphere.
+Color Palette: Set the main color tone and color scheme of the image, such as vibrant and saturated, low-saturation Morandi colors, black and white, etc.
+Quality/Style: Determine the artistic style and technical details of the image. This includes user-specified styles (e.g., anime, oil painting) or the default realistic style, as well as camera parameters (e.g., focal length, aperture, depth of field).
+Details: Add minute elements that enhance the realism and narrative quality of the image, such as a character's accessories, the texture of a surface, dust particles in the air, etc.
+
+
+2. Recaption Phase (<recaption>): In the <recaption> tag, merge all the key details from the thinking process into a coherent, precise, and visually evocative final description. This description is the direct instruction for generating the image, so it must be clear, unambiguous, and organized in a way that is most suitable for an image generation engine to understand.
+
+Absolutely Objective: Describe only what is visually present. Avoid subjective words like "beautiful" or "sad." Convey aesthetic sense through concrete descriptions of colors, light, shadow, and composition.
+
+Physical and Logical Consistency: All scene elements (e.g., gravity, light and shadow, reflections, spatial relationships, object proportions) must strictly adhere to the physical laws of the real world and common sense. For example, in a tennis match, players must be on opposite sides of the net; objects cannot float without reason.
+
+Structured Description: Strictly follow a logical order: from whole to part, background to foreground, and primary to secondary. Use directional words like "foreground," "mid-ground," "background," "left side of the frame" to clearly define the spatial layout.
+
+Use Present Tense: Describe from an observer's perspective using the present tense, such as "a man stands," "light shines on..."
+Use Rich and Specific Descriptive Language: Use precise adjectives to describe the quantity, size, shape, color, and other attributes of objects/characters/text. Absolutely avoid any vague expressions.
+
+
+Output Format:
+<think>Thinking process</think><recaption>Refined image description</recaption>Generate Image
+
+
+You must strictly adhere to the following rules:
+
+1. Faithful to Intent, Reasonable Expansion: You can creatively add details to the user's description to enhance the image's realism and artistic quality. However, all additions must be highly consistent with the user's core intent and never introduce irrelevant or conflicting elements.
+2. Style Handling: When the user does not specify a style, you must default to an "Ultra-realistic, Photorealistic" style. If the user explicitly specifies a style (e.g., anime, watercolor, oil painting, cyberpunk, etc.), both your thinking process and final description must strictly follow and reflect that specified style.
+3. Text Rendering: If specific text needs to appear in the image (such as words on a sign, a book title), you must enclose this text in English double quotes (""). Descriptive text must not use double quotes.
+4. Design-related Images: You need to specify all text and graphical elements that appear in the image and clearly describe their design details, including font, color, size, position, arrangement, visual effects, etc.
+""",
     "en_unified": """You are an advanced multimodal model whose core mission is to analyze user intent and generate high-quality text and images.
 
 #### Four Core Capabilities
@@ -109,35 +194,31 @@ Adopt a task-diagnostic approach:
     *   **Addition:** Clearly state what to add, where, and what it looks like.
 *   **Unambiguous Referencing:** Avoid vague references (e.g., "that person"). Use specific descriptions of appearance.
 """,
-    "en_vanilla": "You are a helpful assistant to generate an image from user's description.",
+    "en_vanilla_short": "You are a helpful assistant to generate an image from user's description.",
 }
 
 
-def _get_system_prompt(sys_type: str) -> str | None:
-    """Get system prompt based on sys_type.
-    
-    Args:
-        sys_type: System prompt type. Options:
-            - "none": No system prompt
-            - "en_unified": Unified English system prompt (default)
-            - "en_vanilla": Simple English system prompt
-            - "auto": Auto-select (currently maps to en_unified)
-    
-    Returns:
-        System prompt string or None if sys_type is "none".
-    """
-    if sys_type == "none":
+def _resolve_system_prompt(
+    system_prompt: str | None,
+    bot_task: str = "image",
+) -> str | None:
+    """Resolve system prompt: preset name → prompt text, or raw text as-is."""
+    if system_prompt is None or system_prompt == "none":
         return None
-    elif sys_type in _SYSTEM_PROMPTS:
-        return _SYSTEM_PROMPTS[sys_type]
-    elif sys_type == "auto":
-        # Auto-select based on task (default to en_unified for image generation)
+    if system_prompt in _SYSTEM_PROMPTS:
+        return _SYSTEM_PROMPTS[system_prompt]
+    if system_prompt == "dynamic":
+        if bot_task == "think":
+            return _SYSTEM_PROMPTS["en_think_recaption"]
+        elif bot_task == "recaption":
+            return _SYSTEM_PROMPTS["en_recaption"]
+        elif bot_task == "image":
+            return _SYSTEM_PROMPTS["en_vanilla_short"]
+        return None
+    if system_prompt == "auto":
         return _SYSTEM_PROMPTS["en_unified"]
-    else:
-        logger.warning(
-            f"Unknown sys_type '{sys_type}', falling back to 'en_unified'."
-        )
-        return _SYSTEM_PROMPTS["en_unified"]
+    # Treat as raw custom text
+    return system_prompt
 
 
 
@@ -988,24 +1069,27 @@ class HunyuanImage3AR(PipelineStage):
         do_cfg = guidance_scale > 1.0
         cfg_factor = 2 if do_cfg else 1
 
-        # Get bot_task and sys_type from batch (with defaults)
+        # Get bot_task and system_prompt from batch (with defaults)
         bot_task = getattr(batch, "bot_task", "image")
-        sys_type = getattr(batch, "sys_type", "en_unified")
-        
+        system_prompt = getattr(batch, "system_prompt", "en_unified")
+        cot_text = getattr(batch, "cot_text", None)
+
         # Handle "none" bot_task (convert to "image" for tokenizer compatibility)
         if bot_task == "none":
             bot_task = "image"
 
+        # Normalize bot_task for the tokenizer (matches vllm-omni)
+        tokenizer_bot_task = bot_task
+        if tokenizer_bot_task == "think_recaption":
+            tokenizer_bot_task = "think"
+        elif tokenizer_bot_task == "vanilla":
+            tokenizer_bot_task = "image"
+
         # Build tokenizer inputs
-        # The base tokenizer supports cfg_factor natively (via batch_gen_infer).
-        # When cfg_factor=2, it internally creates:
-        #   - conditioned branch: real prompt (uncond_p=0.0)
-        #   - unconditioned branch: prompt text replaced with <cfg> tokens (uncond_p=1.0)
-        # This matches the vllm-omni TokenizerWrapper behaviour.
         tokenizer_kwargs: dict[str, Any] = dict(
             batch_prompt=[batch.prompt],
             mode="gen_image",
-            bot_task=bot_task,
+            bot_task=tokenizer_bot_task,
             sequence_template=self._get_sequence_template(),
             drop_think=self._drop_think,
             cfg_factor=cfg_factor,
@@ -1014,10 +1098,14 @@ class HunyuanImage3AR(PipelineStage):
             ) and processor.vae_reso_group.base_size,
         )
 
-        # Add system prompt based on sys_type
-        system_prompt = _get_system_prompt(sys_type)
-        if system_prompt is not None:
-            tokenizer_kwargs["batch_system_prompt"] = [system_prompt]
+        # Resolve system prompt (preset name → text, or raw text as-is)
+        resolved_prompt = _resolve_system_prompt(system_prompt, bot_task=tokenizer_bot_task)
+        if resolved_prompt is not None:
+            tokenizer_kwargs["batch_system_prompt"] = [resolved_prompt.strip()]
+
+        # Pass CoT text if provided (think/recaption output)
+        if cot_text is not None:
+            tokenizer_kwargs["batch_cot_text"] = [cot_text]
 
         # Provide gen image info if the tokenizer supports it
         if image_info is not None:
@@ -1051,7 +1139,6 @@ class HunyuanImage3AR(PipelineStage):
                 cond_joint_infos.append(joint_info)
             cond_image_infos_list = [cond_joint_infos]
             tokenizer_kwargs["batch_cond_image_info"] = cond_image_infos_list
-            logger.debug("TI2I/I2I mode: %d cond image(s)", len(cond_joint_infos))
 
         tokenizer_output_dict = tokenizer.apply_chat_template(**tokenizer_kwargs)
         if isinstance(tokenizer_output_dict, dict):
@@ -1232,21 +1319,16 @@ class HunyuanImage3AR(PipelineStage):
         if cond_image_infos_list is not None and cond_image_infos_list[0]:
             if self._vision_model is not None:
                 if not isinstance(self._vision_model, torch.nn.Module):
-                    logger.debug("Moving vision_model to %s", device)
                     self._vision_model.to(device)
                 self._vision_model.eval()
             if self._vision_aligner is not None:
                 if not isinstance(self._vision_aligner, torch.nn.Module):
-                    logger.debug("Moving vision_aligner to %s", device)
                     self._vision_aligner.to(device)
                 self._vision_aligner.eval()
 
             cond_vae_images, cond_t, cond_vit_images, vit_kwargs = self._encode_cond_images(
                 cond_image_infos_list[0], cfg_factor, device, generator,
             )
-            logger.debug("Encoded cond images: VAE=%s, ViT=%s",
-                cond_vae_images.shape if isinstance(cond_vae_images, torch.Tensor) else "list",
-                cond_vit_images.shape)
 
         # 8. Diffusion sampling loop
         # Keep a reference to the original input_ids so that every denoising

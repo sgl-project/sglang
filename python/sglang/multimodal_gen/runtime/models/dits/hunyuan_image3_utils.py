@@ -155,9 +155,7 @@ class HunYuanRotary2DEmbedder:
         q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
         k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim)
 
-        #print(f"before cos/std={cos.float().detach().std()} cos/mean={sin.float().detach().std()}")
         q, k = apply_rotary_pos_emb(q.to(torch.float32), k.to(torch.float32), cos, sin)
-        #print(f"after apply_rotary_pos_emb q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
 
         # 5. Restore original shape + convert to bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)

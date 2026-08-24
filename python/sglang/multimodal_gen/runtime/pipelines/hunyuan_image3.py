@@ -181,7 +181,6 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             else:
                 raise ValueError(f"Unknown required module: {module_name}")
 
-        logger.debug("Memory usage of loaded modules (GiB): %s", self.memory_usages)
         return modules
 
     # --- component loaders ---------------------------------------------------
