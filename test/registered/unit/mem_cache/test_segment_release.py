@@ -124,6 +124,25 @@ class TestPagedFreePageReps(CustomTestCase):
         sub.free_group_end()
         self.assertEqual(2, len(_free_page_set(sub) - before))
 
+    def test_group_owns_deferred_page_reps(self):
+        # free() and free_segment() hand the deferred tensor to
+        # _copy_for_free_group(); free_page_reps() must too. The reps are a
+        # strided view of the caller's kv row, so without the copy a caller
+        # that rewrites the row between begin/end silently changes which
+        # pages free_group_end releases.
+        allocator, rows = _build(self.PAGE)
+        sub = allocator.full_attn_allocator
+        reps = rows[0, 0 : 2 * self.PAGE : self.PAGE]
+        expected = set((reps // self.PAGE).tolist())
+        before = _free_page_set(sub)
+
+        sub.free_group_begin()
+        sub.free_page_reps(reps)
+        rows[0].zero_()
+        sub.free_group_end()
+
+        self.assertEqual(expected, _free_page_set(sub) - before)
+
     def test_free_segment_matches_free_for_aligned_and_unaligned_starts(self):
         # start_pos == 0 takes the stride-slice branch; a non-aligned start_pos
         # additionally emits the partial head page.

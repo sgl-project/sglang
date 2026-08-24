@@ -318,7 +318,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.append(page_reps)
+            self.free_page_reps_group.append(self._copy_for_free_group(page_reps))
 
     def _debug_check_no_duplicate_pages(self):
         # span both containers: need_sort (PD disagg) routes frees into release_pages
