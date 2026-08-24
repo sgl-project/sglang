@@ -76,8 +76,12 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
             patch.object(deepseek_v4, "_is_hip", False),
             patch.object(deepseek_v4, "_is_npu", False),
-            patch.object(deepseek_v4, "is_dsa_enable_prefill_cp", return_value=False),
             patch.object(deepseek_v4, "get_parallel", return_value=parallel),
+            patch.object(
+                deepseek_v4,
+                "resolve_model_attention_partition",
+                return_value=(0, 1),
+            ),
             patch.object(deepseek_v4, "get_device", return_value=device),
             patch.object(deepseek_v4, "ReplicatedLinear", _ModuleStub),
             patch.object(deepseek_v4, "ColumnParallelLinear", _ModuleStub),

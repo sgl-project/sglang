@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
@@ -35,7 +36,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -141,6 +142,24 @@ def is_cp_v2_active(forward_batch) -> bool:
         return False
 
     return strategy.can_apply(len(input_ids), forward_batch)
+
+
+def is_mla_prefill_cp_enabled() -> bool:
+    """Return whether prefill CP is configured for an MLA attention backend."""
+    if enable_cp_v2():
+        return is_cp_enabled() and uses_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
+
+
+def mla_use_prefill_cp(forward_batch) -> bool:
+    """Return whether this MLA forward batch is using prefill CP."""
+    if enable_cp_v2():
+        return is_mla_prefill_cp_enabled() and is_cp_v2_active(forward_batch)
+    return (
+        getattr(forward_batch, "attn_cp_metadata", None) is not None
+        and is_mla_prefill_cp_enabled()
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -251,8 +270,8 @@ def cp_materialize_global_token_order(
         assert strategy is not None
         return strategy.gather_kv_cache(x, forward_batch, stream)
 
-    # TODO(hzh0425): Keep the legacy gather temporarily for CP-v1 compatibility. Remove it
-    # with the follow-up CP-v1 cleanup.
+    # HIP/NPU still materialize their protected platform layout through the
+    # legacy collective until those backends migrate independently.
     from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 
     return cp_all_gather_rerange_output(
@@ -313,6 +332,8 @@ __all__ = [
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",
+    "is_mla_prefill_cp_enabled",
+    "mla_use_prefill_cp",
     "cp_gather_after_forward",
     "cp_materialize_global_token_order",
     "cp_round_robin_input_ids_v2",

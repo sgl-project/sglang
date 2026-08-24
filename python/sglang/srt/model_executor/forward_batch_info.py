@@ -66,9 +66,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -303,8 +303,8 @@ def compute_local_num_token_non_padded_cpu(
 def prefill_graph_tolerates_sum_len() -> bool:
     """Whether MegaMoE may replay prefill graphs with local shapes."""
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
@@ -597,7 +597,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
-    attn_cp_metadata: Optional[ContextParallelMetadata] = None
+    attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

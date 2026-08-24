@@ -26,6 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_hidden_states,
     cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_v2_active,
@@ -379,7 +380,7 @@ class EagerRunner(BaseRunner):
     def _execute_extend_cp_v2(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        """CP-v2 extend: shard inputs at the model boundary, run the body on the
+        """CP extend: shard inputs at the model boundary, run the body on the
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
@@ -390,11 +391,14 @@ class EagerRunner(BaseRunner):
         with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
         ) as (sharded_input_embeds, sharded_positions):
+            sharded_input_ids = cp_shard_hidden_states(
+                forward_batch.input_ids, forward_batch
+            )
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
-                forward_batch.input_ids,
+                sharded_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,

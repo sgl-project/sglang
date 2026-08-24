@@ -602,53 +602,6 @@ def handle_platform_cp_compatibility(server_args: Any):
         )
 
 
-def handle_legacy_cp_runtime_compatibility(server_args: Any):
-    """Project canonical CP settings for runtime consumers removed by PR3."""
-    cfg = resolving_view(server_args)
-
-    if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
-        return
-
-    if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
-        return
-
-    strategy_to_legacy_mode = {
-        "zigzag": "in-seq-split",
-        "interleave": "round-robin-split",
-    }
-    mode = strategy_to_legacy_mode[cfg.cp_strategy]
-    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-        resolved_view(server_args), "attention_backend", None
-    ) in ("dsa", "dsv4")
-    if use_dsa_legacy_aliases:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=False,
-        )
-    else:
-        declare_resolution(
-            server_args,
-            "_handle_legacy_cp_runtime_compatibility",
-            enable_prefill_context_parallel=True,
-        )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        dsa_prefill_cp_mode=mode,
-    )
-    declare_resolution(
-        server_args,
-        "_handle_legacy_cp_runtime_compatibility",
-        prefill_cp_mode=mode,
-    )
-
-
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
     if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:

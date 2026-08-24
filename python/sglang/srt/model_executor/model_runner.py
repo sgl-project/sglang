@@ -77,10 +77,10 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_v2_active,
+    is_mla_prefill_cp_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -266,7 +266,7 @@ class SamplingPrewarmResult:
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
-    """Allow CP only through a runner that captured the validated CP-v2 body."""
+    """Allow CP only through a runner that captured the validated CP body."""
     return get_cp_strategy() is None or (
         bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
         and is_cp_v2_active(forward_batch)

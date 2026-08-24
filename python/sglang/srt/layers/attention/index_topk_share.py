@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional
 
+from sglang.srt.layers.cp.utils import cp_gather_after_forward, is_cp_v2_active
+
 if TYPE_CHECKING:
     import torch
 
@@ -46,6 +48,12 @@ class IndexTopKShareState:
         return self._topk_indices
 
     def update(self, topk_indices: Optional[torch.Tensor]) -> None:
+        if (
+            topk_indices is not None
+            and self.should_publish
+            and is_cp_v2_active(self._forward_batch)
+        ):
+            topk_indices = cp_gather_after_forward(topk_indices, self._forward_batch)
         self._topk_indices = topk_indices
 
     def publish(self) -> None:

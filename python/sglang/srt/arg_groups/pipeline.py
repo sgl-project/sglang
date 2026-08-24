@@ -156,7 +156,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
-        handle_legacy_cp_runtime_compatibility,
         handle_platform_cp_compatibility,
     )
 
@@ -286,10 +285,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Normalize load balancing defaults.
     handle_load_balance_method(server_args)
-
-    # The old runtime distinguishes DSA from other CP paths through legacy
-    # fields, so project only after attention_backend has been resolved.
-    handle_legacy_cp_runtime_compatibility(server_args)
 
     # Handle context parallelism.
     handle_context_parallelism(server_args)
