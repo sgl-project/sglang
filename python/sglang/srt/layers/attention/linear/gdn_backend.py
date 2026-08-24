@@ -255,6 +255,13 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # The fused SYCL kernel is dispatched via XpuGDNAttnBackend.forward_fused_gdn,
+            # outside this dispatcher; Triton is the dispatcher-level kernel for requests
+            # that hook doesn't handle (e.g. verify).
+            self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -281,6 +288,12 @@ class GDNKernelDispatcher:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
         if prefill_backend.is_triton():
+            self.extend_kernel = triton_kernel
+        elif prefill_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # See the decode branch above: intel_xpu uses Triton as its
+            # dispatcher-level fallback kernel.
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
@@ -501,6 +514,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
+        self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
