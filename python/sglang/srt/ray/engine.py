@@ -464,8 +464,8 @@ class RayEngine(Engine):
 
         # Set dist_init_addr on server_args so PortArgs.init_new() can compute
         # TCP addresses correctly (required for DP attention path).
-        dp_server_args = dataclasses.replace(
-            server_args,
+        dp_server_args = server_args.replace_resolved(
+            "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
         # Create the DP controller in-process. This blocks until all actors
