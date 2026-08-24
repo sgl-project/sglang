@@ -147,12 +147,12 @@ jobs:
 
           # Parse the default ROCm 7.2 nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          # One nightly run covers every flavor, so ask for each by its full name:
-          # a stem-only prefix matches every flavor and merges them into a single
-          # row, hiding a regression that only reproduces on one image. Nightly
-          # names carry the runner too, so pair each job id with its runs-on.
+          # Ask for each flavor by its full name: a stem-only prefix matches
+          # every flavor and merges them into a single row, hiding a regression
+          # that only reproduces on one image. Nightly names carry the runner
+          # too, so pair each job id with its runs-on.
           # Keep in sync with the rocm_version matrix in the nightly workflow.
-          rocm_flavors="rocm724 rocm720"
+          rocm_flavors="rocm724"
           nightly_jobs=$(yq -r '.jobs | to_entries[] | .key + " " + .value."runs-on"' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^check-all-jobs ' | \
             while read -r id runner; do
