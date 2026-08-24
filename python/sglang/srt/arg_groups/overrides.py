@@ -50,6 +50,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
     is_mps,
@@ -2650,15 +2651,11 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        # Every flashinfer_* choice is CUDA-only and flashinfer does not exist on
-        # ROCm, so Triton is both the only valid backend and the default there:
-        # gfx950 runs the native MX fused MoE, and gfx942 (no MX matmul) converts
-        # MXFP8 to block-fp8 [128,128] at load and runs the block-fp8 fused MoE.
-        is_rocm_mxfp8 = is_hip()
+        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_rocm_mxfp8:
+        if is_gfx95_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_rocm_mxfp8 else "flashinfer_trtllm"
+        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:

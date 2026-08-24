@@ -98,8 +98,6 @@ on:
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
           - nightly-4-gpu-mi35x-minimax-m3-rocm720
-          # 8-GPU MiniMax-M3 MXFP8 (MI30x - MXFP8 converted to block-fp8 at load)
-          - nightly-8-gpu-minimax-m3-rocm720
           # 8-GPU MiniMax-M2.7 (MI30x only)
           - nightly-8-gpu-minimax-m27-rocm720
           # Diffusion (MI30x)
@@ -2221,66 +2219,6 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU MiniMax-M3 MXFP8 (MI30x - MXFP8 converted to block-fp8 at load)
-  # ==============================================================================
-
-  nightly-8-gpu-minimax-m3-rocm720:
-    name: ${{ format('nightly-8-gpu-minimax-m3 ({0}, linux-mi300-8gpu-sglang)', matrix.rocm_version) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m3-rocm720,'))
-    runs-on: linux-mi300-8gpu-sglang
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (${{ matrix.rocm_version }})
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-
-      # Budgeted above the MI35x M3 job: the ~440 GB checkpoint has to load, gfx942
-      # requantizes every MXFP8 weight to block-fp8 at load, and the first
-      # generation pays for the AITER JIT this recipe skips warmup for.
-      - name: Accuracy Test ROCm 7.2 (8-GPU MiniMax-M3 MXFP8)
-        timeout-minutes: 240
-        run: |
-          > github_summary.md
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m3 --nightly --timeout-per-file 10800 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-      # Run perf only after correctness passes. The eval already pulled the
-      # checkpoint into the container cache, so this step never pays the download.
-      - name: Performance Test ROCm 7.2 (8-GPU MiniMax-M3 MXFP8)
-        timeout-minutes: 120
-        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
-        run: |
-          > github_summary.md
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m3 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  # ==============================================================================
   # 8-GPU MiniMax-M2.7 (MI30x only)
   # ==============================================================================
 
@@ -2447,8 +2385,6 @@ jobs:
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
       - nightly-4-gpu-mi35x-minimax-m3-rocm720
-      # 8-GPU MiniMax-M3 MXFP8 (MI30x - MXFP8 converted to block-fp8 at load)
-      - nightly-8-gpu-minimax-m3-rocm720
       # 8-GPU MiniMax-M2.7 (MI30x only)
       - nightly-8-gpu-minimax-m27-rocm720
       # Diffusion (MI30x)
