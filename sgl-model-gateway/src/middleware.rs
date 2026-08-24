@@ -244,6 +244,13 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
+        // Make the resolved ID available before dispatch. In PD mode the router
+        // copies this header into both worker requests, so the same ID can be
+        // used in router, prefill, and decode logs.
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            req.headers_mut().insert("x-request-id", value);
+        }
+
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
@@ -982,6 +989,8 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use tower::{service_fn, ServiceExt};
 
     #[test]
     fn test_normalize_path_no_ids() {
@@ -1045,5 +1054,71 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+
+    #[tokio::test]
+    async fn test_request_id_is_forwarded_to_downstream_and_response() {
+        let middleware = RequestIdLayer::new(vec!["x-request-id".to_string()]).layer(service_fn(
+            |request: Request<Body>| async move {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("client-request-id"),
+                );
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            },
+        ));
+
+        let response = middleware
+            .oneshot(
+                Request::builder()
+                    .uri("/generate")
+                    .header("x-request-id", "client-request-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("client-request-id"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generated_request_id_is_forwarded_to_downstream() {
+        let middleware = RequestIdLayer::new(vec!["x-request-id".to_string()]).layer(service_fn(
+            |request: Request<Body>| async move {
+                assert!(request
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("gnt-")),);
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            },
+        ));
+
+        let response = middleware
+            .oneshot(
+                Request::builder()
+                    .uri("/generate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(response_request_id.starts_with("gnt-"));
     }
 }
