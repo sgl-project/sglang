@@ -79,6 +79,13 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    # The runner's read-path id-space choke point (KVIndexTranslator); backends
+    # that build read indices through it set the instance attribute in their
+    # __init__. Consumers reaching through get_attn_backend() None-check —
+    # a backend that never set it cannot serve the unified pool (the
+    # server-args allow-list enforces that), so None means "no translate".
+    kv_index_translator = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

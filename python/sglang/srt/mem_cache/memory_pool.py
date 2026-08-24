@@ -3667,11 +3667,6 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
-        # The MLA doors take DIFFERENT id spaces: `get_mla_kv_buffer` gets
-        # ForwardBatch-built read indices (prefix_chunk_kv_indices /
-        # fetch_mha_one_shot_kv_indices), still VIRTUAL, so it translates;
-        # `set_mla_kv_buffer` gets out_cache_loc, already kernel-facing.
-        self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -3969,7 +3964,10 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
-        loc = self._full_translate(loc)
+        # Read door — same kernel-facing contract as the write door: `loc` is
+        # a read-index tensor already translated at its production site
+        # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
+        # pool never translates.
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
