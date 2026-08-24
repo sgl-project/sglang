@@ -973,9 +973,10 @@ def flashinfer_allreduce(
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         launch_with_pdl=True,
-        fp32_acc=False,
         output=output,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = True
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
     _flashinfer_comm.allreduce_fusion(**kwargs)

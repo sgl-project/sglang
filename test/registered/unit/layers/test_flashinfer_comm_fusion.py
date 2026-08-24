@@ -294,10 +294,11 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
 
         buffers[manager_key] = manager
-        fusion._flashinfer_comm = _FakeFlashInferComm()
+        fake_comm = _FakeFlashInferComm()
+        fusion._flashinfer_comm = fake_comm
         fusion._flashinfer_allreduce_unavailable = False
         try:
-            yield
+            yield fake_comm
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
@@ -321,7 +322,7 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         manager = self._make_manager(world_size)
         manager.dtype = torch.bfloat16
         manager.use_fp32_lamport = False
-        with self._patched_attn_workspace(manager):
+        with self._patched_attn_workspace(manager) as fake_comm:
             input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
 
@@ -330,6 +331,8 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
 
             torch.testing.assert_close(result, expected)
+            # trtllm rounds to the input dtype on every rank without this
+            self.assertTrue(fake_comm.fusion_kwargs["fp32_acc"])
 
     def test_shape_guard_rejects_non_2d(self):
         with self._patched_attn_workspace(self._make_manager(4)):
