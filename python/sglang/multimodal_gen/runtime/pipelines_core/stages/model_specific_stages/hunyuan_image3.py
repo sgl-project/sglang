@@ -796,7 +796,11 @@ class HunyuanImage3AR(PipelineStage):
             vae_tensor = processor.vae_processor(vae_input)
         else:
             import torchvision.transforms as T
-            vae_tensor = T.ToTensor()(vae_input).unsqueeze(0)
+            # Match vllm-omni HunyuanImage3ImageProcessor: normalize to [-1, 1]
+            vae_tensor = T.Compose([
+                T.ToTensor(),
+                T.Normalize([0.5], [0.5]),
+            ])(vae_input).unsqueeze(0)
 
         vae_info = ImageInfo(
             image_type="vae",
