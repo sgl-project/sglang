@@ -519,6 +519,53 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(layer.weight_scale.shape, (3,))
         self.assertEqual(layer.weight_scale.dtype, torch.float32)
 
+    def test_mixed_w4a4_int8_dispatches_each_serialized_layer(self):
+        markers = {
+            "w4a4": {
+                "format": "convrot_w4a4",
+                "convrot_groupsize": 256,
+                "linear_dtype": "int8",
+            },
+            "int8": {
+                "format": "int8_tensorwise",
+                "convrot": True,
+                "convrot_groupsize": 256,
+            },
+        }
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4."
+                "convrot_w4a4_linear",
+                new=object(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+                "_load_comfy_kitchen"
+            ),
+        ):
+            config = resolve_minimax_h3_checkpoint_quantization(markers)
+            w4a4 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="w4a4",
+            )
+            int8 = ReplicatedLinear(
+                256,
+                3,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="int8",
+            )
+
+        self.assertIsInstance(config, KitchenW4A4Config)
+        self.assertEqual(w4a4.weight.shape, (3, 128))
+        self.assertEqual(int8.weight.shape, (3, 256))
+        self.assertEqual(set(config.selected), {"w4a4", "int8"})
+
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
         "_load_comfy_kitchen"
@@ -1058,6 +1105,16 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
 
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "layers.0.attention.qkv": {"format": "nvfp4"},
+                    },
+                }
+            )
+        }
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
                 {
@@ -1080,6 +1137,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     ),
                 },
                 f.name,
+                metadata=metadata,
             )
 
             config = build_nvfp4_config_from_safetensors_list([f.name])
@@ -1090,6 +1148,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
         self.assertEqual(config.checkpoint_weight_scale_layout, "linear")
         self.assertFalse(config.swap_weight_nibbles)
+        self.assertFalse(config.checkpoint_uses_comfy_quantization)
 
     def test_nvfp4_safetensors_inference_uses_comfy_checkpoint_layout(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
@@ -1130,6 +1189,62 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(config.group_size, 16)
         self.assertIn("fallback", config.exclude_modules)
         self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
+        self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
+        self.assertTrue(config.swap_weight_nibbles)
+        self.assertTrue(config.checkpoint_uses_comfy_quantization)
+        self.assertFalse(config.checkpoint_uses_native_qkv_layout)
+        spec = TransformerQuantLoadSpec(
+            safetensors_list=[f.name],
+            quant_config=config,
+            nunchaku_config=None,
+            param_dtype=None,
+        )
+        self.assertTrue(spec.uses_comfy_layer_markers)
+
+    def test_minimax_h3_comfy_nvfp4_resolves_modelopt_backend(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "blocks.0.attn.qkv_proj": {"format": "nvfp4"},
+                    },
+                }
+            )
+        }
+        with (
+            tempfile.NamedTemporaryFile(suffix=".safetensors") as quantized,
+            tempfile.NamedTemporaryFile(suffix=".safetensors") as fallback,
+        ):
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.weight": torch.zeros(
+                        (32, 8), dtype=torch.uint8
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale": torch.ones(
+                        (32, 1), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale_2": torch.tensor(1.0),
+                },
+                quantized.name,
+                metadata=metadata,
+            )
+            save_file(
+                {"blocks.0.mlp.fc1.weight": torch.ones((2, 2))},
+                fallback.name,
+            )
+            checkpoint_files = [quantized.name, fallback.name]
+            _, markers = inspect_minimax_h3_safetensors(checkpoint_files)
+            config = resolve_minimax_h3_checkpoint_quantization(
+                markers,
+                checkpoint_files,
+            )
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertEqual(config.group_size, 16)
+        self.assertIn("blocks.0.mlp.fc1", config.exclude_modules)
+        self.assertTrue(config.checkpoint_uses_comfy_quantization)
+        self.assertTrue(config.checkpoint_uses_native_qkv_layout)
         self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
         self.assertTrue(config.swap_weight_nibbles)
 
