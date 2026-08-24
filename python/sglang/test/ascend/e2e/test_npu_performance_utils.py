@@ -28,6 +28,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     NAMESPACE,
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -493,12 +494,6 @@ def run_bench_serving(
 
     reader_done = threading.Event()
 
-    def _kill_benchmark_group():
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError) as e:
-            logger.error(f"killpg failed: {e}")
-
     def _kill_on_timeout():
         try:
             process.wait(timeout=BENCHMARK_SERVING_TIMEOUT)
@@ -507,7 +502,7 @@ def run_bench_serving(
                 f"Benchmark hung past {BENCHMARK_SERVING_TIMEOUT}s, killing "
                 f"process group {process.pid}"
             )
-            _kill_benchmark_group()
+            kill_process_group(process)
             return
         # The direct child exited, but a re-parented descendant may still hold
         # the stdout pipe open and wedge the reader below. Give it a short
@@ -518,7 +513,7 @@ def run_bench_serving(
                 f"Benchmark stdout still open after process exit, killing "
                 f"process group {process.pid}"
             )
-            _kill_benchmark_group()
+            kill_process_group(process)
 
     watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
     watchdog.start()
