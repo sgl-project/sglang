@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import yaml
 
 from sglang.cli.serve import serve
 from sglang.cli.serve_backends import (
@@ -12,6 +16,7 @@ from sglang.cli.serve_backends import (
     ServeBackendRegistry,
     ServeRequest,
 )
+from sglang.cli.utils import try_get_model_path
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -243,6 +248,41 @@ class TestServeBackendDispatch(unittest.TestCase):
         self.assertIsNone(request.model_path)
         mock_load_plugins.assert_not_called()
         mock_kill.assert_not_called()
+
+
+class TestTryGetModelPath(unittest.TestCase):
+    """Regression tests for GH #36105: `sglang serve --config x.yaml` raised
+    "--model-path is required" even when the config supplied model-path,
+    because backend auto-detection scanned raw argv before the --config
+    file was merged in."""
+
+    def test_resolves_model_path_from_config_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                yaml.safe_dump({"model-path": "meta-llama/Llama-3-8B"})
+            )
+
+            self.assertEqual(
+                try_get_model_path(["--config", str(config_path)]),
+                "meta-llama/Llama-3-8B",
+            )
+
+    def test_explicit_cli_flag_takes_precedence_over_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(yaml.safe_dump({"model-path": "from-config"}))
+
+            self.assertEqual(
+                try_get_model_path(
+                    ["--model-path", "from-cli", "--config", str(config_path)]
+                ),
+                "from-cli",
+            )
+
+    def test_missing_config_file_returns_none_instead_of_raising(self):
+        result = try_get_model_path(["--config", "/no/such/config.yaml"])
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
