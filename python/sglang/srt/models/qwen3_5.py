@@ -39,6 +39,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -206,6 +207,11 @@ if _is_cpu:
     fused_qkvzba_split_reshape_cat_contiguous = (
         torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
     )
+
+if _is_npu:
+    # NPU uses the Ascend-tuned implementation; other backends keep the
+    # original Triton kernel.
+    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
 
 @lru_cache(maxsize=1)
@@ -729,10 +735,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 return self._forward_xpu(
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
-
-        if (
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
-            and not _is_npu
+        if self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS and (
+            not _is_npu or envs.SGLANG_NPU_FUSED_QKVZBA_SPLIT.get()
         ):
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
@@ -1270,6 +1274,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             if not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            elif envs.SGLANG_NPU_FUSED_SIGMOID_MUL.get():
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                if gate_val.numel() == attn_output.numel():
+                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+                    )
+
+                    attn_output = npu_fused_sigmoid_mul(
+                        attn_output, gate_val.contiguous()
+                    )
+                else:
+                    attn_output.mul_(torch.sigmoid(gate_val))
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))
