@@ -845,6 +845,12 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    # Debug hooks for exercising the export path outside torch.export
+    # (eager attention reference, KV-delta capture); never set in serving.
+    SGLANG_DEBUG_MLX_EXPORT_VALIDATE = EnvBool(False)
+    SGLANG_DEBUG_MLX_EXPORT_EXECUTE = EnvBool(False)
+    SGLANG_DEBUG_MLX_EXPORT_SAVE = EnvBool(False)
+    SGLANG_DEBUG_MLX_EXPORT_ATTENTION = EnvBool(False)
 
     # ===================================================================
     # Ascend NPU
