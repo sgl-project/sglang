@@ -1547,7 +1547,7 @@ class DeepseekV4AscendAttnBackend(
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
             )
-            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
                 device=str(actual_seq_lengths_kv.device),
                 **c1a_kwargs,
             )
@@ -1665,10 +1665,7 @@ class DeepseekV4AscendAttnBackend(
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        if self._is_dspark_draft_worker:
-            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
-        else:
-            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(

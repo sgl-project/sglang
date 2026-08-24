@@ -112,7 +112,7 @@ def initialize_dspark_sparse_attn_ops() -> Optional[Path]:
     spec = OpLibSpec(
         name="DSpark sparse-attention",
         so_env="SGLANG_DSPARK_EXTRA_OPS_SO",
-        namespace="_C_ascend",
+        namespace="custom",
         required_ops=(
             "npu_sparse_attn_sharedkv_metadata",
             "npu_sparse_attn_sharedkv",
