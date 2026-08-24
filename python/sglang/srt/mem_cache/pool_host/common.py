@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,43 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class ShmHostTensorAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        self.fds = []
+        self.mms = []
+
+    @property
+    def fd(self):
+        return self.fds[0] if self.fds else None
+
+    @property
+    def mm(self):
+        return self.mms[0] if self.mms else None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        from sglang.srt.mem_cache.storage.mmap import alloc_shm
+
+        tensor, fd, mm = alloc_shm(dims, dtype)
+        self.fds.append(fd)
+        self.mms.append(mm)
+        return tensor
+
+    def __del__(self):
+        for fd in getattr(self, "fds", []):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fds = []
 
 
 def get_allocator_from_storage(allocator_type):
@@ -54,8 +93,28 @@ def get_allocator_from_storage(allocator_type):
                 exc,
             )
             return HostTensorAllocator()
+    elif allocator_type == "shm":
+        return ShmHostTensorAllocator()
     else:
         return HostTensorAllocator()
+
+
+def get_allocator_type(server_args) -> str:
+    backend = getattr(server_args, "hicache_storage_backend", None)
+    if backend == "shm":
+        return "shm"
+    if backend == "dynamic":
+        extra_config_str = getattr(
+            server_args, "hicache_storage_backend_extra_config", None
+        )
+        if extra_config_str:
+            try:
+                config = json.loads(extra_config_str)
+                if config.get("allocator") == "shm":
+                    return "shm"
+            except Exception:
+                pass
+    return backend or "default"
 
 
 def _cuda_host_register(buffer: torch.Tensor) -> None:

@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.dllm.mixin.scheduler import DllmManager
-from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -117,16 +117,11 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.pool = ReqToTokenPool(
             size=8, max_context_len=64, device="cpu", enable_memory_saver=False
         )
-        self._old_support_triton = allocation.support_triton
-        self._old_get_server_args = allocation.get_server_args
-        allocation.support_triton = lambda _: False
-        allocation.get_server_args = lambda: SimpleNamespace(
+        override = get_context().override_server_args(
             attention_backend="torch_native", dcp_size=1
         )
-
-    def tearDown(self):
-        allocation.support_triton = self._old_support_triton
-        allocation.get_server_args = self._old_get_server_args
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_alloc_for_extend_mixed_reuse_allocates_only_fresh_and_writes_rows(self):
         allocator = _FakeAllocator(base=200)
@@ -141,10 +136,17 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         out, _, req_pool_indices_cpu = alloc_for_extend(batch)
 
         self.assertEqual(allocator.alloc_calls, [4])
-        self.assertEqual(req_pool_indices_cpu.tolist(), [1, 2])
+        # Allocation order is not semantically meaningful (ReqToTokenPool.alloc
+        # picks whichever free slot is cheapest to pop), so only pin the
+        # reused row's index and that the fresh row got a different, real slot.
+        self.assertEqual(req_pool_indices_cpu[0].item(), 1)
+        fresh_idx = req_pool_indices_cpu[1].item()
+        self.assertNotEqual(fresh_idx, 1)
         self.assertEqual(out.tolist(), [100, 101, 102, 103, 200, 201, 202, 203])
         self.assertEqual(self.pool.req_to_token[1, 4:8].tolist(), [100, 101, 102, 103])
-        self.assertEqual(self.pool.req_to_token[2, 4:8].tolist(), [200, 201, 202, 203])
+        self.assertEqual(
+            self.pool.req_to_token[fresh_idx, 4:8].tolist(), [200, 201, 202, 203]
+        )
         self.assertEqual(reused.kv.kv_allocated_len, 8)
         self.assertEqual(fresh.kv.kv_allocated_len, 8)
 
@@ -179,7 +181,10 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         batch = _make_batch(self.pool, allocator, [reused, fresh], [4, 4])
         out, _, req_pool_indices_cpu = alloc_for_extend(batch)
 
-        self.assertEqual(req_pool_indices_cpu.tolist(), [1, 2])
+        # See test_alloc_for_extend_mixed_reuse_allocates_only_fresh_and_writes_rows:
+        # allocation order is not semantically meaningful.
+        self.assertEqual(req_pool_indices_cpu[0].item(), 1)
+        self.assertNotEqual(req_pool_indices_cpu[1].item(), 1)
         self.assertEqual(out.tolist(), [100, 101, 102, 103, 500, 501, 502, 503])
         self.assertEqual(
             allocator.extend_calls,

@@ -42,41 +42,11 @@ TOP_K_ALL = 1 << 30
 logger = logging.getLogger(__name__)
 
 
-def raise_if_tokenizer_required(
-    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
-):
-    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
-
-    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
-    to convert output token IDs to text for matching. min_new_tokens requires the
-    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
-    be used.
-    """
-    if tokenizer is not None:
-        return
-
-    if stop_strs:
-        raise ValueError(
-            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer to decode tokens to text for matching)."
-        )
-    if stop_regex_strs:
-        raise ValueError(
-            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer to decode tokens to text for matching)."
-        )
-    if min_new_tokens > 0:
-        raise ValueError(
-            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer for eos_token_id)."
-        )
-
-
-class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
+class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -106,10 +76,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
-    custom_params: Optional[Dict[str, CustomParamValue]] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
+    custom_params: Optional[Dict[str, CustomParamValue]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -163,6 +133,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+
+        # An empty grammar constraint means "unset", not "constrain to nothing".
+        self.json_schema = self.json_schema or None
+        self.regex = self.regex or None
+        self.ebnf = self.ebnf or None
+        self.structural_tag = self.structural_tag or None
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -226,9 +202,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings
@@ -269,7 +248,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
         )
 
-        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        # Clear API input aliases after normalizing them into internal fields.
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
@@ -321,3 +300,33 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
             total += MAX_LEN
 
     return total
+
+
+def raise_if_tokenizer_required(
+    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
+):
+    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
+
+    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
+    to convert output token IDs to text for matching. min_new_tokens requires the
+    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
+    be used.
+    """
+    if tokenizer is not None:
+        return
+
+    if stop_strs:
+        raise ValueError(
+            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if stop_regex_strs:
+        raise ValueError(
+            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if min_new_tokens > 0:
+        raise ValueError(
+            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer for eos_token_id)."
+        )

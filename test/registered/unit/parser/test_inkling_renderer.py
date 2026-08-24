@@ -3,15 +3,18 @@ import unittest
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_IMAGE,
     CONTENT_INVOKE_TOOL_JSON,
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_TEXT,
     CONTENT_THINKING,
     CONTENT_XML,
     END_MESSAGE,
+    IMAGE_TOKEN_ID,
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
     MESSAGE_SYSTEM,
+    MESSAGE_TOOL,
     MESSAGE_USER,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -183,6 +186,131 @@ class TestInklingRenderer(unittest.TestCase):
             self.tokenizer,
         )
         self.assertNotIn(INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING], actual)
+
+    def test_tool_result_renders_image_parts_alongside_text(self):
+        """Bug regression: the tool branch coerced content to a string, so a
+        tool_result carrying an image (Claude Code screenshots / Read of a PNG)
+        raised TypeError and 500'd the request. Every part must render, and the
+        image must emit a placeholder for the MM processor to expand."""
+        actual = render_inkling_messages(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "name": "screenshot",
+                    "content": [
+                        {"type": "text", "text": "captured"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ],
+            self.tokenizer,
+        )
+        self.assertEqual(
+            actual,
+            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
+            + _block(MESSAGE_TOOL, CONTENT_TEXT, "captured", author="screenshot")
+            + [
+                INKLING_SPECIAL_TOKEN_IDS[MESSAGE_TOOL],
+                *_text("screenshot"),
+                INKLING_SPECIAL_TOKEN_IDS[CONTENT_IMAGE],
+                IMAGE_TOKEN_ID,
+                INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE],
+            ],
+        )
+
+    def test_tool_result_placeholder_count_matches_image_parts(self):
+        """The MM processor harvests media from tool messages and expands one
+        placeholder per item, so the counts have to agree or the two passes
+        desync."""
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+        }
+        actual = render_inkling_messages(
+            [{"role": "tool", "name": "shot", "content": [image, image, image]}],
+            self.tokenizer,
+        )
+        self.assertEqual(actual.count(IMAGE_TOKEN_ID), 3)
+
+    def test_tool_result_with_multiple_text_blocks_renders_each(self):
+        """A tool_result with 2+ text blocks also arrives as a list and used to
+        raise, even with no image involved."""
+        actual = render_inkling_messages(
+            [
+                {
+                    "role": "tool",
+                    "name": "bash",
+                    "content": [
+                        {"type": "text", "text": "stdout"},
+                        {"type": "text", "text": "stderr"},
+                    ],
+                }
+            ],
+            self.tokenizer,
+        )
+        self.assertEqual(
+            actual,
+            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
+            + _block(MESSAGE_TOOL, CONTENT_TEXT, "stdout", author="bash")
+            + _block(MESSAGE_TOOL, CONTENT_TEXT, "stderr", author="bash"),
+        )
+
+    def test_empty_tool_result_still_emits_a_block(self):
+        """An empty tool result must not vanish — the tool_call it answers
+        would be left dangling."""
+        for content in ("", None, []):
+            with self.subTest(content=content):
+                actual = render_inkling_messages(
+                    [{"role": "tool", "name": "noop", "content": content}],
+                    self.tokenizer,
+                )
+                self.assertEqual(
+                    actual,
+                    _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
+                    + _block(MESSAGE_TOOL, CONTENT_TEXT, "", author="noop"),
+                )
+
+    def test_tool_result_author_falls_back_to_tool_call_id(self):
+        """String content still resolves the author from a prior tool_call."""
+        actual = render_inkling_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "weather", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+            ],
+            self.tokenizer,
+        )
+        self.assertEqual(
+            actual[
+                -len(_block(MESSAGE_TOOL, CONTENT_TEXT, "sunny", author="weather")) :
+            ],
+            _block(MESSAGE_TOOL, CONTENT_TEXT, "sunny", author="weather"),
+        )
+
+    def test_tool_result_rejects_thinking_parts(self):
+        with self.assertRaisesRegex(ValueError, "require role='assistant'"):
+            render_inkling_messages(
+                [
+                    {
+                        "role": "tool",
+                        "name": "t",
+                        "content": [{"type": "thinking", "thinking": "nope"}],
+                    }
+                ],
+                self.tokenizer,
+            )
 
     def test_reasoning_content_cannot_reorder_thinking_parts(self):
         with self.assertRaisesRegex(ValueError, "cannot mix"):

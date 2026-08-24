@@ -82,6 +82,12 @@ def maybe_assert_async(cond: torch.Tensor, msg: str = ""):
     torch._assert_async(cond, msg)
 
 
+def maybe_assert_sum(tensor: torch.Tensor, expected: int, msg: str = "") -> None:
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    torch._assert_async(tensor.sum() == expected, msg)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():

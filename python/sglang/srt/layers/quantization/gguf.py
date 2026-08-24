@@ -51,7 +51,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -169,6 +169,15 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
+def dequantize_gguf_weight(
+    qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Dequantize a packed GGUF matrix using its inferred logical shape."""
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+    return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -191,9 +200,7 @@ def fused_mul_mat_gguf(
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
-        shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
         y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
