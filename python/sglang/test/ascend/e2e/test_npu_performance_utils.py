@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -12,6 +13,8 @@ import time
 from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
+
+import psutil
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
@@ -26,6 +29,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     NAMESPACE,
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -205,6 +209,10 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
+BENCHMARK_SERVING_TIMEOUT = 3600
+BENCHMARK_STDOUT_DRAIN_GRACE = 10
+BENCHMARK_STDOUT_IDLE_TIMEOUT = 300
+BENCHMARK_WATCHDOG_POLL_INTERVAL = 30
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -474,6 +482,9 @@ def run_bench_serving(
     # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
+    # Launch the benchmark in its own session/process group so a dead server
+    # cannot wedge the run: on timeout we nuke the whole group (including any
+    # re-parented descendants) instead of waiting forever on its stdout.
     process = subprocess.Popen(
         cmd_args,
         stdout=subprocess.PIPE,
@@ -481,11 +492,67 @@ def run_bench_serving(
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
+
+    reader_done = threading.Event()
+    # Shared holder for the reader thread to refresh its activity timestamp;
+    # the watchdog polls it to detect a silent/stuck benchmark before the
+    # 1-hour ceiling is reached.
+    last_activity = [time.time()]
+
+    def _kill_on_timeout():
+        deadline = time.time() + BENCHMARK_SERVING_TIMEOUT
+        while True:
+            if process.poll() is not None:
+                if reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+                    return
+                logger.error(
+                    f"Benchmark stdout still open after process exit, "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            if reader_done.is_set():
+                # stdout has drained, but the direct child may still be alive:
+                # give it a bounded time to exit, otherwise nuke the group.
+                try:
+                    process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Benchmark {process.pid} still alive after stdout EOF, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # No output for too long while still alive -> likely hung.
+            idle = time.time() - last_activity[0]
+            if idle > BENCHMARK_STDOUT_IDLE_TIMEOUT:
+                logger.error(
+                    f"Benchmark produced no output for {idle:.0f}s "
+                    f"(> {BENCHMARK_STDOUT_IDLE_TIMEOUT}s), "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            # Absolute ceiling.
+            if time.time() >= deadline:
+                logger.error(
+                    f"Benchmark exceeded {BENCHMARK_SERVING_TIMEOUT}s, "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            time.sleep(BENCHMARK_WATCHDOG_POLL_INTERVAL)
+
+    watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+    watchdog.start()
+
     try:
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
             for line in process.stdout:
+                last_activity[0] = time.time()
                 if line.strip():
                     print(line, end="")
                 f.write(line)
@@ -508,6 +575,7 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+        reader_done.set()
         process.wait()
         if process.returncode != 0:
             logger.error(
@@ -516,6 +584,7 @@ def run_bench_serving(
     except Exception as e:
         logger.error(f"Error running benchmark: {e}")
     finally:
+        reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
@@ -883,6 +952,73 @@ def assert_metrics(self, metrics):
         )
 
 
+def _collect_process_tree(root_pid):
+    """Snapshot every PID under ``root_pid`` while they are still children.
+
+    Returns a mapping ``{pid: create_time}``. Recording ``create_time`` lets
+    ``_kill_recorded_pids`` skip a PID that has since been recycled, avoiding
+    an accidental SIGKILL of an unrelated process.
+
+    A crashed scheduler can leave deep-ep/HCCL workers re-parented to init;
+    ``kill_process_tree`` walks the live parent->child links and misses those
+    orphans. Recording the tree at launch lets ``tearDownClass`` SIGKILL the
+    same PIDs later even after re-parenting.
+    """
+    procs = {}
+    try:
+        root = psutil.Process(root_pid)
+    except psutil.NoSuchProcess:
+        logger.warning(f"_collect_process_tree: root_pid {root_pid} not found")
+        return procs
+    try:
+        for proc in [root] + root.children(recursive=True):
+            try:
+                procs[proc.pid] = proc.create_time()
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+                logger.debug(
+                    f"_collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})"
+                )
+    except psutil.NoSuchProcess:
+        logger.warning(
+            f"_collect_process_tree: root_pid {root_pid} vanished while walking children"
+        )
+    logger.info(f"_collect_process_tree: recorded {len(procs)} PIDs")
+    return procs
+
+
+def _kill_recorded_pids(procs):
+    """Best-effort SIGKILL of a previously recorded PID snapshot.
+
+    ``procs`` maps ``pid -> create_time``; the recorded ``create_time`` is
+    re-checked before killing so a recycled PID is never killed by mistake.
+    Complements ``kill_process_tree`` so re-parented orphans that still hold
+    the runner's stdout pipe (or NPU device memory) do not wedge the suite.
+    """
+    logger.info(f"_kill_recorded_pids: attempting SIGKILL on {len(procs)} PIDs")
+    for pid, create_time in procs.items():
+        try:
+            if psutil.Process(pid).create_time() != create_time:
+                logger.warning(
+                    f"_kill_recorded_pids: skip PID {pid} (create_time mismatch, likely reused)"
+                )
+                continue
+        except psutil.NoSuchProcess:
+            logger.debug(f"_kill_recorded_pids: skip PID {pid} (no longer exists)")
+            continue
+        except psutil.AccessDenied as exc:
+            logger.warning(
+                f"_kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})"
+            )
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logger.debug(f"_kill_recorded_pids: SIGKILL sent to PID {pid}")
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            logger.warning(
+                f"_kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})"
+            )
+
+
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -1061,14 +1197,23 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             other_args=other_args,
             env=env,
         )
+        cls._server_pids = _collect_process_tree(cls.process.pid)
 
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             try:
+                # Union the launch-time snapshot (catches re-parented orphans)
+                # with the current child tree (catches workers spawned lazily
+                # after launch) before tearing the server down.
+                cls._server_pids = {
+                    **getattr(cls, "_server_pids", {}),
+                    **_collect_process_tree(cls.process.pid),
+                }
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+            _kill_recorded_pids(getattr(cls, "_server_pids", {}))
         cls._save_metrics_json()
         cls._backup_plog()
 
