@@ -284,6 +284,7 @@ def cp_shard_model_inputs(
     complete_hidden_states: Any,
     complete_position_ids: Any,
     forward_batch,
+    complete_input_ids: Optional[Any] = None,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
@@ -291,6 +292,18 @@ def cp_shard_model_inputs(
         complete_hidden_states, forward_batch
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+    model_input_ids = (
+        cp_shard_hidden_states(complete_input_ids, forward_batch)
+        if complete_input_ids is not None
+        else None
+    )
+
+    had_input_ids_global = hasattr(forward_batch, "input_ids_global")
+    input_ids_global_backup = getattr(forward_batch, "input_ids_global", None)
+    if complete_input_ids is not None:
+        forward_batch.input_ids_global = cp_round_robin_input_ids_v2(
+            complete_input_ids, forward_batch
+        )
 
     spec_info = getattr(forward_batch, "spec_info", None)
     spec_hidden_states = getattr(spec_info, "hidden_states", None)
@@ -305,10 +318,14 @@ def cp_shard_model_inputs(
         )
 
     try:
-        yield sharded_hidden_states, sharded_positions
+        yield sharded_hidden_states, sharded_positions, model_input_ids
     finally:
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
+        if had_input_ids_global:
+            forward_batch.input_ids_global = input_ids_global_backup
+        elif hasattr(forward_batch, "input_ids_global"):
+            delattr(forward_batch, "input_ids_global")
 
 
 def _to_int_list(values) -> Optional[list[int]]:
