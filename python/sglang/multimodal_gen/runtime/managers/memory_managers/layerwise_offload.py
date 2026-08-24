@@ -4,6 +4,7 @@ import re
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -710,7 +711,14 @@ class LayerwiseOffloadManager:
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
-                    if hosting == "mapped" and self._mapped_regions.holds(local_weight):
+                    if (
+                        hosting == "mapped"
+                        and local_weight.is_contiguous()
+                        and self._mapped_regions.holds(local_weight)
+                    ):
+                        # Only a contiguous view can stay mapped: the reload
+                        # path allocates contiguous and would drop any other
+                        # layout without saying so.
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
@@ -726,7 +734,6 @@ class LayerwiseOffloadManager:
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
-                            "stride": local_weight.stride(),
                             "preserve_strides": False,
                             "mapped": True,
                         }
@@ -811,9 +818,6 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         self._configured = True
-        logger.debug(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
-        )
         if self.residency_policy == RESIDENCY_POLICY_STRIDED and self._streamed_order:
             # Printed because the layout is the whole point of the policy, and
             # "did it actually stride?" is otherwise only answerable from a
@@ -1300,7 +1304,17 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            if meta.get("preserve_strides", False):
+            if meta.get("mapped", False):
+                # The mapping is a read-only view of the checkpoint, so the new
+                # values cannot be written into it. Own the storage from here
+                # on; every reader of this store copies out of whatever tensor
+                # it holds. This trades mapped bytes for anonymous ones on the
+                # configuration that chose mapping because host memory was
+                # short, so it costs the updated weight's bytes.
+                self._mapped_cpu_weights[layer_idx][name] = (
+                    local_loaded_weight.detach().to(dtype=dtype).contiguous()
+                )
+            elif meta.get("preserve_strides", False):
                 self._strided_cpu_weights[layer_idx][name].copy_(
                     local_loaded_weight.to(dtype=dtype)
                 )
@@ -1657,7 +1671,7 @@ class LayerwiseOffloadableModuleMixin:
         )
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
-        configured_layer_names = []
+        layer_specs = []
         # `--dit-*` is the group default these fall back to, not a scope.
         prefetch_value, resident_value, residency_policy = (
             server_args.layerwise_tuning_for(
@@ -1687,6 +1701,32 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 resident_layers = min(num_layers, int(resident_value))
 
+            layer_specs.append((layer_name, num_layers, prefetch_size, resident_layers))
+
+        if not layer_specs:
+            logger.debug(
+                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
+                self.__class__.__name__,
+                self.layer_names,
+            )
+            return
+
+        component_label = (
+            f"{component_name} ({self.__class__.__name__})"
+            if component_name is not None
+            else self.__class__.__name__
+        )
+        logger.info(
+            "Configuring layerwise offload for %s: %s",
+            component_label,
+            ", ".join(
+                f"{layer_name} ({num_layers} layers)"
+                for layer_name, num_layers, _, _ in layer_specs
+            ),
+        )
+        started_at = perf_counter()
+
+        for layer_name, num_layers, prefetch_size, resident_layers in layer_specs:
             # Pinning these weights is what lets the copy stream run ahead of
             # compute, but pinned pages are the ones the kernel cannot reclaim,
             # so they are handed out only while the budget lasts. The budget goes
@@ -1709,7 +1749,6 @@ class LayerwiseOffloadableModuleMixin:
                 residency_policy=residency_policy,
             )
             self.layerwise_offload_managers.append(manager)
-            configured_layer_names.append(layer_name)
 
         if current_platform.is_mps():
             for manager in self.layerwise_offload_managers:
@@ -1746,18 +1785,26 @@ class LayerwiseOffloadableModuleMixin:
             for manager in enabled_managers:
                 manager._finalize_initialization()
 
-        if configured_layer_names:
-            logger.debug(
-                "Enabled layerwise offload for %s on modules: %s",
-                self.__class__.__name__,
-                configured_layer_names,
-            )
-        else:
-            logger.debug(
-                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
-                self.__class__.__name__,
-                self.layer_names,
-            )
+        managers = self.layerwise_offload_managers
+        prefetch_sizes = ", ".join(
+            str(value)
+            for value in sorted({manager.prefetch_size for manager in managers})
+        )
+        policies = ", ".join(sorted({manager.residency_policy for manager in managers}))
+        total_layers = sum(manager.num_layers for manager in managers)
+        resident_layers = sum(manager.resident_layers for manager in managers)
+        logger.info(
+            "Layerwise offload ready for %s in %.2fs: groups=%d, layers=%d, "
+            "prefetch/group=%s, resident=%d/%d, policy=%s",
+            component_label,
+            perf_counter() - started_at,
+            len(managers),
+            total_layers,
+            prefetch_sizes,
+            resident_layers,
+            total_layers,
+            policies,
+        )
 
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
@@ -2073,7 +2120,7 @@ def configure_layerwise_offload_modules(
         reverse=True,
     )
     pin_budget = HostPinBudget()
-    logger.info("Layerwise offload: %s", describe_host_memory())
+    logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
@@ -2108,7 +2155,7 @@ def configure_layerwise_offload_modules(
         )
 
         logger.info(
-            "Enabled layerwise offload for pipeline components: %s",
+            "Layerwise offload summary: %s",
             ", ".join(
                 f"{name} ({format_component_residency(modules[name])})"
                 for name in configured_component_names

@@ -273,8 +273,10 @@ sglang serve \
   --port 30010
 ```
 
-SGLang uses its native static-activation FP8 linear path for attention and
-`fc1`. The checkpoint marks `fc2` for full-precision matrix multiplication, so
+SGLang uses its native static-activation FP8 linear path when the checkpoint
+stores input scales, and automatically uses dynamic activation scaling for
+Comfy FP8 exports that omit them. The checkpoint above marks `fc2` for
+full-precision matrix multiplication, so
 SGLang retains its FP8 storage but materializes and scales one compute-dtype
 `fc2` matrix for each call. This preserves the checkpoint's mixed execution
 contract and low resident weight memory, but that part is slower than a fully
@@ -288,6 +290,21 @@ automatically. Install `comfy-kitchen`, replace the FP8 filename above with
 the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
 layerwise offload are supported; TP8 violates the checkpoint's 256-element
 ConvRot group boundary, and FSDP is rejected.
+
+Self-describing community MXFP8 files use the same
+`--transformer-weights-path <repo/file.safetensors>` form and need no
+quantization flag. SGLang reads their global format metadata, keeps unmarked H3
+layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
+selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
+this mixed per-layer layout.
+
+W4A8 ConvRot DiT files use the same flagless flow. With
+`comfy-kitchen>=0.2.27`, pass a file such as
+`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
+and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
+subject to each row-parallel shard preserving the checkpoint's ConvRot group
+boundary, and FSDP is rejected.
 
 ### Advanced: precomputed AdaLN cache
 

@@ -79,10 +79,10 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.model_executor.cuda_graph_config import Phase
+from sglang.srt.model_executor.cuda_graph_config import Phase, cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -487,7 +487,7 @@ class TreeCacheNamespace(SimpleNamespace):
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
     dummy_tree_cache = TreeCacheNamespace(
-        page_size=model_runner.server_args.page_size,
+        page_size=get_schedule().page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
@@ -542,14 +542,14 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=model_runner.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
-            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+            disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
-            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )
 
@@ -989,8 +989,10 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    # Post-init write to the legacy cuda_graph_max_bs_decode field would
-    # not propagate to cuda_graph_config; update the decode phase directly.
+    server_args.resolve_once()
+
+    # The legacy cuda_graph_max_bs_decode field does not propagate; set the
+    # decode phase.
     if server_args.cuda_graph_config is not None:
         server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
 
