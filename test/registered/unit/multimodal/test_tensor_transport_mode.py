@@ -30,9 +30,7 @@ class TestTensorTransportMode(CustomTestCase):
                     "sglang.srt.multimodal.transport.get_parallel",
                     return_value=parallel,
                 ):
-                    self.assertEqual(
-                        determine_tensor_transport_mode(), expected
-                    )
+                    self.assertEqual(determine_tensor_transport_mode(), expected)
 
 
 if __name__ == "__main__":
