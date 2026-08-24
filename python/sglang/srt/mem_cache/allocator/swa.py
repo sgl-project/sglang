@@ -89,6 +89,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
+        # Invariant for s > 0: ref_counts[s] is the number of full-cache
+        # mapping entries that currently name physical SWA token slot s.
+        # Slot 0 is padding and is never counted.
+        self._swa_slot_ref_counts = torch.zeros(
+            size_swa + self.page_size,
+            dtype=torch.int32,
+            device=device,
+        )
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -279,9 +287,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = 0
+            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
         return alloc_full_indices
 
     def alloc_decode(
@@ -303,15 +309,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
-            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
-            torch_npu.npu_scatter_nd_update_(
-                self.full_to_swa_index_mapping,
-                indices_2d,
-                alloc_swa_indices.to(torch.int64),
-            )
-        else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._write_full_to_swa_mapping(
+            alloc_full_indices,
+            alloc_swa_indices,
+            use_npu_scatter=_is_npu,
+        )
 
         return alloc_full_indices
 
@@ -337,26 +339,87 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         Used by HiCache load-back path to rebuild the mapping after FULL and SWA device alloc.
         """
+        self._write_full_to_swa_mapping(full_indices, swa_indices)
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        self.set_full_to_swa_mapping(full_indices, torch.zeros_like(full_indices))
+
+    def _write_full_to_swa_mapping(
+        self,
+        full_indices: torch.Tensor,
+        swa_indices: torch.Tensor,
+        *,
+        use_npu_scatter: bool = False,
+    ) -> torch.Tensor:
         if full_indices.numel() == 0:
-            return
+            return torch.empty(
+                (0,),
+                dtype=self.full_to_swa_index_mapping.dtype,
+                device=self.full_to_swa_index_mapping.device,
+            )
         assert full_indices.numel() == swa_indices.numel()
-        full_indices = full_indices.to(torch.int64)
-        swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
-        self.full_to_swa_index_mapping[full_indices] = swa_indices
+        full_indices = full_indices.to(torch.int64).reshape(-1)
+        swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype).reshape(-1)
+
+        # A mapping index contributes exactly once even if it is repeated in the
+        # assignment. Read back the backend's chosen value to mirror duplicate
+        # index semantics exactly.
+        unique_full_indices = torch.unique(full_indices)
+        old_swa_indices = self.full_to_swa_index_mapping[unique_full_indices].clone()
+
+        if use_npu_scatter:
+            assert _is_npu
+            torch_npu.npu_scatter_nd_update_(
+                self.full_to_swa_index_mapping,
+                full_indices.unsqueeze(-1),
+                swa_indices,
+            )
+        else:
+            self.full_to_swa_index_mapping[full_indices] = swa_indices
+
+        new_swa_indices = self.full_to_swa_index_mapping[unique_full_indices]
+        changed = old_swa_indices != new_swa_indices
+        self._adjust_swa_slot_ref_counts(torch.where(changed, old_swa_indices, 0), -1)
+        self._adjust_swa_slot_ref_counts(torch.where(changed, new_swa_indices, 0), 1)
+        return old_swa_indices
+
+    def _adjust_swa_slot_ref_counts(
+        self, swa_indices: torch.Tensor, delta: int
+    ) -> None:
+        if swa_indices.numel() == 0:
+            return
+
+        is_live = swa_indices > 0
+        self._swa_slot_ref_counts.scatter_add_(
+            0,
+            swa_indices.clamp_min(0),
+            is_live.to(self._swa_slot_ref_counts.dtype) * delta,
+        )
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.page_size == 1:
-            mapping_indices = free_index
+            mapping_indices = torch.unique(free_index.to(torch.int64))
         else:
-            mapping_indices = self._expand_to_full_pages(free_index)
+            mapping_indices = self._expand_to_full_pages(free_index.to(torch.int64))
 
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
+        old_swa_indices = self._write_full_to_swa_mapping(
+            mapping_indices, torch.zeros_like(mapping_indices)
+        )
+        swa_indices = torch.unique(old_swa_indices[old_swa_indices > 0])
+        if self.page_size == 1:
+            swa_indices = swa_indices[self._swa_slot_ref_counts[swa_indices] == 0]
+        elif swa_indices.numel() > 0:
+            pages = torch.unique(swa_indices // self.page_size)
+            page_offsets = torch.arange(
+                self.page_size, dtype=pages.dtype, device=pages.device
+            )
+            page_slots = pages[:, None] * self.page_size + page_offsets[None, :]
+            pages = pages[torch.all(self._swa_slot_ref_counts[page_slots] == 0, dim=1)]
+            swa_indices = pages * self.page_size
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -395,6 +458,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        self._swa_slot_ref_counts.zero_()
         self.is_not_in_free_group = True
         self.free_group = []
 
@@ -468,6 +532,17 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return kv_indices
+
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        # PureSWA uses identity slots and retains its direct-assignment semantics.
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = swa_indices.to(
+            self.full_to_swa_index_mapping.dtype
+        )
 
     def alloc(self, need_size: int):
         assert self.page_size == 1

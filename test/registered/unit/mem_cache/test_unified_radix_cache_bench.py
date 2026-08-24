@@ -311,7 +311,7 @@ def _alloc(env, n):
         full_indices = env.alloc.full_attn_allocator.alloc(aligned)
         swa_indices = env.alloc.swa_attn_allocator.alloc(aligned)
         assert full_indices is not None and swa_indices is not None
-        env.alloc.full_to_swa_index_mapping[full_indices] = swa_indices
+        env.alloc.set_full_to_swa_mapping(full_indices, swa_indices)
         return full_indices[:n]
     return env.alloc.alloc(n)
 
