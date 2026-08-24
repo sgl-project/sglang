@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
     _should_use_verify_shared_kv,
 )
+from sglang.srt.utils import get_hip_version
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +57,11 @@ def _build_inputs(
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
+@unittest.skipIf(
+    get_hip_version()[:2] == (7, 0),
+    "Triton 3.4 on the ROCm 7.0 image aborts gfx950 fp8 KV tl.dot "
+    "(triton-lang/triton#8278). Coverage stays on ROCm 7.2+.",
+)
 class TestVerifySharedKV(CustomTestCase):
     def _run_parity(
         self,
