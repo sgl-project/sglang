@@ -273,6 +273,50 @@ def _offset_endpoint_port(endpoint: str, offset: int) -> Optional[str]:
     return f"{host}:{int(port) + offset}"
 
 
+def _reject_unaddressable_parallelism(storage_config: HiCacheStorageConfig) -> None:
+    """Refuse the parallel layouts whose pages this backend cannot tell apart.
+
+    A KVCR block key is ``sha256(token ids)#<segment>``: it names the tokens and
+    nothing about which slice of the model produced the bytes. So every rank
+    coordinate that changes a page's *contents* has to be separated some other
+    way, or two ranks holding different bytes agree on a key and a fetch returns
+    the wrong KV with no error anywhere. ``_rank_port_offset`` separates
+    ``(dp, attn_cp, attn_tp)`` by giving each rank its own control port and
+    realigning every incoming hint onto it; the two below have no such
+    separation. Mooncake, which keys into a shared store rather than a per-rank
+    one, instead folds both into its key suffixes.
+
+    - Pipeline parallelism: ``pp_rank`` is absent from the port offset, so
+      ``pp0/tp0`` and ``pp1/tp0`` derive the same port. The loser of that bind
+      is invisible (see :meth:`KVCRStore._control_port`), and a hint aimed at
+      one rank reaches the other, filling the second half of the layers with
+      the first half's KV.
+    - Heterogeneous TP: ``should_split_heads`` says the deployment expects
+      per-head-slice keys so a tp4 and a tp8 peer can share a prefix. This
+      backend emits one key per page either way, so those peers agree on a key
+      while holding different head slices.
+    """
+    if storage_config.pp_size > 1:
+        raise RuntimeError(
+            "KVCRStore does not support pipeline parallelism (pp_size="
+            f"{storage_config.pp_size}). KVCR block keys carry no pp_rank, so "
+            "two pipeline stages of one engine would share both a control port "
+            "and a key namespace, and a peer fetch would return another stage's "
+            "layers. Run with pp_size=1, or use a backend that namespaces keys "
+            "per stage (e.g. mooncake)."
+        )
+    if storage_config.should_split_heads:
+        raise RuntimeError(
+            "KVCRStore does not support heterogeneous TP (tp_lcm_size="
+            f"{storage_config.tp_lcm_size} > tp_size={storage_config.tp_size}). "
+            "Head splitting exists so peers at different TP degrees can share a "
+            "prefix, but KVCR block keys are page-level and carry no head slice, "
+            "so those peers would agree on a key while holding different heads. "
+            "Drop tp_lcm_size from the backend extra config, or use a backend "
+            "with split-head support (e.g. mooncake)."
+        )
+
+
 def _dp_stride(storage_config: HiCacheStorageConfig) -> int:
     """How many schedulers one attention-DP rank of this engine owns.
 
@@ -338,6 +382,7 @@ class KVCRStore(HiCacheStorage):
         storage_config: HiCacheStorageConfig,
         mem_pool: Optional[HostKVCache] = None,
     ) -> None:
+        _reject_unaddressable_parallelism(storage_config)
         self._storage_config = storage_config
         self._config = KVCRBackendConfig.from_extra_config(storage_config.extra_config)
         self.mem_pool_host = mem_pool

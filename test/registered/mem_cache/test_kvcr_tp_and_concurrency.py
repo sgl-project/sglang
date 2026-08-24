@@ -710,6 +710,62 @@ class SidecarPoolTest(unittest.TestCase):
 
 
 @_needs_kvcr
+class UnaddressableParallelismTest(unittest.TestCase):
+    """Rank coordinates a KVCR block key cannot encode must fail at startup.
+
+    A block key is ``sha256(token ids)#<segment>`` and a router hint carries only
+    an endpoint plus page hashes, so nothing on the wire says which slice of the
+    model produced the bytes. ``_rank_port_offset`` separates
+    ``(dp, attn_cp, attn_tp)`` by port instead, and ``_parse_hint`` realigns
+    every incoming hint onto that offset. Pipeline rank and head splitting have
+    no such separation: two ranks that differ only along one of them derive the
+    same port *and* the same key, so a fetch lands another rank's bytes in pages
+    the model then attends over -- wrong output with nothing logged. Refusing to
+    construct is the only place that failure is still visible.
+    """
+
+    def _config(self, **overrides) -> HiCacheStorageConfig:
+        config = _storage_config(0, 1)
+        for field, value in overrides.items():
+            setattr(config, field, value)
+        return config
+
+    def test_pipeline_parallelism_refuses_to_start_the_backend(self):
+        with self.assertRaises(RuntimeError) as raised:
+            KVCRStore(self._config(pp_size=2), mem_pool=None)
+
+        self.assertIn("pipeline parallelism", str(raised.exception))
+
+    def test_split_heads_refuses_to_start_the_backend(self):
+        with self.assertRaises(RuntimeError) as raised:
+            KVCRStore(
+                self._config(should_split_heads=True, tp_lcm_size=8), mem_pool=None
+            )
+
+        self.assertIn("heterogeneous TP", str(raised.exception))
+
+    def test_a_single_stage_unsplit_engine_is_still_accepted(self):
+        """The guard must not fire on the layout every current test runs under."""
+        store = KVCRStore(self._config(), mem_pool=None)
+        self.assertIsNotNone(store)
+
+    def test_tp_lcm_size_alone_is_not_what_gets_rejected(self):
+        """Only ``should_split_heads`` means the keys actually differ per rank.
+
+        ``cache_controller`` accepts ``tp_lcm_size`` on every deployment but
+        resolves it to ``should_split_heads=False`` for a rank-replicated model
+        (MLA) or a layout other than ``page_head`` -- there the pages are
+        identical across ranks and the pooled key is correct. Keying the guard
+        on ``tp_lcm_size`` instead would refuse those deployments, which is the
+        mistake this pins.
+        """
+        store = KVCRStore(
+            self._config(tp_lcm_size=8, should_split_heads=False), mem_pool=None
+        )
+        self.assertIsNotNone(store)
+
+
+@_needs_kvcr
 class ConcurrentDrainTest(unittest.TestCase):
     """_drain_until and the source pump racing for the same completion queue."""
 
