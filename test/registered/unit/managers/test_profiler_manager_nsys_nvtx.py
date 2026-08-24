@@ -307,6 +307,82 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
     assert barrier.call_count == 2
 
 
+def test_nsys_named_rank_gate_broadcasts_representative_readiness():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    exact_nsys_group = MagicMock(name="exact_nsys_group")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+                "SGLANG_NSYS_EXACT_GATE_REDUCTION": "rank3",
+                "SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE": "4",
+            },
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            exact_nsys_cpu_group=exact_nsys_group,
+            get_forward_ct=lambda: 100,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 132
+
+    def mark_rank_three_ready(ready, **_kwargs):
+        ready.fill_(1)
+
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
+        patch(
+            "torch.distributed.broadcast", side_effect=mark_rank_three_ready
+        ) as broadcast,
+        patch("torch.distributed.all_reduce") as all_reduce,
+    ):
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 27, forward_mode=decode_mode)
+        )
+
+    start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
+    broadcast.assert_called_once()
+    assert broadcast.call_args.kwargs == {"src": 3, "group": exact_nsys_group}
+    all_reduce.assert_not_called()
+
+
+def test_nsys_named_rank_fixed_shape_only_checks_representative_rank():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "rank3",
+        },
+    ):
+        peer_manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+        representative_manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=3, tp_rank=3),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+    peer_manager.profile_in_progress = True
+    representative_manager.profile_in_progress = True
+
+    peer_manager._profile_batch_predicate(
+        SimpleNamespace(reqs=[object()] * 27, forward_mode=decode_mode)
+    )
+    with pytest.raises(RuntimeError, match="expected 32, got 31"):
+        representative_manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+        )
+
+
 def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
     manager = SchedulerProfilerManager(
         ps=SimpleNamespace(gpu_id=0),

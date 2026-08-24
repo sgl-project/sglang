@@ -98,8 +98,21 @@ class SchedulerProfilerManager:
         self.nsys_exact_gate_reduction = (
             os.getenv("SGLANG_NSYS_EXACT_GATE_REDUCTION", "all").strip().lower()
         )
-        if self.nsys_exact_gate_reduction not in {"all", "any"}:
-            raise ValueError("SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all' or 'any'")
+        self.nsys_exact_gate_rank: Optional[int] = None
+        if self.nsys_exact_gate_reduction.startswith("rank"):
+            try:
+                self.nsys_exact_gate_rank = int(
+                    self.nsys_exact_gate_reduction.removeprefix("rank")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', "
+                    "or 'rank<N>'"
+                ) from exc
+        elif self.nsys_exact_gate_reduction not in {"all", "any"}:
+            raise ValueError(
+                "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', " "or 'rank<N>'"
+            )
         self.nsys_require_fixed_capture = os.getenv(
             "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE", "1"
         ).strip().lower() not in {"0", "false", "no"}
@@ -115,6 +128,14 @@ class SchedulerProfilerManager:
                 raise ValueError(
                     "Exact-batch Nsight sync group has world size "
                     f"{actual_sync_world_size}; expected {expected_sync_world_size}"
+                )
+            if self.nsys_exact_gate_rank is not None and not (
+                0 <= self.nsys_exact_gate_rank < actual_sync_world_size
+            ):
+                raise ValueError(
+                    "SGLANG_NSYS_EXACT_GATE_REDUCTION selected rank "
+                    f"{self.nsys_exact_gate_rank}, but the exact-batch sync group "
+                    f"has world size {actual_sync_world_size}"
                 )
             logger.info(
                 "Exact-batch Nsight sync group ready: world_size=%d",
@@ -601,15 +622,27 @@ class SchedulerProfilerManager:
                     ready = torch.tensor(
                         [int(exact_worker_ready)], dtype=torch.int32, device="cpu"
                     )
-                    torch.distributed.all_reduce(
-                        ready,
-                        op=(
-                            torch.distributed.ReduceOp.MIN
-                            if self.nsys_exact_gate_reduction == "all"
-                            else torch.distributed.ReduceOp.MAX
-                        ),
-                        group=self.exact_nsys_cpu_group,
-                    )
+                    if self.nsys_exact_gate_rank is not None:
+                        # Capture a stable representative rank while keeping
+                        # every rank in the worker on the same collective
+                        # iteration. This is useful for attention-DP serving,
+                        # where admission can leave peer ranks at different
+                        # local batch sizes even under a fixed global load.
+                        torch.distributed.broadcast(
+                            ready,
+                            src=self.nsys_exact_gate_rank,
+                            group=self.exact_nsys_cpu_group,
+                        )
+                    else:
+                        torch.distributed.all_reduce(
+                            ready,
+                            op=(
+                                torch.distributed.ReduceOp.MIN
+                                if self.nsys_exact_gate_reduction == "all"
+                                else torch.distributed.ReduceOp.MAX
+                            ),
+                            group=self.exact_nsys_cpu_group,
+                        )
                     exact_worker_ready = bool(ready.item())
                 else:
                     exact_worker_ready = start_reached
@@ -646,6 +679,10 @@ class SchedulerProfilerManager:
             ):
                 if (
                     self.nsys_require_fixed_capture
+                    and (
+                        self.nsys_exact_gate_rank is None
+                        or self.ps.tp_rank == self.nsys_exact_gate_rank
+                    )
                     and len(batch.reqs) != self.nsys_exact_batch
                 ):
                     raise RuntimeError(
