@@ -919,12 +919,14 @@ def _collect_process_tree(root_pid):
     try:
         root = psutil.Process(root_pid)
     except psutil.NoSuchProcess:
+        logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} not found")
         return pids
     try:
         for child in root.children(recursive=True):
             pids.add(child.pid)
     except psutil.NoSuchProcess:
-        pass
+        logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} vanished while walking children")
+    logger.info(f"[cleanup-debug] _collect_process_tree: recorded PIDs {sorted(pids)}")
     return pids
 
 
@@ -934,11 +936,13 @@ def _kill_recorded_pids(pids):
     Complements ``kill_process_tree`` so re-parented orphans that still hold
     the runner's stdout pipe (or NPU device memory) do not wedge the suite.
     """
+    logger.info(f"[cleanup-debug] _kill_recorded_pids: attempting SIGKILL on {sorted(pids)}")
     for pid in pids:
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+            logger.info(f"[cleanup-debug] _kill_recorded_pids: SIGKILL sent to PID {pid}")
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})")
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
