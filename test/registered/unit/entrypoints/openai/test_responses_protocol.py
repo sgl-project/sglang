@@ -52,6 +52,25 @@ class ResponsesRequestTestCase(CustomTestCase):
         self.assertEqual(request.tools[0].name, "lookup")
         self.assertTrue(request.tools[0].strict)
 
+    def test_function_tool_accepts_strict_null(self):
+        """The OpenAI spec types ``strict`` as nullable; ``"strict": null``
+        must be accepted and normalized to False (issue #36194)."""
+        request = ResponsesRequest(
+            model="x",
+            input="ping",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "t1",
+                    "description": "d",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": None,
+                }
+            ],
+            store=False,
+        )
+        self.assertFalse(request.tools[0].strict)
+
     def test_function_tool_requires_name(self):
         with self.assertRaises(ValueError):
             ResponsesRequest(

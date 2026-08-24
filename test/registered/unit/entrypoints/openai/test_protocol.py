@@ -704,6 +704,22 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(data["strict"], False)
         self.assertNotIn("defer_loading", data)
 
+    def test_function_accepts_strict_null(self):
+        """The OpenAI spec types ``strict`` as nullable; ``"strict": null``
+        must be accepted and normalized to False (issue #36194)."""
+        f = Function.model_validate({"name": "foo", "strict": None})
+        self.assertEqual(f.strict, False)
+        data = f.model_dump()
+        self.assertEqual(data["strict"], False)
+
+        # Also via direct construction
+        f = Function(name="foo", strict=None)
+        self.assertEqual(f.strict, False)
+
+        # True is preserved
+        f = Function(name="foo", strict=True)
+        self.assertTrue(f.strict)
+
     def test_function_defer_loading_true_serialized(self):
         f = Function(name="foo", defer_loading=True)
         data = f.model_dump()
