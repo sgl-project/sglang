@@ -23,6 +23,11 @@ class ImageEncoderLoader(TextEncoderLoader):
         component_name: str = "image_encoder",
     ):
         """Load the text encoders based on the model path, and inference args."""
+        component_weights_path = self.resolve_model_weights_path(
+            component_model_path,
+            server_args,
+            component_name,
+        )
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
         #     trust_remote_code=server_args.trust_remote_code,
@@ -39,6 +44,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             encoder_config,
             model_config,
             component_model_path,
+            component_weights_path,
             component_name,
         )
         # real dims are populated now; resolve fold vs replicate
@@ -50,7 +56,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
         return self.load_model(
-            component_model_path,
+            component_weights_path,
             encoder_config,
             server_args,
             server_args.pipeline_config.image_encoder_precision,
