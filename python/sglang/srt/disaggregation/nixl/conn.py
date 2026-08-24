@@ -524,6 +524,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
         self.agent.create_backend(backend, backend_params)
+        if self.enable_dcp_peer_rows:
+            # GPUNETIO initializes its QP/progress context on the communication
+            # GPU. Restore the model/KV owner before SGLang creates streams or
+            # allocates the destination-ready pool.
+            import torch
+
+            torch.cuda.set_device(self.kv_args.gpu_id)
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
