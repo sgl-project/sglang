@@ -90,7 +90,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
-    _sana_ln_modulate,
+    sana_ln_modulate as _sana_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
