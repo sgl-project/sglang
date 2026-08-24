@@ -13,6 +13,23 @@
 
 export const popularModels = [
   {
+    name: "Dots3-Note",
+    vendor: "RedNote",
+    href: "/cookbook/autoregressive/RedNote/Dots3-Note",
+    logo: "/cards/logos/rednote.png",
+    badge: "New",
+    tags: ["2 Hopper platforms", "Native multimodal", "BF16 / FP8"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet Dots3-Note on SGLang",
+      blurb:
+        "RedNote's native multimodal omni model accepts text, image, audio, and video inputs. Its hybrid MLA/SWA language model supports DSA indexing on full-attention layers and an in-checkpoint MTP draft layer.",
+      tags: ["524K context", "Text + image + audio + video", "DSA + MTP"],
+      cta: "Open the Dots3-Note cookbook",
+      caption: "Dots3-Note deployment guide",
+    },
+  },
+  {
     name: "Qwen3.8-27B",
     vendor: "Qwen",
     href: "/cookbook/autoregressive/Qwen/Qwen3.8-27B",
