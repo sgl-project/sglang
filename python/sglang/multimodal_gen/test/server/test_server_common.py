@@ -467,8 +467,13 @@ class DiffusionServerBase:
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
                     )
+                    validator.validate_peak_host_anon(
+                        summary,
+                        scenario.load_peak_host_anon_mb,
+                        scenario.runtime_peak_host_anon_mb,
+                    )
                 except AssertionError as e:
-                    logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                    logger.error(f"Peak memory validation failed for {case.id}:\n{e}")
                     self._dump_baseline_for_testcase(case, summary, missing_scenario)
                     raise
 
@@ -664,6 +669,10 @@ class DiffusionServerBase:
                 {
                     "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
                     "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "runtime_peak_host_anon_mb": round(
+                        summary.runtime_peak_host_anon_mb, 2
+                    ),
                 }
             )
 

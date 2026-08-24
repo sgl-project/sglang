@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
@@ -133,13 +136,13 @@ def _get_encoder_quant_config(
                 mapping_fn = get_param_names_mapping(mapping)
 
                 def name_mapper(name: str) -> str:
-                    mapped_name, merge_index, _ = mapping_fn(name)
+                    mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
                     if merge_index is not None:
                         raise ValueError(
                             "Comfy quantized component weights cannot use a "
                             "stacked parameter-name mapping"
                         )
-                    return mapped_name
+                    return mapped_name.removesuffix(".weight")
 
         markers = inspect_comfy_quant_markers(
             [component_weights_path],
@@ -308,7 +311,7 @@ def _require_quantized_encoder_layers(
             f"The native {type(model).__name__} implementation does not construct "
             f"quantized linear layers for {component_name!r}"
         )
-    if isinstance(quant_config, (ComfyFp8Config, KitchenInt8Config)):
+    if isinstance(quant_config, (ComfyFp8Config, KitchenInt8Config, KitchenW4A8Config)):
         missing = set(quant_config.layer_markers) - set(quant_config.selected)
         if missing:
             raise ComponentCheckpointUnsupportedError(
@@ -600,6 +603,11 @@ class TextEncoderLoader(ComponentLoader):
             component_weights_path,
             component_name,
         )
+        if issubclass(model_cls, EncoderTensorParallelMixin):
+            model_cls.configure_component_paths(
+                encoder_config,
+                server_args.component_paths,
+            )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (
             server_args.batching_max_size > 1
