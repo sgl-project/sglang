@@ -22,6 +22,8 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,12 +44,17 @@ class _MockDllmReq(ReqDllmMixin):
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
+        # Only read by UnifiedRadixCache (streaming-session probe + lock
+        # bookkeeping); harmless for RadixCache.
+        self.session = None
+        self.swa_uuid_for_lock = None
+        self.skip_lock_node_ids = {}
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 
 
-def _make_cache(page_size=PAGE_SIZE, pool_tokens=1024):
+def _make_pools(page_size=PAGE_SIZE, pool_tokens=1024):
     """Real paged pools: page-aligned KV indices are essential to this bug."""
     kv = MHATokenToKVPool(
         size=pool_tokens,
@@ -70,28 +77,65 @@ def _make_cache(page_size=PAGE_SIZE, pool_tokens=1024):
     req_to_token_pool = ReqToTokenPool(
         size=4, max_context_len=512, device="cpu", enable_memory_saver=False
     )
-    cache = RadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            eviction_policy="lru",
-            enable_kv_cache_events=False,
+    return allocator, req_to_token_pool
+
+
+def _cache_init_params(allocator, req_to_token_pool, page_size=PAGE_SIZE, **extra):
+    return CacheInitParams(
+        disable=False,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=page_size,
+        eviction_policy="lru",
+        enable_kv_cache_events=False,
+        **extra,
+    )
+
+
+def _make_cache(page_size=PAGE_SIZE, pool_tokens=1024):
+    allocator, req_to_token_pool = _make_pools(page_size, pool_tokens)
+    cache = RadixCache(_cache_init_params(allocator, req_to_token_pool, page_size))
+    return cache, allocator, req_to_token_pool.req_to_token
+
+
+def _make_unified_cache(page_size=PAGE_SIZE, pool_tokens=1024):
+    """UnifiedRadixCache is the default cache, so it needs its own coverage.
+
+    A FULL-only tree is the configuration a dLLM run would hit; SWA/Mamba
+    components need device-backed pools that have no CPU fixture here.
+    """
+    allocator, req_to_token_pool = _make_pools(page_size, pool_tokens)
+    cache = UnifiedRadixCache(
+        _cache_init_params(
+            allocator,
+            req_to_token_pool,
+            page_size,
+            tree_components=(ComponentType.FULL,),
         )
     )
     return cache, allocator, req_to_token_pool.req_to_token
 
 
-def _tree_pages(cache, page_size=PAGE_SIZE):
+def _walk_tree_pages(cache, node_value, page_size=PAGE_SIZE):
     """Distinct physical pages referenced anywhere in the tree."""
     pages, stack = set(), [cache.root_node]
     while stack:
         node = stack.pop()
         if node is not cache.root_node:
-            pages.update(v // page_size for v in node.value.tolist())
+            pages.update(v // page_size for v in node_value(node).tolist())
         stack.extend(node.children.values())
     return pages
+
+
+def _tree_pages(cache, page_size=PAGE_SIZE):
+    return _walk_tree_pages(cache, lambda node: node.value, page_size)
+
+
+def _unified_tree_pages(cache, page_size=PAGE_SIZE):
+    """Unified nodes hold their device indices per component, not in `.value`."""
+    return _walk_tree_pages(
+        cache, lambda node: node.component(ComponentType.FULL).value, page_size
+    )
 
 
 class TestDllmVolatileBlockNotCached(unittest.TestCase):
@@ -122,6 +166,39 @@ class TestDllmVolatileBlockNotCached(unittest.TestCase):
             cache.cache_unfinished_req(req)
 
         owned = len(_tree_pages(cache)) * PAGE_SIZE
+        accounted = cache.evictable_size() + cache.protected_size()
+        self.assertLessEqual(
+            accounted,
+            owned,
+            f"evictable+protected={accounted} exceeds the {owned} tokens the "
+            f"tree actually owns -- the same pages are counted under two nodes",
+        )
+
+
+class TestDllmVolatileBlockNotCachedUnified(unittest.TestCase):
+    """Same regression, on the cache that production actually runs.
+
+    `UnifiedRadixCache` is the default tree, so the RadixCache-only case above
+    leaves the shipping path unguarded.
+    """
+
+    def test_accounting_does_not_exceed_owned_pages(self):
+        cache, allocator, req_to_token = _make_unified_cache()
+        stable = list(range(64))
+
+        req = _MockDllmReq(stable, incomplete_ids=[])
+        req.last_node = cache.root_node_handle()
+        # Settled prefix + the block's slots, allocated once (denoised in place).
+        req_to_token[0, :96] = allocator.alloc(96).to(torch.int64)
+
+        # One physical block rewritten under two different volatile keys.
+        for block in (list(range(900, 932)), list(range(800, 832))):
+            req.full_untruncated_fill_ids = array("q", stable + block)
+            req.extend_range = Range(0, len(req.full_untruncated_fill_ids))
+            req.dllm_incomplete_ids = array("q", block)
+            cache.cache_unfinished_req(req)
+
+        owned = len(_unified_tree_pages(cache)) * PAGE_SIZE
         accounted = cache.evictable_size() + cache.protected_size()
         self.assertLessEqual(
             accounted,
