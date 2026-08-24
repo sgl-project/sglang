@@ -118,3 +118,40 @@ class HermesDetector(BaseFormatDetector):
             end="}</tool_call>",
             trigger="<tool_call>",
         )
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush whatever ``_buffer``/``_normal_text_buffer`` were holding
+        back for a marker that can no longer arrive, since the stream just
+        ended.
+
+        If a ``<tool_call>`` was opened but never closed, the buffered
+        content is not valid normal text and not a parseable tool call
+        either, so it is dropped with a warning rather than being emitted
+        (mirrors KimiK3Detector.finish()).
+        """
+        if self.bot_token in self._buffer:
+            logger.warning(
+                "Hermes stream ended with an unterminated tool call; "
+                "dropping %d buffered chars",
+                len(self._buffer),
+            )
+            self._buffer = ""
+            self._normal_text_buffer = ""
+            return StreamingParseResult()
+
+        # _normal_text_buffer holds text held back by _clean_normal_text on
+        # the chance it was the start of "</tool_call>"; _buffer holds text
+        # held back on the chance it was the start of "<tool_call>" (e.g. the
+        # "<tool_" in "...looks like <tool_call" truncated by max_tokens).
+        # Neither marker can complete now, so release everything, in the
+        # order it was produced, instead of running it back through
+        # _clean_normal_text (which would just re-buffer an unresolved
+        # partial marker forever).
+        pending = self._normal_text_buffer + self._buffer
+        self._normal_text_buffer = ""
+        self._buffer = ""
+        if not pending:
+            return StreamingParseResult()
+        if self.eot_token in pending:
+            pending = pending.replace(self.eot_token, "")
+        return StreamingParseResult(normal_text=pending)
