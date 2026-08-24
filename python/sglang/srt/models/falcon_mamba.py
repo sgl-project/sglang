@@ -57,6 +57,7 @@ class FalconMambaDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_bc_dt_rms: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -73,9 +74,10 @@ class FalconMambaDecoderLayer(nn.Module):
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,
             activation=config.hidden_act,
-            # Falcon-Mamba's stabilization: weightless RMSNorm on B, C and dt.
-            use_bc_dt_rms=True,
-            rms_eps=config.mixer_rms_eps,
+            # Falcon-Mamba stabilizes with a weightless RMSNorm on B/C/dt; plain
+            # Mamba (MambaForCausalLM) sets this False.
+            use_bc_dt_rms=use_bc_dt_rms,
+            rms_eps=config.mixer_rms_eps if use_bc_dt_rms else 1e-6,
             quant_config=quant_config,
             prefix=add_prefix("mixer", prefix),
         )
@@ -116,6 +118,7 @@ class FalconMambaModel(nn.Module):
         config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_bc_dt_rms: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -135,6 +138,7 @@ class FalconMambaModel(nn.Module):
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
+                use_bc_dt_rms=use_bc_dt_rms,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -155,7 +159,15 @@ class FalconMambaModel(nn.Module):
 
 
 class FalconMambaForCausalLM(nn.Module):
-    """Falcon-Mamba (Mamba-1) model with a language modeling head."""
+    """Falcon-Mamba (Mamba-1) model with a language modeling head.
+
+    Also serves as the base for plain Mamba (models/mamba.py), which only flips
+    ``use_bc_dt_rms`` off; the tied vs untied LM head follows
+    ``config.tie_word_embeddings``.
+    """
+
+    # Falcon-Mamba applies the weightless B/C/dt RMSNorm; plain Mamba sets False.
+    use_bc_dt_rms: bool = True
 
     def __init__(
         self,
@@ -168,7 +180,10 @@ class FalconMambaForCausalLM(nn.Module):
         self.quant_config = quant_config
 
         self.model = FalconMambaModel(
-            config=config, quant_config=quant_config, prefix="model"
+            config=config,
+            quant_config=quant_config,
+            prefix="model",
+            use_bc_dt_rms=self.use_bc_dt_rms,
         )
 
         self.lm_head = ParallelLMHead(
@@ -176,8 +191,10 @@ class FalconMambaForCausalLM(nn.Module):
             config.hidden_size,
             prefix="lm_head",
         )
-        # falcon-mamba-7b ships an untied lm_head (config.tie_word_embeddings
-        # is False and the checkpoint has a distinct lm_head.weight).
+        # Tie to the input embeddings when the checkpoint has no separate lm_head
+        # (state-spaces Mamba); Falcon-Mamba is untied (tie_word_embeddings=False).
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -204,11 +221,13 @@ class FalconMambaForCausalLM(nn.Module):
 
         for name, loaded_weight in weights:
             # Remap checkpoint names to SGLang modules: backbone.* -> model.*,
-            # embeddings -> embed_tokens, norm_f -> norm. Keep A_log as-is
-            # (the mixer computes A = -exp(A_log)).
+            # embeddings./embedding. (plural -hf / singular raw state-spaces) ->
+            # embed_tokens., norm_f -> norm. Keep A_log as-is (the mixer computes
+            # A = -exp(A_log)).
             if name.startswith("backbone."):
                 name = "model." + name[len("backbone.") :]
             name = name.replace("embeddings.", "embed_tokens.")
+            name = name.replace("embedding.", "embed_tokens.")
             name = name.replace("norm_f.", "norm.")
 
             if name not in params_dict:
@@ -221,6 +240,8 @@ class FalconMambaForCausalLM(nn.Module):
             loaded_params.add(name)
 
         unloaded_params = set(params_dict.keys()) - loaded_params
+        # A tied lm_head is legitimately absent from the checkpoint.
+        unloaded_params = {p for p in unloaded_params if not p.startswith("lm_head")}
         if unloaded_params:
             logger.warning(
                 f"The following parameters were not loaded: {unloaded_params}"
