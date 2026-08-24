@@ -58,10 +58,6 @@ class _RatioCache:
         self.alloc_evict_params = []
 
     def evict_for_alloc(self, params: EvictParams):
-        # Reclaim up to mamba_num evictable (unlocked) prefix snapshots, mirroring
-        # what the real allocation-aware tree eviction can hand back under mamba
-        # pressure. Record the request so this test also pins the MambaComponent
-        # call-site contract introduced alongside allocation-aware eviction.
         self.alloc_evict_params.append(params)
         need = params.mamba_num
         for node in list(self.prefix_nodes):
