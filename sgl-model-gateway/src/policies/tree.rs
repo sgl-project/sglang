@@ -692,6 +692,47 @@ impl Tree {
         take_chars(text, matched_chars)
     }
 
+    /// Read-only prefix match length (no LRU mutation, no allocation).
+    pub fn prefix_match_tenant_len(&self, text: &str, tenant: &str) -> usize {
+        let tenant_id = intern_tenant(tenant);
+
+        let mut remaining = text;
+        let mut matched_chars = 0;
+        let mut prev = Arc::clone(&self.root);
+
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+
+            let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
+
+            if let Some(matched_node) = child_node {
+                if !matched_node
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
+                {
+                    break;
+                }
+
+                let matched_text_guard = matched_node.text.read().unwrap();
+                let matched_node_text_count = matched_text_guard.char_count();
+                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                drop(matched_text_guard);
+
+                matched_chars += shared_count;
+                if shared_count == matched_node_text_count {
+                    remaining = advance_by_chars(remaining, shared_count);
+                    prev = matched_node;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        matched_chars
+    }
+
     /// Return the list of tenants for which this node is a leaf.
     /// A tenant is a leaf at this node if no children have that tenant.
     fn leaf_of(node: &NodeRef) -> Vec<TenantId> {
