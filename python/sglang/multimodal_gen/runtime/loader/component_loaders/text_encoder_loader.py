@@ -167,17 +167,6 @@ def _get_encoder_quant_config(
                 "quantization declaration"
             )
         tensor_meta = read_gguf_tensor_meta(component_weights_path)
-        checkpoint_filter = None
-        if model_cls is not None and "should_materialize_checkpoint_weight" in vars(
-            model_cls
-        ):
-            checkpoint_filter = vars(model_cls)["should_materialize_checkpoint_weight"]
-        if checkpoint_filter is not None:
-            tensor_meta = {
-                name: metadata
-                for name, metadata in tensor_meta.items()
-                if checkpoint_filter(name)
-            }
         dequantize_prefixes = (
             vars(model_cls).get("gguf_dequantize_prefixes", ())
             if model_cls is not None
@@ -841,6 +830,10 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if isinstance(quant_config, GGUFConfig):
+                quant_config.retain_tensor_meta(
+                    model.should_materialize_checkpoint_weight
+                )
             if quant_config is not None:
                 _require_quantized_encoder_layers(
                     model, component_name, quant_config=quant_config

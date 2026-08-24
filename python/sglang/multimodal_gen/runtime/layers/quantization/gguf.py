@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import gguf
@@ -40,12 +41,23 @@ class GGUFConfig(QuantizationConfig):
         super().__init__()
         self.gguf_file = gguf_file
         self.tensor_meta = tensor_meta
+        self._refresh_quantized_prefixes()
+        self.selected: set[str] = set()
+
+    def retain_tensor_meta(self, key_filter: Callable[[str], bool]) -> None:
+        self.tensor_meta = {
+            name: metadata
+            for name, metadata in self.tensor_meta.items()
+            if key_filter(name)
+        }
+        self._refresh_quantized_prefixes()
+
+    def _refresh_quantized_prefixes(self) -> None:
         self.quantized_prefixes = {
             metadata.param_name.removesuffix(".qweight")
-            for metadata in tensor_meta.values()
+            for metadata in self.tensor_meta.values()
             if metadata.is_packed
         }
-        self.selected: set[str] = set()
 
     @classmethod
     def get_name(cls) -> str:

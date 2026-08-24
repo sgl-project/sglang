@@ -497,6 +497,9 @@ class TestTextEncoderQuantization(unittest.TestCase):
             )
 
         self.assertIsInstance(config, GGUFConfig)
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        encoder.selected_lm_layer = 50
+        config.retain_tensor_meta(encoder.should_materialize_checkpoint_weight)
         self.assertEqual(
             config.quantized_prefixes,
             {"model.language_model.layers.49.self_attn.q_proj"},
