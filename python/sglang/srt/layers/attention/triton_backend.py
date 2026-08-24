@@ -30,6 +30,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -209,14 +210,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
-        # Unified pool WRITE hook (None = no-op): the write loc arrives VIRTUAL
-        # and the store kernels need the kernel-facing space. Applied eagerly so
-        # the captured graph holds no translate.
-        self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_for_kernel", None
-        ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
-        # The runner's id translator: every read index this backend builds
-        # gathers from the table it hands out.
+        # The backends uses the translator instead of translating by itself.
         self.kv_index_translator = model_runner.kv_index_translator
         # Set unconditionally: the read site evaluates it before the call,
         # and a non-translating pool never looks at its value.
@@ -684,17 +678,20 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 return
 
-            self._apply_cuda_graph_metadata(
+            index_table = self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
             out_cache_loc_full_physical = self._fill_cuda_graph_write_locs(
                 forward_batch, bs
             )
-            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(
+                forward_batch, index_table
+            )
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs,
                 forward_mode,
@@ -703,23 +700,25 @@ class TritonAttnBackend(AttentionBackend):
                 out_cache_loc_full_physical,
             )
         else:
-            self._apply_cuda_graph_metadata(
+            index_table = self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                out_cache_loc=forward_batch.out_cache_loc,
             )
             # Metadata view is reused from capture; just refill the buffers.
             self._fill_cuda_graph_write_locs(forward_batch, bs)
-            self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+            self._fill_cuda_graph_swa_out_cache_loc(forward_batch, index_table)
 
     def _fill_cuda_graph_swa_out_cache_loc(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, index_table: KVIndexTable
     ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from live out_cache_loc, returning the
-        [:n] view (None for non-SWA / multi-step draft) so the captured store reads
-        fresh slots on replay."""
+        """Refill the SWA write-target buffer from the batch's derived
+        sliding-window write loc, returning the [:n] view (None for non-SWA /
+        multi-step draft) so the captured store reads fresh slots on replay.
+        """
         if not self.use_sliding_window_kv_pool:
             return None
         out_cache_loc = forward_batch.out_cache_loc
@@ -728,33 +727,34 @@ class TritonAttnBackend(AttentionBackend):
             or out_cache_loc.shape[0] > self.cuda_graph_swa_out_cache_loc.shape[0]
         ):
             return None
+        swa_write_loc = index_table.sliding_window_write_loc
+        assert swa_write_loc is not None, (
+            "sliding-window refill: the batch's index table carries no "
+            "sliding_window_write_loc — was it built without out_cache_loc?"
+        )
         n = out_cache_loc.shape[0]
         self.cuda_graph_swa_out_cache_loc[n:].zero_()
-        self.cuda_graph_swa_out_cache_loc[:n].copy_(
-            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-        )
+        self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_write_loc)
         return self.cuda_graph_swa_out_cache_loc[:n]
 
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Unified pool: eager v2p translate of the cuda-graph WRITE loc into
-        the backend-owned capture-stable buffer, returned as the ``[:n]``
-        view; no-op for non-unified pools.
+        """Copy the cuda-graph WRITE loc into the capture-stable buffer and
+        return the ``[:n]`` view; no-op for non-unified pools.
 
         Runs BEFORE graph.replay() so it reads the live post-compaction v2p.
-        The length comes from the loc's shape, never an ``.item()`` sync.
+        The capture batch is runner-built with zeros, which is safe because
+        slot 0 is the reserved sink in every id space.
         """
-        if self._translate_kv_loc is None:
+        if not self.kv_index_translator.is_translating:
             return None
         out_cache_loc = forward_batch.out_cache_loc
         n = out_cache_loc.shape[0]
         # Zero the padded tail first: a smaller replay batch leaves [n:] holding
         # stale ids that the captured store would write; send them to slot 0 (sink).
         self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
-            self._translate_kv_loc(out_cache_loc)
-        )
+        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(out_cache_loc)
         return self.cuda_graph_out_cache_loc_full_physical[:n]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -992,20 +992,9 @@ class TritonAttnBackend(AttentionBackend):
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
-
-        # Unified pool full-attention WRITE loc (virtual out_cache_loc -> physical),
-        # carried in the metadata (-> KVWriteLoc.full_loc). None for non-unified pools.
-        out_cache_loc_full_physical = None
-        if (
-            self._translate_kv_loc is not None
-            and forward_batch.out_cache_loc is not None
-        ):
-            out_cache_loc_full_physical = self._translate_kv_loc(
-                forward_batch.out_cache_loc
-            )
+            swa_out_cache_loc = self.kv_index_translator.index_table_for_batch(
+                forward_batch
+            ).sliding_window_write_loc
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -1023,7 +1012,11 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
-            out_cache_loc_full_physical=out_cache_loc_full_physical,
+            out_cache_loc_full_physical=(
+                forward_batch.out_cache_loc
+                if self.kv_index_translator.is_translating
+                else None
+            ),
             lean_Mp=lean_Mp,
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
@@ -1144,7 +1137,7 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if self._translate_kv_loc is not None:
+        if self.kv_index_translator.is_translating:
             # Unified pool full-attention write-target buffer, refilled at replay
             # (-> KVWriteLoc.full_loc). Capture-stable, mirrors cuda_graph_swa_out_cache_loc.
             self.cuda_graph_out_cache_loc_full_physical = torch.zeros(
@@ -1268,8 +1261,11 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-    ):
-        """Shared capture+replay body for the cuda-graph init path.
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ) -> KVIndexTable:
+        """Shared capture+replay body for the cuda-graph init path; returns
+        the captured index table so the swa write-loc refill can consume its
+        `sliding_window_write_loc` without a second build.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
@@ -1278,6 +1274,7 @@ class TritonAttnBackend(AttentionBackend):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             into=self.kv_read_tables,
+            out_cache_loc=out_cache_loc,
         )
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
@@ -1302,6 +1299,7 @@ class TritonAttnBackend(AttentionBackend):
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
+        return index_table
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1373,10 +1371,11 @@ class TritonAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
-                cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
-            elif self._translate_kv_loc is not None:
-                # Unified pool: buffers are indexed in the kernel-facing id space.
-                cache_loc = self._translate_kv_loc(cache_loc)
+                assert self.forward_metadata.swa_out_cache_loc is not None, (
+                    "window-layer read-back before the metadata carried a "
+                    "sliding-window write loc"
+                )
+                cache_loc = self.forward_metadata.swa_out_cache_loc
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
@@ -1747,15 +1746,12 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            # Consumes VIRTUAL ids, so it must see out_cache_loc untranslated.
-            extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
+            extend_kv_indices = self.forward_metadata.swa_out_cache_loc
+            assert extend_kv_indices is not None, (
+                "window-layer extend before the metadata carried a "
+                "sliding-window write loc"
+            )
         elif self.forward_metadata.out_cache_loc_full_physical is not None:
-            # Unified pool: this kernel reads the extend half OUT OF THE POOL (the
-            # 2-stage path takes it from the k/v arguments), so it needs the same
-            # translated loc the KV write uses -- otherwise the prefix is read at
-            # physical ids and the extend tokens at virtual ones. Reuse the
-            # per-forward translation rather than re-translating: this runs once
-            # per layer.
             extend_kv_indices = self.forward_metadata.out_cache_loc_full_physical
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set

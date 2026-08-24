@@ -19,7 +19,7 @@ pools hold none and never translate — the write loc reaching `set_kv_buffer` i
 always PHYSICAL. Two routing contracts are pinned here:
 
 1. Full-attention. The full-physical loc is carried in `KVWriteLoc.full_loc`
-   (from `ForwardBatch.out_cache_loc_full_physical`) and written directly.
+   (from `ForwardMetadata.out_cache_loc_full_physical`) and written directly.
    `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
    it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
    where `loc` is itself already physical.
@@ -264,8 +264,10 @@ class TestHybridLinearMLARouting(unittest.TestCase):
     - `set_kv_buffer` (MLA branch) mirrors the MHA branch — write the
       pre-translated `KVWriteLoc.full_loc` when present (unified pool, where it
       carries the DENSE loc), else the raw `loc` (static pool, already physical).
-    - `set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs and apply
-      `_full_translate` exactly once (identity for a static pool)."""
+    - `set_mla_kv_buffer` forwards `loc` untouched (kernel-facing since the
+      ForwardBatch rebind); `get_mla_kv_buffer` applies `_full_translate`
+      exactly once (its indices are req_to_token-produced, virtual under the
+      unified pool)."""
 
     def _make_bare_pool(self, translate=None):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -274,7 +276,7 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         pool.full_kv_pool = _RecordingMLAPool()
         pool.use_mla = True
         pool.full_attention_layer_id_mapping = {0: 0}
-        pool._full_translate = translate if translate is not None else (lambda x: x)
+        pool._full_translate = translate if translate is not None else (lambda ids: ids)
         return pool
 
     def test_mla_writes_full_loc_from_write_loc(self):
@@ -311,28 +313,26 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         forwarded, _ = pool.full_kv_pool.calls[0]
         self.assertIs(forwarded, phys_loc)
 
-    def test_set_mla_kv_buffer_translates_exactly_once(self):
-        calls = []
-
-        def translate(ids):
-            calls.append(ids)
-            return ids + 100
-
-        pool = self._make_bare_pool(translate=translate)
-        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+    def test_set_mla_kv_buffer_door_never_translates(self):
+        """Physical-loc contract: the write door forwards `loc` UNTOUCHED.
+        The translate happens exactly once at ForwardBatch construction
+        (rebind_write_loc, kernel-facing-first); a door that translated
+        again would double-translate every unified MLA write. Deleting the
+        forward (or re-adding a door translate) turns this red."""
+        pool = self._make_bare_pool()
+        loc = torch.tensor([107, 108, 109], dtype=torch.int64)
         layer = types.SimpleNamespace(layer_id=0)
 
-        pool.set_mla_kv_buffer(
-            layer, virtual_loc, torch.zeros(3, 1, 6), torch.zeros(3, 1, 2)
-        )
+        pool.set_mla_kv_buffer(layer, loc, torch.zeros(3, 1, 6), torch.zeros(3, 1, 2))
 
-        self.assertEqual(len(calls), 1)
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
-        self.assertTrue(
-            torch.all(pool.full_kv_pool.mla_set_calls[0] == virtual_loc + 100)
-        )
+        self.assertIs(pool.full_kv_pool.mla_set_calls[0], loc)
 
     def test_get_mla_kv_buffer_translates_exactly_once(self):
+        """READ door: `loc` is produced from req_to_token (VIRTUAL under the
+        unified pool), so the get side still translates here — exactly once.
+        The WRITE door (case above) never translates: the split is the write
+        flip's contract."""
         calls = []
 
         def translate(ids):
