@@ -12,10 +12,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_p_normalize_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -65,6 +68,72 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _dflash_npu_top_k_top_p_renorm_prob(
+    probs: torch.Tensor,
+    *,
+    top_ks: Optional[torch.Tensor] = None,
+    top_ps: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if not is_npu() or probs.device.type != "npu":
+        return None
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+    if not hasattr(torch_npu, "npu_top_k_top_p"):
+        return None
+
+    logits = probs.log()
+    npu_top_ps = (
+        top_ps.reshape(-1).to(device=probs.device, dtype=probs.dtype)
+        if top_ps is not None
+        else None
+    )
+    npu_top_ks = (
+        top_ks.reshape(-1).to(device=probs.device, dtype=torch.int32)
+        if top_ks is not None
+        else None
+    )
+    if npu_top_ks is not None and not bool(
+        torch.all((npu_top_ks >= 1) & (npu_top_ks <= 1024)).item()
+    ):
+        return None
+    filtered_logits = torch_npu.npu_top_k_top_p(logits, npu_top_ps, npu_top_ks)
+    return filtered_logits.softmax(dim=-1)
+
+
+def _dflash_top_k_renorm_prob(
+    probs: torch.Tensor, top_ks: torch.Tensor
+) -> torch.Tensor:
+    if top_k_renorm_prob is not None:
+        return top_k_renorm_prob(probs, top_ks)
+
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
+    if npu_probs is not None:
+        return npu_probs
+
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
+    top_ks = top_ks.clamp(min=1, max=vocab_size)
+    max_top_k = int(top_ks.max().item())
+    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
+    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
+    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
+    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+
+
+def _dflash_top_p_renorm_prob(
+    probs: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    if top_p_renorm_prob is not None:
+        return top_p_renorm_prob(probs, top_ps)
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
+    if npu_probs is not None:
+        return npu_probs
+    return top_p_normalize_probs_torch(probs, top_ps)
 
 
 def dflash_draft_cell_size_per_token(
@@ -417,6 +486,12 @@ class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
+    conv_kernel_size: int
+    conv_group_size: int
+    selector_rank: int
+    selector_top_k: int
+    output_multiplier: float
+    final_logit_softcapping: Optional[float]
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
@@ -495,6 +570,44 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
+    conv_kernel_size = _parse_optional_int(
+        dflash_cfg.get("conv_kernel_size", 0),
+        field_name="DFLASH conv_kernel_size",
+        min_value=0,
+    )
+    conv_group_size = _parse_optional_int(
+        dflash_cfg.get("conv_group_size", 0),
+        field_name="DFLASH conv_group_size",
+        min_value=0,
+    )
+    if bool(conv_kernel_size) != bool(conv_group_size):
+        raise ValueError(
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size "
+            f"together. Got conv_kernel_size={conv_kernel_size}, "
+            f"conv_group_size={conv_group_size}."
+        )
+    selector_rank = _parse_optional_int(
+        dflash_cfg.get("selector_rank", 0),
+        field_name="DFLASH selector rank",
+        min_value=0,
+    )
+    selector_top_k = _parse_optional_int(
+        dflash_cfg.get("selector_top_k", 0),
+        field_name="DFLASH selector top_k",
+        min_value=0,
+    )
+    if bool(selector_rank) != bool(selector_top_k):
+        raise ValueError(
+            "DFLASH selector needs rank and top_k together. "
+            f"Got rank={selector_rank}, top_k={selector_top_k}."
+        )
+
+    output_multiplier = float(dflash_cfg.get("output_multiplier", 1.0))
+    if output_multiplier <= 0:
+        raise ValueError("DFLASH output_multiplier must be positive.")
+    softcap = float(dflash_cfg.get("final_logit_softcapping") or 0.0)
+    final_logit_softcapping = softcap if softcap > 0 else None
+
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
@@ -546,10 +659,27 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
         block_size=block_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
+        selector_rank=selector_rank,
+        selector_top_k=selector_top_k,
+        output_multiplier=output_multiplier,
+        final_logit_softcapping=final_logit_softcapping,
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
     )
+
+
+# is_floating_point() is True for fp8; list dtypes explicitly.
+_DENSE_HEAD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def is_dense_head_weight(weight: Any) -> bool:
+    """Whether an lm_head weight can be read as a plain matrix. A quantized head
+    stores packed values, which a dense matmul would read as if they were
+    activations."""
+    return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
@@ -879,7 +1009,7 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -888,12 +1018,12 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _dflash_top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )

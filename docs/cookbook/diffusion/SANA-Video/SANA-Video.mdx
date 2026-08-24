@@ -1,0 +1,104 @@
+---
+title: SANA-Video
+description: Serve the native SANA-Video 2B 480p text-to-video model with SGLang Diffusion.
+metatags:
+    description: "Run Efficient-Large-Model/SANA-Video_2B_480p_diffusers text-to-video generation with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video", "text-to-video", "480p", "2B lightweight"]} />
+
+## 1. Model Introduction
+
+[SANA-Video 2B 480p](https://huggingface.co/Efficient-Large-Model/SANA-Video_2B_480p_diffusers)
+is a lightweight text-to-video model served through a native SGLang Diffusion
+pipeline. Its main advantage is deployment cost: at 2B parameters it serves
+480p video from a single GPU with a plain `sglang serve` invocation, no
+parallelism flags required.
+
+The released generation profile produces 832×480 output at 81 frames and
+16 FPS over 50 inference steps; a compact 17-frame, 8-step profile is covered
+by server CI for quick validation. Motion strength can be steered directly
+from the prompt with an optional `motion score: N.` suffix.
+
+| Model ID | Task | Default output |
+| --- | --- | --- |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | Text to video | 832x480, 81 frames at 16 FPS |
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+See the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation)
+for platform-specific setup.
+
+## 3. Serve SANA-Video
+
+```bash Command
+sglang serve \
+  --model-path Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --port 30010
+```
+
+## 4. Generate a video
+
+The following request uses the compact 17-frame, 8-step profile covered by
+server CI. Use the model defaults of 81 frames and 50 steps for the released
+generation profile.
+
+```python Python
+import time
+from pathlib import Path
+
+import requests
+
+base_url = "http://127.0.0.1:30010"
+response = requests.post(
+    f"{base_url}/v1/videos",
+    json={
+        "model": "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        "prompt": (
+            "A red tram moves slowly through a sunlit city square while "
+            "pedestrians cross behind it. motion score: 30."
+        ),
+        "size": "832x480",
+        "num_frames": 17,
+        "fps": 16,
+        "num_inference_steps": 8,
+        "guidance_scale": 6.0,
+        "seed": 42,
+    },
+    timeout=60,
+)
+response.raise_for_status()
+video_id = response.json()["id"]
+
+while True:
+    job = requests.get(f"{base_url}/v1/videos/{video_id}", timeout=30).json()
+    if job["status"] == "completed":
+        break
+    if job["status"] == "failed":
+        raise RuntimeError(job.get("error") or "Video generation failed")
+    time.sleep(1)
+
+video = requests.get(
+    f"{base_url}/v1/videos/{video_id}/content",
+    timeout=300,
+)
+video.raise_for_status()
+Path("sana_video.mp4").write_bytes(video.content)
+```
+
+## 5. Request constraints
+
+- The default profile uses `832x480`, 81 frames, 50 inference steps, and 16 FPS.
+- Frame counts are aligned to `4n+1`; for example, a request for 80 frames is
+  adjusted to 77.
+- Use width and height values divisible by 16.
+- The prompt supports an optional `motion score: N.` suffix to express the
+  desired amount of motion.

@@ -225,7 +225,13 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
+    # Optional request-scoped override. The loader keeps the reference decode
+    # dtype resident so lossless requests never consume pre-rounded weights.
+    vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
+    # Bounds the attention grid the diffusion decoder's stages see, which is
+    # what makes a full-length decode tractable.
+    diffusion_decoder_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
 
@@ -844,6 +850,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
+            default=PipelineConfig.diffusion_decoder_tiling,
+            help="Enable tiling for the LTX-2.5 diffusion decoder",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",

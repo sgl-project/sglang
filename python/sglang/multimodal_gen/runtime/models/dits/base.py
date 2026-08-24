@@ -27,6 +27,11 @@ class BaseDiT(nn.Module, ABC):
     # execution semantics support only a subset of the available backends.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
+    # Methods that drive a forward pass without going through __call__. FSDP2
+    # only unshards around the wrapped module's own forward, so anything the
+    # shard conditions left in the root group stays sharded unless the entry
+    # point is registered; loaders read this and register each name.
+    _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
     hidden_size: int
@@ -96,6 +101,12 @@ class BaseDiT(nn.Module, ABC):
     def post_load_weights(self) -> None:
         """Run model-specific post-load weight fixups after all parameters are materialized."""
         return None
+
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Apply model-specific LoRA transforms after names are normalized."""
+        return adapter
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

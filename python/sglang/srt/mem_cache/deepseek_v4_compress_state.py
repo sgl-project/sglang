@@ -8,11 +8,10 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
-_is_npu = is_npu()
 
 
 def _lcm(a: int, b: int) -> int:
@@ -95,11 +94,14 @@ class CompressStatePool:
         online: bool = False,
         swa_page_size: int = 0,
         online_mtp_max_draft_tokens: int = 0,
+        state_cache_page_size: int = 1,
     ):
         self.ratio = ratio
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
+        self.page_size = state_cache_page_size
         self.enable_memory_saver = enable_memory_saver
+        self.online = online
         self.online_mtp_state_slot_offset = 0
         self.online_mtp_max_draft_tokens = 0
 
@@ -115,11 +117,12 @@ class CompressStatePool:
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1
-            # Pad to lcm(ratio, page_size) so the flat buffer reshapes cleanly into
-            # [block_num, page_size, last_dim] for the fused compressor op; page_size=1 falls back to ratio-only padding.
-            pad_to = (
-                _lcm(ratio, swa_page_size) if (swa_page_size > 1 and _is_npu) else ratio
-            )
+            # The common GPU pool is flat by default. A backend that also needs
+            # a physical 3-D cache view can request its second-axis page size;
+            # allocation and ring ownership still stay in this shared class.
+            pad_to = ratio
+            if state_cache_page_size > 1:
+                pad_to = _lcm(pad_to, state_cache_page_size)
             self._size = (self._size + pad_to - 1) // pad_to * pad_to
             self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
@@ -148,10 +151,9 @@ class CompressStatePool:
         :class:`KVAndScore`. Sets ``self.memory_saver_adapter``,
         ``self.custom_mem_pool`` and ``self.kv_score_buffer``.
 
-        Subclasses (e.g. :class:`NPUCompressStatePool`) that compute a
-        different ``self._size`` reuse this instead of duplicating the
-        allocation boilerplate. Requires ``self._size`` and ``self.last_dim``
-        to be set already.
+        The shared constructor computes ``self._size`` and ``self.last_dim``
+        before entering this helper. Backend subclasses should normally call
+        that constructor instead of duplicating this allocation path.
         """
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver

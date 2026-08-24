@@ -14,7 +14,7 @@ from sglang.kernels.jit.benchmark.utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 MAX_SEQ_LEN = 131072
@@ -30,6 +30,8 @@ class CaseSpec:
     head_dim: int
     rope_dim: int
     is_neox: bool
+    cache_has_full_width: bool = False
+    round_norm_before_rope: bool = False
 
 
 BENCH_CASES = (
@@ -38,6 +40,7 @@ BENCH_CASES = (
     CaseSpec("qwen_image_partial", 1, 4096, 32, 128, 64, False),
     # Z-Image-Turbo default 1024x1024 config: dim=3840, num_heads=30 -> head_dim=128.
     CaseSpec("zimage_1024", 1, 4096, 30, 128, 128, False),
+    CaseSpec("longcat_1024", 1, 4608, 24, 128, 128, False, True, True),
     CaseSpec("batch2_medium", 2, 2048, 24, 128, 128, False),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
@@ -46,7 +49,7 @@ CASE_NAMES = get_benchmark_range(
     ci_range=[case.name for case in BENCH_CASES],
 )
 LINE_VALS = ["split", "fused"]
-LINE_NAMES = ["JIT QKNorm + FlashInfer RoPE", "SGL JIT Fused QKNorm+RoPE"]
+LINE_NAMES = ["Split QKNorm + RoPE", "SGL JIT Fused QKNorm+RoPE"]
 STYLES = [("red", "-"), ("blue", "--")]
 
 
@@ -77,6 +80,13 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
     )
     generator = torch.Generator(device=DEFAULT_DEVICE)
     generator.manual_seed(seed)
+    cos_sin_cache = create_cos_sin_cache(case.rope_dim)
+    if case.cache_has_full_width:
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+        cos_sin_cache = torch.cat(
+            (cos.repeat_interleave(2, dim=-1), sin.repeat_interleave(2, dim=-1)),
+            dim=-1,
+        ).contiguous()
     return {
         "q": torch.randn(
             case.batch_size * case.num_tokens,
@@ -114,8 +124,10 @@ def make_inputs(case: CaseSpec) -> dict[str, torch.Tensor | bool]:
             dtype=torch.int64,
             generator=generator,
         ),
-        "cos_sin_cache": create_cos_sin_cache(case.rope_dim),
+        "cos_sin_cache": cos_sin_cache,
         "is_neox": case.is_neox,
+        "cache_has_full_width": case.cache_has_full_width,
+        "round_norm_before_rope": case.round_norm_before_rope,
     }
 
 
@@ -128,7 +140,9 @@ def clone_inputs(
     return out
 
 
-def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
+def split_qknorm_rope(
+    inputs: dict[str, torch.Tensor | bool],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -142,6 +156,18 @@ def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
     is_neox = bool(inputs["is_neox"])
 
     fused_inplace_qknorm(q, k, q_weight, k_weight)
+    if inputs["cache_has_full_width"]:
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+        cos = cos[positions]
+        sin = sin[positions]
+
+        def apply_interleaved(x: torch.Tensor) -> torch.Tensor:
+            x_real, x_imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
+            x_rotated = torch.stack((-x_imag, x_real), dim=-1).flatten(-2)
+            return (x.float() * cos[:, None] + x_rotated * sin[:, None]).to(x.dtype)
+
+        return apply_interleaved(q), apply_interleaved(k)
+
     apply_rope_with_cos_sin_cache_inplace(
         positions=positions,
         query=q.view(q.shape[0], -1),
@@ -153,7 +179,7 @@ def split_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
 
 
 def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
-    from sglang.kernels.ops.diffusion.qknorm_rope import fused_inplace_qknorm_rope
+    from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
 
     fused_inplace_qknorm_rope(
         inputs["q"],
@@ -163,7 +189,13 @@ def fused_qknorm_rope(inputs: dict[str, torch.Tensor | bool]) -> None:
         inputs["cos_sin_cache"],
         inputs["positions"],
         is_neox=bool(inputs["is_neox"]),
-        rope_dim=inputs["cos_sin_cache"].shape[-1],
+        rope_dim=(
+            inputs["cos_sin_cache"].shape[-1] // 2
+            if inputs["cache_has_full_width"]
+            else inputs["cos_sin_cache"].shape[-1]
+        ),
+        round_norm_before_rope=bool(inputs["round_norm_before_rope"]),
+        cache_has_full_width=bool(inputs["cache_has_full_width"]),
     )
 
 

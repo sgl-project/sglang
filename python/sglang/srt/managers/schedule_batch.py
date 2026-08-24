@@ -3,13 +3,15 @@ from __future__ import annotations
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
-    get_exec,
+    get_disagg,
     get_schedule,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
 )
 from sglang.srt.utils.common import (
     Range,
@@ -65,6 +67,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TypeAlias,
     Union,
 )
 
@@ -80,9 +83,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    maybe_evict_dsv4_state,
-)
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -99,9 +99,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
+    RetractionBackup,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     release_kv_cache,
+    retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -144,6 +146,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
+_MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
 
@@ -313,8 +316,12 @@ class MultimodalInputFormat(Enum):
     PRECOMPUTED_EMBEDDING = auto()
 
 
-@dataclasses.dataclass
-class MultimodalDataItem:
+# Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
+# containers intentionally decode as lists, matching msgpack's native model.
+MultimodalDataValue: TypeAlias = object
+
+
+class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
@@ -325,39 +332,51 @@ class MultimodalDataItem:
     """
 
     modality: Modality
-    hash: int = None
-    pad_value: int = None
-    offsets: Optional[list] = None
+    hash: Optional[int] = None
+    pad_value: Optional[int] = None
+    offsets: Optional[List[Tuple[int, int]]] = None
 
     format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
-    feature: Union[torch.Tensor, np.ndarray] = None
+    feature: Optional[MultimodalDataValue] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
-    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[MultimodalDataValue] = None
+    # Keep precomputed_embeddings on GPU after use (EPD pool/GPU receive path)
+    keep_device_embedding: bool = False
 
-    # Model-specific data stored in a dictionary
-    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
+    # precise union with multiple custom types, but accepts Ext-decoded values
+    # under object.
+    model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
+        default_factory=dict
+    )
 
-    def __getattr__(self, name: str):
-        if (
-            "model_specific_data" in self.__dict__
-            and name in self.__dict__["model_specific_data"]
-        ):
-            return self.__dict__["model_specific_data"][name]
+    def __post_init__(self) -> None:
+        if self.hash is not None:
+            msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+
+    def __getattr__(self, name: str) -> MultimodalDataValue:
+        if name in self.model_specific_data:
+            return self.model_specific_data[name]
+
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{name}'"
+        )
+
+    def __setattr__(self, name: str, value: MultimodalDataValue) -> None:
+        if name in self.__struct_fields__:
+            if name == "hash" and isinstance(value, int):
+                value &= _MM_HASH_MASK
+            msgspec.Struct.__setattr__(self, name, value)
         else:
-            raise AttributeError(
-                f"'{self.__class__.__name__}' object has no attribute '{name}'"
-            )
+            self.model_specific_data[name] = value
 
-    def __setitem__(self, key: str, value: Any):
-        if key in self.__dict__:
-            self.__dict__[key] = value
-        else:
-            self.model_specific_data[key] = value
+    def __setitem__(self, key: str, value: MultimodalDataValue) -> None:
+        setattr(self, key, value)
 
-    def set(self, key: str, value: Any):
+    def set(self, key: str, value: MultimodalDataValue) -> None:
         self.__setitem__(key, value)
 
     def set_hash(self, hash_value: int) -> None:
@@ -371,27 +390,16 @@ class MultimodalDataItem:
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        """
-        Set the pad value after first hashing the data
-        """
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
-            import uuid
-
-            self.hash = uuid.uuid4().int
-            self.pad_value = _compute_pad_value(self.hash)
-            return
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
-        assert self.hash is not None
+        self.hash = resolve_multimodal_item_hash(
+            existing_hash=self.hash,
+            feature=self.feature,
+            precomputed_embeddings=self.precomputed_embeddings,
+        )
         self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
@@ -501,8 +509,9 @@ class MultimodalDataItem:
         return min(requested_count, proxy_count)
 
 
-@dataclasses.dataclass
-class MultimodalProcessorOutput:
+class MultimodalProcessorOutput(
+    msgspec.Struct, kw_only=True, dict=True, array_like=True, weakref=True
+):
     """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
@@ -729,9 +738,6 @@ class MultimodalInputs:
         return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
-        """
-        merge image inputs when requests are being merged
-        """
 
         # args needed to be merged
         optional_args = [
@@ -855,6 +861,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -887,6 +894,7 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        self.retraction_backup: Optional[RetractionBackup] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -924,13 +932,14 @@ class Req(ReqDllmMixin):
             return_hidden_states
         )
 
-        # extra key for classifying the request (e.g. cache_salt)
+        # Extra key for caller-defined request classification.
         if lora_id is not None:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+        self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -1169,6 +1178,7 @@ class Req(ReqDllmMixin):
         # kv_send(req.input_ids[req.start_send_idx:req.extend_range.end])
         # start_send_idx = req.extend_range.end
         self.start_send_idx: int = 0
+        self.disagg_decode_prefix_len: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
@@ -1236,11 +1246,7 @@ class Req(ReqDllmMixin):
         return self.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
-        """Update the speculative decoding acceptance histogram.
-
-        Args:
-            num_correct_drafts: Number of correct draft tokens (no bonus) in this step.
-        """
+        """Record one step accepted draft count (excludes bonus token) into the histogram."""
         if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
             self.spec_correct_drafts_histogram.extend(
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
@@ -1359,6 +1365,7 @@ class Req(ReqDllmMixin):
                         token_ids=token_ids_to_match,
                         extra_key=self.extra_key,
                         limit=key_limit,
+                        cache_salt=self.cache_salt,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -1461,9 +1468,6 @@ class Req(ReqDllmMixin):
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
-        """
-        Check if the suffix of tail_str overlaps with any stop_str prefix
-        """
         if not self.sampling_params.stop_strs:
             return False
 
@@ -1718,19 +1722,24 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
-            token_indices, mamba_indices=self.mamba_pool_idx
+        self.retraction_backup = RetractionBackup(
+            cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
+                token_indices, mamba_indices=self.mamba_pool_idx
+            )
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        assert self.retraction_backup is not None
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+            self.retraction_backup.cpu_tensors,
+            token_indices,
+            mamba_indices=self.mamba_pool_idx,
         )
-        del self.kv_cache_cpu
+        self.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -1776,6 +1785,7 @@ class Req(ReqDllmMixin):
             "bootstrap_room": self.bootstrap_room,
             "priority": self.priority,
             "extra_key": self.extra_key,
+            "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
@@ -1910,7 +1920,8 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+) -> bool:
+    """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -1918,8 +1929,15 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
-    if server_args.disaggregation_mode == "decode" and offload_kv:
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    backup_saved = True
+    if get_disagg().disaggregation_mode == "decode" and offload_kv:
+        backup_saved = retraction_backup(
+            req,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            get_disagg().disaggregation_decode_retraction_backup,
+        )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -1927,6 +1945,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
+    return backup_saved
 
 
 def retract_all(
@@ -2076,8 +2095,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
-    # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
+    # DSV4-NPU: KV-only per-pool slot bundle from
+    # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None
 
     # For hybrid GDN prefix cache
@@ -2626,9 +2645,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         chunk_size = mamba_cache_chunk_size()
+        # The donated depth has to be a radix node boundary. Read the tree's own
+        # page rather than re-deriving how DCP widens it; the kernel still
+        # snapshots on the chunk_size grid.
+        checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
-            assert i % chunk_size == 0
+            # h is indexed relative to the extend start, so check that offset.
+            assert (i - len(req.prefix_indices)) % chunk_size == 0, (
+                f"The force track calculation only handles last-position or "
+                f"unaligned seqlens, so it needs a chunk-aligned offset to "
+                f"start from. But i={i} prefix_len={len(req.prefix_indices)} "
+                f"chunk_size={chunk_size} checkpoint_grid={checkpoint_grid}"
+            )
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
             # 1) aligned with chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
@@ -2638,7 +2667,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= chunk_size
+        mask = req.extend_range.length >= checkpoint_grid
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2655,13 +2684,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
+            # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
+            # retrieve the correct mamba state from h by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
                 + (req.extend_range.length // chunk_size) * chunk_size
@@ -2803,9 +2832,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        sorted_indices = self._get_decode_retraction_order(self.reqs)
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2817,11 +2847,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if self.release_req(idx, len(sorted_indices), server_args):
+                retracted_reqs.append(req)
+            else:
+                # The retraction host pool could not hold the backup and the
+                # device KV is already freed, so the request cannot resume.
+                req.to_finish = FINISH_ABORT(
+                    "Retraction host KV pool exhausted. Aborting the request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s, retraction host pool "
+                    "exhausted",
+                    req.rid,
+                )
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2835,7 +2877,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2850,9 +2892,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
-    def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs
-    ) -> List[int]:
+    def _get_decode_retraction_order(reqs: List[Req]) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
         The retraction loop pops from the end of this list, so the least-preferred
@@ -2865,15 +2905,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
 
-        if server_args.retraction_policy == "priority":
-            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        if get_schedule().retraction_policy == "priority":
+            priority_sign = (
+                1 if get_schedule().schedule_low_priority_values_first else -1
+            )
 
             def retraction_key(req: Req) -> Tuple[int, int, int]:
                 priority = req.priority
                 if priority is None:
                     priority = (
                         sys.maxsize
-                        if server_args.schedule_low_priority_values_first
+                        if get_schedule().schedule_low_priority_values_first
                         else -sys.maxsize - 1
                     )
                 return (priority * (-priority_sign), *length_key(req))
@@ -2890,8 +2932,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        release_req(
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+    ) -> bool:
+        return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
             server_args=server_args,
@@ -2899,6 +2947,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=offload_kv,
         )
 
     def prepare_encoder_info_decode(self):
@@ -3070,7 +3119,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if mamba_extra_buffer_enabled():
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -3329,10 +3378,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     ):
                         self._evict_swa(req, req.seqlen - 1)
 
-                    # DSV4-NPU only (no-op elsewhere): the small paged compress-state
-                    # pool must drain every decode step, independent of SWA cadence.
-                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
-
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
                     # needed by this request. Convert it from protected to
@@ -3377,6 +3422,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             is_chunk_cache=self.tree_cache.is_chunk_cache(),
+            retain_floor=self.tree_cache.swa_retain_floor(req),
         )
 
     def __str__(self):
