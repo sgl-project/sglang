@@ -210,6 +210,8 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_SERVING_TIMEOUT = 3600
 BENCHMARK_STDOUT_DRAIN_GRACE = 10
+BENCHMARK_STDOUT_IDLE_TIMEOUT = 300
+BENCHMARK_WATCHDOG_POLL_INTERVAL = 30
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -493,27 +495,54 @@ def run_bench_serving(
     )
 
     reader_done = threading.Event()
+    # Shared holder for the reader thread to refresh its activity timestamp;
+    # the watchdog polls it to detect a silent/stuck benchmark before the
+    # 1-hour ceiling is reached.
+    last_activity = [time.time()]
 
     def _kill_on_timeout():
-        try:
-            process.wait(timeout=BENCHMARK_SERVING_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            logger.error(
-                f"Benchmark hung past {BENCHMARK_SERVING_TIMEOUT}s, killing "
-                f"process group {process.pid}"
-            )
-            kill_process_group(process)
-            return
-        # The direct child exited, but a re-parented descendant may still hold
-        # the stdout pipe open and wedge the reader below. Give it a short
-        # grace period to drain; if the reader is still stuck, nuke the group
-        # to force EOF on the pipe.
-        if not reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
-            logger.error(
-                f"Benchmark stdout still open after process exit, killing "
-                f"process group {process.pid}"
-            )
-            kill_process_group(process)
+        deadline = time.time() + BENCHMARK_SERVING_TIMEOUT
+        while True:
+            if process.poll() is not None:
+                if reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+                    return
+                logger.error(
+                    f"Benchmark stdout still open after process exit, "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            if reader_done.is_set():
+                # stdout has drained, but the direct child may still be alive:
+                # give it a bounded time to exit, otherwise nuke the group.
+                try:
+                    process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Benchmark {process.pid} still alive after stdout EOF, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # No output for too long while still alive -> likely hung.
+            idle = time.time() - last_activity[0]
+            if idle > BENCHMARK_STDOUT_IDLE_TIMEOUT:
+                logger.error(
+                    f"Benchmark produced no output for {idle:.0f}s "
+                    f"(> {BENCHMARK_STDOUT_IDLE_TIMEOUT}s), "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            # Absolute ceiling.
+            if time.time() >= deadline:
+                logger.error(
+                    f"Benchmark exceeded {BENCHMARK_SERVING_TIMEOUT}s, "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            time.sleep(BENCHMARK_WATCHDOG_POLL_INTERVAL)
 
     watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
     watchdog.start()
@@ -522,6 +551,7 @@ def run_bench_serving(
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
             for line in process.stdout:
+                last_activity[0] = time.time()
                 if line.strip():
                     print(line, end="")
                 f.write(line)
