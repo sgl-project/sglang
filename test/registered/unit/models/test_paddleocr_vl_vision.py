@@ -18,7 +18,7 @@ from sglang.srt.models.paddleocr_vl import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Mixes repeated grids (LFU cache hits), an odd aspect ratio, and t > 1.
 GRIDS = [(1, 4, 6), (1, 8, 10), (2, 2, 4), (1, 8, 10)]

@@ -26,7 +26,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=169, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):

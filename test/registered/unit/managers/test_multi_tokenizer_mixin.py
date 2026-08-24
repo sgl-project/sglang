@@ -12,7 +12,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_tokenizer_worker_class,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class CustomTokenizerWorker(TokenizerWorker):

@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Collectives are mocked and world_size is a plain int, so the world_size=4
 # cases need one real CUDA device.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeWorkspace:

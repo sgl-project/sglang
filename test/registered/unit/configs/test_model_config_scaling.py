@@ -5,7 +5,7 @@ from sglang.srt.configs.model_config import ModelConfig, compute_mla_mscale_scal
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _mla_scaling(rope_scaling) -> tuple[float, float]:

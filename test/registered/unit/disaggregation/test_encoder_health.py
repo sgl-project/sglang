@@ -7,7 +7,7 @@ from sglang.srt.disaggregation.encoder import http_server
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 class _FakeEncoder:

@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
 from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 CORE = load_core()
 DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)

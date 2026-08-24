@@ -13,7 +13,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
 )
 
-register_cuda_ci(est_time=130, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestStreamingSessionSWARetractMixedChunk(

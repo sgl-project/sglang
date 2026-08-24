@@ -20,7 +20,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # Pure layout / bookkeeping math: no CUDA, no distributed groups, no kernels.
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _HIDDEN = 3
 _ADAPTER_RANK = 2

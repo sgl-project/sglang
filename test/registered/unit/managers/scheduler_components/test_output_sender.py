@@ -13,7 +13,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_scheduler_req(http_worker_ipc: str) -> Req:

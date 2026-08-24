@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=225, stage="base-c", runner_config="4-gpu-gb300")
 
 # Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
 NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 120

@@ -17,7 +17,7 @@ from sglang.srt.rust_extensions import loader as rust_extension
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _hold_filesystem_lock(path: str, ready, release) -> None:
