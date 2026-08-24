@@ -242,7 +242,26 @@ class Siglip2VisionTransformer(nn.Module):
         attention_mask: torch.Tensor,
         spatial_shapes: torch.LongTensor,
     ) -> torch.Tensor:
+        """
+        Args:
+            pixel_values: Batched pixel values
+                (B, max_num_patches, num_channels * patch_size * patch_size)
+            attention_mask: (B, max_num_patches) with 1 for real, 0 for padding
+            spatial_shapes: (B, 2) with (height, width) per image
+
+        Returns:
+            (B, max_num_patches, hidden_size) with zeros at padding positions
+        """
         batch_size, max_patches, _ = pixel_values.shape
+
+        # Ensure attention_mask is 2D (B, max_patches)
+        if attention_mask.ndim > 2:
+            attention_mask = attention_mask.reshape(batch_size, max_patches)
+        elif attention_mask.ndim == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+        # Ensure spatial_shapes is 2D (B, 2)
+        spatial_shapes = spatial_shapes.reshape(-1, 2)
 
         # Pack: extract real tokens using attention_mask
         mask_bool = attention_mask.bool()

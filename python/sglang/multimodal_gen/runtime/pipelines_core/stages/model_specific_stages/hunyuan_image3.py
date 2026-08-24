@@ -712,8 +712,9 @@ class HunyuanImage3AR(PipelineStage):
         else:
             base_size = 1024
             ratio_idx = 0
-            target_width = orig_width
-            target_height = orig_height
+            # Align to VAE downsample factor so spatial dims are compatible
+            target_width = (orig_width // vae_w_factor) * vae_w_factor
+            target_height = (orig_height // vae_h_factor) * vae_h_factor
 
         # VAE path: center-crop resize → processor → tensor
         vae_input = self._resize_and_crop_center(pil_image, target_width, target_height)
@@ -737,19 +738,44 @@ class HunyuanImage3AR(PipelineStage):
         vit_patch_size = 1
         if processor is not None and hasattr(processor, "vision_encoder_processor"):
             vit_inputs = processor.vision_encoder_processor(pil_image, return_tensors="pt")
-            vit_tensor = vit_inputs["pixel_values"]
-            spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)
-            pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0)
+            # Match vllm-omni: squeeze batch dim so pixel_values is 2D
+            vit_tensor = vit_inputs["pixel_values"].squeeze(0)  # (max_patches, features)
+            spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)  # (2,)
+            pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0)  # (max_patches,)
             vit_token_h = int(spatial_shapes[0].item())
             vit_token_w = int(spatial_shapes[1].item())
             vit_patch_size = getattr(processor.vision_encoder_processor, "patch_size", 1)
             if isinstance(vit_patch_size, (tuple, list)):
                 vit_patch_size = int(vit_patch_size[0])
         else:
-            # Fallback: create minimal ViT inputs
-            vit_tensor = torch.zeros(1, 1, 3)
-            spatial_shapes = torch.tensor([[1, 1]])
-            vit_token_h = vit_token_w = 1
+            # Fallback: build ViT inputs manually using vit config
+            vit_config = getattr(hf_config, "vit", None)
+            if vit_config is None:
+                vit_config = {}
+            vit_num_channels = vit_config.get("num_channels", 3) if isinstance(vit_config, dict) else getattr(vit_config, "num_channels", 3)
+            vit_hidden_patch_size = vit_config.get("patch_size", 14) if isinstance(vit_config, dict) else getattr(vit_config, "patch_size", 14)
+            vit_feat_dim = vit_num_channels * vit_hidden_patch_size * vit_hidden_patch_size
+            vit_patch_size = vit_hidden_patch_size
+
+            # Resize image to be divisible by patch_size
+            fallback_w = (orig_width // vit_patch_size) * vit_patch_size
+            fallback_h = (orig_height // vit_patch_size) * vit_patch_size
+            fallback_w = max(fallback_w, vit_patch_size)
+            fallback_h = max(fallback_h, vit_patch_size)
+            resized = self._resize_and_crop_center(pil_image, fallback_w, fallback_h)
+
+            import torchvision.transforms as T
+            resized_tensor = T.ToTensor()(resized)  # (C, H, W)
+            vit_token_h = fallback_h // vit_patch_size
+            vit_token_w = fallback_w // vit_patch_size
+
+            # Extract non-overlapping patches → (num_patches, C*P*P)
+            patches = resized_tensor.unfold(1, vit_patch_size, vit_patch_size).unfold(2, vit_patch_size, vit_patch_size)
+            # patches: (C, vit_token_h, vit_token_w, P, P)
+            patches = patches.permute(1, 2, 0, 3, 4).reshape(vit_token_h * vit_token_w, vit_feat_dim)
+            vit_tensor = patches  # (max_patches, features)
+            spatial_shapes = torch.tensor([vit_token_h, vit_token_w])  # (2,)
+            pixel_attention_mask = torch.ones(vit_token_h * vit_token_w, dtype=torch.long)  # (max_patches,)
 
         vit_info = ImageInfo(
             image_type="siglip2",
@@ -757,13 +783,16 @@ class HunyuanImage3AR(PipelineStage):
             image_height=vit_token_h * vit_patch_size,
             token_width=vit_token_w,
             token_height=vit_token_h,
-            image_token_length=int(vit_tensor.shape[1]),
+            image_token_length=int(vit_tensor.shape[0]),  # 2D: (max_patches, features)
         )
 
         joint_info = JointImageInfo(
             vae_image_info=vae_info,
             vision_image_info=vit_info,
-            vision_encoder_kwargs={"spatial_shapes": spatial_shapes},
+            vision_encoder_kwargs={
+                "spatial_shapes": spatial_shapes,
+                "pixel_attention_mask": pixel_attention_mask,
+            },
         )
         # Attach tensors for downstream encoding
         vae_info.image_tensor = vae_tensor
@@ -814,7 +843,8 @@ class HunyuanImage3AR(PipelineStage):
             cond_t_list.append(t)
 
         cond_t = torch.cat(cond_t_list, dim=0)
-        cond_vit_images = torch.cat(cond_vit_list, dim=0)
+        # Stack (not cat) to create batch dim — matches vllm-omni's torch.stack pattern
+        cond_vit_images = torch.stack(cond_vit_list, dim=0)  # (N, max_patches, features)
 
         # Stack VAE latents if same shape, else keep as list
         if all(v.shape == cond_vae_list[0].shape for v in cond_vae_list):
@@ -830,10 +860,16 @@ class HunyuanImage3AR(PipelineStage):
                 cond_vae_images = cond_vae_images * cfg_factor
             cond_vit_images = cond_vit_images.repeat(cfg_factor, 1, 1)
 
-        # Build vit_kwargs from vision_image_info
-        vit_kwargs = {"spatial_shapes": torch.cat([info.vision_image_info.vision_encoder_kwargs["spatial_shapes"].unsqueeze(0) for info in cond_image_infos], dim=0)}
+        # Build vit_kwargs from vision_encoder_kwargs (matches vllm-omni)
+        vit_kwargs = {"spatial_shapes": [], "attention_mask": []}
+        for info in cond_image_infos:
+            vit_kwargs["spatial_shapes"].append(info.vision_encoder_kwargs["spatial_shapes"])
+            vit_kwargs["attention_mask"].append(info.vision_encoder_kwargs["pixel_attention_mask"])
+        vit_kwargs["spatial_shapes"] = torch.stack(vit_kwargs["spatial_shapes"])
+        vit_kwargs["attention_mask"] = torch.stack(vit_kwargs["attention_mask"])
         if cfg_factor > 1:
-            vit_kwargs = {k: v.repeat(cfg_factor, *([1] * (v.ndim - 1))) for k, v in vit_kwargs.items()}
+            vit_kwargs["spatial_shapes"] = vit_kwargs["spatial_shapes"].repeat(cfg_factor, *([1] * (vit_kwargs["spatial_shapes"].ndim - 1)))
+            vit_kwargs["attention_mask"] = vit_kwargs["attention_mask"].repeat(cfg_factor, *([1] * (vit_kwargs["attention_mask"].ndim - 1)))
 
         return cond_vae_images, cond_t, cond_vit_images, vit_kwargs
 
@@ -878,13 +914,18 @@ class HunyuanImage3AR(PipelineStage):
         bsz, seq_len, n_embd = hidden_states.shape
         index = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
 
-        # Forward through ViT + aligner
+        # Forward through ViT + aligner (matches vllm-omni's instantiate_vit_image_tokens)
         cond_vit_embeds = []
-        for batch_idx in range(cond_vit_images.shape[0]):
-            cur_spatial_shapes = vit_kwargs["spatial_shapes"][batch_idx:batch_idx+1].to(hidden_states.device)
+        for batch_idx, image in enumerate(cond_vit_images):
+            cur_kwargs = {k: v[batch_idx] for k, v in vit_kwargs.items()}
+            # Ensure spatial_shapes is 2D (1, 2) for the vision model
+            if cur_kwargs["spatial_shapes"].ndim == 1:
+                cur_kwargs["spatial_shapes"] = cur_kwargs["spatial_shapes"].unsqueeze(0)
+            if cur_kwargs["attention_mask"].ndim == 1:
+                cur_kwargs["attention_mask"] = cur_kwargs["attention_mask"].unsqueeze(0)
             image_embed = self._vision_model(
-                cond_vit_images[batch_idx:batch_idx+1].to(hidden_states.device),
-                cur_spatial_shapes,
+                image.unsqueeze(0).to(hidden_states.device),
+                **cur_kwargs,
             )
             image_embed = self._vision_aligner(image_embed)
             n, sl, dim = image_embed.shape
@@ -1017,6 +1058,14 @@ class HunyuanImage3AR(PipelineStage):
         # --- Conditional (joint) image handling for TI2I / I2I ---
         cond_image_infos_list = None  # per-sample list of JointImageInfo
         raw_cond_images = getattr(batch, "condition_image", None)
+        # Fall back to image_path (set by CLI --image-path) if condition_image is absent
+        if raw_cond_images is None:
+            image_path = getattr(batch, "image_path", None)
+            if image_path is not None:
+                if isinstance(image_path, list):
+                    raw_cond_images = image_path
+                else:
+                    raw_cond_images = [image_path]
         if raw_cond_images is not None:
             if not isinstance(raw_cond_images, (list, tuple)):
                 raw_cond_images = [raw_cond_images]
@@ -1132,6 +1181,9 @@ class HunyuanImage3AR(PipelineStage):
         tokenizer_sections = None
         if isinstance(tokenizer_output_dict, dict):
             tokenizer_sections = tokenizer_output_dict.get("sections")
+            # CFG batching may produce a list-of-lists; flatten to a single list
+            if tokenizer_sections and isinstance(tokenizer_sections[0], list):
+                tokenizer_sections = tokenizer_sections[0]
         rope_image_info = _build_rope_image_info(
             tokenizer_output, actual_batch_size, token_h, token_w, image_info,
             sections=tokenizer_sections,
@@ -1288,7 +1340,7 @@ class HunyuanImage3AR(PipelineStage):
                     )
                 if cond_timestep_scatter_index is not None and cond_t is not None:
                     hidden_states = self._instantiate_cond_timestep_tokens(
-                        hidden_states, cond_t, cond_timestep_scatter_index,
+                        hidden_states, cond_t.to(hidden_states.device), cond_timestep_scatter_index,
                     )
 
                 # Use the same RoPE and attention mask on every step
