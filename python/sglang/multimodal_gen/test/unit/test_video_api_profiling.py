@@ -6,7 +6,12 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeVideoGenerationsRequest,
     VideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+    RealtimeChunkInputs,
+    build_realtime_sampling_params,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
@@ -85,3 +90,29 @@ def test_ltx23_request_defaults_to_vae_decoder():
     request = Req(sampling_params=LTX23SamplingParams())
 
     assert request.use_diffusion_decoder is False
+
+
+def test_realtime_video_api_forwards_sampling_quality():
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="profile this realtime request",
+        first_frame="cat.png",
+        quality="high",
+    )
+    chunk_inputs = RealtimeChunkInputs(prompt=request.prompt)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime."
+        "realtime_adapter.build_sampling_params",
+        side_effect=lambda request_id, **kwargs: kwargs,
+    ):
+        kwargs = build_realtime_sampling_params(
+            "realtime-profile-request",
+            request=request,
+            chunk_inputs=chunk_inputs,
+            num_frames=9,
+            num_inference_steps=4,
+            chunk_size=9,
+        )
+
+    assert kwargs["quality"] == "high"
