@@ -7482,18 +7482,18 @@ class ServerArgs:
             # ElasticBuffer needs NCCL symmetric memory; seeding it here avoids
             # --enable-symm-mem's NVLS and 4GB prealloc. A user value still wins.
             os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-            if self.moe_runner_backend == "auto":
+            # A model declaration may already have claimed the runner, and a
+            # declaration made here replays last, so resolving auto off the raw
+            # field would silently outrank it. Read the resolving view instead.
+            resolved_runner = resolved_view(self).moe_runner_backend
+            if resolved_runner == "auto":
                 # deepep_v2 dispatches FP8 activations plus scales, which only
                 # deep_gemm consumes.
-                self.moe_runner_backend = "deep_gemm"
+                self._declare("_handle_a2a_moe", moe_runner_backend="deep_gemm")
                 logger.warning(
                     "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
                 )
-            # Model declarations materialize after this handler, so validate
-            # the resolved runner rather than the raw field.
-
-            resolved_runner = resolved_view(self).moe_runner_backend
-            if resolved_runner != "deep_gemm":
+            elif resolved_runner != "deep_gemm":
                 raise ValueError(
                     "DeepEP v2 MoE currently supports only "
                     f"--moe-runner-backend deep_gemm. Got {resolved_runner!r}. "
