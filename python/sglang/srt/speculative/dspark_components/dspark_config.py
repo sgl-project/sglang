@@ -10,7 +10,10 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    is_nemotron_35_draft_config,
+    parse_dflash_draft_config,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -61,6 +64,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    is_nemotron_35_layout: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -128,9 +132,8 @@ def resolve_runtime_config(
     )
 
 
-def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
-    """Load the draft checkpoint's hf config and read its DSpark gamma
-    (block_size). Raises on config-load failure; callers pick the fallback.
+def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfig:
+    """Load and normalize the DSpark draft checkpoint configuration.
 
     Reads the *resolving* configuration, not the bags: the speculative hook
     calls this from inside resolution, where no bag exists yet -- and the
@@ -148,7 +151,11 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
     )
-    return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
+    return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
+
+
+def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
+    return read_draft_checkpoint_config(server_args=server_args).resolve_gamma(
         default=None
     )
 
@@ -305,4 +312,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        is_nemotron_35_layout=is_nemotron_35_draft_config(draft_hf_config),
     )

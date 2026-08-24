@@ -2190,6 +2190,9 @@ class ServerArgs:
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
         NS("spec"),
     ] = None
+    speculative_dspark_sample_from_anchor: A[
+        Optional[bool], Arg(no_cli=True), NS("spec")
+    ] = None
     speculative_dspark_sps_table_path: A[
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
@@ -2249,7 +2252,10 @@ class ServerArgs:
     ] = "prefill"
     speculative_draft_attention_backend: A[
         Optional[str],
-        "Attention backend for speculative decoding drafting.",
+        Arg(
+            help="Attention backend for speculative decoding drafting.",
+            resolvable=True,
+        ),
         NS("spec"),
     ] = None
     speculative_draft_kv_cache_dtype: A[
@@ -6068,14 +6074,6 @@ class ServerArgs:
 
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
-            )
-        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            # Quantization / MoE runner / attention backend defaults moved to
-            # the override registry (arg_groups/overrides.py:
-            # _nemotron_h_overrides).
-            assert resolved_view(self).attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
             )
         elif model_arch in [
             "Qwen3MoeForCausalLM",

@@ -447,6 +447,28 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             speculative_eagle_topk=1,
         )
 
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        DEFAULT_DSPARK_GAMMA,
+        read_draft_checkpoint_config,
+    )
+
+    draft_config = None
+    try:
+        draft_config = read_draft_checkpoint_config(server_args=server_args)
+        sample_from_anchor = not draft_config.is_nemotron_35_layout
+    except Exception as e:
+        sample_from_anchor = True
+        logger.warning(
+            "Failed to read DSpark draft layout; preserving the standard "
+            "sample-from-anchor graph sizing. Error: %s",
+            e,
+        )
+    declare_resolution(
+        server_args,
+        "_handle_dspark",
+        speculative_dspark_sample_from_anchor=sample_from_anchor,
+    )
+
     gamma: Optional[int] = None
     if server_args.speculative_dspark_block_size is not None:
         if int(server_args.speculative_dspark_block_size) <= 0:
@@ -456,19 +478,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         gamma = int(server_args.speculative_dspark_block_size)
     else:
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            DEFAULT_DSPARK_GAMMA,
-            read_draft_checkpoint_gamma,
-        )
-
-        try:
-            gamma = read_draft_checkpoint_gamma(server_args=server_args)
-        except Exception as e:
-            logger.warning(
-                "Failed to read DSpark gamma from draft model config; "
-                "cannot cross-check --speculative-num-draft-tokens. Error: %s",
-                e,
-            )
+        if draft_config is not None:
+            gamma = draft_config.resolve_gamma(default=None)
         if gamma is None and server_args.speculative_num_draft_tokens is None:
             gamma = DEFAULT_DSPARK_GAMMA
             logger.warning(

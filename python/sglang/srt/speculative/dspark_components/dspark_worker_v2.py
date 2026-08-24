@@ -162,18 +162,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self.sample_from_anchor = bool(self.draft_model.sample_from_anchor)
+        expected_sample_from_anchor = get_spec().speculative_dspark_sample_from_anchor
+        if expected_sample_from_anchor != self.sample_from_anchor:
+            raise RuntimeError(
+                "DSpark draft layout changed between server-args resolution and "
+                "model construction."
+            )
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
+                self.query_token_num,
+                self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -182,7 +192,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.query_token_num), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
