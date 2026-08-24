@@ -58,9 +58,9 @@ def test_splits_never_increase_with_token_count():
     for tokens in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         splits = _kv_splits_heuristic(tokens, HEADS, BLOCK_H, num_cu=NUM_CU)
         if prev is not None:
-            assert splits <= prev, (
-                f"splits rose from {prev} to {splits} going to T={tokens}"
-            )
+            assert (
+                splits <= prev
+            ), f"splits rose from {prev} to {splits} going to T={tokens}"
         prev = splits
 
 
@@ -69,9 +69,7 @@ def test_saturated_grid_does_not_split():
     add partial-buffer writes and reduce work."""
     # base_ctas = T * ceil(H/block_h); target_wg = 1.5 * num_cu by default.
     saturating_tokens = NUM_CU * 4  # 1024 tokens x 2 head blocks = 2048 CTAs
-    assert (
-        _kv_splits_heuristic(saturating_tokens, HEADS, BLOCK_H, num_cu=NUM_CU) == 1
-    )
+    assert _kv_splits_heuristic(saturating_tokens, HEADS, BLOCK_H, num_cu=NUM_CU) == 1
 
 
 def test_does_not_read_tensors_only_capture_time_scalars():
