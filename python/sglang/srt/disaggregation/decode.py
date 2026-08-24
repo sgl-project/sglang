@@ -481,13 +481,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids()
+            if self.draft_token_to_kv_pool is None
+            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            else []
+        )
         if enable_kv_reshard:
-            kv_args.kv_layer_ids = (
-                self.token_to_kv_pool.get_kv_layer_ids()
-                if self.draft_token_to_kv_pool is None
-                and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-                else []
-            )
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
                 kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
