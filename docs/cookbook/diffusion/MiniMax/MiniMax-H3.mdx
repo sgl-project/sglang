@@ -958,6 +958,30 @@ linear layers use FP8 while embeddings, normalization, and the vision tower
 remain BF16. This is an approximate serve-time choice and is incompatible with
 the strict `quality="high"` deployment contract.
 
+The mixed W4A8 community encoder follows the same component-path contract:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
+```
+
+Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
+loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
+vision tower remains BF16.
+
+The same component option accepts a self-describing Quanto qint8 file without
+an additional quantization flag:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors
+```
+
+This variant keeps the declared language and vision linear weights in qint8
+storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
+it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
+is the selector; adding `--quantization` would describe a different operation.
+
 </Tab>
 
 <Tab title="Encoder scheduling">
