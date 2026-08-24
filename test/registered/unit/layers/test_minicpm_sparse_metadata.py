@@ -393,6 +393,11 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_tp_size=1),
             ),
+            patch.object(
+                backend_module,
+                "get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=64),
+            ),
             patch.object(backend_module, "attach_compressed_cache"),
         ):
             backend = MiniCPMSparseBackend(model_runner, use_flashinfer=False)
