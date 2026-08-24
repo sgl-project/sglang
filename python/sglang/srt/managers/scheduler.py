@@ -4449,10 +4449,17 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+        if (
+            self.spec_algorithm.is_dspark()
+            or self.spec_algorithm.is_dflash_confidence()
+        ) and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
-                ret["dspark_info_record"] = info_record
+                ret[
+                    "dspark_info_record"
+                    if self.spec_algorithm.is_dspark()
+                    else "dflash_confidence_info_record"
+                ] = info_record
 
         # These fields are not msgpack-serializable (a config object and a bound
         # signal handler); no reader consumes them.
@@ -4470,6 +4477,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "dflash_confidence_clear_info_records",
             ]
         )
 
@@ -4511,6 +4519,16 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "dflash_confidence_clear_info_records":
+                if not self.spec_algorithm.is_dflash_confidence() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dflash_confidence_clear_info_records requires a "
+                        "DFLASH_CONFIDENCE draft worker."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -4534,6 +4552,8 @@ class Scheduler(
                     None if frac is None else float(frac)
                 )
             if remaining.pop("dspark_clear_info_records", None):
+                self.draft_worker.clear_info_records()
+            if remaining.pop("dflash_confidence_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
                 get_context().override(source="update_server_args", **remaining)

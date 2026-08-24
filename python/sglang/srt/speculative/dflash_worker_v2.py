@@ -14,7 +14,12 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
     accept_sampling,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildRaggedVerifyWindow,
+    ScatterCompactToStrided,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
@@ -41,6 +46,14 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_confidence import (
+    plan_verify_prefixes,
+    select_sps_verify_token_budget,
+    selector_confidence_from_scores,
+)
+from sglang.srt.speculative.dflash_confidence_observability import (
+    DFlashConfidenceObserver,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -61,6 +74,13 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    load_sps_table_from_path,
+)
+from sglang.srt.speculative.dspark_components.dspark_sts import (
+    load_sts_calibration_from_path,
+)
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -290,6 +310,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
+        self._selector_confidence = None
+        self._confidence_observer = DFlashConfidenceObserver()
+        self._confidence_sps_table = self._load_confidence_sps_table()
+        self._confidence_head = None
         self._logged_first_verify = False
 
         bundle = build_draft_tp_worker(
@@ -326,6 +350,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._load_confidence_sts_calibration()
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -453,6 +479,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
+        if self._uses_confidence_scheduling():
+            # Confidence comes from the eager selector lattice. Avoid a folded
+            # draft graph that would otherwise hide those scores; target verify
+            # remains eligible for normal graphs when its ragged geometry matches.
+            capture_decode_cuda_graph = False
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -980,9 +1011,97 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs, sampling_info=sampling_info, device=device
             ),
         )
+        tokens = tokens.view(bs, num_pred)
+        if self._uses_confidence_scheduling():
+            confidence = draft_model.compute_confidence(
+                draft_hidden=pred_hidden,
+                anchor_tokens=anchor_token_ids,
+                sampled_tokens=tokens,
+            )
+            self._selector_confidence = (
+                confidence
+                if confidence is not None
+                else selector_confidence_from_scores(scores)
+            )
         if not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
-        return tokens.view(bs, num_pred)
+        return tokens
+
+    def _uses_confidence_scheduling(self) -> bool:
+        return self.server_args.speculative_algorithm == "DFLASH_CONFIDENCE"
+
+    def _load_confidence_sps_table(self):
+        path = self.server_args.speculative_dflash_confidence_sps_table_path
+        if not path:
+            return None
+        table = load_sps_table_from_path(path)
+        if self.ps.tp_rank == 0:
+            logger.info("Loaded DFLASH_CONFIDENCE SPS cost table from %s.", path)
+        return table
+
+    def _load_confidence_sts_calibration(self) -> None:
+        path = self.server_args.speculative_dflash_confidence_sts_path
+        if not path:
+            return
+        if self._confidence_head is None:
+            raise ValueError(
+                "--speculative-dflash-confidence-sts-path requires a DFlash draft "
+                "checkpoint with enable_confidence_head=True and trained "
+                "confidence_head weights."
+            )
+        calibration = load_sts_calibration_from_path(path)
+        temperatures = torch.tensor(
+            calibration.temperatures, dtype=torch.float32, device=self.device
+        )
+        gamma = self.block_size - 1
+        if temperatures.numel() != gamma:
+            raise ValueError(
+                "DFLASH_CONFIDENCE STS calibration was fit for gamma="
+                f"{temperatures.numel()} but the runtime gamma is {gamma}; refit "
+                f"the table for gamma={gamma} or omit "
+                "--speculative-dflash-confidence-sts-path."
+            )
+        self._confidence_head.sts_temperatures = temperatures
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "Loaded DFLASH_CONFIDENCE STS calibration from %s (gamma=%d).",
+                path,
+                gamma,
+            )
+
+    def _ragged_verify_graph_buckets(self) -> Optional[list[int]]:
+        runner = self.model_runner.decode_cuda_graph_runner
+        buckets = getattr(runner, "capture_num_tokens", None) if runner else None
+        return list(buckets) if buckets else None
+
+    def _confidence_target_verify_tokens(self, confidence: torch.Tensor) -> int:
+        if self._confidence_sps_table is None:
+            return int(self.server_args.speculative_dflash_confidence_target_verify_tokens)
+        decision = select_sps_verify_token_budget(
+            confidence,
+            verify_num_draft_tokens=self.block_size,
+            min_verify_len=int(
+                self.server_args.speculative_dflash_confidence_min_verify_len
+            ),
+            sps_table=self._confidence_sps_table,
+        )
+        target_tokens = int(decision.budget)
+        if self.server_args.speculative_dflash_confidence_align_verify_tokens_to_graph_tier:
+            buckets = self._ragged_verify_graph_buckets()
+            if buckets:
+                for bucket in buckets:
+                    if bucket >= target_tokens:
+                        target_tokens = bucket
+                        break
+        return min(target_tokens, confidence.shape[0] * self.block_size)
+
+    def dump_info_records(self) -> Optional[dict]:
+        if not self._uses_confidence_scheduling():
+            return None
+        return self._confidence_observer.dump()
+
+    def clear_info_records(self) -> None:
+        self._confidence_observer.clear()
 
     def _selector_sampling_accept(
         self,
@@ -1897,6 +2016,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None:
             self._selector_sample = None
+            self._selector_confidence = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
                 self._draft_sampler.stage_sampling_params(
@@ -1950,16 +2070,88 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
+        confidence_layout: Optional[RaggedVerifyLayout] = None
+        use_confidence_ragged = (
+            self._uses_confidence_scheduling()
+            and self._selector_confidence is not None
+            and _is_all_greedy(batch.sampling_info)
+            and not batch.has_grammar
+            and (
+                int(self.server_args.speculative_dflash_confidence_target_verify_tokens)
+                > 0
+                or self._confidence_sps_table is not None
+            )
+        )
+        confidence_reason = "full_verify_disabled"
+        if use_confidence_ragged:
+            decision = plan_verify_prefixes(
+                self._selector_confidence,
+                verify_num_draft_tokens=block_size,
+                confidence_threshold=float(
+                    self.server_args.speculative_dflash_confidence_threshold
+                ),
+                min_verify_len=int(
+                    self.server_args.speculative_dflash_confidence_min_verify_len
+                ),
+                target_verify_tokens=self._confidence_target_verify_tokens(
+                    self._selector_confidence
+                ),
+            )
+            graph_buckets = self._ragged_verify_graph_buckets()
+            confidence_layout = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=decision.verify_lens.cpu().tolist(),
+                device=device,
+                grid=graph_buckets or [int(decision.verify_lens.sum())],
+            )
+            confidence_reason = "confidence_ragged"
+            self._confidence_observer.observe(
+                confidence=self._selector_confidence,
+                verify_lens=confidence_layout.verify_lens,
+                reason=confidence_reason,
+                deferred_tokens=decision.deferred_tokens,
+                low_confidence_tokens=decision.low_confidence_tokens,
+            )
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=confidence_layout,
+                # BuildRaggedVerifyWindow's Triton gather indexes both inputs
+                # with the proposed-token stride. Keep the anchor in column 0
+                # of the full block so every request row has that same stride.
+                draft_block_ids=draft_tokens,
+                draft_tokens=draft_tokens[:, 1:],
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=block_size,
+                model_runner=self.model_runner,
+            )
+            verify_input_ids = ragged_window.verify_ids
+            verify_positions = ragged_window.positions
+            batch.out_cache_loc = ragged_window.verify_cache_loc
+        else:
+            if self._uses_confidence_scheduling():
+                if self._selector_confidence is None:
+                    confidence_reason = "full_verify_no_selector_confidence"
+                elif not _is_all_greedy(batch.sampling_info):
+                    confidence_reason = "full_verify_sampling"
+                elif batch.has_grammar:
+                    confidence_reason = "full_verify_grammar"
+                self._confidence_observer.observe(
+                    confidence=self._selector_confidence,
+                    verify_lens=None,
+                    reason=confidence_reason,
+                )
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_positions = positions
+            batch.out_cache_loc = verify_out_cache_loc
+
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
+            positions=verify_positions,
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=confidence_layout,
         )
-
-        batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -1968,8 +2160,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            # Ragged verify extends each request by its selected prefix; full
+            # DFLASH retains the original fixed-block host bound.
+            verify_host_seq_lens = (
+                seq_lens_cpu_backup + confidence_layout.verify_lens.cpu()
+                if confidence_layout is not None
+                else seq_lens_cpu_backup + block_size
+            )
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -1990,7 +2187,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
-
+        if confidence_layout is not None:
+            compact_logits = logits_output.next_token_logits
+            compact_hidden = logits_output.hidden_states
+            if compact_hidden is None:
+                raise RuntimeError("DFLASH_CONFIDENCE verify requires target hidden states.")
+            logits_output.next_token_logits = ScatterCompactToStrided.execute(
+                compact=compact_logits,
+                layout=confidence_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=block_size,
+            )
+            logits_output.hidden_states = ScatterCompactToStrided.execute(
+                compact=compact_hidden,
+                layout=confidence_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=block_size,
+            )
         grammar_mask = None
         if batch.has_grammar:
             grammar_mask = build_grammar_vocab_mask(
@@ -2024,6 +2237,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+            )
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif confidence_layout is not None:
+            # Only rows materialized by the ragged target forward are eligible.
+            # The discarded suffix cannot be accepted from its zero-filled
+            # scatter slot and will be proposed again after the target bonus.
+            accept_len, bonus, _ = AcceptGreedy.execute(
+                candidates=candidates,
+                target_logits=logits_output.next_token_logits,
+                verify_num_draft_tokens=block_size,
+                cutoff_verify_lens=confidence_layout.verify_lens,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (

@@ -136,7 +136,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+            "DFLASH_CONFIDENCE",
+        ):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
                 "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
@@ -307,6 +311,39 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--speculative-draft-window-size must be >= "
                 "--speculative-num-draft-tokens (block_size). "
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
+            )
+
+    if server_args.speculative_algorithm == "DFLASH_CONFIDENCE":
+        threshold = float(server_args.speculative_dflash_confidence_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "--speculative-dflash-confidence-threshold must be in [0, 1], "
+                f"got {threshold}."
+            )
+        min_verify_len = int(server_args.speculative_dflash_confidence_min_verify_len)
+        block_size = int(server_args.speculative_num_draft_tokens)
+        if not 2 <= min_verify_len <= block_size:
+            raise ValueError(
+                "--speculative-dflash-confidence-min-verify-len must be in "
+                f"[2, {block_size}], got {min_verify_len}."
+            )
+        target_tokens = int(server_args.speculative_dflash_confidence_target_verify_tokens)
+        if target_tokens < 0:
+            raise ValueError(
+                "--speculative-dflash-confidence-target-verify-tokens must be "
+                f"non-negative, got {target_tokens}."
+            )
+        sps_table_path = server_args.speculative_dflash_confidence_sps_table_path
+        if sps_table_path and not os.path.isfile(sps_table_path):
+            raise ValueError(
+                "--speculative-dflash-confidence-sps-table-path must point to an "
+                f"existing SPS table JSON file, got {sps_table_path!r}."
+            )
+        sts_path = server_args.speculative_dflash_confidence_sts_path
+        if sts_path and not os.path.isfile(sts_path):
+            raise ValueError(
+                "--speculative-dflash-confidence-sts-path must point to an "
+                f"existing STS calibration JSON file, got {sts_path!r}."
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
