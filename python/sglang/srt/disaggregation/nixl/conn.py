@@ -487,6 +487,12 @@ class NixlKVManager(CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            # Chunks parked while the room's decode-peer bootstrap metadata
+            # is incomplete. A request can finish prefill (e.g. decode-side
+            # radix cache hit) before all peers register; the chunk must be
+            # parked, not dropped, or the room never concludes.
+            self._pending_chunks = {}
+            self._pending_chunks_lock = threading.Lock()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -2432,15 +2438,76 @@ class NixlKVManager(CommonKVManager):
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
 
-        if bootstrap_room not in self.transfer_infos:
-            # Dummy rank or already cleared; nothing to enqueue.
-            return None
+        with self._pending_chunks_lock:
+            # Opportunistically drop stale parked chunks (room concluded or
+            # peers never finished bootstrapping).
+            if self._pending_chunks:
+                now = time.time()
+                for r in [
+                    r
+                    for r, chunks in self._pending_chunks.items()
+                    if chunks and now - chunks[-1][0] > 300
+                ]:
+                    self._pending_chunks.pop(r, None)
 
+            room_infos = self.transfer_infos.get(bootstrap_room)
+            ready = room_infos is not None and all(
+                info.required_dst_info_num == len(room_infos)
+                for info in room_infos.values()
+            )
+            if not ready:
+                if self.is_dummy_cp_rank:
+                    # Dummy CP ranks never register transfer info.
+                    return None
+                # Bootstrap metadata from the decode peers has not fully
+                # arrived yet (common with decode-side radix cache hits,
+                # where prefill finishes almost instantly). Park the chunk;
+                # the bootstrap thread drains it once the room is ready.
+                self._pending_chunks.setdefault(bootstrap_room, []).append(
+                    (
+                        time.time(),
+                        TransferKVChunk(
+                            room=bootstrap_room,
+                            prefill_kv_indices=kv_indices,
+                            index_slice=index_slice,
+                            is_last_chunk=is_last_chunk,
+                            chunk_id=chunk_id,
+                            prefill_aux_index=aux_index,
+                            state_indices=state_indices,
+                            num_kv_tokens=num_kv_tokens,
+                        ),
+                    )
+                )
+                return None
+
+            self._enqueue_chunk(
+                bootstrap_room,
+                room_infos,
+                kv_indices,
+                index_slice,
+                is_last_chunk,
+                chunk_id,
+                aux_index,
+                state_indices,
+                num_kv_tokens,
+            )
+        return None
+
+    def _enqueue_chunk(
+        self,
+        bootstrap_room: int,
+        room_infos,
+        kv_indices,
+        index_slice,
+        is_last_chunk: bool,
+        chunk_id: int,
+        aux_index,
+        state_indices,
+        num_kv_tokens,
+    ):
         # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
         # worker, keeping a room's chunks on one private staging buffer.
-        session_port_sum = sum(
-            info.dst_port for info in self.transfer_infos[bootstrap_room].values()
-        )
+        session_port_sum = sum(info.dst_port for info in room_infos.values())
         shard_idx = session_port_sum % len(self.transfer_queues)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
@@ -2454,7 +2521,6 @@ class NixlKVManager(CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
             )
         )
-        return None
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
@@ -2760,6 +2826,26 @@ class NixlKVManager(CommonKVManager):
                     )
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
+                    # Drain chunks parked before this room finished
+                    # bootstrapping. Holding the lock across enqueue preserves
+                    # chunk order against concurrent add_transfer_request.
+                    with self._pending_chunks_lock:
+                        parked = self._pending_chunks.pop(room, None)
+                        if parked:
+                            room_infos = self.transfer_infos.get(room)
+                            if room_infos is not None:
+                                for _, chunk in parked:
+                                    self._enqueue_chunk(
+                                        room,
+                                        room_infos,
+                                        chunk.prefill_kv_indices,
+                                        chunk.index_slice,
+                                        chunk.is_last_chunk,
+                                        chunk.chunk_id,
+                                        chunk.prefill_aux_index,
+                                        chunk.state_indices,
+                                        chunk.num_kv_tokens,
+                                    )
 
         threading.Thread(target=bootstrap_thread).start()
 

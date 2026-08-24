@@ -1310,6 +1310,13 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_pending_chunks"):
+            lock = getattr(self.kv_mgr, "_pending_chunks_lock", None)
+            if lock is not None:
+                with lock:
+                    self.kv_mgr._pending_chunks.pop(self.bootstrap_room, None)
+            else:
+                self.kv_mgr._pending_chunks.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
             # Drop a held ack target if the room concluded without draining
             # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
