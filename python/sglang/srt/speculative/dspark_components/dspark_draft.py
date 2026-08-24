@@ -182,6 +182,8 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._reuse_static_inputs = str(draft_model_runner.device).startswith("npu")
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -325,9 +327,7 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
-        )
+        draft_block_ids = self._get_draft_block_ids(bs, device)
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
@@ -388,6 +388,25 @@ class DraftBlockProposer:
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
         )
+
+    def _get_draft_block_ids(self, bs: int, device) -> torch.Tensor:
+        if not self._reuse_static_inputs:
+            return torch.full(
+                (bs, self.gamma),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs:
+            buf = torch.full(
+                (bs, self.gamma),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        return buf[:bs]
 
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
