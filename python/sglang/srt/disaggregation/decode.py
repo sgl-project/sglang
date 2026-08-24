@@ -70,6 +70,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import write_page_tail
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1838,12 +1839,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
+        write_end = total_prefix_len + len(kv_loc)
         self.req_to_token_pool.write(
-            (
-                req.req_pool_idx,
-                slice(total_prefix_len, total_prefix_len + len(kv_loc)),
-            ),
+            (req.req_pool_idx, slice(total_prefix_len, write_end)),
             kv_loc,
+        )
+        write_page_tail(
+            allocator,
+            self.req_to_token_pool.req_to_token,
+            torch.tensor([req.req_pool_idx], device=kv_loc.device),
+            torch.tensor([write_end], device=kv_loc.device),
+            allocator.page_size,
         )
 
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
