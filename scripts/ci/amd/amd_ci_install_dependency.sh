@@ -265,6 +265,15 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
+  # Only the rocm724 (noble) base is missing libgrpc++-dev; 7.0 and 7.2.0 built
+  # MORI without it for months before this step existed, so skip the apt round
+  # trip there. Where it does run, neither step may be fatal: apt-get update
+  # exits 100 for a single unreachable index while still keeping every index it
+  # did fetch, which under set -e is enough to take out the dependency install
+  # on every AMD runner at once. Six external apt hosts are in play, so the
+  # guard is not specific to the rocm-osdb source that first triggered this.
+  # Retries are already configured image-wide (Acquire::Retries) and do not
+  # help against a 404.
   docker exec ci_sglang bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
@@ -273,8 +282,10 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    apt-get update
-    apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
+    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ]; then
+      apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
+      apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
+    fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig

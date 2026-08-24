@@ -112,6 +112,26 @@ TARGET = {
                 "video_audio.reference_preserve",
             ],
         ),
+        (
+            "ref2va",
+            [
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                },
+                {
+                    "type": "image",
+                    "uri": "file:///subject.png",
+                    "role": "reference",
+                },
+            ],
+            "ref2va",
+            [0, 1],
+            [],
+            ["image.target_canvas", "image.reference_preserve"],
+        ),
     ],
 )
 def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
@@ -132,9 +152,33 @@ def test_public_tasks_resolve_to_exact_partition_and_encoder_plan(
     assert plan.encoders["audio"] == audio
     assert [material.material_chain for material in plan.materials] == chains
     if task == "ref2va":
-        assert plan.materials[1].start_time_seconds == 12.5
+        assert plan.encoders["qwen"]["ordered_condition_indices"] == [
+            index
+            for index, condition in enumerate(conditions)
+            if condition["role"] == "reference"
+        ]
+    for index, condition in enumerate(conditions):
+        if condition.get("start_time_seconds") is not None:
+            assert plan.materials[index].start_time_seconds == 12.5
     assert plan.shape["frame_count"] == 124
     assert plan.shape["video_latent_t"] == 37
+
+
+def test_ref2va_rejects_keyframes_without_a_reference():
+    with pytest.raises(ValueError, match="at least one reference"):
+        minimax_h3_validate_canonical_request(
+            task="ref2va",
+            prompt="contract",
+            conditions=[
+                {
+                    "type": "image",
+                    "uri": "file:///first.png",
+                    "role": "keyframe",
+                    "frame_index": 0,
+                }
+            ],
+            target=TARGET,
+        )
 
 
 @pytest.mark.parametrize(
