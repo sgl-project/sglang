@@ -77,19 +77,19 @@
   },
   "profiling_overlay": {
     "parent_local_commit": "85c23c62fdc58a5a0c3b7c6d61a7bba720a6cbbf",
-    "local_commit": "80d1fee3e8bebd2024c71bea36ae2220e184cc5e",
+    "local_commit": "3f76741049e33d5cd9cf9a09e4cc797db050b5d1",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
-    "candidate_sha256": "d32fefc52062b19d81c9110e74e10bfc6e1327fc80ea96a7de449f6dce1d4a45",
+    "candidate_sha256": "cecc4a4a1ea900bf72d965672ce5c09619152e735acb9584c93382f0a5f65ae2",
     "symm_mem_gather_file": "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py",
     "symm_mem_gather_sha256": "8a1f8e9a1f13c26b89691eb0dc7bec07595b107778f180d1afa0a93d5e8af9c4",
     "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
     "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
     "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
-    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX start/end capture range instead of cudaProfilerStart/Stop, synchronize the worker-wide boundary when either any or all DP ranks observe a requested rank-local batch, re-synchronize ranks after unequal Nsight startup latency, optionally retain variable-shape real decode batches in the capture for later exact-shape filtering, and synchronize enqueued GPU work before asynchronous report finalization; model execution is unchanged unless the profiling-only environment variables are set.",
+    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX start/end capture range instead of cudaProfilerStart/Stop, synchronize the worker-wide boundary when either any or all DP ranks observe a requested rank-local batch, release ranks through a profile-specific shared-filesystem startup latch after unequal Nsight attach latency, optionally retain variable-shape real decode batches in the capture for later exact-shape filtering, and synchronize enqueued GPU work before asynchronous report finalization; model execution is unchanged unless the profiling-only environment variables are set.",
     "targeted_validation": {
       "cpu_unit_test": "pass: independent NVTX range start/end selected on the base GPU rank, GPU work synchronized before finalization, and cudaProfilerStart/Stop omitted",
       "exact_batch_gate": "py_compile pass; capture length is controlled by SGLANG_NSYS_EXACT_DECODE_BATCHES and defaults to two for backward compatibility; targeted unit coverage covers deferred exact-running-batch start, all-rank and any-rank reductions, optional variable-shape capture, window rebasing, and idle-pass resistance",
-      "post_start_barrier": "py_compile pass; live job 3262502 proved one worker completed while another entered only a partial first step after unequal Nsight startup, so the profiling-only path now performs one worker-wide CPU barrier immediately after _start_profile; regression assertions require the added start barrier plus the existing pre/post-stop pair",
+      "post_start_latch": "py_compile pass; live job 3262502 proved unequal Nsight attach let only a partial first step enter, while 3262801 proved that a Gloo barrier issued after rank-0 NVTX capture attachment can itself stall. The profiling-only path now uses a profile-specific shared-filesystem marker written after rank-0 startup; regression assertions require this latch and only the existing pre/post-stop barriers",
       "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
       "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
     }
