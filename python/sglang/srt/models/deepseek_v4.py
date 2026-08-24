@@ -181,6 +181,7 @@ if _is_npu:
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
     mhc_fused_post_pre: Optional[Callable[..., Any]]
+    npu_hc_pre: Optional[Callable[..., Any]]
     mhc_pre: Optional[Callable[..., Any]]
     mhc_post: Optional[Callable[..., Any]]
     fused_hc_head: Optional[Callable[..., Any]]
@@ -190,11 +191,11 @@ class MhcOps(NamedTuple):
 def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
 
-    Model modules are imported eagerly by the registry.  Importing
+    Model modules are imported eagerly by the registry. Importing
     ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
     Import it only when a DeepSeek-V4 layer executes so registry discovery
     cannot initialize an optional CUDA runtime before unrelated models set up
-    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    their communication workspaces. DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
         from sgl_kernel import (
@@ -206,11 +207,12 @@ def _get_mhc_ops() -> MhcOps:
         )
 
         return MhcOps(
-            hc_split_sinkhorn,
-            mhc_fused_post_pre,
-            mhc_pre,
-            hc_post,
-            fused_hc_head,
+            hc_split_sinkhorn=hc_split_sinkhorn,
+            mhc_fused_post_pre=mhc_fused_post_pre,
+            npu_hc_pre=None,
+            mhc_pre=mhc_pre,
+            mhc_post=hc_post,
+            fused_hc_head=fused_hc_head,
         )
 
     from sglang.kernels.ops.layernorm.mhc import (
@@ -219,7 +221,14 @@ def _get_mhc_ops() -> MhcOps:
         npu_hc_pre,
     )
 
-    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre, None, None)
+    return MhcOps(
+        hc_split_sinkhorn=hc_split_sinkhorn,
+        mhc_fused_post_pre=mhc_fused_post_pre,
+        npu_hc_pre=npu_hc_pre,
+        mhc_pre=None,
+        mhc_post=None,
+        fused_hc_head=None,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -1830,7 +1839,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            return _get_mhc_ops().mhc_pre(
+            return _get_mhc_ops().npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
