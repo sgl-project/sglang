@@ -958,6 +958,17 @@ linear layers use FP8 while embeddings, normalization, and the vision tower
 remain BF16. This is an approximate serve-time choice and is incompatible with
 the strict `quality="high"` deployment contract.
 
+The mixed W4A8 community encoder follows the same component-path contract:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
+```
+
+Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
+loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
+vision tower remains BF16.
+
 </Tab>
 
 <Tab title="Encoder scheduling">
