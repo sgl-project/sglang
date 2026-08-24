@@ -9,6 +9,8 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 
@@ -25,6 +27,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         super().__init__(cpu_group, device, device_group, unique_name)
         self.dist_module = torch.distributed
+        self._all_gather_single = all_gather_single
 
         if (
             (current_platform.get_cpu_architecture() == CpuArchEnum.X86)
@@ -32,6 +35,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             and unique_name.startswith("tp")
         ):
             self.dist_module = _CPUSHMDistributed(self)
+            self._all_gather_single = self.dist_module.all_gather_single
 
         self._group_shm_handles: dict[tuple[int, ...], int] = {}
         self._group_shm_available = self._load_group_shm_ops()
@@ -220,21 +224,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-
-        if self._can_use_group_shm_allgather(input_):
-            handle = self._get_group_shm_handle(group)
-
-            torch.ops.sgl_kernel.shm_group_allgather(
-                handle,
-                output_tensor,
-                input_,
-            )
-        else:
-            self.dist_module.all_gather_into_tensor(
-                output_tensor,
-                input_,
-                group=group,
-            )
+        # All-gather.
+        self._all_gather_single(output_tensor, input_, group=self.device_group)
 
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
@@ -326,7 +317,7 @@ class _CPUSHMDistributed:
             torch.distributed.get_group_rank(group, dst),
         )
 
-    def all_gather_into_tensor(
+    def all_gather_single(
         self,
         output: torch.Tensor,
         input: torch.Tensor,

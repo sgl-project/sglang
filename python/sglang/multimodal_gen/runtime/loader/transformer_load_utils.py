@@ -75,8 +75,7 @@ _HF_SAFETENSORS_URL_RE = re.compile(
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
     if config is None:
         return None
-    quant_name_getter = getattr(type(config), "get_name", None)
-    return quant_name_getter() if callable(quant_name_getter) else None
+    return config.get_name()
 
 
 def _merge_modelopt_fp4_configs(
@@ -176,7 +175,14 @@ class TransformerQuantLoadSpec:
 
     @property
     def uses_comfy_layer_markers(self) -> bool:
-        return self.is_comfy_fp8 or self.is_serialized_kitchen_int8
+        return (
+            self.is_comfy_fp8
+            or self.is_serialized_kitchen_int8
+            or (
+                _get_quant_config_name(self.quant_config) == "mxfp8"
+                and self.quant_config.layer_markers is not None
+            )
+        )
 
 
 class _TransformerQuantAdapter:
@@ -285,9 +291,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if cls_name != "Flux2Transformer2DModel" or quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-        if quant_name != "modelopt_fp4":
+        if _get_quant_config_name(quant_config) != "modelopt_fp4":
             return
 
         weights_path = os.path.basename(server_args.transformer_weights_path or "")
@@ -370,10 +374,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-
-        if quant_name != "modelopt_fp8":
+        if _get_quant_config_name(quant_config) != "modelopt_fp8":
             return
 
         component_offload = _uses_component_offload(
@@ -856,7 +857,7 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name in ("modelopt_fp8", "comfy_fp8"):
+    if quant_name in ("modelopt_fp8", "comfy_fp8", "mxfp8"):
         return True
     if quant_name == "kitchen_int8":
         assert isinstance(quant_config, KitchenInt8Config)
@@ -864,7 +865,6 @@ def _needs_device_weight_postprocess(
 
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
-        "mxfp8": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
         "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
     }

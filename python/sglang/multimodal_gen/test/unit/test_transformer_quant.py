@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
@@ -101,6 +102,14 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUMXFP8LinearMethod,
+)
+from sglang.srt.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig as SRTBitsAndBytesConfig,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
 
 
 class _FakeFluxTransformer:
@@ -275,7 +284,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(curve_shape, (1025, 8))
         self.assertEqual(comfy_quant["blocks.0.mlp.fc1"]["format"], "int8_tensorwise")
 
-    def test_inspect_minimax_h3_fp8_validates_required_scales(self):
+    def test_inspect_minimax_h3_fp8_detects_static_activation_scale(self):
         marker = torch.tensor(list(b'{"format":"float8_e4m3fn"}'), dtype=torch.uint8)
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
@@ -292,7 +301,31 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
             _, layer_markers = inspect_minimax_h3_safetensors([f.name])
 
-        self.assertEqual(layer_markers["blocks.0.mlp.fc1"], {"format": "float8_e4m3fn"})
+        self.assertEqual(
+            layer_markers["blocks.0.mlp.fc1"],
+            {"format": "float8_e4m3fn", "_activation_scheme": "static"},
+        )
+
+    def test_inspect_minimax_h3_fp8_without_input_scale_uses_dynamic_activation(self):
+        marker = torch.tensor(list(b'{"format":"float8_e4m3fn"}'), dtype=torch.uint8)
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones(
+                        (2, 2), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_scale": torch.tensor(0.5),
+                    "blocks.0.mlp.fc1.comfy_quant": marker,
+                },
+                f.name,
+            )
+
+            _, layer_markers = inspect_minimax_h3_safetensors([f.name])
+
+        self.assertEqual(
+            layer_markers["blocks.0.mlp.fc1"],
+            {"format": "float8_e4m3fn", "_activation_scheme": "dynamic"},
+        )
 
     def test_minimax_h3_comfy_int8_resolves_serialized_kitchen(self):
         config = resolve_minimax_h3_checkpoint_quantization(
@@ -357,7 +390,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     def test_minimax_h3_comfy_fp8_resolves_per_layer_dispatch(self):
         config = resolve_minimax_h3_checkpoint_quantization(
             {
-                "blocks.0.attn.qkv_proj": {"format": "float8_e4m3fn"},
+                "blocks.0.attn.qkv_proj": {
+                    "format": "float8_e4m3fn",
+                    "_activation_scheme": "dynamic",
+                },
                 "blocks.0.mlp.fc2": {
                     "format": "float8_e4m3fn",
                     "full_precision_matrix_mult": True,
@@ -372,14 +408,64 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             config.get_quant_method(layer, "blocks.0.mlp.fc2"),
             ComfyFullPrecisionFp8LinearMethod,
         )
-        self.assertIsInstance(
-            config.get_quant_method(layer, "blocks.0.attn.qkv_proj"),
-            Fp8LinearMethod,
-        )
+        fp8_method = config.get_quant_method(layer, "blocks.0.attn.qkv_proj")
+        self.assertIsInstance(fp8_method, Fp8LinearMethod)
+        self.assertEqual(fp8_method.quant_config.activation_scheme, "dynamic")
         self.assertIsInstance(
             config.get_quant_method(layer, "unmarked"),
             UnquantizedLinearMethod,
         )
+
+    def test_minimax_h3_global_mxfp8_metadata_selects_srt_per_layer(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.attn.out_proj.weight": torch.ones(
+                        (32, 64), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.attn.out_proj.weight_scale": torch.ones(
+                        (32, 2), dtype=torch.uint8
+                    ),
+                    "token_refiner.blocks.0.attn.out_proj.weight": torch.ones(
+                        (32, 64), dtype=torch.bfloat16
+                    ),
+                },
+                checkpoint.name,
+                metadata={"quant_format": "mxfp8"},
+            )
+            _, layer_markers = inspect_minimax_h3_safetensors([checkpoint.name])
+            config = resolve_minimax_h3_checkpoint_quantization(layer_markers)
+
+        self.assertIsInstance(config, MXFP8Config)
+        self.assertIsInstance(config, SRTFp8Config)
+        layer = LinearBase(input_size=64, output_size=32)
+        self.assertIsInstance(
+            config.get_quant_method(layer, "blocks.0.attn.out_proj"),
+            SRTFp8LinearMethod,
+        )
+        self.assertIsInstance(
+            config.get_quant_method(layer, "token_refiner.blocks.0.attn.out_proj"),
+            UnquantizedLinearMethod,
+        )
+
+    def test_mxfp8_npu_selects_srt_linear_method(self):
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.mxfp8.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.mxfp8.current_platform.is_npu",
+                return_value=True,
+            ),
+        ):
+            config = MXFP8Config()
+            method = config.get_quant_method(
+                LinearBase(input_size=64, output_size=32),
+                "blocks.0.attn.out_proj",
+            )
+
+        self.assertIsInstance(method, NPUMXFP8LinearMethod)
 
     def test_comfy_full_precision_fp8_dequantizes_before_linear(self):
         layer = torch.nn.Module()
@@ -600,7 +686,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
         )
         self.assertTrue(_needs_device_weight_postprocess(_make_quant_config("mxfp8")))
-        self.assertFalse(
+        self.assertTrue(
             _needs_device_weight_postprocess(
                 _make_quant_config("mxfp8", is_checkpoint_fp8_serialized=True)
             )
@@ -762,6 +848,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertIsInstance(config, SRTBitsAndBytesConfig)
         self.assertTrue(config.load_in_4bit)
         self.assertEqual(config.bnb_4bit_quant_type, "nf4")
 
@@ -779,6 +866,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertIsInstance(config, Fp8Config)
+        self.assertIsInstance(config, SRTFp8Config)
         self.assertTrue(config.is_checkpoint_fp8_serialized)
 
     def test_bitsandbytes_quant_config_resolves_from_compression_config(self):

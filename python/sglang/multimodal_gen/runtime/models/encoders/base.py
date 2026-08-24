@@ -162,6 +162,14 @@ class EncoderTensorParallelMixin:
     # states or sharding contract cannot use the generic loader lifecycle.
     manages_checkpoint_quantization = False
 
+    @classmethod
+    def configure_component_paths(
+        cls,
+        config: EncoderConfig,
+        component_paths: dict[str, str],
+    ) -> None:
+        """Apply optional runtime components before parallel layout is resolved."""
+
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group
 
