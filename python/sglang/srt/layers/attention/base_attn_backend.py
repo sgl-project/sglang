@@ -39,9 +39,9 @@ def can_write_kv_buffer_from_projection(forward_batch: ForwardBatch) -> bool:
     Distributed attention layouts own cache materialization in the attention
     backend, so projection-side writes are only safe for an ordinary batch.
     """
-    from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.layers.cp.utils import is_cp_active
 
-    return not is_cp_v2_active(forward_batch)
+    return not is_cp_active(forward_batch)
 
 
 class AttentionBackend(ABC):

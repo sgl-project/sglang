@@ -132,7 +132,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import (
-            dsa_cp_round_robin_split_q_seqs_kernel,
+            dsa_cp_interleave_q_seqs_kernel,
         )
 
         cp_size = self.cp_size
@@ -154,7 +154,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         bs_idx = torch.empty(
             (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
         )
-        dsa_cp_round_robin_split_q_seqs_kernel[(1,)](
+        dsa_cp_interleave_q_seqs_kernel[(1,)](
             extend_seqs, q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
         )
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx

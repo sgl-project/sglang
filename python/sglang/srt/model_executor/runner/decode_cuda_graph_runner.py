@@ -49,7 +49,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
+from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -296,9 +296,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
         # layout and is intentionally excluded so the attn_tp-local
         # num_token_non_padded adjustment still runs for it.
-        self.enable_prefill_cp = (
-            is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
-        )
+        self.enable_prefill_cp = is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
