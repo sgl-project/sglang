@@ -994,6 +994,40 @@ def test_configure_resolves_residency_policy(monkeypatch):
     )
 
 
+def test_configure_logs_component_start_and_completion(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    logs = []
+    timestamps = iter((10.0, 12.345))
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "info",
+        lambda message, *args: logs.append(message % args),
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod,
+        "perf_counter",
+        lambda: next(timestamps),
+    )
+
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=2,
+            dit_layerwise_resident_layers=3,
+        ),
+        component_name="transformer",
+    )
+
+    assert logs[0] == (
+        "Configuring layerwise offload for transformer (_ResidentComponent): "
+        "blocks (8 layers)"
+    )
+    assert logs[-1] == (
+        "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
+        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
+    )
+
+
 def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
     _patch_fake_device(monkeypatch)
     model = _MultiGroupComponent()

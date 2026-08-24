@@ -51,7 +51,9 @@ repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
 MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
-including `pruned_fp8_scaled` and serialized ConvRot INT8. Pass one selected
+including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
+exports are also auto-detected: the presence of an input scale selects static
+activation scaling, while its absence selects dynamic scaling. Pass one selected
 FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
 direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
 usage is documented in
@@ -173,6 +175,14 @@ backend.
       <td>Native DiTs and encoders whose parameter mappings preserve each marked linear; MiniMax-H3 DiT and Qwen3-VL encoder checkpoints have validated tensor contracts</td>
       <td><code>comfy-kitchen</code></td>
       <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>mxfp8</code></td>
+      <td>Self-describing serialized weights, or BF16/FP16 weights for online quantization</td>
+      <td><code>--transformer-weights-path</code>, or <code>--quantization mxfp8</code> for online quantization</td>
+      <td>Native diffusion linears; mixed MiniMax-H3 checkpoints are selected per layer</td>
+      <td>SRT's platform MXFP8 backend</td>
+      <td>Serialized metadata is auto-detected. NVIDIA and ROCm reuse SRT's dense MXFP8 kernels; Ascend keeps its native online path. Mixed per-layer checkpoints do not support FSDP.</td>
     </tr>
     <tr>
       <td><code>comfy-w4a8-convrot</code></td>
@@ -1138,11 +1148,13 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
     - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
 
-## MXFP8 Online Quantization
+## MXFP8 Quantization
 
-For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
-Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
-during inference with `npu_quant_matmul` (block_size=32).
+Self-describing serialized MXFP8 transformers are inferred from their
+checkpoint metadata. For online MXFP8 quantization, load the original
+FP16/BF16 model and add `--quantization mxfp8`. NVIDIA and ROCm reuse SRT's
+dense MXFP8 implementation; Ascend uses `npu_dynamic_mx_quant` and
+`npu_quant_matmul` with a block size of 32.
 
 ```bash
 sglang generate \
@@ -1152,7 +1164,9 @@ sglang generate \
   --save-output
 ```
 
-> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
+The selected SRT backend must provide an MXFP8 kernel on NVIDIA or ROCm. On
+Ascend, the hardware requirement remains A5 series or newer;
+`npu_dynamic_mx_quant` is not available on A2/A3.
 
 ## MXFP8 Offline Quantization (msmodelslim)
 
