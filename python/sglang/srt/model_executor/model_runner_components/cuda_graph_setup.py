@@ -72,6 +72,8 @@ def _align_pipeline_layers(layers: list, layer_model) -> list:
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
+    if len(layers) == len(layer_model.layers):
+        return layers
     assert (
         len(layers) <= end_layer - start_layer
     ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
@@ -396,7 +398,18 @@ def capture_prefill_graph(
     model_runner.attention_layers = _align_pipeline_layers(
         model_runner.attention_layers, layer_model
     )
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
+    if len(model_runner.attention_layers) < model_runner.layer_info.end_layer:
+        log_info_on_rank0(
+            logger,
+            "Disable prefill CUDA graph because the attention-layer registry "
+            "does not cover the local pipeline stage",
+        )
+        return result(None)
+
+    local_attention_layers = model_runner.attention_layers[
+        model_runner.layer_info.start_layer : model_runner.layer_info.end_layer
+    ]
+    if any(layer is None for layer in local_attention_layers):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,

@@ -946,7 +946,7 @@ def build_prefill_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 

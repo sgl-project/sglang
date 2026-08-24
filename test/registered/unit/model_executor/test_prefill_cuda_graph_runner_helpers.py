@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    build_prefill_registry,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -27,6 +30,81 @@ class _LayerModel:
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_pp_proxy_uses_stable_capture_buffer_and_live_replay_values(self):
+        buffers = PrefillInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_tokens=8,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=4,
+            dtype=torch.float32,
+            enable_mamba_track=False,
+            pp_size=4,
+        )
+        registry = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+            source=buffers,
+        )
+        live_proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.full((3, 4), 2.0),
+                "residual": torch.full((3, 4), 3.0),
+            }
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(3),
+            positions=torch.arange(3),
+            out_cache_loc=torch.arange(3),
+        )
+
+        registry.fill_from(
+            forward_batch,
+            raw_bs=1,
+            padded_bs=1,
+            raw_num_tokens=3,
+            padded_num_tokens=3,
+            pp_proxy_tensors=live_proxy,
+        )
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.buffers = buffers
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=False)
+        )
+        capture_proxy = runner._capture_pp_proxy_tensors(3)
+        self.assertEqual(capture_proxy["hidden_states"].tolist(), [[2.0] * 4] * 3)
+        self.assertEqual(capture_proxy["residual"].tolist(), [[3.0] * 4] * 3)
+        self.assertEqual(
+            capture_proxy["hidden_states"].data_ptr(),
+            buffers.pp_proxy_tensors["hidden_states"].data_ptr(),
+        )
+
+    def test_finalize_pp_proxy_trims_padded_token_rows(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.raw_num_tokens = 3
+        output = PPProxyTensors(
+            {
+                "hidden_states": torch.arange(20).reshape(5, 4),
+                "residual": torch.arange(20, 40).reshape(5, 4),
+            }
+        )
+
+        trimmed = runner._finalize_execute_output(output)
+
+        self.assertIsInstance(trimmed, PPProxyTensors)
+        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
+        self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
+        self.assertEqual(
+            trimmed["hidden_states"].tolist(),
+            output["hidden_states"][:3].tolist(),
+        )
+        self.assertEqual(trimmed["residual"].tolist(), output["residual"][:3].tolist())
+
     def test_resolve_layer_model_from_language_model_wrapper(self):
         layer_model = _LayerModel()
         model = SimpleNamespace(language_model=SimpleNamespace(model=layer_model))
