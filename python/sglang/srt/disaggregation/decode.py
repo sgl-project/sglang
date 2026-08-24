@@ -297,6 +297,16 @@ class DecodeRequest:
         return self.req.priority
 
 
+@dataclass(frozen=True)
+class _AdmissionFit:
+    full: bool
+    swa: bool
+
+    @property
+    def fits(self) -> bool:
+        return self.full and self.swa
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -407,7 +417,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.skip_lock_node_ids = {}
 
     def _drop_matched_prefix(self, req: Req) -> None:
-        """Release an admission-time hit and restore the state of a cache miss."""
+        """Release an admission-time device hit and clear its device-prefix fields."""
         self._release_matched_prefix_lock(req)
         req.last_node = self.tree_cache.root_node_handle(req.extra_key)
         req.prefix_indices = req.prefix_indices[:0]
@@ -508,7 +518,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         retractable_tokens: int,
         retractable_swa_tokens: int,
         uses_swa_tail_prealloc: bool,
-    ) -> bool:
+    ) -> _AdmissionFit:
         fill_len = self._pre_alloc_fill_len(req)
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len
@@ -518,25 +528,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
 
-        if (
+        full_fits = (
             max(
                 required_tokens_for_request,
                 origin_input_len - prefix_len + max_new_tokens - retractable_tokens,
             )
-            > full_allocatable_tokens
-        ):
-            return False
+            <= full_allocatable_tokens
+        )
 
+        swa_fits = True
         if uses_swa_tail_prealloc:
             _, swa_required = self._prealloc_required_tokens(req)
             _, swa_len = self._prealloc_kv_lens(req)
-            if (
+            swa_fits = (
                 max(swa_required, swa_len + max_new_tokens - retractable_swa_tokens)
-                > swa_allocatable_tokens
-            ):
-                return False
+                <= swa_allocatable_tokens
+            )
 
-        return True
+        return _AdmissionFit(full=full_fits, swa=swa_fits)
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -1298,21 +1307,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 retractable_swa_tokens=retractable_swa_tokens,
                 uses_swa_tail_prealloc=uses_swa_tail_prealloc,
             )
-            fits = self._admission_fits(
+            admission = self._admission_fits(
                 decode_req.req,
                 prefix_len=prefix_len,
                 **admission_kwargs,
             )
             if (
-                not fits
+                not admission.full
+                and admission.swa
                 and prefix_match is not None
-                and prefix_match.l1_prefix_len > 0
+                and prefix_match.l1_prefix_len > prefix_len
                 and not self.scheduler.enable_decode_hicache
             ):
-                # Locking a hit removes its pages from the evictable budget and
-                # can make an otherwise-admissible miss fail this check. Release
-                # it and retry in the same scheduling pass; otherwise every poll
-                # repeats the same hit and head-of-line blocks the queue.
+                # A SWA cap can make the lock cover more FULL pages than the
+                # request may reuse. Only then can dropping the hit reclaim more
+                # budget than it adds back to the request's allocation need.
                 self._drop_matched_prefix(decode_req.req)
                 prefix_match = None
                 prefix_indices = None
@@ -1334,13 +1343,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         extra_reserved_reqs=len(preallocated_reqs),
                     )
                     admission_kwargs["swa_allocatable_tokens"] = swa_allocatable_tokens
-                fits = self._admission_fits(
+                admission = self._admission_fits(
                     decode_req.req,
                     prefix_len=0,
                     **admission_kwargs,
                 )
 
-            if not fits:
+            if not admission.fits:
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
