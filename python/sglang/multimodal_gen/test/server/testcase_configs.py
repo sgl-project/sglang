@@ -46,6 +46,9 @@ class ToleranceConfig:
     non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
+    load_peak_vram: float = 0.01
+    runtime_peak_vram: float = 0.02
+    host_anon: float = 0.02
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -86,6 +89,19 @@ class ToleranceConfig:
             denoise_agg=float(
                 os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
             ),
+            load_peak_vram=float(
+                os.getenv(
+                    "SGLANG_LOAD_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("load_peak_vram", 0.01),
+                )
+            ),
+            runtime_peak_vram=float(
+                os.getenv(
+                    "SGLANG_RUNTIME_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("runtime_peak_vram", 0.02),
+                )
+            ),
+            host_anon=float(tol_data.get("host_anon", 0.02)),
         )
 
 
@@ -99,6 +115,30 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    load_peak_vram_mb: float | None = None
+    runtime_peak_vram_mb: float | None = None
+    # Anonymous-host budget caps; None skips the check (older baselines).
+    load_peak_host_anon_mb: float | None = None
+    runtime_peak_host_anon_mb: float | None = None
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
+        def optional_float(name: str) -> float | None:
+            value = cfg.get(name)
+            return float(value) if value is not None else None
+
+        return cls(
+            stages_ms=cfg["stages_ms"],
+            denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+            expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+            expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+            expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            load_peak_vram_mb=optional_float("load_peak_vram_mb"),
+            runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+            load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
+            runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+        )
 
 
 @dataclass
@@ -122,16 +162,10 @@ class BaselineConfig:
             data.get("tolerances", {}), profile_name
         )
 
-        scenarios = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
+        scenarios = {
+            name: ScenarioConfig.from_dict(cfg)
+            for name, cfg in data["scenarios"].items()
+        }
 
         return cls(
             scenarios=scenarios,
@@ -147,18 +181,12 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        scenarios_new = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios_new[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
-
-        self.scenarios.update(scenarios_new)
+        self.scenarios.update(
+            {
+                name: ScenarioConfig.from_dict(cfg)
+                for name, cfg in data["scenarios"].items()
+            }
+        )
         return self
 
 
@@ -248,6 +276,7 @@ class DiffusionSamplingParams:
 
     # output format
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+    expect_audio_output: bool = False
 
     num_outputs_per_prompt: int = 1
 
@@ -273,6 +302,12 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
+    # Send the request this many times in one server session; performance and
+    # consistency are validated on the last one. >1 asserts a warm second
+    # request meets the same baselines -- a leak in residency arming, courier
+    # in-flight tracking, or host copies shows up as the second request
+    # degrading or dying.
+    perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -408,6 +443,10 @@ class PerformanceSummary:
     step_metrics: list[float]
     sampled_steps: dict[int, float]
     all_denoise_steps: dict[int, float]
+    load_peak_vram_mb: float = 0.0
+    runtime_peak_vram_mb: float = 0.0
+    load_peak_host_anon_mb: float = 0.0
+    runtime_peak_host_anon_mb: float = 0.0
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -437,6 +476,21 @@ class PerformanceSummary:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
 
+        load_peak_vram_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        runtime_peak_vram_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        load_peak_host_anon_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_host_anon_mb", 0.0)
+        )
+        runtime_peak_host_anon_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_host_anon_mb", 0.0
+            )
+        )
+
         return PerformanceSummary(
             e2e_ms=e2e_ms,
             avg_denoise_ms=avg_denoise,
@@ -445,6 +499,10 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            load_peak_vram_mb=load_peak_vram_mb,
+            runtime_peak_vram_mb=runtime_peak_vram_mb,
+            load_peak_host_anon_mb=load_peak_host_anon_mb,
+            runtime_peak_host_anon_mb=runtime_peak_host_anon_mb,
         )
 
 

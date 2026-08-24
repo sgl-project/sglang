@@ -15,6 +15,7 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::environ;
 use crate::utils::response::json_error;
 use crate::utils::serialize::{parse_int, parse_int_opt, parse_int_vec};
 
@@ -337,7 +338,7 @@ fn router(state: Arc<Registry>) -> Router {
 
 /// Drop room entries
 async fn cleanup_sweeper(state: Arc<Registry>) {
-    let cleanup_interval = Duration::from_secs(crate::environ::env_u64(
+    let cleanup_interval = Duration::from_secs(environ::env_u64(
         ENTRY_CLEANUP_INTERVAL_ENV,
         ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS,
     ));
@@ -356,7 +357,10 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{Runtime, RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::message::config::{
+        DisaggregationMode, RuntimeConfig, RustServerServerArgs, ServerArgs,
+    };
+    use crate::runtime::Runtime;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
 
@@ -413,35 +417,36 @@ mod tests {
     const SENTINEL: &str =
         "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1";
 
-    /// Minimal prefill boot blob (same shape as the `runtime` tests): no
-    /// tokenizer load, the two mandatory `model_config` fields, and the
-    /// prefill role that mounts the registry.
-    const TEST_SERVER_ARGS: &str = r#"{
-        "skip_tokenizer_init": true,
-        "disaggregation_mode": "prefill",
-        "model_config": {"context_len": 2048, "vocab_size": 1000}
-    }"#;
+    /// Minimal boot config (same shape as the `runtime` tests): no tokenizer
+    /// load, a complete default `model_config`, and the given PD role.
+    fn test_server_args(disaggregation_mode: DisaggregationMode) -> ServerArgs {
+        ServerArgs {
+            skip_tokenizer_init: true,
+            disaggregation_mode,
+            ..Default::default()
+        }
+    }
 
     /// Pick a free port (probe-bind pattern, as in the `runtime` tests) and
     /// boot the full runtime there with the bootstrap registry mounted — the
     /// registry serves on the api listener, so these tests also pin the merge
     /// wiring (including the `enable_pd_bootstrap()` derivation from the
-    /// blob), not just the handlers.
+    /// role), not just the handlers.
     fn start_on_free_port() -> (Runtime, SocketAddr) {
-        start_runtime(TEST_SERVER_ARGS)
+        start_runtime(test_server_args(DisaggregationMode::Prefill))
     }
 
-    fn start_runtime(server_args_json: &str) -> (Runtime, SocketAddr) {
+    fn start_runtime(server_args: ServerArgs) -> (Runtime, SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
-            server_args: Arc::new(ServerArgs::from_json(server_args_json).unwrap()),
+            server_args: Arc::new(server_args),
         };
         (crate::runtime::start(cfg).expect("start runtime"), addr)
     }
@@ -593,11 +598,7 @@ mod tests {
     /// hiding a misdirected decode/router behind its retry loop.
     #[test]
     fn routes_absent_off_prefill() {
-        let non_prefill = r#"{
-            "skip_tokenizer_init": true,
-            "model_config": {"context_len": 2048, "vocab_size": 1000}
-        }"#;
-        let (_rt, addr) = start_runtime(non_prefill);
+        let (_rt, addr) = start_runtime(test_server_args(DisaggregationMode::Null));
 
         let (status, _) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 404);
