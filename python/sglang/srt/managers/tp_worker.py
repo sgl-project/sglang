@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -51,7 +52,14 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_model,
+    get_schedule,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -81,7 +89,7 @@ class BaseTpWorker(ABC):
         pass
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # For a plain worker that's its own runner.
@@ -340,28 +348,28 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if server_args.skip_tokenizer_init or self.is_draft_worker:
+        if get_serving().skip_tokenizer_init or self.is_draft_worker:
             # A draft worker's tokenizer would only duplicate the target's:
             # tokenizer_path always points at the target model.
             self.tokenizer = self.processor = None
         else:
             if self.model_config.is_multimodal:
                 self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
-                    model_name=server_args.model_path,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    tokenizer_backend=get_serving().tokenizer_backend,
+                    model_name=get_model().model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    tokenizer_backend=get_serving().tokenizer_backend,
                 )
         self.device = self.model_runner.device
 
@@ -372,18 +380,18 @@ class TpModelWorker(BaseTpWorker):
         # Sync random seed across TP workers.
         # Elastic joiners cannot enter the launch-time WORLD broadcast.
         if server_args.is_ep_joiner:
-            self.random_seed = server_args.random_seed
+            self.random_seed = get_device().random_seed
         else:
             self.random_seed = broadcast_pyobj(
-                [server_args.random_seed],
+                [get_device().random_seed],
                 self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
         set_random_seed(self.random_seed)
 
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_spec = server_args.speculative_algorithm is not None
+        self.enable_overlap = not get_schedule().disable_overlap_schedule
+        self.enable_spec = get_spec().speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     def alloc_memory_pool(
@@ -409,8 +417,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * self.model_runner.dcp_size
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
             - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
@@ -428,6 +435,18 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+
+    def start_startup_weight_load(self) -> None:
+        """Start deferred checkpoint prefetching for all model runners."""
+        self.model_runner.start_startup_weight_load()
+        for mr in self.model_runner_list[1:]:
+            mr.start_startup_weight_load()
+
+    def finalize_startup_weight_load(self) -> None:
+        """Commit deferred startup weights for all model runners."""
+        self.model_runner.finalize_startup_weight_load()
+        for mr in self.model_runner_list[1:]:
+            mr.finalize_startup_weight_load()
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -513,8 +532,7 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * self.model_runner.dcp_size
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
             - 1,
         )
         return (
@@ -612,10 +630,18 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
+            # Delay sampling only for normal generation requests.
+            # Keep the existing grammar behavior unchanged.
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and forward_batch.sampling_info.grammars is not None
+                and (
+                    forward_batch.sampling_info.grammars is not None
+                    or (
+                        envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                        and not forward_batch.is_prefill_only
+                    )
+                )
             ):
 
                 def sample_batch_func():

@@ -18,51 +18,31 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool.memory_pool = object()
         pool.use_fabric = True
         pool.shareable_handle = b"handle"
-        pool._pool_pointer = 123
-        pool._allocation_handle = 456
-        pool._allocation_mapped = True
-        pool.allocation_size = 4096
+        allocation = MagicMock()
+        allocation.close.side_effect = [
+            RuntimeError("forced allocation close failure"),
+            None,
+        ]
+        pool._allocation = allocation
         pool.device_index = 0
-        driver = MagicMock()
-        driver.cuMemUnmap.return_value = "unmap"
-        driver.cuMemAddressFree.return_value = "address_free"
-        driver.cuMemRelease.return_value = "release"
-        failed_once = False
-
-        def check_driver(result, _operation):
-            nonlocal failed_once
-            if result == "address_free" and not failed_once:
-                failed_once = True
-                raise RuntimeError("forced address-free failure")
-            return result
 
         with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
             patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=check_driver),
-            self.assertRaisesRegex(RuntimeError, "forced address-free failure"),
+            self.assertRaisesRegex(RuntimeError, "forced allocation close failure"),
         ):
             pool._release_allocation()
 
-        self.assertFalse(pool._allocation_mapped)
-        self.assertEqual(pool._pool_pointer, 123)
-        self.assertEqual(pool._allocation_handle, 456)
+        self.assertIs(pool._allocation, allocation)
 
-        with (
-            patch.object(vmm, "_get_cuda_driver", return_value=driver),
-            patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
-            patch.object(vmm, "check_drv", side_effect=lambda result, _: result),
-        ):
+        with patch.object(vmm.torch.cuda, "device", return_value=nullcontext()):
             pool._release_allocation()
 
-        self.assertIsNone(pool._pool_pointer)
-        self.assertIsNone(pool._allocation_handle)
-        self.assertEqual(driver.cuMemUnmap.call_count, 1)
-        self.assertEqual(driver.cuMemAddressFree.call_count, 2)
-        self.assertEqual(driver.cuMemRelease.call_count, 1)
+        self.assertIsNone(pool._allocation)
+        self.assertEqual(allocation.close.call_count, 2)
 
     def test_model_class_controls_cuda_vmm_opt_in(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
         class SupportedModel:
             supports_cuda_vmm_feature_transport = True
@@ -70,8 +50,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         class UnsupportedModel:
             pass
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cuda_vmm")
         manager.model_config = object()
 
         with patch(
@@ -91,9 +73,12 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_cpu_transport_skips_model_opt_in_lookup(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cpu")
         manager.model_config = object()
 
         with patch(
@@ -104,16 +89,22 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         get_model_architecture.assert_not_called()
 
     def test_vmm_transport_initializes_pool(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         server_args = SimpleNamespace(
             mm_feature_transport="cuda_vmm",
             tokenizer_worker_num=2,
             base_gpu_id=3,
-            enable_dp_attention=False,
             tp_size=4,
             nnodes=1,
         )
+        # The consumer count comes from the published topology.
+        override = get_context().override_server_args(
+            enable_dp_attention=False, tp_size=4, mm_feature_transport="cuda_vmm"
+        )
+        override.install()
+        self.addCleanup(override.restore)
         pool = object()
         with (
             patch.object(vmm, "get_mm_feature_pool_size_per_worker", return_value=123),
@@ -131,13 +122,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
     def test_disabled_transport_is_a_noop(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
-        transport = CudaVmmFeatureTransport(
-            SimpleNamespace(mm_feature_transport="cpu"), None
-        )
+        # The transport choice is a bag leaf.
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        transport = CudaVmmFeatureTransport(SimpleNamespace(), None)
 
         self.assertEqual(transport.prepare_for_dispatch([None]), [])
         transport.cancel_for_dispatch([])
@@ -145,14 +139,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIsNone(transport.pool)
 
     def test_vmm_transport_requires_processor(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         with self.assertRaisesRegex(RuntimeError, "multimodal processor"):
-            CudaVmmFeatureTransport(
-                SimpleNamespace(mm_feature_transport="cuda_vmm"), None
-            )
+            CudaVmmFeatureTransport(SimpleNamespace(), None)
 
     def test_image_features_are_packed_per_request(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -278,8 +274,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.prepare_for_dispatch.return_value = []
         manager.cuda_vmm_feature_transport = transport
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         tokenized_obj = SimpleNamespace(
             rid="test-request",
             mm_inputs=None,
@@ -293,7 +287,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.prepare_for_dispatch.assert_called_once_with((None,))
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_failed_dispatch_cancels_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -308,8 +301,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
         )
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
         tokenized_obj = SimpleNamespace(
             rid="test-request",
@@ -330,7 +321,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             (tokenized_obj.mm_inputs,)
         )
         transport.cancel_for_dispatch.assert_called_once_with(items)
-        self.assertFalse(state.dispatched)
 
     def test_post_dispatch_failure_does_not_cancel_published_items(self):
         from sglang.srt.managers import tokenizer_manager
@@ -343,8 +333,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
-        state = SimpleNamespace(dispatched=False)
-        manager.rid_to_state = {"test-request": state}
         time_stats = MagicMock()
         time_stats.set_api_server_dispatch_finish_time.side_effect = RuntimeError(
             "bookkeeping failed"
@@ -367,7 +355,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.cancel_for_dispatch.assert_not_called()
-        self.assertTrue(state.dispatched)
 
     def test_prepare_batch_cancels_prior_groups_on_failure(self):
         from sglang.srt.utils.cuda_vmm_transport_utils import (
@@ -458,17 +445,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         manager.cuda_vmm_feature_transport = transport
-        server_args = SimpleNamespace(
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            reasoning_parser=None,
-            tool_call_parser=None,
-            weight_cache_mode=None,
-            enable_elastic_expert_backup=False,
-            elastic_ep_backend=None,
-            node_rank=0,
-            tokenizer_worker_num=1,
-            check_server_args=MagicMock(),
-        )
+        # A real record: the launcher publishes it partway through, and what it
+        # reads after that comes out of the bags, which only project from a
+        # dataclass. The validation is stubbed so the dummy path still launches.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        server_args.check_server_args = MagicMock()
+        from sglang.srt.runtime_context import reset_context
+
+        self.addCleanup(reset_context)
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],
             scheduler_infos=[],
@@ -520,6 +506,13 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
 
 class TestSchedulerMmTransportBoundary(unittest.TestCase):
+    def _publish(self, **fields):
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
     def _prepare_scheduler(scheduler):
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
@@ -531,7 +524,9 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.server_args = SimpleNamespace(
+        # The transport gate reads the published bags, so the case publishes
+        # the configuration under test.
+        self._publish(
             mm_feature_transport="cuda_vmm",
             enable_broadcast_mm_inputs_process=True,
         )
@@ -578,7 +573,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
                 return iter(self.batch)
 
         scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.server_args = SimpleNamespace(mm_feature_transport="cuda_vmm")
+        self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
         raw_inputs = [object(), object()]
         materialized = [object(), object()]

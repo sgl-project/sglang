@@ -5,14 +5,14 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
-    HiCacheAck,
+    CacheOperation,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
@@ -23,9 +23,6 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
-from sglang.srt.managers.cache_controller import (
-    make_timing_event_pair,
-)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -33,75 +30,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
-
-
-class CacheOperation(BaseCacheOperation):
-    def __init__(
-        self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        node_id: int,
-        priority: Optional[int] = None,
-        pool_transfers: Optional[list[PoolTransfer]] = None,
-    ):
-        super().__init__(host_indices, device_indices, node_id, priority)
-        self.pool_transfers = pool_transfers
-
-    @staticmethod
-    def merge_pool_transfers(
-        ops: List[CacheOperation],
-    ) -> Optional[list[PoolTransfer]]:
-        grouped: dict[tuple[PoolName, Optional[PoolName]], list[PoolTransfer]] = {}
-        for op in ops:
-            for t in op.pool_transfers or []:
-                grouped.setdefault((t.name, t.indices_from_pool), []).append(t)
-        if not grouped:
-            return None
-
-        def cat_or_none(tensors):
-            parts = [x for x in tensors if x is not None]
-            return torch.cat(parts) if parts else None
-
-        return [
-            PoolTransfer(
-                name=ts[0].name,
-                host_indices=cat_or_none(t.host_indices for t in ts),
-                device_indices=cat_or_none(t.device_indices for t in ts),
-                keys=[k for t in ts if t.keys for k in t.keys] or None,
-                hit_policy=ts[0].hit_policy,
-                indices_from_pool=ts[0].indices_from_pool,
-            )
-            for ts in grouped.values()
-        ]
-
-    @staticmethod
-    def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
-        if len(ops) == 1:
-            return ops[0]
-        host_indices = torch.cat([op.host_indices for op in ops])
-        device_indices = torch.cat([op.device_indices for op in ops])
-        node_ids = []
-        priority = min(op.priority for op in ops)
-        for op in ops:
-            node_ids.extend(op.node_ids)
-        merged = CacheOperation(
-            host_indices,
-            device_indices,
-            -1,
-            priority,
-            pool_transfers=CacheOperation.merge_pool_transfers(ops),
-        )
-        merged.node_ids = node_ids
-        return merged
 
 
 class StorageOperation(BaseStorageOperation):
@@ -176,6 +112,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -195,6 +132,7 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            host_memory_mode=host_memory_mode,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -403,69 +341,134 @@ class HybridCacheController(BaseHiCacheController):
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
-        if not self.write_queue:
-            return
-        op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first staged write-back kernels need CPU destination host indices.
-        # A HostPoolGroup may mix staged and non-staged child pools, so let it
-        # normalize indices per child instead of moving the whole operation here.
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and (
-                getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-                or getattr(
-                    self.mem_pool_host, "supports_per_pool_backup_indices", False
-                )
-            )
-        ):
-            host_indices = op.host_indices
-            device_indices = op.device_indices
-            resolved_pool_transfers = op.pool_transfers
-        else:
-            host_indices, device_indices, resolved_pool_transfers = (
-                self.move_hybrid_indices(op)
-            )
-        self.write_queue.clear()
-        start_event = device_module.Event()
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-        start_event.record()
-        with device_module.stream(self.write_stream):
-            start_event.wait(self.write_stream)
-            ack_start_event.record()
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
-            if self.has_draft and host_indices.numel() > 0:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
-            ack_finish_event.record()
-            self._record_transfer_indices_on_stream(
-                self.write_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
-            )
-        self.ack_write_queue.append(
-            HiCacheAck(
-                start_event=ack_start_event,
-                finish_event=ack_finish_event,
-                node_ids=op.node_ids,
-                num_tokens=len(op.device_indices),
-                timing_enabled=timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
-            )
+    def _move_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        return self.move_hybrid_indices(op)
+
+    def _move_write_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        host_group = self.mem_pool_host
+        if self.io_backend != "kernel" or host_group.layout != "page_first":
+            return self.move_hybrid_indices(op)
+        if not getattr(host_group, "supports_per_pool_backup_indices", False):
+            if not getattr(host_group, "can_use_write_back_jit", False):
+                return self.move_hybrid_indices(op)
+            return op.host_indices, op.device_indices, op.pool_transfers
+
+        def move_for_pool(host_pool, host_indices, device_indices):
+            if getattr(host_pool, "can_use_write_back_jit", False):
+                if host_indices.is_cuda:
+                    host_indices = host_indices.cpu()
+                return host_indices, device_indices
+            return self.move_indices(host_indices, device_indices)
+
+        host_indices, device_indices = move_for_pool(
+            host_group.anchor_entry.host_pool,
+            op.host_indices,
+            op.device_indices,
         )
+        pool_transfers = []
+        for transfer in op.pool_transfers or []:
+            entry = host_group.entry_map[transfer.name]
+            transfer_host_indices, transfer_device_indices = move_for_pool(
+                entry.host_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+            )
+            pool_transfers.append(
+                replace(
+                    transfer,
+                    host_indices=transfer_host_indices,
+                    device_indices=transfer_device_indices,
+                )
+            )
+        return host_indices, device_indices, pool_transfers or None
+
+    def _l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        anchor = self.mem_pool_host.anchor_entry
+        transfers = []
+        if host_indices.numel() > 0:
+            transfers.append(
+                L2Transfer(
+                    host_pool=anchor.host_pool,
+                    device_pool=anchor.device_pool,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    layer_mapper=anchor.layer_mapper,
+                )
+            )
+        for pool_transfer in pool_transfers or []:
+            if (
+                pool_transfer.host_indices is None
+                or pool_transfer.device_indices is None
+            ):
+                raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
+            entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            transfers.append(
+                L2Transfer(
+                    host_pool=entry.host_pool,
+                    device_pool=entry.device_pool,
+                    host_indices=pool_transfer.host_indices,
+                    device_indices=pool_transfer.device_indices,
+                    layer_mapper=entry.layer_mapper,
+                )
+            )
+        if self.has_draft and host_indices.numel() > 0:
+            transfers.append(
+                L2Transfer(
+                    host_pool=self.mem_pool_host_draft,
+                    device_pool=self.mem_pool_device_draft,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return transfers
+
+    def _l2_load_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        if getattr(self, "has_mtp_draft", False):
+            target_transfers = list(transfers)
+            for depth, draft_device_pool in enumerate(self.mtp_draft_device_pools):
+                for transfer in target_transfers:
+                    if transfer.layer_mapper is None:
+                        continue
+                    draft_host_layer = transfer.layer_mapper(self.layer_num + depth)
+                    if draft_host_layer is None:
+                        continue
+
+                    def draft_layer_mapper(
+                        layer_id: int,
+                        *,
+                        expected_layer_id: int = depth,
+                        host_layer_id: int = draft_host_layer,
+                    ) -> Optional[int]:
+                        if layer_id == expected_layer_id:
+                            return host_layer_id
+                        return None
+
+                    transfers.append(
+                        L2Transfer(
+                            host_pool=transfer.host_pool,
+                            device_pool=draft_device_pool,
+                            host_indices=transfer.host_indices,
+                            device_indices=transfer.device_indices,
+                            layer_mapper=draft_layer_mapper,
+                            is_draft=True,
+                        )
+                    )
+        return transfers
 
     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
         """Per-pool token counts for a merged transfer op (anchor + extra
@@ -546,108 +549,6 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
-    def start_loading(self) -> int:
-        if not self.load_queue:
-            return -1
-        producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
-        self.load_queue.clear()
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
-
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            ack_start_event.record()
-            target_device_pool = self.mem_pool_host.anchor_entry.device_pool
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    target_device_pool,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                    pool_transfers=resolved_pool_transfers,
-                )
-                if (
-                    self.has_draft
-                    and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
-                ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-
-                # HiCache now supports draft caches through two paths:
-                #
-                # - Packed: standard NextN/MTP models (DeepSeek-V3.2, GLM-5.x,
-                #   DeepSeek-V4, MiMo-V2.5) and DeepSeek-V4 DSpark. Draft KV/indexer/SWA
-                #   buffers are appended to the matching target host pools as tail layers
-                #   and share their slot mappings. D2H/H2D therefore moves target and draft
-                #   in the same cache operation; the branch below restores the tail layers.
-                #
-                # - Sidecar: standalone EAGLE/EAGLE3 (for example Llama-2/Llama-3.1),
-                #   DFlash (for example Gemma-4), and non-DeepSeek-V4 DSpark. Draft
-                #   KV/indexer/SWA gets a separate host-pool entry sized to its source target
-                #   pool. Its PoolTransfer follows the target KV or SWA indices and is
-                #   attached to the same cache operation.
-
-                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mtp_draft_device_pools[i],
-                        host_indices,
-                        device_indices,
-                        self.layer_num + i,
-                        self.io_backend,
-                        pool_transfers=resolved_pool_transfers,
-                        is_draft=True,
-                    )
-                producer_event.complete(i)
-            ack_finish_event.record()
-            self._record_transfer_indices_on_stream(
-                self.load_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
-            )
-        self.ack_load_queue.append(
-            HiCacheAck(
-                ack_start_event,
-                ack_finish_event,
-                op.node_ids,
-                num_tokens=len(op.device_indices),
-                timing_enabled=timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
-            )
-        )
-        return producer_id
-
-    def _record_transfer_indices_on_stream(
-        self,
-        stream: torch.Stream,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        pool_transfers: Optional[list[PoolTransfer]] = None,
-    ) -> None:
-        if host_indices.is_cuda:
-            host_indices.record_stream(stream)
-        if device_indices.is_cuda:
-            device_indices.record_stream(stream)
-        for transfer in pool_transfers or []:
-            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
-                transfer.host_indices.record_stream(stream)
-            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
-                transfer.device_indices.record_stream(stream)
-
     def prefetch(
         self,
         request_id: str,
@@ -688,6 +589,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        operation.all_hash_values = hash_value
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -881,6 +783,28 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            pool_page_size = (
+                entry.host_pool.page_size if entry is not None else self.page_size
+            )
+            needed = len(transfer.keys) * pool_page_size
+            if transfer.host_indices.numel() > needed:
+                # The hit undershot the pre-allocated window buffer. Backends
+                # fetch keys zipped against the buffer head, so shrink the
+                # transfer to match and release the tail now — otherwise the
+                # length mismatch makes batch_get_v2 fetch nothing and the
+                # whole window is silently lost downstream.
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices[needed:],
+                        )
+                    ]
+                )
+                transfer.host_indices = transfer.host_indices[:needed]
 
     def _resolve_pool_transfers_allocation(
         self,

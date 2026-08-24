@@ -41,8 +41,6 @@ _DEEPEP_ENV = {
 _MEGAMOE_ENV = {
     "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
@@ -126,6 +124,7 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
@@ -183,6 +182,50 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
+                "--moe-runner-backend",  # for fp4 checkpoint
+                "flashinfer_mxfp4",
+            ],
+            env={"SGLANG_ENABLE_CP_V2": "1"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+# DSPARK draft is bundled with the -DSpark checkpoint.
+DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+
+
+class TestDSV4FlashFP4B200_CP_DSpark(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """DSPARK speculation + prefill CP (interleave, CP_V2, attn_cp=tp)."""
+
+    gsm8k_accuracy_thres = 0.90
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(DSPARK_MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--speculative-algorithm",
+                "DSPARK",
                 "--enable-prefill-cp",
                 "--cp-strategy",
                 "interleave",

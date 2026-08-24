@@ -10,12 +10,13 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.configs.hybrid_arch import (
-    hybrid_gdn_config,
-    kimi_linear_config,
-    linear_attn_model_spec,
+from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_dspark_draft,
+    is_kimi_k3,
+    is_qwen3_5,
 )
-from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -37,7 +38,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -78,6 +84,25 @@ def _mla_decode_kv_splits_cap(
     sm_cap = next_power_of_2(sm_count)
     ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
+
+
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+    if not is_gfx95_supported() or topk != 1:
+        return False
+    if use_mla:
+        return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
+        # Added for the K3 DSpark draft model, which is qwen3 type attention,
+        # and using bidirectional (non-causal) mode.
+        return use_verify_splitkv
+    return (
+        use_verify_splitkv
+        and is_qwen3_5(model_config.hf_config)
+        and model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        == 1
+    )
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -138,7 +163,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import (
-            verify_mla_fwd,
+            verify_shared_kv_fwd,
         )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
@@ -154,8 +179,8 @@ class TritonAttnBackend(AttentionBackend):
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
-        # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
-        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
+        # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
+        self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -188,13 +213,13 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
-        # Kimi-K3 absorbed-MLA shape; gate it on K3.
-        self.use_verify_mla = (
-            is_gfx95_supported()
-            and self.topk == 1
-            and self.use_mla
-            and is_kimi_k3(model_runner.model_config.hf_config)
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
+        # GQA with exactly one TP-local KV head.
+        self.use_verify_shared_kv = _should_use_verify_shared_kv(
+            model_runner.model_config,
+            self.topk,
+            self.use_mla,
+            self.use_verify_splitkv,
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
@@ -203,7 +228,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -213,12 +238,12 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
-        elif (
-            hybrid_gdn_config(model_runner.model_config) is not None
-            or kimi_linear_config(model_runner.model_config) is not None
-            or linear_attn_model_spec(model_runner.model_config) is not None
-        ):
+        elif mambaish_config(model_runner.model_config) is not None:
             # For hybrid linear models, layer_id = 0 may not be full attention
+            # (e.g. NemotronH's full-attn layers are [5,12,19,...]). mambaish_config
+            # unions mamba2 (NemotronH/FalconH1/...), hybrid-GDN, kimi-linear, and
+            # linear-attn specs, so we ask get_v_head_dim() instead of indexing
+            # layer 0, which is not guaranteed to be a full-attention layer.
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
@@ -234,7 +259,7 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
@@ -260,11 +285,11 @@ class TritonAttnBackend(AttentionBackend):
                 cuda_graph_fully_disabled()
                 or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
             )
-            and model_runner.server_args.chunked_prefill_size == -1
+            and get_schedule().chunked_prefill_size == -1
         )
 
         self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
+            get_exec().deterministic.enable_deterministic_inference
         )
 
         if self.enable_deterministic:
@@ -1409,10 +1434,10 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
-        # Route target-verify to the K3-tuned MLA kernel when eligible, else the
+        # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
-        if self.use_verify_mla:
-            verify_fwd = self.verify_mla_fwd
+        if self.use_verify_shared_kv:
+            verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
         else:
@@ -1527,9 +1552,19 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Current chunk K/V is still local before masked cache write, so it can
-        # use the original extend kernel's current-token stage directly.
+        # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
+            if layer.tp_k_head_num > 1:
+                kv_head_start = (
+                    group.rank_in_group * layer.tp_k_head_num // group.world_size
+                )
+                kv_head_end = max(
+                    (group.rank_in_group + 1) * layer.tp_k_head_num // group.world_size,
+                    kv_head_start + 1,
+                )
+                k = k[:, kv_head_start:kv_head_end]
+                v = v[:, kv_head_start:kv_head_end]
+
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,
@@ -1668,7 +1703,16 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
+            # Consumes VIRTUAL ids, so it must see out_cache_loc untranslated.
             extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
+        elif self.forward_metadata.out_cache_loc_full_physical is not None:
+            # Unified pool: this kernel reads the extend half OUT OF THE POOL (the
+            # 2-stage path takes it from the k/v arguments), so it needs the same
+            # translated loc the KV write uses -- otherwise the prefix is read at
+            # physical ids and the extend tokens at virtual ones. Reuse the
+            # per-forward translation rather than re-translating: this runs once
+            # per layer.
+            extend_kv_indices = self.forward_metadata.out_cache_loc_full_physical
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
@@ -1948,7 +1992,7 @@ class TritonMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self,
