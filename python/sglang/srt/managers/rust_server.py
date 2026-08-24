@@ -399,7 +399,7 @@ class RustServer:
 
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
-        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
+        dp_rank = scheduler.ps.dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
 
