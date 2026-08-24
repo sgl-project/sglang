@@ -204,6 +204,8 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        attn_parallel_mode=forward_batch.attn_parallel_mode,
+        kv_residency=forward_batch.kv_residency,
     )
 
 
@@ -1131,29 +1133,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
-        attn_parallel_variants = (
-            [
+        dynamic_dcp = getattr(
+            self.model_runner.server_args,
+            "enable_dynamic_attn_parallel",
+            False,
+        ) and getattr(
+            self.model_runner.server_args,
+            "dynamic_attn_parallel_enable_dcp",
+            False,
+        )
+        if dynamic_dcp:
+            attn_parallel_variants = [
                 (AttnParallelMode.TP, KvResidency.REPLICATED),
                 (AttnParallelMode.DCP, KvResidency.REPLICATED),
-                (AttnParallelMode.DCP, KvResidency.STRIPED),
             ]
-            if getattr(
-                self.model_runner.server_args,
-                "enable_dynamic_attn_parallel",
-                False,
-            )
-            and getattr(
-                self.model_runner.server_args,
-                "dynamic_attn_parallel_enable_dcp",
-                False,
-            )
-            else [
+            if (
+                getattr(
+                    self.model_runner.server_args,
+                    "dynamic_attn_parallel_striped_min_context",
+                    None,
+                )
+                is not None
+            ):
+                attn_parallel_variants.append(
+                    (AttnParallelMode.DCP, KvResidency.STRIPED)
+                )
+        else:
+            attn_parallel_variants = [
                 (
                     self._resolve_attn_parallel_mode(),
                     self._resolve_kv_residency(),
                 )
             ]
-        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1193,6 +1204,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         _set_capture_dsa_variant(None)
         self._capture_attn_parallel_mode = None
         self._capture_kv_residency = None
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        if hasattr(allocator, "set_active_residency"):
+            allocator.set_active_residency(KvResidency.REPLICATED)
 
     def capture_one_shape(
         self,

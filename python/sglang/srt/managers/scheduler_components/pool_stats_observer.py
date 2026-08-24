@@ -214,10 +214,20 @@ class SchedulerPoolStatsObserver:
         return pool_stats
 
     def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        allocator = self.token_to_kv_pool_allocator
+        if hasattr(allocator, "total_available_size"):
+            # Residency-aware pools have independent capacities. Report the
+            # active namespace conservatively; striped mode currently requires
+            # radix cache off, so no cross-namespace evictable pages exist.
+            capacity = allocator.size
+            available_size = allocator.available_size()
+            evictable_size = 0
+        else:
+            capacity = self.max_total_num_tokens
+            available_size = allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
+        num_used = capacity - (available_size + evictable_size)
+        token_usage = num_used / capacity
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,

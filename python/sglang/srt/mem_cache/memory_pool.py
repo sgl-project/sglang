@@ -4160,6 +4160,9 @@ class MLATokenToKVPool(KVCache):
             )
         return kv_storage_dcp_size(get_parallel())
 
+    def active_storage_dcp_size(self) -> int:
+        return self._active_storage_dcp_size()
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,

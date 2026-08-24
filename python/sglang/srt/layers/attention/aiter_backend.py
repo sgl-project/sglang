@@ -350,7 +350,10 @@ class AiterAttnBackend(AttentionBackend):
 
             # Under DCP, Q is all-gathered, so this operates on the gathered
             # head count num_head * dcp_world_size. No-op otherwise.
-            _gathered_num_head = self.num_head * self.dcp_world_size
+            _dcp_local_num_head = self.num_head
+            if get_parallel().dynamic_attn_parallel_enable_dcp:
+                _dcp_local_num_head //= get_parallel().attn_cp_size
+            _gathered_num_head = _dcp_local_num_head * self.dcp_world_size
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
             )
@@ -515,8 +518,13 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def make_mla_prefill_ps_meta_data_buffer(
-        self, batch_size: int, max_qlen: int, qlen_granularity: int
+        self,
+        batch_size: int,
+        max_qlen: int,
+        qlen_granularity: int,
+        num_head_k: Optional[int] = None,
     ):
+        num_head_k = self.num_kv_head if num_head_k is None else num_head_k
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -526,7 +534,7 @@ class AiterAttnBackend(AttentionBackend):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_ps_metadata_info_v1(
             batch_size=batch_size,
-            num_head_k=self.num_kv_head,
+            num_head_k=num_head_k,
             max_qlen=max_qlen,
             qlen_granularity=qlen_granularity,
         )
@@ -570,9 +578,13 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map: torch.Tensor,
         reduce_partial_map: torch.Tensor,
         is_causal: bool = True,
+        num_head: Optional[int] = None,
+        num_kv_head: Optional[int] = None,
     ):
-        gqa_ratio = self.num_head // self.num_kv_head
-        num_heads_k = self.num_kv_head
+        num_head = self.num_head if num_head is None else num_head
+        num_kv_head = self.num_kv_head if num_kv_head is None else num_kv_head
+        gqa_ratio = num_head // num_kv_head
+        num_heads_k = num_kv_head
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
@@ -1779,9 +1791,19 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = None
                 fp8_prefill_kv_indices = None
 
-                if _use_fp8_prefill_attn and not runtime_attn_tp:
+                if _use_fp8_prefill_attn:
                     tile_q = 256
-                    qlen_granularity = tile_q // (self.num_head // self.num_kv_head)
+                    metadata_num_head = self.num_head
+                    metadata_num_kv_head = self.num_kv_head
+                    if runtime_attn_tp:
+                        runtime_tp_size = get_parallel().attn_cp_size
+                        metadata_num_head //= runtime_tp_size
+                        metadata_num_kv_head = max(
+                            1, metadata_num_kv_head // runtime_tp_size
+                        )
+                    qlen_granularity = tile_q // (
+                        metadata_num_head // metadata_num_kv_head
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -1790,7 +1812,10 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                     ) = self.make_mla_prefill_ps_meta_data_buffer(
-                        bs, max_q_len, qlen_granularity
+                        bs,
+                        max_q_len,
+                        qlen_granularity,
+                        num_head_k=metadata_num_kv_head,
                     )
 
                     self.make_mla_prefill_ps_meta_data(
@@ -1804,6 +1829,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                         is_causal=True,
+                        num_head=metadata_num_head,
+                        num_kv_head=metadata_num_kv_head,
                     )
 
                     total_s = forward_batch.seq_lens_sum
@@ -1943,7 +1970,7 @@ class AiterAttnBackend(AttentionBackend):
             self.page_size,
             self.dcp_world_size,
             get_parallel().attn_dcp_rank,
-            kv_loc_scale=kv_storage_dcp_size(get_parallel()),
+            kv_loc_scale=self.token_to_kv_pool.active_storage_dcp_size(),
             out=out,
         )
         return block_table, local_kv_lens
@@ -2149,6 +2176,13 @@ class AiterAttnBackend(AttentionBackend):
             if attn_parallel_mode is None
             else AttnParallelMode(attn_parallel_mode) is AttnParallelMode.DCP
         )
+        from sglang.srt.layers.cp.cp_decode_attn_tp import (
+            get_cp_decode_attn_tp_ctx,
+        )
+
+        runtime_attn_tp = (
+            get_cp_decode_attn_tp_ctx().is_enabled and not dcp_batch_active
+        )
 
         num_kv_splits = None
         # num_kv_splits_indptr = None
@@ -2290,7 +2324,11 @@ class AiterAttnBackend(AttentionBackend):
 
                 # DCP decode builds its own block-table metadata in
                 # forward_decode, so the persist metadata is unused here.
-                if _use_mla_ps_kernel and dcp_cp_world_size == 1:
+                if (
+                    _use_mla_ps_kernel
+                    and not runtime_attn_tp
+                    and dcp_cp_world_size == 1
+                ):
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(

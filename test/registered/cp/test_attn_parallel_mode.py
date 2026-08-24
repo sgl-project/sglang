@@ -13,6 +13,7 @@ from sglang.srt.attn_parallel import (
 )
 from sglang.srt.layers.cp.base import init_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active, prepare_cp_forward
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -91,6 +92,41 @@ class TestAttnParallelModeSelector(unittest.TestCase):
         )
         self.assertEqual(decision.mode, AttnParallelMode.TP)
         self.assertEqual(decision.veto_reason, "below_threshold")
+
+    def test_dynamic_scheduler_keeps_tp_when_prefill_threshold_is_unset(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = SimpleNamespace(
+            enable_dynamic_attn_parallel=True,
+            dynamic_attn_parallel_min_prefill_tokens=None,
+            dynamic_attn_parallel_allow_mixed=False,
+            dynamic_attn_parallel_enable_dcp=False,
+            dynamic_attn_parallel_dcp_min_context=8192,
+        )
+        scheduler.ps = SimpleNamespace(attn_cp_size=8, attn_dcp_size=1)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[512],
+            extend_num_tokens=512,
+            seq_lens_cpu=torch.tensor([512]),
+            kv_residency=KvResidency.REPLICATED,
+            attn_parallel_mode=None,
+            attn_parallel_veto_reason=None,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_cp_strategy",
+                return_value=SimpleNamespace(name="zigzag"),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+        ):
+            scheduler._stamp_attn_parallel_mode(batch)
+
+        self.assertEqual(batch.attn_parallel_mode, AttnParallelMode.TP)
+        self.assertEqual(batch.attn_parallel_veto_reason, "prefill_threshold_unset")
 
     def test_decode_selects_dcp_only_above_context_threshold(self):
         short = select_attn_parallel_mode(

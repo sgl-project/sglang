@@ -1182,8 +1182,8 @@ class ServerArgs:
     ] = False
     dynamic_attn_parallel_min_prefill_tokens: A[
         Optional[int],
-        "Minimum total uncached prefill tokens required to select CP. The default "
-        "is the selected strategy's correctness floor.",
+        "Minimum total uncached prefill tokens required to select CP. If unset, "
+        "dynamic prefill remains TP; set this from a measured crossover grid.",
         NS("parallel"),
     ] = None
     dynamic_attn_parallel_allow_mixed: A[
@@ -1204,10 +1204,18 @@ class ServerArgs:
         "engages.",
         NS("parallel"),
     ] = 8192
+    dynamic_attn_parallel_striped_min_context: A[
+        Optional[int],
+        "Opt in to compact striped KV residency for requests whose prompt length "
+        "meets this threshold. By default dynamic DCP reads rank-local shards from "
+        "replicated KV so prefill can still use CP without a layout conversion.",
+        NS("parallel"),
+    ] = None
     dynamic_attn_parallel_replicated_kv_fraction: A[
         float,
         "Fraction of the physical MLA KV pool reserved for TP-readable replicated "
-        "residency; the remainder backs compact DCP-striped residency.",
+        "residency when striped residency is explicitly enabled; the remainder "
+        "backs compact DCP-striped residency.",
         NS("parallel"),
     ] = 0.5
     # Split DSA GPU KV/indexer cache layers across CP ranks.
@@ -7037,6 +7045,10 @@ class ServerArgs:
             raise ValueError(
                 "--enable-dynamic-attn-parallel requires --enable-prefill-cp."
             )
+        if self.enable_dynamic_attn_parallel and not envs.SGLANG_ENABLE_CP_V2.get():
+            raise ValueError(
+                "--enable-dynamic-attn-parallel requires the CP-v2 runtime."
+            )
         if (
             self.dynamic_attn_parallel_min_prefill_tokens is not None
             and self.dynamic_attn_parallel_min_prefill_tokens <= 0
@@ -7051,6 +7063,13 @@ class ServerArgs:
         if self.dynamic_attn_parallel_dcp_min_context <= 0:
             raise ValueError(
                 "--dynamic-attn-parallel-dcp-min-context must be positive."
+            )
+        if (
+            self.dynamic_attn_parallel_striped_min_context is not None
+            and self.dynamic_attn_parallel_striped_min_context <= 0
+        ):
+            raise ValueError(
+                "--dynamic-attn-parallel-striped-min-context must be positive."
             )
         if not (0.0 < self.dynamic_attn_parallel_replicated_kv_fraction < 1.0):
             raise ValueError(
@@ -7132,6 +7151,22 @@ class ServerArgs:
                 raise ValueError(
                     "Residency-aware dynamic TP/DCP does not yet support HiCache; "
                     "its host pools need the same per-layout address translation."
+                )
+            if (
+                self.dynamic_attn_parallel_striped_min_context is not None
+                and not self.disable_radix_cache
+            ):
+                raise ValueError(
+                    "Striped dynamic TP/DCP currently requires "
+                    "--disable-radix-cache because eviction accounting is "
+                    "residency-specific."
+                )
+            if (
+                self.dynamic_attn_parallel_striped_min_context is not None
+                and self.disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    "Striped dynamic TP/DCP does not support PD disaggregation."
                 )
         if view.attn_cp_size > 1:
             if self.cp_strategy is not None:

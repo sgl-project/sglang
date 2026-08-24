@@ -1,3 +1,4 @@
+from sglang.srt.attn_parallel import kv_storage_dcp_size
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -194,6 +195,11 @@ def handle_attention_aiter(attn, forward_batch):
     from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 
     if get_cp_decode_attn_tp_ctx().should_use_attn_tp(forward_batch):
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and kv_storage_dcp_size(get_parallel(), forward_batch) == 1
+        ):
+            return AttnForwardMethod.MHA
         return AttnForwardMethod.MLA
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for

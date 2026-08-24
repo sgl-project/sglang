@@ -3143,6 +3143,14 @@ class Scheduler(
             kv_residency=batch.kv_residency,
         )
         if (
+            self.server_args.enable_dynamic_attn_parallel
+            and self.server_args.dynamic_attn_parallel_min_prefill_tokens is None
+            and decision.mode is AttnParallelMode.CP
+        ):
+            decision = AttnParallelDecision(
+                AttnParallelMode.TP, "prefill_threshold_unset"
+            )
+        if (
             not self.server_args.enable_dynamic_attn_parallel
             and self.ps.attn_dcp_size > 1
             and (
@@ -3159,9 +3167,12 @@ class Scheduler(
             return
         if self.server_args.dynamic_attn_parallel_enable_dcp:
             prompt_len = len(req.full_untruncated_fill_ids or req.origin_input_ids)
+            striped_threshold = (
+                self.server_args.dynamic_attn_parallel_striped_min_context
+            )
             req.kv_residency = (
                 KvResidency.STRIPED
-                if prompt_len >= self.server_args.dynamic_attn_parallel_dcp_min_context
+                if striped_threshold is not None and prompt_len >= striped_threshold
                 else KvResidency.REPLICATED
             )
             if not req.kv_layout_tagged:

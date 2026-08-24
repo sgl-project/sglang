@@ -43,14 +43,13 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         striped_physical_size = (
             (physical_size - replicated_size) // physical_page_size
         ) * physical_page_size
-        if (
-            replicated_size < logical_page_size
-            or striped_physical_size < physical_page_size
-        ):
+        striped_pages = striped_physical_size // physical_page_size - (dcp_size - 1)
+        striped_usable_physical_size = striped_pages * physical_page_size
+        if replicated_size < logical_page_size or striped_pages < 1:
             raise ValueError("KV pool is too small for both residency regions")
 
         super().__init__(
-            size=replicated_size + striped_physical_size * dcp_size,
+            size=replicated_size + striped_usable_physical_size * dcp_size,
             page_size=logical_page_size,
             dtype=dtype,
             device=device,
@@ -60,9 +59,11 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.dcp_size = dcp_size
         self.physical_page_size = physical_page_size
         self.logical_page_size = logical_page_size
-        self.physical_size = replicated_size + striped_physical_size
+        self.physical_size = physical_size
         self.replicated_size = replicated_size
-        self.striped_physical_size = striped_physical_size
+        self.striped_physical_size = striped_usable_physical_size
+        self.striped_page_start = replicated_size // physical_page_size + dcp_size
+        self.striped_pages = striped_pages
         self.active_residency = KvResidency.REPLICATED
 
         self.replicated = PagedTokenToKVPoolAllocator(
@@ -74,7 +75,7 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             need_sort=need_sort,
         )
         self.striped = PagedTokenToKVPoolAllocator(
-            size=striped_physical_size * dcp_size,
+            size=striped_usable_physical_size * dcp_size,
             page_size=logical_page_size,
             dtype=dtype,
             device=device,
@@ -84,16 +85,14 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Paged allocator page IDs become physical addresses after loc/dcp.
         # Offset the striped IDs past the replicated physical region.
-        striped_page_offset = replicated_size // physical_page_size
-        striped_pages = striped_physical_size // physical_page_size
         self.striped.free_pages = torch.arange(
-            striped_page_offset + 1,
-            striped_page_offset + striped_pages + 1,
+            self.striped_page_start,
+            self.striped_page_start + self.striped_pages,
             dtype=torch.int64,
             device=device,
         )
         self.striped.release_pages = torch.empty(0, dtype=torch.int64, device=device)
-        self.striped_virtual_start = (striped_page_offset + 1) * logical_page_size
+        self.striped_virtual_start = self.striped_page_start * logical_page_size
         self.num_pages = replicated_size // logical_page_size + striped_pages
         self.set_active_residency(KvResidency.REPLICATED)
 
@@ -166,8 +165,7 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.striped.free_segment(striped, start_pos=start_pos)
 
     def free_segments(self, segments):
-        for free_index, start_pos in segments:
-            self.free_segment(free_index, start_pos=start_pos)
+        super().free_segments(segments)
 
     def free_group_begin(self):
         self.replicated.free_group_begin()
@@ -184,14 +182,16 @@ class ResidencyAwarePagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.replicated.clear()
         self.striped.clear()
-        striped_page_offset = self.replicated_size // self.physical_page_size
-        striped_pages = self.striped_physical_size // self.physical_page_size
         self.striped.free_pages = torch.arange(
-            striped_page_offset + 1,
-            striped_page_offset + striped_pages + 1,
+            self.striped_page_start,
+            self.striped_page_start + self.striped_pages,
             dtype=torch.int64,
             device=self.device,
         )
+        self.striped.release_pages = torch.empty(
+            0, dtype=torch.int64, device=self.device
+        )
+        self.set_active_residency(KvResidency.REPLICATED)
 
     def translate_kv_indices_for_transfer(self, kv_indices: torch.Tensor):
         replicated, striped = self._split_indices(kv_indices)

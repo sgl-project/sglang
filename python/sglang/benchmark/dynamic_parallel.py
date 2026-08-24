@@ -122,6 +122,7 @@ def build_mode_server_args(
     cp_size: int,
     dcp_size: int,
     dynamic_include_dcp: bool,
+    dynamic_striped_min_context: int | None = None,
 ) -> list[str]:
     """Return only the mode-specific server arguments."""
 
@@ -151,6 +152,12 @@ def build_mode_server_args(
                 "--disable-overlap-schedule",
                 "--no-dcp-replicate-q-proj",
             ]
+            if dynamic_striped_min_context is not None:
+                args += [
+                    "--dynamic-attn-parallel-striped-min-context",
+                    str(dynamic_striped_min_context),
+                    "--disable-radix-cache",
+                ]
         return args
     raise AssertionError(f"unhandled deployment mode: {mode}")
 
@@ -378,6 +385,7 @@ def _build_server_command(args, mode: DeploymentMode) -> list[str]:
         cp_size=args.cp_size,
         dcp_size=args.dcp_size,
         dynamic_include_dcp=args.dynamic_include_dcp,
+        dynamic_striped_min_context=args.dynamic_striped_min_context,
     )
     command += shlex.split(args.extra_server_args)
     mode_args = args.mode_server_args.get(mode.value, "")
@@ -576,6 +584,15 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--logprob-tolerance", type=float, default=0.1)
     parser.add_argument("--strict-parity", action="store_true")
     parser.add_argument("--dynamic-include-dcp", action="store_true")
+    parser.add_argument(
+        "--dynamic-striped-min-context",
+        type=int,
+        default=None,
+        help=(
+            "Opt in to compact striped KV residency at this prompt length. "
+            "The default keeps replicated KV so prefill can use CP before decode DCP."
+        ),
+    )
     parser.add_argument("--launch-module", default="sglang.launch_server")
     parser.add_argument("--extra-server-args", default="")
     parser.add_argument(
@@ -597,6 +614,11 @@ def parse_args(argv: Sequence[str] | None = None):
     }
     if args.output_length <= 0 or args.repeats <= 0:
         parser.error("--output-length and --repeats must be positive")
+    if (
+        args.dynamic_striped_min_context is not None
+        and args.dynamic_striped_min_context <= 0
+    ):
+        parser.error("--dynamic-striped-min-context must be positive")
     if args.tp_size % args.cp_size != 0 or args.tp_size % args.dcp_size != 0:
         parser.error("--cp-size and --dcp-size must divide --tp-size")
     if args.modes[0] is not DeploymentMode.TP and len(args.modes) > 1:

@@ -5,6 +5,7 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.attn_parallel import AttnParallelMode
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -77,11 +78,24 @@ def is_mla_prefill_cp_enabled() -> bool:
     return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
+def _batch_selects_cp(forward_batch) -> bool:
+    from sglang.srt.environ import envs
+
+    # CP-v1 predates scheduler batch stamps and derives applicability from its
+    # own metadata. Dynamic switching requires CP-v2, where the stamp is
+    # authoritative and must prevent a TP batch from falling back into CP-v1.
+    if not envs.SGLANG_ENABLE_CP_V2.get():
+        return True
+    stamped_mode = getattr(forward_batch, "attn_parallel_mode", None)
+    return stamped_mode is None or AttnParallelMode(stamped_mode) is AttnParallelMode.CP
+
+
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     if mla_enable_prefill_cp is None:
         mla_enable_prefill_cp = is_mla_prefill_cp_enabled()
     return (
         forward_batch.attn_cp_metadata is not None
+        and _batch_selects_cp(forward_batch)
         and mla_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     )
@@ -97,6 +111,7 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     if not (
         cur_cp_seq_len != 0
         and cp_size > 1
+        and _batch_selects_cp(forward_batch)
         # prepare_context_parallel_metadata hard-codes bs_per_cp_group = 1;
         # guard explicitly to avoid silent mis-partitioning under continuous batching.
         and forward_batch.forward_mode.is_context_parallel_extend()

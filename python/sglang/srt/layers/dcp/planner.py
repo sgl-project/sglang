@@ -63,6 +63,8 @@ def prepare_decode_context_parallel_metadata(
     extend_cu_prefix_lens[1:] = torch.cumsum(extend_prefix_lens, dim=0)
     extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
     extend_prefix_lens_sum = sum([i for i in extend_prefix_lens_cpu])
+    effective_seq_lens = extend_prefix_lens + extend_seq_lens
+    effective_seq_lens_sum = extend_prefix_lens_sum + int(extend_seq_lens.sum().item())
 
     dcp_prefix_kv_indices = torch.empty(
         sum(extend_prefix_lens_cpu),
@@ -83,10 +85,10 @@ def prepare_decode_context_parallel_metadata(
         dtype=torch.int32,
         device=get_device().device,
     )
-    dcp_kv_indptr[1:] = seq_lens.cumsum(dim=0)
+    dcp_kv_indptr[1:] = effective_seq_lens.cumsum(dim=0)
     dcp_kv_indptr = dcp_kv_indptr[: (len(seq_lens) + 1)]
     dcp_kv_indices = torch.zeros(
-        seq_lens_sum,
+        effective_seq_lens_sum,
         dtype=torch.int32,
         device=get_device().device,
     )
@@ -116,7 +118,7 @@ def prepare_decode_context_parallel_metadata(
     )
     dcp_kv_buffer = torch.empty(
         (
-            seq_lens_sum,
+            effective_seq_lens_sum,
             *kv_buffer_shape[1:],
         ),
         dtype=kv_cache_dtype,

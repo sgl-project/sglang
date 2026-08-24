@@ -292,6 +292,20 @@ def all_gather_kv_cache_for_mla_extend(
         )
         dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
+    # Model-runner warmup and DP-attention sync may pad the in-hand Q/K/V token
+    # dimension beyond the logical extend lengths used to size this metadata.
+    # Copy only the leading logical rows; any extra rows are trailing padding
+    # and do not belong to a request.
+    extend_token_count = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
+    if k_nope.shape[0] < extend_token_count or k_pe.shape[0] < extend_token_count:
+        raise RuntimeError(
+            "DCP prefill metadata expects more extend tokens than the model produced: "
+            f"expected={extend_token_count}, k_nope={k_nope.shape[0]}, "
+            f"k_pe={k_pe.shape[0]}"
+        )
+    k_nope = k_nope[:extend_token_count]
+    k_pe = k_pe[:extend_token_count]
+
     # copy local (in-hand) new-token kv cache into dcp_kv_buffer
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,

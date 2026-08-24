@@ -1980,13 +1980,13 @@ class DeepseekV2AttentionMLA(
             (self, "w_scale_k", 0),
             (self, "w_scale_v", 0),
         ]
-        radix_attns = [self.attn_mqa]
+        radix_attns = [self.attn_mqa, self.attn_mha]
         if hasattr(self, "attn_mqa_for_dcp_decode"):
             radix_attns.append(self.attn_mqa_for_dcp_decode)
         ctx = get_cp_decode_attn_tp_ctx()
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
-            [self.q_b_proj, self.o_proj],
+            [self.q_b_proj, self.kv_b_proj, self.o_proj],
             tensor_attrs=tensor_attrs,
             radix_attn=radix_attns,
         ):

@@ -548,19 +548,25 @@ class DeepseekMLARocmForwardMixin:
 
         # The fused rope+cache-write kernel writes at the virtual out_cache_loc,
         # which is wrong under DCP, so force the standalone rope there.
-        force_rope_for_aiter_dcp_decode = (
-            is_dcp_mla_attention_phase(forward_batch)
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+        striped_kv_residency = kv_storage_dcp_size(get_parallel(), forward_batch) > 1
+        force_rope_for_aiter_dcp = (
+            (
+                striped_kv_residency
+                or (
+                    is_dcp_mla_attention_phase(forward_batch)
+                    and (
+                        forward_batch.forward_mode.is_decode()
+                        or forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend_v2()
+                    )
+                )
             )
             and _use_aiter_gfx95
             and self.current_attention_backend
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
         if self.rotary_emb is not None and (
-            force_rope_for_aiter_dcp_decode
+            force_rope_for_aiter_dcp
             or (
                 (not fuse_rope_for_trtllm_mla)
                 and (not self._skip_rope_for_dsa_tilelang_fused())
@@ -604,7 +610,6 @@ class DeepseekMLARocmForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         dcp_decode_active = is_dcp_mla_decode_phase(forward_batch)
-        striped_kv_residency = kv_storage_dcp_size(get_parallel(), forward_batch) > 1
         if (dcp_decode_active or striped_kv_residency) and not cp_v2_active:
             if dcp_decode_active:
                 if not q_replicate_active:
@@ -800,8 +805,10 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla() and not is_cp_v2_active(
-                forward_batch
+            if (
+                self._skip_rope_for_aiter_fused_mla()
+                and not is_cp_v2_active(forward_batch)
+                and kv_storage_dcp_size(get_parallel(), forward_batch) == 1
             ):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,

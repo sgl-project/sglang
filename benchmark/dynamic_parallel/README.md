@@ -15,7 +15,8 @@ python -m sglang.benchmark.dynamic_parallel \
   --prefix-hit-ratios 0,0.5,0.9 \
   --output-length 32 \
   --repeats 3 \
-  --mode-server-args-json '{"dcp":"--dcp-comm-backend a2a"}' \
+  --mode-server-args-json '{"dcp":"--dcp-comm-backend a2a","dynamic":"--dynamic-attn-parallel-min-prefill-tokens 8192"}' \
+  --server-env-json '{"SGLANG_JIT_DEEPGEMM_PRECOMPILE":"0","SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK":"32768","MORI_SHMEM_HEAP_SIZE":"16G"}' \
   --strict-parity \
   --result-file dynamic_parallel.jsonl
 ```
@@ -34,4 +35,18 @@ Useful ROCm overrides:
 ```
 
 The `dynamic` mode expects the runtime selector flags implemented by this
-feature branch. `--dynamic-include-dcp` additionally enables decode DCP.
+feature branch. Dynamic prefill remains TP unless
+`--dynamic-attn-parallel-min-prefill-tokens` is supplied through the dynamic
+mode's server arguments; choose it from a measured crossover grid.
+`--dynamic-include-dcp` additionally enables decode DCP over replicated KV,
+which preserves the CP prefill path. Compact striped KV is an
+explicit experiment; add `--dynamic-striped-min-context 8192` to assign prompts
+at or above that length to the striped pool. The harness also disables radix
+cache for this opt-in path because cross-residency eviction accounting is not
+yet supported. Striped prefill currently uses the full-prefix DCP assembly path
+and should be benchmarked separately.
+
+For MLA CP with MoRI, set
+`SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK >= --chunked-prefill-size`.
+Large values also need a larger `MORI_SHMEM_HEAP_SIZE`; 16 GiB is sufficient
+for the 32K-token example above on MI355X.

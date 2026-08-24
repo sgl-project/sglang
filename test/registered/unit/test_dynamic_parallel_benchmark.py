@@ -82,6 +82,18 @@ class TestDynamicParallelBenchmark(unittest.TestCase):
         self.assertIn("--enable-dynamic-attn-parallel", dynamic_args)
         self.assertIn("--dynamic-attn-parallel-enable-dcp", dynamic_args)
         self.assertIn("--dcp-size", dynamic_args)
+        self.assertNotIn("--dynamic-attn-parallel-striped-min-context", dynamic_args)
+
+        striped_args = build_mode_server_args(
+            DeploymentMode.DYNAMIC,
+            cp_size=8,
+            dcp_size=8,
+            dynamic_include_dcp=True,
+            dynamic_striped_min_context=8192,
+        )
+        self.assertIn("--dynamic-attn-parallel-striped-min-context", striped_args)
+        self.assertIn("8192", striped_args)
+        self.assertIn("--disable-radix-cache", striped_args)
 
     def test_parity_comparison_reports_logprob_delta(self):
         baseline = _record(DeploymentMode.TP.value)

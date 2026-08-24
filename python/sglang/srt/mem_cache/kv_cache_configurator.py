@@ -1775,7 +1775,11 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        if get_parallel().dynamic_attn_parallel_enable_dcp:
+                        if (
+                            get_parallel().dynamic_attn_parallel_enable_dcp
+                            and get_parallel().dynamic_attn_parallel_striped_min_context
+                            is not None
+                        ):
                             token_to_kv_pool_allocator = ResidencyAwarePagedTokenToKVPoolAllocator(
                                 physical_size=sizes.max_total_num_tokens,
                                 physical_page_size=get_schedule().page_size,

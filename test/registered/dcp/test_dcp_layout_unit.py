@@ -22,10 +22,12 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_mla_extend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -142,6 +144,65 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_mla_prefill_ignores_padded_in_hand_kv_rows(self):
+        k_nope = torch.arange(16, dtype=torch.float32).view(8, 1, 2)
+        k_pe = (torch.arange(8, dtype=torch.float32) + 100).view(8, 1, 1)
+        dcp_kv_buffer = torch.empty((7, 1, 3), dtype=torch.float32)
+
+        all_gather_kv_cache_for_mla_extend(
+            token_to_kv_pool=None,
+            attn_mqa=None,
+            extend_prefix_lens_cpu=[0],
+            dcp_local_prefix_kv_indices=torch.empty(0, dtype=torch.int64),
+            dcp_extend_prefix_lens_sum=0,
+            dcp_kv_buffer=dcp_kv_buffer,
+            kv_lora_rank=2,
+            k_nope=k_nope,
+            k_pe=k_pe,
+        )
+
+        self.assertTrue(torch.equal(dcp_kv_buffer[..., :2], k_nope[:7]))
+        self.assertTrue(torch.equal(dcp_kv_buffer[..., 2:], k_pe[:7]))
+
+    def test_prefill_metadata_uses_prefix_plus_extend_not_stale_seq_sum(self):
+        class FakeKernel:
+            def __getitem__(self, _grid):
+                return lambda *_args, **_kwargs: None
+
+        parallel = SimpleNamespace(dcp_enabled=True, dcp_size=8, dcp_rank=0)
+        device = SimpleNamespace(device=torch.device("cpu"))
+        with (
+            patch(
+                "sglang.srt.layers.dcp.planner.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_device",
+                return_value=device,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.create_dcp_kv_indices",
+                FakeKernel(),
+            ),
+        ):
+            metadata = prepare_decode_context_parallel_metadata(
+                seq_lens=torch.tensor([7], dtype=torch.int32),
+                extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+                extend_prefix_lens_cpu=[0],
+                extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0]),
+                req_to_token=torch.zeros((1, 16), dtype=torch.int32),
+                seq_lens_sum=7,
+                kv_buffer_shape=torch.Size([16, 1, 576]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device=torch.device("cpu"),
+                create_chunked_prefix_cache_kv_indices_fn=FakeKernel(),
+            )
+
+        self.assertEqual(metadata.dcp_kv_indptr.tolist(), [0, 8])
+        self.assertEqual(metadata.dcp_kv_indices.numel(), 8)
+        self.assertEqual(metadata.dcp_kv_buffer.shape[0], 8)
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):
