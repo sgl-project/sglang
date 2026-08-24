@@ -408,7 +408,7 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Use group-aware CPU SHM.
+        # Use the CPU device communicator.
         if current_platform.is_cpu() and self.device_communicator is not None:
             output_tensor = self.device_communicator.all_gather(
                 input_,
@@ -437,12 +437,7 @@ class GroupCoordinator:
         )
 
         # All-gather.
-        if current_platform.is_cpu() and is_shm_available(
-            input_.dtype, self.world_size, len(self.ranks)
-        ):
-            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-        else:
-            all_gather_single(output_tensor, input_, group=self.device_group)
+        all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
