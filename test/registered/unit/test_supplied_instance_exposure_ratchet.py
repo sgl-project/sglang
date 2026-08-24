@@ -171,6 +171,10 @@ _EXPOSED = {
     ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
     ("lora/lora_manager.py", "enable_lora_overlap_loading"),
     ("lora/marlin_lora_temp/policy.py", "lora_paths"),
+    ("managers/disagg_service.py", "disaggregation_bootstrap_port"),
+    # Only the non-flip branch reads it; a flip-capable instance takes a stable
+    # "dynamic" label so its metric series does not split on a flip.
+    ("observability/metrics_collector.py", "disaggregation_mode"),
     ("parser/template_detection.py", "model_path"),
     ("speculative/adaptive_spec_params.py", "speculative_algorithm"),
     ("speculative/adaptive_spec_params.py", "speculative_eagle_topk"),
@@ -209,19 +213,8 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
-    # Role-independent startup setup; live-path reads use the config bags.
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "disaggregation_mode",
-    ),
-    ("managers/disagg_service.py", "disaggregation_mode"),
-    # These configurations are rejected when role switch is enabled.
-    ("managers/data_parallel_controller.py", "disaggregation_mode"),
-    ("speculative/dspark_components/dspark_worker_v2.py", "disaggregation_mode"),
-    # Launch-time metadata.
-    ("kv_canary/api.py", "disaggregation_mode"),
-    ("managers/scheduler.py", "disaggregation_mode"),
-    # Flip-capable instances use a stable "dynamic" metrics label.
+    # Only the non-flip branch reads it; a flip-capable instance takes a stable
+    # "dynamic" label so its metric series does not split on a flip.
     ("observability/metrics_collector.py", "disaggregation_mode"),
     ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "reasoning_parser"),
