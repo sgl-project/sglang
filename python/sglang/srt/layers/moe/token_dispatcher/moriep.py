@@ -74,6 +74,11 @@ class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
             hook_fun(dispatcher)
 
 
+# Set by the normal dispatch path each time it sends, read by the aiter runner
+# to bound the receive buffer in decode. (n_tokens_sent, world_size, topk).
+LAST_DISPATCH_SEND_TOKENS = None
+
+
 class MoriEPNormalDispatchOutput(NamedTuple):
     """Mori EP normal dispatch output."""
 
@@ -566,6 +571,12 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
         num_token = hidden_states.shape[0]
+        global LAST_DISPATCH_SEND_TOKENS
+        LAST_DISPATCH_SEND_TOKENS = (
+            int(num_token),
+            self.group.world_size,
+            self.router_topk,
+        )
         output_dtype = hidden_states.dtype
         scale = None
 
