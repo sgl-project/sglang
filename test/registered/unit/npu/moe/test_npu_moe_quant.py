@@ -9,6 +9,15 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Mock optional third-party deps pulled in by sglang/__init__ when they are
+# not installed, so these tests also run on a CPU-only box (CI installs them).
+for _mod in ("triton", "IPython", "IPython.display", "aiohttp"):
+    if _mod not in sys.modules:
+        try:
+            __import__(_mod)
+        except ImportError:
+            sys.modules.setdefault(_mod, MagicMock())
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
@@ -47,6 +56,11 @@ class TestHiddenStatesDynamicQuantInit(unittest.TestCase):
     @patch("torch.ops")
     def test_float8_uses_mx_quant(self, mock_ops):
         quant = HiddenStatesDynamicQuant(torch.float8_e4m3fn)
+        self.assertIs(quant._op, mock_ops.npu.npu_dynamic_mx_quant)
+
+    @patch("torch.ops")
+    def test_use_mx_quant_override(self, mock_ops):
+        quant = HiddenStatesDynamicQuant(torch.int8, use_mx_quant=True)
         self.assertIs(quant._op, mock_ops.npu.npu_dynamic_mx_quant)
 
     @patch("torch.ops")

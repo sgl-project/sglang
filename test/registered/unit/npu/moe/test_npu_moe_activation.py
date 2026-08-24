@@ -10,6 +10,26 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn.functional as F
 
+# Mock deps pulled in by sglang/__init__ or the source import chain that are
+# unavailable on a CPU-only box, so these tests also run locally (CI uses the
+# real modules).
+if "triton" not in sys.modules:
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        _triton = type(sys)("triton")
+        _triton.jit = MagicMock(return_value=lambda f: f)
+        _triton.autotune = lambda *a, **kw: (lambda f: f)
+        sys.modules["triton"] = _triton
+        sys.modules.setdefault("triton.language", MagicMock())
+        sys.modules.setdefault("triton.backends", MagicMock())
+for _mod in ("IPython", "IPython.display", "aiohttp", "zmq", "fcntl", "sglang.srt.layers.activation"):
+    if _mod not in sys.modules:
+        try:
+            __import__(_mod)
+        except ImportError:
+            sys.modules.setdefault(_mod, MagicMock())
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=5, suite="stage-a-unit-test-npu")

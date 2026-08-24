@@ -9,6 +9,15 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Mock optional third-party deps pulled in by sglang/__init__ when they are
+# not installed, so these tests also run on a CPU-only box (CI installs them).
+for _mod in ("triton", "IPython", "IPython.display", "aiohttp"):
+    if _mod not in sys.modules:
+        try:
+            __import__(_mod)
+        except ImportError:
+            sys.modules.setdefault(_mod, MagicMock())
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
