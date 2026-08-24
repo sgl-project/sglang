@@ -3339,6 +3339,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 for backend, indices in deferred_by_backend.items():
                     group_items = [selected_items[index] for index in indices]
                     group_configs = [deferred[index] for index in indices]
+                    # Map backend-group positions through the rank-local shard to global grid rows.
+                    global_indices = [image_indices[index] for index in indices]
                     first_config = group_configs[0]
                     if backend == "gpu":
                         from sglang.srt.multimodal.processors.kimi_k25 import (
@@ -3361,7 +3363,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                                 x, first_config.transparent_bg_config
                             ),
                         )
-                        expected_grids = grid_thws_host[indices]
+                        expected_grids = grid_thws_host[global_indices]
                         if not torch.equal(produced_grids.cpu(), expected_grids):
                             raise ValueError(
                                 "Kimi-K3 deferred GPU preprocessing produced wrong grids"
@@ -3380,7 +3382,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         )
 
                     patch_counts = [
-                        int(grid_thws_host[index].prod().item()) for index in indices
+                        int(grid_thws_host[index].prod().item())
+                        for index in global_indices
                     ]
                     if sum(patch_counts) != pixel_values.shape[0]:
                         raise ValueError(

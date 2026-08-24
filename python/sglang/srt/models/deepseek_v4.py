@@ -138,7 +138,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    try_fused_hc_post_pre,
+    apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -168,7 +169,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -217,17 +217,6 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
-
-
-def _is_fused_mhc_post_pre_enabled() -> bool:
-    # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
-    # not read that flag and dispatches independently for both small and large
-    # token batches, so the standalone pre flag must not veto the fused opt-in.
-    return (
-        envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
-    )
 
 
 # FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
@@ -1295,11 +1284,19 @@ class MQALayer(MqaAttentionBase):
 
         unified = is_unified_kv_triton()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        do_fused_store = (unified and is_decode) or (
+        # The kernel is token-indexed (q, kv and positions are all length M), so
+        # a verify batch carrying several draft tokens per request is a shape it
+        # already handles. Only the cache store differs between decode and
+        # verify, and that half is left off below.
+        fuse_verify = (
+            envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_store:
+        if do_fused_qk_norm_rope:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -1318,7 +1315,27 @@ class MQALayer(MqaAttentionBase):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            if unified:
+            if unified and fuse_verify:
+                # Target-verify runs through the unified_kv decode path. The
+                # backend writes the current chunk's KV into the ring *before*
+                # attention (save_kv_cache=True -> store_swa_into_unified ahead
+                # of runtime.decode), and per-token causal index streams -- built
+                # once per step in the backend metadata -- keep each draft query
+                # attending only to positions up to itself. Causal masking among
+                # the draft tokens comes from those index streams, not from store
+                # timing. So this path skips only the fused kernel's *own* store
+                # and returns kv, letting that existing causally-indexed backend
+                # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
+                # computed -- it only addresses the kernel store this path drops.
+                #
+                # kv is a strided slice of qkv_a and the ring store requires a
+                # contiguous buffer, so materialise it before the kernel norms
+                # it in place. The unfused path pays the same copy inside
+                # _compute_kv_bf16.
+                kv = kv.contiguous()
+                swa_cache, swa_loc = None, None
+                swa_page_size, bf16_store = 1, True
+            elif unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
@@ -1354,7 +1371,13 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
                 bf16_store=bf16_store,
             )
-            kv = None
+            # On the verify path the kernel normed + RoPE'd kv in place and wrote
+            # nothing, so hand it back: the caller feeds it to attention as the
+            # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
+            # the backend do its normal causally-indexed store into the ring
+            # before the decode kernel runs -- exactly as the unfused path did.
+            if not (unified and fuse_verify):
+                kv = None
 
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
@@ -1563,10 +1586,13 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
+        # save_kv_cache = kv is not None selects who writes the ring. When kv is
+        # None the store was already fused into _forward_prepare* (decode) or
+        # done inline, so the backend skips its own store_cache; pass `q` as a
+        # sentinel for the `k is v` assert (attention won't read it once
+        # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
+        # _forward_prepare* deliberately left the store off and the backend does
+        # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1755,7 +1781,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -1985,7 +2011,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
+            input_norm_weight = (
+                self._input_layernorm_weight_bf16
+                if self._input_layernorm_weight_bf16 is not None
+                else self.input_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -1993,19 +2024,63 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                self.hc_mult,
                 self.rms_norm_eps,
-                self.hc_eps,
                 self.hc_eps,
                 _MHC_POST_MULT_VALUE,
                 self.hc_sinkhorn_iters,
-                norm_weight=(
-                    self._input_layernorm_weight_bf16
-                    if self._input_layernorm_weight_bf16 is not None
-                    else self.input_layernorm.weight.data
-                ),
-                norm_eps=self.input_layernorm.variance_epsilon,
+                input_norm_weight,
+                self.input_layernorm.variance_epsilon,
+                fn_transpose=False,
             )
-            x_quant = None
+            if fused is not None:
+                residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre returns the layer input WITHOUT
+                    # the input layernorm applied (norm_fused=False). Apply it
+                    # (fp8-quant on aiter gfx95) before attention, exactly as the
+                    # unfused hc_pre path below does; otherwise unnormalized
+                    # activations reach self_attn.
+                    if _use_aiter and _is_gfx95_supported:
+                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.rms_norm_eps,
+                        )
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
+                        x_quant = None
+                else:
+                    x_quant = None
+            else:
+                # Fused dispatch declined: close the previous layer's deferred
+                # mHC post (prev_residual/prev_post/prev_comb) before opening this
+                # layer's pre. Skipping hc_post here would drop the previous-layer
+                # post state and corrupt all subsequent layers.
+                hidden_states = self.hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
+                residual = hidden_states
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
+                if not norm_fused:
+                    if _use_aiter and _is_gfx95_supported:
+                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.rms_norm_eps,
+                        )
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
+                        x_quant = None
+                else:
+                    x_quant = None
         else:
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2038,12 +2113,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if use_fused:
-            fused_mhc = try_fused_hc_post_pre(
+            post_attn_norm_weight = (
+                self._post_attention_layernorm_weight_bf16
+                if self._post_attention_layernorm_weight_bf16 is not None
+                else self.post_attention_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 residual,
                 post,
                 comb,
-                self.hc_ffn_fn.T,
+                self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
                 self.hc_mult,
@@ -2051,32 +2131,30 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 _MHC_POST_MULT_VALUE,
                 self.hc_sinkhorn_iters,
-                _is_gfx95_supported,
+                post_attn_norm_weight,
+                self.post_attention_layernorm.variance_epsilon,
+                fn_transpose=True,
             )
-            if fused_mhc is not None:
-                residual, hidden_states, post, comb, norm_fused = fused_mhc
+            if fused is not None:
+                residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
             else:
-                residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
+                residual = hidden_states
+                hidden_states, post, comb, norm_fused = self.hc_pre(
                     hidden_states,
-                    residual,
-                    post.unsqueeze(-1) if post.ndim == 2 else post,
-                    comb,
                     self.hc_ffn_fn,
                     self.hc_ffn_scale,
                     self.hc_ffn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    _MHC_POST_MULT_VALUE,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=(
-                        self._post_attention_layernorm_weight_bf16
-                        if self._post_attention_layernorm_weight_bf16 is not None
-                        else self.post_attention_layernorm.weight.data
-                    ),
-                    norm_eps=self.post_attention_layernorm.variance_epsilon,
+                    norm=self.post_attention_layernorm,
+                    forward_batch=forward_batch,
                 )
-                norm_fused = True
+                if not norm_fused:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states
@@ -2315,11 +2393,63 @@ class DeepseekV4DecoderLayer(nn.Module):
     def op_mhc_post_attn_pre_mlp(self, state):
         # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
         # post-attention layernorm. Produces the 2D MoE input.
+        #
+        # Pop each boundary tensor from the state EXACTLY ONCE, up front, and
+        # reuse the locals for both the fused attempt and the non-fused
+        # fallback. apply_mhc_post_pre_boundary() returns None when it declines
+        # to fuse -- most importantly for the 0-token DP two-batch-overlap idle
+        # ubatch -- in which case control must fall through to the unfused
+        # hc_post. Popping in the fused call's arguments and again in the
+        # fallback would double-pop -> KeyError: 'hidden_states_after_attn' on
+        # every idle DP rank. use_fused_mhc_post_pre is on whenever the aiter
+        # gfx95 mHC path is available (is_cross_layer_mhc_fusion_enabled), so
+        # this fallback is reached under DP regardless of the TileLang env.
+        hidden_states_after_attn = state.pop("hidden_states_after_attn")
+        attn_residual = state.pop("attn_residual")
+        attn_post = state.pop("attn_post")
+        attn_comb = state.pop("attn_comb")
+
+        if self.use_fused_mhc_post_pre:
+            post_attn_norm_weight = (
+                self._post_attention_layernorm_weight_bf16
+                if self._post_attention_layernorm_weight_bf16 is not None
+                else self.post_attention_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
+                hidden_states_after_attn,
+                attn_residual,
+                attn_post,
+                attn_comb,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.hc_mult,
+                self.rms_norm_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
+                post_attn_norm_weight,
+                self.post_attention_layernorm.variance_epsilon,
+                fn_transpose=True,
+            )
+            if fused is not None:
+                ffn_residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                state.ffn_residual = ffn_residual
+                state.ffn_post = post
+                state.ffn_comb = comb
+                state.hidden_states_mlp_input = hidden_states
+                return
+
         hidden_states = self.hc_post(
-            state.pop("hidden_states_after_attn"),
-            state.pop("attn_residual"),
-            state.pop("attn_post"),
-            state.pop("attn_comb"),
+            hidden_states_after_attn,
+            attn_residual,
+            attn_post,
+            attn_comb,
         )
         ffn_residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2593,7 +2723,7 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 

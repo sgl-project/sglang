@@ -1,5 +1,5 @@
 //! The native SGLang data-plane endpoints: `/generate` (submit a request, then
-//! either fold egress frames to one unary JSON response or relay them as SSE
+//! either fold decode frames to one unary JSON response or relay them as SSE
 //! `data: {json}` … `[DONE]`, byte-compatible with Python
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
@@ -7,10 +7,9 @@
 //! generate-request submission (`submit`); the shared `AppState` lives in the
 //! parent `api_server` module.
 
-use std::{
-    convert::Infallible,
-    time::{Duration, Instant},
-};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -25,18 +24,20 @@ use axum::{
 };
 use tokio::sync::mpsc;
 
-use super::AppState;
+use super::app::AppState;
 use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::environ::env_bool;
-use crate::ids::Rid;
-use crate::message::{
-    ChunkEvent, EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams,
+use crate::message::ids::Rid;
+use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
+use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::sampling::SamplingParams;
+use crate::utils::{
+    environ,
+    response::{error_response, error_value},
 };
-use crate::utils::response::{error_response, error_value};
 
 /// API-local timing for one request.
 ///
@@ -78,7 +79,7 @@ impl RequestTiming {
 }
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate))
         .merge(health_routes())
@@ -97,11 +98,11 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
 /// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
-fn health_routes() -> Router<AppState> {
+fn health_routes() -> Router<Arc<AppState>> {
     let timeout =
-        std::time::Duration::from_secs(crate::environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
-    let probe = get(move |state: State<AppState>| health_generate(state, timeout));
-    let health = if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+        std::time::Duration::from_secs(environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
+    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
+    let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
     } else {
         get(|| async { StatusCode::OK.into_response() })
@@ -116,19 +117,21 @@ fn health_routes() -> Router<AppState> {
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
-/// producing output. 200 iff the egress heartbeat advances within `timeout`
+/// producing output. 200 if the response heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
 /// (`/health` uses the same handler when its env gate is on.)
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
-/// [`AppState::egress_activity`] counter (not the probe's own rid) — so a busy
+/// [`AppState::response_activity`] counter (not the probe's own rid) — so a busy
 /// server passes immediately and a backlog never false-503s (the analogue of
-/// Python's `last_receive_tstamp`). The `HEALTH_CHECK` skip + `http_worker_ipc`
-/// ack are irrelevant here: this single-process server owns the egress ring.
-async fn health_generate(State(state): State<AppState>, timeout: std::time::Duration) -> Response {
+/// Python's `last_receive_tstamp`).
+async fn health_generate(
+    State(state): State<Arc<AppState>>,
+    timeout: std::time::Duration,
+) -> Response {
     let baseline = state
-        .egress_activity
+        .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);
 
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
@@ -167,7 +170,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if state
-            .egress_activity
+            .response_activity
             .load(std::sync::atomic::Ordering::Relaxed)
             != baseline
         {
@@ -189,7 +192,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// with **400** (Python's status for a bad request) carrying serde's field-level
 /// message, instead of axum's default 422.
 async fn generate(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
     let body = match body {
@@ -280,18 +283,18 @@ async fn generate_single(
 /// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal);
 /// `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
 async fn drain_unary(
-    rx: &mut mpsc::Receiver<EgressItem>,
+    rx: &mut mpsc::Receiver<ResponseItem>,
     rid_str: &str,
     mut timing: RequestTiming,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
         match item {
-            EgressItem::Frame(out) => {
+            ResponseItem::Frame(out) => {
                 timing.observe_first_output();
                 acc.fold(&out);
             }
-            EgressItem::Done(out) => {
+            ResponseItem::Done(out) => {
                 timing.observe_first_output();
                 timing.finish();
                 acc.fold(&out);
@@ -310,14 +313,14 @@ async fn drain_unary(
                 add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value, true);
             }
-            EgressItem::Error(e) => {
+            ResponseItem::Error(e) => {
                 timing.finish();
                 let code = e.http_status();
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            EgressItem::Control(_) | EgressItem::Data(_) => continue, // never on `/generate`
+            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -393,8 +396,8 @@ async fn generate_batch(
 /// back for `FuturesUnordered` to re-poll. Empty result = channel closed.
 async fn recv_indexed(
     index: usize,
-    mut rx: mpsc::Receiver<EgressItem>,
-) -> (usize, mpsc::Receiver<EgressItem>, Vec<EgressItem>) {
+    mut rx: mpsc::Receiver<ResponseItem>,
+) -> (usize, mpsc::Receiver<ResponseItem>, Vec<ResponseItem>) {
     let mut items = Vec::new();
     match rx.recv().await {
         Some(item) => items.push(item),
@@ -410,7 +413,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>, RequestTiming)>,
+    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -456,7 +459,7 @@ fn generation_event_stream(
 
             for item in items {
                 match item {
-                    EgressItem::Frame(out) => {
+                    ResponseItem::Frame(out) => {
                         timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
@@ -465,17 +468,17 @@ fn generation_event_stream(
                             coalesced = true;
                         }
                     }
-                    EgressItem::Done(out) => {
+                    ResponseItem::Done(out) => {
                         timings[i].observe_first_output();
                         timings[i].finish();
                         accs[i].fold(&out);
                         terminal = Some(out);
                     }
-                    EgressItem::Error(e) => {
+                    ResponseItem::Error(e) => {
                         timings[i].finish();
                         failed = Some(e);
                     }
-                    EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
+                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
                 }
             }
 
@@ -539,29 +542,30 @@ fn terminal_stream_frame_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ChunkEvent;
-    use crate::tokenizer_manager::Senders;
+    use crate::message::response::ChunkEvent;
+    use crate::tokenizer_manager::wiring::Senders;
+    use crate::utils::error::Error;
     use futures::StreamExt;
     use std::time::Duration;
     fn senders() -> Senders {
         Senders {
-            tm: flume::unbounded().0,
-            abort: flume::unbounded().0,
-            tok: flume::unbounded().0,
-            detok: vec![],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![],
         }
     }
 
-    fn frame(rid: u64, text: &str) -> EgressItem {
-        EgressItem::Frame(ChunkEvent {
+    fn frame(rid: u64, text: &str) -> ResponseItem {
+        ResponseItem::Frame(ChunkEvent {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
             ..Default::default()
         })
     }
-    fn done(rid: u64, text: &str) -> EgressItem {
-        EgressItem::Done(ChunkEvent {
+    fn done(rid: u64, text: &str) -> ResponseItem {
+        ResponseItem::Done(ChunkEvent {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
@@ -579,8 +583,8 @@ mod tests {
 
     fn timed_receiver(
         rid: u64,
-        rx: mpsc::Receiver<EgressItem>,
-    ) -> (Rid, mpsc::Receiver<EgressItem>, RequestTiming) {
+        rx: mpsc::Receiver<ResponseItem>,
+    ) -> (Rid, mpsc::Receiver<ResponseItem>, RequestTiming) {
         (
             Rid::from(rid.to_string()),
             rx,
@@ -630,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn unary_terminal_meta_info_matches_python_semantics() {
         let (tx, mut rx) = mpsc::channel(2);
-        tx.send(EgressItem::Done(ChunkEvent {
+        tx.send(ResponseItem::Done(ChunkEvent {
             rid: "internal-rid".into(),
             text: "ok".into(),
             token_ids: vec![7, 8],
@@ -723,11 +727,9 @@ mod tests {
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
 
-        tx0.send(EgressItem::Error(crate::error::Error::Validation(
-            "bad".into(),
-        )))
-        .await
-        .unwrap();
+        tx0.send(ResponseItem::Error(Error::Validation("bad".into())))
+            .await
+            .unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["error"]["code"], 400);
