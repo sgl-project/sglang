@@ -38,6 +38,10 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
           </tr>
           <tr>
+            <td>LongCat-Image</td>
+            <td><div className="sgd-id-list"><code>meituan-longcat/LongCat-Image</code></div></td>
+          </tr>
+          <tr>
             <td>SD3 / SD3.5</td>
             <td><div className="sgd-id-list"><code>stabilityai/stable-diffusion-3-medium</code><code>stabilityai/stable-diffusion-3-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-medium</code><code>stabilityai/stable-diffusion-3.5-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-large</code><code>stabilityai/stable-diffusion-3.5-large-diffusers</code></div></td>
           </tr>
@@ -86,6 +90,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><span className="sgd-muted">No dedicated optimization listed</span></td>
           </tr>
           <tr>
+            <td>LingBot Video MoE</td>
+            <td><div className="sgd-id-list"><code>robbyant/lingbot-video-moe-30b-a3b</code></div></td>
+            <td>T2V, 480p</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
             <td>Wan2.2</td>
             <td><div className="sgd-id-list"><code>Wan-AI/Wan2.2-TI2V-5B-Diffusers</code><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code><code>Wan-AI/Wan2.2-I2V-A14B-Diffusers</code></div></td>
             <td>TI2V / T2V / I2V, 480p / 720p</td>
@@ -125,7 +135,7 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td>MiniMax-H3</td>
             <td><div className="sgd-id-list"><code>MiniMaxAI/MiniMax-H3</code></div></td>
             <td>T2VA / FL2VA / Ref2VA, 768p at 24 fps with synchronized audio</td>
-            <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Sage</span><span className="sgd-chip">Online FP8</span></td>
+            <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Sage</span><span className="sgd-chip">Online FP8</span><span className="sgd-chip">GGUF</span></td>
           </tr>
           <tr>
             <td>Wan2.1 Fun</td>
@@ -143,6 +153,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td>LTX-2</td>
             <td><div className="sgd-id-list"><code>Lightricks/LTX-2</code><code>Lightricks/LTX-2.3</code></div></td>
             <td>One-stage, two-stage, TI2V, HQ</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>LTX-2.5</td>
+            <td><div className="sgd-id-list"><code>Lightricks/LTX-2.5-Diffusers</code></div></td>
+            <td>One-stage, two-stage, TI2V, auto-duration, diffusion decode</td>
             <td><span className="sgd-muted">No dedicated optimization listed</span></td>
           </tr>
           <tr>
@@ -263,6 +279,21 @@ Optimization columns are abbreviated to keep the matrix readable:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SANA-Video 2B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Efficient-Large-Model/SANA-Video_2B_480p_diffusers</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LingBot Video MoE 30B-A3B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>robbyant/lingbot-video-moe-30b-a3b</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -606,6 +637,21 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2.5 (one/two-stage/TI2V)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Lightricks/LTX-2.5-Diffusers</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>960×544 (default)<br />1920×1088 (two-stage)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cosmos3-Nano (T2V / I2V / T2I)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Cosmos3-Nano</code></td>
       <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>720p · 480p<br />1024×1024 (T2I)</td>
@@ -653,7 +699,6 @@ Optimization columns are abbreviated to keep the matrix readable:
    - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
-   - Deprecated compatibility: `snapshot` is accepted as an alias for `original` and may be removed after two release cycles.
 5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (16B) and
    `nvidia/Cosmos3-Super` (64B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from
@@ -670,6 +715,13 @@ component directory.
 
 The same overrides can also be provided in config files through
 `component_paths.<component>`.
+
+Component path overrides are generic, but quantized checkpoint support is
+loader-specific. Native SGLang loaders that only materialize plain state dicts
+reject detected quantization metadata before weight loading instead of silently
+casting the checkpoint into an unquantized module. Library-managed components
+inherit the corresponding Transformers or Diffusers support. See
+[Quantized Component Repositories](./quantization#quantized-component-repositories).
 
 ### Common Syntax
 
@@ -773,7 +825,7 @@ The table below lists concrete Hugging Face component repos that are already use
 ### Transformer / DiT
 
 - `--transformer-path` is the standard override for the main denoising transformer.
-- For quantized transformers, prefer `--transformer-path` or `--transformer-weights-path`; see `quantization.md`.
+- For a pre-quantized main transformer, prefer `--transformer-path` or `--transformer-weights-path`; see [Quantization](./quantization).
 - `--video-dit-path` and `--audio-dit-path` are only for pipelines that split denoisers by modality.
 
 ### Text Encoders and Preprocessors
@@ -793,6 +845,10 @@ The table below lists concrete Hugging Face component repos that are already use
    that component.
 2. The override key should match the component name in the pipeline's
    `model_index.json` or the native pipeline's registered module name.
+3. An override path does not enable quantization by itself. A pre-quantized
+   component must include metadata for a format supported by its selected
+   loader. `--quantization` overrides the transformer loader; other component
+   checkpoints select their serialized format through their own metadata.
 
 ## Verified LoRA Examples
 

@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
@@ -103,6 +104,8 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    CheckpointFilePrefetchHandle,
+    _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -112,6 +115,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    initialize_capture_safe_weights,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
@@ -147,61 +151,15 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
         yield module
         return
 
-    original_infos: Dict[str, Dict] = {}
-
-    # Store original device states and move parameters to GPU if they're on CPU
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            original_data = p.data
-            device_data = p.data.to(target_device)
-            original_infos[name] = dict(
-                device=p.device,
-                original_data=original_data,
-                device_data=device_data,
-            )
-            p.data = device_data
-        # Parameters already on target device are not touched
-
-    try:
+    with stage_module_for_post_load(
+        module,
+        target_device,
+        pin_memory=target_device.type != "cpu" and is_pin_memory_available(),
+    ):
         yield module
-
-    finally:
-        # Restore parameters to their original devices, ignoring new parameters
-        pin_memory = is_pin_memory_available()
-        for name, p in module.named_parameters():
-            if name in original_infos:
-                original_info = original_infos[name]
-                device_data = original_info["device_data"]
-                original_data = original_info["original_data"]
-                original_device: torch.device = original_info["device"]
-
-                if (
-                    (device_data.device == p.data.device)
-                    and (device_data.data_ptr() == p.data.data_ptr())
-                    and (device_data.shape == p.data.shape)
-                    and (device_data.dtype == p.data.dtype)
-                ):
-                    original_data.copy_(p.data.to(original_data.device))
-                    p.data = original_data
-                elif original_device.type == "cpu":
-                    # `torch.empty_like` does not support `pin_memory` argument
-                    cpu_data = torch.empty_strided(
-                        size=p.data.size(),
-                        stride=p.data.stride(),
-                        dtype=p.data.dtype,
-                        layout=p.data.layout,
-                        device="cpu",
-                        pin_memory=pin_memory,
-                    )
-                    cpu_data.copy_(p.data)
-                    p.data = cpu_data
-                else:
-                    p.data = p.data.to(original_device)
-        # New parameters or parameters already on target device are untouched
 
 
 logger = logging.getLogger(__name__)
@@ -410,6 +368,15 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config=model_config,
             )
 
+    @dataclasses.dataclass(frozen=True)
+    class ResolvedSource:
+        """A weight source whose local checkpoint files are already resolved."""
+
+        source: DefaultModelLoader.Source
+        hf_folder: str
+        weight_files: Tuple[str, ...]
+        use_safetensors: bool
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -571,22 +538,31 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: Source
+        self,
+        source: Source,
+        *,
+        resolved_source: Optional[ResolvedSource] = None,
+        startup_prefetch_started: bool = False,
+        startup_prefetch_active: bool = False,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path, source.revision, source.fall_back_to_pt
-        )
-
-        if use_safetensors and source.model_config is not None:
-            hf_weights_files = maybe_add_mtp_safetensors(
-                hf_weights_files,
-                hf_folder,
-                "model.safetensors.index.json",
-                source.model_config.hf_config,
+        if resolved_source is None:
+            hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+                source.model_or_path, source.revision, source.fall_back_to_pt
             )
+            if use_safetensors and source.model_config is not None:
+                hf_weights_files = maybe_add_mtp_safetensors(
+                    hf_weights_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+        else:
+            hf_folder = resolved_source.hf_folder
+            hf_weights_files = list(resolved_source.weight_files)
+            use_safetensors = resolved_source.use_safetensors
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -599,7 +575,13 @@ class DefaultModelLoader(BaseModelLoader):
             )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
-            weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
+            configured_prefetch = get_model().weight_loader_prefetch_checkpoints
+            start_iterator_prefetch = (
+                configured_prefetch and not startup_prefetch_started
+            )
+            concurrent_prefetch_active = (
+                startup_prefetch_active or start_iterator_prefetch
+            )
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
@@ -616,7 +598,7 @@ class DefaultModelLoader(BaseModelLoader):
             # e.g. local NVMe, where prefetch is a no-op and multi-threading
             # helps.
             if (
-                weight_loader_prefetch
+                concurrent_prefetch_active
                 and not weight_loader_disable_mmap
                 and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
                 and use_multithread
@@ -625,7 +607,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             ):
                 logger.warning(
-                    "--weight-loader-prefetch-checkpoints is enabled; falling "
+                    "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "
                     "enable_multithread_load=true in --model-loader-extra-config "
@@ -647,7 +629,7 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
-                    prefetch=weight_loader_prefetch,
+                    prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
@@ -655,7 +637,7 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
-                    prefetch=weight_loader_prefetch,
+                    prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
@@ -715,6 +697,143 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
+
+    def resolve_model_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Tuple[ResolvedSource, ...]:
+        """Resolve all checkpoint files before background startup prefetching."""
+        sources = [DefaultModelLoader.Source.init_new(model_config, model)]
+        sources.extend(
+            cast(
+                Iterable[DefaultModelLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            )
+        )
+
+        resolved_sources = []
+        for source in sources:
+            hf_folder, weight_files, use_safetensors = self._prepare_weights(
+                source.model_or_path,
+                source.revision,
+                source.fall_back_to_pt,
+            )
+            if use_safetensors and source.model_config is not None:
+                weight_files = maybe_add_mtp_safetensors(
+                    weight_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+            resolved_sources.append(
+                DefaultModelLoader.ResolvedSource(
+                    source=source,
+                    hf_folder=hf_folder,
+                    weight_files=tuple(weight_files),
+                    use_safetensors=use_safetensors,
+                )
+            )
+        return tuple(resolved_sources)
+
+    @staticmethod
+    def start_checkpoint_prefetch(
+        resolved_sources: Tuple[ResolvedSource, ...],
+        *,
+        num_threads: int,
+    ) -> CheckpointFilePrefetchHandle:
+        """Start CPU-only page-cache staging for already-resolved sources."""
+        if not all(source.use_safetensors for source in resolved_sources):
+            raise ValueError(
+                "Startup weight-loading overlap requires safetensors checkpoints"
+            )
+        weight_files = sorted(
+            {path for source in resolved_sources for path in source.weight_files}
+        )
+        return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
+
+    def initialize_model_for_startup(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Build the final model structure and GPU parameter storage."""
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        return model
+
+    def prepare_model_for_capture(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+    ) -> nn.Module:
+        """Initialize final storage with values safe for graph warmup.
+
+        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
+        that parameters are filled with a detectable sentinel instead of random
+        values so ``commit_model_weights`` can prove every one of them was
+        replaced.
+
+        Note that this runs ``process_weights_after_loading`` on the sentinel
+        values, and ``commit_model_weights`` runs it again on the real weights,
+        so overlap invokes it once more than the serial path. That is safe for
+        the currently supported matrix, where the CUDA unquantized path is a
+        no-op, and it is not covered by the storage manifest, which proves
+        tensor identity rather than idempotence. Any quantization method that
+        mutates weights in place therefore has to be evaluated here before its
+        configuration is added to the supported set.
+        """
+        with set_default_torch_dtype(model_config.dtype):
+            initialize_capture_safe_weights(model)
+            _post_load_weights(model)
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None:
+                    continue
+                if (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
+        return model.eval()
+
+    def commit_model_weights(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        resolved_sources: Tuple[ResolvedSource, ...],
+        target_device: torch.device,
+        startup_prefetch_active: bool,
+    ) -> None:
+        """Load real checkpoint values into a capture-ready model."""
+
+        def weights_iterator():
+            for resolved_source in resolved_sources:
+                yield from self._get_weights_iterator(
+                    resolved_source.source,
+                    resolved_source=resolved_source,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=startup_prefetch_active,
+                )
+
+        with set_default_torch_dtype(model_config.dtype):
+            self.load_weights_and_postprocess(
+                model,
+                weights_iterator(),
+                target_device,
+            )
+        self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -915,9 +1034,6 @@ class LayeredModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-
-        torchao_config = get_exec().graph.torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -958,17 +1074,9 @@ class LayeredModelLoader(DefaultModelLoader):
                     fqn_path,
                     weights,
                 )
-                # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
-                    # Note: `None` here is needed to indicate no filter, see
-                    # `apply_torchao_config_to_model` for details.
-                    apply_torchao_config_to_model(module, torchao_config, None)
 
             # Start calling on root module
             fill_module(model, [], weights)
-
-        if torchao_config:
-            model.torchao_applied = True
 
         return model.eval()
 
@@ -4125,6 +4233,9 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
+    if isinstance(load_config.load_format, type):
+        return load_config.load_format(load_config)
+
     if model_config and model_config.quantization in ["auto-round-int8"]:
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
@@ -4178,9 +4289,6 @@ def get_model_loader(
                 f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
             )
         return ModelOptModelLoader(load_config)
-
-    if isinstance(load_config.load_format, type):
-        return load_config.load_format(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

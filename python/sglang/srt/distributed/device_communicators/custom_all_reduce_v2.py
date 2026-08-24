@@ -31,18 +31,21 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     custom_all_reduce,
 )
-from sglang.srt.cuda_vmm_utils import (
-    VmmGraphInputManager,
-    compute_graph_capture_bases,
-    is_vmm_pointer,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.utils.cuda_vmm_utils import (
+    VmmGraphInputManager,
+    compute_graph_capture_bases,
+    is_vmm_pointer,
+)
 
-from .configs.custom_all_reduce_v2 import get_all_reduce_config
+from .configs.custom_all_reduce_v2 import (
+    get_all_reduce_config,
+    get_supported_world_sizes,
+)
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_one_nvlink_clique,
@@ -447,8 +450,7 @@ class CustomAllReduceV2:
 
 
 def _is_vmm_backed_allocator(device: torch.device) -> bool:
-    """True iff the caching allocator is VMM-backed (expandable_segments). Uniform
-    launch, so the local probe reflects every rank."""
+    """Check whether expandable-segments VMM backs the caching allocator."""
     probe = torch.empty(1, dtype=torch.uint8, device=device)
     return is_vmm_pointer(probe.data_ptr())
 
@@ -457,34 +459,15 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
-    # Multi-node (MNNVL): the node-local NVLink/P2P topology checks below
-    # are meaningless across nodes; the torch symm-mem rendezvous (fabric
-    # handles) is the real capability gate there.
-    if envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get() and not all(
-        in_the_same_node_as(group, source_rank=0)
-    ):
-        world_size = dist.get_world_size(group=group)
-        if world_size in range(2, 9):
-            logger.warning(
-                "CustomAllReduceV2 enabled on a multi-node group "
-                "(world_size=%d); graph zero-copy is disabled.",
-                world_size,
-            )
-            return True
-        return False
-
-    supported = list(range(2, 17))
+    supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
-    # Multi-node needs a single NVLink clique (one NVL72 / MNNVL domain) whose
-    # allocator is VMM-backed: graph inputs cross nodes via FABRIC / POSIX-fd VMM
-    # handles, not cudaIpc (intra-node only). Else use the intra-node nvlink check.
     if not all(in_the_same_node_as(group, source_rank=0)):
         return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
-        supported_world_size=supported,
+        supported_world_size=list(supported),
         cls_name="CustomAllReduceV2",
     )
     return full_nvlink is True
