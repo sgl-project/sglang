@@ -520,6 +520,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         self.register_buffer_to_engine()
         self._ready_pool = None
+        self._ready_descs = None
         self._ready_slot_count = 0
         self._ready_next_epoch: List[int] = []
         self._ready_leases: Dict[Tuple[int, int, int], Tuple[int, int]] = {}
@@ -660,6 +661,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not descs:
             raise RuntimeError("NIXL memory registration failed for ready pool")
+        self._ready_descs = descs
         self._ready_slot_count = slot_count
         self._ready_next_epoch = [0] * slot_count
 
