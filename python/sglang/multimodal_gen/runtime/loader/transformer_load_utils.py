@@ -868,14 +868,7 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-<<<<<<< HEAD
-    # Serialized modelopt_fp8 still requantizes fused shards to a shared max
-    # scale via scaled_fp8_quant(), a CUDA/Triton kernel; postprocess therefore
-    # needs device tensors even when the checkpoint is already fp8.
-    if quant_name in ("modelopt_fp8", "comfy_fp8"):
-=======
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
->>>>>>> origin/main
         return True
     if quant_name == "kitchen_int8":
         assert isinstance(quant_config, KitchenInt8Config)
