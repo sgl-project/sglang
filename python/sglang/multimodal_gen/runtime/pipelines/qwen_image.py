@@ -105,7 +105,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         def create_before_denoising_stage():
-            return QwenImageLayeredBeforeDenoisingStage(
+            stage = QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
@@ -117,6 +117,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
                     server_args.pipeline_config.text_encoder_precisions[0]
                 ],
             )
+            return stage
 
         self.add_stage_factory(
             RoleType.ENCODER,

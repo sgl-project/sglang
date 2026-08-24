@@ -183,8 +183,8 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi30x-20260822",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260822",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -258,11 +258,8 @@ sgl-eval run aime25 \\
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       ep: { label: "EP", values: [
@@ -319,7 +316,6 @@ sgl-eval run aime25 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
-      showWhen: (base) => base.specAlgorithm !== "DSPARK",
       incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
@@ -1647,7 +1643,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1656,7 +1652,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--host {{HOST_IP}}",
@@ -1667,7 +1663,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1679,7 +1675,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -1690,7 +1686,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1702,7 +1698,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2335,6 +2331,7 @@ sgl-eval run aime25 \\
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2344,7 +2341,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--host {{HOST_IP}}",
@@ -2358,6 +2355,7 @@ sgl-eval run aime25 \\
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2367,7 +2365,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--speculative-algorithm EAGLE",
@@ -2389,6 +2387,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2401,7 +2400,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2419,6 +2418,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2431,7 +2431,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2453,6 +2453,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2465,7 +2466,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2483,6 +2484,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2495,7 +2497,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2515,6 +2517,7 @@ sgl-eval run aime25 \\
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2524,7 +2527,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--speculative-algorithm EAGLE",
@@ -2546,6 +2549,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2558,7 +2562,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2580,6 +2584,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2592,7 +2597,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2612,6 +2617,7 @@ sgl-eval run aime25 \\
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2621,7 +2627,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--speculative-algorithm EAGLE",
@@ -2643,6 +2649,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2655,7 +2662,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2677,6 +2684,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2689,7 +2697,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2709,6 +2717,7 @@ sgl-eval run aime25 \\
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2718,7 +2727,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
         "--speculative-algorithm EAGLE",
@@ -2740,6 +2749,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2752,7 +2762,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2774,6 +2784,7 @@ sgl-eval run aime25 \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2786,7 +2797,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
