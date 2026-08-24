@@ -188,7 +188,7 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
     start_profile.assert_called_once_with()
     start_latch.assert_called_once_with()
     stop_profile.assert_called_once_with()
-    # The rank-0 filesystem latch replaces the deadlocking post-start barrier;
+    # The all-rank filesystem latch replaces the deadlocking post-start barrier;
     # the existing pre/post-stop pair remains.
     assert barrier.call_count == 2
 
@@ -281,10 +281,37 @@ def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
     manager.torch_profiler_output_dir = tmp_path
     manager.profile_id = "worker-specific-profile"
 
-    with patch(
-        "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
-        return_value=SimpleNamespace(base_gpu_id=0),
-    ):
-        manager._wait_for_nsys_capture_start()
+    manager._wait_for_nsys_capture_start()
 
-    assert (tmp_path / ".nsys-capture-ready-worker-specific-profile").is_file()
+    assert (
+        tmp_path / ".nsys-capture-ready-worker-specific-profile-rank-0"
+    ).is_file()
+
+
+def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+                "SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE": "4",
+            },
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+    manager.torch_profiler_output_dir = tmp_path
+    manager.profile_id = "all-rank-profile"
+    for rank in (1, 2, 3):
+        (tmp_path / f".nsys-capture-ready-all-rank-profile-rank-{rank}").touch()
+
+    manager._wait_for_nsys_capture_start()
+
+    assert (
+        len(list(tmp_path.glob(".nsys-capture-ready-all-rank-profile-rank-*")))
+        == 4
+    )

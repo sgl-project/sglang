@@ -108,6 +108,7 @@ class SchedulerProfilerManager:
         expected_sync_world_size = int(
             os.getenv("SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE", "0") or "0"
         )
+        self.nsys_exact_sync_world_size = expected_sync_world_size or 1
         if self.nsys_exact_batch and expected_sync_world_size:
             actual_sync_world_size = torch.distributed.get_world_size(
                 group=self.exact_nsys_cpu_group
@@ -328,23 +329,37 @@ class SchedulerProfilerManager:
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _wait_for_nsys_capture_start(self) -> None:
-        """Release all scheduler ranks after rank 0 has finished arming Nsight."""
+        """Release scheduler ranks only after every rank has armed Nsight."""
 
-        capture_ready = (
+        capture_ready_prefix = (
             Path(self.torch_profiler_output_dir)
             / f".nsys-capture-ready-{self.profile_id}"
         )
-        if self.ps.gpu_id == get_device().base_gpu_id:
-            capture_ready.touch()
+        rank_ready = Path(f"{capture_ready_prefix}-rank-{self.ps.gpu_id}")
+        rank_ready.touch()
         deadline = time.monotonic() + 60.0
-        while not capture_ready.exists():
+        ready_count = 0
+        while ready_count < self.nsys_exact_sync_world_size:
+            ready_count = len(
+                list(
+                    capture_ready_prefix.parent.glob(
+                        f"{capture_ready_prefix.name}-rank-*"
+                    )
+                )
+            )
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    "Timed out waiting for rank-0 Nsight capture startup marker "
-                    f"{capture_ready}"
+                    "Timed out waiting for every rank's Nsight capture startup marker: "
+                    f"ready={ready_count}/{self.nsys_exact_sync_world_size}, "
+                    f"prefix={capture_ready_prefix}"
                 )
             time.sleep(0.01)
-        logger.info("Nsight capture startup latch released: %s", capture_ready)
+        logger.info(
+            "Nsight capture startup latch released: ready=%d/%d prefix=%s",
+            ready_count,
+            self.nsys_exact_sync_world_size,
+            capture_ready_prefix,
+        )
 
     def _merge_profile_traces(self) -> str:
         if not self.merge_profiles:
@@ -595,7 +610,8 @@ class SchedulerProfilerManager:
                         # first measured symmetric-memory collective while a
                         # peer is still arming Nsight. A Gloo barrier here can
                         # itself stall once Nsight has attached to rank 0, so
-                        # use a per-profile shared-filesystem latch instead.
+                        # use an all-rank, per-profile shared-filesystem
+                        # rendezvous instead.
                         self._wait_for_nsys_capture_start()
             if (
                 self.nsys_exact_batch
