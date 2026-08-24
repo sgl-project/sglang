@@ -360,6 +360,23 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
+# topk_per_row_kernels.cu uses std::optional but stopped including <optional>
+# when ROCm/aiter#4702 dropped its torch headers, which had pulled it in
+# transitively. ROCm 7.2's toolchain still provides it through another header;
+# ROCm 7.0's does not, so the module_top_k_per_row build fails there. Upstream
+# added the include in ROCm/aiter#4853, so this no-ops once AITER_COMMIT
+# reaches that; drop it then.
+RUN python3 <<'PY'
+from pathlib import Path
+
+p = Path("/sgl-workspace/aiter/csrc/kernels/topk_per_row_kernels.cu")
+anchor = "#include <type_traits>\n"
+if p.exists():
+    s = p.read_text()
+    if "std::optional" in s and "#include <optional>" not in s and anchor in s:
+        p.write_text(s.replace(anchor, "#include <optional>\n" + anchor, 1))
+PY
+
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
