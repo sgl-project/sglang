@@ -435,11 +435,12 @@ def dispatch_custom_allreduce(
 def _enable_register_for_capturing() -> bool:
     """Whether custom AR may bind graph-owned input pointers directly.
 
-    DSA DP attention captures dense and sparse decode graphs for every batch
-    bucket in one shared graph pool. On ROCm, direct custom-AR registration is
-    unsafe for that layout: peer pointer mappings can differ between the two
-    captures even when a local graph-pool address is reused. Copying into the
-    communicator's pre-registered buffer keeps the peer mapping stable.
+    DSA DP-attention lanes may replay different decode graphs at the same time.
+    Direct registration bakes a peer-pointer tuple for one captured graph into
+    each custom-AR call. If another rank replays a different graph, that tuple
+    still points at the peer buffer from the original graph and reads stale
+    data. Copy-in uses one pre-registered address per rank across every graph,
+    so independently selected graph variants remain compatible.
     """
     if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
         return False
