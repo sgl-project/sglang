@@ -297,6 +297,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
+        self._verify_ids_buf: Optional[torch.Tensor] = None
 
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
@@ -655,9 +656,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        verify_ids_2d = torch.cat(
-            [draft_block_ids[:, :1], draft_tokens], dim=1
-        ).contiguous()
+        if _is_npu:
+            verify_ids_buf = self._verify_ids_buf
+            if verify_ids_buf is None or verify_ids_buf.shape[0] < bs:
+                verify_ids_buf = torch.empty(
+                    (bs, self.verify_num_draft_tokens),
+                    dtype=draft_block_ids.dtype,
+                    device=device,
+                )
+                self._verify_ids_buf = verify_ids_buf
+            verify_ids_2d = torch.cat(
+                [draft_block_ids[:, :1], draft_tokens],
+                dim=1,
+                out=verify_ids_buf[:bs],
+            )
+        else:
+            verify_ids_2d = torch.cat(
+                [draft_block_ids[:, :1], draft_tokens], dim=1
+            ).contiguous()
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
