@@ -28,7 +28,7 @@ _LIVE_SHADOWED = {
     "pp_size": "configured_pp_size()",
     "moe_dp_size": "configured_moe_dp_size()",
     "attn_cp_size": "configured_attn_cp_size()",
-    "dcp_size": "a configured accessor (none exists yet; add one beside configured_pp_size)",
+    "dcp_size": "configured_dcp_size()",
 }
 
 # Launch paths that decide how many children to spawn are derived below
@@ -234,6 +234,119 @@ def _launch_paths():
 
 
 class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
+    def test_configured_sizes_hold_when_the_live_topology_disagrees(self):
+        """The other direction: groups exist and answer something else.
+
+        The check above proves nobody reads a live size too early. It says
+        nothing about what `configured_*()` returns once the groups *are* up
+        and answering a different number -- which is not hypothetical: elastic
+        EP scales the live topology away from what the operator configured, and
+        that divergence is the entire reason these five helpers exist. With
+        only the early-read direction covered, a helper that quietly delegated
+        to the live property would look correct.
+        """
+        import json
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.runtime_context import (
+            configured_attn_cp_size,
+            configured_dcp_size,
+            configured_moe_dp_size,
+            configured_pp_size,
+            configured_tp_size,
+            get_parallel,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        directory = tempfile.mkdtemp(prefix="configured_sizes_")
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        # No resolve_once() here: `tp_size` is raw input, so the configured
+        # value is 2 either way.
+        server_args = ServerArgs(model_path=directory, device="cuda", tp_size=2)
+        self.addCleanup(reset_context)
+        publish(server_args, role="scheduler")
+
+        # The live getter behind each property, read out of ParallelContext
+        # rather than listed here.
+        context_source = ast.parse(
+            (_PACKAGE_ROOT / "srt" / "runtime_context.py").read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        parallel_class = next(
+            node
+            for node in ast.walk(context_source)
+            if isinstance(node, ast.ClassDef) and node.name == "ParallelContext"
+        )
+        live_getter = {}
+        for method in parallel_class.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            for call in ast.walk(method):
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_v"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                ):
+                    continue
+                getter = call.args[1]
+                if isinstance(getter, ast.Attribute):
+                    live_getter[call.args[0].value] = getter.attr
+        state = "sglang.srt.distributed.parallel_state"
+        helpers = {
+            "tp_size": configured_tp_size,
+            "pp_size": configured_pp_size,
+            "moe_dp_size": configured_moe_dp_size,
+            "attn_cp_size": configured_attn_cp_size,
+            "dcp_size": configured_dcp_size,
+        }
+        missing = sorted(set(helpers) - set(live_getter))
+        self.assertEqual(
+            missing,
+            [],
+            f"these sizes no longer have a live property to diverge from: {missing}",
+        )
+        cases = tuple(
+            (name, helper, f"{state}.{live_getter[name]}")
+            for name, helper in helpers.items()
+        )
+        for name, helper, target in cases:
+            with self.subTest(size=name):
+                configured = helper()
+                with patch(target, return_value=configured + 41):
+                    self.assertEqual(
+                        get_parallel().__getattribute__(name),
+                        configured + 41,
+                        f"{name} no longer follows the live topology",
+                    )
+                    self.assertEqual(
+                        helper(),
+                        configured,
+                        f"configured_{name}() followed the live topology instead "
+                        "of the published configuration",
+                    )
+        reset_context()
+
     def test_no_live_topology_read_before_distributed_init(self):
         offenders = []
         for rel, tree in _launch_paths():

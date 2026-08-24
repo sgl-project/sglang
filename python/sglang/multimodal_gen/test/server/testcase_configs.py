@@ -48,6 +48,7 @@ class ToleranceConfig:
     denoise_agg: float
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
+    host_anon: float = 0.02
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -100,6 +101,7 @@ class ToleranceConfig:
                     tol_data.get("runtime_peak_vram", 0.02),
                 )
             ),
+            host_anon=float(tol_data.get("host_anon", 0.02)),
         )
 
 
@@ -115,6 +117,9 @@ class ScenarioConfig:
     estimated_full_test_time_s: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
+    # Anonymous-host budget caps; None skips the check (older baselines).
+    load_peak_host_anon_mb: float | None = None
+    runtime_peak_host_anon_mb: float | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -131,6 +136,8 @@ class ScenarioConfig:
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+            load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
+            runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
         )
 
 
@@ -295,6 +302,12 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
+    # Send the request this many times in one server session; performance and
+    # consistency are validated on the last one. >1 asserts a warm second
+    # request meets the same baselines -- a leak in residency arming, courier
+    # in-flight tracking, or host copies shows up as the second request
+    # degrading or dying.
+    perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -432,6 +445,8 @@ class PerformanceSummary:
     all_denoise_steps: dict[int, float]
     load_peak_vram_mb: float = 0.0
     runtime_peak_vram_mb: float = 0.0
+    load_peak_host_anon_mb: float = 0.0
+    runtime_peak_host_anon_mb: float = 0.0
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -467,6 +482,14 @@ class PerformanceSummary:
         runtime_peak_vram_mb = float(
             record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
         )
+        load_peak_host_anon_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_host_anon_mb", 0.0)
+        )
+        runtime_peak_host_anon_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get(
+                "peak_host_anon_mb", 0.0
+            )
+        )
 
         return PerformanceSummary(
             e2e_ms=e2e_ms,
@@ -478,6 +501,8 @@ class PerformanceSummary:
             all_denoise_steps=per_step,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
+            load_peak_host_anon_mb=load_peak_host_anon_mb,
+            runtime_peak_host_anon_mb=runtime_peak_host_anon_mb,
         )
 
 
