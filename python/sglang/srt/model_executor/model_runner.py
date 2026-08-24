@@ -586,6 +586,7 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
+            server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,

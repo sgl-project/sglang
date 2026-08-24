@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     remote_instance_transfer_engine_enabled,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
+    server_args: ServerArgs
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
