@@ -1,6 +1,25 @@
-"""HunyuanImage-3 attention metadata, 2D RoPE and KV-cache helpers."""
+# coding=utf-8
+# Copyright 2024 The HunYuan team.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Custom attention metadata, 2D RoPE and image KV-cache helpers used by the
+HunyuanImage-3 model during image generation.
+
+Ported from the official HunyuanImage-3 model repository
+(`modeling_hunyuan_image_3.py`).
+"""
 
 import math
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from einops import rearrange, repeat
@@ -8,6 +27,12 @@ from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
+
+
+# =============================================================
+# 1. Custom attention meta.
+# =============================================================
 
 @dataclass
 class HunYuanImageAttentionMeta:
@@ -29,6 +54,10 @@ def create_hunyuan_image_attention_meta(
     )
 
 
+# =============================================================
+# 2. RoPE helpers
+# =============================================================
+
 
 def rotate_half(x, interleaved=False):
     if not interleaved:
@@ -40,6 +69,7 @@ def rotate_half(x, interleaved=False):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
+    
     if cos.dim() == 3:
         cos = cos[0]
         sin = sin[0]
@@ -63,6 +93,9 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class HunYuanRotary2DEmbedder:
+    """
+    A RoPE wrapper specifically designed for HunYuan-Image attention.
+    """
 
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
         self.num_heads = num_heads
@@ -107,23 +140,35 @@ class HunYuanRotary2DEmbedder:
 
         first_step = attn_meta.first_step
         device = q.device
+        # 1. Prepare cos/sin
         cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
 
+        # 2. Shape validation
         query_lens: list[int] = attn_meta.query_lens
         bs = len(query_lens)
         q_len = query_lens[0]
+
         assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
 
+        # 3. Reshape + transpose for apply_rotary_pos_emb
+        #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
         q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
         k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim)
 
+        #print(f"before cos/std={cos.float().detach().std()} cos/mean={sin.float().detach().std()}")
         q, k = apply_rotary_pos_emb(q.to(torch.float32), k.to(torch.float32), cos, sin)
+        #print(f"after apply_rotary_pos_emb q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
 
+        # 5. Restore original shape + convert to bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
         return q, k
 
+
+# =============================================================
+# 3. 2D RoPE construction (ported from official model repo)
+# =============================================================
 
 def _to_tuple(x, dim=2):
     if isinstance(x, int):
@@ -135,6 +180,7 @@ def _to_tuple(x, dim=2):
 
 
 def get_meshgrid_nd(start, *args, dim=2, device="cpu"):
+    """Get n-D meshgrid with start, stop and num."""
     if len(args) == 0:
         num = _to_tuple(start, dim=dim)
         start = (0,) * dim
@@ -172,6 +218,16 @@ def build_2d_rope(
     base_rescale_factor: float = 1.0,
     return_all_pos: bool = False,
 ):
+    """Build 2D RoPE cos/sin tables.
+
+    Text positions use sequential 1D indices (y = x = index).
+    Image positions use 2D grid indices derived from the image layout.
+
+    Returns
+    -------
+    cos: torch.Tensor with shape [seq_len, n_elem]
+    sin: torch.Tensor with shape [seq_len, n_elem]
+    """
     assert n_elem % 4 == 0, f"n_elem must be divisible by 4, but got {n_elem}."
 
     if base_rescale_factor != 1.0:
@@ -234,6 +290,7 @@ def build_batch_2d_rope(
     base_rescale_factor: float = 1.0,
     return_all_pos: bool = False,
 ):
+    """Build batched 2D RoPE cos/sin tables."""
     cos_list, sin_list, all_pos_list = [], [], []
     if image_infos is None:
         image_infos = [None]
@@ -261,6 +318,7 @@ def build_batch_2d_rope(
 
 
 class CachedRoPE:
+    """Cache for 2D RoPE cos/sin tables to avoid recomputation across diffusion steps."""
 
     def __init__(self, rope_theta: float, head_dim: int, rope_type: str = "2d"):
         self.rope_theta = rope_theta
@@ -297,7 +355,12 @@ class CachedRoPE:
         return cos, sin
 
 
+# =============================================================
+# 4. Timestep embedding helpers (ported from official model repo)
+# =============================================================
+
 def timestep_embedding(t, dim, max_period=10000):
+    """Create sinusoidal timestep embeddings."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
@@ -311,6 +374,10 @@ def timestep_embedding(t, dim, max_period=10000):
     return embedding
 
 
+# =============================================================
+# 5. Custom attention impl (KV cache for image tokens).
+# =============================================================
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -321,6 +388,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+# ------------------------------------------------------------------
+# Attention internals logging.
+#
+# Logs input/output of EVERY call inside the attention forward pass
+# so we can compare step-by-step with vllm-omni and find the FIRST
+# line where the two frameworks diverge.
+# ------------------------------------------------------------------
+
 def _attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -328,7 +403,15 @@ def _attention_forward(
     attention_mask: torch.Tensor,
     layer_id: int = -1,
 ) -> torch.Tensor:
+    """Attention forward with step-by-step internals logging.
+
+    All tensors in **BNSD** layout ``[batch, heads, seq_len, head_dim]``.
+    ``attention_mask`` is a 4-D bool tensor ``[B, 1, Q, K]``
+    (True = attend, False = mask out).
+    """
     scale = 1.0 / (query.shape[-1] ** 0.5)
+
+    # --- Optimized SDPA (the actual computation) ---
     output = F.scaled_dot_product_attention(
         query, key, value,
         attn_mask=attention_mask,
@@ -341,6 +424,9 @@ def _attention_forward(
 
 
 class ImageKVCacheManager:
+    """
+    Manages specialized caching and updating of KV-Cache for image tokens.
+    """
 
     def __init__(self, image_token_len: int = 4097):
         self.image_token_len: int = image_token_len
@@ -427,6 +513,7 @@ class ImageKVCacheManager:
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
+        # Full attention every step – no KV cache needed.
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()

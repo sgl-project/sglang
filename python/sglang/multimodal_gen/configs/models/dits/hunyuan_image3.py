@@ -5,7 +5,9 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 @dataclass
 class HunyuanImage3ArchConfig(DiTArchConfig):
+    """Architecture config for HunyuanImage-3 AR transformer backbone."""
 
+    # AR transformer params (from HF config)
     hidden_size: int = 4096
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
@@ -14,21 +16,26 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
     vocab_size: int = 133120
     intermediate_size: int = 3072
 
+    # MoE params
     num_experts: int = 64
     moe_topk: int = 8
     num_shared_expert: int = 1
     use_mixed_mlp_moe: bool = True
     norm_topk_prob: bool = True
 
+    # CLA (Cross-Layer Attention)
     use_cla: bool = False
     cla_share_factor: int = 2
 
+    # QK Norm
     use_qk_norm: bool = True
 
+    # RoPE
     rope_theta: float = 10000.0
     rope_scaling_type: str = "custom"
     max_position_embeddings: int = 22800
 
+    # Image generation
     vae_downsample_factor: tuple[int, int] = (16, 16)
     latent_channels: int = 32
 
@@ -46,6 +53,7 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
 
 @dataclass
 class HunyuanImage3DitConfig(DiTConfig):
+    """DiT config for HunyuanImage-3."""
 
     arch_config: DiTArchConfig = field(default_factory=HunyuanImage3ArchConfig)
 

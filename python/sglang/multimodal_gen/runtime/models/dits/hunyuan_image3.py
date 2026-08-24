@@ -1,7 +1,34 @@
-"""HunyuanImage-3 AR model for sglang multimodal_gen diffusion pipeline."""
+# coding=utf-8
+# Copyright 2024 The HunYuan team.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""HunyuanImage-3 model for sglang multimodal_gen diffusion pipeline.
 
+This is the AR transformer backbone + diffusion I/O interface for
+HunyuanImage-3. It lives in multimodal_gen (not srt) because HunyuanImage-3
+is a diffusion model, not an LLM serving model.
+
+Ported from the official HunyuanImage-3 model repository
+(`modeling_hunyuan_image_3.py`).
+
+Uses multimodal_gen layers for TP parallelism, attention, RoPE and
+embeddings. The MoE block uses SRT FusedMoE for efficient fused expert
+computation.
+"""
+
+import math
 import re
 import types
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -9,6 +36,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -45,8 +74,14 @@ from .hunyuan_image3_utils import (
     timestep_embedding,
 )
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
+
+# Weight names belonging to the non-AR parts of the HunyuanImage-3 checkpoint
+# (VAE, ViT). These are skipped during backbone weight loading.
 UNEXPECTED_KEYWORDS = [
     "vae",
     "vision_aligner",
@@ -79,7 +114,13 @@ def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, defaul
     return value
 
 
+# =============================================================
+# Diffusion I/O helper functions and modules
+# (ported from official HunyuanImage-3 model repository)
+# =============================================================
+
 def _conv_nd(dims, *args, **kwargs):
+    """Create a 1D, 2D, or 3D convolution module."""
     if dims == 1:
         return nn.Conv1d(*args, **kwargs)
     elif dims == 2:
@@ -90,16 +131,19 @@ def _conv_nd(dims, *args, **kwargs):
 
 
 def _zero_module(module):
+    """Zero out the parameters of a module and return it."""
     for p in module.parameters():
         p.detach().zero_()
     return module
 
 
 def _normalization(channels, **kwargs):
+    """GroupNorm normalization."""
     return nn.GroupNorm(32, channels, **kwargs)
 
 
 class _Upsample(nn.Module):
+    """Upsample layer with optional convolution (dims=3 for spatial 2D)."""
 
     def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -125,6 +169,7 @@ class _Upsample(nn.Module):
 
 
 class _Downsample(nn.Module):
+    """Downsample layer with optional convolution (dims=3 for spatial 2D)."""
 
     def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -148,6 +193,7 @@ class _Downsample(nn.Module):
 
 
 class _ResBlock(nn.Module):
+    """Residual block with timestep embedding conditioning."""
 
     def __init__(
         self, in_channels, emb_channels, out_channels=None, dropout=0.0,
@@ -223,6 +269,7 @@ class _ResBlock(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
+    """Embeds scalar timesteps into vector representations."""
 
     def __init__(self, hidden_size, act_layer=nn.GELU, frequency_embedding_size=256,
                  max_period=10000, out_size=None, dtype=None, device=None):
@@ -245,6 +292,7 @@ class TimestepEmbedder(nn.Module):
 
 
 class UNetDown(nn.Module):
+    """Patch embed: converts noise latents (B, C, H, W) into sequence embeddings."""
 
     def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
                  out_channels, dropout=0.0, device=None, dtype=None):
@@ -283,6 +331,7 @@ class UNetDown(nn.Module):
 
 
 class UNetUp(nn.Module):
+    """Final layer: converts backbone output sequence into noise predictions."""
 
     def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
                  out_channels, dropout=0.0, device=None, dtype=None, out_norm=False):
@@ -390,6 +439,7 @@ def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling
 
 
 class HunYuanAttention(nn.Module):
+    """Self-attention of a master layer."""
 
     def __init__(
         self,
@@ -461,6 +511,7 @@ class HunYuanAttention(nn.Module):
         )
 
         if self.use_qk_norm:
+            # self.weight = torch.ones(self.head_dim)
             self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
             self.query_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
             self.key_layernorm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
@@ -477,8 +528,12 @@ class HunYuanAttention(nn.Module):
     ):
         q_len, hidden_size = hidden_states.size()
         hidden_states = hidden_states.reshape(-1, hidden_size)
+        #print(f"hidden_states={hidden_states.std()} {hidden_states.shape}")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #print(f"q={q.std()} k={k.std()} v={v.std()}")
+        
+        #print(f"before rope q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
 
         if attn_meta is not None:
             assert positions is None
@@ -486,12 +541,49 @@ class HunYuanAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k)
 
+        # print(f"image_rope2d_emb q={q.std()} k={k.std()} v={v.std()}")
+
         ori_k = k
+
+        # print(
+        #     "Q weight:",
+        #     self.query_layernorm.weight.float().mean().item(),
+        #     self.query_layernorm.weight.float().std().item(),
+        #     self.query_layernorm.weight.float().min().item(),
+        #     self.query_layernorm.weight.float().max().item(),
+        # )
+
+        # print(
+        #     "K weight:",
+        #     self.key_layernorm.weight.float().mean().item(),
+        #     self.key_layernorm.weight.float().std().item(),
+        #     self.key_layernorm.weight.float().min().item(),
+        #     self.key_layernorm.weight.float().max().item(),
+        # )
+
+        # print(
+        #     "Q/K max diff:",
+        #     (
+        #         self.query_layernorm.weight.float()
+        #         - self.key_layernorm.weight.float()
+        #     ).abs().max().item()
+        # )
 
         if self.use_qk_norm:
             import torch_npu
+            # print(f"{q.shape} {k.shape}")
+            #print(f"before use_qk_norm q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
+
             q = torch_npu.npu_rms_norm(q.view(-1, self.num_heads, self.head_dim).contiguous(), gamma=self.query_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
             k = torch_npu.npu_rms_norm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous(), gamma=self.key_layernorm.weight.float(), epsilon=self.rms_norm_eps)[0]
+            #q0 = q.view(-1, self.num_heads, self.head_dim).contiguous()
+            #k0 = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+            #q = self.query_layernorm(q0)
+            #k = self.key_layernorm(k0)
+        
+        #print(f"after use_qk_norm q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
+
+        #print(f"after self.rms_norm_eps={self.rms_norm_eps} attn_meta={attn_meta is not None} use_qk_norm={self.use_qk_norm} q={q.std()} k={k.std()} v={v.std()}")
 
         if attn_meta is not None:
             attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask, layer_id=self.layer_id)
@@ -501,6 +593,8 @@ class HunYuanAttention(nn.Module):
             v = v.view(-1, self.num_kv_heads, self.head_dim)
             attn_output = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
 
+        # print(f"after attn_output attn_output={attn_output.std()}")
+
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
         output = output.reshape(q_len, -1)
@@ -508,6 +602,7 @@ class HunYuanAttention(nn.Module):
 
 
 class HunYuanCrossAttention(nn.Module):
+    """CLA follower layer: owns only q_proj, attends to master K/V."""
 
     def __init__(
         self,
@@ -611,6 +706,11 @@ class HunYuanCrossAttention(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
+    """Sparse MoE block using SRT FusedMoE with separate TopK routing.
+
+    TopK handles softmax + top-k routing, FusedMoE handles expert computation.
+    A separate shared MLP (when present) is always applied to all tokens.
+    """
 
     def __init__(
         self, config: PretrainedConfig, layer_id: int,
@@ -638,6 +738,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.topk = TopK(
             top_k=top_k,
+            #renormalize=norm_topk_prob,
             layer_id=layer_id,
         )
 
@@ -663,6 +764,8 @@ class HunYuanSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             layer_id=layer_id,
             prefix=f"{prefix}.experts",
+            #renormalize=top_k > 1,
+            #with_bias=getattr(config, "mlp_bias", False),
         )
 
     def forward(self, hidden_states):
@@ -670,14 +773,33 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # Router logits: [num_tokens, num_experts]
         router_logits, _ = self.gate(hidden_states)
+        # from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        # topk_output = StandardTopKOutput(
+        #     topk_weights=_,
+        #     topk_ids=router_logits,
+        #     router_logits=torch.empty(0, device=hidden_states.device),
+        # )
+        
+        print(f"L[{self.layer_id}] {router_logits.float().detach().mean()} {router_logits.float().detach().std()}")
+        # TopK routing: softmax + top-k selection
         topk_output = self.topk(hidden_states, router_logits)
 
+        # FusedMoE expert computation
         final_hidden_states = self.experts(hidden_states, topk_output)
+        print(f"L[{self.layer_id}] final_hidden_states {final_hidden_states.float().detach().mean()} {final_hidden_states.float().detach().std()}")
 
+        # Shared MLP contribution (always applied to all tokens)
         if self.shared_mlp is not None:
             _shared_out = self.shared_mlp(hidden_states)
             final_hidden_states = final_hidden_states + _shared_out
+
+        # NOTE: The AscendTPDispatcher's finalize routing performs all-gather
+        # internally for the FusedMoE output on NPU. The shared MLP's down_proj
+        # uses reduce_results=True to all-reduce its output across TP ranks.
+        # Both components are now properly TP-synchronized.
 
         return final_hidden_states.view(orig_shape)
 
@@ -748,6 +870,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
+            print(f"[L{self.layer_id}] mlp {hidden_states.float().detach().std()} {hidden_states.float().detach().mean()}")
+
             hidden_states = residual + hidden_states
         else:
             if residual is None:
@@ -854,24 +978,34 @@ class HunyuanImage3Model(nn.Module):
 
 
 class HunyuanImage3ForCausalMM(CachableDiT):
+    """Top-level HunyuanImage-3 model for diffusion pipeline."""
 
     def __init__(
         self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
     ):
         super().__init__(config=config, **kwargs)
         self.config = config
+        # self.hf_config is the full HF config dict set by BaseDiT.__init__
+        # (from the pipeline's config_dict). It contains all fields including
+        # diffusion-specific ones (patch_size, patch_embed_hidden_dim, etc.).
+        # The arch_config dataclass only has backbone fields.
+        # Wrap the dict in a SimpleNamespace for attribute-style access.
         raw_hf_config = self.hf_config
         if isinstance(raw_hf_config, dict):
             hf_config = types.SimpleNamespace(**raw_hf_config)
             self.hf_config = hf_config
         else:
             hf_config = raw_hf_config
+        # For the backbone model, use the arch config (dataclass with
+        # attribute access) which has all required transformer fields.
         backbone_config = config.arch_config
 
         self.model = HunyuanImage3Model(
             backbone_config, prefix=f"{prefix}.model",
         )
         self.unpadded_vocab_size = backbone_config.vocab_size
+        # multimodal_gen has no dedicated LM-head layer; the vocab-parallel
+        # embedding shares its layout and only `.weight` is consumed downstream.
         self.lm_head = VocabParallelEmbedding(
             self.unpadded_vocab_size, backbone_config.hidden_size,
             org_num_embeddings=self.unpadded_vocab_size,
@@ -880,9 +1014,11 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if getattr(backbone_config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
+        # ---- Diffusion I/O modules ----
         patch_size = getattr(hf_config, "patch_size", 1)
         patch_embed_hidden_dim = getattr(hf_config, "patch_embed_hidden_dim", 1024)
         img_proj_type = getattr(hf_config, "img_proj_type", "unet")
+        # latent_channels may be at top-level or nested under hf_config.vae
         if hasattr(hf_config, "vae") and isinstance(hf_config.vae, dict):
             latent_channels = hf_config.vae["latent_channels"]
         else:
@@ -910,6 +1046,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         else:
             raise ValueError(f"Unknown img_proj_type: {img_proj_type}")
 
+        # Cached 2D RoPE for diffusion steps
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
         )
@@ -968,6 +1105,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         cla_factor = _get_cla_factor(self.hf_config)
 
+        # Expert params mapping for FusedMoE weight loading (matching vllm-omni).
+        # Checkpoint stores fused gate_and_up_proj per expert.
+        # expert_weights_remapping maps model weight_name → checkpoint key substring.
         expert_weights_remapping = {
             "gate_proj": ("gate_and_up_proj", 1, 2),
             "up_proj": ("gate_and_up_proj", 0, 2),
@@ -983,8 +1123,16 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set = set()
+        _ckpt_dtype_logged = False
 
         for name, loaded_weight in weights:
+            if not _ckpt_dtype_logged:
+                logger.info(
+                    "  checkpoint weight dtype: %s (param dtype: %s)",
+                    loaded_weight.dtype,
+                    next(iter(params_dict.values())).dtype if params_dict else "?",
+                )
+                _ckpt_dtype_logged = True
             if any(keyword in name for keyword in UNEXPECTED_KEYWORDS):
                 continue
             if "rotary_emb.inv_freq" in name:
@@ -1055,14 +1203,21 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if is_found:
                 continue
 
+            # Expert weights: matching vllm-omni approach exactly.
+            # Uses FusedMoE.make_expert_params_mapping + expert_weights_remapping
+            # to handle fused gate_and_up_proj checkpoint format.
             is_expert_weight = False
             is_found = False
             found_num = 0
             if _is_moe(self.hf_config) and "mlp.experts" in name:
+                if not getattr(self, "_expert_ckpt_logged", False):
+                    logger.info("  expert ckpt key sample: %s", name)
+                    self._expert_ckpt_logged = True
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     offset = 0
                     den = 1
+                    # Apply remapping: convert model weight_name to checkpoint key
                     for (
                         mapped_weight_substr,
                         origin_weight_info,
@@ -1083,6 +1238,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                     param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
             
+                    # Extract the correct shard from the loaded weight
                     if den > 1:
                         assert loaded_weight.shape[0] % den == 0
                         units = loaded_weight.shape[0] // den
@@ -1106,6 +1262,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if is_found:
                 continue
             if is_expert_weight:
+                # Recognised as expert weight but not mapped locally
                 continue
 
             if name.endswith(".bias") and name not in params_dict:
@@ -1116,6 +1273,51 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Log missing weights (model params not loaded from checkpoint)
+        all_param_names = set(params_dict.keys())
+        missing = all_param_names - loaded_params
+        if missing:
+            # Filter out expected missing patterns
+            significant_missing = [
+                n for n in missing
+                if not any(k in n for k in ["rotary_emb", "lm_head"])
+            ]
+            if significant_missing:
+                logger.warning(
+                    "Weight loading: %d/%d params loaded, %d MISSING:",
+                    len(loaded_params), len(all_param_names), len(significant_missing),
+                )
+                for n in sorted(significant_missing)[:30]:
+                    logger.warning("  MISSING: %s", n)
+                if len(significant_missing) > 30:
+                    logger.warning("  ... and %d more", len(significant_missing) - 30)
+            else:
+                logger.info(
+                    "Weight loading: %d/%d params loaded (all accounted for)",
+                    len(loaded_params), len(all_param_names),
+                )
+        else:
+            logger.info(
+                "Weight loading: %d/%d params loaded (complete)",
+                len(loaded_params), len(all_param_names),
+            )
+
+        # Log weight dtypes for a few key parameters
+        key_names = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.gate.weight",
+            "patch_embed.proj.weight",
+            "final_layer.linear.weight",
+        ]
+        for kn in key_names:
+            if kn in params_dict:
+                p = params_dict[kn]
+                logger.info(
+                    "  weight dtype check: %s -> dtype=%s shape=%s",
+                    kn, p.dtype, tuple(p.shape),
+                )
 
         return loaded_params
 
