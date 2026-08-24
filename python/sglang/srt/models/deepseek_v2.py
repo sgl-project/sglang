@@ -1971,7 +1971,7 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_cpu_forward()
 
     def named_startup_weight_load_derived_tensors(self):
-        """Expose post-load MLA operands whose storage CUDA graphs capture."""
+        """Yield derived MLA tensors whose storage CUDA graphs capture."""
         for name in ("w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"):
             tensor = getattr(self, name)
             if isinstance(tensor, torch.Tensor):

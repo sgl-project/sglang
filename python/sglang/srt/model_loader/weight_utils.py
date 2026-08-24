@@ -1654,15 +1654,10 @@ def initialize_capture_safe_weights(
     model: torch.nn.Module,
     value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
 ) -> Tuple[Tuple[torch.nn.Parameter, torch.Tensor], ...]:
-    """Fill floating-point parameters with finite values for graph warmup.
+    """Fill required floating-point parameters with the capture sentinel.
 
-    Parameters marked ``_skip_weight_check`` may be absent from a checkpoint,
-    so preserve their constructor values for the real post-load pass. The
-    returned snapshots must be restored before checkpoint tensors are copied;
-    this gives optional-weight logic the same inputs as serial loading even
-    though capture preparation runs post-load processing once first.
-    Persistent buffers are intentionally left intact: unlike parameters, they
-    are not guaranteed to be replaced by ``model.load_weights()``.
+    Snapshot optional ``_skip_weight_check`` parameters for the real post-load
+    pass. Buffers stay intact because loading may not replace them.
     """
     optional_parameter_values = []
     for param in model.parameters():

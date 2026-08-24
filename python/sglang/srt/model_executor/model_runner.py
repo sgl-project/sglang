@@ -1223,21 +1223,15 @@ class ModelRunner:
         self.startup_weight_load.start_prefetch()
 
     def finalize_startup_weight_load(self) -> None:
-        """Commit the real weights, then run the post-load barrier.
+        """Commit real weights before entering the post-load barrier.
 
-        The barrier moves here because ``load_model`` returns with sentinel
-        values under overlap, so this is the first point at which "weights are
-        loaded" is true for this rank. It follows the commit and its validation
-        deliberately: a rank that fails to commit must not report readiness. A
-        commit failure is terminal for the process, so peer ranks observe it as
-        a barrier timeout rather than a clean collective abort, which matches
-        the existing startup contract for load failures.
+        Under overlap, ``load_model`` returns capture-safe sentinel weights.
+        This rank enters the barrier only after the real commit is validated.
         """
         assert self.startup_weight_load is not None
         timings = self.startup_weight_load.finalize()
-        # Attribute only weight-specific work to the legacy public phase. The
-        # overlap critical path remains visible in scheduler_e2e and the
-        # startup-weight-load phase log.
+        # Keep the legacy phase weight-specific; scheduler_e2e reports the
+        # overlap critical path.
         self.weight_load_time = timings.weight_load_seconds
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,

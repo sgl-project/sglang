@@ -237,7 +237,7 @@ class StartupWeightLoadRejection:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StartupWeightLoadPlan:
-    """Config-level plan; resolved checkpoint sources are verified in prepare."""
+    """Config-level plan before checkpoint source resolution."""
 
     profile: StartupWeightLoadProfile
     prefetch_num_threads: int
@@ -723,6 +723,7 @@ def _validate_glm_5_2_dsa_fp8(
     )
 
 
+# Keep each profile narrow until its storage and startup behavior are validated.
 _STARTUP_WEIGHT_LOAD_PROFILE_SPECS = (
     _StartupWeightLoadProfileSpec(
         profile=StartupWeightLoadProfile.NATIVE_DENSE,
@@ -858,15 +859,11 @@ def _get_profile_rejections(
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StartupWeightLoadTimings:
-    """Wall times until real weights are ready under overlap.
+    """Phase timings for deferred startup loading.
 
-    ``weight_load_seconds`` is exclusive phase attribution for the existing
-    public ``load_weight`` metric, not end-to-end wall time. ``total_seconds``
-    is diagnostic critical-path elapsed time and, together with
-    ``prefetch_window_seconds``, intentionally overlaps the separately
-    reported CUDA graph and KV-cache phases. The prefetch window measures the
-    opportunity for overlap; it does not imply that the worker stayed active
-    for the whole interval.
+    ``weight_load_seconds`` keeps the legacy ``load_weight`` metric limited to
+    weight-specific work. ``total_seconds`` covers the end-to-end path, whose
+    prefetch window overlaps CUDA graph and KV-cache initialization.
     """
 
     prepare_seconds: float
@@ -938,13 +935,9 @@ class ModelStorageManifest:
                 (f"{kind}:{name}", TensorStorageMetadata.from_tensor(tensor))
                 for name, tensor in tensors
             )
-        # CUDA graphs may also close over plain tensors produced by model
-        # post-load code. A module hook enumerates only its local derived
-        # tensors; walking hooks explicitly avoids a recursive attribute scan
-        # that would mix in runtime state. This manifest verifies storage, while
-        # each post-load implementation remains responsible for refreshing the
-        # real contents in place. Hooks must not allocate replacement tensors;
-        # they return the same graph-visible tensor objects on every call.
+        # CUDA graphs may capture post-load tensors that are not parameters or
+        # buffers. Explicit hooks avoid scanning arbitrary runtime state; each
+        # implementation must refresh the reported tensors in place.
         derived_names = set()
         for module_name, module in model.named_modules(remove_duplicate=False):
             named_derived_tensors = getattr(
@@ -989,18 +982,11 @@ class ModelStorageManifest:
         )
 
     def unchanged_parameter_names(self, value: float) -> Tuple[str, ...]:
-        """Return floating-point parameters still entirely equal to ``value``.
+        """Return required floating-point parameters still equal to ``value``.
 
-        This is the capture-sentinel check, and it is deliberately strict: every
-        floating-point parameter that requires a checkpoint entry must be
-        rewritten by ``model.load_weights()``. Parameters marked
-        ``_skip_weight_check`` are optional checkpoint state, so capture-safe
-        initialization preserves their constructor values and this check omits
-        them. A model that keeps any other ``__init__``-computed floating-point
-        parameter with no checkpoint entry will fail startup here rather than
-        silently serve the sentinel, so this doubles as the admission gate for
-        widening ``_NATIVE_DENSE_ARCHITECTURES``. Buffers are excluded because
-        ``initialize_capture_safe_weights`` never overwrites them.
+        Optional ``_skip_weight_check`` parameters keep their constructor
+        values. Every other floating-point parameter must replace the capture
+        sentinel; buffers are excluded because they are never overwritten.
         """
         names = []
         checks = []
@@ -1036,10 +1022,6 @@ def evaluate_startup_weight_load_admission(
     """Return an overlap plan or a deterministic preflight rejection report."""
 
     architectures = tuple(model_config.hf_config.architectures or ())
-    # NOTE(2026-08): Expand this matrix only with storage-stability,
-    # capture-sentinel, and startup-correctness coverage for the new profile.
-    # These checks depend on resolved loader/model state, so ServerArgs owns
-    # mode selection but not support policy.
     rules = (
         (
             "non_cuda",
@@ -1177,9 +1159,8 @@ def evaluate_startup_weight_load_admission(
             )
         )
 
-    # Resolve/import the implementation only after cheap, side-effect-free
-    # preflight passes. Future auto mode can therefore fall back to serial for
-    # rejected configurations without remote-code imports or config mutation.
+    # Delay implementation imports until cheap preflight passes, so auto can
+    # fall back without remote-code imports or config mutation.
     if not rejections:
         assert architecture is not None
         resolved_model_class, resolved_architecture = get_model_architecture(
@@ -1209,12 +1190,10 @@ def evaluate_startup_weight_load_admission(
 
 
 class StartupWeightLoadManager:
-    """Coordinate checkpoint prefetch with capture and post-capture commit.
+    """Coordinate checkpoint prefetch, graph capture, and real-weight commit.
 
-    Model commit and validation failures after capture-safe preparation are
-    terminal startup failures: the manager fails closed instead of rolling a
-    mutated model back for an in-process serial retry. Background page-cache
-    prefetch is best-effort and can fall back to the normal checkpoint reader.
+    After capture-safe mutation, commit failures are terminal. Background
+    page-cache prefetch remains best-effort.
     """
 
     def __init__(
@@ -1253,12 +1232,7 @@ class StartupWeightLoadManager:
         server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> Optional[StartupWeightLoadManager]:
-        """Build a manager straight from ``ServerArgs`` when admitted.
-
-        Callers on the model-loading path only decide *whether* to overlap; the
-        knowledge of which server arguments matter, and every support rule,
-        stays in this module.
-        """
+        """Create a manager, or return ``None`` when auto selects serial."""
         options = StartupWeightLoadOptions.from_server_args(
             server_args=server_args,
             is_draft_worker=is_draft_worker,
@@ -1335,14 +1309,12 @@ class StartupWeightLoadManager:
 
     @property
     def is_deferred(self) -> bool:
-        """Whether real-weight loading was deferred past graph capture."""
         return self._state == StartupWeightLoadState.CAPTURE_READY
 
     def prepare(self) -> nn.Module:
-        """Resolve sources and build capture-safe storage.
+        """Resolve sources, then build capture-safe storage.
 
-        Source-dependent rejection stays before ``prepare_model_for_capture``
-        mutates parameters with sentinel values.
+        Source-based auto fallback happens before sentinel mutation.
         """
 
         if self._state != StartupWeightLoadState.CREATED:
@@ -1510,11 +1482,8 @@ class StartupWeightLoadManager:
         try:
             handle.stop()
         except TimeoutError:
-            # Cancellation is cooperative because Python cannot safely stop a
-            # thread blocked in a file read. If it completed at the timeout
-            # boundary, normal loading is safe; otherwise keep reporting the
-            # active worker so iterator dispatch can apply its configured
-            # concurrency policy during the real commit.
+            # A blocking file read may outlive cooperative cancellation. Keep
+            # reporting it as active so commit uses the conservative policy.
             if handle.done:
                 handle.wait()
                 self._report_prefetch_failure(falling_back=True)
@@ -1542,9 +1511,7 @@ class StartupWeightLoadManager:
         if handle.done:
             handle.wait()
         else:
-            # Do not spend the same timeout twice. The first stop already set
-            # the cancellation event, and the daemon worker cannot keep the
-            # process alive after startup.
+            # The first stop already cancelled the daemon; do not wait twice.
             logger.warning(
                 "Checkpoint prefetch is still exiting after the weight commit; "
                 "leaving the cancelled daemon prefetch worker to finish on "

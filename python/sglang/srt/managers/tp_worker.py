@@ -449,7 +449,6 @@ class TpModelWorker(BaseTpWorker):
             mr.finalize_startup_weight_load()
 
     def has_startup_weight_load(self) -> bool:
-        """Return whether this worker selected deferred startup loading."""
         return self.model_runner.startup_weight_load is not None
 
     def _init_model_config(self):

@@ -585,15 +585,9 @@ class DefaultModelLoader(BaseModelLoader):
                 get_model().weight_loader_drop_cache_after_load
             )
 
-            # Prefetch and multi-threaded loading both read the same shards,
-            # competing for I/O on shared/network storage. When prefetch is
-            # active (mmap path, not FASTSAFETENSORS) and the user didn't
-            # explicitly request multi-threaded loading, fall back to the
-            # single-threaded loader and let prefetch feed the page cache.
-            # Setting enable_multithread_load or num_threads in
-            # --model-loader-extra-config opts out (the latter is consumed
-            # only by the multi-threaded iterator, so it signals intent);
-            # this can be preferable on high-throughput local storage.
+            # Active prefetch and multithreaded loading reread the same shards.
+            # Unless explicitly requested, use one commit reader to avoid I/O
+            # oversubscription. Explicit multithreading may help local storage.
             if (
                 concurrent_prefetch_active
                 and not weight_loader_disable_mmap
@@ -773,24 +767,10 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
         model_config: ModelConfig,
     ) -> nn.Module:
-        """Initialize final storage with values safe for graph warmup.
+        """Prepare final storage for graph capture with sentinel weights.
 
-        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
-        that parameters are filled with a detectable sentinel instead of random
-        values so ``commit_model_weights`` can prove every one of them was
-        replaced.
-
-        Note that this runs ``process_weights_after_loading`` on the sentinel
-        values, and ``commit_model_weights`` runs it again on the real weights,
-        so overlap invokes it once more than the serial path. That is safe for
-        the currently supported matrix, where the CUDA unquantized path is a
-        no-op, and it is not covered by the storage manifest, which proves
-        tensor identity rather than idempotence. Native dense profiles use
-        post-load paths that are no-ops on CUDA. Quantized profiles are admitted
-        only when their exact backend combination refreshes the same parameter
-        and derived-tensor storage in place. Any additional quantization method
-        must therefore be evaluated here before its configuration is added to
-        the supported set.
+        Post-load processing runs once for capture and again for real weights.
+        Each admitted profile must refresh graph-visible storage in place.
         """
         with set_default_torch_dtype(model_config.dtype):
             self._startup_optional_parameter_values = initialize_capture_safe_weights(
@@ -851,13 +831,10 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_sources: Tuple[ResolvedSource, ...],
         target_device: torch.device,
     ) -> nn.Module:
-        """Run the serial loader on an already initialized model.
+        """Load resolved sources serially into an initialized model.
 
-        Startup ``auto`` mode resolves checkpoint sources before deciding
-        whether overlap is possible. If source-dependent admission rejects
-        overlap, reuse the allocated model and resolved files instead of
-        constructing a second model. Iterator prefetch remains in its normal
-        serial mode because no overlap prefetch worker has been started.
+        Auto uses this path for source-based fallback before sentinel mutation,
+        avoiding a second model allocation.
         """
 
         def weights_iterator():
