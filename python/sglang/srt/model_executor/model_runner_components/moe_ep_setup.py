@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.lplb_solver import (
@@ -104,12 +106,19 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
 
+def _has_moe_module(model: torch.nn.Module) -> bool:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    return any(isinstance(m, FusedMoE) for m in model.modules())
+
+
 def check_quantized_moe_compatibility(
     *,
     model_config: ModelConfig,
     tp_size: int,
     moe_ep_size: int,
     moe_dp_size: int,
+    model: torch.nn.Module | None = None,
 ) -> None:
     if (
         quantization_config := getattr(
@@ -130,6 +139,13 @@ def check_quantized_moe_compatibility(
             model_config.hf_text_config, "moe_intermediate_size", None
         )
         if moe_intermediate_size is None:
+            return
+
+        if model is not None and not _has_moe_module(model):
+            logger.debug(
+                "Skipping quantized MoE compatibility check: model has no "
+                "FusedMoE layers (dense model with inherited MoE config fields)."
+            )
             return
 
         if moe_intermediate_size % moe_tp_size != 0:
