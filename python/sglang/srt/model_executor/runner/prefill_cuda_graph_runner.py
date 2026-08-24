@@ -1022,6 +1022,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=num_tokens
+            )
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
