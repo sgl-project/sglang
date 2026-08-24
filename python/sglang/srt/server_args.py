@@ -2169,9 +2169,9 @@ class ServerArgs:
     ] = 0.5
     speculative_dflash_confidence_min_verify_len: A[
         int,
-        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token.",
+        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token; 1 means anchor-only verification and a bonus-only commit step.",
         NS("spec"),
-    ] = 2
+    ] = 1
     speculative_dflash_confidence_target_verify_tokens: A[
         int,
         "DFLASH_CONFIDENCE only. Fixed total target-verify token target; zero preserves full verification without an SPS table.",

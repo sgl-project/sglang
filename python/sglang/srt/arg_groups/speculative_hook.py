@@ -322,10 +322,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
         min_verify_len = int(server_args.speculative_dflash_confidence_min_verify_len)
         block_size = int(server_args.speculative_num_draft_tokens)
-        if not 2 <= min_verify_len <= block_size:
+        # Anchor-only verification still commits the target bonus token.
+        if not 1 <= min_verify_len <= block_size:
             raise ValueError(
                 "--speculative-dflash-confidence-min-verify-len must be in "
-                f"[2, {block_size}], got {min_verify_len}."
+                f"[1, {block_size}] (1 means anchor-only / bonus-only), got "
+                f"{min_verify_len}."
             )
         target_tokens = int(
             server_args.speculative_dflash_confidence_target_verify_tokens

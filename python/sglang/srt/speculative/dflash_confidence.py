@@ -78,9 +78,9 @@ def select_sps_verify_token_budget(
             "verify_num_draft_tokens must equal confidence width + 1; "
             f"got {verify_num_draft_tokens=} and gamma={gamma}"
         )
-    if not 2 <= min_verify_len <= verify_num_draft_tokens:
+    if not 1 <= min_verify_len <= verify_num_draft_tokens:
         raise ValueError(
-            f"min_verify_len must be in [2, {verify_num_draft_tokens}], got {min_verify_len}"
+            f"min_verify_len must be in [1, {verify_num_draft_tokens}], got {min_verify_len}"
         )
 
     survival = torch.cumprod(confidence.float().clamp(0.0, 1.0), dim=1)
@@ -129,8 +129,9 @@ def plan_verify_prefixes(
 ) -> DFlashConfidenceDecision:
     """Allocate a target-verify token budget across request-local prefixes.
 
-    Every request verifies an anchor plus at least one proposed token, preserving
-    progress and preventing starvation.  Optional positions compete globally by
+    Every request verifies at least its anchor. An anchor-only window still
+    commits the target bonus, preserving progress without forcing a proposal.
+    Optional positions compete globally by
     uncertainty (``1 - cumulative_confidence``), so lower-confidence paths are
     verified earlier.  Prefix expansion is performed one round at a time to keep
     every selected per-request set contiguous.
@@ -146,9 +147,9 @@ def plan_verify_prefixes(
         )
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("confidence_threshold must be in [0, 1]")
-    if not 2 <= min_verify_len <= verify_num_draft_tokens:
+    if not 1 <= min_verify_len <= verify_num_draft_tokens:
         raise ValueError(
-            "min_verify_len must verify an anchor and at least one proposal, got "
+            "min_verify_len must verify at least the anchor, got "
             f"{min_verify_len} for verify width {verify_num_draft_tokens}"
         )
 

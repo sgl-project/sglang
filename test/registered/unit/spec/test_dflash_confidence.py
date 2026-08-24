@@ -4,7 +4,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.arg_groups import speculative_hook
 from sglang.srt.models.dspark import DSparkConfidenceHead
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_confidence import (
     plan_verify_prefixes,
     select_sps_verify_token_budget,
@@ -70,6 +72,17 @@ class TestDFlashConfidence(unittest.TestCase):
         self.assertEqual(decision.verify_lens.tolist(), [2, 2, 2])
         self.assertEqual(decision.deferred_tokens, 9)
 
+    def test_anchor_only_floor_allows_bonus_only_steps(self):
+        decision = plan_verify_prefixes(
+            torch.full((3, 4), 0.9),
+            verify_num_draft_tokens=5,
+            confidence_threshold=0.5,
+            min_verify_len=1,
+            target_verify_tokens=0,
+        )
+        self.assertEqual(decision.verify_lens.tolist(), [1, 1, 1])
+        self.assertEqual(decision.deferred_tokens, 12)
+
     def test_mixed_batch_budget_keeps_contiguous_prefixes_and_is_deterministic(self):
         confidence = torch.tensor(
             [
@@ -98,29 +111,35 @@ class TestDFlashConfidence(unittest.TestCase):
     def test_vectorized_allocation_matches_token_by_token_reference(self):
         generator = torch.Generator().manual_seed(7)
         for batch_size in (1, 3, 8):
-            for target_budget in range(0, batch_size * 6 + 1):
-                confidence = torch.rand((batch_size, 5), generator=generator)
-                decision = plan_verify_prefixes(
-                    confidence,
-                    verify_num_draft_tokens=6,
-                    confidence_threshold=0.5,
-                    min_verify_len=2,
-                    target_verify_tokens=target_budget,
-                )
-                survival = torch.cumprod(confidence, dim=1)
-                priority = (survival < 0.5).float() * 2.0 + (1.0 - survival)
-                expected = torch.full((batch_size,), 2, dtype=torch.int32)
-                remaining = max(batch_size * 2, target_budget) - batch_size * 2
-                for _ in range(remaining):
-                    next_index = expected.to(torch.long) - 1
-                    eligible = next_index < confidence.shape[1]
-                    if not bool(eligible.any()):
-                        break
-                    score = torch.full((batch_size,), float("-inf"))
-                    active = torch.nonzero(eligible, as_tuple=False).flatten()
-                    score[active] = priority[active, next_index[active]]
-                    expected[torch.argmax(score)] += 1
-                self.assertEqual(decision.verify_lens.tolist(), expected.tolist())
+            for min_verify_len in (1, 2):
+                for target_budget in range(0, batch_size * 6 + 1):
+                    confidence = torch.rand((batch_size, 5), generator=generator)
+                    decision = plan_verify_prefixes(
+                        confidence,
+                        verify_num_draft_tokens=6,
+                        confidence_threshold=0.5,
+                        min_verify_len=min_verify_len,
+                        target_verify_tokens=target_budget,
+                    )
+                    survival = torch.cumprod(confidence, dim=1)
+                    priority = (survival < 0.5).float() * 2.0 + (1.0 - survival)
+                    expected = torch.full(
+                        (batch_size,), min_verify_len, dtype=torch.int32
+                    )
+                    remaining = (
+                        max(batch_size * min_verify_len, target_budget)
+                        - batch_size * min_verify_len
+                    )
+                    for _ in range(remaining):
+                        next_index = expected.to(torch.long) - 1
+                        eligible = next_index < confidence.shape[1]
+                        if not bool(eligible.any()):
+                            break
+                        score = torch.full((batch_size,), float("-inf"))
+                        active = torch.nonzero(eligible, as_tuple=False).flatten()
+                        score[active] = priority[active, next_index[active]]
+                        expected[torch.argmax(score)] += 1
+                    self.assertEqual(decision.verify_lens.tolist(), expected.tolist())
 
     def test_verify_prefix_contains_the_bonus_logit_for_every_request(self):
         # A target verify window contains the current-token (anchor) logit plus
@@ -150,6 +169,18 @@ class TestDFlashConfidence(unittest.TestCase):
         self.assertEqual(capped.tolist(), [2, 1, 0])
         self.assertEqual(bonus.tolist(), [13, 77, 88])
         self.assertTrue(bool((capped < verify_lens).all()))
+
+    def test_anchor_only_verify_uses_anchor_prediction_as_bonus(self):
+        candidates = torch.tensor([[10, 11, 12]])
+        target_predict = torch.tensor([[99, 98, 97]])
+        verify_lens = torch.tensor([1], dtype=torch.int32)
+        uncapped = torch.tensor([2], dtype=torch.int32)
+        capped = torch.minimum(uncapped, verify_lens - 1)
+        bonus = target_predict[torch.arange(1), capped]
+        commit_lens = capped + 1
+        self.assertEqual(capped.tolist(), [0])
+        self.assertEqual(bonus.tolist(), [99])
+        self.assertEqual(commit_lens.tolist(), [1])
 
     def test_observer_reports_confidence_and_defer_metrics(self):
         observer = DFlashConfidenceObserver()
@@ -182,6 +213,19 @@ class TestDFlashConfidence(unittest.TestCase):
         )
         self.assertEqual(decision.budget, 2)
         self.assertAlmostEqual(decision.predicted_theta, 19.0, places=5)
+
+    def test_sps_budget_allows_anchor_only_floor(self):
+        decision = select_sps_verify_token_budget(
+            torch.full((2, 2), 0.1),
+            verify_num_draft_tokens=3,
+            min_verify_len=1,
+            sps_table=SpsCostTable(
+                sample_batch_tokens=[1, 2, 3, 4, 6],
+                sample_steps_per_sec=[100.0, 100.0, 0.01, 0.01, 0.01],
+                max_batch_tokens=6,
+            ),
+        )
+        self.assertEqual(decision.budget, 2)
 
     def test_sps_budget_preserves_the_per_request_progress_floor(self):
         decision = select_sps_verify_token_budget(
@@ -271,6 +315,47 @@ class TestDFlashConfidence(unittest.TestCase):
         self.assertEqual(decision.verify_lens.device.type, "cpu")
         self.assertEqual(int(decision.verify_lens.sum()), 6)
         self.assertTrue(bool(((decision.verify_lens >= 2) & (decision.verify_lens <= 4)).all()))
+
+    def test_server_args_accepts_anchor_only_floor_and_rejects_zero(self):
+        def make_args(min_verify_len):
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "DFLASH_CONFIDENCE"
+            args.speculative_draft_model_path = "draft"
+            args.device = "cuda"
+            args.speculative_num_draft_tokens = 4
+            args.speculative_dflash_confidence_min_verify_len = min_verify_len
+            args.get_model_config = lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+            return args
+
+        speculative_hook._handle_dflash(make_args(1))
+        with self.assertRaisesRegex(ValueError, "anchor-only / bonus-only"):
+            speculative_hook._handle_dflash(make_args(0))
+
+    def test_planner_rejects_invalid_min_verify_len(self):
+        with self.assertRaisesRegex(ValueError, "min_verify_len"):
+            plan_verify_prefixes(
+                torch.full((1, 2), 0.5),
+                verify_num_draft_tokens=3,
+                confidence_threshold=0.5,
+                min_verify_len=0,
+                target_verify_tokens=0,
+            )
+        with self.assertRaisesRegex(ValueError, "min_verify_len"):
+            select_sps_verify_token_budget(
+                torch.full((1, 2), 0.5),
+                verify_num_draft_tokens=3,
+                min_verify_len=0,
+                sps_table=SpsCostTable(
+                    sample_batch_tokens=[1, 2, 3],
+                    sample_steps_per_sec=[1.0, 1.0, 1.0],
+                    max_batch_tokens=3,
+                ),
+            )
 
     def test_planner_rejects_invalid_threshold(self):
         for threshold in (-0.1, 1.1):

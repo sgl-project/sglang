@@ -224,12 +224,28 @@ class _SelectorDraftSampler:
     greedy_mask selects the argmax per row.
     """
 
-    def __init__(self, *, draft_model, block_size, max_bs, device):
+    def __init__(
+        self, *, draft_model, block_size, max_bs, device, enable_confidence=False
+    ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        self.confidence_out = (
+            torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
+            if enable_confidence
+            else None
+        )
+        # Select the graph tail once, before capture. Replay itself has no
+        # confidence-head availability branch: it invokes this fixed callable.
+        self._confidence_writer = (
+            self._write_head_confidence
+            if enable_confidence and draft_model.confidence_head is not None
+            else self._write_proxy_confidence
+            if enable_confidence
+            else self._skip_confidence
+        )
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
@@ -276,6 +292,28 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
+        self._confidence_writer(hs, block_ids[:, 0], tokens.view(bs, -1), scores, bs)
+
+    def _skip_confidence(self, hs, anchor_tokens, sampled_tokens, scores, bs) -> None:
+        del hs, anchor_tokens, sampled_tokens, scores, bs
+
+    def _write_head_confidence(
+        self, hs, anchor_tokens, sampled_tokens, scores, bs
+    ) -> None:
+        del scores
+        confidence = self.draft_model.compute_confidence(
+            draft_hidden=hs,
+            anchor_tokens=anchor_tokens,
+            sampled_tokens=sampled_tokens,
+        )
+        assert confidence is not None
+        self.confidence_out[:bs].copy_(confidence)
+
+    def _write_proxy_confidence(
+        self, hs, anchor_tokens, sampled_tokens, scores, bs
+    ) -> None:
+        del hs, anchor_tokens, sampled_tokens
+        self.confidence_out[:bs].copy_(selector_confidence_from_scores(scores))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -479,11 +517,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
-        if self._uses_confidence_scheduling():
-            # Confidence comes from the eager selector lattice. Avoid a folded
-            # draft graph that would otherwise hide those scores; target verify
-            # remains eligible for normal graphs when its ragged geometry matches.
-            capture_decode_cuda_graph = False
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -540,6 +573,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size=self.block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
+                enable_confidence=self._uses_confidence_scheduling(),
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
@@ -2101,6 +2135,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if (
+                self._uses_confidence_scheduling()
+                and self._draft_sampler.confidence_out is not None
+            ):
+                self._selector_confidence = self._draft_sampler.confidence_out[:bs]
             if self.selector is not None and not _is_all_greedy(batch.sampling_info):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
