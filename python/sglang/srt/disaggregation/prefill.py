@@ -1382,6 +1382,53 @@ class SchedulerDisaggregationPrefillMixin:
                             m &= _t.roll(b, -k) == h[k]
                         return int(m.sum().item())
 
+                    def _stride_hits(buf):
+                        # §24.12: a 1-elem/token (stride-H) column read of a
+                        # [T,H] tensor is invisible to the contiguous matchers
+                        # above -- probe every column of the int32 cell view
+                        # (covers native fp32 cells and bf16/fp16-pair cells).
+                        try:
+                            if buf is None or buf.ndim < 2 or _kv.numel() < 4:
+                                return 0, -1, -1
+                            if buf.numel() > (1 << 27):  # skip giant pools
+                                return 0, -1, -1
+                            if buf.dtype in (_t.bfloat16, _t.float16):
+                                _cols = buf.shape[-1] // 2
+                            elif buf.dtype == _t.int64:
+                                _cols = buf.shape[-1] * 2
+                            else:
+                                _cols = buf.shape[-1]
+                            if _cols < 1 or buf.shape[0] < 8:
+                                return 0, -1, -1
+                            cells = buf.view(_t.int32).reshape(-1, _cols)
+                        except Exception:
+                            return 0, -1, -1
+                        m = cells == _kv[0]
+                        for k in range(1, 4):
+                            m &= _t.roll(cells, -k, dims=0) == _kv[k]
+                        if not bool(m.any()):
+                            return 0, -1, -1
+                        idx = m.nonzero()[:3]
+                        return int(m.sum()), int(idx[0, 1].item()), int(idx[0, 0].item())
+
+                    # One-shot backend self-test: if 2-D roll is unsupported on
+                    # this device every stride probe would silently return 0 --
+                    # annotate so a null is never misread as an exclusion.
+                    try:
+                        _sx = _t.arange(0, 64, dtype=_t.float32).reshape(8, 8)
+                        _sk = _sx[:, 3].contiguous().view(_t.int32)[:4]
+                        _scx = _sx.view(_t.int32).reshape(-1, 8)
+                        _sm = _scx == _sk[0]
+                        for k in range(1, 4):
+                            _sm &= _t.roll(_scx, -k, dims=0) == _sk[k]
+                        _stride_ok = bool(_sm.any())
+                    except Exception:
+                        _stride_ok = False
+                    if not _stride_ok:
+                        logger.error(
+                            "[mf-fp] stride matcher self-test FAILED -- stride nulls are NOT verdicts"
+                        )
+
                     _cands = []
                     for _pn in ("compress_state_pools", "indexer_compress_state_pools"):
                         for _pool in getattr(_kc, _pn, None) or []:
@@ -1454,6 +1501,7 @@ class SchedulerDisaggregationPrefillMixin:
                                 _cands.append((f"rope{_i}.sin", _tb[1], "p"))
                     except Exception:
                         pass
+                    _stride_probed = 0
                     for _name, _buf, _mode in _cands:
                         if _buf is None:
                             continue
@@ -1463,7 +1511,26 @@ class SchedulerDisaggregationPrefillMixin:
                             _n = 0
                         if _n:
                             logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
-                    logger.error("[mf-fp] probed %d candidates", len(_cands))
+                        try:
+                            _s, _sc, _sr = (
+                                _stride_hits(_buf) if _stride_ok else (0, -1, -1)
+                            )
+                        except Exception:
+                            _s, _sc, _sr = 0, -1, -1
+                        if _s:
+                            logger.error(
+                                "[mf-fp] payload stride FOUND x%d col=%d row=%d in %s",
+                                _s,
+                                _sc,
+                                _sr,
+                                _name,
+                            )
+                        _stride_probed += 1
+                    logger.error(
+                        "[mf-fp] probed %d candidates (%d stride-probed)",
+                        len(_cands),
+                        _stride_probed,
+                    )
                 except Exception as _e:
                     logger.error("[mf-fp] fingerprint probe failed: %s", _e)
                 logger.error(
