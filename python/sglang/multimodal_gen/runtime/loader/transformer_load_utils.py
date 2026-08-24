@@ -18,6 +18,12 @@ from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -37,6 +43,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    hf_hub_download,
     maybe_download_model,
     snapshot_download,
 )
@@ -61,13 +68,17 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
 )
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
+_HF_SAFETENSORS_URL_RE = re.compile(
+    r"https?://huggingface\.co/(?P<repo>[^/]+/[^/]+)/"
+    r"(?:blob|resolve)/(?P<revision>[^/]+)/(?P<filename>.+\.safetensors)$",
+    re.IGNORECASE,
+)
 
 
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
     if config is None:
         return None
-    quant_name_getter = getattr(type(config), "get_name", None)
-    return quant_name_getter() if callable(quant_name_getter) else None
+    return config.get_name()
 
 
 def _merge_modelopt_fp4_configs(
@@ -153,6 +164,33 @@ class TransformerQuantLoadSpec:
     @property
     def is_modelopt_fp4(self) -> bool:
         return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
+
+    @property
+    def is_comfy_fp8(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "comfy_fp8"
+
+    @property
+    def is_serialized_kitchen_int8(self) -> bool:
+        return (
+            isinstance(self.quant_config, KitchenInt8Config)
+            and self.quant_config.is_checkpoint_int8_serialized
+        )
+
+    @property
+    def is_serialized_kitchen_w4a8(self) -> bool:
+        return isinstance(self.quant_config, KitchenW4A8Config)
+
+    @property
+    def uses_comfy_layer_markers(self) -> bool:
+        return (
+            self.is_comfy_fp8
+            or self.is_serialized_kitchen_int8
+            or self.is_serialized_kitchen_w4a8
+            or (
+                _get_quant_config_name(self.quant_config) == "mxfp8"
+                and self.quant_config.layer_markers is not None
+            )
+        )
 
 
 class _TransformerQuantAdapter:
@@ -261,9 +299,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if cls_name != "Flux2Transformer2DModel" or quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-        if quant_name != "modelopt_fp4":
+        if _get_quant_config_name(quant_config) != "modelopt_fp4":
             return
 
         weights_path = os.path.basename(server_args.transformer_weights_path or "")
@@ -346,10 +382,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_config is None:
             return
 
-        quant_name_getter = getattr(type(quant_config), "get_name", None)
-        quant_name = quant_name_getter() if callable(quant_name_getter) else None
-
-        if quant_name != "modelopt_fp8":
+        if _get_quant_config_name(quant_config) != "modelopt_fp8":
             return
 
         component_offload = _uses_component_offload(
@@ -567,7 +600,31 @@ def resolve_transformer_safetensors_to_load(
 
     if quantized_path:
         original_quantized_path = quantized_path
-        quantized_path = maybe_download_model(original_quantized_path)
+        direct_url = _HF_SAFETENSORS_URL_RE.fullmatch(original_quantized_path)
+        if direct_url is not None:
+            quantized_path = hf_hub_download(
+                repo_id=direct_url.group("repo"),
+                filename=direct_url.group("filename"),
+                revision=direct_url.group("revision"),
+            )
+        else:
+            parts = original_quantized_path.strip("/").split("/")
+            is_hub_file = (
+                not os.path.exists(original_quantized_path)
+                and not os.path.isabs(original_quantized_path)
+                and not original_quantized_path.startswith((".", "~"))
+                and len(parts) > 2
+                and original_quantized_path.endswith(".safetensors")
+            )
+            quantized_path = (
+                hf_hub_download(
+                    repo_id="/".join(parts[:2]),
+                    filename="/".join(parts[2:]),
+                    revision=server_args.revision,
+                )
+                if is_hub_file
+                else maybe_download_model(original_quantized_path)
+            )
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
@@ -694,8 +751,11 @@ def resolve_transformer_quant_load_spec(
     cls_name: str,
     component_name: str | None = None,
     gguf_file: str | None = None,
+    checkpoint_quant_config: QuantizationConfig | None = None,
 ) -> TransformerQuantLoadSpec:
     if gguf_file is not None:
+        if checkpoint_quant_config is not None:
+            raise ValueError("GGUF and safetensors quantization metadata conflict")
         return _resolve_gguf_quant_load_spec(
             gguf_file=gguf_file,
             server_args=server_args,
@@ -703,7 +763,19 @@ def resolve_transformer_quant_load_spec(
             component_name=component_name,
         )
 
-    if getattr(model_cls, "handles_checkpoint_quantization", False):
+    if checkpoint_quant_config is not None:
+        if server_args.quantization is not None:
+            raise ValueError(
+                "Checkpoint quantization is encoded in per-layer metadata; do not "
+                "also set --quantization"
+            )
+        if server_args.nunchaku_config is not None:
+            raise ValueError(
+                "Per-layer checkpoint quantization and Nunchaku are mutually "
+                "exclusive"
+            )
+        quant_config = checkpoint_quant_config
+    elif getattr(model_cls, "handles_checkpoint_quantization", False):
         quant_config = None
     else:
         quant_config = _resolve_quant_config(
@@ -717,6 +789,9 @@ def resolve_transformer_quant_load_spec(
         packed = getattr(model_cls, "packed_modules_mapping", None)
         if packed and hasattr(quant_config, "packed_modules_mapping"):
             quant_config.packed_modules_mapping = packed
+        quant_config.remap_checkpoint_prefixes(
+            vars(model_cls).get("param_names_mapping", {})
+        )
 
     nunchaku_config = server_args.nunchaku_config
 
@@ -793,12 +868,14 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name == "modelopt_fp8":
+    if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
+    if quant_name == "kitchen_int8":
+        assert isinstance(quant_config, KitchenInt8Config)
+        return not quant_config.is_checkpoint_int8_serialized
 
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
-        "mxfp8": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
         "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
     }

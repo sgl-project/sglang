@@ -179,7 +179,7 @@ class SelfAttention(nn.Module):
         # USPAttention handles SP communication internally; the tail meta keeps
         # SP padding out of the softmax.
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
-        out = out.view(b, s, -1)
+        out = out.reshape(b, s, -1)
 
         out, _ = self.o(out)
         return out
@@ -236,6 +236,7 @@ class CrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
+            is_cross_attention=True,
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
