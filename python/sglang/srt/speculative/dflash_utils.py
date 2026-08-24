@@ -1030,9 +1030,39 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
+def dflash_tree_verify_active() -> bool:
+    """Whether DFLASH verifies a tree-shaped draft rather than a chain this run.
+
+    The one predicate both the request-admission check and `DFlashWorkerV2` read, so
+    a request cannot be admitted on the chain's terms and then verified as a tree.
+    Keyed on the DFLASH-only flag, so DSPARK (which shares the request validation
+    hook and carries its own `speculative_eagle_topk`) never trips it.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_spec
+
+    tree_width = get_spec().speculative_dflash_tree_width
+    return bool(
+        (tree_width is not None and int(tree_width) > 1)
+        or envs.SGLANG_DFLASH_FORCE_TREE_VERIFY.get()
+    )
+
+
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if req.sampling_params.top_k > 1 and dflash_tree_verify_active():
+        # Greedy-only by construction: the beam walk that builds the tree emits no q,
+        # so no rejection-sampling accept can read it. Rejected rather than silently
+        # served greedily, which would misreport the acceptance length this feature is
+        # being measured on. `top_k > 1` is the per-request mirror of the batch-level
+        # `is_all_greedy`; temperature 0 normalizes to top_k == 1.
+        return (
+            "DFLASH tree drafting supports greedy decoding only (temperature 0), but "
+            f"this request samples (top_k={req.sampling_params.top_k}). Send "
+            "temperature 0, or serve with --speculative-dflash-tree-width 1 to sample."
+        )
 
     return None
 

@@ -784,7 +784,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_seqlens = None
 
 
-def _verify_commit_step_indices(
+def verify_commit_step_indices(
     *,
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
@@ -878,7 +878,7 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+        last_correct_step_indices, mamba_steps_to_track = verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
@@ -926,7 +926,7 @@ def commit_mamba_states_after_verify(
         )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
-        last_correct_step_indices, _ = _verify_commit_step_indices(
+        last_correct_step_indices, _ = verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
@@ -1012,7 +1012,7 @@ def commit_mamba_states_after_verify(
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+        last_correct_step_indices, mamba_steps_to_track = verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,

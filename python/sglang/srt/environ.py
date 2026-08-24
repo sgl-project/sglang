@@ -1122,6 +1122,11 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Route DFLASH tree width 1 through the tree verify path instead of the chain
+    # path it is otherwise dispatched to. The width-1 tree *is* the chain, so this
+    # is the equivalence gate for the tree wiring: same prompts, same tokens. No
+    # effect at width > 1, which always takes the tree path.
+    SGLANG_DFLASH_FORCE_TREE_VERIFY = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
