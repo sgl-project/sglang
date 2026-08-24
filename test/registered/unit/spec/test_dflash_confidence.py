@@ -5,8 +5,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.arg_groups import speculative_hook
+from sglang.srt.managers import overlap_utils
 from sglang.srt.models.dspark import DSparkConfidenceHead
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_confidence import (
     plan_verify_prefixes,
     select_sps_verify_token_budget,
@@ -24,6 +26,51 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDFlashConfidence(unittest.TestCase):
+    def test_ragged_verify_input_advertises_nonuniform_width(self):
+        verify_input = DFlashVerifyInput(
+            draft_token=torch.tensor([1, 2, 3]),
+            positions=torch.tensor([0, 1, 2]),
+            draft_token_num=4,
+            ragged_verify_layout=SimpleNamespace(),
+        )
+        self.assertEqual(verify_input.num_tokens_per_req, 1)
+        self.assertEqual(verify_input.num_tokens_for_logprob_per_req, 4)
+        self.assertNotEqual(verify_input.num_tokens_per_req, 4)
+
+    def test_uniform_graph_rejects_ragged_dflash_input(self):
+        runner = SimpleNamespace(captured_req_width=4, ragged_verify_mode=False)
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            spec_info=DFlashVerifyInput(
+                draft_token=torch.tensor([1, 2, 3]),
+                positions=torch.tensor([0, 1, 2]),
+                draft_token_num=4,
+                ragged_verify_layout=SimpleNamespace(),
+            ),
+        )
+        self.assertNotEqual(
+            forward_batch.spec_info.num_tokens_per_req, runner.captured_req_width
+        )
+
+    def test_confidence_relay_follows_dflash_server_args_not_ragged_env(self):
+        server_args = SimpleNamespace(
+            speculative_dflash_confidence_target_verify_tokens=4,
+            speculative_dflash_confidence_sps_table_path=None,
+        )
+        with mock.patch.object(
+            overlap_utils,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
+        ):
+            self.assertTrue(overlap_utils.decide_needs_confidence_relay(server_args))
+        server_args.speculative_dflash_confidence_target_verify_tokens = 0
+        with mock.patch.object(
+            overlap_utils,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="DFLASH_CONFIDENCE"),
+        ):
+            self.assertFalse(overlap_utils.decide_needs_confidence_relay(server_args))
+
     def test_selector_confidence_is_bounded_and_uses_anchor_row(self):
         scores = torch.tensor(
             [
@@ -298,6 +345,24 @@ class TestDFlashConfidence(unittest.TestCase):
             "sglang.srt.speculative.spec_utils.get_spec", return_value=spec
         ):
             self.assertFalse(spec_need_hidden_states())
+
+    def test_observer_records_lagged_cpu_plan_without_confidence_copy(self):
+        observer = DFlashConfidenceObserver()
+        observer.observe(
+            confidence=None,
+            verify_lens=torch.tensor([1, 3], dtype=torch.int32),
+            reason="confidence_ragged_lagged",
+            deferred_tokens=4,
+            low_confidence_tokens=2,
+        )
+        record = observer.dump()
+        self.assertEqual(
+            record["verify_reason_counts"], {"confidence_ragged_lagged": 1}
+        )
+        self.assertEqual(record["verify_batch_size_distribution"], {4: 1})
+        self.assertEqual(record["deferred_tokens"], 4)
+        self.assertEqual(record["low_confidence_tokens"], 2)
+        self.assertEqual(record["confidence"], {})
 
     def test_lagged_cpu_confidence_plan_preserves_prefix_invariants(self):
         # ConfidenceRelay resolves a pinned CPU N-2 snapshot. Planning from it

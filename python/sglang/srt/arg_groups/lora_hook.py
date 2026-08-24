@@ -196,16 +196,23 @@ def check_lora_speculative_compatibility(server_args: Any):
         )
 
     ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+    dflash_confidence_ragged = (
+        cfg.speculative_algorithm == "DFLASH_CONFIDENCE"
+        and (
+            int(cfg.speculative_dflash_confidence_target_verify_tokens) > 0
+            or cfg.speculative_dflash_confidence_sps_table_path is not None
+        )
+    )
 
     # Each entry: (is unsupported, why). Reasons are appended to a shared
     # prefix so the message names the combination, not just the flag.
     unsupported = [
         (
-            cfg.speculative_algorithm in ("DSPARK", "DFLASH_CONFIDENCE")
-            and ragged_mode != "static",
-            f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
-            "the per-request verify lengths it schedules break the "
-            "uniform-width LoRA segment layout",
+            (cfg.speculative_algorithm == "DSPARK" and ragged_mode != "static")
+            or dflash_confidence_ragged,
+            "does not support per-request ragged verification: the "
+            "uniform-width LoRA segment layout would apply adapters to "
+            "the wrong tokens",
         ),
         (
             cfg.speculative_adaptive,
