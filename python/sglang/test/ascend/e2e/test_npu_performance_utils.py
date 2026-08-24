@@ -3,7 +3,6 @@ import inspect
 import json
 import logging
 import os
-import psutil
 import re
 import shutil
 import signal
@@ -14,6 +13,8 @@ import time
 from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
+
+import psutil
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
@@ -974,9 +975,13 @@ def _collect_process_tree(root_pid):
             try:
                 procs[proc.pid] = proc.create_time()
             except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-                logger.debug(f"_collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})")
+                logger.debug(
+                    f"_collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})"
+                )
     except psutil.NoSuchProcess:
-        logger.warning(f"_collect_process_tree: root_pid {root_pid} vanished while walking children")
+        logger.warning(
+            f"_collect_process_tree: root_pid {root_pid} vanished while walking children"
+        )
     logger.info(f"_collect_process_tree: recorded {len(procs)} PIDs")
     return procs
 
@@ -1001,13 +1006,17 @@ def _kill_recorded_pids(procs):
             logger.debug(f"_kill_recorded_pids: skip PID {pid} (no longer exists)")
             continue
         except psutil.AccessDenied as exc:
-            logger.warning(f"_kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})")
+            logger.warning(
+                f"_kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})"
+            )
             continue
         try:
             os.kill(pid, signal.SIGKILL)
             logger.debug(f"_kill_recorded_pids: SIGKILL sent to PID {pid}")
         except (ProcessLookupError, PermissionError, OSError) as e:
-            logger.warning(f"_kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})")
+            logger.warning(
+                f"_kill_recorded_pids: skip PID {pid} ({e.__class__.__name__}: {e})"
+            )
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
