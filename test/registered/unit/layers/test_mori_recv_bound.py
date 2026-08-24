@@ -23,6 +23,9 @@ pytest.importorskip("torch")
 from sglang.srt.layers.moe.moe_runner.aiter import (  # noqa: E402
     _mori_decode_recv_bound,
 )
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -102,3 +105,9 @@ def test_margin_widens_the_bound(monkeypatch):
     wide = _mori_decode_recv_bound(24576)
     if tight and wide:
         assert wide >= tight
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
