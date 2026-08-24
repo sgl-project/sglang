@@ -101,6 +101,10 @@ def handle_expert_pack(server_args: Any) -> None:
                     server_args, loader_config
                 )
             server_args.model_loader_extra_config = loader_config
+            server_args._declare(
+                "handle_expert_pack",
+                model_loader_extra_config=loader_config,
+            )
         except Exception as exc:
             errors.append(f"failed to prepare raw expert_pack GGUF input: {exc}")
             raw_preparation_failed = True
@@ -181,6 +185,11 @@ def handle_expert_pack(server_args: Any) -> None:
 
     server_args.disable_cuda_graph = True
     server_args.disable_shared_experts_fusion = True
+    server_args._declare(
+        "handle_expert_pack",
+        disable_cuda_graph=True,
+        disable_shared_experts_fusion=True,
+    )
     if model_kind == DEEPSEEK_V4_MODEL_TYPE:
         envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
     logger.info(

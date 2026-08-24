@@ -208,6 +208,11 @@ def prepare_raw_kimi_server_args(
     )
     server_args.model_path = str(assets["model_dir"])
     server_args.tokenizer_path = str(assets["model_dir"])
+    server_args._declare(
+        "prepare_raw_kimi_server_args",
+        model_path=str(assets["model_dir"]),
+        tokenizer_path=str(assets["model_dir"]),
+    )
     for key in ("pack_path", "manifest_path", "stats_path"):
         loader_config.setdefault(key, str(assets[key]))
     loader_config.setdefault("source_path", str(assets["gguf"]))
@@ -524,6 +529,11 @@ def prepare_raw_deepseek_server_args(
     )
     server_args.model_path = str(model_config.parent)
     server_args.tokenizer_path = str(model_config.parent)
+    server_args._declare(
+        "prepare_raw_deepseek_server_args",
+        model_path=str(model_config.parent),
+        tokenizer_path=str(model_config.parent),
+    )
     for key, value in {
         "pack_path": pack,
         "manifest_path": manifest,
