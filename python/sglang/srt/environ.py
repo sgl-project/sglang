@@ -864,8 +864,7 @@ class Envs:
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
-    # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
-    # Ascend DeepEP library; the MTP draft-build scopes override it to False).
+    # Kept only so legacy deployments can migrate to the dispatcher dtype CLI.
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")

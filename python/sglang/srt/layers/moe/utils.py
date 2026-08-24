@@ -255,6 +255,14 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         )
         return DispatcherOutputDtype.BF16
 
+    if envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
+        logger.warning_once(
+            "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
+            "and will be removed in future releases. Please use "
+            "`--deepep-dispatcher-output-dtype int8` instead."
+        )
+        return DispatcherOutputDtype.INT8
+
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
         input_global_scale = self.quant_config.get("input_global_scale", None)
