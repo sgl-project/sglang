@@ -63,8 +63,7 @@ _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
     if quant_config is None:
         return False
-    quant_name_getter = getattr(type(quant_config), "get_name", None)
-    return bool(callable(quant_name_getter) and quant_name_getter() == "bitsandbytes")
+    return quant_config.get_name() == "bitsandbytes"
 
 
 def _format_dtype_mismatch_summary(

@@ -21,6 +21,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
+    SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
+    SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -264,6 +267,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
+    # Kill-switch: keep VAE decoder weights in their checkpoint dtype at load
+    # instead of the decode compute dtype the decode stage would round them to
+    # on first use anyway.
+    "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST"
+    ),
+    # Kill-switch: keep the decode-dtype VAE decoder weights in anonymous host
+    # memory instead of a file-backed cache mapping the page cache can drop.
+    "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
+    # of the file-backed LoRA merge cache.
+    "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference

@@ -1,3 +1,4 @@
+import pathlib
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -24,7 +25,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
-from sglang.multimodal_gen.runtime.loader.utils import keep_checkpoint_mapped
+from sglang.multimodal_gen.runtime.loader.utils import (
+    checkpoint_bytes,
+    keep_checkpoint_mapped,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
@@ -48,6 +52,29 @@ class _FakeServerArgs:
 
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
+
+
+class TestDeploymentBytesRoot(unittest.TestCase):
+    """A hub repo id is not a directory; the component path always is."""
+
+    def test_the_component_parent_carries_the_variant_weight(self):
+        with TemporaryDirectory() as root:
+            variant = pathlib.Path(root) / "FL2VA"
+            (variant / "video_vae").mkdir(parents=True)
+            (variant / "transformer").mkdir()
+            (variant / "video_vae" / "w.safetensors").write_bytes(b"x" * 128)
+            (variant / "transformer" / "w.safetensors").write_bytes(b"x" * 512)
+            self.assertEqual(
+                checkpoint_bytes(str(variant)),
+                640,
+                "the parent of a component dir sums every sibling's shards",
+            )
+            self.assertEqual(
+                checkpoint_bytes("MiniMaxAI/MiniMax-H3"),
+                0,
+                "a repo id globs nothing -- which is why the gate must never "
+                "be fed one",
+            )
 
 
 class TestKeepCheckpointMapped(unittest.TestCase):
@@ -96,6 +123,28 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_weights_override_keeps_base_component_config(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_weights_paths = {
+            "audio_vae": "owner/repo/audio_vae.safetensors"
+        }
+
+        with (
+            patch.object(vae_loader, "resolve_weight", return_value="resolved"),
+            patch.object(
+                vae_loader,
+                "materialize_weight",
+                return_value="/cache/audio.safetensors",
+            ),
+        ):
+            self.assertEqual(
+                loader.resolve_model_weights_path(
+                    "/base/audio_vae", server_args, "audio_vae"
+                ),
+                "/cache/audio.safetensors",
+            )
+
     def test_mps_layerwise_load_uses_residency_api(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())
