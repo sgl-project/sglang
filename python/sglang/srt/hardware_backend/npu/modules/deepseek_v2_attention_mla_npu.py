@@ -588,8 +588,18 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+
+    # Selective HiSparse: bypass MLAProlog for selected layers
+    _coordinator = getattr(
+        forward_batch, "npu_selective_hisparse_coordinator", None
+    )
+    _is_selected_layer = (
+        _coordinator is not None and _coordinator.is_selected(m.layer_id)
+    )
+
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
+        and not _is_selected_layer
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
     cp_handle = None
@@ -729,6 +739,15 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
+
+    # Selective HiSparse: start H2D prefetch from anchor layer
+    if _coordinator is not None:
+        _coordinator.maybe_start_prefetch(
+            anchor_layer_id=m.layer_id,
+            topk_indices=topk_indices,
+            forward_batch=forward_batch,
+        )
+
     if cp_handle is not None:
         cp_handle.wait()
         latent_cache_output = cp_all_gather_rerange_kv_cache_finalize(

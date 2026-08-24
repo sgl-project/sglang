@@ -145,6 +145,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    # Selective HiSparse: drain async D2H writes before releasing locs
+    kv_pool = tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    drain = getattr(kv_pool, "drain_async_writes_before_release", None)
+    if drain is not None:
+        drain(req)
+
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,

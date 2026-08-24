@@ -91,7 +91,6 @@ class AscendTransferEngine(MooncakeTransferEngine):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
-            # Mark register as failed
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")

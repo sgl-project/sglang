@@ -1339,6 +1339,9 @@ class KVCacheConfigurator:
                 if enable_quant_lightning_indexer
                 else None
             ),
+            selective_host_layer_ids=getattr(
+                self.server_args, "npu_selective_hisparse_layer_ids", None
+            ),
         )
         return token_to_kv_pool
 

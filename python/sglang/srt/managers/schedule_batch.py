@@ -1918,6 +1918,12 @@ def release_req(
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
+    # Selective HiSparse: drain async D2H writes before retraction
+    _kv_pool = token_to_kv_pool_allocator.get_kvcache()
+    _drain = getattr(_kv_pool, "drain_async_writes_before_retract", None)
+    if _drain is not None:
+        _drain(req)
+
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)

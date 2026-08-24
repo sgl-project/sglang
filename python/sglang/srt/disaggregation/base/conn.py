@@ -86,6 +86,9 @@ class KVArgs:
     hidden_kv_layers: int
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
+    # Optional per-backend extension payload (e.g. selective HiSparse metadata).
+    # Serialized as the final ZMQ frame for backward compatibility.
+    pd_extension: Optional[dict] = None
 
 
 class KVPoll:

@@ -1462,6 +1462,40 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         num_token_padding = q_nope.shape[0]
+
+        # Selective HiSparse: route selected layers to coordinator
+        coordinator = getattr(
+            forward_batch, "npu_selective_hisparse_coordinator", None
+        )
+        is_selected_layer = (
+            coordinator is not None and coordinator.is_selected(layer.layer_id)
+        )
+        if is_selected_layer:
+            if not is_prefill and not self.graph_mode:
+                query_tokens_per_req = (
+                    self.speculative_num_draft_tokens
+                    if (
+                        forward_batch.forward_mode.is_draft_extend_v2()
+                        or forward_batch.forward_mode.is_target_verify()
+                    )
+                    else 1
+                )
+                num_query_tokens = min(
+                    num_token_padding,
+                    self.forward_metadata.block_tables.shape[0] * query_tokens_per_req,
+                )
+                q_nope = q_nope[:num_query_tokens]
+                q_pe = q_pe[:num_query_tokens]
+                topk_indices = topk_indices[:num_query_tokens]
+            return coordinator.run_selected_attention(
+                layer_id=layer.layer_id,
+                layer=layer,
+                q_nope=q_nope,
+                q_rope=q_pe,
+                topk_indices=topk_indices,
+                forward_batch=forward_batch,
+            )
+
         if not is_prefill and not self.graph_mode:
             query_tokens_per_req = (
                 self.speculative_num_draft_tokens

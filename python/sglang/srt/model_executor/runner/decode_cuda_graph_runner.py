@@ -924,6 +924,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
 
+        # Selective HiSparse: attach coordinator for graph capture
+        forward_batch.npu_selective_hisparse_coordinator = (
+            getattr(self.model_runner, "npu_selective_hisparse_coordinator", None)
+            if not self.model_runner.is_draft_worker
+            else None
+        )
+        forward_batch.npu_selective_graph_mode = (
+            forward_batch.npu_selective_hisparse_coordinator is not None
+        )
+        if forward_batch.npu_selective_hisparse_coordinator is not None:
+            forward_batch.npu_selective_hisparse_coordinator.prepare_graph_capture(
+                capture_bs=bs,
+                capture_tokens=num_tokens,
+                out_cache_loc=out_cache_loc,
+            )
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
@@ -1048,6 +1064,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+
+        # Selective HiSparse: register ACL host callback for graph capture
+        _sel_coord = getattr(
+            self.model_runner, "npu_selective_hisparse_coordinator", None
+        )
+        if _sel_coord is not None:
+            _sel_coord.register_callback_stream(
+                torch.npu.current_stream(self.device)
+            )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1195,6 +1220,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label
             )
+
+            # Selective HiSparse: prepare for replay (fast path)
+            _sel_coord = getattr(
+                self.model_runner, "npu_selective_hisparse_coordinator", None
+            )
+            if _sel_coord is not None:
+                _sel_coord.prepare_graph_replay(
+                    real_batch=forward_batch.batch_size,
+                    graph_batch=self.bs,
+                    is_idle=forward_batch.forward_mode.is_idle(),
+                )
             return
 
         buffers = self.buffers
@@ -1236,6 +1272,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        # Selective HiSparse: prepare for replay (full path)
+        _sel_coord = getattr(
+            self.model_runner, "npu_selective_hisparse_coordinator", None
+        )
+        if _sel_coord is not None:
+            _sel_coord.prepare_graph_replay(
+                real_batch=raw_bs,
+                graph_batch=bs,
+                is_idle=forward_batch.forward_mode.is_idle(),
+            )
 
         if (
             not is_ragged

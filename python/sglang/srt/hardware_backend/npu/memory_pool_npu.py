@@ -1,8 +1,11 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
     DSA_KV_QUANT_TILE_SIZE,
@@ -543,6 +546,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         enable_npu_quant_lightning_indexer: bool = False,
         kv_cache_dim: Optional[int] = None,
+        selective_host_layer_ids: Optional[Sequence[int]] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -636,11 +640,39 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.custom_mem_pool = None
 
+        # === Selective HiSparse: resident/selected layer split ===
+        self.selective_host_layer_ids: frozenset[int] = (
+            frozenset(selective_host_layer_ids) if selective_host_layer_ids else frozenset()
+        )
+        self.selective_coordinator = None  # set later by ModelRunner
+
+        if self.selective_host_layer_ids:
+            # Build resident layer mapping (only non-selected layers get HBM buffers)
+            all_layer_ids = list(range(self.start_layer, self.start_layer + layer_num))
+            self.resident_layer_ids = tuple(
+                lid for lid in all_layer_ids if lid not in self.selective_host_layer_ids
+            )
+            self.resident_layer_to_slot = {
+                lid: slot for slot, lid in enumerate(self.resident_layer_ids)
+            }
+            num_main_slots = len(self.resident_layer_ids)
+            logger.info(
+                f"NPUMLATokenToKVPool selective split: {layer_num} total layers, "
+                f"{num_main_slots} resident (HBM), "
+                f"{len(self.selective_host_layer_ids)} selected (Host DRAM)"
+            )
+        else:
+            self.resident_layer_ids = tuple(range(self.start_layer, self.start_layer + layer_num))
+            self.resident_layer_to_slot = {
+                lid: slot for slot, lid in enumerate(self.resident_layer_ids)
+            }
+            num_main_slots = layer_num
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = torch.zeros(
                 (
-                    layer_num,
+                    num_main_slots,
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
@@ -651,7 +683,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             self.v_buffer = torch.zeros(
                 (
-                    layer_num,
+                    num_main_slots,
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
@@ -688,6 +720,59 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self._finalize_allocation_log(size)
 
+    def _resident_slot(self, layer_id: int) -> int:
+        """Return the k_buffer/v_buffer slot for a resident layer."""
+        try:
+            return self.resident_layer_to_slot[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Layer {layer_id} is not a resident (HBM) layer; "
+                f"it may be a selected (Host DRAM) layer. "
+                f"Resident layers: {self.resident_layer_ids}"
+            ) from exc
+
+    def is_selective_host_layer(self, layer_id: int) -> bool:
+        return layer_id in self.selective_host_layer_ids
+
+    def get_pd_target_meta(self):
+        """Return metadata for PD transfer descriptor."""
+        component_kinds: list[str] = []
+        logical_layer_ids: list[int] = []
+        memory_kinds: list[str] = []
+        for lid in range(self.start_layer, self.start_layer + self.layer_num):
+            if lid in self.selective_host_layer_ids:
+                component_kinds.append("MAIN_K")
+                logical_layer_ids.append(lid)
+                memory_kinds.append("DRAM")
+            else:
+                component_kinds.append("MAIN_K")
+                logical_layer_ids.append(lid)
+                memory_kinds.append("VRAM")
+        if self.index_head_dim is not None:
+            for lid in self.indexer_layer_ids:
+                component_kinds.append("INDEX_K")
+                logical_layer_ids.append(lid)
+                memory_kinds.append("VRAM")
+                if self.index_k_scale_buffer is not None:
+                    component_kinds.append("INDEX_SCALE")
+                    logical_layer_ids.append(lid)
+                    memory_kinds.append("VRAM")
+        return {
+            "component_kinds": component_kinds,
+            "logical_layer_ids": logical_layer_ids,
+            "memory_kinds": memory_kinds,
+        }
+
+    def drain_async_writes_before_release(self, req=None):
+        """Wait for all pending selective D2H writes before releasing locs."""
+        if self.selective_coordinator is not None:
+            self.selective_coordinator.drain_all()
+
+    def drain_async_writes_before_retract(self, req=None):
+        """Wait for pending selective D2H writes before retraction."""
+        if self.selective_coordinator is not None:
+            self.selective_coordinator.drain_all()
+
     def _get_indexer_slot(self, layer_id: int) -> int:
         if self.index_head_dim is None:
             raise RuntimeError("This KV pool does not have an Indexer cache")
@@ -717,11 +802,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
+        if self.is_selective_host_layer(layer_id):
+            # Selected layers: return dummy scratch buffer for npu_kv_rmsnorm_rope_cache
+            # write target. Actual KV is handled via selective hisparse path.
+            if not hasattr(self, "_selective_scratch_k"):
+                self._selective_scratch_k = torch.zeros(
+                    1, self.size // self.page_size + 1,
+                    self.page_size, 1, self.kv_cache_dim,
+                    dtype=self.k_store_dtype, device=self.device,
+                )
+                self._selective_scratch_v = torch.zeros(
+                    1, self.size // self.page_size + 1,
+                    self.page_size, 1, self.kr_cache_dim,
+                    dtype=self.v_store_dtype, device=self.device,
+                )
+            return self._selective_scratch_k[0], self._selective_scratch_v[0]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        slot = self._resident_slot(layer_id)
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[slot],
+            self.v_buffer[slot],
         )
 
     def get_state_buf_infos(self):
@@ -752,20 +853,30 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
+        if self.is_selective_host_layer(layer_id):
+            raise RuntimeError(
+                f"get_key_buffer: layer {layer_id} is a selected (Host DRAM) layer"
+            )
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        slot = self._resident_slot(layer_id)
         if self.k_store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[slot].view(self.dtype)
+        return self.k_buffer[slot]
 
     def get_value_buffer(self, layer_id: int):
+        if self.is_selective_host_layer(layer_id):
+            raise RuntimeError(
+                f"get_value_buffer: layer {layer_id} is a selected (Host DRAM) layer"
+            )
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        slot = self._resident_slot(layer_id)
         if self.v_store_dtype == self.store_dtype and self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[slot].view(self.dtype)
+        return self.v_buffer[slot]
 
     def get_index_k_buffer(self, layer_id: int):
         indexer_slot = self._get_indexer_slot(layer_id)
@@ -789,20 +900,45 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)]
-        # When DSA KV cache is packed into the FP8 k_buffer, the v_buffer is
-        # intentionally empty (kr_cache_dim == 0). Its data_ptr() is null
+        kv_data_ptrs: list[int] = []
+        kv_data_lens: list[int] = []
+        kv_item_lens: list[int] = []
+
+        # MAIN_K: iterate over all logical layers
+        # NOTE: kv_item_lens must be PER-PAGE bytes (page_size * record_bytes)
+        # because the PD transfer path is page-indexed (kv_to_page_indices).
+        # Resident layers get this naturally from k_buffer[slot][0].nbytes;
+        # selected layers must match the same per-page convention.
+        per_page_bytes = self.kv_cache_dim * self.page_size
+        for lid in range(self.start_layer, self.start_layer + self.layer_num):
+            if self.is_selective_host_layer(lid):
+                # Selected layer: publish Host HVA
+                host_pool = getattr(self, "selective_host_pool", None)
+                if host_pool is not None:
+                    kv_data_ptrs.append(host_pool.layer_hva(lid))
+                    kv_data_lens.append(host_pool.layer_bytes(lid))
+                    kv_item_lens.append(per_page_bytes)
+                else:
+                    # Fallback: publish zero-size placeholder
+                    kv_data_ptrs.append(0)
+                    kv_data_lens.append(0)
+                    kv_item_lens.append(per_page_bytes)
+            else:
+                # Resident layer: publish NPU pointer
+                slot = self._resident_slot(lid)
+                kv_data_ptrs.append(self.k_buffer[slot].data_ptr())
+                kv_data_lens.append(self.k_buffer[slot].nbytes)
+                kv_item_lens.append(self.k_buffer[slot][0].nbytes)
+
+        # MAIN_V: zero-size in packed FP8 mode, skip
         if not self.dsa_kv_cache_store_fp8:
-            kv_data_ptrs += [
-                self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-            ]
-            kv_data_lens += [self.v_buffer[i].nbytes for i in range(self.layer_num)]
-            kv_item_lens += [
-                self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-            ]
+            for lid in range(self.start_layer, self.start_layer + self.layer_num):
+                if not self.is_selective_host_layer(lid):
+                    slot = self._resident_slot(lid)
+                    kv_data_ptrs.append(self.v_buffer[slot].data_ptr())
+                    kv_data_lens.append(self.v_buffer[slot].nbytes)
+                    kv_item_lens.append(self.v_buffer[slot][0].nbytes)
+
         if self.index_head_dim is not None:
             kv_data_ptrs += [
                 self.index_k_buffer[i].data_ptr()
@@ -920,6 +1056,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
+
+        # Selective HiSparse: selected layers pack to scratch + D2H
+        if self.is_selective_host_layer(layer_id):
+            if cache_v is None:
+                cache_k, cache_v = cache_k.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+            packed = self._pack_dsa_fp8_kv_cache(
+                cache_k, cache_v, loc.numel()
+            )
+            if self.selective_coordinator is not None:
+                self.selective_coordinator.publish_new_packed_kv(
+                    layer_id=layer_id,
+                    logical_locs=loc,
+                    packed_kv=packed.view(-1, self.kv_cache_dim),
+                )
+            return
+
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -927,7 +1081,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             packed_cache = self._pack_dsa_fp8_kv_cache(cache_k, cache_v, loc.numel())
             torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
+                self.k_buffer[self._resident_slot(layer_id)].view(
                     -1, 1, self.kv_cache_dim
                 ),
                 loc.view(-1, 1),
@@ -949,12 +1103,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            self.k_buffer[self._resident_slot(layer_id)].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
+            self.v_buffer[self._resident_slot(layer_id)].view(
                 -1, 1, self.qk_rope_head_dim
             ),
             loc.view(-1, 1),
@@ -1040,6 +1194,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return out
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        if self.selective_host_layer_ids:
+            raise RuntimeError(
+                "get_cpu_copy is not supported when selective HiSparse is "
+                "enabled. Use PD rebootstrap for retraction recovery."
+            )
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(local_layer_id)
@@ -1051,6 +1210,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if self.selective_host_layer_ids:
+            raise RuntimeError(
+                "load_cpu_copy is not supported when selective HiSparse is "
+                "enabled. Use PD rebootstrap for retraction recovery."
+            )
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):

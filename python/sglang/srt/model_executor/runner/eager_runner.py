@@ -197,6 +197,16 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
+        # Selective HiSparse: attach coordinator for eager mode
+        if not hasattr(forward_batch, "npu_selective_hisparse_coordinator") or (
+            forward_batch.npu_selective_hisparse_coordinator is None
+        ):
+            coord = getattr(
+                self.model_runner, "npu_selective_hisparse_coordinator", None
+            )
+            if coord is not None and not self.model_runner.is_draft_worker:
+                forward_batch.npu_selective_hisparse_coordinator = coord
+
         mode = forward_batch.forward_mode
         if mode.is_decode():
             return self._execute_decode(forward_batch, pp_proxy_tensors)

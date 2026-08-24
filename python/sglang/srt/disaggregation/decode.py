@@ -444,7 +444,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
             if self.scheduler.enable_hisparse
-            else ["VRAM"] * len(kv_data_ptrs)
+            else (
+                # Selective HiSparse: use per-layer memory kind from the pool
+                transfer_kv_pool.get_pd_target_meta()["memory_kinds"]
+                if hasattr(transfer_kv_pool, "get_pd_target_meta")
+                and getattr(
+                    self.scheduler.server_args,
+                    "npu_selective_hisparse_layer_ids",
+                    None,
+                )
+                else ["VRAM"] * len(kv_data_ptrs)
+            )
         )
         if self.scheduler.enable_hisparse and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
@@ -496,6 +506,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+
+        # Selective HiSparse: generate pd_extension metadata
+        selective_layer_ids = getattr(
+            self.scheduler.server_args, "npu_selective_hisparse_layer_ids", None
+        )
+        if selective_layer_ids and hasattr(self.token_to_kv_pool, "get_pd_target_meta"):
+            target_meta = self.token_to_kv_pool.get_pd_target_meta()
+            kv_args.pd_extension = {
+                "schema": "npu_selective_host_v1",
+                "target_kv_data_ptr_count": len(kv_data_ptrs),
+                "target_component_kinds": target_meta["component_kinds"],
+                "target_logical_layer_ids": target_meta["logical_layer_ids"],
+                "target_memory_kinds": target_meta["memory_kinds"],
+                "selected_layer_ids": list(selective_layer_ids),
+                "cp_cache_layout": "REPLICATED",
+                "cp_sender_rank": 0,
+            }
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

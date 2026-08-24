@@ -52,6 +52,15 @@ class AscendKVManager(MooncakeKVManager):
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
         )
+        # Selective HiSparse: read pd_extension metadata
+        self._selective_meta = None
+        pd_ext = getattr(self.kv_args, "pd_extension", None)
+        if pd_ext is not None and pd_ext.get("schema") == "npu_selective_host_v1":
+            self._selective_meta = pd_ext
+            logger.info(
+                f"AscendKVManager: selective HiSparse enabled, "
+                f"selected_layers={pd_ext.get('selected_layer_ids', [])}"
+            )
 
     def register_buffer_to_engine(self):
         # MemFabric aligns registered buffers to 2 MiB. Register everything in

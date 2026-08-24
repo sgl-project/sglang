@@ -2732,6 +2732,16 @@ class ServerArgs:
         NS("memory"),
     ] = None
 
+    # NPU Selective HiSparse: offload selected DSA layers' KV to Host DRAM
+    npu_selective_hisparse_layer_ids: A[
+        Optional[List[int]],
+        Arg(
+            help="List of DSA layer IDs whose KV cache will be offloaded to Host DRAM. "
+                 "Candidates are {5,9,13,...,77}. Example: --npu-selective-hisparse-layer-ids 5 21 49 77",
+        ),
+        NS("memory"),
+    ] = None
+
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------

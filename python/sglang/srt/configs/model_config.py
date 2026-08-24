@@ -243,6 +243,33 @@ def resolve_dsa_indexer_layer_ids(
     )
 
 
+def resolve_dsa_last_shared_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+) -> tuple[int, ...]:
+    """Return the last layer ID of each complete shared-index group.
+
+    These are candidate layers for Selective HiSparse offload.
+    For GLM-5.2: {5, 9, 13, ..., 77}.
+    """
+    if end_layer is None:
+        end_layer = getattr(config, "num_hidden_layers", 0)
+
+    physical = resolve_dsa_indexer_layer_ids(config, start_layer, end_layer)
+    freq = getattr(config, "index_topk_freq", 1) or 1
+
+    groups: list[int] = []
+    for i in range(len(physical) - 1):
+        if physical[i + 1] - physical[i] == freq:
+            groups.append(physical[i] + freq - 1)
+    if physical:
+        last = physical[-1] + freq - 1
+        if last < end_layer:
+            groups.append(last)
+    return tuple(sorted(set(groups)))
+
+
 def can_use_compact_npu_dsa_indexer_cache(server_args) -> bool:
     """Whether Ascend transfer protocols support a non-uniform layer layout."""
     return (

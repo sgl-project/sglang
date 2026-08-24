@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import logging
+
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -186,6 +188,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kvc = kvc
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
@@ -305,6 +308,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 kvc, num_layers
             )
 
+        # Selective HiSparse: reduce main KV layer count by number of offloaded layers
+        selective_layer_ids = getattr(
+            kvc.server_args, "npu_selective_hisparse_layer_ids", None
+        )
+        num_selective = len(selective_layer_ids) if selective_layer_ids else 0
+        main_kv_layers = effective_num_layers - num_selective
+
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
@@ -314,13 +324,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
+            # Main KV: only resident layers
             cell_size = (
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
                     server_args=kvc.server_args,
                 )
-                * effective_num_layers
+                * max(main_kv_layers, 0)
                 * kv_size
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
@@ -438,13 +449,67 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        # Selective HiSparse: subtract fixed staging/workspace bias
+        selective_layer_ids = getattr(
+            self.kvc.server_args, "npu_selective_hisparse_layer_ids", None
+        )
+        if selective_layer_ids and _is_npu_pool_device(self.kvc.device):
+            fixed_bias = self._compute_selective_fixed_bias()
+            usable_bytes = max(available_bytes - fixed_bias, 0)
+        else:
+            usable_bytes = available_bytes
+
         max_total_num_tokens = (
-            available_bytes // self._cell_size
+            usable_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+
+    def _compute_selective_fixed_bias(self) -> int:
+        """Compute fixed HBM overhead for selective HiSparse staging buffers."""
+        from sglang.srt.layers.dp_attention import get_attention_dp_size
+
+        kvc = self.kvc
+        max_running = kvc.server_args.max_running_requests or 256
+        attn_dp = get_attention_dp_size()
+        bcap = max_running // attn_dp
+        cuda_graph_bs = getattr(kvc.server_args, "cuda_graph_bs", None)
+        if cuda_graph_bs:
+            bcap = max(bcap, max(cuda_graph_bs))
+        verify_width = 6
+        topk = 2048
+        record_bytes = 656
+        kv_lora_rank = 512
+        qk_rope_head_dim = 64
+
+        tcap = bcap * verify_width
+        rcap = tcap * topk
+
+        # packed_staging: [Tcap, K, 656] uint8
+        staging = rcap * record_bytes
+        # unpack_k_nope_bf16: [Tcap, K, 512] BF16
+        unpack_nope = rcap * kv_lora_rank * 2
+        # unpack_k_rope_bf16: [Tcap, K, 64] BF16
+        unpack_rope = rcap * qk_rope_head_dim * 2
+        # new_packed_scratch: [Tcap, 656] uint8
+        scratch = tcap * record_bytes
+        # metadata: locs, mask, current_rows, sparse_indices, seq_lens
+        meta = (
+            tcap * topk * 8  # host_locs int64
+            + tcap * topk  # valid_mask bool
+            + tcap * topk * 8  # current_source_row int64
+            + tcap * topk * 4  # sparse_indices int32
+            + tcap * 4  # actual_seq_lens_kv int32
+        )
+
+        total = staging + unpack_nope + unpack_rope + scratch + meta
+        logger.info(
+            f"Selective HiSparse fixed bias: {total / (1024*1024):.1f} MiB "
+            f"(Bcap={bcap}, Tcap={tcap})"
+        )
+        return total
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int

@@ -844,6 +844,7 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
 
         self.maybe_init_hisparse_coordinator()
+        self.maybe_init_npu_selective_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -883,6 +884,84 @@ class ModelRunner:
             ),
         )
 
+    def maybe_init_npu_selective_hisparse_coordinator(self):
+        """Create the Selective HiSparse coordinator if configured."""
+        self.npu_selective_hisparse_coordinator = None
+        layer_ids = getattr(
+            self.server_args, "npu_selective_hisparse_layer_ids", None
+        )
+        if not layer_ids:
+            return
+        if self.is_draft_worker:
+            return
+
+        from sglang.srt.hardware_backend.npu.selective_hisparse import (
+            NPUSelectiveHiSparseCoordinator,
+            SelectiveHostKVPool,
+            validate_npu_selective_hisparse_config,
+            RECORD_BYTES,
+            VERIFY_WIDTH,
+            DEFAULT_TOPK,
+        )
+
+        selected_ids = validate_npu_selective_hisparse_config(
+            self.server_args, self.model_config
+        )
+
+        # Compute local batch capacity
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_size,
+        )
+        attn_dp_size = get_attention_dp_size()
+        max_running = self.server_args.max_running_requests or 256
+        local_batch_capacity = max_running // attn_dp_size
+
+        # Graph capture may use batch sizes larger than max_running // attn_dp.
+        # The staging buffers must accommodate the largest captured batch.
+        cuda_graph_bs = getattr(self.server_args, "cuda_graph_bs", None)
+        if cuda_graph_bs:
+            local_batch_capacity = max(
+                local_batch_capacity, max(cuda_graph_bs)
+            )
+
+        # Create Host pool
+        token_pool = self.token_to_kv_pool
+        page_size = token_pool.page_size
+        num_slots = (
+            (token_pool.size // page_size + 1) * page_size
+        )
+        if isinstance(self.device, torch.device) and self.device.index is not None:
+            npu_id = self.device.index
+        else:
+            npu_id = torch.npu.current_device()
+
+        host_pool = SelectiveHostKVPool(
+            layer_ids=selected_ids,
+            num_slots=num_slots,
+            record_bytes=RECORD_BYTES,
+            npu_id=npu_id,
+        )
+        token_pool.selective_host_pool = host_pool
+
+        # Create coordinator
+        self.npu_selective_hisparse_coordinator = NPUSelectiveHiSparseCoordinator(
+            pool=host_pool,
+            req_to_token_pool=self.req_to_token_pool,
+            selected_layer_ids=selected_ids,
+            local_batch_capacity=local_batch_capacity,
+            verify_width=VERIFY_WIDTH,
+            topk=DEFAULT_TOPK,
+            record_bytes=RECORD_BYTES,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            num_hidden_layers=self.model_config.num_hidden_layers,
+        )
+
+        # Wire coordinator into pool
+        token_pool.selective_coordinator = (
+            self.npu_selective_hisparse_coordinator
+        )
+
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)
         self.max_total_num_tokens = resize.max_total_num_tokens
@@ -902,6 +981,26 @@ class ModelRunner:
             if self.memory_pool_config is not None:
                 self.memory_pool_config.max_running_requests = (
                     resize.capped_max_running_requests
+                )
+
+        # Selective HiSparse: cap HBM pool size to not exceed Host DRAM pool.
+        # The Host pool's DVA addresses are baked into captured graphs, so it
+        # cannot be resized after capture.  Instead, cap the HBM pool here.
+        coord = getattr(self, "npu_selective_hisparse_coordinator", None)
+        if coord is not None:
+            page_size = self.token_to_kv_pool.page_size
+            max_host_slots = coord.pool.num_slots
+            max_hbm_tokens = (max_host_slots // page_size) * page_size
+            if self.max_total_num_tokens > max_hbm_tokens:
+                old_tokens = self.max_total_num_tokens
+                self.max_total_num_tokens = max_hbm_tokens
+                if self.memory_pool_config is not None:
+                    self.memory_pool_config.max_total_num_tokens = max_hbm_tokens
+                logger.warning(
+                    "SelectiveHiSparse: capping HBM pool %d → %d tokens "
+                    "to match Host DRAM pool capacity",
+                    old_tokens,
+                    max_hbm_tokens,
                 )
 
     def post_capture_elastic_ep_recover(self):

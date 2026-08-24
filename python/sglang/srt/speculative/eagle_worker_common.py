@@ -587,6 +587,20 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+
+    # Selective HiSparse: notify coordinator of verify results
+    _selective_coord = getattr(
+        target_worker.model_runner, "npu_selective_hisparse_coordinator", None
+    )
+    if _selective_coord is not None and not batch.forward_mode.is_idle():
+        _selective_coord.on_verify_result(
+            req_pool_indices=batch.req_pool_indices,
+            verify_cache_locs=batch.out_cache_loc,
+            old_seq_lens=batch.seq_lens,
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+        )
+
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
