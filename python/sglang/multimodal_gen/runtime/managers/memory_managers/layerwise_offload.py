@@ -1570,14 +1570,6 @@ class LayerwiseOffloadableModuleMixin:
                     names.update(offload_param_name_aliases(name))
         return names
 
-    def _managed_layer_parameter_ids(self) -> set[int]:
-        """ids of Parameters the managers prefetch/release."""
-        return {
-            id(param)
-            for manager in self.layerwise_offload_managers
-            for param in manager._named_parameters.values()
-        }
-
     def park_non_layer_weights(self) -> None:
         """Move the parameters no manager streams back to the host.
 
@@ -1599,13 +1591,10 @@ class LayerwiseOffloadableModuleMixin:
             # MPS parks its own non-layer weights, scoped to subphases
             return
         managed = self._managed_layer_parameter_names()
-        managed_ids = self._managed_layer_parameter_ids()
         resident = [
             (name, parameter)
             for name, parameter in self.named_parameters()
-            if name not in managed
-            and id(parameter) not in managed_ids
-            and parameter.device.type != "cpu"
+            if name not in managed and parameter.device.type != "cpu"
         ]
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
