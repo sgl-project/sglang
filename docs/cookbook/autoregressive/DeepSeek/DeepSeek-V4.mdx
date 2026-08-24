@@ -564,6 +564,8 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 Flash Official (0731) bundles a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
 
+If a post-training checkpoint was derived from this model but does not retain the bundled DSpark tensors, load the target and the official 0731 draft separately. See [serve a fine-tuned checkpoint with an official DSpark draft](/cookbook/autoregressive/DeepSeek/DeepSeek-V4-Finetuned-DSpark).
+
 Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
 
 The verified 4×GB300 FP4 low-latency command is:

@@ -1,0 +1,323 @@
+---
+title: "DeepSeek-V4: serve a fine-tuned checkpoint with an official DSpark draft"
+sidebarTitle: "Fine-tuned checkpoint + DSpark"
+description: "Load a post-training DeepSeek-V4 target checkpoint together with the DSpark weights from DeepSeek-V4-Flash-0731."
+---
+
+This guide shows how to serve a post-training DeepSeek-V4 checkpoint while reusing
+the trained DSpark draft from the official `DeepSeek-V4-Flash-0731` checkpoint.
+Use this layout when your training checkpoint contains the target model weights
+but does not contain the DSpark tensors.
+
+The target and draft are loaded as two model instances:
+
+| Role | Checkpoint | What SGLang uses it for |
+| --- | --- | --- |
+| Target | Your fine-tuned checkpoint | Verification and final token selection |
+| Draft | `deepseek-ai/DeepSeek-V4-Flash-0731` | DSpark proposal, Markov head, and confidence head |
+
+Do not copy the draft tensors into the training output. Pass the two checkpoint
+paths separately so that SGLang can construct the target and draft runners with
+their own quantization settings.
+
+For the bundled-checkpoint recipe, where the target and draft are stored in the
+same `DeepSeek-V4-Flash-0731` directory, see the [DeepSeek-V4 cookbook](/cookbook/autoregressive/DeepSeek/DeepSeek-V4#3-4-dspark-speculative-decoding).
+
+## When to use this layout
+
+Use a separate draft path when all of the following are true:
+
+- The target is a DeepSeek-V4 checkpoint produced by supervised fine-tuning,
+  continued training, or another post-training job.
+- The target checkpoint is compatible with the official V4 tokenizer and model
+  geometry.
+- The target checkpoint does not carry a complete DSpark bundle (configuration
+  metadata plus DSpark tensors).
+- You want to reuse the official DSpark draft without changing the target
+  checkpoint.
+
+SGLang uses `dspark_*` fields in the target configuration when deciding whether
+  to default the draft path to the target path. Some training outputs preserve
+  those fields while dropping all `mtp.*` or `stages.*` tensors, so configuration
+  metadata alone does not prove that a usable DSpark head is present. Inspect
+  both the configuration and the tensor index, then pass the official draft path
+  explicitly when the target tensor count is zero. Pointing this flag at the
+  fine-tuned target is not a substitute for the official draft: it either fails
+  validation or loads a target that has no trained DSpark head.
+
+## Prerequisites
+
+This example targets NVIDIA CUDA GPUs, including Hopper H100/H200. The current
+DSpark implementation requires `pp_size == 1`. Use the target topology's tensor
+parallel size and keep DP-Attention disabled unless your SGLang version and
+topology have an explicitly validated DSpark DP configuration. See the
+[general DeepSeek-V4 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)
+for hardware-specific model recipes.
+
+For Hopper, use an FP8-compatible serving path. H100 and H200 do not support
+NVFP4 execution; the `fp8` setting below is suitable for a BF16 training output
+because SGLang quantizes the target weights at load time and quantizes
+activations dynamically for the FP8 path. It does not rewrite the training
+checkpoint on disk.
+
+The official draft may be local or a Hugging Face repository ID. Make sure both
+paths are visible to every SGLang process in a multi-process deployment.
+
+## Inspect the two checkpoints
+
+Before launching, verify the target and draft use compatible model geometry and
+vocabulary. The draft must contain DSpark metadata; a post-training target is
+allowed to contain zero DSpark tensors.
+
+Run the following against local copies of both checkpoints:
+
+```bash Command
+export TARGET_MODEL_PATH=/path/to/fine-tuned-checkpoint
+export DRAFT_MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731
+
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def weight_names(model_path):
+    index_path = Path(model_path) / "model.safetensors.index.json"
+    if not index_path.exists():
+        return set()
+    return set(read_json(index_path)["weight_map"])
+
+
+for label, env_name in (("target", "TARGET_MODEL_PATH"), ("draft", "DRAFT_MODEL_PATH")):
+    model_path = Path(os.environ[env_name])
+    config = read_json(model_path / "config.json")
+    names = weight_names(model_path)
+    dspark_config = {
+        key: config[key]
+        for key in (
+            "dspark_block_size",
+            "dspark_markov_rank",
+            "dspark_noise_token_id",
+            "dspark_target_layer_ids",
+        )
+        if key in config
+    }
+    dspark_tensor_names = tuple(
+        name
+        for name in names
+        if name.startswith("mtp.") or name.startswith("stages.")
+    )
+    print(f"[{label}] {model_path}")
+    print(
+        "  architecture=",
+        config.get("architectures"),
+        "vocab_size=",
+        config.get("vocab_size"),
+        "hidden_size=",
+        config.get("hidden_size"),
+    )
+    print("  dspark_config=", dspark_config or "<not bundled>")
+    print("  dspark_tensor_count=", len(dspark_tensor_names))
+PY
+```
+
+For a training checkpoint that retained DSpark metadata but not its tensors, the
+expected pattern is:
+
+```text Output
+[target] ...
+  dspark_config= ...
+  dspark_tensor_count= 0
+[draft] ...DeepSeek-V4-Flash-0731
+  dspark_config= ...
+  dspark_tensor_count= 4705
+```
+
+The exact tensor count can change between checkpoint revisions. In the target
+checkpoint used for the H200 validation, the target retained the DSpark shape
+metadata but had zero DSpark tensors; the official 0731 draft had 4705 indexed
+DSpark tensors. The important checks are that the draft exposes DSpark metadata
+and tensors and that the target and draft have the same tokenizer/vocabulary
+contract.
+
+## Launch with separate target and draft paths
+
+The following is a single SGLang server example for an H200-style FP8
+deployment. Replace `--tp-size 4` with the tensor parallel size used by your
+target topology.
+
+```bash Command
+export TARGET_MODEL_PATH=/path/to/fine-tuned-checkpoint
+export DRAFT_MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731
+
+sglang serve \
+  --trust-remote-code \
+  --model-path "$TARGET_MODEL_PATH" \
+  --model-impl sglang \
+  --served-model-name fine-tuned-deepseek-v4 \
+  --quantization fp8 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+  --speculative-draft-model-quantization fp8 \
+  --tp-size 4 \
+  --pp-size 1 \
+  --enable-metrics \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+The two quantization flags are independent:
+
+- `--quantization fp8` selects the target serving path. For a BF16 target,
+  SGLang performs online weight quantization at load time; the BF16 files remain
+  unchanged.
+- `--speculative-draft-model-quantization fp8` selects the draft serving path.
+  Set it explicitly when the target and draft have different checkpoint
+  serialization or when you want the comparison to use the same FP8 workload.
+
+Do not add EAGLE-only flags such as `--speculative-eagle-topk` to this recipe.
+DSpark reads its runtime shape from the draft checkpoint. If you need to sweep
+the proposal length, use `--speculative-dspark-block-size N`; `N` is the number
+of proposed tokens and the verify window is `N + 1`. Omitting the flag uses the
+draft checkpoint's configured block size.
+
+## Verify that the trained draft is actually loaded
+
+The startup log should identify the DSpark model and the draft runtime
+configuration. Look for these messages in the server log:
+
+```bash Command
+grep -E "DeepseekV4ForCausalLMDSpark|Initialized DSpark draft runner|DSpark draft runner ready" server.log
+```
+
+For the official 0731 draft used in the H200 validation, the relevant shape was
+`gamma=5` and `verify_num_draft_tokens=6`. A typical startup line is similar to:
+
+```text Output
+Initialized DSpark draft runner ... gamma=5, verify_num_draft_tokens=6, ...
+```
+
+The metrics endpoint enabled by `--enable-metrics` exposes the batch-level gauges. Send traffic first,
+then inspect the current values:
+
+```bash Command
+curl -s http://localhost:30000/metrics \
+  | grep -E 'sglang:spec_(accept_rate|accept_length|num_draft_tokens|num_steps)'
+```
+
+Interpret the gauges as follows:
+
+| Metric | Meaning |
+| --- | --- |
+| `sglang:spec_accept_rate` | Accepted draft tokens divided by proposed draft tokens in the latest batch |
+| `sglang:spec_accept_length` | Accepted draft tokens plus the bonus token per verify round |
+| `sglang:spec_num_draft_tokens` | Active verify-window size, including the bonus slot |
+| `sglang:spec_num_steps` | Active speculative steps; DSpark uses one step |
+
+You can also inspect per-request metadata from the OpenAI-compatible response:
+
+```bash Command
+curl -s http://localhost:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "fine-tuned-deepseek-v4",
+    "messages": [{"role": "user", "content": "Explain speculative decoding in one sentence."}],
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_tokens": 64
+  }' \
+  | jq '.choices[0].meta_info | {spec_accept_rate, spec_accept_length, spec_num_correct_drafts}'
+```
+
+An `accept_rate` near zero together with `accept_length` near one usually means
+that the request is being served without useful trained draft weights. Check
+the draft path, the draft startup log, the tokenizer/vocabulary match, and the
+checkpoint's DSpark metadata before tuning GPU or KV-cache settings.
+
+## H200 validation example
+
+The following configuration was validated with a fine-tuned DeepSeek-V4 target
+checkpoint and the official `DeepSeek-V4-Flash-0731` draft:
+
+| Item | Value |
+| --- | --- |
+| Target | Fine-tuned checkpoint derived from the V4 Flash training run |
+| Draft | `deepseek-ai/DeepSeek-V4-Flash-0731` |
+| Target serving precision | Online FP8 from a BF16 training checkpoint |
+| Draft serving precision | FP8 |
+| DSpark verify window | 6 tokens (`gamma=5`) |
+| Hardware | H200 |
+
+In the 4×3 workload smoke run, all 780 requests passed the exact-token-work
+check. The full-run log samples averaged about `0.599` acceptance rate and
+`3.99` acceptance length. A later live sample was `0.55` acceptance rate and
+`3.75` acceptance length. These numbers are workload-dependent; use the same
+dataset, sampling parameters, warmup, concurrency, and quantization when
+comparing against a target-only baseline.
+
+## Fair baseline comparison
+
+Run the target-only and DSpark configurations as separate server lifecycles.
+Keep the following identical between the two legs:
+
+- target checkpoint and target quantization;
+- GPU topology, tensor parallel size, context limit, KV-cache dtype, and memory
+  fraction;
+- tokenizer, chat template, sampling parameters, request corpus, warmup, and
+  concurrency;
+- cache flush and measurement duration.
+
+Report throughput together with P50/P95/P99 latency, GPU memory, accepted length,
+and acceptance rate. Acceptance rate alone does not prove a speedup: a larger
+draft block can increase verification work even when the rate stays high.
+
+For the official draft, compare against the same target command with only the
+following DSpark settings removed:
+
+```text
+--speculative-algorithm DSPARK
+--speculative-draft-model-path ...
+--speculative-draft-model-quantization fp8
+```
+
+Restart the server between legs so that CUDA graphs, model weights, and KV-cache
+state are not reused across configurations.
+
+## Troubleshooting
+
+### SGLang says that a draft path is required
+
+This is expected when the target does not advertise bundled DSpark metadata. Add
+`--speculative-draft-model-path` and point it to the official 0731 checkpoint.
+
+### The server starts but acceptance is zero
+
+Check that the draft log reports `DeepseekV4ForCausalLMDSpark`, not a generic
+target model. Confirm that the draft directory is mounted into every worker and
+that the target and draft use the same tokenizer and vocabulary. Do not rely on
+`dspark_*` fields in `config.json` alone: recheck the target tensor index and do
+not use a random or incomplete draft directory for an acceptance comparison.
+
+### The server reports a mask-token or vocabulary error
+
+The draft's DSpark mask token must be within the target vocabulary. Use a draft
+checkpoint from the same V4 tokenizer family; do not mix revisions with different
+vocabulary layouts.
+
+### The server reports an unsupported parallelism or device
+
+DSpark currently requires CUDA and `pp_size == 1`. Remove pipeline parallelism
+from this recipe. If you are using a deployment framework with prefill/decode
+workers, verify its release-specific DSpark support before enabling DSpark on
+both roles.
+
+### The server runs out of memory during graph capture
+
+Lower `--speculative-dspark-block-size`, reduce `--max-running-requests`, or
+lower `--mem-fraction-static`. Rerun the target-only and DSpark legs with the
+same memory settings after tuning.
