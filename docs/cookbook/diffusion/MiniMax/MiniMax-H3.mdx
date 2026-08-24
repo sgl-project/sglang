@@ -291,6 +291,35 @@ the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
 layerwise offload are supported; TP8 violates the checkpoint's 256-element
 ConvRot group boundary, and FSDP is rejected.
 
+Self-describing community MXFP8 files use the same
+`--transformer-weights-path <repo/file.safetensors>` form and need no
+quantization flag. SGLang reads their global format metadata, keeps unmarked H3
+layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
+selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
+this mixed per-layer layout.
+
+W4A8 ConvRot DiT files use the same flagless flow. With
+`comfy-kitchen>=0.2.27`, pass a file such as
+`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
+and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
+subject to each row-parallel shard preserving the checkpoint's ConvRot group
+boundary, and FSDP is rejected.
+
+W4A4 ConvRot files are also detected from their layer metadata. Install a
+current `comfy-kitchen`, then pass a full or pruned FL2VA / Ref2VA file such as
+`Merserk/MiniMax-H3-INT4-ConvRot/minimax_h3_fl2va_pruned_int4_convrot.safetensors`
+to `--transformer-weights-path`. The packed weights stay INT4 and the runtime
+honors each layer's activation mode; omit `--quantization`.
+Mixed exports use the same command: SGLang dispatches each marked layer to its
+serialized W4A4 or INT8 ConvRot kernel instead of applying one global method.
+
+Comfy NVFP4 DiTs reuse SGLang's ModelOpt NVFP4 backend, which requires CUDA
+compute capability 10.0 or newer. Pass a pruned FL2VA / Ref2VA file such as
+`Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/MiniMax_H3_FL2VA_pruned_nvfp4.safetensors`
+to `--transformer-weights-path` and omit `--quantization`. SGLang infers the
+packed group size and Comfy scale layout from the checkpoint; FSDP is rejected.
+
 ### Advanced: precomputed AdaLN cache
 
 The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
@@ -942,6 +971,55 @@ fails closed if the native encoder does not support that format. The language
 linear layers use FP8 while embeddings, normalization, and the vision tower
 remain BF16. This is an approximate serve-time choice and is incompatible with
 the strict `quality="high"` deployment contract.
+
+The mixed W4A8 community encoder follows the same component-path contract:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
+```
+
+Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
+loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
+vision tower remains BF16.
+
+W4A4 Qwen3-VL files use the same overlay, for example:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Merserk/MiniMax-H3-INT4-ConvRot/qwen3vl_32b_minimax_h3_int4_convrot.safetensors
+```
+
+This checkpoint keeps its unmarked embedding and vision tower in their source
+precision; no explicit component quantization option is needed.
+
+The same component option accepts a self-describing Quanto qint8 file without
+an additional quantization flag:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors
+```
+
+This variant keeps the declared language and vision linear weights in qint8
+storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
+it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
+is the selector; adding `--quantization` would describe a different operation.
+
+Qwen3-VL GGUF files use the same component option:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf
+```
+
+The file selects its own Q4/Q6 layout; do not add `--quantization`. SGLang keeps
+the aligned vocabulary table and language linears in packed GGML storage. The
+smaller Comfy vision tower, whose flattened blocks can cross row and TP shard
+boundaries, is restored one matrix at a time to BF16 during loading.
+This CUDA-only memory option supports encoder TP and layerwise placement, but
+not encoder FSDP. Like the Quanto variant, it is approximate and is not a
+throughput claim.
 
 </Tab>
 
