@@ -2,6 +2,8 @@
 
 import unittest
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     unwrap_from_pickle,
@@ -43,6 +45,19 @@ class TestMultiTokenizerEmbeddingRepack(CustomTestCase):
         self.assertEqual(out.cached_tokens_details, [{"radix": 2}])
         self.assertEqual(unwrap_from_pickle(out.time_stats), ["stats-1"])
         self.assertEqual(out.pooled_hidden_states, [[2.0]])
+
+    def test_repack_unstacks_pooled_hidden_states(self):
+        # The scheduler's output streamer may pack pooled_hidden_states as a
+        # single stacked tensor ([tensor(N, ...)], len 1) when all requests
+        # share a shape; the repack must index into the tensor, not the list.
+        output = _batch_output()
+        stacked = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
+        output.pooled_hidden_states = [stacked]
+        out = _handle_output_by_index(output, 1)
+        self.assertEqual(len(out.pooled_hidden_states), 1)
+        self.assertTrue(
+            torch.equal(out.pooled_hidden_states[0], torch.tensor([2.0, 20.0]))
+        )
 
     def test_repack_handles_absent_optional_fields(self):
         output = _batch_output()

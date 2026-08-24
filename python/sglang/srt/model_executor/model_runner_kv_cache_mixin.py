@@ -1301,6 +1301,18 @@ class ModelRunnerKVCacheMixin:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
+                if self.server_args.gpu_id_step == 0:
+                    # Same-GPU DP relies on --max-total-tokens to give every
+                    # colocated worker an identical KV pool; falling back to
+                    # the profiled value would silently produce asymmetric
+                    # pools across DP workers.
+                    raise RuntimeError(
+                        f"gpu_id_step=0 (same-GPU DP) requires max_total_tokens="
+                        f"{user_limit} to fit on every colocated worker, but this "
+                        f"worker only profiled capacity for {token_capacity} tokens. "
+                        f"Reduce --max-total-tokens or --dp-size, or raise "
+                        f"--mem-fraction-static."
+                    )
                 logging.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."

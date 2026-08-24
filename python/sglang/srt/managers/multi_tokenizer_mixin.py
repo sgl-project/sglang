@@ -244,6 +244,14 @@ def _handle_output_by_index(output, i):
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
         )
     elif isinstance(output, BatchEmbeddingOutput):
+        # pooled_hidden_states uses two IPC formats (see output_streamer.py):
+        # stacked ([one tensor holding all N requests], len 1) or per-request
+        # (len == N). For the stacked format, index into the tensor's dim 0.
+        phs = output.pooled_hidden_states
+        if phs is not None and len(phs) == 1 and len(output.rids) > 1:
+            new_phs = [phs[0][i]]
+        else:
+            new_phs = _extract_field_by_index(output, "pooled_hidden_states", i)
         new_output = BatchEmbeddingOutput(
             rids=[output.rids[i]],
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -257,9 +265,7 @@ def _handle_output_by_index(output, i):
                 output, "cached_tokens_details", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
-            pooled_hidden_states=_extract_field_by_index(
-                output, "pooled_hidden_states", i, check_length=False
-            ),
+            pooled_hidden_states=new_phs,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
