@@ -22,6 +22,7 @@
 #include <bit>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 
 namespace sglang {
 
@@ -64,7 +65,7 @@ struct alignas(8) PlanItem {
 };
 static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) == sizeof(GlobalMetadata));
 
-struct TopKLaunchParams {
+struct TopKPagedParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
@@ -104,12 +105,22 @@ struct TopKLaunchParams {
   }
 };
 
+struct TopKRaggedParams {
+  float* __restrict__ scores;  // NOTE: may write
+  const int32_t* __restrict__ seq_lens;
+  const int32_t* __restrict__ row_starts;
+  const int32_t* __restrict__ out_offsets;
+  int32_t* __restrict__ topk_indices;
+  int64_t score_stride;
+  uint32_t topk;
+};
+
 /**
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
  */
 template <bool kPDL>
-CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
+CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
   const uint32_t num_cluster_items = params.global().num_cluster_items;
@@ -160,6 +171,85 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
 }
 
 /**
+ * \brief Ragged (prefill) top-k: select inside a per-row window, emit indices
+ * rebased onto the flattened KV.
+ *
+ * Row `b` selects the top-k of `scores[b][ks : ks + seq_lens[b]]` (`ks =
+ * row_starts[b]`) and writes `selected_position + out_offsets[b]`, `-1` padded.
+ * No page table and no plan: the DeepGEMM contiguous-KV indexer emits columns
+ * that are already absolute positions in the batch's flattened KV, so an add is
+ * the whole transform. One block per row -- prefill has thousands of rows, so
+ * the cluster path (which exists to split ONE row across blocks) is never worth
+ * it here.
+ *
+ * The window start is an arbitrary token offset, so the 16-byte vectorized load
+ * needs the row pointer rounded down to a 4-float boundary. The <= 3 elements
+ * that pulls in are columns of a preceding request -- real finite scores that
+ * would otherwise win the selection -- so they are masked in place first. That
+ * write races with nothing and needs no barrier of its own:
+ *   - one block owns the row, and a column of row `b` is read by no other row;
+ *   - the score buffer is dead once the top-k has run;
+ *   - every forward() below opens with its smem init and a `__syncthreads()`
+ *     before it reads any score. That barrier both publishes the mask to
+ *     whichever thread loads the head vector and keeps the compiler from
+ *     hoisting those loads above the store -- store and loads reach the same row
+ *     through two `__restrict__` pointers, which otherwise licenses exactly that
+ *     reordering.
+ * It must however land after the PDL wait, or the indexer overwrites it.
+ */
+template <bool kPDL>
+TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+  device::enable_smem_spilling();
+  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  const auto bx = blockIdx.x;
+  // issue all metadata prefetch ahead of time
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto offset = params.out_offsets[bx];
+  const auto row_start = params.row_starts == nullptr ? 0u : params.row_starts[bx];
+  const auto topk = params.topk;
+  const auto out = params.topk_indices + bx * static_cast<int64_t>(topk);
+
+  if (seq_len <= topk) {
+    device::PDLWaitPrimary<kPDL>();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) {
+      out[tx] = tx < seq_len ? static_cast<int32_t>(tx) + offset : -1;  // note: need offset
+    });
+    return;
+  }
+
+  const auto rem = row_start % kVecSize;
+  const auto score = params.scores + bx * params.score_stride;
+  if (rem != 0) {
+    // The mask has to land after the indexer has retired
+    // Otherwise it may be accidentally overwritten by DG upstream
+    device::PDLWaitPrimary<kPDL>();
+    static_assert(kVecSize <= kBlockSize, "not enough threads ");
+    if (const auto tx = threadIdx.x; tx < rem) {
+      score[row_start - rem + tx] = -std::numeric_limits<float>::max();
+    }
+  }
+
+  const auto problem = TopKProblem{
+      .in = score + (row_start - rem),
+      .out = out,
+      .page_table = nullptr,  // unused
+      .topk = topk,
+      .seq_len = seq_len + rem,
+      .page_bits = 1,  // unused
+      .bias = offset - static_cast<int32_t>(rem),
+  };
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  if (problem.seq_len <= Register2::kMaxSeqLen) {
+    Register2::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
+    Register4::forward<kPDL>(problem, &smem);
+  } else {
+    Streaming::forward<kPDL>(problem, &smem);
+  }
+  // PDL trigger secondary at the end the block typically has no use, so ignore it
+}
+
+/**
  * \brief Main kernel for the short items and epilogue of long items.
  * \tparam kPDL whether to use PDL to synchronize with the cluster kernel (if any)
  * \tparam kLevel:
@@ -169,7 +259,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
 template <bool kPDL, int kLevel, TopKMode kMode>
-TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
+TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
@@ -217,7 +307,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
 }
 
 template <bool kPDL, TopKMode kMode>
-CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
+CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
@@ -378,7 +468,7 @@ struct TopKKernel {
         static_cluster_threshold);
   }
 
-  static void transform(
+  static void transform_paged(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
@@ -444,7 +534,7 @@ struct TopKKernel {
     // The floor is chosen on the host per launch.
     constexpr uint32_t kClusterFloorSmall = 32768;
     constexpr uint32_t kSmallBatchLowFloor = 15;
-    const auto params = TopKLaunchParams{
+    const auto params = TopKPagedParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
@@ -497,6 +587,78 @@ struct TopKKernel {
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode>, params);
       }
     });
+  }
+
+  /**
+   * \brief Ragged (prefill) variant of `transform`: per-row window, additive
+   * output transform, no page table and no plan.
+   *
+   * `scores` is written in place: the <= 3 columns the 16-byte-aligned read base
+   * pulls in ahead of each row's window are masked out (see
+   * `topk_ragged_kernel`). They are invalid for that row, and the buffer has no
+   * consumer after this call.
+   *
+   * `row_starts` absent means every window starts at column 0, which is the
+   * single-request case; `out_offsets` is added to every selected position and
+   * is what rebases them onto the flattened KV.
+   */
+  static void transform_ragged(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
+      const tvm::ffi::TensorView out_offsets,
+      const tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({B})  // out_offsets
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out_offsets);
+    TensorMatcher({B, K})  // topk_indices
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(topk_indices);
+    const int32_t* row_starts_ptr = nullptr;
+    if (row_starts.has_value()) {
+      TensorMatcher({B})  // row_starts
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(row_starts.value());
+      row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
+    }
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+
+    constexpr bool kUsePDL = true;
+    const auto params = TopKRaggedParams{
+        .scores = static_cast<float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .row_starts = row_starts_ptr,
+        .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+        .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+        .score_stride = S.unwrap(),
+        .topk = topk,
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_ragged_kernel<kUsePDL>, params);
   }
 };
 

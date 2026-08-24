@@ -610,6 +610,46 @@ class PerformanceValidator:
             unit=" MiB",
         )
 
+    def validate_peak_host_anon(
+        self,
+        summary: PerformanceSummary,
+        expected_load_mb: float | None,
+        expected_runtime_mb: float | None,
+    ) -> None:
+        """Anonymous-host budget: peaks must stay at or under the baseline.
+
+        Skipped wholesale when the baseline carries no host figures (older
+        scenarios) or the record has none (non-Linux, or a server predating
+        the sampler) -- the VRAM checks do not imply anything about the host,
+        as the LoRA-merge blow-up showed: VRAM green, host budget gone.
+        """
+        if expected_load_mb is None and expected_runtime_mb is None:
+            return
+        if summary.runtime_peak_host_anon_mb <= 0:
+            logger.warning(
+                "Host-anon baseline present but the record has no host peaks; "
+                "skipping the host budget check"
+            )
+            return
+        if expected_load_mb is not None:
+            self._assert_le(
+                "Load Peak Host Anon",
+                summary.load_peak_host_anon_mb,
+                expected_load_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
+        if expected_runtime_mb is not None:
+            self._assert_le(
+                "Runtime Peak Host Anon",
+                summary.runtime_peak_host_anon_mb,
+                expected_runtime_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
+
     def validate(
         self, perf_record: RequestPerfRecord, *args, **kwargs
     ) -> PerformanceSummary:

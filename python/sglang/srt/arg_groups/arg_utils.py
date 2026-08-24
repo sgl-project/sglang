@@ -120,6 +120,14 @@ def namespace_of(cls) -> dict:
 
 
 @functools.lru_cache(maxsize=None)
+def field_names(cls) -> frozenset:
+    """Names of ``cls`` dataclass fields — what a declaration may name."""
+    if not dataclasses.is_dataclass(cls):
+        return frozenset()
+    return frozenset(field.name for field in dataclasses.fields(cls))
+
+
+@functools.lru_cache(maxsize=None)
 def resolvable_fields(cls) -> frozenset:
     """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
     ``resolvable=True`` — the whitelist for config resolution.
