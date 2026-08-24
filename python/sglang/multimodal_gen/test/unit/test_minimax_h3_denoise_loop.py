@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
     _build_cube_attn_metadata,
+    _precompute_refined_prompt_embeds,
 )
 
 
@@ -333,3 +334,30 @@ def test_native_dit_forward_publishes_cube_metadata_in_forward_context():
         )
     assert video.shape == (1, 96)
     assert audio.shape == (1, 32)
+
+
+def test_grouped_outputs_share_prompt_refinement():
+    class Refiner:
+        calls = 0
+
+        def refine_prompt_embeds(self, prompt_embeds, refiner_cu, *, device):
+            del refiner_cu
+            self.calls += 1
+            return torch.ones(
+                prompt_embeds.shape[0], 5376, dtype=prompt_embeds.dtype, device=device
+            )
+
+    model = Refiner()
+    conditioning = {}
+    first, second = _branch("t2va"), _branch("t2va")
+
+    for branch in (first, second):
+        assert _precompute_refined_prompt_embeds(
+            model,
+            branch,
+            device=torch.device("cpu"),
+            shared_conditioning=conditioning,
+        )
+
+    assert model.calls == 1
+    assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]
