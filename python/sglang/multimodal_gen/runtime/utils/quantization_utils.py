@@ -288,6 +288,8 @@ def resolve_comfy_checkpoint_quantization(
         return KitchenW4A8Config(layer_markers)
     if formats == ["convrot_w4a4"]:
         return KitchenW4A4Config(layer_markers)
+    if formats == ["convrot_w4a4", "int8_tensorwise"]:
+        return KitchenW4A4Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
     if formats == ["mxfp8"]:
