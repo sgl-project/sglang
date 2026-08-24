@@ -96,7 +96,7 @@ jobs:
             DEVICE_TYPE=${{ matrix.device_type }}
             SGLANG_TAG=${{ steps.version.outputs.version }}
 
-  # add 950/a3，CANN 9.1.0，用 npu-950.Dockerfile
+  # add 950/a3，CANN 9.1.0，npu-950.Dockerfile
   build-950-a3:
     runs-on: ubuntu-22.04-arm
     strategy:
