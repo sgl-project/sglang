@@ -1394,7 +1394,12 @@ Under that cap, Recipe A wins the whole request at every host size:
 | 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
 | 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
 
-Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
+figures are anchored at 480P — activations grow with the pixel count, so at
+768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
+decode still collides. And the host convention holds the weights in page
+cache; a physical 32 GB machine re-reads them from disk each step (a real
+desktop 4090 measured ~38 s/step at 480P from NVMe). The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
 and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
 22 GiB cap so a desktop's own allocations fit; a headless card can raise it

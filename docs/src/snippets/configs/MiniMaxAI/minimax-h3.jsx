@@ -134,6 +134,8 @@ function consumerHints(s) {
     hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
   }
   hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
+  hints.push("every figure here is anchored at 480P: activations grow with the pixel count, so at 768P drop the resident DiT layers to 0 first, then video_vae to 24 if the decode still collides -- the flags trade speed for headroom in that order");
+  hints.push("on a physical 32 GB host the 108 GB checkpoint cannot stay cached: expect the stream to re-read from disk (a real desktop 4090 measured ~38 s/step at 480P on NVMe, warming from ~46) -- the quoted step times assume the page cache holds the weights");
   return hints;
 }
 
