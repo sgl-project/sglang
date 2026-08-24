@@ -1062,6 +1062,14 @@ class SchedulerBatchResultProcessor:
         output: LogitsProcessorOutput,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
+        if output.sampling_mask_output is not None:
+            (
+                output.next_token_sampling_mask_idx,
+                output.next_token_sampling_logprobs,
+            ) = output.sampling_mask_output.materialize()
+            output.next_token_sampling_mask_len = None
+            output.sampling_mask_output = None
+
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
         req.output_token_sampling_mask.append(None if mask is None else mask[i])

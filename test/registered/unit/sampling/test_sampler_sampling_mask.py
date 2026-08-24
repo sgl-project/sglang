@@ -41,6 +41,10 @@ class TestSamplingMaskCapture(CustomTestCase):
             torch.tensor(sampled_tokens, device=weights.device),
             _SamplingMaskCapture(weights, token_ids, selected_weight),
         )
+        (
+            output.next_token_sampling_mask_idx,
+            output.next_token_sampling_logprobs,
+        ) = output.sampling_mask_output.materialize()
         return output
 
     def test_strict_positive_support_and_exact_selected_logprob(self):
@@ -85,6 +89,10 @@ class TestSamplingMaskCapture(CustomTestCase):
                 selected_weight=None,
             ),
         )
+        (
+            output.next_token_sampling_mask_idx,
+            output.next_token_sampling_logprobs,
+        ) = output.sampling_mask_output.materialize()
 
         self.assertEqual(set(output.next_token_sampling_mask_idx[0]), {0, 1})
         self.assertIsNone(output.next_token_sampling_mask_idx[1])
@@ -97,6 +105,10 @@ class TestSamplingMaskCapture(CustomTestCase):
             SimpleNamespace(return_sampling_masks=[True, False, True]),
             torch.tensor([4, 5, 6], device="cuda"),
         )
+        (
+            output.next_token_sampling_mask_idx,
+            output.next_token_sampling_logprobs,
+        ) = output.sampling_mask_output.materialize()
 
         self.assertEqual(output.next_token_sampling_mask_idx, [[4], None, [6]])
         self.assertEqual(output.next_token_sampling_logprobs, [0.0, None, 0.0])
@@ -218,6 +230,10 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.assertEqual(set(support), {0, 1, 2, 3})
         self.assertGreater(len(support), 2)
         self.assertIn(int(sampled[0]), support)
+        output = self._attach(
+            capture.weights, sampled.tolist(), selected_weight=capture.selected_weight
+        )
+        self.assertEqual(set(output.next_token_sampling_mask_idx[0]), {0, 1, 2, 3})
 
     def test_capture_off_returns_no_data(self):
         probs = torch.tensor([[0.40, 0.30, 0.20, 0.10]], device="cuda")

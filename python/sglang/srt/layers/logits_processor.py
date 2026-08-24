@@ -95,6 +95,83 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
 
 
 @dataclasses.dataclass
+class SamplingMaskOutput:
+    """Tensor-backed sampling support for rows that requested it."""
+
+    batch_indices: torch.Tensor
+    batch_size: torch.Tensor
+    token_ids: Optional[torch.Tensor]
+    support_bits: Optional[torch.Tensor]
+    lengths: torch.Tensor
+    selected_logprobs: torch.Tensor
+    valid: torch.Tensor
+
+    def map_device_tensors(self, fn) -> None:
+        self.batch_indices = fn(self.batch_indices)
+        self.batch_size = fn(self.batch_size)
+        if self.token_ids is not None:
+            self.token_ids = fn(self.token_ids)
+        if self.support_bits is not None:
+            self.support_bits = fn(self.support_bits)
+        self.lengths = fn(self.lengths)
+        self.selected_logprobs = fn(self.selected_logprobs)
+        self.valid = fn(self.valid)
+
+    def materialize(self) -> Tuple[List[Optional[List[int]]], List[Optional[float]]]:
+        """Convert copied tensors into batch-aligned Python values."""
+        batch_indices = self.batch_indices.cpu().tolist()
+        valid = self.valid.cpu().tolist()
+        invalid_rows = [
+            batch_row
+            for batch_row, is_valid in zip(batch_indices, valid)
+            if not is_valid
+        ]
+        if invalid_rows:
+            raise RuntimeError(
+                "Sampled token is outside captured positive sampling support "
+                f"for batch rows {invalid_rows}."
+            )
+
+        lengths = self.lengths.cpu().tolist()
+        selected_logprobs = self.selected_logprobs.cpu().tolist()
+        batch_size = int(self.batch_size.cpu().item())
+        masks: List[Optional[List[int]]] = [None] * batch_size
+        logprobs: List[Optional[float]] = [None] * batch_size
+
+        if self.support_bits is not None:
+            support_bits = self.support_bits.cpu().tolist()
+            row_token_ids = []
+            for row_bytes, length in zip(support_bits, lengths):
+                token_ids = []
+                for byte_index, byte_value in enumerate(row_bytes):
+                    while byte_value:
+                        bit_index = (byte_value & -byte_value).bit_length() - 1
+                        token_ids.append(byte_index * 8 + bit_index)
+                        byte_value &= byte_value - 1
+                if len(token_ids) != length:
+                    raise RuntimeError(
+                        "Captured sampling support length does not match its bitset."
+                    )
+                row_token_ids.append(token_ids)
+        else:
+            assert self.token_ids is not None
+            token_ids = self.token_ids.cpu()
+            packed_width = token_ids.shape[1]
+            row_token_ids = []
+            for row, length in enumerate(lengths):
+                if not 0 <= length <= packed_width:
+                    raise RuntimeError(
+                        "Captured sampling support exceeds its packed token storage."
+                    )
+                row_token_ids.append(token_ids[row, :length].tolist())
+
+        for row, batch_index in enumerate(batch_indices):
+            masks[batch_index] = row_token_ids[row]
+            logprobs[batch_index] = float(selected_logprobs[row])
+        return masks, logprobs
+
+
+@dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
@@ -116,10 +193,18 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Sparse top-k/top-p/min-p support ids and selected-token logprob after
-    # truncation/renormalization. Only populated when requested.
-    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    # Sparse top-k/top-p/min-p support and selected-token logprob after
+    # truncation/renormalization. SamplingMaskOutput stays tensor-backed until
+    # the scheduler processes the completed result. The legacy fields hold the
+    # final batch-aligned values after materialization.
+    sampling_mask_output: Optional[SamplingMaskOutput] = None
+    next_token_sampling_mask_idx: Optional[
+        Union[torch.Tensor, List[Optional[List[int]]]]
+    ] = None
+    next_token_sampling_mask_len: Optional[torch.Tensor] = None
+    next_token_sampling_logprobs: Optional[
+        Union[torch.Tensor, List[Optional[float]]]
+    ] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
