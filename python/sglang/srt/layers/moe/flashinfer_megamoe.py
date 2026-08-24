@@ -89,8 +89,8 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
     capturing. Replace the helper only around the mega forward that runs during
     capture, then restore the exact upstream function.
 
-    TODO(flashinfer/deep_gemm): remove once upstream gates these asserts behind a
-    debug env or moves them off the capture path.
+    TODO(deepseek-ai/DeepGEMM#414): remove once upstream provides a capture-safe
+    helper: https://github.com/deepseek-ai/DeepGEMM/issues/414
     """
     if not torch.cuda.is_available() or not torch.cuda.is_current_stream_capturing():
         yield

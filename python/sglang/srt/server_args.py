@@ -286,6 +286,26 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer_megamoe",
 ]
 
+# FlashInfer MegaMOE performs the routed-expert all-to-all and combine inside
+# the kernel, so SGLang skips the normal post-experts all-reduce. Keep this
+# startup gate intentionally narrow until each model's shared-expert sharding
+# has been audited for that contract.
+FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "Qwen2MoeForCausalLM",
+        # Qwen3 MoE has no separate shared-expert branch and is part of the
+        # original FlashInfer MegaMOE integration.
+        "Qwen3MoeForCausalLM",
+    }
+)
+
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
@@ -6990,6 +7010,18 @@ class ServerArgs:
                 "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
             )
 
+    def _validate_flashinfer_megamoe_model(self):
+        architectures = self.get_model_config().hf_config.architectures or []
+        if not any(
+            architecture in FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES
+            for architecture in architectures
+        ):
+            raise ValueError(
+                "FlashInfer MegaMOE is not validated for model architectures "
+                f"{architectures}. Supported architectures: "
+                f"{sorted(FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES)}."
+            )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -7025,6 +7057,7 @@ class ServerArgs:
             )
 
         if a2a_backend == "flashinfer_megamoe":
+            self._validate_flashinfer_megamoe_model()
             self._validate_flashinfer_megamoe_envs()
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
