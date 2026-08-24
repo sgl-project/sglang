@@ -66,6 +66,7 @@ def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
 
     with (
         patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch("torch.distributed.all_reduce") as all_reduce,
     ):
         manager._profile_batch_predicate(
@@ -79,6 +80,7 @@ def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
         )
 
     start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
     assert all_reduce.call_count == 2
     assert manager.profiler_target_forward_ct == 207
 
@@ -117,6 +119,7 @@ def test_nsys_exact_running_batch_waits_for_every_dp_rank():
     peer_readiness.calls = 0
     with (
         patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch("torch.distributed.all_reduce", side_effect=peer_readiness),
     ):
         manager._profile_batch_predicate(batch)
@@ -124,6 +127,7 @@ def test_nsys_exact_running_batch_waits_for_every_dp_rank():
         manager._profile_batch_predicate(batch)
 
     start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
     assert all(
         call.kwargs["group"] is exact_nsys_group for call in all_reduce.call_args_list
     )
@@ -147,6 +151,7 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
     idle_mode = SimpleNamespace(is_decode=lambda: False)
     with (
         patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch.object(manager, "_stop_profile") as stop_profile,
         patch("torch.distributed.all_reduce"),
         patch("torch.distributed.barrier") as barrier,
@@ -181,9 +186,11 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
         )
 
     start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
     stop_profile.assert_called_once_with()
-    # One post-start barrier plus the pre/post-stop pair.
-    assert barrier.call_count == 3
+    # The rank-0 filesystem latch replaces the deadlocking post-start barrier;
+    # the existing pre/post-stop pair remains.
+    assert barrier.call_count == 2
 
 
 def test_nsys_exact_capture_fails_closed_if_batch_shape_changes():
@@ -228,6 +235,7 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
 
     with (
         patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch.object(manager, "_stop_profile") as stop_profile,
         patch("torch.distributed.all_reduce", side_effect=mark_any_rank_ready) as reduce,
         patch("torch.distributed.barrier") as barrier,
@@ -259,5 +267,24 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
         )
 
     start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
     stop_profile.assert_called_once_with()
-    assert barrier.call_count == 3
+    assert barrier.call_count == 2
+
+
+def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
+    manager = SchedulerProfilerManager(
+        ps=SimpleNamespace(gpu_id=0),
+        dp_tp_cpu_group=MagicMock(),
+        get_forward_ct=lambda: 0,
+    )
+    manager.torch_profiler_output_dir = tmp_path
+    manager.profile_id = "worker-specific-profile"
+
+    with patch(
+        "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+        return_value=SimpleNamespace(base_gpu_id=0),
+    ):
+        manager._wait_for_nsys_capture_start()
+
+    assert (tmp_path / ".nsys-capture-ready-worker-specific-profile").is_file()
