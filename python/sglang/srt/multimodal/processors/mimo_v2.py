@@ -5,6 +5,7 @@ import base64
 import copy
 import json
 import math
+import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,6 @@ from io import BytesIO
 from typing import List, Literal, Optional, Union
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
@@ -39,7 +39,9 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     MiMoAudioPipeline,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.common import download_remote_media
 from sglang.utils import logger
 
 
@@ -485,12 +487,14 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
-        # In-process probe via torchcodec for bytes/path; ffprobe range
-        # request for HTTP URLs so we do not pre-download the blob here.
+        # Never hand a client-supplied URL to ffprobe: its internal HTTP client
+        # would bypass the shared domain and redirect policy. Resolve it through
+        # the guarded downloader first, then probe the resulting bytes in-process.
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            return _ffprobe_has_audio(path_or_data, stdin=None, label=path_or_data)
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):
             source = BytesIO(path_or_data)
@@ -1017,7 +1021,7 @@ class MiMoProcessor:
                     "num_video_tokens": num_media_tokens_per_grid,
                     "segment_audio_token_len": segment_audio_token_len,
                     "segment_audio": segment_audio,
-                    # Used by encode_server to trim audio_encoder output.
+                    # Used by encoder.server to trim audio_encoder output.
                     "audio_start_token_idx": audio_start_token_idx,
                 }
             )
@@ -1446,10 +1450,8 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with requests.get(image, stream=True) as response:
-                    response.raise_for_status()
-                    with BytesIO(response.content) as bio:
-                        image_obj = copy.deepcopy(Image.open(bio))
+                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
                 image_obj = Image.open(image[7:])
             elif image.startswith("data:image"):
@@ -1587,7 +1589,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             processor_config, "video_end_token_id"
         )
         self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
-        device = server_args.device if self.use_image_processor_gpu else None
+        device = get_device().device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoProcessor(
             tokenizer=self._processor.tokenizer,
