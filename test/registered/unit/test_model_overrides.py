@@ -1816,6 +1816,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        # ROCm has no flashinfer at all, so mxfp8 MoE resolves to Triton on both
+        # AMD paths (gfx950 native MX, gfx942 block-fp8 after the load-time
+        # convert), and an explicit flashinfer backend is overridden back to it.
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+                {"moe_runner_backend": "triton"},
+            )
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="mxfp8", moe_runner_backend="flashinfer_trtllm")
+                ),
+                {"moe_runner_backend": "triton"},
+            )
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="mxfp8", moe_runner_backend="triton")
+                ),
+                {},
+            )
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
