@@ -29,6 +29,10 @@ import msgspec
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
+from .mooncake_weight_adapter import (
+    build_mooncake_weight_manifests,
+    immutable_weight_allocation_guards,
+)
 from .weight_runtime_manifest import (
     WeightParallelTopology,
     create_weight_runtime_manifest_builder,
@@ -518,9 +522,8 @@ def _initialize_weight_transfer_engine():
 class WeightsManifestState:
     transfer_engine: Any
     runtime_inventory: Any
-    runtime_manifest: Any
+    parallel_layout: WeightParallelLayout
     registered_memory_ranges: tuple[tuple[int, int], ...]
-    fragment_registrations: tuple[Any, ...]
     source_content_checksums: tuple[dict[str, Any], ...]
 
     @classmethod
@@ -538,16 +541,6 @@ class WeightsManifestState:
         revision: str,
         is_source_daemon: bool,
     ) -> WeightsManifestState:
-        try:
-            from mooncake.weight_transfer import (
-                MemoryRegistrationLease,
-                RuntimeManifest,
-            )
-        except ImportError as error:
-            raise WeightHeterogeneousTransferError(
-                "mooncake.weight_transfer is unavailable in this environment"
-            ) from error
-
         transfer_engine, transfer_endpoint = _initialize_weight_transfer_engine()
         registered_memory_ranges: list[tuple[int, int]] = []
         try:
@@ -564,27 +557,21 @@ class WeightsManifestState:
                 model_id=model_identity_from_config(model_config.hf_config),
                 revision=revision,
             )
-            runtime_manifest = RuntimeManifest.from_runtime_inventory(runtime_inventory)
             registered_memory_ranges.extend(
                 _register_weight_fragment_allocations(
                     transfer_engine,
-                    runtime_manifest.fragments,
-                )
-            )
-            fragment_registrations = (
-                ()
-                if is_source_daemon
-                else tuple(
-                    MemoryRegistrationLease.from_fragment(fragment)
-                    for fragment in runtime_manifest.fragments
+                    runtime_inventory.tensors,
                 )
             )
             return cls(
                 transfer_engine=transfer_engine,
                 runtime_inventory=runtime_inventory,
-                runtime_manifest=runtime_manifest,
+                parallel_layout=WeightParallelLayout(
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    ep_size=ep_size,
+                ),
                 registered_memory_ranges=tuple(registered_memory_ranges),
-                fragment_registrations=fragment_registrations,
                 source_content_checksums=(
                     _compute_weight_content_checksums(model, runtime_inventory)
                     if is_source_daemon
@@ -809,48 +796,73 @@ def pull_weights_from_source(
     *,
     target_manifest_state: WeightsManifestState,
     source_runtime_inventories: Sequence[Any],
+    source_parallel_layout: WeightParallelLayout,
+    target_runtime_inventories: Sequence[Any],
 ) -> dict[str, int]:
     try:
-        from mooncake.weight_transfer import (
+        from mooncake.reshard.weight import (
             MemoryRegistrationLease,
             MooncakeTransferEngineReader,
-            RuntimeManifest,
-            plan_runtime_transfer_to_local_target,
+            bind_logical_transfer_plan,
+            plan_placement_transfer_to_local_target,
         )
     except ImportError as error:
         raise WeightHeterogeneousTransferError(
-            "mooncake.weight_transfer is unavailable in this environment"
+            "mooncake.reshard.weight is unavailable in this environment"
         ) from error
 
-    source_manifests = tuple(
-        RuntimeManifest.from_runtime_inventory(runtime_inventory)
-        for runtime_inventory in source_runtime_inventories
+    source_placement, source_bindings = build_mooncake_weight_manifests(
+        source_runtime_inventories,
+        placement_set_id="weight-cache-source",
+        tp_size=source_parallel_layout.tp_size,
+        pp_size=source_parallel_layout.pp_size,
+        ep_size=source_parallel_layout.ep_size,
     )
-    if not source_manifests:
-        raise WeightHeterogeneousTransferError("source manifest set is empty")
-    for source_manifest in source_manifests:
-        if (
-            source_manifest.model_id != target_manifest_state.runtime_manifest.model_id
-            or source_manifest.revision
-            != target_manifest_state.runtime_manifest.revision
-        ):
-            raise WeightHeterogeneousTransferError(
-                "source and target manifest model identity differs: "
-                f"source={source_manifest.model_id}@{source_manifest.revision}, "
-                f"target={target_manifest_state.runtime_manifest.model_id}@"
-                f"{target_manifest_state.runtime_manifest.revision}"
-            )
+    target_placement, target_bindings = build_mooncake_weight_manifests(
+        target_runtime_inventories,
+        placement_set_id="weight-cache-target",
+        tp_size=target_manifest_state.parallel_layout.tp_size,
+        pp_size=target_manifest_state.parallel_layout.pp_size,
+        ep_size=target_manifest_state.parallel_layout.ep_size,
+    )
+    target_instance_id = target_manifest_state.runtime_inventory.instance_id
+    try:
+        target_binding = next(
+            binding
+            for binding in target_bindings
+            if binding.instance_id == target_instance_id
+        )
+    except StopIteration as error:
+        raise WeightHeterogeneousTransferError(
+            f"local target binding is missing: {target_instance_id}"
+        ) from error
 
     source_fragment_registrations = tuple(
         MemoryRegistrationLease.from_fragment(
             fragment,
+            lease_generation=binding.generation,
+            runtime_lease_id=binding.lease_id,
         )
-        for source_manifest in source_manifests
-        for fragment in source_manifest.fragments
+        for binding in source_bindings
+        for fragment in binding.fragments
     )
-    transfer_plan = plan_runtime_transfer_to_local_target(
-        source_manifests,
-        target_manifest_state.runtime_manifest,
+    target_fragment_registrations = tuple(
+        MemoryRegistrationLease.from_fragment(
+            fragment,
+            lease_generation=target_binding.generation,
+            runtime_lease_id=target_binding.lease_id,
+        )
+        for fragment in target_binding.fragments
+    )
+    logical_plan = plan_placement_transfer_to_local_target(
+        source_placement,
+        target_placement,
+        target_participant_id=target_binding.participant_id,
+    )
+    transfer_plan = bind_logical_transfer_plan(
+        logical_plan,
+        (target_binding,),
+        source_bindings=source_bindings,
     )
     if transfer_plan.total_bytes <= 0 or not transfer_plan.operations:
         raise WeightHeterogeneousTransferError(
@@ -863,12 +875,16 @@ def pull_weights_from_source(
     )
     transfer_receipts = transfer_reader.execute(
         transfer_plan,
-        source_manifests,
-        target_manifest_state.runtime_manifest,
+        source_placement,
+        source_bindings,
+        target_placement,
+        target_binding,
         source_pre_registered=True,
         source_registrations=source_fragment_registrations,
         target_pre_registered=True,
-        target_registrations=target_manifest_state.fragment_registrations,
+        target_registrations=target_fragment_registrations,
+        source_allocation_guards=immutable_weight_allocation_guards(source_bindings),
+        target_allocation_guards=immutable_weight_allocation_guards((target_binding,)),
     )
     wire_bytes = sum(receipt.nbytes for receipt in transfer_receipts)
     wire_operations = sum(receipt.operation_count for receipt in transfer_receipts)
@@ -889,7 +905,7 @@ def pull_weights_from_source(
         "logical_bytes": int(transfer_plan.total_bytes),
         "wire_bytes": int(wire_bytes),
         "wire_operations": int(wire_operations),
-        "source_ranks": len(source_manifests),
+        "source_ranks": len(source_bindings),
     }
 
 
@@ -944,9 +960,16 @@ def transfer_weights_from_source_daemons(
                 f"overlapping ranks: {overlap}"
             )
 
+    target_runtime_inventories: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        target_runtime_inventories,
+        target_manifest_state.runtime_inventory_for_wire(),
+    )
     transfer_stats = pull_weights_from_source(
         target_manifest_state=target_manifest_state,
         source_runtime_inventories=source_weights_manifest.runtime_inventories,
+        source_parallel_layout=source_weights_manifest.parallel_layout,
+        target_runtime_inventories=target_runtime_inventories,
     )
     rebuild_transferred_weight_state(model)
     transfer_stats.update(

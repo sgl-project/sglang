@@ -10,6 +10,9 @@ import torch
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_enable_ipc_weight_cache,
 )
+from sglang.srt.weight_cache.mooncake_weight_adapter import (
+    build_mooncake_weight_manifests,
+)
 from sglang.srt.weight_cache.weight_runtime_manifest import (
     IMMUTABLE_WEIGHT_GENERATION,
     ImmutableWeightRuntimeManifestBuilder,
@@ -95,7 +98,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             "10.0.0.8", "P2PHANDSHAKE", "rdma", "mlx5_0"
         )
 
-    def test_daemon_manifest_is_immutable_without_application_lease(self):
+    def test_daemon_manifest_adapts_to_immutable_runtime_binding(self):
         class FullTensorAdapter:
             @staticmethod
             def describe_parameter(*, names, parameter, topology):
@@ -131,9 +134,16 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         self.assertEqual(manifest.generation, IMMUTABLE_WEIGHT_GENERATION)
         self.assertFalse(hasattr(manifest, "lease_id"))
-        from mooncake.weight_transfer import RuntimeManifest
-
-        self.assertIsNone(RuntimeManifest.from_runtime_inventory(manifest).lease_id)
+        placement, bindings = build_mooncake_weight_manifests(
+            (manifest,),
+            placement_set_id="test",
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+        )
+        self.assertEqual(bindings[0].generation, IMMUTABLE_WEIGHT_GENERATION)
+        self.assertEqual(bindings[0].placement_id, placement.placement_id)
+        self.assertEqual(bindings[0].lease_id, "immutable:worker")
 
     def test_active_moe_runner_backend_overrides_auto_config(self):
         backend = SimpleNamespace(value="triton")

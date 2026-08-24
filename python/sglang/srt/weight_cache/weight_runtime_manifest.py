@@ -7,10 +7,9 @@ from typing import Any, Protocol, Sequence
 
 import msgspec
 
-# Mooncake's runtime-manifest schema requires a generation on the manifest and
-# each fragment. Weight-cache daemon tensors are immutable after publication,
-# so they always belong to this single generation; there is no application-level
-# lease lifecycle to acquire, renew, expire, or release.
+# Mooncake's placement and runtime-binding contracts require a weight generation.
+# Weight-cache daemon tensors are immutable after publication, so they always
+# belong to this single generation.
 IMMUTABLE_WEIGHT_GENERATION = 0
 
 
@@ -87,13 +86,11 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     fragment_id: str
     tensor_id: str
     runtime_name: str
-    aliases: tuple[str, ...]
     global_shape: tuple[int, ...]
     global_offset: tuple[int, ...]
     local_shape: tuple[int, ...]
     dtype: str
     itemsize: int
-    partition_dim: int | None
     shard_dims: tuple[int, ...]
     layer_id: int | None
     expert_id: int | None
@@ -104,11 +101,9 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     stride: tuple[int, ...]
     storage_offset: int
     device: str
-    is_contiguous: bool
     worker_id: str
     endpoint: str
     rank: WeightParallelRank
-    lease_generation: int
 
 
 class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
@@ -117,7 +112,6 @@ class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     instance_id: str
     generation: int
     tensors: tuple[RuntimeWeightTensor, ...]
-    format_version: int = 2
 
 
 class WeightSemanticsAdapter(Protocol):
@@ -430,13 +424,11 @@ class ImmutableWeightRuntimeManifestBuilder:
                         ),
                         tensor_id=view.tensor_id,
                         runtime_name=item.names[0],
-                        aliases=item.names,
                         global_shape=view.global_shape,
                         global_offset=view.global_offset,
                         local_shape=view.local_shape,
                         dtype=item.dtype,
                         itemsize=item.itemsize,
-                        partition_dim=view.partition_dim,
                         shard_dims=_view_shard_dims(view),
                         layer_id=view.layer_id,
                         expert_id=view.expert_id,
@@ -449,11 +441,9 @@ class ImmutableWeightRuntimeManifestBuilder:
                             item.storage_offset + view.byte_offset // item.itemsize
                         ),
                         device=item.device,
-                        is_contiguous=True,
                         worker_id=worker_id,
                         endpoint=endpoint,
                         rank=rank,
-                        lease_generation=IMMUTABLE_WEIGHT_GENERATION,
                     )
                 )
         return tuple(
