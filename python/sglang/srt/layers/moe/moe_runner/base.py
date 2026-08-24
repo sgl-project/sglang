@@ -61,6 +61,9 @@ class MoeRunnerConfig:
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
+    # Last successfully built runner; StandardDispatcher uses it to narrow
+    # the expert-ID namespace inferred from the configured backend.
+    runner_backend: Optional[MoeRunnerBackend] = None
     use_tp_all_gather_activation: bool = False
 
 

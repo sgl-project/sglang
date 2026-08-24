@@ -97,9 +97,15 @@ class StandardDispatcher(BaseDispatcher):
         self.use_aiter_moe_runner = backend.is_aiter() or (
             backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
         )
+        # Quantization may build a non-AITER runner despite configured auto/AITER.
+        # Only narrow the inference: local-ID kernels cannot accept global expert IDs.
+        recorded_backend = moe_runner_config.runner_backend
+        if recorded_backend is not None and not recorded_backend.is_aiter():
+            self.use_aiter_moe_runner = False
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
+        # Keep this configured-backend behavior until the mirror case is tested.
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
