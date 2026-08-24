@@ -269,17 +269,33 @@ def _strip(text: str, reasoning_separated: bool = True) -> str:
 def test_stripped_spans_reconstruct_cleaned_text() -> None:
     detector = KimiK3Detector()
     cases = [
-        ("plain response", False),
-        (f"{RESPONSE_OPEN}visible{RESPONSE_CLOSE}{MESSAGE_CLOSE}", False),
-        (f"{THINK_OPEN}secret{THINK_CLOSE}visible", True),
-        (f"visible{LEAKED_TOOLS_SECTION}", False),
-        ("   ", False),
+        ("plain response", False, "plain response"),
+        (f"{RESPONSE_OPEN}visible{RESPONSE_CLOSE}{MESSAGE_CLOSE}", False, "visible"),
+        (f"{THINK_OPEN}secret{THINK_CLOSE}visible", True, "visible"),
+        (f"visible{LEAKED_TOOLS_SECTION}", False, "visible"),
+        ("   ", False, "   "),
     ]
-    for original, reasoning_separated in cases:
+    for original, reasoning_separated, expected in cases:
         cleaned, kept_spans = detector.strip_template_artifacts_spans(
             original, reasoning_separated
         )
+        assert cleaned == expected
         assert "".join(original[start:end] for start, end in kept_spans) == cleaned
+
+
+def test_strip_template_artifacts_whitespace_behavior() -> None:
+    detector = KimiK3Detector()
+
+    cleaned, kept_spans = detector.strip_template_artifacts_spans("   ")
+    assert cleaned == "   "
+    assert kept_spans == [(0, 3)]
+    assert detector.strip_template_artifacts("   ") == "   "
+
+    marker_only = f"{RESPONSE_OPEN}   {RESPONSE_CLOSE}"
+    cleaned, kept_spans = detector.strip_template_artifacts_spans(marker_only)
+    assert cleaned == ""
+    assert kept_spans == []
+    assert detector.strip_template_artifacts(marker_only) == ""
 
 
 def test_strip_response_wrappers_preserves_whitespace() -> None:

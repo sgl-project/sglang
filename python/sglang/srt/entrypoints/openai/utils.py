@@ -88,6 +88,10 @@ def align_token_logprobs_to_text(
     full_parts = []
     for entry in entries:
         if entry.token is None:
+            logger.debug(
+                "Dropping logprobs because sanitized text could not be realigned: "
+                "token stream contains a None token"
+            )
             return None
         full_parts.append(entry.token)
     full = "".join(full_parts)
@@ -96,6 +100,10 @@ def align_token_logprobs_to_text(
     elif strip_input and full.endswith(strip_input):
         offset = len(full) - len(strip_input)
     else:
+        logger.debug(
+            "Dropping logprobs because sanitized text could not be realigned: "
+            "token stream failed the positional anchor check"
+        )
         return None
 
     aligned: List[_TokenLogprobT] = []
@@ -115,7 +123,13 @@ def align_token_logprobs_to_text(
         ):
             aligned.append(entry)
         cursor = end
-    return aligned if "".join(entry.token for entry in aligned) == cleaned else None
+    if "".join(entry.token for entry in aligned) != cleaned:
+        logger.debug(
+            "Dropping logprobs because sanitized text could not be realigned: "
+            "retained tokens failed the reconstruction check"
+        )
+        return None
+    return aligned
 
 
 def process_hidden_states_from_ret(

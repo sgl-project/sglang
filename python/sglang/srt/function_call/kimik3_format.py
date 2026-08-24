@@ -61,12 +61,15 @@ def strip_partial_marker_suffix(text: str) -> str:
 class _SpanTracker:
     def __init__(self, text: str):
         self._chars = list(zip(text, range(len(text))))
+        self._deleted = False
 
     @property
     def text(self) -> str:
         return "".join(char for char, _ in self._chars)
 
     def delete(self, current_start: int, current_end: int) -> None:
+        if current_start < current_end and self._chars[current_start:current_end]:
+            self._deleted = True
         del self._chars[current_start:current_end]
 
     def truncate_at(self, current_end: int) -> None:
@@ -84,7 +87,7 @@ class _SpanTracker:
 
     def result(self, collapse_blank: bool = False) -> tuple[str, list[tuple[int, int]]]:
         text = self.text
-        if collapse_blank and not text.strip():
+        if collapse_blank and self._deleted and not text.strip():
             return "", []
         spans = []
         for _, original_index in self._chars:
