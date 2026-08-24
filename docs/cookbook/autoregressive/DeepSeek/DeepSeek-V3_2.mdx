@@ -432,25 +432,25 @@ For production deployments (RBG / LWS-based, DeepEP EP parallelism), see [multi_
 
 #### 4.2.5 DSA Long-Sequence Context Parallel and PP/CP
 
-SGLang provides two context parallel (CP) modes for long-sequence workloads, controlled with `--dsa-prefill-cp-mode`.
+SGLang provides two context parallel (CP) layouts for long-sequence workloads. Enable prefill CP with `--enable-prefill-cp` and select the layout with `--cp-strategy`.
 
-**In-sequence splitting** (`--dsa-prefill-cp-mode in-seq-split`): Each CP rank handles a uniform shard of the sequence; KV cache is gathered via all-gather. Batch size is restricted to 1 during prefill. See [PR #12065](https://github.com/sgl-project/sglang/pull/12065).
+**Zigzag** (`--cp-strategy zigzag`): Splits each sequence into `2 * cp_size` blocks and assigns each rank one early and one late block to balance causal-attention work. KV cache is restored to logical token order after the rank-local work.
 
 ```bash Command
-# In-seq splitting mode — EP + DP, batch size 1
+# Zigzag — EP + DP
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
   --tp 8 --ep 8 --dp 2 --enable-dp-attention \
-  --enable-dsa-prefill-context-parallel --attn-cp-size 4 \
-  --dsa-prefill-cp-mode in-seq-split --max-running-requests 32
+  --enable-prefill-cp --attn-cp-size 4 \
+  --cp-strategy zigzag --max-running-requests 32
 ```
 
-**Round-robin splitting** (`--dsa-prefill-cp-mode round-robin-split`, default): Distributes tokens by `token_idx % cp_size`. Supports fused MoE, FP8 KV cache, and multi-batch prefill. Cannot be combined with DP attention. See [PR #13959](https://github.com/sgl-project/sglang/pull/13959).
+**Interleave** (`--cp-strategy interleave`): Distributes tokens by `token_idx % cp_size`. It supports fused MoE, FP8 KV cache, and multi-batch prefill. It cannot be combined with DP attention.
 
 ```bash Command
-# Round-robin splitting — FusedMoE + CP8
+# Interleave — FusedMoE + CP8
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
-  --tp 8 --enable-dsa-prefill-context-parallel --attn-cp-size 8 \
-  --dsa-prefill-cp-mode round-robin-split --max-running-requests 32
+  --tp 8 --enable-prefill-cp --attn-cp-size 8 \
+  --cp-strategy interleave --max-running-requests 32
 ```
 
 **PP + CP (multi-node):** Combines Pipeline Parallelism and Context Parallelism for cross-node scaling. The production-optimized configurations below have been verified on Hopper:
@@ -499,8 +499,8 @@ sglang_args=$(echo serve \
   --attention-backend dsa \
   --dsa-prefill-backend flashmla_sparse \
   --dsa-decode-backend flashmla_sparse \
-  --enable-dsa-prefill-context-parallel \
-  --dsa-prefill-cp-mode round-robin-split \
+  --enable-prefill-cp \
+  --cp-strategy interleave \
   --cuda-graph-max-bs-decode 128 \
   --max-running-requests 128 \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
@@ -529,20 +529,20 @@ dp_config=" \
 "
 
 cp_config=" \
-  --enable-dsa-prefill-context-parallel \
+  --enable-prefill-cp \
 "
 
 if [ "$dp" -eq 1 ]; then
 
 cp_config=" \
   $cp_config \
-  --dsa-prefill-cp-mode round-robin-split \
+  --cp-strategy interleave \
 "
 
 else
 cp_config=" \
   $cp_config \
-  --dsa-prefill-cp-mode in-seq-split \
+  --cp-strategy zigzag \
 "
 fi
 
