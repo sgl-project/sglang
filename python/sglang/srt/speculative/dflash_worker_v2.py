@@ -2081,6 +2081,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             and self._selector_confidence is not None
             and _is_all_greedy(batch.sampling_info)
             and not batch.has_grammar
+            # Spec logprob output is rectangular per request. A compact
+            # verification suffix has no target logits, so use the complete
+            # target verify path whenever callers requested logprobs.
+            and not batch.return_logprob
             and (
                 int(self.server_args.speculative_dflash_confidence_target_verify_tokens)
                 > 0
@@ -2140,6 +2144,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     confidence_reason = "full_verify_sampling"
                 elif batch.has_grammar:
                     confidence_reason = "full_verify_grammar"
+                elif batch.return_logprob:
+                    confidence_reason = "full_verify_logprob"
                 self._confidence_observer.observe(
                     confidence=self._selector_confidence,
                     verify_lens=None,
@@ -2349,6 +2355,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 new_seq_lens = None
 
         if batch.return_logprob:
+            # `return_logprob` forces full verification above, preserving the
+            # rectangular per-request layout required by compute_spec_logprobs.
+            assert confidence_layout is None
             compute_spec_logprobs(
                 batch,
                 logits_output,
