@@ -128,11 +128,19 @@ class ForwardBatchDeepSeekMHAMixin:
             HybridLinearKVPool,
             MLATokenToKVPool,
         )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         token_to_kv_pool = get_token_to_kv_pool()
-        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
-            isinstance(token_to_kv_pool, HybridLinearKVPool)
-            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+        assert (
+            isinstance(token_to_kv_pool, MLATokenToKVPool)
+            or (
+                isinstance(token_to_kv_pool, HybridLinearKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
+            or (
+                isinstance(token_to_kv_pool, SWAKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):
