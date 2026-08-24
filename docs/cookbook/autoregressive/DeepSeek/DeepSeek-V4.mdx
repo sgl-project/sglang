@@ -325,7 +325,7 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 - **Supported models** — **MI300X** supports DeepSeek-V4-Flash in FP8; **MI355X** supports DeepSeek-V4-Flash / Pro in both FP4 and FP8. All recipes run single-node.
 - **TP / DP setting** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP**, which additionally needs `--dp 8 --enable-dp-attention --enable-prefill-delayer --prefill-delayer-max-delay-ms 5000`.
 - **MTP** — speculative decoding is supported; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
-- **Kernels** — uses the Unified KV attention and the flydsl MoE.
+- **Kernels** — uses the Unified KV attention and the flydsl MoE. On MI355X, fused MegaMoE is available via `--moe-a2a-backend megamoe` (requires `SGLANG_USE_AITER=1` and AITER MegaMoEV2). Set `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` to a power-of-two cap covering peak tokens per rank.
 
 **MegaMoE**
 
@@ -341,7 +341,7 @@ Two variants are exposed:
   Higher throughput with negligible accuracy drop (~89.5 GPQA on Pro).
 
 Notes:
-- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.
+- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300) via DeepGEMM. On **MI355X**, `--moe-a2a-backend megamoe` uses AITER FlyDSL MegaMoEV2 instead (see the AMD note). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below.
 - MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
 - When running MegaMoE, don't set `--moe-runner-backend` manually.
 - Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 8320 for high-throughput).

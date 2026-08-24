@@ -1432,6 +1432,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
+            if get_moe_a2a_backend().is_megamoe():
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_mega_moe_experts_weights,
+                )
+
+                # MegaMoEV2 needs the raw MXFP4 layout, not AITER fused_moe
+                # shuffle. Build fused MegaMoE weights and skip the standard
+                # FlyDSL shuffle path below.
+                build_mega_moe_experts_weights(layer)
+                return
+
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 

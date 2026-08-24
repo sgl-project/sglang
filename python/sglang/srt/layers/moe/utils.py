@@ -89,6 +89,7 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+            MoeA2ABackend.MEGAMOE,
         )
 
 

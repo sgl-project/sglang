@@ -33,6 +33,15 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
+
+def _use_aiter_mega_moe() -> bool:
+    # HIP + megamoe always takes the AITER MegaMoEV2 path. Missing MegaMoEV2
+    # should fail at import/weight-build, not silently fall back to DeepGEMM.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -83,7 +92,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-    if _device_sm == 90:
+    if _device_sm == 90 and not _is_hip:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return False
     if get_is_capture_mode():
@@ -142,6 +151,17 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
+    if _use_aiter_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_aiter import run_mega_moe_aiter_routed
+
+        return run_mega_moe_aiter_routed(
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+        )
+
     import deep_gemm
 
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
@@ -296,12 +316,18 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    if _use_aiter_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_aiter import build_mega_moe_aiter_weights
+
+        build_mega_moe_aiter_weights(experts)
+        return
+
     from deep_gemm import (
         transform_sf_into_required_layout,
     )
-
-    if getattr(experts, "_mega_moe_weights_built", False):
-        return
 
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
