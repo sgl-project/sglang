@@ -735,6 +735,18 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "auto"
+    qkrot_block: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Enable Q/K block Hadamard rotation for FP4 KV cache. The value "
+                "is the rotation block size and must be a positive power of two. "
+                "16 matches SGLang's FP4 KV cache quantization block size. "
+                "Requires --kv-cache-dtype nvfp4 or --kv-cache-dtype fp4_mx_block16."
+            ),
+        ),
+        NS("model"),
+    ] = None
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
     ] = False
@@ -3888,6 +3900,7 @@ class ServerArgs:
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
+        self._handle_qkrot_compatibility()
         self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -6525,6 +6538,23 @@ class ServerArgs:
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
+    def _handle_qkrot_compatibility(self):
+        """Validate Q/K block Hadamard rotation settings for FP4 KV cache."""
+        if self.qkrot_block is None:
+            return
+
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
+            raise ValueError(
+                "--qkrot-block currently requires --kv-cache-dtype nvfp4 or "
+                "--kv-cache-dtype fp4_mx_block16."
+            )
+
+        if self.qkrot_block <= 0 or self.qkrot_block & (self.qkrot_block - 1) != 0:
+            raise ValueError("--qkrot-block must be a positive power of two.")
+
+        if not is_cuda():
+            raise RuntimeError("--qkrot-block uses the CUDA Hadamard kernel.")
 
     def _handle_page_size(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:

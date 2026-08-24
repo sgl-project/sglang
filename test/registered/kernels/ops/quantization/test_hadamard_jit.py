@@ -14,6 +14,7 @@ from sglang.kernels.ops.quantization.hadamard import (
     hadamard_transform_28n,
     hadamard_transform_40n,
 )
+from sglang.srt.layers.attention.kvrot import apply_block_hadamard_rotation
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=128, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -315,6 +316,24 @@ def test_hadamard_transform_scale_one(dtype):
     out_ref = hadamard_transform_ref(x.detach().clone().float(), scale=1.0)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_block_hadamard_rotation_is_self_inverse(dtype):
+    device = "cuda"
+
+    if dtype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+    else:
+        rtol, atol = 3e-3, 5e-3
+
+    torch.random.manual_seed(0)
+    x = torch.randn(4, 8, 128, device=device, dtype=dtype)
+
+    rotated = apply_block_hadamard_rotation(x, block_size=16)
+    restored = apply_block_hadamard_rotation(rotated, block_size=16)
+
+    torch.testing.assert_close(restored.float(), x.float(), rtol=rtol, atol=atol)
 
 
 # Test dimensions for M×N variants: dim = M * N where N = 2^k.

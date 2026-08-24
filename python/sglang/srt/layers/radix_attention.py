@@ -24,6 +24,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.layers.attention.kvrot import (
+    apply_block_hadamard_rotation,
+    get_qkrot_block,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -146,6 +150,7 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+        self.qkrot_block = get_qkrot_block()
 
     def forward(
         self,
@@ -163,6 +168,13 @@ class RadixAttention(nn.Module):
             if "k_rope" not in kwargs:
                 k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+                if self.qkrot_block is not None:
+                    q_shape = q.shape
+                    q = q.view(-1, self.tp_q_head_num, self.qk_head_dim)
+                    q = apply_block_hadamard_rotation(q, self.qkrot_block).reshape(
+                        q_shape
+                    )
+                    k = apply_block_hadamard_rotation(k, self.qkrot_block)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
