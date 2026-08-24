@@ -335,7 +335,7 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 # Speculative algorithms whose verify forward presents a uniform per-request
 # token width, which is what the LoRA segment layout assumes.
-_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK", "DFLASH_CONFIDENCE")
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -6823,14 +6823,14 @@ class ServerArgs:
                 # refusing those combinations.
                 _algo = (self.speculative_algorithm or "").upper()
                 verify = self.linear_attn_verify_backend
-                if _algo not in ("DSPARK", "DFLASH") or verify not in (
+                if _algo not in ("DSPARK", "DFLASH", "DFLASH_CONFIDENCE") or verify not in (
                     "triton",
                     "nv_cutedsl",
                 ):
                     raise ValueError(
                         "--enable-linear-replayssm-spec with "
                         f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                        "KDA fold-every-commit family (DSPARK/DFLASH) and a "
+                        "KDA fold-every-commit family (DSPARK/DFLASH/DFLASH_CONFIDENCE) and a "
                         "ring-writing verify kernel (--linear-attn-verify-backend "
                         "triton or nv_cutedsl); got "
                         f"algorithm={self.speculative_algorithm!r}, "
@@ -10176,7 +10176,7 @@ class ServerArgs:
             )
             raise ValueError(
                 "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
-                "DFLASH, or DSPARK speculative decoding, not "
+                "DFLASH, DFLASH_CONFIDENCE, or DSPARK speculative decoding, not "
                 f"{self.speculative_algorithm}{promoted}."
             )
 
@@ -10186,7 +10186,8 @@ class ServerArgs:
         # prefix so the message names the combination, not just the flag.
         unsupported = [
             (
-                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+                self.speculative_algorithm in ("DSPARK", "DFLASH_CONFIDENCE")
+                and ragged_mode != "static",
                 f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
                 "the per-request verify lengths it schedules break the "
                 "uniform-width LoRA segment layout",

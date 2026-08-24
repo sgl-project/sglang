@@ -2305,32 +2305,38 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
 
         if SIMULATE_ACC_LEN > 0:
-            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            if confidence_layout is not None:
+                logger.warning(
+                    "Ignoring SGLANG_SIMULATE_ACC_LEN for DFLASH_CONFIDENCE ragged "
+                    "verification because forced acceptance may exceed the target-verified prefix."
+                )
+            elif SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
                 raise ValueError(
                     "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
                     f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
                     "'real-draft-token'."
                 )
 
-            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
-                # The sampling-verify branch does not materialize the target argmax.
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
-            apply_dflash_simulated_acceptance(
-                candidates=candidates,
-                target_predict=target_predict,
-                accept_len=accept_len,
-                commit_lens=commit_lens,
-                bonus=bonus,
-                out_tokens=out_tokens,
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
+            else:
+                if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
+                    # The sampling-verify branch does not materialize the target argmax.
+                    target_predict = torch.argmax(
+                        logits_output.next_token_logits, dim=-1
+                    ).view(bs, int(self.block_size))
+                apply_dflash_simulated_acceptance(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    accept_len=accept_len,
+                    commit_lens=commit_lens,
+                    bonus=bonus,
+                    out_tokens=out_tokens,
+                    simulate_acc_len=SIMULATE_ACC_LEN,
+                    simulate_acc_method=SIMULATE_ACC_METHOD,
+                    simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                )
+                # The Triton path may have written new_seq_lens from the real
+                # accept_len; recompute it from the forced commit_lens.
+                new_seq_lens = None
 
         if batch.return_logprob:
             compute_spec_logprobs(
