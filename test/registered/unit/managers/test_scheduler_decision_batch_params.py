@@ -93,6 +93,44 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
         req.req_pool_idx = None
         self.assertFalse(Scheduler._pp_batched_chunk_reuses_req_slot(scheduler, req))
 
+    def test_requeued_chunks_bypass_slotless_requests_before_pool_saturation(self):
+        new_reqs = [
+            MagicMock(
+                rid=f"new-{i}",
+                pp_batched_chunk_requeued=False,
+                req_pool_idx=None,
+            )
+            for i in range(16)
+        ]
+        reusable_0 = MagicMock(
+            rid="reusable-0", pp_batched_chunk_requeued=True, req_pool_idx=3
+        )
+        reusable_1 = MagicMock(
+            rid="reusable-1", pp_batched_chunk_requeued=True, req_pool_idx=9
+        )
+        waiting_queue = new_reqs + [reusable_0, reusable_1]
+        scheduler = SimpleNamespace(pp_batch_independent_chunks=True)
+        scheduler._pp_batched_chunk_reuses_req_slot = (
+            lambda req: Scheduler._pp_batched_chunk_reuses_req_slot(scheduler, req)
+        )
+
+        for num_allocatable_reqs in (0, 1, 15):
+            with self.subTest(num_allocatable_reqs=num_allocatable_reqs):
+                ordered = Scheduler._pp_order_waiting_queue_for_req_slots(
+                    scheduler,
+                    waiting_queue,
+                    num_allocatable_reqs=num_allocatable_reqs,
+                )
+                self.assertEqual(ordered, [reusable_0, reusable_1] + new_reqs)
+
+        self.assertEqual(waiting_queue, new_reqs + [reusable_0, reusable_1])
+        self.assertIs(
+            Scheduler._pp_order_waiting_queue_for_req_slots(
+                scheduler, waiting_queue, num_allocatable_reqs=16
+            ),
+            waiting_queue,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
