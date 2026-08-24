@@ -75,6 +75,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -130,7 +131,6 @@ class PrefillBootstrapQueue:
         tp_rank: int,
         tp_size: int,
         gpu_id: int,
-        bootstrap_port: int,
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
@@ -148,7 +148,6 @@ class PrefillBootstrapQueue:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.gpu_id = gpu_id
-        self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
@@ -311,9 +310,13 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
+        assert req.bootstrap_host is not None and req.bootstrap_port is not None
+        bootstrap_addr = NetworkAddress(
+            req.bootstrap_host, req.bootstrap_port
+        ).to_host_port_str()
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=bootstrap_addr,
             bootstrap_room=req.bootstrap_room,
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,

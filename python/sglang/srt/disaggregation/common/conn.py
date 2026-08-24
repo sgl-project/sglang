@@ -1188,7 +1188,8 @@ class CommonKVSender(BaseKVSender):
             if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
+                self.kv_mgr.system_dp_rank
+                != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
@@ -1197,7 +1198,7 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.kv_mgr.system_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
                         f"{self.bootstrap_room % get_parallel().dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
@@ -1211,7 +1212,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
+            "dp_rank": self.kv_mgr.system_dp_rank,
         }
         try:
             response = requests.post(url, json=payload, timeout=5)

@@ -8,6 +8,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
@@ -187,14 +189,19 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_url_with_dist_init_addr(self, mock_put, mock_time):
+    def test_rust_dp_rank_registers_only_with_rank_zero(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
 
         mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
-        mgr.register_to_bootstrap()
+        mgr.attn_dp_size = 2
+        mgr.attn_dp_rank = 1
+        mgr.system_dp_size = 2
+        mgr.system_dp_rank = 1
+        with envs.SGLANG_RUST_SERVER.override(True):
+            mgr.register_to_bootstrap()
 
         url_used = mock_put.call_args[0][0]
         self.assertIn("10.0.0.1", url_used)
@@ -282,6 +289,82 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_cache_dtype_str = "auto"
 
         return mgr
+
+
+class TestPrefillBootstrapSenderAddress(CustomTestCase):
+    @patch("sglang.srt.disaggregation.prefill.get_kv_class")
+    def test_request_bootstrap_port_selects_room_registry(self, mock_get_kv_class):
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.kv_manager = MagicMock()
+        queue.pp_rank = 0
+        queue.tp_rank = 0
+        queue.transfer_backend = TransferBackend.NIXL
+        queue._check_if_req_exceed_kv_capacity = MagicMock(return_value=False)
+        queue._process_req = MagicMock()
+
+        req = MagicMock(
+            bootstrap_host="2001:db8::1",
+            bootstrap_port=30001,
+            bootstrap_room=42,
+            disagg_prefill_dp_rank=None,
+        )
+        sender = MagicMock()
+        sender_class = MagicMock(return_value=sender)
+        mock_get_kv_class.return_value = sender_class
+
+        self.assertTrue(queue.create_sender(req, num_kv_heads=8))
+
+        sender_class.assert_called_once_with(
+            mgr=queue.kv_manager,
+            bootstrap_addr="[2001:db8::1]:30001",
+            bootstrap_room=42,
+            dest_tp_ranks=[0],
+            pp_rank=0,
+            req_has_disagg_prefill_dp_rank=False,
+        )
+        self.assertIs(req.disagg_kv_sender, sender)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_room_registration_uses_effective_dp_rank(self, mock_post):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        sender = MagicMock()
+        sender.bootstrap_server_url = "127.0.0.1:30000"
+        sender.bootstrap_room = 42
+        sender.kv_mgr = MagicMock(system_dp_rank=1)
+        mock_post.return_value = MagicMock(status_code=200)
+
+        CommonKVSender._register_prefill_dp_rank(sender)
+
+        mock_post.assert_called_once_with(
+            "http://127.0.0.1:30000/register_dp_rank",
+            json={"bootstrap_room": 42, "dp_rank": 1},
+            timeout=5,
+        )
+
+    def test_follow_bootstrap_room_accepts_matching_ordinary_dp_rank(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        sender = MagicMock()
+        manager = MagicMock(is_dummy_cp_rank=False, system_dp_rank=1)
+
+        with get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room", dp_size=2
+        ):
+            CommonKVSender.__init__(
+                sender,
+                mgr=manager,
+                bootstrap_addr="127.0.0.1:30000",
+                bootstrap_room=43,
+                dest_tp_ranks=[0],
+                pp_rank=0,
+                req_has_disagg_prefill_dp_rank=False,
+            )
+
+        sender._register_prefill_dp_rank.assert_not_called()
+        manager.record_failure.assert_not_called()
 
 
 if __name__ == "__main__":
