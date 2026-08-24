@@ -23,7 +23,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
-    _is_single_contiguous_pair,
+    _has_fewer_contiguous_runs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,16 +108,16 @@ def _fake_staging_buffer_module(mock_gather=None):
 
 
 class TestNixlTransferInfo(CustomTestCase):
-    def test_single_contiguous_pair(self):
+    def test_fewer_contiguous_runs(self):
         def arr(values):
             return np.array(values, dtype=np.int32)
 
-        self.assertTrue(_is_single_contiguous_pair(arr([3, 4]), arr([7, 8])))
-        self.assertFalse(_is_single_contiguous_pair(arr([3, 5]), arr([7, 9])))
-        self.assertFalse(_is_single_contiguous_pair(arr([3, 4]), arr([7, 9])))
-        self.assertFalse(_is_single_contiguous_pair(arr([3]), arr([7])))
-        self.assertFalse(_is_single_contiguous_pair(arr([]), arr([])))
-        self.assertFalse(_is_single_contiguous_pair(arr([3, 4]), arr([7])))
+        self.assertTrue(_has_fewer_contiguous_runs(arr([3, 4]), arr([7, 8])))
+        self.assertTrue(_has_fewer_contiguous_runs(arr([3, 4, 8]), arr([7, 8, 9])))
+        self.assertFalse(_has_fewer_contiguous_runs(arr([3, 5]), arr([7, 9])))
+        self.assertFalse(_has_fewer_contiguous_runs(arr([3]), arr([7])))
+        self.assertFalse(_has_fewer_contiguous_runs(arr([]), arr([])))
+        self.assertFalse(_has_fewer_contiguous_runs(arr([3, 4]), arr([7])))
 
     def test_from_zmq_parses_required_fields(self):
         kv_indices = np.array([3, 5, 8], dtype=np.int32)

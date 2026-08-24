@@ -345,13 +345,14 @@ def repeat_indices_over_layers(
     return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32)
 
 
-def _is_single_contiguous_pair(
+def _has_fewer_contiguous_runs(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> bool:
-    """Whether pairwise src/dst indices form one contiguous transfer run."""
-    return src_indices.size == dst_indices.size > 1 and (
-        np.all(np.diff(src_indices) == 1) and np.all(np.diff(dst_indices) == 1)
-    )
+    """Whether grouped pairwise runs need fewer descriptors than page entries."""
+    if src_indices.size != dst_indices.size or src_indices.size <= 1:
+        return False
+    breaks = (np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1)
+    return np.count_nonzero(breaks) + 1 < src_indices.size
 
 
 @dataclasses.dataclass
@@ -1486,7 +1487,7 @@ class NixlKVManager(CommonKVManager):
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
-            and not _is_single_contiguous_pair(
+            and not _has_fewer_contiguous_runs(
                 prefill_data_indices, dst_data_indices
             )
         ):
