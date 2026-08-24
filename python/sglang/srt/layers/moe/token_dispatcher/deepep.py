@@ -691,7 +691,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        # Ascend's low-latency DeepEP op consumes int32 expert ids and casts
+        # them back to int32 in its strategy. NPU TopK already emits int32, so
+        # avoid an int32 -> int64 -> int32 round trip on every MoE layer.
+        if not _is_npu:
+            topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
