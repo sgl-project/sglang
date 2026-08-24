@@ -140,8 +140,8 @@ class TestVerifySharedKV(CustomTestCase):
 
     @unittest.skipIf(
         get_hip_version()[:2] == (7, 0),
-        "Triton 3.4 on the ROCm 7.0 image aborts gfx950 fp8 KV tl.dot "
-        "(triton-lang/triton#8278). Coverage stays on ROCm 7.2+.",
+        "Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.",
     )
     def test_qwen3_5_fp8_kv_cache(self):
         self._run_parity(
