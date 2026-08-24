@@ -1883,3 +1883,105 @@ def test_park_placeholders_are_shared(monkeypatch):
         id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
     }
     assert len(stand_ins) <= len(comp._park_placeholders)
+
+
+class _LoRAWrap(torch.nn.Module):
+    """Mimic BaseLayerWithLoRA: live Parameter name becomes *.base_layer.weight."""
+
+    def __init__(self, base: torch.nn.Module) -> None:
+        super().__init__()
+        self.base_layer = base
+
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+
+def test_offload_param_name_aliases_cover_lora_wrap():
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        offload_param_name_aliases,
+    )
+
+    aliases = offload_param_name_aliases("blocks.0.weight")
+    assert "blocks.0.weight" in aliases
+    assert "blocks.0.base_layer.weight" in aliases
+    assert "blocks.0.weight" in offload_param_name_aliases(
+        "blocks.0.base_layer.weight"
+    )
+
+
+def test_parking_does_not_steal_lora_wrapped_layer_weights(monkeypatch):
+    """After wrap, live names are *.base_layer.weight; park must still skip them."""
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+
+    for i, block in enumerate(list(model.blocks)):
+        model.blocks[i] = _LoRAWrap(block)
+
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        refresh_layerwise_targets,
+    )
+
+    refresh_layerwise_targets(model)
+    live_names = {n for n, _ in model.named_parameters() if n.endswith(".weight")}
+    assert any("base_layer.weight" in n for n in live_names)
+
+    managed = model._managed_layer_parameter_names()
+    assert live_names <= managed
+
+    model.park_non_layer_weights()
+    parked = set(model._parked_non_layer_weights)
+    assert not (parked & live_names), parked
+
+
+def test_iter_materialized_weights_skips_wrapped_placeholders(monkeypatch):
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        iter_materialized_weights,
+        refresh_layerwise_targets,
+    )
+
+    model = _configure_mixin_model(monkeypatch)
+    before = dict(iter_materialized_weights(model))
+    assert "blocks.0.weight" in before
+    assert before["blocks.0.weight"].numel() > 1
+
+    for i, block in enumerate(list(model.blocks)):
+        model.blocks[i] = _LoRAWrap(block)
+    refresh_layerwise_targets(model)
+
+    after = dict(iter_materialized_weights(model))
+    assert "blocks.0.weight" in after
+    assert after["blocks.0.weight"].numel() > 1
+    assert "blocks.0.base_layer.weight" not in after
+
+
+def test_write_dense_weight_keeps_manager_parameter(monkeypatch):
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        write_dense_weight,
+    )
+
+    model = _configure_mixin_model(monkeypatch)
+    layer = model.blocks[0]
+    manager = model.layerwise_offload_managers[0]
+    original = manager.get_target_with_name("blocks.0.weight")
+    layer._offload_root = model
+    layer._offload_param_prefix = "blocks.0"
+
+    merged = torch.arange(9, dtype=torch.float32).reshape(3, 3) + 7
+    with torch.no_grad():
+        write_dense_weight(layer, merged)
+
+    assert manager.get_target_with_name("blocks.0.weight") is original
+    got = manager.get_cpu_weight("blocks.0.weight")
+    assert got is not None
+    torch.testing.assert_close(got, merged)
+
+
+def test_finish_offload_writeback_is_noop_when_idle():
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+        finish_offload_writeback,
+    )
+
+    finish_offload_writeback()
