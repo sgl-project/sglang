@@ -17,6 +17,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_kv_host_pool,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -59,6 +61,12 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kv_cache, HybridLinearKVPool):
+            # Hybrid model (e.g. K3 with MLA + KDA): offload only the full
+            # attention KV pool. Mamba/SSM state is ephemeral and does not
+            # require L3 offload on the decode side.
+            kv_cache = kv_cache.full_kv_pool
+
         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
             raise ValueError("Unsupported KV cache type for decode offload")
         self.decode_host_mem_pool = build_kv_host_pool(
@@ -255,17 +263,19 @@ class DecodeKVCacheOffloadManager:
 
         kv_committed_len = req.effective_kv_committed_len()
 
-        # Free the prefill-aligned slots. Previously this was done
-        # eagerly in offload_kv_cache (mid-decode), which raced with
-        # concurrent admission. Now consolidated here at request
-        # finish, where the request is guaranteed to no longer attend
-        # to those slots.
+        # Free prefill-aligned slots here at finish (previously done
+        # mid-decode in offload_kv_cache, racing concurrent admission).
+        # Skip [0, cache_protected_len): tree-managed prefix tokens (L1
+        # device hits or L2/L3 restored), locked via inc_lock_ref.  Only
+        # the request-owned delta prefill slots are freed.
         state = self.offloaded_state.get(req.rid)
         if state is not None and state.prefill_len > 0:
-            prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
-            ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
+            free_start = max(req.cache_protected_len, 0)
+            if free_start < state.prefill_len:
+                prefill_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, free_start : state.prefill_len
+                ]
+                self.token_to_kv_pool_allocator.free(prefill_indices)
         start = start_offset
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
@@ -283,9 +293,26 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        # Hybrid models (e.g. K3 with KDA) need manual mamba slot release
+        # here since the offload path skips release_kv_cache.  Must run
+        # before req_to_token_pool.free(req), which nulls req_pool_idx
+        # that free_mamba_cache indexes the ping-pong track buffer with.
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool) and (
+            not self.tree_cache.supports_mamba()
+        ):
+            if req.mamba_pool_idx is not None:
+                self.req_to_token_pool.free_mamba_cache(req)
+
         self.req_to_token_pool.free(req)
         req.kv = None
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # Release the tree-cache lock taken at admission (inc_lock_ref in
+        # _match_prefix_and_lock).  dec_lock_ref keeps lock_ref and the
+        # protected/evictable size accounting consistent.  req.last_node is
+        # the currently-locked node: the L1 prefix node (L1-only), or the
+        # restored node (L2/L3 restore already released the L1 lock via
+        # _commit_hicache_local_restore_to_req), so no double release.
+        if req.cache_protected_len > 0 and req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 

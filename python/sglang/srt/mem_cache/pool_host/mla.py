@@ -436,9 +436,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
-            device_pool
-        )
+        # data_ptrs/kv_buffers are only needed by the kernel/direct backends;
+        # kernel_ascend (NPU) uses k_buffer/v_buffer/index_k_buffer instead and
+        # NPU device pools do not expose data_ptrs.
+        if io_backend != "kernel_ascend":
+            device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+                device_pool
+            )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -588,6 +592,44 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
+        if self.layout == "page_first_kv_split":
+            # TODO (iforgetmyname): merge mla kv
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    k_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.kv_lora_rank
+                    * self.dtype.itemsize
+                )
+                v_ptr = (
+                    v_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.qk_rope_head_dim
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            k_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_lora_rank
+            )
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            element_size_list = []
+            for _ in range(0, len(indices), self.page_size):
+                element_size_list.append(k_element_size)
+                element_size_list.append(v_element_size)
+            return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
                 for layer_id in range(self.layer_num):

@@ -2718,9 +2718,27 @@ def create_custom_parallel_group(
     rank = torch.distributed.get_rank()
 
     local_config = sorted(list(set(group_ranks)))
-    gathered_configs = [None for _ in range(world_size)]
+    group_size = len(local_config)
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Standard TP/DP partitioning: contiguous, group-aligned ranks.
+    is_standard_partition = (
+        world_size % group_size == 0
+        and local_config == list(range(local_config[0], local_config[0] + group_size))
+        and local_config[0] % group_size == 0
+    )
+
+    if not (_is_npu and is_standard_partition):
+        # General path: collect every rank's group via all_gather_object.
+        gathered_configs = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_configs, local_config)
+    else:
+        # NPU fast path: all_gather_object on the default HCCL PG allocates
+        # an HCCL buffer; instead derive the standard TP/DP groups locally.
+        num_groups = world_size // group_size
+        gathered_configs = [
+            list(range(i * group_size, (i + 1) * group_size))
+            for i in range(num_groups)
+        ]
 
     unique_groups = []
     seen_signatures = set()

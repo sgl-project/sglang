@@ -1019,6 +1019,14 @@ class HostPoolGroup:
         return self.anchor_entry.host_pool.kv_buffer
 
     @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
+
+    @property
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 

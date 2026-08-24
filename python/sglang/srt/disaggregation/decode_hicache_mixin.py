@@ -197,6 +197,10 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
+        # The re-match overwrites cache_protected_len; restore the
+        # admission-time value that _release_finished_req uses to free the
+        # owned prefix slots and release the admission lock.
+        saved_cache_protected_len = dr.req.cache_protected_len
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
@@ -204,6 +208,7 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+        dr.req.cache_protected_len = saved_cache_protected_len
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
