@@ -1,12 +1,10 @@
 import re
 
-from safetensors.torch import load_file as safetensors_load_file
-
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
+    load_safetensors_state_dict,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -27,6 +25,9 @@ class VocoderLoader(PlainStateDictComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = self.load_component_config(component_model_path, component_name)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
         class_name = config.pop("_class_name", None) or self.component_architecture
         assert (
             class_name is not None
@@ -57,11 +58,7 @@ class VocoderLoader(PlainStateDictComponentLoader):
             vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)
             vocoder = vocoder_cls(vocoder_config).to(target_device)
 
-        safetensors_list = _list_safetensors_files(component_model_path)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
+        loaded = load_safetensors_state_dict(component_weights_path)
         mapping = vocoder_config.arch_config.param_names_mapping
         loaded = {_remap_vocoder_key(k, mapping): v for k, v in loaded.items()}
 
@@ -69,7 +66,7 @@ class VocoderLoader(PlainStateDictComponentLoader):
         # A half-loaded vocoder produces plausible but wrong audio.
         if missing_keys or unexpected_keys:
             raise ValueError(
-                f"Vocoder weights at '{component_model_path}' do not match the "
+                f"Vocoder weights at '{component_weights_path}' do not match the "
                 f"instantiated {class_name}. Missing: {sorted(missing_keys)}. "
                 f"Unexpected: {sorted(unexpected_keys)}."
             )
