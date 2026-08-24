@@ -177,10 +177,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Retraction backup transfers the full and sliding-window components
-        # only, so UnifiedRadixCache rejects host_pool for a model that also
-        # keeps recurrent state. Inferring it here is a refusal at startup
-        # rather than a fallback, so keep those models on cpu_tensor.
+        # Host-pool retraction transfers full and sliding-window components
+        # only, so a model with recurrent state stays on cpu_tensor.
         supports_host_pool = not uses_ssm_state(
             tp_worker.model_runner.model_config
         ) and (

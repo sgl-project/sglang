@@ -105,7 +105,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_backup,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1717,15 +1717,30 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = array("q")
 
+    def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
+        if allocator.get_kvcache().cpu_copy_carries_mamba:
+            return None
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return None
+        return req_to_token_pool.mamba_pool
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
+        mamba_pool = self._mamba_pool_needing_backup(
+            req_to_token_pool, token_to_kv_pool_allocator
+        )
         self.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
                 token_indices, mamba_indices=self.mamba_pool_idx
-            )
+            ),
+            mamba_cpu=(
+                mamba_pool.get_cpu_copy(self.mamba_pool_idx.unsqueeze(0))
+                if mamba_pool is not None and self.mamba_pool_idx is not None
+                else None
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1734,6 +1749,11 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
+        mamba_cpu = self.retraction_backup.mamba_cpu
+        if mamba_cpu is not None and self.mamba_pool_idx is not None:
+            req_to_token_pool.mamba_pool.load_cpu_copy(
+                mamba_cpu, self.mamba_pool_idx.unsqueeze(0)
+            )
         token_to_kv_pool_allocator.load_cpu_copy(
             self.retraction_backup.cpu_tensors,
             token_indices,
