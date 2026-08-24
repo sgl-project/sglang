@@ -13,10 +13,15 @@ on:
         default: perf
         description: perf or accuracy
       test_suite:
-        required: true
+        required: false
         type: string
         default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
+      test_case:
+        required: false
+        type: string
+        default: ''
+        description: repo-relative path of a single test file to run directly (mutually exclusive with test_suite)
       image:
         required: true
         type: string
@@ -63,12 +68,12 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
-  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}${{ inputs.test_case }}
   cancel-in-progress: true
 
 jobs:
   e2e:
-    name: ${{ inputs.test_suite }}
+    name: ${{ inputs.test_suite }}${{ inputs.test_case }}
     strategy:
       fail-fast: false
       matrix:
@@ -226,10 +231,17 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
 
-          # Determine test mode: suite (run_suite.py --suite) or single case file.
+          # Determine test mode: suite (run_suite.py --suite) or single case file (python3 <file> -f).
           test_suite="${{ inputs.test_suite }}"
-          echo "Test mode: suite (${test_suite})"
-          tc_name="${test_suite}"
+          test_case="${{ inputs.test_case }}"
+          if [ -n "${test_case}" ]; then
+            echo "Test mode: single case (${test_case})"
+            tc_name=${test_case##*/}
+            tc_name=${tc_name%.*}
+          else
+            echo "Test mode: suite (${test_suite})"
+            tc_name="${test_suite}"
+          fi
 
           # The ID is used to locate the current job instance,
           # size determines whether parallel execution is enabled.
@@ -387,10 +399,20 @@ jobs:
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
           fi
 
-          # Run NPU test suite with run_suite.py.
-          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
-          # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          # Run a single test case directly (unittest script with -f failfast), or the
+          # full suite via run_suite.py.
+          if [ -n "${test_case}" ]; then
+            test_case_path="${sglang_source_path}/${test_case}"
+            if [ ! -f "${test_case_path}" ]; then
+              echo "Test case not found: ${test_case_path}"
+              exit 1
+            fi
+            ${PYTHON_FOR_SGLANG} -u "${test_case_path}" -f 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          else
+            # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+            # tee pipe, so leftover server processes cannot block the pipeline on exit.
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          fi
 
           echo "Finished test: ${tc_name}"
 

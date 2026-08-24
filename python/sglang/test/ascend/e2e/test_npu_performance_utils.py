@@ -3,8 +3,10 @@ import inspect
 import json
 import logging
 import os
+import psutil
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -205,6 +207,7 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
+BENCHMARK_SERVING_TIMEOUT = 3600
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -474,6 +477,9 @@ def run_bench_serving(
     # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
+    # Launch the benchmark in its own session/process group so a dead server
+    # cannot wedge the run: on timeout we nuke the whole group (including any
+    # re-parented descendants) instead of waiting forever on its stdout.
     process = subprocess.Popen(
         cmd_args,
         stdout=subprocess.PIPE,
@@ -481,7 +487,25 @@ def run_bench_serving(
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
+
+    def _kill_on_timeout():
+        try:
+            process.wait(timeout=BENCHMARK_SERVING_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            logger.error(
+                f"Benchmark hung past {BENCHMARK_SERVING_TIMEOUT}s, killing "
+                f"process group {process.pid}"
+            )
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError) as e:
+                logger.error(f"killpg failed: {e}")
+
+    watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+    watchdog.start()
+
     try:
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
@@ -883,6 +907,40 @@ def assert_metrics(self, metrics):
         )
 
 
+def _collect_process_tree(root_pid):
+    """Snapshot every PID under ``root_pid`` while they are still children.
+
+    A crashed scheduler can leave deep-ep/HCCL workers re-parented to init;
+    ``kill_process_tree`` walks the live parent->child links and misses those
+    orphans. Recording the tree at launch lets ``tearDownClass`` SIGKILL the
+    same PIDs later even after re-parenting.
+    """
+    pids = {root_pid}
+    try:
+        root = psutil.Process(root_pid)
+    except psutil.NoSuchProcess:
+        return pids
+    try:
+        for child in root.children(recursive=True):
+            pids.add(child.pid)
+    except psutil.NoSuchProcess:
+        pass
+    return pids
+
+
+def _kill_recorded_pids(pids):
+    """Best-effort SIGKILL of a previously recorded PID snapshot.
+
+    Complements ``kill_process_tree`` so re-parented orphans that still hold
+    the runner's stdout pipe (or NPU device memory) do not wedge the suite.
+    """
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -1061,6 +1119,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             other_args=other_args,
             env=env,
         )
+        cls._server_pids = _collect_process_tree(cls.process.pid)
 
     @classmethod
     def tearDownClass(cls):
@@ -1069,6 +1128,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+            _kill_recorded_pids(getattr(cls, "_server_pids", set()))
         cls._save_metrics_json()
         cls._backup_plog()
 
