@@ -4,7 +4,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_schedule,
     get_serving,
     get_spec,
@@ -12,6 +11,7 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
 )
 from sglang.srt.utils.common import (
     Range,
@@ -67,6 +67,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TypeAlias,
     Union,
 )
 
@@ -145,6 +146,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
+_MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
 
@@ -314,8 +316,12 @@ class MultimodalInputFormat(Enum):
     PRECOMPUTED_EMBEDDING = auto()
 
 
-@dataclasses.dataclass
-class MultimodalDataItem:
+# Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
+# containers intentionally decode as lists, matching msgpack's native model.
+MultimodalDataValue: TypeAlias = object
+
+
+class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
@@ -326,39 +332,51 @@ class MultimodalDataItem:
     """
 
     modality: Modality
-    hash: int = None
-    pad_value: int = None
-    offsets: Optional[list] = None
+    hash: Optional[int] = None
+    pad_value: Optional[int] = None
+    offsets: Optional[List[Tuple[int, int]]] = None
 
     format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
-    feature: Union[torch.Tensor, np.ndarray] = None
+    feature: Optional[MultimodalDataValue] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
-    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[MultimodalDataValue] = None
+    # Keep precomputed_embeddings on GPU after use (EPD pool/GPU receive path)
+    keep_device_embedding: bool = False
 
-    # Model-specific data stored in a dictionary
-    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
+    # precise union with multiple custom types, but accepts Ext-decoded values
+    # under object.
+    model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
+        default_factory=dict
+    )
 
-    def __getattr__(self, name: str):
-        if (
-            "model_specific_data" in self.__dict__
-            and name in self.__dict__["model_specific_data"]
-        ):
-            return self.__dict__["model_specific_data"][name]
+    def __post_init__(self) -> None:
+        if self.hash is not None:
+            msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+
+    def __getattr__(self, name: str) -> MultimodalDataValue:
+        if name in self.model_specific_data:
+            return self.model_specific_data[name]
+
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{name}'"
+        )
+
+    def __setattr__(self, name: str, value: MultimodalDataValue) -> None:
+        if name in self.__struct_fields__:
+            if name == "hash" and isinstance(value, int):
+                value &= _MM_HASH_MASK
+            msgspec.Struct.__setattr__(self, name, value)
         else:
-            raise AttributeError(
-                f"'{self.__class__.__name__}' object has no attribute '{name}'"
-            )
+            self.model_specific_data[name] = value
 
-    def __setitem__(self, key: str, value: Any):
-        if key in self.__dict__:
-            self.__dict__[key] = value
-        else:
-            self.model_specific_data[key] = value
+    def __setitem__(self, key: str, value: MultimodalDataValue) -> None:
+        setattr(self, key, value)
 
-    def set(self, key: str, value: Any):
+    def set(self, key: str, value: MultimodalDataValue) -> None:
         self.__setitem__(key, value)
 
     def set_hash(self, hash_value: int) -> None:
@@ -372,9 +390,6 @@ class MultimodalDataItem:
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        """
-        Set the pad value after first hashing the data
-        """
         if self.pad_value is not None:
             return
 
@@ -494,8 +509,9 @@ class MultimodalDataItem:
         return min(requested_count, proxy_count)
 
 
-@dataclasses.dataclass
-class MultimodalProcessorOutput:
+class MultimodalProcessorOutput(
+    msgspec.Struct, kw_only=True, dict=True, array_like=True, weakref=True
+):
     """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
@@ -722,9 +738,6 @@ class MultimodalInputs:
         return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
-        """
-        merge image inputs when requests are being merged
-        """
 
         # args needed to be merged
         optional_args = [
@@ -1233,11 +1246,7 @@ class Req(ReqDllmMixin):
         return self.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
-        """Update the speculative decoding acceptance histogram.
-
-        Args:
-            num_correct_drafts: Number of correct draft tokens (no bonus) in this step.
-        """
+        """Record one step accepted draft count (excludes bonus token) into the histogram."""
         if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
             self.spec_correct_drafts_histogram.extend(
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
@@ -1459,9 +1468,6 @@ class Req(ReqDllmMixin):
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
-        """
-        Check if the suffix of tail_str overlaps with any stop_str prefix
-        """
         if not self.sampling_params.stop_strs:
             return False
 
@@ -1924,7 +1930,7 @@ def release_req(
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     backup_saved = True
-    if server_args.disaggregation_mode == "decode" and offload_kv:
+    if get_disagg().disaggregation_mode == "decode" and offload_kv:
         backup_saved = retraction_backup(
             req,
             tree_cache,
@@ -2645,7 +2651,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
-            assert i % chunk_size == 0
+            # h is indexed relative to the extend start, so check that offset.
+            assert (i - len(req.prefix_indices)) % chunk_size == 0, (
+                f"The force track calculation only handles last-position or "
+                f"unaligned seqlens, so it needs a chunk-aligned offset to "
+                f"start from. But i={i} prefix_len={len(req.prefix_indices)} "
+                f"chunk_size={chunk_size} checkpoint_grid={checkpoint_grid}"
+            )
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
             # 1) aligned with chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
@@ -2820,7 +2832,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        sorted_indices = self._get_decode_retraction_order(self.reqs)
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2880,9 +2892,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
-    def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs
-    ) -> List[int]:
+    def _get_decode_retraction_order(reqs: List[Req]) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
         The retraction loop pops from the end of this list, so the least-preferred
@@ -2895,15 +2905,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
 
-        if server_args.retraction_policy == "priority":
-            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        if get_schedule().retraction_policy == "priority":
+            priority_sign = (
+                1 if get_schedule().schedule_low_priority_values_first else -1
+            )
 
             def retraction_key(req: Req) -> Tuple[int, int, int]:
                 priority = req.priority
                 if priority is None:
                     priority = (
                         sys.maxsize
-                        if server_args.schedule_low_priority_values_first
+                        if get_schedule().schedule_low_priority_values_first
                         else -sys.maxsize - 1
                     )
                 return (priority * (-priority_sign), *length_key(req))
@@ -3107,7 +3119,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if mamba_extra_buffer_enabled():
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(

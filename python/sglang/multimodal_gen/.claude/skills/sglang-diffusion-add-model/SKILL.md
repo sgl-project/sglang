@@ -120,7 +120,7 @@ Once you have the reference code, study it thoroughly:
 **Before creating any new files, check whether an existing pipeline or stage can be reused or extended.** Only create new pipelines/stages when the existing ones would require extensive modifications or when no similar implementation exists.
 
 Specifically:
-1. **Compare the new model's architecture against existing pipelines** before creating files. Current native families include MiniMax-H3, Krea-2, LTX-2/2.3, HunyuanVideo/FastHunyuan, Wan/FastWan/TurboWan/LingBot World/LingBot Video MoE, MOVA, FLUX/FLUX.2/Klein, Z-Image, Qwen-Image/edit/layered, GLM-Image, SD3, Hunyuan3D, Helios, Cosmos3, SANA/SANA-WM, FireRed, ERNIE-Image, JoyAI, and Ideogram4. If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
+1. **Compare the new model's architecture against existing pipelines** before creating files. Current native families include MiniMax-H3, Krea-2, LTX-2/2.3/2.5, HunyuanVideo/FastHunyuan, Wan/FastWan/TurboWan/LingBot World/LingBot Video MoE, MOVA, FLUX/FLUX.2/Klein, LongCat-Image, Z-Image, Qwen-Image/edit/layered, GLM-Image, SD3, Hunyuan3D, Helios, Cosmos3 Nano/Super/Edge/distilled, SANA/SANA-Video/SANA-WM, FireRed, ERNIE-Image, JoyAI, and Ideogram4. If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
    - Adding a new config variant to the existing pipeline rather than creating a new pipeline class
    - Reusing the existing `BeforeDenoisingStage` with minor parameter differences
    - Using `add_standard_t2i_stages()` / `add_standard_ti2i_stages()` / `add_standard_ti2v_stages()` if the model fits standard patterns
@@ -574,6 +574,39 @@ After implementation, **you must verify that the generated output is not noise**
 2. Running the Diffusers pipeline and SGLang pipeline side-by-side with the same seed
 3. Checking each stage's output shape and value range independently
 
+### Step 10: Decide the ComfyUI Route (Optional)
+
+A model is reachable from ComfyUI two ways. Pick one deliberately — the wrong
+choice costs several hundred lines of weight-mapping code that buys nothing.
+
+**Server route.** ComfyUI sends an HTTP request and SGLang runs the whole
+pipeline. Choose this when the model needs conditioning ComfyUI cannot supply
+(audio, reference materials, task routing), produces more than one modality,
+or has its own request contract.
+
+Cost: nothing, if the request fits the existing `generate_image` /
+`generate_video` fields. If the model has extra request fields, pass them
+through `extra_fields` — the request schemas accept unknown keys, so the
+client in `apps/ComfyUI_SGLDiffusion/core/server_api.py` does **not** need a
+per-model change. Add a node in `nodes.py` only when the inputs are worth
+surfacing as ComfyUI widgets. `SGLDiffusionGenerateH3` is the worked example.
+
+**Executor route.** ComfyUI's KSampler drives the denoise loop and SGLang
+replaces the DiT forward, using ComfyUI's own text encoders and VAE. Choose
+this only when the model denoises a single latent tensor that ComfyUI already
+knows how to build and decode.
+
+Cost, per model: a `runtime/pipelines/comfyui_<model>_pipeline.py` that maps
+ComfyUI's single-file checkpoint layout onto the native module tree (350-690
+lines in the existing three), an executor in
+`apps/ComfyUI_SGLDiffusion/executors/` that adapts latent layout and
+conditioning to `Req`, and entries in both dicts in `core/generator.py`.
+
+The deciding question is not model size or modality — it is whether ComfyUI's
+sampler can drive the model's loop unchanged. If reproducing the conditioning
+inside ComfyUI would duplicate stages the server already runs, take the server
+route.
+
 ## Reference Implementations
 
 ### Hybrid Style (recommended for most new models)
@@ -583,6 +616,7 @@ After implementation, **you must verify that the generated output is not noise**
 | GLM-Image | `runtime/pipelines/glm_image.py` | `stages/model_specific_stages/glm_image.py` | `configs/pipeline_configs/glm_image.py` |
 | Qwen-Image-Layered | `runtime/pipelines/qwen_image.py` (`QwenImageLayeredPipeline`) | `stages/model_specific_stages/qwen_image_layered.py` | `configs/pipeline_configs/qwen_image.py` (`QwenImageLayeredPipelineConfig`) |
 | Cosmos3 | `runtime/pipelines/cosmos3_pipeline.py` | `stages/model_specific_stages/cosmos3.py` | `configs/pipeline_configs/cosmos3.py` |
+| LongCat-Image | `runtime/pipelines/longcat_image.py` | `stages/model_specific_stages/longcat_image.py` | `configs/pipeline_configs/longcat_image.py` |
 | ErnieImage | `runtime/pipelines/ernie_image.py` | `stages/model_specific_stages/ernie_image_pe.py` | `configs/pipeline_configs/ernie_image.py` |
 | Hunyuan3D | `runtime/pipelines/hunyuan3d_pipeline.py` | `stages/model_specific_stages/hunyuan3d/` | `configs/pipeline_configs/hunyuan3d.py` |
 | SANA-WM | `runtime/pipelines/sana_wm_pipeline.py`, `sana_wm_realtime_pipeline.py` | `stages/model_specific_stages/sana_wm/` | `configs/pipeline_configs/sana_wm.py` |
@@ -600,8 +634,9 @@ After implementation, **you must verify that the generated output is not noise**
 | Z-Image | `runtime/pipelines/zimage_pipeline.py` | Uses standard image pipeline stages plus Z-Image-specific config/model code |
 | Ideogram4 | `runtime/pipelines/ideogram.py` | Uses dedicated text encoding and denoising stages while keeping standard latent prep |
 | SANA | `runtime/pipelines/sana.py` | Spatial image pipeline; reuse the spatial image config pattern |
+| SANA-Video | `runtime/pipelines/sana_video.py` | Native 3D transformer with model-specific text encoding and otherwise standard T2V stages |
 | Stable Diffusion 3/3.5 | `runtime/pipelines/stable_diffusion_3.py` | Spatial image pipeline; compare scheduler, VAE scale, and conditioning layout |
-| LTX-2 / LTX-2.3 | `runtime/pipelines/ltx_2_pipeline.py` | Video pipeline family with one-stage, two-stage, and HQ variants |
+| LTX-2 / LTX-2.3 / LTX-2.5 | `runtime/pipelines/ltx_2_pipeline.py` | Video pipeline family with one-stage, two-stage, HQ, joint audio/video, and optional LTX-2.5 diffusion-decoder variants; prefer config/loader specialization over a new pipeline |
 | Helios | `runtime/pipelines/helios_pipeline.py` | Video pipeline family with custom denoising and decoding stages |
 | FireRed/JoyAI image edit | `runtime/pipelines/qwen_image.py`, `runtime/pipelines/joy_image.py` | FireRed reuses Qwen edit-plus config; JoyAI has its own edit pipeline |
 | Wan | `runtime/pipelines/wan_pipeline.py` | Uses `add_standard_ti2v_stages()` |
