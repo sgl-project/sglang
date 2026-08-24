@@ -298,6 +298,14 @@ layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
 selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
 this mixed per-layer layout.
 
+W4A8 ConvRot DiT files use the same flagless flow. With
+`comfy-kitchen>=0.2.27`, pass a file such as
+`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
+and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
+subject to each row-parallel shard preserving the checkpoint's ConvRot group
+boundary, and FSDP is rejected.
+
 ### Advanced: precomputed AdaLN cache
 
 The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
