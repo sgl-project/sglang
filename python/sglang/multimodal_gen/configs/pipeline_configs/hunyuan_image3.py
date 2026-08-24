@@ -28,7 +28,7 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
     vae_precision: str = "fp32"  # VAE uses float32 per HF config
 
     should_use_guidance: bool = True
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     vae_tiling: bool = False
     vae_sp: bool = False
