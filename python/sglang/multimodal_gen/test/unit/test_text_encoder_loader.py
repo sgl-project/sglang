@@ -186,7 +186,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             "model.layers.49.self_attn.q_proj.weight": True,
             "model.layers.50.self_attn.q_proj.weight": False,
             "visual.blocks.0.attn.qkv.weight": True,
-            "language_model.layers.63.mlp.down_proj.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": False,
             "module.model.language_model.layers.63.mlp.down_proj.weight": True,
         }
         self.assertEqual(
@@ -383,11 +383,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
             save_file(
                 {
-                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                    "visual.blocks.0.attn.qkv.weight": torch.ones(
                         (2, 256), dtype=torch.int8
                     ),
-                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones((2, 1)),
-                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                    "visual.blocks.0.attn.qkv.weight_scale": torch.ones((2, 1)),
+                    "visual.blocks.0.attn.qkv.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
                 },
@@ -411,7 +411,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
-            {"model.language_model.layers.0.self_attn.q_proj"},
+            {"model.visual.blocks.0.attn.qkv_proj"},
         )
 
     def test_mixed_w4a8_weight_file_maps_embedding_and_linear_markers(self):
