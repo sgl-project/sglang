@@ -208,6 +208,7 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_SERVING_TIMEOUT = 3600
+BENCHMARK_STDOUT_DRAIN_GRACE = 10
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -490,6 +491,14 @@ def run_bench_serving(
         start_new_session=True,
     )
 
+    reader_done = threading.Event()
+
+    def _kill_benchmark_group():
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            logger.error(f"killpg failed: {e}")
+
     def _kill_on_timeout():
         try:
             process.wait(timeout=BENCHMARK_SERVING_TIMEOUT)
@@ -498,10 +507,18 @@ def run_bench_serving(
                 f"Benchmark hung past {BENCHMARK_SERVING_TIMEOUT}s, killing "
                 f"process group {process.pid}"
             )
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError) as e:
-                logger.error(f"killpg failed: {e}")
+            _kill_benchmark_group()
+            return
+        # The direct child exited, but a re-parented descendant may still hold
+        # the stdout pipe open and wedge the reader below. Give it a short
+        # grace period to drain; if the reader is still stuck, nuke the group
+        # to force EOF on the pipe.
+        if not reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+            logger.error(
+                f"Benchmark stdout still open after process exit, killing "
+                f"process group {process.pid}"
+            )
+            _kill_benchmark_group()
 
     watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
     watchdog.start()
@@ -532,6 +549,7 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+        reader_done.set()
         process.wait()
         if process.returncode != 0:
             logger.error(
@@ -540,6 +558,7 @@ def run_bench_serving(
     except Exception as e:
         logger.error(f"Error running benchmark: {e}")
     finally:
+        reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
@@ -824,6 +843,22 @@ def run_aisbench(
         raise
 
 
+def _metric_float(metrics, key):
+    """Return ``float(metrics[key])`` or fail cleanly when the metric is missing.
+
+    A benchmark that timed out (or was SIGKILLed by the watchdog) leaves its
+    metrics dict entries as ``None``; ``float(None)`` would otherwise raise an
+    opaque ``TypeError`` instead of a meaningful assertion failure.
+    """
+    value = metrics.get(key)
+    if value is None:
+        raise AssertionError(
+            f"Benchmark metric '{key}' is missing; the benchmark likely timed "
+            "out or was killed before producing results."
+        )
+    return float(value)
+
+
 def assert_metrics(self, metrics):
     """Assert benchmark metrics against expected values.
 
@@ -882,27 +917,27 @@ def assert_metrics(self, metrics):
     if self.tpot:
         if self.tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
-                float(metrics["mean_tpot"]),
+                _metric_float(metrics, "mean_tpot"),
                 self.tpot + TPOT_TOLERANCE_LOW,
             )
         else:
             self.assertLessEqual(
-                float(metrics["mean_tpot"]),
+                _metric_float(metrics, "mean_tpot"),
                 self.tpot * TPOT_TOLERANCE_HIGH,
             )
     if self.output_token_throughput:
         self.assertGreaterEqual(
-            float(metrics["total_tps"]),
+            _metric_float(metrics, "total_tps"),
             self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
     if self.ttft:
         self.assertLessEqual(
-            float(metrics["mean_ttft"]),
+            _metric_float(metrics, "mean_ttft"),
             self.ttft * TTFT_TOLERANCE,
         )
     if self.mean_e2e_latency:
         self.assertLessEqual(
-            float(metrics["mean_e2e_latency"]),
+            _metric_float(metrics, "mean_e2e_latency"),
             self.mean_e2e_latency * E2E_TOLERANCE,
         )
 
@@ -910,34 +945,53 @@ def assert_metrics(self, metrics):
 def _collect_process_tree(root_pid):
     """Snapshot every PID under ``root_pid`` while they are still children.
 
+    Returns a mapping ``{pid: create_time}``. Recording ``create_time`` lets
+    ``_kill_recorded_pids`` skip a PID that has since been recycled, avoiding
+    an accidental SIGKILL of an unrelated process.
+
     A crashed scheduler can leave deep-ep/HCCL workers re-parented to init;
     ``kill_process_tree`` walks the live parent->child links and misses those
     orphans. Recording the tree at launch lets ``tearDownClass`` SIGKILL the
     same PIDs later even after re-parenting.
     """
-    pids = {root_pid}
+    procs = {}
     try:
         root = psutil.Process(root_pid)
     except psutil.NoSuchProcess:
         logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} not found")
-        return pids
+        return procs
     try:
-        for child in root.children(recursive=True):
-            pids.add(child.pid)
+        for proc in [root] + root.children(recursive=True):
+            try:
+                procs[proc.pid] = proc.create_time()
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+                logger.info(f"[cleanup-debug] _collect_process_tree: skip PID {proc.pid} ({exc.__class__.__name__})")
     except psutil.NoSuchProcess:
         logger.info(f"[cleanup-debug] _collect_process_tree: root_pid {root_pid} vanished while walking children")
-    logger.info(f"[cleanup-debug] _collect_process_tree: recorded PIDs {sorted(pids)}")
-    return pids
+    logger.info(f"[cleanup-debug] _collect_process_tree: recorded PIDs {sorted(procs)}")
+    return procs
 
 
-def _kill_recorded_pids(pids):
+def _kill_recorded_pids(procs):
     """Best-effort SIGKILL of a previously recorded PID snapshot.
 
+    ``procs`` maps ``pid -> create_time``; the recorded ``create_time`` is
+    re-checked before killing so a recycled PID is never killed by mistake.
     Complements ``kill_process_tree`` so re-parented orphans that still hold
     the runner's stdout pipe (or NPU device memory) do not wedge the suite.
     """
-    logger.info(f"[cleanup-debug] _kill_recorded_pids: attempting SIGKILL on {sorted(pids)}")
-    for pid in pids:
+    logger.info(f"[cleanup-debug] _kill_recorded_pids: attempting SIGKILL on {sorted(procs)}")
+    for pid, create_time in procs.items():
+        try:
+            if psutil.Process(pid).create_time() != create_time:
+                logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} (create_time mismatch, likely reused)")
+                continue
+        except psutil.NoSuchProcess:
+            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} (no longer exists)")
+            continue
+        except psutil.AccessDenied as exc:
+            logger.info(f"[cleanup-debug] _kill_recorded_pids: skip PID {pid} ({exc.__class__.__name__})")
+            continue
         try:
             os.kill(pid, signal.SIGKILL)
             logger.info(f"[cleanup-debug] _kill_recorded_pids: SIGKILL sent to PID {pid}")
@@ -1129,10 +1183,17 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             try:
+                # Union the launch-time snapshot (catches re-parented orphans)
+                # with the current child tree (catches workers spawned lazily
+                # after launch) before tearing the server down.
+                cls._server_pids = {
+                    **getattr(cls, "_server_pids", {}),
+                    **_collect_process_tree(cls.process.pid),
+                }
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
-            _kill_recorded_pids(getattr(cls, "_server_pids", set()))
+            _kill_recorded_pids(getattr(cls, "_server_pids", {}))
         cls._save_metrics_json()
         cls._backup_plog()
 
