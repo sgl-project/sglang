@@ -1733,13 +1733,6 @@ class Req(ReqDllmMixin):
             return None
         return req_to_token_pool.mamba_pool
 
-    def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
-        if allocator.get_kvcache().cpu_copy_carries_mamba:
-            return None
-        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
-            return None
-        return req_to_token_pool.mamba_pool
-
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
