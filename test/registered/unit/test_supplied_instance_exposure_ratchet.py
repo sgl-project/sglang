@@ -187,7 +187,6 @@ _EXPOSED = {
     ("weight_cache/daemon.py", "dtype"),
     ("weight_cache/daemon.py", "enable_dp_attention"),
     ("weight_cache/daemon.py", "enable_dp_lm_head"),
-    ("weight_cache/daemon.py", "enable_eplb"),
     ("weight_cache/daemon.py", "ep_size"),
     ("weight_cache/daemon.py", "load_format"),
     ("weight_cache/daemon.py", "model_path"),
@@ -196,7 +195,6 @@ _EXPOSED = {
     ("weight_cache/daemon.py", "moe_dp_size"),
     ("weight_cache/daemon.py", "pp_size"),
     ("weight_cache/daemon.py", "quantization"),
-    ("weight_cache/daemon.py", "random_seed"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
