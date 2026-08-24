@@ -306,6 +306,12 @@ and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
 subject to each row-parallel shard preserving the checkpoint's ConvRot group
 boundary, and FSDP is rejected.
 
+W4A4 ConvRot files are also detected from their layer metadata. Install a
+current `comfy-kitchen`, then pass a full or pruned FL2VA / Ref2VA file such as
+`Merserk/MiniMax-H3-INT4-ConvRot/minimax_h3_fl2va_pruned_int4_convrot.safetensors`
+to `--transformer-weights-path`. The packed weights stay INT4 and the runtime
+honors each layer's activation mode; omit `--quantization`.
+
 ### Advanced: precomputed AdaLN cache
 
 The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
@@ -968,6 +974,29 @@ The mixed W4A8 community encoder follows the same component-path contract:
 Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
 loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
 vision tower remains BF16.
+
+W4A4 Qwen3-VL files use the same overlay, for example:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Merserk/MiniMax-H3-INT4-ConvRot/qwen3vl_32b_minimax_h3_int4_convrot.safetensors
+```
+
+This checkpoint keeps its unmarked embedding and vision tower in their source
+precision; no explicit component quantization option is needed.
+
+The same component option accepts a self-describing Quanto qint8 file without
+an additional quantization flag:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors
+```
+
+This variant keeps the declared language and vision linear weights in qint8
+storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
+it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
+is the selector; adding `--quantization` would describe a different operation.
 
 </Tab>
 
