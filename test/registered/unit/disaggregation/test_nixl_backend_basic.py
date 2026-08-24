@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    _is_single_contiguous_pair,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -107,6 +108,17 @@ def _fake_staging_buffer_module(mock_gather=None):
 
 
 class TestNixlTransferInfo(CustomTestCase):
+    def test_single_contiguous_pair(self):
+        def arr(values):
+            return np.array(values, dtype=np.int32)
+
+        self.assertTrue(_is_single_contiguous_pair(arr([3, 4]), arr([7, 8])))
+        self.assertFalse(_is_single_contiguous_pair(arr([3, 5]), arr([7, 9])))
+        self.assertFalse(_is_single_contiguous_pair(arr([3, 4]), arr([7, 9])))
+        self.assertFalse(_is_single_contiguous_pair(arr([3]), arr([7])))
+        self.assertFalse(_is_single_contiguous_pair(arr([]), arr([])))
+        self.assertFalse(_is_single_contiguous_pair(arr([3, 4]), arr([7])))
+
     def test_from_zmq_parses_required_fields(self):
         kv_indices = np.array([3, 5, 8], dtype=np.int32)
         state_indices = [[1, 2], [], [9]]

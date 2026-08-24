@@ -345,6 +345,15 @@ def repeat_indices_over_layers(
     return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32)
 
 
+def _is_single_contiguous_pair(
+    src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
+) -> bool:
+    """Whether pairwise src/dst indices form one contiguous transfer run."""
+    return src_indices.size == dst_indices.size > 1 and (
+        np.all(np.diff(src_indices) == 1) and np.all(np.diff(dst_indices) == 1)
+    )
+
+
 @dataclasses.dataclass
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
@@ -1477,6 +1486,9 @@ class NixlKVManager(CommonKVManager):
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
+            and not _is_single_contiguous_pair(
+                prefill_data_indices, dst_data_indices
+            )
         ):
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
