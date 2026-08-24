@@ -81,15 +81,14 @@ class ModelConfig:
 
 
 MI30X_MINIMAX_M3_MODELS = [
-    # The threshold is the floor the block-fp8 path is documented to clear, not a
-    # tight bound: the cookbook's MI300X card reports GSM8K 0.917-0.929 on the
-    # legacy few-shot harness (aiter ~0.929), and chat+thinking scores well above
-    # its own few-shot number (0.972 vs ~0.87 on MI35x). Tighten once a nightly
-    # run establishes what this configuration actually returns.
+    # 0.95 sits ~2 points under the 0.973 this configuration measured on MI300X
+    # (run 32740768200, full 1319 questions, 0 invalid), the same margin the MI35x
+    # M3 test keeps against its 0.972. The block-fp8 conversion gfx942 applies at
+    # load therefore costs nothing measurable here versus gfx950's native MX path.
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M3-MXFP8",
         tp_size=8,
-        accuracy_threshold=0.93,
+        accuracy_threshold=0.95,
         timeout=7200,
         variant="TP8+MXFP8->blockFP8+aiterAttn+tritonMoE",
         other_args=[
