@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     remote_instance_transfer_engine_enabled,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
+    server_args: ServerArgs
     get_model: Callable[[], torch.nn.Module]
     # Registration may run after the runner's construction scope has exited.
     tp_rank: int = field(init=False, default_factory=lambda: get_parallel().tp_rank)
