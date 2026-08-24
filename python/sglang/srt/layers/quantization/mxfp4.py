@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -51,6 +52,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_device_capability,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -72,6 +74,48 @@ has_triton_kernels = is_triton_kernels_available()
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
 # post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
 _UE8M0_ONE = 127
+
+
+@lru_cache(maxsize=1)
+def _is_sm107_supported() -> bool:
+    return get_device_capability() == (10, 7)
+
+
+def _prepare_flashinfer_mxfp8_activations(
+    x: torch.Tensor, hidden_size: int
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    prepared = None
+    if x.shape[-1] == hidden_size:
+        if x.dim() > 2:
+            x = x.view(-1, x.shape[-1])
+        # K3's routing dispatch may already have quantized these rows and
+        # packed the topk ids. Other models use FlashInfer's own activation
+        # preparation so the producer matches the fused-MoE input contract.
+        from sglang.srt.layers.moe import route_quant_handoff
+
+        prepared = route_quant_handoff.take(x)
+
+    if prepared is not None:
+        prepared_packed_topk, x_quant, x_scale = prepared
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mxfp8_quantize,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
+        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+    else:
+        from sglang.kernels.ops.quantization.per_token_group_quant import (
+            per_token_group_quant,
+        )
+
+        prepared_packed_topk = None
+        x_quant, x_scale = per_token_group_quant(x, group_size=32, scale_ue8m0=True)
+        x_scale = x_scale.view(torch.float8_e4m3fn)
+
+    return x, prepared_packed_topk, x_quant, x_scale
 
 
 if is_flashinfer_available():
@@ -1464,40 +1508,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                if x.shape[-1] == self.hidden_size:
-                    if x.dim() > 2:
-                        x = x.view(-1, x.shape[-1])
-                    # K3 staged fusion (route_quant_handoff): the routing
-                    # dispatch already quantized these rows and packed the
-                    # topk ids in the fused route launch — consume both and
-                    # skip the two standalone kernels. Identity-verified;
-                    # a miss runs the unfused chain below.
-                    from sglang.srt.layers.moe import route_quant_handoff
-
-                    prepared = route_quant_handoff.take(x)
-                    if prepared is not None:
-                        prepared_packed_topk, x_quant, x_scale = prepared
-                        x_scale = x_scale.view(torch.float8_e4m3fn)
-                    else:
-                        from sglang.kernels.ops.quantization.per_token_group_quant import (
-                            per_token_group_quant,
-                        )
-
-                        x_quant, x_scale = per_token_group_quant(
-                            x, group_size=32, scale_ue8m0=True
-                        )
-                        x_scale = x_scale.view(torch.float8_e4m3fn)
-                else:
-                    from sglang.srt.layers.quantization.fp8_utils import (
-                        flashinfer_mxfp8_quantize,
-                    )
-
-                    x_quant, x_scale = flashinfer_mxfp8_quantize(
-                        x, False, alignment=self.hidden_size
-                    )
-                    x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
-                        *x.shape[:-1], -1
-                    )
+                x, prepared_packed_topk, x_quant, x_scale = (
+                    _prepare_flashinfer_mxfp8_activations(x, self.hidden_size)
+                )
             else:
                 raise NotImplementedError()
 

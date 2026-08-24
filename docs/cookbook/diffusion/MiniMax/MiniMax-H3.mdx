@@ -5,9 +5,43 @@ metatags:
     description: "Serve MiniMax-H3 with SGLang Diffusion for text-to-video-and-audio, first/last-frame conditioning, video-to-video, and multimodal reference conditioning."
 ---
 
-## 1. Model introduction
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
-[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) generates a video and a synchronized stereo audio track in one request. SGLang Diffusion provides a native pipeline for the three public task profiles, split across the released FL2VA (First-and-Last-Frame-to-Video-and-Audio) and Ref2VA (Reference-to-Video-and-Audio) checkpoint partitions:
+<DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
+
+## 1. Quick start
+
+Install with `uv pip install "sglang[diffusion]" --prerelease=allow`, then choose
+a verified recipe below. Setup changes the deployment; Server and Request expose
+orthogonal startup and sampling choices.
+
+<Deployment config={config} />
+
+<Note>
+The generated Server command already includes the recommended encoder policy.
+Change a Server option only for a deliberate trade-off; Request options do not
+reload the model.
+</Note>
+
+The Docker form installs the platform-specific diffusion extra from the source
+bundled in the image. For conditioned requests, set **Host media directory**
+under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
+AMD currently offers the Python form, while NVIDIA also offers Docker.
+
+To use ModelScope through the same normal `sglang serve` path, prefix the copied
+command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
+`MiniMax/MiniMax-H3`. Keep the selected variant and topology flags unchanged.
+
+For platform-specific installation details, see the
+[SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 2. Model capabilities
+
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is a native joint video-and-audio model for text-to-video-and-audio, first/last-frame control, and multimodal reference conditioning. Its main strength is producing the picture and stereo soundtrack together, so speech, music, ambient sound, and visible events can stay aligned without a separate audio-generation pass.
+
+Choose H3 when synchronized audiovisual output or reference-driven generation matters more than a lightweight deployment. The released recipe targets a 768-pixel short edge at 24 fps for 4–15 seconds, and its capabilities are split across two checkpoint partitions; serving every mode therefore requires separate FL2VA and Ref2VA deployments.
 
 | Task | `task` value | Conditioning |
 | --- | --- | --- |
@@ -29,62 +63,12 @@ mapping; do not point `--model-path` at a manually downloaded subdirectory.
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
-## 2. Installation
+## 3. Deployment details
 
-Install SGLang with the diffusion dependencies:
-
-```bash Command
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
-## 3. Serve MiniMax-H3
-
-Use the interactive selector to choose a hardware platform, deployment profile,
-one of the two checkpoint partitions, a request mode, and deployment features.
-It generates Python and, where available, Docker launch forms. AMD selections
-use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
-button follows the selected request mode and switches the payload across
-text-only, all three first/last-frame signatures, and the image/audio/video
-reference combinations listed below.
-Set **Outputs per prompt** in the picker’s **Env** panel to generate more than
-one output without mixing request sampling controls into the deployment
-matrix.
-
-The Docker form does not assume the base SGLang image contains optional
-diffusion dependencies. It installs the platform-specific diffusion extra from
-the source bundled in the image before starting the server. Set **Host media
-directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
-that directory read-only at `/data/minimax-h3` inside the container.
-
-Every hardware/topology cell in this picker has completed a real request on
-that exact GPU model. Approximate load-time features such as online
-quantization are called out separately in the generated command. Sampling
-behavior such as Cache-DiT is documented separately below.
-
-**Deployment Profile** exposes resident and FSDP placement on B200, B300,
-H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. On H200 it
-also selects the verified 2-node cross-node topology. **Online
-Quantization** appears only on B200 and B300. AMD keeps its resident AITER
-recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
-
-import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
-
-<Deployment config={config} />
-
-<Note>
-The ready-to-run request template lives behind the **$ cURL** button in the
-picker above. It regenerates as you change the selection, so the payload it
-shows always matches the serve command next to it.
-</Note>
-
-The selector uses the verified Hugging Face ID. To use ModelScope through the
-same normal `sglang serve` path, prefix the copied command with
-`SGLANG_USE_MODELSCOPE=true` and replace the model path with
-`MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
+The builder accepts legal custom GPU counts and topologies, marking them
+**Unverified** until the exact recipe has completed end-to-end validation.
+Static H3 head or partition violations disable Copy before they reach
+`sglang serve`.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident by default.
 The model fits without FSDP, so this path avoids the per-block parameter
@@ -96,6 +80,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -119,6 +104,7 @@ sglang serve \
   --num-gpus 4 \
   --tp-size 2 \
   --ulysses-degree 2 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -134,6 +120,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference true \
   --port 30010
@@ -151,6 +138,7 @@ sglang serve \
   --num-gpus 2 \
   --tp-size 2 \
   --ulysses-degree 1 \
+  --encoder-parallel auto \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder,vae \
   --dit-offload-prefetch-size 1 \
@@ -168,11 +156,155 @@ transfer overhead. This exact recipe was validated on
 2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine. The
 latency and memory comparison is collected in the benchmark section below.
 
+For a single 24 GB consumer card (RTX 4090), stream the DiT and text encoder
+and quantize DiT linear layers online with `kitchen_int8`. Keep `vae` out of
+`--layerwise-offload-components`: putting the VAE decoder in layerwise
+offload re-streams about 9 GiB on each of 167 decode tiles. Default
+attention stays `fa` (exact). Approximate backends are opt-in; see
+[Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
+Install `comfy-kitchen` first (`pip install comfy-kitchen`).
+
+```bash 1×RTX 4090 24GB
+sglang generate \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --quantization kitchen_int8 \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+The same flags work on `sglang serve`. Drop `--quantization` for the BF16
+baseline; everything else stays identical. GPU peak stays about 18 GB
+either way because streaming offload is set by the offload buffers and VAE
+decode, not the weight dtype.
+
+### Pre-quantized GGUF transformer
+
+Use `--transformer-weights-path` to replace only the DiT with a GGUF file; the
+base repository continues to provide the text encoder, VAEs, scheduler, and
+tokenizers. Do not also pass `--quantization gguf`.
+
+```bash 1×RTX 5090 Q4_K_M
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The loader also recognizes pruned checkpoints that replace the timestep MLP
+with `adaln_t_table`. Repositories containing both FL2VA and Ref2VA variants
+need a full file reference:
+
+```bash Pruned FL2VA Q4_K
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The linear adapter reuses SRT's GGUF type definitions and CUDA dequantization,
+then runs the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
+regime and are slower at diffusion sequence lengths. TP is supported when each
+row-parallel input shard remains GGML-block aligned; incompatible degrees fail
+during model construction. FSDP, LoRA merging, and the separate MiniMax-H3
+AdaLN cache flags are not compatible with packed GGUF weights.
+
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.
 
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+
+### AdaLN-pruned safetensors transformers
+
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
+publishes smaller DiT-only checkpoints that replace the original AdaLN branches
+with an interpolated curve table. Select one file explicitly; the base model
+still supplies the text encoder and VAEs.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+The pruned checkpoint is approximate and is therefore rejected by
+`quality="high"`, which remains limited to the audited official BF16 DiT.
+
+The Comfy `pruned_fp8_scaled` FL2VA and Ref2VA files are also supported. Their
+per-layer markers are detected automatically; do not add `--quantization`:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+SGLang uses its native static-activation FP8 linear path when the checkpoint
+stores input scales, and automatically uses dynamic activation scaling for
+Comfy FP8 exports that omit them. The checkpoint above marks `fc2` for
+full-precision matrix multiplication, so
+SGLang retains its FP8 storage but materializes and scales one compute-dtype
+`fc2` matrix for each call. This preserves the checkpoint's mixed execution
+contract and low resident weight memory, but that part is slower than a fully
+quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
+component/layerwise offload are supported; FSDP inference is rejected.
+
+The `pruned_int8_convrot` files use the same override path and are detected
+automatically. Install `comfy-kitchen`, replace the FP8 filename above with
+`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and still omit
+`--quantization`. SGLang loads their serialized INT8 weights and row scales into
+the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
+layerwise offload are supported; TP8 violates the checkpoint's 256-element
+ConvRot group boundary, and FSDP is rejected.
+
+Self-describing community MXFP8 files use the same
+`--transformer-weights-path <repo/file.safetensors>` form and need no
+quantization flag. SGLang reads their global format metadata, keeps unmarked H3
+layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
+selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
+this mixed per-layer layout.
+
+W4A8 ConvRot DiT files use the same flagless flow. With
+`comfy-kitchen>=0.2.27`, pass a file such as
+`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
+and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
+subject to each row-parallel shard preserving the checkpoint's ConvRot group
+boundary, and FSDP is rejected.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -553,6 +685,7 @@ sglang serve \
   --sp-degree 4 \
   --ulysses-degree 4 \
   --ring-degree 1 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference false \
   --enable-torch-compile false \
@@ -637,6 +770,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -650,7 +784,11 @@ task profile. A real B200 request has completed, but the `quality: "high"`
 path above remains fail-closed to the audited 4×H200 workload.
 </Warning>
 
-## 7. Runtime feature recipes
+## 7. Feature contracts and advanced recipes
+
+The generated command already contains the recommended topology and encoder
+setting. Use the detailed reference below only when applying an optional
+override or checking its installation, topology limits, and validation evidence.
 
 <Tabs>
 
@@ -664,11 +802,10 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 | --- | --- | --- |
 | Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`. Combine with Ring for cross-node scaling; see the next row. |
 | Ring sequence parallelism (cross-node) | Verified: 2 nodes of 8× H200 each (Ulysses8 × Ring2) | Use `--ring-degree` together with `--nnodes`/`--node-rank`/`--dist-init-addr`. Ring shards the sequence across nodes while Ulysses shards heads within a node; H3's packed multi-segment attention only supports Ring across the node boundary, not within a single node's Ulysses group. Requires `--encoder-parallel replicate` — `auto`'s fold decision is not node-boundary aware. See the benchmark section below. |
-| SageAttention | Supported | Use `--attention-backend sage_attn` to select the native packed varlen path; install the SageAttention dependency first. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
-| CPU and layerwise offload | Verified: 2× RTX 5090 TP2 | The measured lossless recipe keeps 20 DiT blocks plus both VAE encoders resident, streams the remaining DiT blocks, text encoder, and video VAE decoder blocks, and leaves the small audio VAE resident. This status applies only to the listed topology. |
+| CPU and layerwise offload | Verified: 2× RTX 5090 TP2; 1× RTX 4090 24 GB | The 5090 lossless recipe keeps 20 DiT blocks plus both VAE encoders resident, streams the remaining DiT blocks, text encoder, and video VAE decoder blocks, and leaves the small audio VAE resident. The 4090 recipe streams DiT and the text encoder with zero resident DiT layers and **omits `vae`** from `--layerwise-offload-components`. |
 | Breakable CUDA graph | Verified: B200 Ref2VA, opt-in | Matching eager output was observed for the captured signature, without a measured speedup. Re-capture for other shapes and reference sets. |
 | `torch.compile` | Measured: H200, opt-in | Steady-state benefit was below measurement noise, while startup increased and numerical output changed. Do not use it for consistency ground truth. |
 
@@ -687,6 +824,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --enable-breakable-cuda-graph true \
   --warmup-resolutions 1344x768 \
@@ -700,6 +838,29 @@ different task profile, reference set, resolution, or prompt template.
 
 </Tab>
 
+<Tab title="Attention backends">
+
+Leave `--attention-backend` unset for the platform default. Use
+`--attention-backend fa` only for an explicit FlashAttention comparison.
+
+SageAttention uses quantized attention math and is not a consistency mode. To
+select H3's native packed-varlen Sage path, install the dependency and add
+`--attention-backend sage_attn`. On Hopper, install the upstream SM90 binding
+fix rather than the PyPI 2.2.0 build:
+
+```bash Command
+pip install --force-reinstall \
+  git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 \
+  --no-build-isolation
+```
+
+The backend is a server-wide default. Use
+`--component-attention-backends` only when a measured component needs a
+different kernel, and keep the platform default for every component not named
+in the override.
+
+</Tab>
+
 <Tab title="Online quantization">
 
 On the verified 8× B200 topology, quantize the BF16 transformer at server load:
@@ -710,6 +871,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --quantization fp8 \
   --port 30010
@@ -725,6 +887,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --quantization fp8 \
   --quantization-ignored-layers blocks.0.attn token_refiner \
   --port 30010
@@ -734,9 +897,104 @@ sglang serve \
 Online FP8 is approximate and is not a consistency ground-truth mode. It can
 be combined with Cache-DiT, but the two approximations compound. Validate
 visual quality, audio quality, memory use, and latency on the target workload.
-The picker exposes this option only on the B200 and B300 topologies used for
-real H3 validation runs.
+This recipe is limited to the resident B200 and B300 topologies used for real
+H3 validation runs.
 </Warning>
+
+On a single 24 GB card, use `kitchen_int8` instead of FP8. It quantizes the
+four GEMMs per DiT block online from the Hub BF16 weights (data-free, no
+calibration) and dispatches them through `comfy_kitchen.int8_linear`.
+Quantization happens after H3's grouped `qkv` reorder, so do not load an
+externally pre-quantized INT8 checkpoint here.
+
+```bash Command
+sglang generate \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --quantization kitchen_int8 \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+`fa` keeps exact attention. For a faster, approximate DiT path, use
+`--attention-backend sol_attn` with
+`--attention-backend-config dense_backend=sage_attn,dense_steps=10` and
+`--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn`.
+See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)
+and [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
+
+<Warning>
+`kitchen_int8` changes Linear numerics. `sol_attn` / `sage_attn` also change
+the attention algorithm. Neither is a consistency ground-truth mode. The
+BF16 path is unchanged when `comfy-kitchen` is not installed.
+</Warning>
+
+The Qwen3-VL text encoder can be replaced independently of the DiT. To reduce
+its resident memory, point the text-encoder component at the serialized FP8
+checkpoint used in validation:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+`--text-encoder-path` is accepted as a shorter alias. No separate quantization
+flag is required: SGLang reads the checkpoint's `quantization_config` and
+fails closed if the native encoder does not support that format. The language
+linear layers use FP8 while embeddings, normalization, and the vision tower
+remain BF16. This is an approximate serve-time choice and is incompatible with
+the strict `quality="high"` deployment contract.
+
+The mixed W4A8 community encoder follows the same component-path contract:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
+```
+
+Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
+loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
+vision tower remains BF16.
+
+</Tab>
+
+<Tab title="Encoder scheduling">
+
+The picker explicitly writes `--encoder-parallel auto` in every single-node
+recipe. At the default request batch size of one, H100/H200/B200/B300 servers
+with peer-to-peer access fold the Qwen encoder across otherwise idle Ulysses
+ranks. A pure-TP recipe keeps the encoder inside its TP group, while a
+PCIe-only host can avoid an expensive world fold. Keep `auto` unless one of
+the cases below applies.
+
+Encoder DP is a throughput policy for compatible request batches. It requires
+TP1 and DiT DP1, replicates the encoder weights, and does not improve a batch
+of one:
+
+```bash Overlay
+--encoder-parallel dp \
+--batching-max-size 2
+```
+
+The cross-node picker recipe already uses replication because the automatic
+fold decision is not node-boundary aware:
+
+```bash Overlay
+--encoder-parallel replicate
+```
 
 </Tab>
 
@@ -755,7 +1013,7 @@ real H3 validation runs.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
-- For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
+- For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1. Encoder DP stays inside each DiT replica and composes with encoder TP: the H100 TP2 + Ulysses2 recipe has two TP-sharded encoder copies that can split a batch, while the RTX 5090 pure-TP2 recipe has one encoder copy and therefore no additional batch-DP degree. It provides no benefit for a batch of one and is not bitwise-identical to the unsplit deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
 - `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
@@ -776,6 +1034,7 @@ the configurations with collected measurements:
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
+| RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
 
 ### B300 precision and encoder placement
 
@@ -810,7 +1069,7 @@ The swept axes are `--model-variant` (`fl2va` / `ref2va`), `--quantization`
 
 This is a single-request latency sweep (`batching_max_size: 1`), so encoder DP
 is intentionally excluded: it cannot distribute a batch of one. Use the
-picker’s **DP (batched throughput)** option for a multi-request throughput
+**DP for a request batch** setting above for a compatible multi-request
 deployment; the table below does not claim a measured H3 DP speedup.
 
 **Driver.**
@@ -967,6 +1226,208 @@ peak per GPU.
 | prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Selected recipe |
 | prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
 | Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
+
+### Consumer GPU tuning
+
+On consumer hardware the binding question is not which card you have but how much
+host RAM sits behind it. H3's weights are about 108 GB — 61.73 GB of DiT and
+46.18 GB of text encoder — so no consumer configuration holds them all, and where
+the shortfall lands decides the throughput.
+
+**The command** — most consumer machines need exactly one flag beyond the model:
+
+```bash consumer single GPU, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --layerwise-offload-components dit,text_encoder,vae
+```
+
+With 16 GB of VRAM or more, add `--layerwise-resident-layers video_vae=36` for
+the 13 s decode; with ~96 GB of host RAM and 16 GB+ of VRAM, add
+`--dit-layerwise-resident-layers 4` for the 6 s step. That is the whole flag
+surface. The [builder at the top of this page](#1-quick-start) has consumer
+cards and a Host RAM selector: pick your budget and it emits this command with
+your tier's measured expectations attached as comments. The table below is the
+same data in one view.
+
+**Two budgets, and what each one buys**
+
+| | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |
+| --- | ---: | ---: |
+| Recipe | A | B |
+| Peak VRAM | ≤ 12 GiB | ≤ 16 GiB (OOMs at 12) |
+| Host anonymous (must fit) | 24.5 GiB | 116.7 GB pinned |
+| Denoise, 864×480 / 124 frames / 20 NFE | 16.8 - 18.7 s/it | **6.01 s/it** |
+| Runs at all | yes | yes |
+
+The left column is one configuration measured twice, at 318.94 s and 356.37 s;
+the 12% spread tracked host load on a shared machine, so treat smaller
+differences than that as unresolved. The right column is 120.92 s at a 16 GiB
+allocator cap. Four resident DiT layers is what Recipe B buys its speed with,
+and it is also why 12 GiB is not enough for it.
+
+Read the host row carefully, because the two numbers are not the same kind of
+memory. *Anonymous* host memory — pinned buffers and pageable copies — has to fit,
+and the kernel cannot reclaim it. Page cache backing a file mapping is
+*droppable*, so it does not count against the budget even though it shows up in
+`VmRSS`; use `RssAnon` from `/proc/<pid>/status` when checking. Likewise measure
+VRAM with `torch.cuda.set_per_process_memory_fraction` and let the allocator fail,
+rather than reading `nvidia-smi`, which reports the caching allocator's reserved
+pool and overstates the requirement.
+
+Inside 32 GB the weights cannot be pinned, so each denoise step copies about
+60 GiB from the checkpoint mapping, and a mapped source is synchronous however
+the copy is requested: the driver stages it through its own buffer, so the
+transfer neither overlaps compute nor runs at pinned bandwidth. That is where
+the step goes, and giving the host room to pin the weights instead is what takes
+it to 6.01 s.
+
+Two caveats on the constrained number, both from instrumenting the run rather
+than from arithmetic. The machine it was measured on has 2 TB of host memory, so
+the kernel kept all 107.7 GiB of mapped checkpoint pages resident: major faults
+across a whole request were 6, and `read_bytes` was zero. Nothing was read from
+disk. A real 32 GB host cannot cache 107.7 GiB, so it will fault and re-read,
+and should be expected to be slower than the figures here rather than equal to
+them — an NVMe is a requirement, not a recommendation. Measure your own machine
+with major faults (`/proc/<pid>/stat`) on the worker process, not on the
+launcher, which holds no weights.
+
+**Recipe A — fits 12 GB VRAM + 32 GB host**
+
+```bash 12 GB + 32 GB, lossless
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --layerwise-resident-layers video_vae=36
+```
+
+**Recipe B — host memory is free (the fast path)**
+
+```bash unconstrained host, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-layerwise-resident-layers 4 \
+  --layerwise-resident-layers video_vae=36
+```
+
+Recipe B pins ~112 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
+~4.5 GB in its decode dtype). Do not reach for it on a 32 GB machine.
+
+**What not to change, and why**
+
+- `video_vae=36` holds every decoder block for the decode only — residency
+  arms at the decoder's first block and releases when it finishes, so the
+  denoise still runs on an empty card. It fits 12 GB because decoder weights
+  are held in their decode compute dtype (fp16) from load, which halves them
+  to ~4.9 GiB; the rounding was already part of every output (the decode
+  computes in fp16 autocast), so the result is bit-identical, and the decode
+  drops from 60 s streamed (or 209 s on a busy host) to ~10 s. The
+  `expandable_segments` line stays: the decode sits close enough to the cap
+  that fragmentation otherwise tips it over.
+- Leave `--enable-torch-compile` off, as elsewhere on this page. Layerwise offload
+  rebinds `param.data` on every layer, so compiled graphs do not get the benefit
+  they would on resident weights.
+- Recipe A's flags are what the automatic policy should choose on its own. Until
+  the model declares its own placement, `--performance-mode memory` plus the
+  explicit component list is what makes it happen; pass them.
+
+**Reading the startup log**
+
+The server prints the memory decisions it made; checking three lines against
+your budget catches a mis-set machine in the first minute instead of the first
+request.
+
+- `Layerwise offload: host memory available: N GiB` — what the runtime sees
+  after loading, not your DIMM size. On a 32 GB host expect single digits here;
+  a much larger number means another process's memory accounting (or a
+  container limit) is in play.
+- `leaving N GiB of weights on the checkpoint mapping` — the expected line on a
+  32 GB host: the DiT streams from the checkpoint file. If instead the log
+  reports pinned weights, the runtime decided your host has room — which is
+  faster, and means the 32 GB figures above do not apply to you.
+- `Loaded video_vae: ... host mmap` vs `host pageable` — where the VAE landed
+  (decoder weights are ~4.9 GiB once held in their decode dtype).
+  `Loaded <component>` lines carry the same buckets for every component.
+
+If a request dies after the denoise finishes, it is the decode colliding with
+the cap: keep the `expandable_segments` line, and if it persists drop to
+`video_vae=24` and take the partially streamed decode.
+
+**Against ComfyUI, on the same weights**
+
+Same unpruned bf16 checkpoints, same card, same sampler settings (cfg 1.0,
+euler_ancestral, sigma shift 12.0/3.0, seed 1101), 864×480 / 124 frames / 20 NFE:
+
+When host memory is free, the engines are close and sglang is ahead:
+
+| | denoise | host anonymous | peak VRAM |
+| --- | ---: | ---: | ---: |
+| sglang, Recipe B | **6.01 s/it** | 116.7 GB pinned | ≤ 16 GiB |
+| ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
+
+Inside 12 GB, both engines run these weights, and one measurement convention
+matters on each side. ComfyUI's memory manager reads system RAM and adapts, so
+the rows below patch `psutil` to a pretend host size — the same convention the
+sglang rows use. Its `--reserve-vram` is also soft: told to keep 12 GiB free it
+still peaked at 13.5 GiB, a figure a real 12 GB card cannot give it, so both
+engines here run under the same hard allocator cap
+(`set_per_process_memory_fraction`), where its peak stays at 12.1–12.3 GiB.
+Under that cap, Recipe A wins the whole request at every host size:
+
+| 12 GB VRAM, both engines hard-capped | sglang Recipe A (TE + denoise + decode) | ComfyUI, bf16 (warm) |
+| --- | ---: | ---: |
+| 32 GB host | 12.4 + 212.8 + 9.4 ≈ **235 s** | 276–302 s |
+| 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
+| 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
+
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
+VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
+and at 24 GiB (with `--dit-layerwise-resident-layers 10`, which only a 24 GB
+card has headroom for) ~230 vs 249–260 s. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+#35946), per-layer pinning with net-cost accounting (#35867), the courier
+thread that ships still-mapped layers through pinned slots (#35882), and
+decoder weights held in their decode dtype from load (#35967) — which is what
+lets `video_vae=36` fit and turns the decode from the slowest stage (54–96 s
+streamed) into the fastest (~10 s, faster than ComfyUI's own 15–25 s). Output
+equivalence is bit-level: the fp16-held decode reproduced the fp32-store run's
+video byte for byte, and the audio stream is bit-identical.
+
+Stage by stage under the cap: text encoding is even (both stream the same
+48 GB Qwen3VL), the denoise leads at 32–48 GB hosts and sits within
+run-to-run variance of ComfyUI at 64 GB (162 vs 159 s), and the decode leads
+everywhere. Two ComfyUI notes that still matter: `--fast-disk` measured no
+faster than its default here, and stacking
+`--novram --cache-none --disable-pinned-memory` made things strictly worse
+(69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
+configuration on a small host.
+
+The path ComfyUI ships for 12 GB cards uses
+`minimax_h3_fl2va_pruned_int8_convrot` and `qwen3vl_32b_minimax_h3_nvfp4_awq`,
+i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
+against the unpruned 66.3 GB. Those are different weights, so it is not a
+like-for-like comparison with the recipes above.
+
+### RTX 4090 24 GB single-GPU run
+
+One RTX 4090 D 24 GB completed the 1344×768, 107-frame, 20-NFE T2VA
+workload (euler, `torch.compile` and step caching disabled) with DiT and
+text-encoder layerwise offload. Same process: load → warmup (seed 0) →
+timed (seed 42); only the timed pass is reported. GPU peak stayed about
+18 GB.
+
+| Config | Timed e2e | Denoise | vs BF16 | PSNR vs BF16 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 + FlashAttention | 405.6 s | 370.2 s | 1.00× | — |
+| `kitchen_int8` + FA | 303.3 s | 273.7 s | 1.34× | 24.81 dB |
+| `kitchen_int8` + `sol_attn` | 223.9 s | 203.9 s | 1.81× | 24.44 dB |
+| `kitchen_int8` + `sage_attn` | 174.9 s | 154.2 s | 2.32× | 23.51 dB |
+| `kitchen_int8` + Sage→Sol hybrid | 163.8 s | 143.1 s | 2.48× | 23.04 dB |
+
+`kitchen_int8` + FA changes Linear numerics only. The `sol_attn` /
+`sage_attn` / hybrid rows also change the attention algorithm, so speed
+and pixel fidelity rank in opposite orders there. Default remains
+`kitchen_int8` + `fa`.
 
 ### AMD Instinct task and scaling runs
 

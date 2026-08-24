@@ -219,7 +219,6 @@ class FlashAttentionBackend(AttentionBackend):
             # Static verify width; NOTE: overwrites the config-named attr in place.
             self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=model_runner.server_args,
                 spec_algorithm=SpeculativeAlgorithm.from_string(
                     get_spec().speculative_algorithm
                 ),
@@ -617,11 +616,14 @@ class FlashAttentionBackend(AttentionBackend):
             # upper bound) so captured graphs keep a valid address; each replay
             # refills a [:num_tokens] view.
             if self.use_sliding_window_kv_pool:
+                assert forward_batch.out_cache_loc is not None
                 m.swa_page_table = torch.zeros(
                     (bs, self.max_num_pages), dtype=torch.int32, device=device
                 )
                 self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
-                    (self.max_context_len,), dtype=torch.int64, device=device
+                    (forward_batch.out_cache_loc.shape[0],),
+                    dtype=torch.int64,
+                    device=device,
                 )
             self.full_cg_prefill_metadata = m
         m = self.full_cg_prefill_metadata
@@ -658,6 +660,11 @@ class FlashAttentionBackend(AttentionBackend):
             # SWA write targets for the new tokens (KVWriteLoc.swa_loc), refilled
             # into the pointer-stable buffer and bound as a [:num_tokens] view.
             num_out = forward_batch.out_cache_loc.shape[0]
+            assert_buffer_fits(
+                num_out,
+                self.full_cg_prefill_swa_out_cache_loc.shape[0],
+                "full-CG prefill SWA write-location buffer",
+            )
             self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
@@ -687,7 +694,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
             seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
+            if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
             else self.max_context_len
         )
 
@@ -2185,7 +2192,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             # SWA write-target buffer; metadata binds a [:num_tokens] view,
             # refilled from the live out_cache_loc before each replay.
-            self.swa_out_cache_loc_buf = torch.zeros(
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
                 device=self.device,
@@ -2464,7 +2471,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.swa_page_table = self.decode_cuda_graph_metadata[
                             "swa_page_table"
                         ][:bs, :]
-                        metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[
+                        metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                             :num_tokens
                         ]
                     self.decode_cuda_graph_metadata[bs] = metadata
@@ -2526,7 +2533,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"
                     ][:bs, :]
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+                    metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                        :num_tokens
+                    ]
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
@@ -2546,7 +2555,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table = self.target_verify_metadata[
                         "swa_page_table"
                     ][:bs, :]
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+                    metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                        :num_tokens
+                    ]
                 self.target_verify_metadata[bs] = metadata
             else:
                 # Target Verify topk>1: two (or three with SWA) metadata objects
@@ -2585,7 +2596,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # topk>1 target-verify early-returns before _apply; bind the
                 # view here (buffer refilled at replay).
                 if self.use_sliding_window_kv_pool:
-                    metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+                    metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                        :num_tokens
+                    ]
 
                 if self.has_swa:
                     metadata_swa = FlashAttentionMetadata()
@@ -2622,7 +2635,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_page_table = self.draft_extend_metadata["swa_page_table"][
                     :bs, :
                 ]
-                metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+                metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                    :num_tokens
+                ]
             self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
@@ -2685,8 +2700,8 @@ class FlashAttentionBackend(AttentionBackend):
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.swa_out_cache_loc_buf[n:].zero_()
-            self.swa_out_cache_loc_buf[:n].copy_(
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
 

@@ -2,21 +2,29 @@
 title: "Quantization"
 tag: "approx"
 metatags:
-    description: "Configure transformer weight quantization and Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
+    description: "Configure quantized component repositories, transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
 ---
 
-SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep
-the base model and the quantized transformer override separate.
+SGLang-Diffusion treats component path selection and quantized checkpoint
+materialization as separate capabilities. Every loaded component can use an
+independent checkpoint path, but that checkpoint is quantized only when its
+selected loader supports the serialized format. Transformer, encoder, and VAE
+precision are resolved independently.
 
 ## Quick Reference
 
 Use these paths:
 
 - `--model-path`: the base or original model
+- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo/local directory; for transformer and native encoder loaders, an explicit weight filename retains the base component config
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
-- `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
-- `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
-- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--transformer-weights-path`: replacement transformer weights in safetensors
+  format (file, directory, or Hub repository/file) or a supported GGUF file
+  (local or Hub)
+- `--quantization`: override the quantization method used by the transformer loader
+- `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
+- `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
+- `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
 
 Recommended example for pre-quantized checkpoints:
@@ -41,6 +49,42 @@ NOTE: Some model-specific integrations also accept a quantized repo or local
 directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
+
+MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
+including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
+exports are also auto-detected: the presence of an input scale selects static
+activation scaling, while its absence selects dynamic scaling. Pass one selected
+FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
+direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
+usage is documented in
+the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
+
+## Quantized Component Repositories
+
+Every loaded component can point to an independent repository, but path routing
+does not imply that every loader can materialize every quantization format.
+SGLang resolves quantized component checkpoints through one of three explicit
+paths:
+
+- load through an SGLang quantization implementation;
+- delegate a standard component to Transformers or Diffusers;
+- fail closed in a native plain-state loader when the format cannot be restored.
+
+| Component path | Quantized checkpoint behavior |
+| --- | --- |
+| `transformer`, `transformer_2`, `unconditional_transformer`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
+| `text_encoder*`, `image_encoder*` | Passes detected metadata to the registered native encoder. Loading continues only when that implementation constructs compatible quantized layers; unknown or incompatible combinations fail closed. |
+| `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
+| Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
+| Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
+
+`--quantization` is the explicit override for the transformer loader; it is not
+the boundary of component quantization support. Other pre-quantized component
+repositories select their format through their own metadata and the capability
+of the selected loader. A generic string override without a matching
+materialization backend would advertise support that the component does not
+have, while a quantized weight file without matching config metadata cannot be
+identified or restored generically.
 
 ## Quant Families
 
@@ -77,10 +121,18 @@ backend.
       <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
     </tr>
     <tr>
+      <td><code>kitchen_int8</code> (online quantization)</td>
+      <td>Unquantized BF16/FP16 checkpoint</td>
+      <td><code>--quantization kitchen_int8</code></td>
+      <td>MiniMax-H3 (validated on 1× RTX 4090 24 GB)</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>Data-free INT8 ConvRot at load time via <code>comfy_kitchen.int8_linear</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires Turing+ (SM75).</td>
+    </tr>
+    <tr>
       <td><code>fp8</code> (offline quantization)</td>
       <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
       <td><code>--transformer-path</code> or <code>--transformer-weights-path</code></td>
-      <td>ALL</td>
+      <td>Native DiTs whose linear layers support the selected FP8 method; validate quality per model</td>
       <td>None</td>
       <td>Component-folder and single-file flows are both supported</td>
     </tr>
@@ -93,12 +145,60 @@ backend.
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
     <tr>
+      <td><code>auto-round</code> W4A16</td>
+      <td>Transformer component repo with a self-describing <code>quantization_config</code> and <code>auto_round:auto_gptq</code> packing</td>
+      <td><code>--transformer-path</code></td>
+      <td>Native dense DiTs with compatible component parameter mappings; MiniMax-H3 Diffusers components are supported</td>
+      <td>None</td>
+      <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
       <td><code>modelopt-nvfp4</code></td>
       <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
       <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
       <td>None</td>
       <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+    </tr>
+    <tr>
+      <td><code>gguf</code></td>
+      <td>One selected GGUF DiT file</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA only; auto-detected; supports standard and K-quant GGML types; FSDP and the separate Qwen3-VL text-encoder GGUF files are not supported</td>
+    </tr>
+    <tr>
+      <td><code>comfy-fp8</code></td>
+      <td>One selected Comfy safetensors file with per-layer <code>comfy_quant</code> metadata</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA; auto-detected; TP, sequence parallelism, and component/layerwise offload are supported, while FSDP is not. Checkpoint-marked <code>fc2</code> layers retain FP8 storage and use compute-dtype matmul.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-int8-convrot</code></td>
+      <td>One selected safetensors file with per-layer <code>int8_tensorwise</code> and ConvRot metadata</td>
+      <td><code>--transformer-weights-path</code>, or an explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native DiTs and encoders whose parameter mappings preserve each marked linear; MiniMax-H3 DiT and Qwen3-VL encoder checkpoints have validated tensor contracts</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>mxfp8</code></td>
+      <td>Self-describing serialized weights, or BF16/FP16 weights for online quantization</td>
+      <td><code>--transformer-weights-path</code>, or <code>--quantization mxfp8</code> for online quantization</td>
+      <td>Native diffusion linears; mixed MiniMax-H3 checkpoints are selected per layer</td>
+      <td>SRT's platform MXFP8 backend</td>
+      <td>Serialized metadata is auto-detected. NVIDIA and ROCm reuse SRT's dense MXFP8 kernels; Ascend keeps its native online path. Mixed per-layer checkpoints do not support FSDP.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-w4a8-convrot</code></td>
+      <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 FL2VA / Ref2VA DiTs and its native Qwen3-VL encoder</td>
+      <td><code>comfy-kitchen&gt;=0.2.27</code></td>
+      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. Mixed encoder files may keep their embedding tensorwise INT8. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -123,6 +223,14 @@ backend.
       <td>Wan2.2 family</td>
       <td>None</td>
       <td>Currently only compatible with the Ascend NPU family and supports <code>mxfp8</code>, <code>mxfp4</code>, <code>w8a8</code>, and <code>w4a4</code></td>
+    </tr>
+    <tr>
+      <td><code>gguf</code></td>
+      <td>A single community <code>.gguf</code> holding the transformer</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 <code>fl2va</code> (original and pruned AdaLN curve)</td>
+      <td>None</td>
+      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Shrinks the download and the host memory offload pins (17.5 vs 61.7 GiB for H3) rather than peak VRAM, which offload already bounds. Dequantized per use, so it is not faster. See <a href="#gguf">GGUF</a>.</td>
     </tr>
   </tbody>
 </table>
@@ -225,11 +333,15 @@ support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
 
 ## Online Quantization
 
-Online quantization applies quantization to unquantized models at load time. This is useful for when pre-quantized checkpoints are not available.
+This section describes the online methods currently implemented by the
+transformer loader. They are useful when a pre-quantized transformer checkpoint
+is not available. Encoders, VAEs, and auxiliary components are independent:
+their repositories may still carry serialized quantized weights, which are
+restored when the selected component loader supports that format.
 
 ### FP8 Online Quantization
 
-Apply FP8 quantization to any unquantized model:
+Apply FP8 quantization to a supported unquantized DiT checkpoint:
 
 ```bash
 sglang generate \
@@ -241,7 +353,7 @@ sglang generate \
 
 MiniMax-H3 supports this path while preserving its required FP32 patch,
 timestep, and output projections. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
 for its distributed serving recipe.
 
 ### MXFP4 Online Quantization
@@ -257,10 +369,63 @@ sglang generate \
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
+### Kitchen INT8
+
+Serialized Comfy ConvRot INT8 DiTs use `--transformer-weights-path`; compatible
+native encoders use an explicit file through `--component-paths.<component>` or
+its component alias. Both are auto-detected from per-layer markers and load
+INT8 weights and row scales directly; omit `--quantization`.
+
+For a BF16 checkpoint, `--quantization kitchen_int8` instead performs online
+quantization after loading:
+
+`kitchen_int8` quantizes DiT linear weights online from the stock BF16
+checkpoint. Forward uses the fused `comfy_kitchen.int8_linear` op (rotation,
+dynamic per-row activation quantization, INT8 GEMM, dequant, and bias).
+Install the optional dependency first:
+
+```bash
+pip install comfy-kitchen
+```
+
+```bash
+sglang generate \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --quantization kitchen_int8 \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+Quantization runs after the model's weight loaders, so MiniMax-H3's grouped
+`qkv` reorder is already applied. Layers whose input dim is not divisible by
+the group size (256) stay in BF16 instead of failing the load; H3's AdaLN
+projections take that path.
+
+<Warning>
+`kitchen_int8` is approximate and is not a consistency ground-truth mode.
+The BF16 path is unchanged when `comfy-kitchen` is not installed. See the
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
+for the 24 GB offload recipe, including why `vae` must stay out of
+`--layerwise-offload-components`.
+</Warning>
+
+Large-M GEMMs (`rows > 8192` and `out_features >= 8192`) are split by rows so
+the fused kernel stays on the data-parallel CUTLASS config. Override the
+thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
+`SGLANG_KITCHEN_INT8_MIN_SPLIT_N`.
+
 ### Skipping Layers
 
-By default, online quantization quantizes every linear layer in
-the transformer. However, `--quantization-ignored-layers` can be used to keep specific layers in their original precision:
+By default, transformer online quantization quantizes every supported linear
+layer in that component. However, `--quantization-ignored-layers` can keep
+specific transformer layers in their original precision:
 
 ```bash
 sglang generate \
@@ -278,7 +443,28 @@ sglang generate \
   --save-output
 ```
 
-Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
+Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantized if its prefix contains any of the given patterns.
+
+## Transformers Component BnB4
+
+Model components that already have a native Transformers loading path can load
+serialized BitsAndBytes 4-bit checkpoints with a standard top-level
+`quantization_config`. Plain checkpoints keep using an available native SGLang
+implementation. For example, replace FLUX's T5 component with the official
+Diffusers checkpoint:
+
+```bash Command
+sglang serve \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --component-paths.text_encoder_2 \
+    diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2
+```
+
+The quantized component must stay resident. SGLang rejects component or
+layerwise offload, nonstandard metadata locations, and native-only component
+fallbacks for this path instead of silently changing the checkpoint contract.
+Diffusion DiT components declared under the Diffusers library use the separate
+quantization backends documented above.
 
 ## Validated ModelOpt Checkpoints
 
@@ -596,6 +782,131 @@ sglang generate \
   `quant_algo=NVFP4`; the `modelopt-nvfp4` label here is again a documentation
   family name rather than a serialized config key.
 
+## GGUF
+
+GGUF loads a community-quantized transformer from a single `.gguf` file while
+the rest of the pipeline — VAE, text encoder, scheduler, tokenizer — keeps
+loading from the base model.
+
+GGUF primarily reduces checkpoint, host-memory, and resident-weight size. For
+example, MiniMax-H3's transformer is 17.5 GiB as Q4_K_M versus 61.7 GiB as
+BF16. With full layerwise offload, VAE decode and offload buffers can still
+dominate peak GPU memory, but each streamed DiT layer also transfers fewer
+bytes.
+
+Packed linears reuse SRT's GGUF type definitions and CUDA dequantization, then
+run the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
+regime and are slower at diffusion sequence lengths. GGUF remains a
+capacity-oriented option; latency depends on the quantization type, activation
+shape, and placement policy.
+
+Layers the checkpoint stores unquantized (F32/F16/BF16) take the ordinary linear
+path rather than the packed one. Their precision is then whatever the model
+declares for that layer, exactly as on the safetensors path — a checkpoint
+cannot raise a layer above the model's own dtype by storing it wider. For
+MiniMax-H3 the two agree: the layers it pins to FP32 are the ones the validated
+checkpoint leaves unquantized, and `post_load_weights` fails the load if any of
+them ends up narrower.
+
+### Usage
+
+No extra install: `gguf` is already a core SGLang dependency.
+
+`--model-path` stays the base model; `--transformer-weights-path` takes the
+GGUF. A local path, `owner/repo/file.gguf`, or `owner/repo:QUANT_TYPE` all work.
+The quant-type shorthand is accepted only when exactly one repository file
+matches it; otherwise SGLang lists the candidates and asks for a full path.
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
+  --num-gpus 1 \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+Note that `--quantization gguf` is not the selector — the quantization is read
+from the file itself, so passing the file is what enables the path.
+
+MiniMax-H3 GGUF checkpoints may use either the original timestep MLP or the
+pruned AdaLN curve architecture. Repositories often contain both FL2VA and
+Ref2VA files, so use the full Hub file reference instead of an ambiguous
+`owner/repo:QUANT_TYPE` selector:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The pruned architecture keeps its sampled curve and reduced AdaLN projections
+in FP32, matching the published checkpoint implementation. This precision
+island deliberately bypasses the BF16-only fused modulation kernels.
+
+#### Whether to offload the VAE
+
+Adding `vae` to `--layerwise-offload-components` trades a lot of latency for
+some peak VRAM, because the video VAE decoder is re-streamed per decode tile.
+Measured on 1× RTX 5090 with this checkpoint, 1344×768 × 107 frames:
+
+| `--layerwise-offload-components` | Peak VRAM | Denoise | VAE decode |
+| --- | ---: | ---: | ---: |
+| `dit,text_encoder` | 26.3 GiB | 39.0 s | **9.5 s** |
+| `dit,text_encoder,vae` | **19.6 GiB** | 39.0 s | 57.2 s |
+
+Denoise is unaffected, and the output is bit-identical either way. Leave the VAE
+resident unless the 6.7 GiB matters — on a 24 GB card by this measurement it
+does, and the 6× slower decode is the price of fitting.
+
+### Constraints
+
+| Constraint | Reason |
+| --- | --- |
+| TP shard boundaries must align to GGML blocks | Column-parallel rows shard directly; row-parallel packed columns require each local input partition to contain whole quantization blocks |
+| No `--use-fsdp-inference` | FSDP does not preserve the GGUF packed-block layout |
+| CUDA only | The reused SRT GGML dequantization kernel currently ships for CUDA |
+| Native byte order only | A quantized block embeds its scales, so a non-native file cannot be byte-swapped as a whole |
+| No LoRA, and none of the H3 AdaLN cache flags | An adapter cannot be merged into packed blocks, and the AdaLN paths read the transformer's safetensors |
+| No `--quantization` | The checkpoint fixes the quantization; the flag would be a second, conflicting selector |
+
+Every constraint above fails at startup with an explanatory error rather than
+silently producing wrong output.
+
+Sequence parallelism (`--ulysses-degree` / `--ring-degree`) remains available
+because it shards activations rather than packed weights. TP is also available;
+startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
+
+### Validated scope
+
+| Model | Checkpoint | Hardware | Result |
+| --- | --- | --- | --- |
+| MiniMax-H3 `fl2va` | [`leejet/MiniMax-H3-GGUF`](https://huggingface.co/leejet/MiniMax-H3-GGUF) `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x RTX 5090 (32 GiB) | t2va 1344x768, 107 frames, video + audio; 19.6-26.3 GiB peak depending on VAE offload |
+| MiniMax-H3 `fl2va` | `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 10.13 s and 17.17 GiB peak |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | [`unsloth/MiniMax-H3-GGUF`](https://huggingface.co/unsloth/MiniMax-H3-GGUF) `minimax_h3_fl2va_pruned-Q4_K.gguf` (10.7 GiB loaded DiT) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 1x GB300 (CUDA 13, PyTorch 2.13) | 50-step t2va 1344x768, 107 frames, H.264 + AAC; 105.38 s and 80.88 GB peak |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 2x GB300, TP2 (CUDA 13, PyTorch 2.13) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 7.55 s and 51.90 GB peak per rank |
+
+The DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
+fidelity was checked tensor-by-tensor against the BF16 reference: cosine
+1.00000 for the F32/BF16 tensors and 0.9973 for Q4_K/Q4_0.
+
+Not validated in the measurements above: any other quantization type, the
+`ref2va` partition, and a BF16-vs-GGUF output comparison.
+
 ## Nunchaku (SVDQuant)
 
 ### Install
@@ -837,11 +1148,13 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
     - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
 
-## MXFP8 Online Quantization
+## MXFP8 Quantization
 
-For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
-Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
-during inference with `npu_quant_matmul` (block_size=32).
+Self-describing serialized MXFP8 transformers are inferred from their
+checkpoint metadata. For online MXFP8 quantization, load the original
+FP16/BF16 model and add `--quantization mxfp8`. NVIDIA and ROCm reuse SRT's
+dense MXFP8 implementation; Ascend uses `npu_dynamic_mx_quant` and
+`npu_quant_matmul` with a block size of 32.
 
 ```bash
 sglang generate \
@@ -851,7 +1164,9 @@ sglang generate \
   --save-output
 ```
 
-> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
+The selected SRT backend must provide an MXFP8 kernel on NVIDIA or ROCm. On
+Ascend, the hardware requirement remains A5 series or newer;
+`npu_dynamic_mx_quant` is not available on A2/A3.
 
 ## MXFP8 Offline Quantization (msmodelslim)
 

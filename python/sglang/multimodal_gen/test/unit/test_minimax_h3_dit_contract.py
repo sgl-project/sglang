@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _diffusers_h3_checkpoint,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -84,6 +85,31 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         None,
     )
 
+    assert mapping("transformer_blocks.7.attn.to_k.qweight") == (
+        "blocks.7.attn.qkv_proj.qweight",
+        1,
+        3,
+    )
+
+    diffusers_weights = [
+        ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
+        ("transformer_blocks.0.attn.to_k.qweight", torch.full((2, 3), 2)),
+        ("transformer_blocks.0.attn.to_v.qweight", torch.full((2, 3), 3)),
+        (
+            "transformer_blocks.0.ff.net.0.proj.weight",
+            torch.arange(8).reshape(4, 2),
+        ),
+    ]
+    converted = dict(_diffusers_h3_checkpoint(diffusers_weights))
+    assert torch.equal(
+        converted["blocks.0.attn.qkv_proj.qweight"],
+        torch.cat([tensor for _, tensor in diffusers_weights[:3]], dim=1),
+    )
+    assert torch.equal(
+        converted["blocks.0.mlp.fc1.weight"],
+        torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
+    )
+
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
         weight,
@@ -97,36 +123,54 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ).reshape(12, 1)
     torch.testing.assert_close(actual, expected)
 
-    grouped = torch.arange(48, dtype=torch.int16).reshape(24, 2).view(torch.bfloat16)
-    reordered = _reorder_grouped_qkv_to_qkv(
-        grouped,
-        num_query_groups=4,
-        heads_per_group=1,
-        head_dim=2,
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        grouped = torch.arange(48, dtype=torch.float32).reshape(24, 2).to(dtype)
+        reordered = _reorder_grouped_qkv_to_qkv(
+            grouped,
+            num_query_groups=4,
+            heads_per_group=1,
+            head_dim=2,
+        )
+        for tp_size in (1, 2, 4):
+            local_rows = 8 // tp_size
+            for tp_rank in range(tp_size):
+                start = tp_rank * local_rows
+                param = torch.nn.Parameter(
+                    torch.empty(3 * local_rows, 2, dtype=dtype),
+                    requires_grad=False,
+                )
+                param.output_dim = 0
+                assert _copy_grouped_qkv_tp_shard(
+                    param,
+                    grouped,
+                    num_query_groups=4,
+                    head_dim=2,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+                expected_shard = reordered.view(3, 8, 2)[
+                    :, start : start + local_rows
+                ].reshape(-1, 2)
+                assert torch.equal(param, expected_shard)
+
+
+def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.time_embedder = None
+    model.adaln_t_table = torch.nn.Parameter(
+        torch.tensor([[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]]),
+        requires_grad=False,
     )
-    for tp_size in (1, 2, 4):
-        local_rows = 8 // tp_size
-        for tp_rank in range(tp_size):
-            start = tp_rank * local_rows
-            param = torch.nn.Parameter(
-                torch.empty(3 * local_rows, 2, dtype=torch.bfloat16),
-                requires_grad=False,
-            )
-            param.output_dim = 0
-            assert _copy_grouped_qkv_tp_shard(
-                param,
-                grouped,
-                num_query_groups=4,
-                head_dim=2,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-            expected_shard = reordered.view(3, 8, 2)[
-                :, start : start + local_rows
-            ].reshape(-1, 2)
-            assert torch.equal(
-                param.view(torch.int16), expected_shard.view(torch.int16)
-            )
+
+    result = model._time_embedding(torch.tensor([0.0, 0.25, 1.0]))
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, 2.0], [1.0, 3.0], [4.0, 6.0]]),
+        rtol=0,
+        atol=0,
+    )
 
 
 class _KwargIdentity(torch.nn.Module):
@@ -294,6 +338,27 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.bfloat16, name
 
 
+def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
+    _ensure_single_process_parallel_runtime()
+    config = MiniMaxH3DiTConfig(
+        arch_config=MiniMaxH3DiTArchConfig(
+            adaln_curve_grid=1025,
+            time_embed_dim=8,
+        )
+    )
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=config,
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+    assert model.final_layer.adaln_proj.linear.weight.dtype == torch.float32
+
+
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
     _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
@@ -400,9 +465,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ulysses_qkv_pack_is_bit_exact():
-    from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-        pack_qkv_destination_major,
-    )
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128

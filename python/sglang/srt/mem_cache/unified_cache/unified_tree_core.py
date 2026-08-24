@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -417,8 +418,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         self.reset()
 
@@ -512,6 +514,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         """The hash values owned by this node, excluding its ancestors."""
         return self.node_by_id(node_id).hash_value or []
+
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node that was built while storage was disabled.
+
+        Page hashes chain from the parent's last hash, so a node whose parent has
+        none restarts the chain mid-sequence: its keys then encode only a suffix
+        of the prefix they claim to represent, which would alias unrelated
+        requests that happen to start with those tokens. Walks parent-before-child
+        so each node hashes against an already-filled parent. Returns the number
+        of nodes filled.
+        """
+        filled = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            # The root anchors every chain and is seeded with an empty hash list.
+            if node is not self.root_node and node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+                filled += 1
+            stack.extend(node.children.values())
+        return filled
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches; the single root serves every namespace."""
@@ -1119,7 +1142,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1138,7 +1161,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self._record_store_event(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(node, medium=StorageMedium.GPU)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1303,7 +1326,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
-        self._record_remove_event(node, medium=medium)
+        self.kv_events.record_remove(node, medium=medium)
         for comp in self.components:
             self._evict_component_and_detach_lru(
                 node,
@@ -1422,7 +1445,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
-        self._record_remove_event(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         self._evict_component_and_detach_lru(
             node,
             self.components_by_type[BASE_COMPONENT_TYPE],
@@ -1447,7 +1470,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
-        self._record_remove_event(node, medium=StorageMedium.CPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
                 node,
@@ -1494,7 +1517,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._cascade_evict(
             node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self._record_remove_event(node, medium=StorageMedium.GPU)
+        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -1980,7 +2003,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=cache_actions,
         )
         for nid in kv_xfer.nodes_to_load or ():
-            self._record_store_event(self.node_by_id(nid), medium=StorageMedium.GPU)
+            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2023,7 +2046,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self._record_store_event(node, medium=StorageMedium.CPU)
+            self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

@@ -10,9 +10,15 @@ from abc import ABC
 from typing import Any, Type
 
 import torch
+import transformers
 from diffusers import AutoModel
 from torch import nn
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoImageProcessor,
+    AutoProcessor,
+    AutoTokenizer,
+    PretrainedConfig,
+)
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -22,6 +28,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    format_component_residency,
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -33,13 +40,60 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
     get_hf_config,
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.weights.source import (
+    materialize_weight,
+    resolve_weight,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
+
+
+class ComponentCheckpointUnsupportedError(ValueError):
+    """A component checkpoint is unsupported and must not use native fallback."""
+
+
+class NativeComponentLoaderRequired(RuntimeError):
+    """The customized loader must defer to the native library loader."""
+
+
+def uses_native_transformers_bnb4(config: object, component_name: str) -> bool:
+    """Validate a serialized BnB4 checkpoint owned by Transformers."""
+    try:
+        quant_spec = resolve_checkpoint_quant_spec(config)
+    except (TypeError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
+        ) from error
+    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
+        return False
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization requires "
+            "a top-level quantization_config; "
+            f"got metadata from {quant_spec.source!r}"
+        )
+
+    load_in_4bit = quant_spec.config.get(
+        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
+    )
+    load_in_8bit = quant_spec.config.get(
+        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
+    )
+    if load_in_4bit is not True or load_in_8bit is True:
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization supports only "
+            "serialized BitsAndBytes 4-bit checkpoints"
+        )
+    return True
 
 
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
@@ -71,6 +125,11 @@ class ComponentLoader(ABC):
 
     # diffusers or transformers
     expected_library: str = ""
+
+    # --attention-backend primarily selects the DiT backend. Auxiliary
+    # components may fall back when that global choice is incompatible; an
+    # explicit --component-attention-backends entry remains strict.
+    allow_global_attention_backend_fallback = True
 
     _loaders_registered = False
 
@@ -116,9 +175,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -135,9 +197,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             component = self.load_native(
                 component_model_path,
@@ -189,18 +254,24 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "sgl-diffusion"
-        except ComponentResidencyError:
+        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
             raise
         except Exception as e:
+            native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
+                if native_loader_required:
+                    raise
                 traceback.print_exc()
                 raise RuntimeError(
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
-            if "Unsupported model architecture" in str(e):
+            if native_loader_required:
+                logger.info("%s", e)
+            elif "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Component: {component_name} doesn't have a customized version yet, using native version"
                 )
@@ -217,6 +288,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "native"
             logger.warning(
@@ -241,11 +313,11 @@ class ComponentLoader(ABC):
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,
-                consumed,
+                format_component_residency(component),
                 current_gpu_mem,
             )
         return component, consumed
@@ -270,14 +342,18 @@ class ComponentLoader(ABC):
             load_kwargs["torch_dtype"] = precision
 
         if transformers_or_diffusers == "transformers":
-            from transformers import AutoModel
-
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            return AutoModel.from_pretrained(
+            if uses_native_transformers_bnb4(config, component_name or "component"):
+                server_args.require_component_resident(
+                    component_name or "component",
+                    feature_name="Transformers bitsandbytes component",
+                )
+            model_class = self.resolve_native_transformers_model_class(config)
+            return model_class.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
@@ -298,6 +374,9 @@ class ComponentLoader(ABC):
             )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
+
+    def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
+        return transformers.AutoModel
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -414,6 +493,49 @@ class ComponentLoader(ABC):
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
 
 
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
+
+    @staticmethod
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
+        try:
+            quant_spec = resolve_checkpoint_quant_spec(config)
+        except (TypeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization metadata for "
+                f"{component_name!r}: {error}"
+            ) from error
+        if quant_spec is None:
+            return
+
+        method = quant_spec.declared_method or "unspecified"
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name!r} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
+        )
+
+    def load_component_config(
+        self, component_model_path: str, component_name: str
+    ) -> dict[str, Any]:
+        config = get_diffusers_component_config(component_path=component_model_path)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
+        return config
+
+    def resolve_component_weights_path(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> str:
+        override = server_args.component_weights_paths.get(component_name)
+        if override is None:
+            return component_model_path
+        weights_path = materialize_weight(resolve_weight(override))
+        logger.info("Using weight override for %s: %s", component_name, weights_path)
+        return weights_path
+
+
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
@@ -487,6 +609,10 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
+    # An unknown out-of-tree component may itself be the primary transformer.
+    # Require it to opt into fallback through a registered component loader.
+    allow_global_attention_backend_fallback = False
+
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
@@ -507,6 +633,8 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         component_architecture: str | None = None,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -524,15 +652,21 @@ class PipelineComponentLoader:
         )
 
         try:
-            # Load the component
-            return loader.load(
-                component_model_path,
-                server_args,
-                component_name,
-                transformers_or_diffusers,
-            )
-        except Exception as e:
+            with component_attn_backend_context_manager(
+                component_attn_backend,
+                component_name=component_attn_name,
+                allow_global_backend_fallback=(
+                    loader.allow_global_attention_backend_fallback
+                ),
+            ):
+                return loader.load(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+        except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
             )
-            raise e
+            raise

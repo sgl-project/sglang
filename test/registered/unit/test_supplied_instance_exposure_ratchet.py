@@ -118,6 +118,12 @@ _LATE_RESOLUTION_DYNAMIC_SITES = {
     "parser/template_detection.py": frozenset({"reasoning_parser", "tool_call_parser"}),
 }
 
+# `get_context().override(...)` declares through the same seam, but the fields
+# are the caller's -- a test names them one call at a time. There is no static
+# set to collect, and nothing resolution decides: whatever a caller overrides
+# there is exposure only through that caller's own reads.
+_CALLER_SUPPLIED_LATE_SITES = frozenset({"runtime_context.py"})
+
 # Resolution also branches on ambient environment; those shapes are explicit
 # entries so the written set is the same on every host. `SGLANG_IS_IN_CI`
 # makes resolution fill `soft_watchdog_timeout`.
@@ -129,6 +135,15 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
 _EXPOSED = {
+    ("dllm/config.py", "max_running_requests"),
+    ("dllm/config.py", "model_path"),
+    ("multimodal/processors/base_processor.py", "image_processor_backend"),
+    ("speculative/spec_registry.py", "disable_overlap_schedule"),
+    ("layers/moe/utils.py", "deepep_mode"),
+    ("layers/moe/utils.py", "moe_a2a_backend"),
+    ("layers/moe/utils.py", "moe_runner_backend"),
+    ("layers/moe/utils.py", "quantization"),
+    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
     ("configs/embedding_model_spec.py", "chunked_prefill_size"),
     ("configs/embedding_model_spec.py", "cuda_graph_config"),
     ("configs/embedding_model_spec.py", "disable_radix_cache"),
@@ -143,344 +158,43 @@ _EXPOSED = {
     ("configs/model_config.py", "quantization"),
     ("configs/model_config.py", "speculative_algorithm"),
     ("configs/model_config.py", "speculative_draft_model_quantization"),
-    ("constrained/base_grammar_backend.py", "grammar_backend"),
-    ("constrained/base_grammar_backend.py", "reasoning_parser"),
-    ("disaggregation/common/conn.py", "disaggregation_bootstrap_port"),
-    ("disaggregation/common/conn.py", "pp_size"),
-    ("disaggregation/decode_kvcache_offload_manager.py", "hicache_io_backend"),
-    ("disaggregation/decode_kvcache_offload_manager.py", "served_model_name"),
-    ("disaggregation/encode_receiver.py", "disaggregation_ib_device"),
-    ("disaggregation/encode_receiver.py", "encoder_transfer_backend"),
-    ("disaggregation/encode_receiver.py", "mooncake_ib_device"),
-    ("disaggregation/encode_receiver.py", "tokenizer_path"),
-    ("disaggregation/encode_server.py", "allowed_media_domains"),
-    ("disaggregation/encode_server.py", "device"),
-    ("disaggregation/encode_server.py", "dp_size"),
-    ("disaggregation/encode_server.py", "encoder_transfer_backend"),
-    ("disaggregation/encode_server.py", "load_format"),
-    ("disaggregation/encode_server.py", "mm_process_config"),
-    ("disaggregation/encode_server.py", "model_path"),
-    ("disaggregation/encode_server.py", "served_model_name"),
-    ("disaggregation/encode_server.py", "tokenizer_path"),
-    ("disaggregation/utils.py", "disaggregation_transfer_backend"),
-    ("distributed/bootstrap.py", "disable_custom_all_reduce"),
-    ("distributed/bootstrap.py", "enable_symm_mem"),
-    ("distributed/bootstrap.py", "enable_torch_symm_mem"),
-    ("distributed/bootstrap.py", "flashinfer_allreduce_fusion_backend"),
-    ("distributed/bootstrap.py", "moe_a2a_backend"),
-    ("distributed/bootstrap.py", "pre_warm_nccl"),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "disaggregation_ib_device",
-    ),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "disaggregation_mode",
-    ),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "disaggregation_transfer_backend",
-    ),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "enable_hierarchical_cache",
-    ),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "encoder_transfer_backend",
-    ),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "mooncake_ib_device",
-    ),
-    ("dllm/config.py", "max_running_requests"),
-    ("dllm/config.py", "model_path"),
-    ("elastic_ep/elastic_ep.py", "elastic_ep_initial_size"),
-    ("elastic_ep/elastic_ep.py", "ep_join_mode"),
-    ("elastic_ep/elastic_ep.py", "moe_a2a_backend"),
-    ("elastic_ep/expert_backup_manager.py", "disaggregation_ib_device"),
-    ("elastic_ep/expert_backup_manager.py", "load_format"),
-    ("elastic_ep/expert_backup_manager.py", "mooncake_ib_device"),
-    ("entrypoints/engine.py", "attn_cp_size"),
-    ("entrypoints/engine.py", "detokenizer_worker_num"),
-    ("entrypoints/engine.py", "dp_size"),
-    ("entrypoints/engine.py", "dtype"),
-    ("entrypoints/engine.py", "enable_dp_attention"),
     ("entrypoints/engine.py", "enable_symm_mem"),
-    ("entrypoints/engine.py", "ep_join_mode"),
-    ("entrypoints/engine.py", "ep_size"),
-    ("entrypoints/engine.py", "load_format"),
-    ("entrypoints/engine.py", "model_path"),
-    ("entrypoints/engine.py", "moe_dp_size"),
-    ("entrypoints/engine.py", "pp_size"),
-    ("entrypoints/engine.py", "quantization"),
     ("entrypoints/engine.py", "reasoning_parser"),
-    (
-        "entrypoints/engine.py",
-        "remote_instance_weight_loader_start_seed_via_transfer_engine",
-    ),
     ("entrypoints/engine.py", "tool_call_parser"),
-    ("entrypoints/http_server.py", "disaggregation_mode"),
-    ("entrypoints/http_server.py", "dp_size"),
-    ("entrypoints/http_server.py", "ep_join_mode"),
-    ("entrypoints/http_server.py", "grpc_port"),
-    ("entrypoints/http_server.py", "model_path"),
-    ("entrypoints/http_server.py", "served_model_name"),
-    ("entrypoints/http_server.py", "skip_server_warmup"),
-    ("entrypoints/sidecar.py", "grpc_port"),
     ("eplb/eplb_manager.py", "ep_dispatch_algorithm"),
     ("eplb/eplb_manager.py", "expert_distribution_recorder_buffer_size"),
-    ("eplb/expert_distribution.py", "deepep_mode"),
-    ("eplb/expert_distribution.py", "device"),
-    ("eplb/expert_distribution.py", "expert_distribution_recorder_mode"),
-    ("eplb/expert_distribution.py", "moe_a2a_backend"),
-    ("eplb/expert_location.py", "device"),
-    ("eplb/expert_location.py", "eplb_algorithm"),
-    ("kv_canary/api.py", "disaggregation_mode"),
-    ("kv_canary/api.py", "speculative_num_steps"),
-    ("kv_canary/capacities.py", "chunked_prefill_size"),
-    ("kv_canary/capacities.py", "cuda_graph_config"),
-    ("kv_canary/capacities.py", "speculative_num_draft_tokens"),
-    ("kv_canary/token_oracle/install.py", "sampling_backend"),
-    ("layers/attention/dsa/utils.py", "disaggregation_mode"),
     ("layers/cp/base.py", "attn_cp_size"),
     ("layers/cp/base.py", "cp_strategy"),
     ("layers/cp/base.py", "enable_prefill_cp"),
     ("layers/cp/bcg.py", "cp_strategy"),
     ("layers/cp/bcg.py", "enable_prefill_cp"),
-    ("layers/dp_attention.py", "attn_cp_size"),
-    ("layers/dp_attention.py", "device"),
-    ("layers/dp_attention.py", "dp_size"),
-    ("layers/dp_attention.py", "enable_dp_attention"),
     ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
-    ("layers/moe/kt_ep_wrapper.py", "chunked_prefill_size"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
-    ("layers/quantization/unquant.py", "enable_deterministic_inference"),
-    ("lora/lora_manager.py", "enable_dp_attention"),
     ("lora/lora_manager.py", "enable_lora_overlap_loading"),
-    ("lora/marlin_lora_temp/policy.py", "enable_lora"),
     ("lora/marlin_lora_temp/policy.py", "lora_paths"),
-    ("managers/data_parallel_controller.py", "attn_cp_size"),
-    ("managers/data_parallel_controller.py", "disaggregation_mode"),
-    ("managers/data_parallel_controller.py", "dp_size"),
-    ("managers/data_parallel_controller.py", "enable_dp_attention"),
-    (
-        "managers/data_parallel_controller.py",
-        "enable_dp_attention_local_control_broadcast",
-    ),
-    ("managers/data_parallel_controller.py", "ep_size"),
-    ("managers/data_parallel_controller.py", "load_balance_method"),
-    ("managers/data_parallel_controller.py", "moe_dp_size"),
-    ("managers/data_parallel_controller.py", "pp_size"),
-    ("managers/data_parallel_controller.py", "soft_watchdog_timeout"),
-    ("managers/detokenizer_manager.py", "soft_watchdog_timeout"),
-    ("managers/detokenizer_manager.py", "tokenizer_path"),
-    ("managers/detokenizer_manager.py", "tool_call_parser"),
-    ("managers/disagg_service.py", "disaggregation_bootstrap_port"),
-    ("managers/disagg_service.py", "disaggregation_mode"),
-    ("managers/disagg_service.py", "disaggregation_transfer_backend"),
-    ("managers/load_snapshot.py", "dp_size"),
-    ("managers/load_snapshot.py", "enable_dp_attention"),
-    ("managers/load_snapshot.py", "load_balance_method"),
-    ("managers/overlap_utils.py", "speculative_algorithm"),
-    ("managers/prefill_delayer.py", "disable_overlap_schedule"),
-    ("managers/prefill_delayer.py", "enable_dp_attention"),
-    ("managers/rust_server.py", "mm_process_config"),
-    ("managers/schedule_batch.py", "disaggregation_mode"),
-    ("managers/scheduler.py", "attn_cp_size"),
-    ("managers/scheduler.py", "disable_overlap_schedule"),
-    ("managers/scheduler.py", "disaggregation_mode"),
-    ("managers/scheduler.py", "dp_size"),
-    ("managers/scheduler.py", "enable_dp_attention"),
-    ("managers/scheduler.py", "enable_hierarchical_cache"),
-    ("managers/scheduler.py", "enable_lora"),
-    ("managers/scheduler.py", "enable_lora_overlap_loading"),
-    ("managers/scheduler.py", "ep_size"),
-    ("managers/scheduler.py", "moe_dp_size"),
-    ("managers/scheduler.py", "pp_size"),
-    ("managers/scheduler.py", "soft_watchdog_timeout"),
-    ("managers/scheduler.py", "speculative_algorithm"),
-    (
-        "managers/scheduler_components/new_token_ratio_tracker.py",
-        "schedule_conservativeness",
-    ),
-    ("managers/scheduler_components/recv_skipper.py", "enable_dp_attention"),
-    ("managers/tokenizer_control_mixin.py", "dp_size"),
-    ("managers/tokenizer_manager.py", "disable_radix_cache"),
-    ("managers/tokenizer_manager.py", "disaggregation_mode"),
-    ("managers/tokenizer_manager.py", "disaggregation_transfer_backend"),
-    ("managers/tokenizer_manager.py", "dp_size"),
-    ("managers/tokenizer_manager.py", "enable_dp_attention"),
-    ("managers/tokenizer_manager.py", "enable_lora"),
-    ("managers/tokenizer_manager.py", "enable_tokenizer_batch_encode"),
-    ("managers/tokenizer_manager.py", "encoder_transfer_backend"),
-    ("managers/tokenizer_manager.py", "limit_mm_data_per_request"),
-    ("managers/tokenizer_manager.py", "lora_paths"),
-    ("managers/tokenizer_manager.py", "mm_feature_transport"),
-    ("managers/tokenizer_manager.py", "model_path"),
-    ("managers/tokenizer_manager.py", "preferred_sampling_params"),
-    ("managers/tokenizer_manager.py", "return_hidden_states_mode"),
-    ("managers/tokenizer_manager.py", "served_model_name"),
-    ("managers/tokenizer_manager.py", "soft_watchdog_timeout"),
-    ("managers/tokenizer_manager.py", "speculative_algorithm"),
-    ("managers/tokenizer_manager.py", "speculative_num_draft_tokens"),
-    ("managers/tokenizer_manager.py", "tokenizer_path"),
-    ("managers/tp_worker.py", "disable_overlap_schedule"),
-    ("managers/tp_worker.py", "model_path"),
-    ("managers/tp_worker.py", "random_seed"),
-    ("managers/tp_worker.py", "speculative_algorithm"),
-    ("managers/tp_worker.py", "tokenizer_path"),
-    ("managers/utils.py", "speculative_algorithm"),
-    ("managers/utils.py", "speculative_eagle_topk"),
-    ("managers/utils.py", "speculative_num_steps"),
-    ("mem_cache/allocation_sizing.py", "page_size"),
-    ("mem_cache/allocation_sizing.py", "speculative_algorithm"),
-    ("mem_cache/allocation_sizing.py", "speculative_eagle_topk"),
-    ("mem_cache/allocation_sizing.py", "speculative_num_steps"),
-    ("mem_cache/hiradix_cache.py", "hicache_io_backend"),
-    ("mem_cache/hiradix_cache.py", "hicache_mem_layout"),
-    ("mem_cache/hiradix_cache.py", "served_model_name"),
-    ("mem_cache/hybrid_cache/hybrid_pool_assembler.py", "hicache_io_backend"),
-    ("mem_cache/hybrid_cache/hybrid_pool_assembler.py", "hicache_mem_layout"),
-    ("mem_cache/hybrid_cache/hybrid_pool_assembler.py", "served_model_name"),
-    ("mem_cache/kv_cache_builder.py", "disable_radix_cache"),
-    ("mem_cache/kv_cache_builder.py", "disaggregation_mode"),
-    ("mem_cache/kv_cache_builder.py", "enable_dp_attention"),
-    ("mem_cache/kv_cache_builder.py", "hicache_mem_layout"),
-    ("mem_cache/radix_cache_cpp.py", "enable_hierarchical_cache"),
-    ("model_executor/forward_batch_info.py", "enable_return_hidden_states"),
-    ("model_executor/forward_batch_info.py", "return_hidden_states_mode"),
-    ("model_executor/model_runner.py", "device"),
-    ("model_executor/model_runner.py", "speculative_algorithm"),
-    ("model_executor/model_runner.py", "speculative_draft_attention_backend"),
-    ("model_executor/model_runner_components/load_model_utils.py", "load_format"),
-    ("model_executor/model_runner_components/load_model_utils.py", "quantization"),
-    (
-        "model_executor/model_runner_components/spec_aux_hidden_state.py",
-        "speculative_draft_attention_backend",
-    ),
-    (
-        "model_executor/model_runner_components/spec_aux_hidden_state.py",
-        "speculative_draft_model_path",
-    ),
-    (
-        "model_executor/model_runner_components/spec_aux_hidden_state.py",
-        "speculative_draft_model_revision",
-    ),
-    ("model_executor/model_runner_components/startup_weight_load.py", "attn_cp_size"),
-    (
-        "model_executor/model_runner_components/startup_weight_load.py",
-        "cuda_graph_config",
-    ),
-    (
-        "model_executor/model_runner_components/startup_weight_load.py",
-        "custom_weight_loader",
-    ),
-    ("model_executor/model_runner_components/startup_weight_load.py", "device"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "dp_size"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "enable_lora"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "ep_size"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "lora_paths"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "pp_size"),
-    (
-        "model_executor/model_runner_components/startup_weight_load.py",
-        "speculative_algorithm",
-    ),
-    (
-        "model_executor/runner_backend/tc_piecewise_cuda_graph_backend.py",
-        "cuda_graph_config",
-    ),
-    ("models/sarvam_moe.py", "attention_backend"),
-    ("models/sarvam_moe.py", "decode_attention_backend"),
-    ("models/sarvam_moe.py", "prefill_attention_backend"),
-    ("multimodal/cache/identity.py", "mm_process_config"),
-    ("multimodal/processors/base_processor.py", "allowed_media_domains"),
-    ("multimodal/processors/base_processor.py", "image_processor_backend"),
-    ("multimodal/processors/base_processor.py", "mm_feature_transport"),
-    ("multimodal/processors/base_processor.py", "mm_process_config"),
-    ("multimodal/processors/mimo_v2.py", "device"),
-    ("observability/metrics_collector.py", "disaggregation_mode"),
-    ("observability/metrics_collector.py", "prefill_delayer_max_delay_passes"),
-    ("observability/metrics_collector.py", "served_model_name"),
     ("parser/template_detection.py", "model_path"),
-    ("ray/data_parallel_controller.py", "attn_cp_size"),
-    ("ray/data_parallel_controller.py", "dp_size"),
-    ("ray/data_parallel_controller.py", "enable_dp_attention"),
-    ("ray/data_parallel_controller.py", "pp_size"),
-    ("ray/engine.py", "dp_size"),
-    ("ray/engine.py", "enable_dp_attention"),
-    ("ray/engine.py", "pp_size"),
     ("speculative/adaptive_spec_params.py", "speculative_algorithm"),
     ("speculative/adaptive_spec_params.py", "speculative_eagle_topk"),
-    ("speculative/dflash_worker_v2.py", "speculative_draft_window_size"),
-    ("speculative/dflash_worker_v2.py", "speculative_num_draft_tokens"),
     ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
-    ("speculative/dspark_components/dspark_config.py", "speculative_draft_model_path"),
-    (
-        "speculative/dspark_components/dspark_config.py",
-        "speculative_draft_model_revision",
-    ),
-    ("speculative/dspark_components/dspark_worker_v2.py", "disable_cuda_graph"),
-    ("speculative/dspark_components/dspark_worker_v2.py", "disaggregation_mode"),
-    ("speculative/dspark_components/dspark_worker_v2.py", "enable_dp_attention"),
-    (
-        "speculative/dspark_components/dspark_worker_v2.py",
-        "speculative_num_draft_tokens",
-    ),
-    ("speculative/eagle_disaggregation.py", "enable_multi_layer_eagle"),
-    ("speculative/eagle_disaggregation.py", "speculative_eagle_topk"),
-    ("speculative/eagle_disaggregation.py", "speculative_num_steps"),
-    ("speculative/eagle_worker_v2.py", "device"),
-    ("speculative/eagle_worker_v2.py", "enable_dp_attention"),
-    ("speculative/eagle_worker_v2.py", "speculative_adaptive"),
-    ("speculative/eagle_worker_v2.py", "speculative_algorithm"),
-    ("speculative/eagle_worker_v2.py", "speculative_eagle_topk"),
-    ("speculative/eagle_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/eagle_worker_v2.py", "speculative_num_steps"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "device"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "enable_dp_attention"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_adaptive"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_algorithm"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_eagle_topk"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_num_steps"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "device"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "enable_dp_attention"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_algorithm"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_eagle_topk"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_num_steps"),
-    ("speculative/ngram_worker.py", "device"),
-    ("speculative/ngram_worker.py", "disable_overlap_schedule"),
-    ("speculative/ngram_worker.py", "speculative_eagle_topk"),
-    ("speculative/ngram_worker.py", "speculative_num_draft_tokens"),
-    ("speculative/ngram_worker.py", "speculative_num_steps"),
     ("speculative/spec_info.py", "enable_multi_layer_eagle"),
-    ("speculative/spec_info.py", "speculative_eagle_topk"),
-    ("speculative/spec_info.py", "speculative_num_draft_tokens"),
-    ("speculative/spec_info.py", "speculative_num_steps"),
-    ("speculative/spec_registry.py", "disable_overlap_schedule"),
-    ("speculative/spec_utils.py", "speculative_eagle_topk"),
-    ("speculative/spec_utils.py", "speculative_num_draft_tokens"),
-    ("speculative/standalone_worker_v2.py", "device"),
-    ("speculative/standalone_worker_v2.py", "enable_dp_attention"),
-    ("speculative/standalone_worker_v2.py", "speculative_algorithm"),
-    ("speculative/standalone_worker_v2.py", "speculative_eagle_topk"),
-    ("speculative/standalone_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/standalone_worker_v2.py", "speculative_num_steps"),
-    ("utils/common.py", "page_size"),
-    ("utils/common.py", "speculative_eagle_topk"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
-    ("utils/cuda_vmm_transport_utils.py", "dp_size"),
-    ("utils/cuda_vmm_transport_utils.py", "enable_dp_attention"),
-    ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
-    ("utils/offloader.py", "dp_size"),
+    # The daemon command and constructor snapshot the resolved startup layout
+    # before the daemon's loading lifecycle can apply any runtime overrides.
+    ("weight_cache/daemon.py", "attn_cp_size"),
+    ("weight_cache/daemon.py", "deepep_mode"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "enable_dp_attention"),
+    ("weight_cache/daemon.py", "enable_dp_lm_head"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
+    ("weight_cache/daemon.py", "moe_a2a_backend"),
+    ("weight_cache/daemon.py", "moe_dense_tp_size"),
+    ("weight_cache/daemon.py", "moe_dp_size"),
+    ("weight_cache/daemon.py", "pp_size"),
+    ("weight_cache/daemon.py", "quantization"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -495,90 +209,26 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
+    ("dllm/config.py", "model_path"),
+    ("entrypoints/engine.py", "reasoning_parser"),
+    ("entrypoints/engine.py", "tool_call_parser"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
-    ("constrained/base_grammar_backend.py", "grammar_backend"),
-    ("disaggregation/decode_kvcache_offload_manager.py", "hicache_storage_backend"),
-    (
-        "disaggregation/decode_kvcache_offload_manager.py",
-        "hicache_storage_backend_extra_config",
-    ),
-    ("disaggregation/encode_server.py", "dp_size"),
-    ("disaggregation/encode_server.py", "load_format"),
-    ("disaggregation/encode_server.py", "model_path"),
-    (
-        "distributed/device_communicators/mooncake_transfer_engine.py",
-        "hicache_storage_backend",
-    ),
-    ("dllm/config.py", "model_path"),
-    ("elastic_ep/expert_backup_manager.py", "load_format"),
-    ("entrypoints/engine.py", "dp_size"),
-    ("entrypoints/engine.py", "dtype"),
-    ("entrypoints/engine.py", "ep_size"),
-    ("entrypoints/engine.py", "load_format"),
-    ("entrypoints/engine.py", "model_path"),
-    ("entrypoints/http_server.py", "dp_size"),
-    ("entrypoints/http_server.py", "model_path"),
-    ("kv_canary/api.py", "speculative_num_steps"),
-    ("kv_canary/capacities.py", "speculative_num_draft_tokens"),
-    ("layers/dp_attention.py", "dp_size"),
-    ("managers/data_parallel_controller.py", "dp_size"),
-    ("managers/data_parallel_controller.py", "ep_size"),
-    ("managers/load_snapshot.py", "dp_size"),
-    ("managers/scheduler.py", "dp_size"),
-    ("managers/scheduler.py", "ep_size"),
-    ("managers/scheduler.py", "hicache_storage_backend"),
-    ("managers/tokenizer_control_mixin.py", "dp_size"),
-    ("managers/tokenizer_manager.py", "dp_size"),
-    ("managers/tokenizer_manager.py", "model_path"),
-    ("managers/tokenizer_manager.py", "speculative_num_draft_tokens"),
-    ("managers/tp_worker.py", "model_path"),
-    ("managers/utils.py", "speculative_num_steps"),
-    ("mem_cache/allocation_sizing.py", "speculative_num_steps"),
-    ("mem_cache/hiradix_cache.py", "hicache_storage_backend"),
-    ("mem_cache/hiradix_cache.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/hiradix_cache.py", "hicache_storage_prefetch_policy"),
-    ("mem_cache/hiradix_cache.py", "hicache_write_policy"),
-    ("mem_cache/hybrid_cache/hybrid_pool_assembler.py", "hicache_storage_backend"),
-    ("mem_cache/hybrid_cache/hybrid_pool_assembler.py", "hicache_write_policy"),
     ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/radix_cache_cpp.py", "hicache_write_policy"),
     ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
     ("mem_cache/unified_radix_cache.py", "hicache_storage_backend_extra_config"),
     ("mem_cache/unified_radix_cache.py", "hicache_storage_prefetch_policy"),
     ("mem_cache/unified_radix_cache.py", "hicache_write_policy"),
-    ("model_executor/model_runner_components/load_model_utils.py", "load_format"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "dp_size"),
-    ("model_executor/model_runner_components/startup_weight_load.py", "ep_size"),
     ("parser/template_detection.py", "model_path"),
-    ("ray/data_parallel_controller.py", "dp_size"),
-    ("ray/engine.py", "dp_size"),
-    ("speculative/dflash_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/dspark_components/dspark_worker_v2.py", "disable_cuda_graph"),
-    (
-        "speculative/dspark_components/dspark_worker_v2.py",
-        "speculative_num_draft_tokens",
-    ),
-    ("speculative/eagle_disaggregation.py", "speculative_num_steps"),
-    ("speculative/eagle_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/eagle_worker_v2.py", "speculative_num_steps"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/frozen_kv_mtp_worker_v2.py", "speculative_num_steps"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/multi_layer_eagle_worker_v2.py", "speculative_num_steps"),
-    ("speculative/ngram_worker.py", "speculative_num_draft_tokens"),
-    ("speculative/ngram_worker.py", "speculative_num_steps"),
-    ("speculative/spec_info.py", "speculative_num_draft_tokens"),
-    ("speculative/spec_info.py", "speculative_num_steps"),
-    ("speculative/spec_utils.py", "speculative_num_draft_tokens"),
-    ("speculative/standalone_worker_v2.py", "speculative_num_draft_tokens"),
-    ("speculative/standalone_worker_v2.py", "speculative_num_steps"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
-    ("utils/cuda_vmm_transport_utils.py", "dp_size"),
-    ("utils/offloader.py", "dp_size"),
 }
 
 
@@ -604,11 +254,53 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
         ):
             return set()
 
+    def loop_variable_values(name: str) -> set:
+        """The values a `for name, ... in (<literal tuples>)` loop binds.
+
+        A handler that records one field per loop iteration spells the field
+        names in the loop's own literal, so they are still static.
+        """
+        values = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.For):
+                continue
+            target = node.target
+            names = (
+                [target]
+                if isinstance(target, ast.Name)
+                else list(getattr(target, "elts", []))
+            )
+            if not names or not isinstance(names[0], ast.Name) or names[0].id != name:
+                continue
+            if not (node.lineno <= call.lineno <= (node.end_lineno or node.lineno)):
+                continue
+            for item in getattr(node.iter, "elts", []):
+                first = (
+                    item.elts[0] if isinstance(item, ast.Tuple) and item.elts else item
+                )
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    values.add(first.value)
+        return values
+
     def dict_keys(node) -> set:
-        assert isinstance(node, ast.Dict) and all(
-            isinstance(key, ast.Constant) for key in node.keys
+        assert isinstance(
+            node, ast.Dict
         ), f"non-literal dict in override expansion at {rel}:{call.lineno}"
-        return {key.value for key in node.keys}
+        keys = set()
+        for key in node.keys:
+            if isinstance(key, ast.Constant):
+                keys.add(key.value)
+                continue
+            assert isinstance(
+                key, ast.Name
+            ), f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            bound = loop_variable_values(key.id)
+            assert bound, (
+                f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
+                "literal loop; extend the resolver"
+            )
+            keys |= bound
+        return keys
 
     if isinstance(kw.value, ast.Dict):
         return dict_keys(kw.value)
@@ -743,6 +435,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 resolved = ServerArgs(
                     model_path=model_path, device="cuda", random_seed=42, **extra
                 )
+                resolved.resolve_once()
             except Exception as exc:
                 self.fail(
                     f"the matrix entry {extra} (env={env}) did not resolve in "
@@ -781,14 +474,22 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         `speculative_draft_attention_backend`, and no entry ran it) showed
         that a family nobody listed leaves its readers unpinned. The hook
         modules under `arg_groups/` are the resolution pipeline's extension
-        points, and their assignment surface (`server_args.field = ...`) is
-        the may-write set, family-blind by construction. Collected like the
+        points -- along with the NPU default helper, which the pipeline calls
+        the same way -- and their write surface is the may-write set,
+        family-blind by
+        construction. A hook writes two ways: `server_args.field = ...`, and
+        `declare_resolution(server_args, source, field=...)`, which records
+        the write in the declaration stash on its way to the field. Counting
+        only the assignment would read a hook's conversion to a declaration as
+        the field having stopped being written. Collected like the
         late-resolution keywords: statically, failing loudly on an
         unparsable module. Underscore-prefixed targets are pipeline
         bookkeeping, not config leaves.
         """
         targets = set()
-        for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+        modules = sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py"))
+        modules.append(_PACKAGE_ROOT / "hardware_backend/npu/utils.py")
+        for path in modules:
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8-sig"))
             except SyntaxError:
@@ -798,6 +499,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     tgts = node.targets
                 elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                     tgts = [node.target]
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
+                ):
+                    targets |= {
+                        kw.arg
+                        for kw in node.keywords
+                        if kw.arg and not kw.arg.startswith("_")
+                    }
+                    continue
                 else:
                     continue
                 for tgt in tgts:
@@ -820,6 +532,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         A write site that can never fire is a dead branch to delete upstream,
         not a census exemption. Only names that are declared dataclass fields
         count; underscore bookkeeping does not.
+
+        Two spellings write: an assignment, and ``self._declare(source,
+        field=value)``, which records the write in the declaration stash on
+        its way to the field. Counting only assignments would read a handler's
+        conversion to a declaration as the field having stopped being written,
+        which would quietly retire every pinned pair that reads it.
         """
         tree = ast.parse(
             (_PACKAGE_ROOT / "server_args.py").read_text(encoding="utf-8-sig")
@@ -840,6 +558,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = node.targets
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                 tgts = [node.target]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_declare"
+            ):
+                targets |= {
+                    kw.arg
+                    for kw in node.keywords
+                    if kw.arg in declared and not kw.arg.startswith("_")
+                }
+                continue
             else:
                 continue
             for tgt in tgts:
@@ -851,27 +580,24 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     and not tgt.attr.startswith("_")
                 ):
                     targets.add(tgt.attr)
-        # The deprecated-alias normalization loop writes through a *name
-        # tuple* (`for attr in (...): setattr(self, attr, "dsv4")`), which no
-        # assignment scan sees; its field set is pinned here with a drift
-        # guard on the tuple itself.
+        # The deprecated-alias normalization declares through `**renamed`, so
+        # the keyword scan sees no names; its field set is pinned here.
         alias_fields = {
             "attention_backend",
             "decode_attention_backend",
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
+        deprecated = next(
+            node
+            for node in ast.walk(sa_class)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_handle_deprecated_args"
+        )
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Tuple)
-            and any(
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "setattr"
-                for inner in ast.walk(node)
-            )
+            for node in ast.walk(deprecated)
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
         ]
         self.assertIn(
             alias_fields,
@@ -988,6 +714,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     if kw.arg and kw.arg != "source":
                         written.add(kw.arg)
                     elif kw.arg is None:
+                        if rel in _CALLER_SUPPLIED_LATE_SITES:
+                            continue
                         dynamic = _LATE_RESOLUTION_DYNAMIC_SITES.get(rel)
                         if dynamic is not None:
                             constants = {
@@ -1012,11 +740,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         name, and the *parked* form -- ``self.x = server_args`` in a method
         that takes the parameter, read as ``self.x.field`` anywhere in the
         class. Parking under a different object, a container, or a computed
-        name stays invisible, like in every census of this family -- the
-        loudest known boundary is the *chain* spelling,
-        ``model_runner.server_args.field`` off some other parameter, which
-        this census does not count (~150 reads tree-wide; extending the pin
-        to that spelling is its own step, not a by-product of this one)."""
+        name stays invisible, like in every census of this family. The
+        loudest boundary *was* the *chain* spelling,
+        ``model_runner.server_args.field`` off some other object, which this
+        census still does not count -- but those reads are gone for every
+        resolution-written field and ``test_chain_read_ratchet.py`` holds them
+        at zero, so the gap is no longer where the risk is."""
         pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
@@ -1103,25 +832,37 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 raise AssertionError(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):
                 if not (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "override"
+                    isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 ):
                     continue
                 base = node.func.value
-                if (
+                is_override = node.func.attr == "override" and (
                     isinstance(base, ast.Call)
                     and isinstance(base.func, ast.Name)
                     and base.func.id == "get_context"
-                ):
-                    for kw in node.keywords:
-                        if kw.arg == "source":
-                            # Override metadata, not a config field.
-                            continue
-                        if kw.arg:
-                            written.add(kw.arg)
-                        else:
-                            written |= _expanded_override_keys(rel, tree, node, kw)
+                )
+                # `record_config_updates` is a named wrapper over override, so
+                # its call sites are override sites. Its body forwards **kwargs
+                # and names no field, so skip the forwarding call itself.
+                is_wrapper = node.func.attr == "record_config_updates"
+                if not (is_override or is_wrapper):
+                    continue
+                inside_wrapper = any(
+                    isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and fn.name == "record_config_updates"
+                    and fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno)
+                    for fn in ast.walk(tree)
+                )
+                if inside_wrapper:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg == "source":
+                        # Override metadata, not a config field.
+                        continue
+                    if kw.arg:
+                        written.add(kw.arg)
+                    else:
+                        written |= _expanded_override_keys(rel, tree, node, kw)
         return written
 
     def test_the_post_publish_override_surface_matches_the_pinned_list(self):
