@@ -98,7 +98,7 @@ def test_does_not_read_tensors_only_capture_time_scalars():
 )
 def test_tuned_operating_points(tokens, expected):
     """Values measured fastest on MI355X. Update alongside the constants if the
-    heuristic is retuned -- this is the one test that pins numbers."""
+    heuristic is re-tuned -- this is the one test that pins numbers."""
     assert _kv_splits_heuristic(tokens, HEADS, BLOCK_H, num_cu=NUM_CU) == expected
 
 
