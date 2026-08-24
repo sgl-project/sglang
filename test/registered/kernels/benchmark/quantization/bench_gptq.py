@@ -2,7 +2,7 @@ import torch
 from sgl_kernel import gptq_gemm as aot_gptq_gemm
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.quantization.gptq import gptq_gemm
+from sglang.kernels.ops.quantization import gptq_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
