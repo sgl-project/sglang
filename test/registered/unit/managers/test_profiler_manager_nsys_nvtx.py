@@ -201,3 +201,61 @@ def test_nsys_exact_capture_fails_closed_if_batch_shape_changes():
         manager._profile_batch_predicate(
             SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
         )
+
+
+def test_nsys_any_rank_gate_captures_variable_shape_window():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    forward_ct = 100
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "any",
+            "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE": "0",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: forward_ct,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 102
+
+    def mark_any_rank_ready(ready, **_kwargs):
+        ready.fill_(1)
+
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_stop_profile") as stop_profile,
+        patch("torch.distributed.all_reduce", side_effect=mark_any_rank_ready) as reduce,
+        patch("torch.distributed.barrier"),
+    ):
+        start_profile.side_effect = lambda: setattr(
+            manager, "profile_in_progress", True
+        )
+        stop_profile.side_effect = lambda: setattr(
+            manager, "profile_in_progress", False
+        )
+
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+        )
+        assert manager.profile_in_progress
+        assert reduce.call_args.kwargs["op"] == torch.distributed.ReduceOp.MAX
+
+        forward_ct = 101
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 29, forward_mode=decode_mode)
+        )
+        forward_ct = 102
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 27, forward_mode=decode_mode)
+        )
+        forward_ct = 103
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 25, forward_mode=decode_mode)
+        )
+
+    start_profile.assert_called_once_with()
+    stop_profile.assert_called_once_with()

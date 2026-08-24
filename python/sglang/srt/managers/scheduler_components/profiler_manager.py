@@ -95,6 +95,16 @@ class SchedulerProfilerManager:
         )
         if self.nsys_exact_warmup_batches <= 0:
             raise ValueError("SGLANG_NSYS_EXACT_WARMUP_BATCHES must be positive")
+        self.nsys_exact_gate_reduction = os.getenv(
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION", "all"
+        ).strip().lower()
+        if self.nsys_exact_gate_reduction not in {"all", "any"}:
+            raise ValueError(
+                "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all' or 'any'"
+            )
+        self.nsys_require_fixed_capture = os.getenv(
+            "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE", "1"
+        ).strip().lower() not in {"0", "false", "no"}
         expected_sync_world_size = int(
             os.getenv("SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE", "0") or "0"
         )
@@ -533,7 +543,11 @@ class SchedulerProfilerManager:
                     )
                     torch.distributed.all_reduce(
                         ready,
-                        op=torch.distributed.ReduceOp.MIN,
+                        op=(
+                            torch.distributed.ReduceOp.MIN
+                            if self.nsys_exact_gate_reduction == "all"
+                            else torch.distributed.ReduceOp.MAX
+                        ),
                         group=self.exact_nsys_cpu_group,
                     )
                     exact_worker_ready = bool(ready.item())
@@ -547,8 +561,10 @@ class SchedulerProfilerManager:
                         )
                         self.profiler_target_forward_ct = forward_ct + capture_width
                         logger.info(
-                            "All-DP exact running-batch Nsight gate matched: "
-                            "batch=%d forward_ct=%d warmup_batches=%d",
+                            "Worker-wide exact running-batch Nsight gate matched: "
+                            "reduction=%s batch=%d forward_ct=%d "
+                            "local_warmup_batches=%d",
+                            self.nsys_exact_gate_reduction,
                             self.nsys_exact_batch,
                             forward_ct,
                             self.nsys_exact_warmup_batches_seen,
@@ -559,7 +575,10 @@ class SchedulerProfilerManager:
                 and self.profile_in_progress
                 and batch.forward_mode.is_decode()
             ):
-                if len(batch.reqs) != self.nsys_exact_batch:
+                if (
+                    self.nsys_require_fixed_capture
+                    and len(batch.reqs) != self.nsys_exact_batch
+                ):
                     raise RuntimeError(
                         "Exact-batch Nsight capture lost its fixed shape: "
                         f"expected {self.nsys_exact_batch}, got {len(batch.reqs)}"
