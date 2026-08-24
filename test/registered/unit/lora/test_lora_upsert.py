@@ -11,11 +11,14 @@ instead of failing with a duplicate error. Covers:
   * LoRAManager.validate_new_adapter duplicate-name / starvation checks
   * TokenizerControlMixin from_distributed id reuse; the from_tensors route
     rejects upsert explicitly (only from_distributed supports in-place refresh)
+  * source checksum validation for the distributed tensor transport
 """
 
 import asyncio
+import hashlib
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import torch
 
@@ -29,12 +32,69 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
+    LoRAUpdateOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_executor.model_runner import ModelRunner
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CONFIG_DICT = {"target_modules": ["q_proj"], "r": 8, "lora_alpha": 16}
+
+
+class TestDistributedLoRAChecksums(CustomTestCase):
+    @staticmethod
+    def _run(expected_checksum: str):
+        received = torch.tensor([1.0, 2.0])
+        handle = MagicMock()
+        runner = SimpleNamespace(
+            weight_updater=SimpleNamespace(_model_update_group={"group": object()}),
+            device=torch.device("cpu"),
+            ps=SimpleNamespace(tp_rank=0),
+            lora_manager=MagicMock(),
+        )
+        runner.lora_manager.load_lora_adapter_from_tensors.return_value = (
+            LoRAUpdateOutput(success=True)
+        )
+
+        def broadcast(output, src, *, group, async_op):
+            assert src == 0
+            assert group is runner.weight_updater._model_update_group["group"]
+            assert async_op
+            output.copy_(received)
+            return handle
+
+        with patch("torch.distributed.broadcast", side_effect=broadcast):
+            result = ModelRunner.load_lora_adapter_from_distributed(
+                runner,
+                LoRARef(lora_name="a", lora_path="__distributed__"),
+                names=["weight"],
+                dtypes=[torch.float32],
+                shapes=[[2]],
+                config_dict=CONFIG_DICT,
+                group_name="group",
+                expected_checksums={"weight": expected_checksum},
+            )
+        handle.wait.assert_called_once()
+        return result, runner.lora_manager
+
+    def test_matching_checksum_loads_adapter(self):
+        checksum = hashlib.sha256(
+            torch.tensor([1.0, 2.0]).view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+
+        result, manager = self._run(checksum)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.checksums_verified)
+        manager.load_lora_adapter_from_tensors.assert_called_once()
+
+    def test_mismatched_checksum_rejects_before_load(self):
+        result, manager = self._run("wrong")
+
+        self.assertFalse(result.success)
+        self.assertIn("value-diff", result.error_message)
+        manager.load_lora_adapter_from_tensors.assert_not_called()
 
 
 class TestLoRARegistryGetLoraId(CustomTestCase):

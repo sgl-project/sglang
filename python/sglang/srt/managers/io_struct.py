@@ -2132,6 +2132,7 @@ class LoadLoRAAdapterFromDistributedReqInput(BaseReq, kw_only=True):
     lora_id: Optional[str] = None
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
+    expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
@@ -2146,6 +2147,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    checksums_verified: bool = False
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (

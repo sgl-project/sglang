@@ -83,6 +83,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.utils import verify_lora_tensor_checksums
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
@@ -1083,6 +1084,7 @@ class ModelRunner:
         group_name,
         added_tokens_config=None,
         upsert: bool = False,
+        expected_checksums=None,
     ):
         """Load a new lora adapter whose weights are broadcast over the
         `_model_update_group` process group (no CUDA IPC).
@@ -1119,6 +1121,21 @@ class ModelRunner:
             logger.error(error_msg)
             return LoRAUpdateOutput(success=False, error_message=error_msg)
 
+        try:
+            verify_lora_tensor_checksums(
+                tensors,
+                expected_checksums,
+                self.ps.tp_rank,
+            )
+        except Exception as e:
+            logger.error(str(e))
+            return LoRAUpdateOutput(success=False, error_message=str(e))
+        if expected_checksums is not None:
+            logger.info(
+                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: "
+                f"{len(expected_checksums)}/{len(expected_checksums)} tensors match (sha256)"
+            )
+
         result = self.lora_manager.load_lora_adapter_from_tensors(
             lora_ref,
             tensors,
@@ -1126,6 +1143,7 @@ class ModelRunner:
             added_tokens_config,
             upsert=upsert,
         )
+        result.checksums_verified = expected_checksums is not None
         logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
         return result
 

@@ -1,11 +1,47 @@
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+
+def verify_lora_tensor_checksums(
+    tensors: Dict[str, torch.Tensor],
+    expected_checksums: Optional[Dict[str, str]],
+    rank: int,
+) -> None:
+    if expected_checksums is None:
+        return
+
+    mismatched = []
+    missing = []
+    for name, expected in expected_checksums.items():
+        if name not in tensors:
+            missing.append(name)
+            continue
+        actual = hashlib.sha256(
+            tensors[name]
+            .detach()
+            .cpu()
+            .contiguous()
+            .flatten()
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+        ).hexdigest()
+        if actual != expected:
+            mismatched.append(name)
+    extra = [name for name in tensors if name not in expected_checksums]
+    if mismatched or missing or extra:
+        raise RuntimeError(
+            f"[LORA-CHECK] rank{rank} adapter sync MISMATCH of {len(expected_checksums)} expected: "
+            f"{len(mismatched)} value-diff {mismatched[:5]}, {len(missing)} missing {missing[:5]}, "
+            f"{len(extra)} extra {extra[:5]}"
+        )
 
 
 @dataclass
