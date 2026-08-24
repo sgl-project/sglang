@@ -694,7 +694,16 @@ class Qwen3VLModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.visual = Qwen3VLVisionTransformer(config.vision_config)
+        vision_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.supports_srt_linear_layers
+            else None
+        )
+        self.visual = Qwen3VLVisionTransformer(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             quant_config=quant_config,
