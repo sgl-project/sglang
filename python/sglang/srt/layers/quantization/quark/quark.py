@@ -323,10 +323,12 @@ class QuarkConfig(QuantizationConfig):
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
         # Both are consumed by _is_draft_layer(), which has to tell an appended
-        # MTP/NextN draft layer from a target-model one.
+        # MTP/NextN draft layer from a target-model one. "No draft stack" is
+        # spelled None as often as it is spelled absent -- ModelConfig defaults
+        # the same field to None -- so coerce rather than let range() raise.
         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
-        self.num_nextn_predict_layers = getattr(
-            hf_config, "num_nextn_predict_layers", 0
+        self.num_nextn_predict_layers = int(
+            getattr(hf_config, "num_nextn_predict_layers", 0) or 0
         )
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
