@@ -9,6 +9,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -18,8 +23,8 @@ def start_disagg_service(
     server_args: ServerArgs,
 ):
     # Start kv bootstrap server on prefill
-    disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
-    transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
+    disagg_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+    transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
 
     # With role switching, run bootstrap on every instance (not just prefill) so
     # one flipped to prefill already has it; it isn't rebuilt on flip.
@@ -41,8 +46,8 @@ def start_disagg_service(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
         bootstrap_server = kv_bootstrap_server_class(
-            host=server_args.host,
-            port=server_args.disaggregation_bootstrap_port,
+            host=get_serving().host,
+            port=get_disagg().disaggregation_bootstrap_port,
         )
         maybe_create_ascend_config_store(
             server_args=server_args, transfer_backend=transfer_backend
@@ -60,7 +65,9 @@ def maybe_create_ascend_config_store(
     bootstrap-server subclasses are all plain ``CommonKVBootstrapServer``,
     which the rust registry ports verbatim), leaving this store as the only
     ``start_disagg_service`` duty left to perform."""
-    if not (server_args.node_rank == 0 and transfer_backend == TransferBackend.ASCEND):
+    if not (
+        get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
+    ):
         return
     try:
         from memfabric_hybrid import create_config_store
