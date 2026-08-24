@@ -40,7 +40,7 @@ For how to launch the image, see [Install -> Method 3: Using Docker](../../../do
 
 </Accordion>
 
-Pick a Granite 4.2 checkpoint to generate the launch command. The verified matrix covers BF16 serving on one NVIDIA H200 with tensor parallelism 1.
+Pick a Granite 4.2 checkpoint to generate the launch command. The verified matrix covers BF16 serving on one NVIDIA H200 or B200 with tensor parallelism 1.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/ibm-granite/granite-4.2.jsx";
@@ -49,7 +49,7 @@ import { benchmarks } from "/src/snippets/configs/ibm-granite/granite-4.2-benchm
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  The speed results use one NVIDIA H200 with `lmsysorg/sglang:dev` at SGLang commit `d59c1ddf7`; the launch recipes were re-verified end to end on commit `d10a656ad8` against the release checkpoints. Each speed point uses 80 fixed-length random requests at 8,192 input and 1,024 output tokens, 8 warmup requests, a flushed cache, greedy sampling, and ignore-EOS.
+  The H200 speed results use `lmsysorg/sglang:dev` at SGLang commit `d59c1ddf7` and the B200 results at commit `d10a656ad8`; the launch recipes were verified end to end on both GPUs against the release checkpoints. Each speed point uses 80 fixed-length random requests at 8,192 input and 1,024 output tokens, 8 warmup requests, a flushed cache, greedy sampling, and ignore-EOS.
 </Note>
 
 ## Playground
@@ -101,7 +101,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **Give thinking enough tokens.** At `temperature=1.0` the default thinking mode can run past 1,000 tokens on multi-step problems. Use a `max_tokens` of at least 2,048 for thinking requests so the answer is not cut off.
 - **Reasoning parser.** Launch with `--reasoning-parser nemotron_3` so OpenAI-compatible responses separate the trace into `message.reasoning_content` and the answer into `message.content`. Without a parser flag the reasoning markup stays inline in `message.content`. `--reasoning-parser auto` also resolves to `nemotron_3` for these checkpoints.
 - **Tool-call parser.** Launch with `--tool-call-parser qwen3_coder` so tool requests are returned through `message.tool_calls`. Without it, raw `<tool_call>` markup stays in `message.content`. `--tool-call-parser auto` also resolves to `qwen3_coder` for these checkpoints.
-- **Single-H200 sizing.** All three BF16 checkpoints loaded and completed chat requests with `--tp 1 --mem-fraction-static 0.8` on one H200. Increase TP only after validating the new topology.
+- **Single-GPU sizing.** All three BF16 checkpoints loaded and completed chat requests with `--tp 1 --mem-fraction-static 0.8` on one H200 and on one B200. Increase TP only after validating the new topology.
 - **Image selection.** The validated path uses `lmsysorg/sglang:dev`. A stable image tested during validation had an incompatible dependency set before model loading, so use the recipe's image until a newer tagged release is confirmed.
 
 ## 3. Advanced usage

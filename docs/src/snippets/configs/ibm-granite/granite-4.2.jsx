@@ -3,7 +3,7 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200"],
+  supportedHardware: ["h200", "b200"],
 
   variants: [
     { id: "3b", label: "3B", subtitle: "Dense" },
@@ -55,6 +55,7 @@ export const config = {
 
   dockerImages: {
     h200: "lmsysorg/sglang:dev",
+    b200: "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -133,6 +134,48 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "30b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.8",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "3b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.8",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "8b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.8",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "30b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
       flags: [
