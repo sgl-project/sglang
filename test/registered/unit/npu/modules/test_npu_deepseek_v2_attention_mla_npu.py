@@ -108,7 +108,9 @@ _comm = _make_stub("sglang.srt.layers.communicator")
 _comm.ScatterMode = _ScatterMode
 _comm.get_attn_tp_context = MagicMock()
 
-from sglang.srt.hardware_backend.npu.modules import deepseek_v2_attention_mla_npu as dsa_mod
+from sglang.srt.hardware_backend.npu.modules import (
+    deepseek_v2_attention_mla_npu as dsa_mod,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +144,7 @@ def _set_model_attrs(obj, **ov):
     obj.kv_a_proj_with_mqa = MagicMock(
         return_value=(torch.randn(NT, KV_LR + QK_RD), None)
     )
-    obj.kv_b_proj = MagicMock(
-        return_value=(torch.randn(NT, NH * (QK_ND + VHD)), None)
-    )
+    obj.kv_b_proj = MagicMock(return_value=(torch.randn(NT, NH * (QK_ND + VHD)), None))
     obj.fused_qkv_a_proj_with_mqa = MagicMock(
         return_value=(torch.randn(NT, QLR + KV_LR + QK_RD), None)
     )
@@ -319,13 +319,15 @@ class TestForwardMhaPrepareNpu(unittest.TestCase):
         )
         _torch_npu.npu_interleave_rope.return_value = torch.randn(NT, NH, 1, QK_RD)
         _torch_npu.npu_kv_rmsnorm_rope_cache.return_value = (
-            MagicMock(), MagicMock(),
+            MagicMock(),
+            MagicMock(),
             torch.randn(NT, 1, QK_RD),  # k_pe
-            torch.randn(NT, KV_LR),     # kv_a
+            torch.randn(NT, KV_LR),  # kv_a
         )
         mock_pool = MagicMock()
         mock_pool.get_kv_buffer.return_value = (
-            torch.randn(100, NH, VHD), torch.randn(100, 1, QK_RD)
+            torch.randn(100, NH, VHD),
+            torch.randn(100, 1, QK_RD),
         )
         positions = torch.arange(NT)
         hidden_states = torch.randn(NT, 8)
@@ -354,8 +356,10 @@ class TestForwardMhaPrepareNpu(unittest.TestCase):
         )
         _torch_npu.npu_interleave_rope.return_value = torch.randn(NT, NH, 1, QK_RD)
         _torch_npu.npu_kv_rmsnorm_rope_cache.return_value = (
-            MagicMock(), MagicMock(),
-            torch.randn(NT, 1, QK_RD), torch.randn(NT, KV_LR),
+            MagicMock(),
+            MagicMock(),
+            torch.randn(NT, 1, QK_RD),
+            torch.randn(NT, KV_LR),
         )
         result, mock_pool = self._call(m)
         self.assertFalse(mock_pool.set_kv_buffer.called)
@@ -395,24 +399,33 @@ class TestForwardMhaCoreNpu(unittest.TestCase):
     def test_calls_attn_mha(self):
         m = _make_model()
         dsa_mod.forward_mha_core_npu(
-            m, torch.randn(NT, NH, QK_HD), torch.randn(NT, NH, QK_HD),
-            torch.randn(NT, NH, VHD), _make_forward_batch(),
+            m,
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, VHD),
+            _make_forward_batch(),
         )
         self.assertTrue(m.attn_mha.called)
 
     def test_calls_o_proj(self):
         m = _make_model()
         dsa_mod.forward_mha_core_npu(
-            m, torch.randn(NT, NH, QK_HD), torch.randn(NT, NH, QK_HD),
-            torch.randn(NT, NH, VHD), _make_forward_batch(),
+            m,
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, VHD),
+            _make_forward_batch(),
         )
         self.assertTrue(m.o_proj.called)
 
     def test_return_is_tensor(self):
         m = _make_model()
         result = dsa_mod.forward_mha_core_npu(
-            m, torch.randn(NT, NH, QK_HD), torch.randn(NT, NH, QK_HD),
-            torch.randn(NT, NH, VHD), _make_forward_batch(),
+            m,
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, QK_HD),
+            torch.randn(NT, NH, VHD),
+            _make_forward_batch(),
         )
         self.assertIsInstance(result, torch.Tensor)
 
@@ -440,7 +453,9 @@ class TestForwardMlaPrepareNpu(unittest.TestCase):
         with (
             patch.object(dsa_mod, "get_attn_tp_context", return_value=mock_ctx),
             patch.object(dsa_mod, "get_token_to_kv_pool", return_value=mock_pool),
-            patch.object(dsa_mod, "is_mla_preprocess_enabled", return_value=mla_enabled),
+            patch.object(
+                dsa_mod, "is_mla_preprocess_enabled", return_value=mla_enabled
+            ),
             patch.object(dsa_mod, "dsa_use_prefill_cp", return_value=use_cp),
         ):
             return dsa_mod.forward_mla_prepare_npu(
@@ -453,9 +468,13 @@ class TestForwardMlaPrepareNpu(unittest.TestCase):
         m.mla_preprocess = MagicMock()
         m.mla_preprocess.forward = MagicMock(
             return_value=(
-                torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-                torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
-                _make_forward_batch(), None, torch.arange(NT),
+                torch.randn(NT, NH, QK_RD),
+                torch.randn(NT, 1, QK_RD),
+                torch.randn(NT, NH, KV_LR),
+                torch.randn(NT, 1, KV_LR),
+                _make_forward_batch(),
+                None,
+                torch.arange(NT),
             )
         )
         result = self._call(m, mla_enabled=True)
@@ -541,48 +560,62 @@ class TestForwardMlaCoreNpu(unittest.TestCase):
     def _args(self):
         return (
             _make_model(),
-            torch.randn(NT, NH, QK_RD),   # q_pe
-            torch.randn(NT, 1, QK_RD),    # k_pe
-            torch.randn(NT, NH, KV_LR),   # q_nope_out
-            torch.randn(NT, 1, KV_LR),    # k_nope
+            torch.randn(NT, NH, QK_RD),  # q_pe
+            torch.randn(NT, 1, QK_RD),  # k_pe
+            torch.randn(NT, NH, KV_LR),  # q_nope_out
+            torch.randn(NT, 1, KV_LR),  # k_nope
             _make_forward_batch(),
         )
 
     # -- L293: calls attn_mqa --
     def test_calls_attn_mqa(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
-        dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None)
+        dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None
+        )
         self.assertTrue(m.attn_mqa.called)
 
     # -- L300: topk_indices is None → no topk_indices kwarg passed --
     def test_topk_indices_none_no_kwarg(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
-        dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None)
+        dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None
+        )
         self.assertNotIn("topk_indices", m.attn_mqa.call_args.kwargs)
 
     # -- L300: topk_indices is not None → topk_indices kwarg passed --
     def test_topk_indices_not_none_passes_kwarg(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
         tk = torch.randn(NT, 10)
-        dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), tk)
-        self.assertTrue(torch.equal(m.attn_mqa.call_args.kwargs.get("topk_indices"), tk))
+        dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), tk
+        )
+        self.assertTrue(
+            torch.equal(m.attn_mqa.call_args.kwargs.get("topk_indices"), tk)
+        )
 
     # -- L308: calls npu_transpose_batchmatmul --
     def test_calls_npu_transpose_batchmatmul(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
-        dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None)
+        dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None
+        )
         self.assertTrue(_torch_npu.npu_transpose_batchmatmul.called)
 
     # -- L317: calls o_proj --
     def test_calls_o_proj(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
-        dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None)
+        dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None
+        )
         self.assertTrue(m.o_proj.called)
 
     # -- L319: return is tensor --
     def test_return_is_tensor(self):
         m, q_pe, k_pe, qno, kn, fb = self._args()
-        result = dsa_mod.forward_mla_core_npu(m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None)
+        result = dsa_mod.forward_mla_core_npu(
+            m, q_pe, k_pe, qno, kn, fb, None, torch.arange(NT), None
+        )
         self.assertIsInstance(result, torch.Tensor)
 
 
@@ -600,35 +633,57 @@ class TestForwardDsaPrepareNpu(unittest.TestCase):
         forward_batch = ov.get(
             "forward_batch", _make_forward_batch(ov.get("mode", "extend"))
         )
-        scatter_modes = ov.get("scatter_modes", SimpleNamespace(
-            layer_input_mode=_ScatterMode.TP_ATTN_FULL,
-            attn_mode=_ScatterMode.TP_ATTN_FULL,
-        ))
+        scatter_modes = ov.get(
+            "scatter_modes",
+            SimpleNamespace(
+                layer_input_mode=_ScatterMode.TP_ATTN_FULL,
+                attn_mode=_ScatterMode.TP_ATTN_FULL,
+            ),
+        )
         prev_topk = ov.get("prev_topk_indices", None)
         with (
             patch.object(dsa_mod, "is_mla_preprocess_enabled", return_value=False),
-            patch.object(dsa_mod, "dsa_use_prefill_cp", return_value=ov.get("use_cp", False)),
+            patch.object(
+                dsa_mod, "dsa_use_prefill_cp", return_value=ov.get("use_cp", False)
+            ),
         ):
             return dsa_mod.forward_dsa_prepare_npu(
-                m, positions, hidden_states, forward_batch, None, scatter_modes, prev_topk
+                m,
+                positions,
+                hidden_states,
+                forward_batch,
+                None,
+                scatter_modes,
+                prev_topk,
             )
 
     # -- L336: is_mla_preprocess_enabled + is_decode → npu_mla_preprocess called --
     @patch.object(dsa_mod, "npu_mla_preprocess")
     def test_mla_preprocess_enabled_decode_calls_npu_mla_preprocess(self, mock_prep):
         mock_prep.return_value = (
-            torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-            torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
-            torch.randn(NT, QLR), _make_forward_batch(), None,
-            torch.arange(NT), None,
+            torch.randn(NT, NH, QK_RD),
+            torch.randn(NT, 1, QK_RD),
+            torch.randn(NT, NH, KV_LR),
+            torch.randn(NT, 1, KV_LR),
+            torch.randn(NT, QLR),
+            _make_forward_batch(),
+            None,
+            torch.arange(NT),
+            None,
         )
         m = _make_model()
         fb = _make_forward_batch("decode")
         with patch.object(dsa_mod, "is_mla_preprocess_enabled", return_value=True):
             dsa_mod.forward_dsa_prepare_npu(
-                m, torch.arange(NT), torch.randn(NT, 8), fb, None,
-                SimpleNamespace(layer_input_mode=_ScatterMode.TP_ATTN_FULL,
-                               attn_mode=_ScatterMode.TP_ATTN_FULL),
+                m,
+                torch.arange(NT),
+                torch.randn(NT, 8),
+                fb,
+                None,
+                SimpleNamespace(
+                    layer_input_mode=_ScatterMode.TP_ATTN_FULL,
+                    attn_mode=_ScatterMode.TP_ATTN_FULL,
+                ),
                 None,
             )
         self.assertTrue(mock_prep.called)
@@ -649,10 +704,13 @@ class TestForwardDsaPrepareNpu(unittest.TestCase):
     def test_neox_ag_after_qlora_calls_scattered(self):
         dsa_mod._use_ag_after_qlora = True
         m = _make_model(is_neox_style=True)
-        self._call(m, scatter_modes=SimpleNamespace(
-            layer_input_mode=_ScatterMode.SCATTERED,
-            attn_mode=_ScatterMode.TP_ATTN_FULL,
-        ))
+        self._call(
+            m,
+            scatter_modes=SimpleNamespace(
+                layer_input_mode=_ScatterMode.SCATTERED,
+                attn_mode=_ScatterMode.TP_ATTN_FULL,
+            ),
+        )
         self.assertTrue(dsa_mod.scattered_to_tp_attn_full.called)
 
     # -- L372-378: neox + alt_stream is not None → alt_stream ops --
@@ -745,25 +803,29 @@ class TestForwardDsaCoreNpu(unittest.TestCase):
         m = _make_model()
         return (
             m,
-            torch.randn(NT, NH, QK_RD),   # q_pe
-            torch.randn(NT, 1, QK_RD),    # k_pe
-            torch.randn(NT, NH, KV_LR),   # q_nope_out
-            torch.randn(NT, 1, KV_LR),    # k_nope
-            torch.randn(NT, 10),          # topk_indices
-            _make_forward_batch(mode),    # forward_batch
+            torch.randn(NT, NH, QK_RD),  # q_pe
+            torch.randn(NT, 1, QK_RD),  # k_pe
+            torch.randn(NT, NH, KV_LR),  # q_nope_out
+            torch.randn(NT, 1, KV_LR),  # k_nope
+            torch.randn(NT, 10),  # topk_indices
+            _make_forward_batch(mode),  # forward_batch
         )
 
     # -- L493-505: extend path → torch.bmm called --
     def test_extend_path_calls_bmm(self):
         m, q_pe, k_pe, qno, kn, tk, fb = self._make_args("extend")
         with patch("torch.bmm") as mock_bmm:
-            dsa_mod.forward_dsa_core_npu(m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT))
+            dsa_mod.forward_dsa_core_npu(
+                m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT)
+            )
         self.assertTrue(mock_bmm.called)
 
     # -- L506-508: non-extend path → torch.ops.npu.batch_matmul_transpose --
     def test_non_extend_path_calls_batch_matmul_transpose(self):
         m, q_pe, k_pe, qno, kn, tk, fb = self._make_args("decode")
-        dsa_mod.forward_dsa_core_npu(m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT))
+        dsa_mod.forward_dsa_core_npu(
+            m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT)
+        )
         self.assertTrue(torch.ops.npu.batch_matmul_transpose.called)
 
     # -- L513: next_skip_topk=False → returns (output, None) --
@@ -771,9 +833,15 @@ class TestForwardDsaCoreNpu(unittest.TestCase):
         m = _make_model(next_skip_topk=False)
         with patch("torch.bmm"):
             result = dsa_mod.forward_dsa_core_npu(
-                m, torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-                torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
-                torch.randn(NT, 10), _make_forward_batch("extend"), None, torch.arange(NT),
+                m,
+                torch.randn(NT, NH, QK_RD),
+                torch.randn(NT, 1, QK_RD),
+                torch.randn(NT, NH, KV_LR),
+                torch.randn(NT, 1, KV_LR),
+                torch.randn(NT, 10),
+                _make_forward_batch("extend"),
+                None,
+                torch.arange(NT),
             )
         self.assertEqual(len(result), 2)
         self.assertIsNone(result[1])
@@ -784,9 +852,15 @@ class TestForwardDsaCoreNpu(unittest.TestCase):
         tk = torch.randn(NT, 10)
         with patch("torch.bmm"):
             result = dsa_mod.forward_dsa_core_npu(
-                m, torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-                torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
-                tk, _make_forward_batch("extend"), None, torch.arange(NT),
+                m,
+                torch.randn(NT, NH, QK_RD),
+                torch.randn(NT, 1, QK_RD),
+                torch.randn(NT, NH, KV_LR),
+                torch.randn(NT, 1, KV_LR),
+                tk,
+                _make_forward_batch("extend"),
+                None,
+                torch.arange(NT),
             )
         self.assertEqual(len(result), 2)
         self.assertIs(result[1], tk)
@@ -795,14 +869,18 @@ class TestForwardDsaCoreNpu(unittest.TestCase):
     def test_calls_attn_mqa(self):
         m, q_pe, k_pe, qno, kn, tk, fb = self._make_args("extend")
         with patch("torch.bmm"):
-            dsa_mod.forward_dsa_core_npu(m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT))
+            dsa_mod.forward_dsa_core_npu(
+                m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT)
+            )
         self.assertTrue(m.attn_mqa.called)
 
     # -- L512: calls o_proj --
     def test_calls_o_proj(self):
         m, q_pe, k_pe, qno, kn, tk, fb = self._make_args("extend")
         with patch("torch.bmm"):
-            dsa_mod.forward_dsa_core_npu(m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT))
+            dsa_mod.forward_dsa_core_npu(
+                m, q_pe, k_pe, qno, kn, tk, fb, None, torch.arange(NT)
+            )
         self.assertTrue(m.o_proj.called)
 
 
@@ -820,12 +898,12 @@ class TestNpuMlaPreprocess(unittest.TestCase):
         m.mla_preprocess.forward = MagicMock(
             return_value=(
                 torch.randn(NT, NH, QK_RD),  # q_pe
-                torch.randn(NT, 1, QK_RD),   # k_pe
-                torch.randn(NT, NH, KV_LR),   # q_nope_out
-                torch.randn(NT, 1, KV_LR),   # k_nope
-                _make_forward_batch(),        # forward_batch
-                None,                         # zero_allocator
-                torch.arange(NT),             # positions
+                torch.randn(NT, 1, QK_RD),  # k_pe
+                torch.randn(NT, NH, KV_LR),  # q_nope_out
+                torch.randn(NT, 1, KV_LR),  # k_nope
+                _make_forward_batch(),  # forward_batch
+                None,  # zero_allocator
+                torch.arange(NT),  # positions
             )
         )
         return m
@@ -833,7 +911,11 @@ class TestNpuMlaPreprocess(unittest.TestCase):
     def _call(self, m):
         with patch.object(dsa_mod, "is_mla_preprocess_enabled", return_value=True):
             return dsa_mod.npu_mla_preprocess(
-                m, torch.randn(NT, 8), torch.arange(NT), _make_forward_batch("decode"), None
+                m,
+                torch.randn(NT, 8),
+                torch.arange(NT),
+                _make_forward_batch("decode"),
+                None,
             )
 
     # -- L527: not hasattr(m, "mla_preprocess") → NPUFusedMLAPreprocess constructed --
@@ -842,9 +924,13 @@ class TestNpuMlaPreprocess(unittest.TestCase):
         mock_inst = MagicMock()
         mock_inst.forward = MagicMock(
             return_value=(
-                torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-                torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
-                _make_forward_batch(), None, torch.arange(NT),
+                torch.randn(NT, NH, QK_RD),
+                torch.randn(NT, 1, QK_RD),
+                torch.randn(NT, NH, KV_LR),
+                torch.randn(NT, 1, KV_LR),
+                _make_forward_batch(),
+                None,
+                torch.arange(NT),
             )
         )
         mock_cls.return_value = mock_inst
@@ -871,10 +957,14 @@ class TestNpuMlaPreprocess(unittest.TestCase):
         m.quant_config = SimpleNamespace(ignore=["model.layers.0.kv_b_proj"])
         m.mla_preprocess.forward = MagicMock(
             return_value=(
-                torch.randn(NT, NH, QK_RD), torch.randn(NT, 1, QK_RD),
-                torch.randn(NT, NH, KV_LR), torch.randn(NT, 1, KV_LR),
+                torch.randn(NT, NH, QK_RD),
+                torch.randn(NT, 1, QK_RD),
+                torch.randn(NT, NH, KV_LR),
+                torch.randn(NT, 1, KV_LR),
                 torch.randn(NT, QLR),  # q_lora from forward
-                _make_forward_batch(), torch.arange(NT), None,  # dynamic_scale
+                _make_forward_batch(),
+                torch.arange(NT),
+                None,  # dynamic_scale
             )
         )
         self._call(m)
