@@ -416,7 +416,7 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # CPU: delegate to CpuCommunicator, which handles group-aware SHM.
+        # Use the CPU device communicator.
         if current_platform.is_cpu() and self.device_communicator is not None:
             output_tensor = self.device_communicator.all_gather(
                 input_,
