@@ -27,12 +27,12 @@ def dcp_pack_max_tokens() -> int:
 def dcp_pack_buffer_bytes(kv_item_lens: Sequence[int], page_size: int) -> int:
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    token_item_lens = [item_len // page_size for item_len in kv_item_lens]
-    if any(item_len <= 0 for item_len in token_item_lens):
+    if any(item_len <= 0 or item_len % page_size != 0 for item_len in kv_item_lens):
         raise ValueError(
             "PD DCP pack requires page-aligned kv_item_lens, "
             f"got {list(kv_item_lens)} with page_size={page_size}"
         )
+    token_item_lens = [item_len // page_size for item_len in kv_item_lens]
     return dcp_pack_max_tokens() * sum(token_item_lens)
 
 
