@@ -19,6 +19,9 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (  # noqa: E402
     MXFP4_BLOCK_SIZE,
     DispatchDtype,
 )
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 HIDDEN = 7168  # DeepSeek-V4
 
@@ -70,3 +73,9 @@ def test_empty_token_batch_scale_shape():
     scale = torch.empty((0, HIDDEN // MXFP4_BLOCK_SIZE), dtype=torch.float8_e8m0fnu)
     assert scale.shape == (0, 224)
     assert scale.dtype == torch.float8_e8m0fnu
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
