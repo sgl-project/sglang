@@ -269,8 +269,9 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
         from sglang.srt.weight_cache import daemon
 
         # The spawn helper receives Engine's already-resolved ServerArgs. A
-        # minimal namespace keeps this projection test CPU-only and
-        # model-independent; importantly, no EPLB configuration is involved.
+        # minimal namespace keeps this forwarding test CPU-only and
+        # model-independent while covering the static DP/EP and EPLB fields
+        # consumed by the daemon.
         server_args = SimpleNamespace(
             model_path="/models/demo",
             tp_size=8,
@@ -284,6 +285,8 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
             moe_dense_tp_size=1,
             moe_a2a_backend="mooncake",
             deepep_mode="low_latency",
+            enable_eplb=True,
+            ep_num_redundant_experts=72,
             load_format="safetensors",
             dtype="bfloat16",
             quantization="fp8",

@@ -43,6 +43,17 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_weight_cache_daemon_allows_static_eplb(self):
+        args = ServerArgs(
+            model_path="dummy",
+            weight_cache_mode="daemon",
+            enable_eplb=True,
+        )
+
+        # This validation runs before model construction and should allow the
+        # daemon to build the same static EPLB layout as the engine.
+        args._handle_load_format()
+
     def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

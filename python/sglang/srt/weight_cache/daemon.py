@@ -314,6 +314,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -453,6 +454,24 @@ class WeightCacheDaemon:
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+        )
+
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine."""
+        if not self.server_args.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                server_args=self.server_args,
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
         )
 
     def serve(self):
