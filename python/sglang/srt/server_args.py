@@ -6816,7 +6816,7 @@ class ServerArgs:
             ragged_mode = read_ragged_verify_mode()
             if ragged_mode is not RaggedVerifyMode.STATIC:
                 # Ragged ring-writes need the KDA fold-every-commit family
-                # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
+                # (DSPARK/DFLASH/DFLASH_CONFIDENCE) + the triton verify kernel (nv_cutedsl falls
                 # back to it for ragged layouts). The GDN ring-write kernels do
                 # not take the ragged layout and the flashinfer verify kernel
                 # never writes the ring -> a stale ring would be folded; keep

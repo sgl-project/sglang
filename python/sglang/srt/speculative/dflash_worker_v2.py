@@ -1633,6 +1633,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
@@ -1652,10 +1653,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -2346,16 +2347,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
+        if new_seq_lens is None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
             )
-
-        if new_seq_lens is None:
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
