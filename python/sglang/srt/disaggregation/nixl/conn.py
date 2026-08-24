@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -1680,6 +1681,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            logger.info(
+                "SGLANG_DCP_GEOMETRY_TRANSFER %s",
+                json.dumps(
+                    {
+                        "physical_page_size": physical_page_size,
+                        "dst_dcp_size": dst_info.dst_dcp_size,
+                        "dst_dcp_rank": dst_info.dst_dcp_rank,
+                        "src_page_offset": src_page_offset,
+                        "decode_prefix_len": decode_prefix_len,
+                        "num_kv_tokens": num_kv_tokens,
+                        "layer_count": len(token_item_lens),
+                        "dcp_token_item_lens": token_item_lens,
+                        "src_token_indices": plan.src_token_indices.tolist(),
+                        "dst_token_indices": plan.dst_token_indices.tolist(),
+                    },
+                    sort_keys=True,
+                ),
+            )
         dst_kv_ptrs = [
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
