@@ -20,12 +20,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-b300")
 
-MODEL_PATH = (
-    "/data/radixark/model-cache/hub/models--moonshotai--Kimi-K3/"
-    "snapshots/9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
-)
+MODEL_PATH = "moonshotai/Kimi-K3"
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
 MEGAMOE_URL = "http://0.0.0.0:30000"
+MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 12}'
 MEGAMOE_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
@@ -44,6 +42,7 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
+    gsm8k_num_threads = 37
     # Gated on GSM8K rather than on test_bs_1_speed below: a 200-question
     # average holds steady when a numerics change moves where the single
     # greedy prompt hits EOS.
@@ -68,7 +67,8 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
                 "8",
                 "--mem-fraction-static",
                 "0.85",
-                "--weight-loader-prefetch-checkpoints",
+                "--model-loader-extra-config",
+                MODEL_LOADER_EXTRA_CONFIG,
                 "--reasoning-parser",
                 "kimi_k3",
                 "--tool-call-parser",
@@ -95,6 +95,7 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
+    gsm8k_num_threads = 98
 
     @classmethod
     def setUpClass(cls):
@@ -112,7 +113,8 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
                 "8",
                 "--mem-fraction-static",
                 "0.85",
-                "--weight-loader-prefetch-checkpoints",
+                "--model-loader-extra-config",
+                MODEL_LOADER_EXTRA_CONFIG,
                 "--reasoning-parser",
                 "kimi_k3",
                 "--tool-call-parser",
@@ -133,6 +135,7 @@ class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
+    gsm8k_num_threads = 22
 
     @classmethod
     def setUpClass(cls):
@@ -154,6 +157,8 @@ class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
                 "8",
                 "--mem-fraction-static",
                 "0.85",
+                "--model-loader-extra-config",
+                MODEL_LOADER_EXTRA_CONFIG,
                 "--reasoning-parser",
                 "kimi_k3",
                 "--tool-call-parser",

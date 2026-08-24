@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -55,6 +56,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             try:
                 self._encode_from_plan(batch, plan)
                 self._publish_native_text_conditioning(batch)
+                if current_platform.is_mps():
+                    self._finish_active_component_use()
             except Exception:
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
                     minimax_h3_cleanup_temp_dirs,
@@ -242,11 +245,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         keyframes = [
             m for m in plan.materials if m.material_chain == "image.target_canvas"
         ]
-        if plan.task == "fl2va":
+        if plan.task in {"fl2va", "ref2va"} and keyframes:
             frame_indices = tuple(material.frame_index for material in keyframes)
             if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
                 raise ValueError(
-                    "fl2va text encoding requires an ordered keyframe signature "
+                    "MiniMax H3 text encoding requires an ordered keyframe signature "
                     f"in {MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got "
                     f"{frame_indices!r}"
                 )
@@ -357,7 +360,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
         Per condition in order — image i: '<Picture i>: ' label +
         vision block (prepared reference image); audio j: '<Audio j>: ' label
-        only — then the verbatim prompt.
+        only — then the verbatim prompt. Hybrid keyframes are deliberately
+        omitted: they are guide latents appended after reference presentation.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.presentation import (
             minimax_h3_ref2va_presentation,
@@ -404,6 +408,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         has_image = False
         has_video = False
         for material in plan.materials:
+            if material.material_chain == "image.target_canvas":
+                continue
             if material.material_chain == "image.reference_preserve":
                 counters["image"] += 1
                 condition_labels.append(("image", counters["image"]))
