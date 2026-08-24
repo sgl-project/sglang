@@ -133,6 +133,7 @@ class TestNixlTransferInfo(CustomTestCase):
         self.assertEqual(info.required_dst_info_num, 2)
         self.assertEqual(info.dst_state_indices, state_indices)
         self.assertEqual(info.decode_prefix_len, 11)
+        self.assertEqual(info.completion_pipeline_depth, 1)
 
     def test_from_zmq_defaults_optional_fields(self):
         info = TransferInfo.from_zmq(
@@ -144,11 +145,16 @@ class TestNixlTransferInfo(CustomTestCase):
                 np.array([1], dtype=np.int32).tobytes(),
                 b"0",
                 b"1",
+                b"",
+                b"",
+                b"",
+                b"2",
             ]
         )
 
         self.assertEqual(info.dst_state_indices, [])
         self.assertIsNone(info.decode_prefix_len)
+        self.assertEqual(info.completion_pipeline_depth, 2)
 
     def test_decode_radix_full_hit_is_not_dummy(self):
         info = TransferInfo.from_zmq(
@@ -347,6 +353,7 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        mgr.enable_transfer_queue_pipeline = False
         return mgr
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
@@ -401,6 +408,31 @@ class TestNixlAbortHandling(CustomTestCase):
         self.assertEqual(mgr.request_status[13], KVPoll.WaitingForInput)
         self.assertEqual(mgr.failure_records, {})
         mgr._connect.assert_not_called()
+
+    def test_pipeline_abort_ack_waits_for_inflight_chunk(self):
+        mgr = self._make_manager({15: KVPoll.Transferring})
+        mgr.enable_transfer_queue_pipeline = True
+        mgr._transfer_condition = threading.Condition()
+        mgr._pending_abort_acks = defaultdict(set)
+        mgr._staging_outstanding = defaultdict(int, {15: 1})
+        mgr.transfer_source_rank = 3
+        mgr.agent = SimpleNamespace(send_notif=MagicMock())
+        chunk = TransferKVChunk(
+            room=15,
+            prefill_kv_indices=np.array([], dtype=np.int32),
+            index_slice=slice(0, 0),
+            is_last_chunk=True,
+            chunk_id=0,
+            staging_counted=True,
+        )
+
+        mgr._handle_abort_notification(
+            [b"ABORT", b"15", b"127.0.0.1", b"5559", b"decode_agent"]
+        )
+        mgr.agent.send_notif.assert_not_called()
+
+        mgr._complete_transfer_chunk(chunk)
+        mgr.agent.send_notif.assert_called_once_with("decode_agent", b"15_abort_3")
 
 
 class TestNixlUpdateStatus(CustomTestCase):
@@ -467,6 +499,9 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_staging = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
+        mgr._transfer_condition = threading.Condition()
+        mgr._pending_abort_acks = defaultdict(set)
+        mgr.enable_transfer_queue_pipeline = False
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
@@ -482,6 +517,25 @@ class TestNixlTransferWorker(CustomTestCase):
 
         mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
         return mgr
+
+    def test_completion_is_not_published_before_all_handles_are_done(self):
+        room = 23
+        mgr = self._make_manager(room)
+        chunk = self._make_chunk(room, [], is_last_chunk=True)
+        chunk.staging_counted = True
+        mgr._staging_outstanding[room] = 1
+
+        states = iter(["IN_PROGRESS", "DONE"])
+
+        def check_xfer_state(_handle):
+            self.assertNotEqual(mgr.request_status[room], KVPoll.Success)
+            return next(states)
+
+        mgr.agent.check_xfer_state = check_xfer_state
+        mgr._finalize_transfer_chunk(chunk, ["handle"])
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+        self.assertNotIn(room, mgr.transfer_infos)
 
     def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
         return TransferKVChunk(
@@ -540,6 +594,8 @@ class TestNixlNotifications(CustomTestCase):
         mgr.enable_staging = False
         mgr._staging_handler = None
         mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(list))
+        mgr._abort_ack_expected = {}
+        mgr._abort_ack_received = defaultdict(set)
         return mgr
 
     def test_kv_last_notification_sets_expected_count(self):
@@ -588,6 +644,18 @@ class TestNixlNotifications(CustomTestCase):
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
 
+    def test_abort_waits_for_all_prefill_rank_drained_acks(self):
+        mgr = self._make_manager(["9_abort_0", "9_abort_0"])
+        mgr.request_status = {9: KVPoll.Transferring}
+        mgr._abort_ack_expected[9] = 2
+
+        mgr.update_transfer_status()
+        self.assertEqual(mgr.request_status[9], KVPoll.Transferring)
+
+        mgr.agent.messages = ["9_abort_1"]
+        mgr.update_transfer_status()
+        self.assertEqual(mgr.request_status[9], KVPoll.Failed)
+
 
 class TestNixlReceiverPoll(CustomTestCase):
     def _make_receiver(self, status=KVPoll.WaitingForInput):
@@ -598,6 +666,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr.enable_transfer_queue_pipeline = False
+        mgr._peer_loss_rooms = set()
+        mgr._abort_ack_expected = {}
 
         receiver = object.__new__(NixlKVReceiver)
         receiver.kv_mgr = mgr
@@ -607,6 +678,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._abort_pending_since = None
         return receiver, mgr
 
     def test_returns_existing_conclude_state_without_polling_manager(self):
@@ -701,6 +773,8 @@ class TestNixlNodeFailure(CustomTestCase):
         }
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        mgr.enable_transfer_queue_pipeline = False
+        mgr._peer_loss_rooms = set()
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
         mgr.check_status = CommonKVManager.check_status.__get__(mgr, CommonKVManager)
         mgr.record_failure = CommonKVManager.record_failure.__get__(

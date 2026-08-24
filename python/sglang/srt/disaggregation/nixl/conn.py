@@ -162,6 +162,7 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy_rank: Optional[bool] = None
+    completion_pipeline_depth: int = 1
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -199,6 +200,9 @@ class TransferInfo:
                 bool(int(msg[9].decode("ascii")))
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            completion_pipeline_depth=(
+                int(msg[10].decode("ascii")) if len(msg) > 10 else 1
             ),
         )
 
@@ -461,6 +465,9 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_transfer_queue_pipeline = (
+            envs.SGLANG_NIXL_TRANSFER_QUEUE_PIPELINE.get()
+        )
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
@@ -484,6 +491,8 @@ class NixlKVManager(CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            self._transfer_condition = threading.Condition()
+            self._pending_abort_acks = defaultdict(set)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -503,6 +512,9 @@ class NixlKVManager(CommonKVManager):
                 ).start()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._abort_ack_expected = {}
+            self._abort_ack_received = defaultdict(set)
+            self._peer_loss_rooms = set()
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
@@ -685,6 +697,12 @@ class NixlKVManager(CommonKVManager):
     def update_status(self, bootstrap_room: int, status: KVPoll):
         # Keep Failed sticky until the sender clears the room.
         if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            return
+        if (
+            status == KVPoll.Failed
+            and hasattr(self, "_abort_ack_expected")
+            and bootstrap_room in self._abort_ack_expected
+        ):
             return
         super().update_status(bootstrap_room, status)
 
@@ -1105,27 +1123,184 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _claim_transfer_chunk(self, kv_chunk: TransferKVChunk) -> bool:
+        if not self.enable_transfer_queue_pipeline:
+            room = kv_chunk.room
+            if self.check_status(room) == KVPoll.Failed:
+                self._staging_outstanding.pop(room, None)
+                return False
+            if not kv_chunk.staging_counted:
+                self._staging_outstanding[room] += 1
+                kv_chunk.staging_counted = True
+            return True
+        with self._transfer_condition:
+            room = kv_chunk.room
+            if (
+                room not in self.request_status
+                or self.check_status(room) == KVPoll.Failed
+            ):
+                return False
+            if not kv_chunk.staging_counted:
+                self._staging_outstanding[room] += 1
+                kv_chunk.staging_counted = True
+            return True
+
+    def _send_drained_abort_acks(self, room: int, peers) -> None:
+        for agent_name in peers:
+            try:
+                self.agent.send_notif(
+                    agent_name,
+                    f"{room}_abort_{self.transfer_source_rank}".encode("ascii"),
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to send drained NIXL abort ACK for room %s: %s",
+                    room,
+                    e,
+                )
+
+    def _complete_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        if not self.enable_transfer_queue_pipeline:
+            self._staging_outstanding[kv_chunk.room] -= 1
+            kv_chunk.staging_counted = False
+            return
+        peers = ()
+        with self._transfer_condition:
+            room = kv_chunk.room
+            if kv_chunk.staging_counted:
+                self._staging_outstanding[room] -= 1
+                kv_chunk.staging_counted = False
+            if self._staging_outstanding.get(room, 0) <= 0:
+                self._staging_outstanding.pop(room, None)
+                peers = self._pending_abort_acks.pop(room, ())
+            self._transfer_condition.notify_all()
+        self._send_drained_abort_acks(room, peers)
+
+    def _finalize_transfer_chunk(
+        self, kv_chunk: TransferKVChunk, handles: List[Any]
+    ) -> None:
+        room = kv_chunk.room
+        error = None
+        pending = list(handles)
+        while pending:
+            remaining = []
+            for handle in pending:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    error = error or RuntimeError(
+                        f"NIXL transfer encountered ERR room={room}"
+                    )
+                elif state != "DONE":
+                    remaining.append(handle)
+            pending = remaining
+            if pending:
+                time.sleep(0)
+
+        if error is not None:
+            self.exceptions[room] = error
+            self.record_failure(room, str(error))
+            self.update_status(room, KVPoll.Failed)
+        elif self.check_status(room) != KVPoll.Failed:
+            if kv_chunk.is_last_chunk:
+                self.update_status(room, KVPoll.Success)
+            elif self.check_status(room) != KVPoll.Success:
+                self.update_status(room, KVPoll.Transferring)
+
+        self._complete_transfer_chunk(kv_chunk)
+        if self._staging_outstanding.get(room, 0) <= 0 and (
+            self.check_status(room) == KVPoll.Success
+            or (kv_chunk.is_last_chunk and self.check_status(room) == KVPoll.Failed)
+        ):
+            self._staging_outstanding.pop(room, None)
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            if self.enable_staging and self._staging_ctx is not None:
+                self._staging_ctx.prefetched_rooms.discard(room)
+                for key in list(self._staging_ctx.prefetch_requested):
+                    if key[0] == room:
+                        self._staging_ctx.prefetch_requested.discard(key)
+
+    def _fail_room_and_defer_ack(self, room: int, agent_name: str) -> None:
+        peers = ()
+        with self._transfer_condition:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
+                self.record_failure(room, "Aborted by decode-side abort notification.")
+                self.update_status(room, KVPoll.Failed)
+            self._pending_abort_acks[room].add(agent_name)
+            if self._staging_outstanding.get(room, 0) == 0:
+                peers = self._pending_abort_acks.pop(room)
+            self._transfer_condition.notify_all()
+        self._send_drained_abort_acks(room, peers)
+
+    def wait_for_room_transfers(self, room: int) -> None:
+        with self._transfer_condition:
+            self.update_status(room, KVPoll.Failed)
+            while self._staging_outstanding.get(room, 0) > 0:
+                self._transfer_condition.wait()
+
+    def record_drained_abort_ack(self, room: int, prefill_rank: int) -> None:
+        expected = self._abort_ack_expected.get(room)
+        if expected is None:
+            return
+        self._abort_ack_received[room].add(prefill_rank)
+        if len(self._abort_ack_received[room]) >= expected:
+            self._abort_ack_expected.pop(room, None)
+            self._abort_ack_received.pop(room, None)
+            super().update_status(room, KVPoll.Failed)
+
+    def _handle_node_failure(self, failed_bootstrap_addr: str):
+        if self.enable_transfer_queue_pipeline:
+            self._peer_loss_rooms.update(
+                room
+                for room in self.addr_to_rooms_tracker.get(failed_bootstrap_addr, ())
+                if room in self.request_status
+            )
+        super()._handle_node_failure(failed_bootstrap_addr)
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
 
+        pending_completion = None
         while True:
-            kv_chunk: TransferKVChunk = queue.get()
+            if pending_completion is None:
+                kv_chunk: TransferKVChunk = queue.get()
+            else:
+                kv_chunk = queue.get(block=False)
+                if kv_chunk is None:
+                    self._finalize_transfer_chunk(*pending_completion)
+                    pending_completion = None
+                    continue
             room = kv_chunk.room
             handles: List[Any] = []
             try:
-                if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
+                if not self._claim_transfer_chunk(kv_chunk):
+                    if pending_completion is not None:
+                        self._finalize_transfer_chunk(*pending_completion)
+                        pending_completion = None
                     continue
 
                 assert room in self.transfer_infos
 
-                # Count each chunk once; the flag survives re-enqueue on defer.
-                if not kv_chunk.staging_counted:
-                    self._staging_outstanding[room] += 1
-                    kv_chunk.staging_counted = True
+                reqs_to_be_processed = list(self.transfer_infos[room].values())
+                pipeline_this_chunk = (
+                    self.enable_transfer_queue_pipeline
+                    and not self.enable_staging
+                    and kv_chunk.is_last_chunk
+                    and len(reqs_to_be_processed) == 1
+                    and not reqs_to_be_processed[0].is_dummy()
+                    and reqs_to_be_processed[0].completion_pipeline_depth == 2
+                )
+                if pending_completion is not None and (
+                    not pipeline_this_chunk or room == pending_completion[0].room
+                ):
+                    self._finalize_transfer_chunk(*pending_completion)
+                    pending_completion = None
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1137,8 +1312,6 @@ class NixlKVManager(CommonKVManager):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
                 self.update_status(room, KVPoll.Transferring)
-
-                reqs_to_be_processed = list(self.transfer_infos[room].values())
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1323,49 +1496,20 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
-
-                self._staging_outstanding[room] -= 1
-                if kv_chunk.is_last_chunk:
-                    self.update_status(room, KVPoll.Success)
-                elif self.check_status(room) != KVPoll.Success:
-                    # A deferred earlier chunk can complete after the last chunk
-                    # already concluded Success; don't regress the status.
-                    self.update_status(room, KVPoll.Transferring)
-
-                # Drop per-room state only when no chunk is still outstanding and
-                # the room has concluded: Success, or a Failed *last* chunk. A
-                # non-last Failed chunk keeps the room (more chunks may follow); a
-                # late chunk for an already-Failed room is skipped at loop top.
-                if self._staging_outstanding.get(room, 0) <= 0 and (
-                    self.check_status(room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(room) == KVPoll.Failed
-                    )
-                ):
-                    self._staging_outstanding.pop(room, None)
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        # Snapshot first: the scheduler thread adds concurrently.
-                        for k in list(self._staging_ctx.prefetch_requested):
-                            if k[0] == room:
-                                self._staging_ctx.prefetch_requested.discard(k)
+                if pipeline_this_chunk:
+                    if pending_completion is not None:
+                        self._finalize_transfer_chunk(*pending_completion)
+                    pending_completion = (kv_chunk, handles)
+                else:
+                    self._finalize_transfer_chunk(kv_chunk, handles)
             except Exception as e:
+                self.exceptions[room] = e
+                self.record_failure(room, str(e))
+                self.update_status(room, KVPoll.Failed)
+                # Never release source/destination ownership while submitted
+                # NIXL operations may still be in flight.
+                if kv_chunk.staging_counted:
+                    self._finalize_transfer_chunk(kv_chunk, handles)
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
@@ -1374,9 +1518,6 @@ class NixlKVManager(CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2470,6 +2611,8 @@ class NixlKVManager(CommonKVManager):
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                elif tag == "abort":
+                    self.record_drained_abort_ack(room, int(components[2]))
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2626,6 +2769,18 @@ class NixlKVManager(CommonKVManager):
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
+        if self.enable_transfer_queue_pipeline:
+            if len(msg) <= 4:
+                logger.error(
+                    "Missing decode NIXL agent name in abort for room %s; "
+                    "refusing an unsafe early ACK",
+                    room_to_be_aborted,
+                )
+                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                return True
+            self._fail_room_and_defer_ack(room_to_be_aborted, msg[4].decode("ascii"))
+            return True
+
         if (
             room_to_be_aborted in self.request_status
             and self.check_status(room_to_be_aborted) != KVPoll.Success
@@ -2644,9 +2799,6 @@ class NixlKVManager(CommonKVManager):
                 f"Received abort notification for room {room_to_be_aborted}, "
                 f"ignoring (already completed or unknown)"
             )
-
-        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
-        # release needs to wait for prefill-side NIXL transfer quiescence.
 
         return True
 
@@ -2744,6 +2896,13 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+
+    def abort(self):
+        if self.kv_mgr.enable_transfer_queue_pipeline:
+            self.kv_mgr.wait_for_room_transfers(self.bootstrap_room)
+            self.conclude_state = KVPoll.Failed
+        else:
+            super().abort()
 
     def send(
         self,
@@ -2843,6 +3002,43 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+        self._abort_pending_since = None
+
+    def abort(self):
+        if (
+            not self.kv_mgr.enable_transfer_queue_pipeline
+            or not getattr(self, "bootstrap_infos", None)
+            or self.init_time is None
+        ):
+            super().abort()
+            return
+        self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
+        self.kv_mgr._abort_ack_expected[self.bootstrap_room] = len(self.bootstrap_infos)
+        self.kv_mgr._abort_ack_received[self.bootstrap_room].clear()
+        self._abort_pending_since = time.monotonic()
+        self._send_abort_notification()
+        self.abort_notified = True
+
+    def _send_abort_notification(self):
+        for bootstrap_info in self.bootstrap_infos:
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                        ]
+                    )
+            except Exception as e:
+                logger.error(
+                    "Failed to send NIXL abort notification for room %s: %s",
+                    self.bootstrap_room,
+                    e,
+                )
 
     def send_metadata(
         self,
@@ -2868,6 +3064,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        pipeline_depth = b"2" if self.kv_mgr.enable_transfer_queue_pipeline else b"1"
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
@@ -2899,6 +3096,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            pipeline_depth,
                         ]
                     )
             except zmq.ZMQError:
@@ -2923,6 +3121,26 @@ class NixlKVReceiver(CommonKVReceiver):
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
+
+        if self.bootstrap_room in self.kv_mgr._peer_loss_rooms:
+            raise RuntimeError(
+                "Lost a NIXL prefill peer while transfers may still be in flight; "
+                "refusing to release destination KV slots"
+            )
+        if self.bootstrap_room in self.kv_mgr._abort_ack_expected:
+            self.kv_mgr.update_transfer_status()
+            if self.bootstrap_room not in self.kv_mgr._abort_ack_expected:
+                self.conclude_state = KVPoll.Failed
+                return self.conclude_state
+            if (
+                time.monotonic() - self._abort_pending_since
+                >= self.kv_mgr.waiting_timeout
+            ):
+                raise RuntimeError(
+                    "Timed out waiting for drained NIXL abort acknowledgements; "
+                    "refusing to release destination KV slots"
+                )
+            return KVPoll.Transferring
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
@@ -2949,6 +3167,23 @@ class NixlKVReceiver(CommonKVReceiver):
             return timeout_result
 
         return KVPoll.WaitingForInput  # type: ignore
+
+    def _check_waiting_timeout(self):
+        if not self.kv_mgr.enable_transfer_queue_pipeline:
+            return super()._check_waiting_timeout()
+        if (
+            self.init_time is None
+            or time.time() - self.init_time < self.kv_mgr.waiting_timeout
+        ):
+            return None
+        self.abort()
+        return KVPoll.Transferring
+
+    def clear(self):
+        self.kv_mgr._abort_ack_expected.pop(self.bootstrap_room, None)
+        self.kv_mgr._abort_ack_received.pop(self.bootstrap_room, None)
+        self.kv_mgr._peer_loss_rooms.discard(self.bootstrap_room)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:

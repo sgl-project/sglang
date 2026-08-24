@@ -78,8 +78,10 @@ class FastQueue:
             # wake up a thread of wait()
             self._cond.notify()
 
-    def get(self):
+    def get(self, block=True):
         with self._cond:
+            if not block and not self._buf:
+                return None
             # if queue is empty  ,block until is notified()
             while not self._buf:
                 self._cond.wait()
