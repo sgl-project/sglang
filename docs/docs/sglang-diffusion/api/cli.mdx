@@ -212,6 +212,15 @@ vae_sp: true
 enable_torch_compile: false
 ```
 
+HunyuanVideo and FastHunyuan use tiled VAE decode by default so multi-GPU runs
+distribute VAE tiles instead of selecting spatial-shard decode. At
+HunyuanVideo's supported 960×544×77 shape, spatial-shard decode can consume
+99.8 GiB per rank before requesting another 49.61 GiB causal mask. At
+FastHunyuan's default 1280×720×125 shape, the mask alone would require
+197.75 GiB. You can still override the policy with
+`--vae-config.parallel-decode-mode`, but `spatial` and `spatial_shard` should
+only be used for smaller validated shapes.
+
 ## Generate
 
 `sglang generate` runs a single generation job and exits when the job finishes.
