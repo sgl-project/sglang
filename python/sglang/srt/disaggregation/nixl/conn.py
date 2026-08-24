@@ -1213,10 +1213,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
-                                pack_buffer = (
-                                    self._dcp_pack_buffers[worker_index]
-                                    if self._dcp_pack_buffers
-                                    else None
+                                pack_buffer = self._dcp_pack_buffer_for_worker(
+                                    worker_index
                                 )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,

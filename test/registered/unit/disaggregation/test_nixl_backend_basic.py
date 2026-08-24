@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,6 +105,71 @@ def _fake_staging_buffer_module(mock_gather=None):
     module.resolve_total_kv_heads = lambda kv_args, attn_tp_size: 2
     module.gather_all_layers_to_staging = mock_gather or MagicMock()
     return module
+
+
+class TestDcpGpunetioPeerRows(CustomTestCase):
+    def test_default_keeps_legacy_dcp_pack(self):
+        mgr = object.__new__(CommonKVManager)
+        with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(False):
+            with envs.SGLANG_DISAGG_DCP_PACK.override(True):
+                mgr._configure_dcp_pack_mode()
+
+        self.assertFalse(mgr.enable_dcp_peer_rows)
+        self.assertTrue(mgr.enable_dcp_pack)
+
+    def test_peer_rows_rejects_non_gpunetio_backend(self):
+        mgr = object.__new__(CommonKVManager)
+        with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(True):
+            with envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.override("UCX"):
+                with self.assertRaisesRegex(ValueError, "requires .*GPUNETIO"):
+                    mgr._configure_dcp_pack_mode()
+
+    def test_peer_rows_skips_pack_and_keeps_cyclic_indices(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_dcp_peer_rows = True
+        mgr.enable_dcp_pack = False
+        mgr._dcp_pack_buffers = [object()]
+        mgr.kv_args = SimpleNamespace(
+            page_size=64,
+            kv_data_ptrs=[0x1000],
+            gpu_id=0,
+        )
+        mgr.src_mem_kind = "VRAM"
+        mgr._send_kvcache_generic = MagicMock(return_value="transfer")
+        dst_info = SimpleNamespace(
+            dst_homogeneous_mem_kind="VRAM",
+            dst_dcp_size=4,
+            dst_dcp_rank=0,
+            dcp_token_item_lens=[16],
+            dst_kv_ptrs=[0x2000],
+            dcp_dst_region_indices=[0],
+            gpu_id=0,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src"
+        ) as pack:
+            result = mgr.send_kvcache_dcp(
+                "decode",
+                np.arange(4, dtype=np.int32),
+                dst_info,
+                np.array([7], dtype=np.int32),
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=256,
+                notif="ready",
+                pack_buffer=mgr._dcp_pack_buffer_for_worker(0),
+            )
+
+        self.assertEqual(result, "transfer")
+        pack.assert_not_called()
+        args = mgr._send_kvcache_generic.call_args.kwargs
+        np.testing.assert_array_equal(
+            args["prefill_data_indices"], np.arange(0, 256, 4, dtype=np.int32)
+        )
+        np.testing.assert_array_equal(
+            args["dst_data_indices"], np.arange(448, 512, dtype=np.int32)
+        )
 
 
 class TestNixlTransferInfo(CustomTestCase):

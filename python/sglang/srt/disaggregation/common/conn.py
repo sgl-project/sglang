@@ -167,7 +167,7 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
-        self.enable_dcp_pack = envs.SGLANG_DISAGG_DCP_PACK.get()
+        self._configure_dcp_pack_mode()
         self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
@@ -334,6 +334,20 @@ class CommonKVManager(BaseKVManager):
             return None
         return tensors
 
+    def _configure_dcp_pack_mode(self) -> None:
+        self.enable_dcp_peer_rows = envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.get()
+        if self.enable_dcp_peer_rows:
+            backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+            if backend != "GPUNETIO":
+                raise ValueError(
+                    "SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS=1 requires "
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND=GPUNETIO, got "
+                    f"{backend!r}"
+                )
+        self.enable_dcp_pack = (
+            envs.SGLANG_DISAGG_DCP_PACK.get() and not self.enable_dcp_peer_rows
+        )
+
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [
@@ -364,6 +378,11 @@ class CommonKVManager(BaseKVManager):
             self.kv_args,
             len(self.transfer_queues),
         )
+
+    def _dcp_pack_buffer_for_worker(self, worker_index: int):
+        if self.enable_dcp_peer_rows or not self._dcp_pack_buffers:
+            return None
+        return self._dcp_pack_buffers[worker_index]
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
