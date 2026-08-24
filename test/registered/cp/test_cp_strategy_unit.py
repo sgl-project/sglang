@@ -345,6 +345,19 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         self.assertTrue(torch.equal(state.topk_indices, global_topk))
 
+    def test_index_topk_share_ignores_missing_spec_info(self):
+        topk = torch.tensor([[1, 2], [3, 4]])
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reuse_dsa_topk_indices=False,
+            spec_info=None,
+        )
+        state = IndexTopKShareState(forward_batch, None)
+
+        state.update(topk)
+
+        self.assertTrue(torch.equal(state.topk_indices, topk))
+
     def test_eager_runner_exposes_model_input_id_layouts(self):
         init_cp_strategy(
             enable_prefill_cp=True,
