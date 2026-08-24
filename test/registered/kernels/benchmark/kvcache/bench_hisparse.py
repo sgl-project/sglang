@@ -166,7 +166,8 @@ def _time_planned_copy(
     batch_size: int, hot_buffer_size: int, miss_rate: float
 ) -> float:
     """Time the copy-only replay used by shared-index skip layers: one anchor
-    swap-in records a real plan, each timed round replays it (num_blocks=4)."""
+    swap-in records a real plan, each timed round replays it
+    (num_blocks=batch_size, one block per request)."""
     state = _build_inputs(batch_size, hot_buffer_size, miss_rate)
     miss_src = torch.zeros((batch_size, TOP_K), dtype=torch.int64, device=DEVICE)
     miss_dst = torch.zeros((batch_size, TOP_K), dtype=torch.int32, device=DEVICE)
@@ -203,7 +204,7 @@ def _time_planned_copy(
             host_cache=state["host_cache"],
             device_buffer=skip_layer_buffer,
             item_size_bytes=ITEM_SIZE_BYTES,
-            num_blocks=4,
+            num_blocks=batch_size,
         )
 
     run_once()
