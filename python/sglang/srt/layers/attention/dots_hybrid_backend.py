@@ -559,12 +559,22 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
         return DotsSWAMLAAttnBackend(full_attn_backend)
 
     from sglang.srt.layers.attention.attention_registry import create_dsa_backend
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
 
     swa_backend = (
         full_attn_backend.prefill_backend
         if isinstance(full_attn_backend, HybridAttnBackend)
         else full_attn_backend
     )
+    # The default Dots DSA configuration resolves both the prefill and decode
+    # backends to DeepseekSparseAttnBackend. SWA cannot reuse that backend:
+    # DotsSWAMLAAttnBackend consumes FlashAttention's page size, sliding-window
+    # metadata, and swa_page_table. Keep an explicitly configured FA prefill
+    # backend when available; otherwise create a dedicated one for SWA layers.
+    if not isinstance(swa_backend, FlashAttentionBackend):
+        swa_backend = FlashAttentionBackend(runner)
     return DotsHybridAttnBackend(
         dsa_backend=create_dsa_backend(runner),
         swa_backend=DotsSWAMLAAttnBackend(swa_backend),

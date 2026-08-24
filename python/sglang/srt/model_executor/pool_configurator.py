@@ -507,7 +507,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
+        # EAGLE/STANDALONE draft layers share the target allocator but own their
+        # KV tensors. Full-attention layers use full capacity, ordinary SWA
+        # layers use the target SWA capacity, and an Inkling banded MTP depth
+        # uses SWA geometry at full capacity.
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0
