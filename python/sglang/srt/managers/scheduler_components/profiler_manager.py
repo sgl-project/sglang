@@ -329,15 +329,32 @@ class SchedulerProfilerManager:
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _wait_for_nsys_capture_start(self) -> None:
-        """Release scheduler ranks only after every rank has armed Nsight."""
+        """Prime every CUDA context before releasing ranks into model work."""
 
         capture_ready_prefix = (
             Path(self.torch_profiler_output_dir)
             / f".nsys-capture-ready-{self.profile_id}"
         )
+        capture_active = Path(f"{capture_ready_prefix}-active")
+        deadline = time.monotonic() + 60.0
+        if self.ps.gpu_id == get_device().base_gpu_id:
+            capture_active.touch()
+        while not capture_active.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for rank-0 Nsight capture-active marker "
+                    f"{capture_active}"
+                )
+            time.sleep(0.01)
+
+        # Nsight lazily instruments each scheduler process on its first CUDA
+        # activity after a multi-process NVTX capture begins. If that first
+        # activity is a model collective, unequal instrumentation latency can
+        # strand peers inside symmetric-memory gather. Force the one-time work
+        # through a harmless kernel while every rank is outside model work.
+        self._prime_nsys_cuda_context()
         rank_ready = Path(f"{capture_ready_prefix}-rank-{self.ps.gpu_id}")
         rank_ready.touch()
-        deadline = time.monotonic() + 60.0
         ready_count = 0
         while ready_count < self.nsys_exact_sync_world_size:
             ready_count = len(
@@ -360,6 +377,12 @@ class SchedulerProfilerManager:
             self.nsys_exact_sync_world_size,
             capture_ready_prefix,
         )
+
+    @staticmethod
+    def _prime_nsys_cuda_context() -> None:
+        probe = torch.zeros(1, device="cuda")
+        torch.cuda.synchronize()
+        del probe
 
     def _merge_profile_traces(self) -> str:
         if not self.merge_profiles:

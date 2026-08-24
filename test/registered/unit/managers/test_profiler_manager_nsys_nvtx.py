@@ -281,8 +281,11 @@ def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
     manager.torch_profiler_output_dir = tmp_path
     manager.profile_id = "worker-specific-profile"
 
-    manager._wait_for_nsys_capture_start()
+    with patch.object(manager, "_prime_nsys_cuda_context") as prime_cuda:
+        manager._wait_for_nsys_capture_start()
 
+    prime_cuda.assert_called_once_with()
+    assert (tmp_path / ".nsys-capture-ready-worker-specific-profile-active").is_file()
     assert (
         tmp_path / ".nsys-capture-ready-worker-specific-profile-rank-0"
     ).is_file()
@@ -309,8 +312,10 @@ def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):
     for rank in (1, 2, 3):
         (tmp_path / f".nsys-capture-ready-all-rank-profile-rank-{rank}").touch()
 
-    manager._wait_for_nsys_capture_start()
+    with patch.object(manager, "_prime_nsys_cuda_context") as prime_cuda:
+        manager._wait_for_nsys_capture_start()
 
+    prime_cuda.assert_called_once_with()
     assert (
         len(list(tmp_path.glob(".nsys-capture-ready-all-rank-profile-rank-*")))
         == 4
