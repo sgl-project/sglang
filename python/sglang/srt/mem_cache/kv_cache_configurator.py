@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
@@ -1262,7 +1263,7 @@ class KVCacheConfigurator:
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1533,7 +1534,7 @@ class KVCacheConfigurator:
             # with the widening-dequant contract.
             index_dtype=(
                 self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(self.server_args)
+                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
                 else self.model_dtype
             ),
             head_num=self.model_config.get_num_kv_heads(

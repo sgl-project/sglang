@@ -31,6 +31,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -187,7 +188,7 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", dist_port
+            get_serving().host or "127.0.0.1", dist_port
         ).to_tcp()
     return dist_init_method
 

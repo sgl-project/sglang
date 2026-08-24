@@ -139,9 +139,9 @@ bag to override at all.
   `Engine`s can share one process, bags are last-publish-wins across them") is
   **retracted** — owner ruling (2026-08-15): a process holds at most one live
   config at a time (concurrent multi-Engine is unsupported; sequential rebuild
-  stays legal, unit tests rely on it). What still reads the instance in those
-  files is pinned pair by pair in the exposure ratchet, each with its own
-  disposition; none of it is a boundary to imitate. What
+  stays legal, unit tests rely on it). Nothing in those files reads the instance
+  any more -- the exposure ratchet's pin set is empty, so the next such read is a
+  new entry that has to argue for itself. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
   `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
@@ -149,18 +149,17 @@ bag to override at all.
   supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
   `eplb/expert_location.py`) — **or the field is one that resolution fills in
-  and the callee runs in a process that has published.** That second case is
-  pinned debt, not a style question: the record is destined to carry the
-  user's raw input, so `server_args.page_size` inside a runner-owned
-  constructor will read the raw pre-resolution value instead of the effective
-  one. Debt means a decision, not automatically a bag read: pick where the
+  and the callee runs in a process that has published.** That second case is a
+  decision, not a style question: the record carries the user's raw input, so a
+  resolution-filled field read off it inside a runner-owned constructor answers
+  with the pre-resolution value instead of the effective one. Debt means a decision, not automatically a bag read: pick where the
   value should come from — usually the `get_*()` bag, sometimes a runner stamp
   or a constructor argument (the per-mode attention pair and the encode-server
   `gpu_id` above are dispositions of exactly this debt). The per-instance
   boundaries above are **not** exempt from this unless-clause (the multi-Engine
   exemption is retracted); each one gets its own disposition.
   `test_supplied_instance_exposure_ratchet.py`
-  pins the remaining set — three spellings of the read: `server_args.field`,
+  pins that set (empty today) — three spellings of the read: `server_args.field`,
   literal-name `getattr(server_args, "field", default)`, and the parked form
   (`self.x = server_args` in a method that takes the parameter, read as
   `self.x.field` anywhere in the class) — and fails on a new one, so the
@@ -411,7 +410,8 @@ probes, swappable ACTIVE values. Not for config mirrors (read the bag leaf inste
 
 - Groups are typed dataclasses on `Flags` (`capture` / `moe` / `dp`): typo-safe writes,
   transactional test-only `override(**kw)` context manager.
-- `flags.moe` is materialized by `initialize_moe_config(server_args)` at scheduler init;
+- `flags.moe` is materialized by `initialize_moe_config()` at scheduler init (it
+  reads `exec.moe` / `spec` / `model`, and takes no record);
   accessors (`get_moe_a2a_backend` etc.) are thin shims with lazy defaults. The speculative
   contexts (`speculative_moe_backend_context`) swap the ACTIVE leaves around draft forwards.
 - `flags.dp` is materialized by `initialize_dp_attention`; `is_dp_attention_enabled()` is a

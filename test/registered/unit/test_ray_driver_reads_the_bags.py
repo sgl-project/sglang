@@ -1,10 +1,10 @@
 """The Ray driver sizes its actors from the published configuration.
 
 `RayEngine` publishes as part of `Engine._launch_subprocesses` and *then* lays
-out the actors, so the placement arithmetic reads the `parallel` bag rather than
-the record it was constructed from. That matters because the record holds the
-raw input: a launch that leaves `dp_size` to resolution would size the placement
-group from `None`.
+out the actors, so the placement arithmetic reads the `parallel` bag. That is
+where a resolution decision lives: a launch that leaves `dp_size` to resolution
+has it in the `parallel` bag, and the override case below is what tells the two
+apart.
 
 There is no CI coverage of the Ray path (`test/manual/test_ray_engine.py` boots a
 real cluster), so these cases drive the two pure helpers directly against a
