@@ -7,6 +7,7 @@
 import collections
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import itertools
@@ -129,6 +130,81 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
         if _ROUTED_EXPERT_KEY_RE.search(k):
             return meta.get("dtype")
     return None
+
+
+_SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+
+# Suffixes a serialized checkpoint attaches to a quantized weight. Whether any
+# of them appears under a module prefix is what separates "this submodule ships
+# quantized" from "this submodule ships in the compute dtype".
+_QUANT_COMPANION_SUFFIXES = (
+    "weight_scale",
+    "weight_scale_inv",
+    "weight_scale_2",
+    "weight_zero_point",
+    "weight_packed",
+    "input_scale",
+)
+
+
+def _module_quantization_from_keys(keys: Iterable[str], prefix: str) -> Optional[bool]:
+    found = False
+    for key in keys:
+        if not key.startswith(prefix):
+            continue
+        found = True
+        if key.endswith(_QUANT_COMPANION_SUFFIXES):
+            return True
+    return False if found else None
+
+
+def _unindexed_safetensors_keys(model_path: str) -> List[str]:
+    keys: List[str] = []
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        with open(shard, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        keys.extend(k for k in header if k != "__metadata__")
+    return keys
+
+
+@functools.lru_cache(maxsize=None)
+def probe_module_is_quantized(
+    model_path: str, prefix: str, revision: Optional[str] = None
+) -> Optional[bool]:
+    """Whether the checkpoint ships the ``prefix`` submodule quantized.
+
+    ``True`` when some tensor under ``prefix`` carries a quantization companion
+    (a scale / zero-point), ``False`` when the submodule is present and carries
+    none, and ``None`` when the answer is unknown -- no tensor under ``prefix``,
+    or no locally readable index. Tensor *names* settle this, so the safetensors
+    index is enough and no shard is opened when the checkpoint has one.
+
+    A `quantization_config` that does not enumerate an unquantized submodule
+    under `exclude` is indistinguishable from one that quantizes the submodule,
+    and building it for the wrong precision surfaces only as a shape mismatch
+    deep in the weight loader. This asks the checkpoint instead. Cached: the
+    checkpoint does not change under a live process, and the index of a large
+    MoE model is tens of MB to parse.
+    """
+    if os.path.isdir(model_path):
+        index_file = os.path.join(model_path, _SAFETENSORS_INDEX_NAME)
+        if not os.path.exists(index_file):
+            return _module_quantization_from_keys(
+                _unindexed_safetensors_keys(model_path), prefix
+            )
+    else:
+        cached_index = huggingface_hub.try_to_load_from_cache(
+            model_path, _SAFETENSORS_INDEX_NAME, revision=revision
+        )
+        # Also returns a `_CACHED_NO_EXIST` sentinel, not just `None`.
+        if not isinstance(cached_index, str):
+            return None
+        index_file = cached_index
+
+    with open(index_file) as f:
+        weight_map = json.load(f).get("weight_map", {}) or {}
+    return _module_quantization_from_keys(weight_map.keys(), prefix)
 
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).

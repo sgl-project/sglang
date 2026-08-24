@@ -32,7 +32,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    probe_module_is_quantized,
+)
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import (
     get_model,
@@ -42,6 +45,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
+
+# Prefix every MTP tensor carries in a Qwen3.5 checkpoint.
+_MTP_WEIGHT_PREFIX = "mtp."
 
 
 def _mtp_quant_config(quant_config):
@@ -64,18 +70,54 @@ def _mtp_quant_config(quant_config):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16.
+    # Skip quantization for those so linear/MoE weight loaders allocate bf16
+    # shapes (see sgl-project/sglang#23113).
     if quant_config and quant_config.get_name() == "quark":
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+        if _quark_mtp_is_unquantized(quant_config):
             return None
     return quant_config
+
+
+def _quark_mtp_is_unquantized(quant_config) -> bool:
+    """Whether a quark checkpoint keeps its MTP module out of quantization.
+
+    `amd/Qwen3.5-397B-A17B-MXFP4` declares this by listing every `mtp.*` layer
+    under `quantization_config.exclude`. Its successor
+    `amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2` ships the same bf16 `mtp.*`
+    tensors but declares none of them, so the declaration alone is not a
+    reliable signal: believing it allocates packed MXFP4 experts for bf16
+    weights, and `_load_w13` dies on a 2048-vs-4096 shape mismatch. Ask the
+    checkpoint whenever the exclude list is silent.
+    """
+    if any(
+        isinstance(layer, str) and layer.startswith(_MTP_WEIGHT_PREFIX)
+        for layer in quant_config.exclude_layers
+    ):
+        return True
+
+    # Quark also requantizes bf16 / FP8 / NVFP4 sources on load. Those pair a
+    # quark config with unquantized `mtp.*` weights by design, and the probe
+    # would misread them as an undeclared exclude.
+    if not quant_config.is_prequantized:
+        return False
+
+    try:
+        return (
+            probe_module_is_quantized(
+                model_path=get_spec().speculative_draft_model_path
+                or get_model().model_path,
+                prefix=_MTP_WEIGHT_PREFIX,
+                revision=get_spec().speculative_draft_model_revision
+                or get_model().revision,
+            )
+            is False
+        )
+    except Exception as e:
+        # A probe that cannot answer must not keep the server from starting;
+        # the declared exclude list stays authoritative.
+        logger.warning("Could not probe the checkpoint for MTP quantization: %s", e)
+        return False
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
