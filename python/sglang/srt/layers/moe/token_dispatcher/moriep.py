@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import logging
 import functools
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
@@ -89,6 +89,7 @@ def _aiter_supports_mxfp8_dispatch() -> bool:
         )
     except Exception:
         return False
+
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
 

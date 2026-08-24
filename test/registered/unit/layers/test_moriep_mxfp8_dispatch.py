@@ -50,8 +50,12 @@ def test_e8m0_scale_is_one_byte():
 
 @pytest.mark.parametrize(
     "name,expected",
-    [("bf16", DispatchDtype.bf16), ("fp8", DispatchDtype.fp8),
-     ("fp4", DispatchDtype.fp4), ("mxfp8", DispatchDtype.mxfp8)],
+    [
+        ("bf16", DispatchDtype.bf16),
+        ("fp8", DispatchDtype.fp8),
+        ("fp4", DispatchDtype.fp4),
+        ("mxfp8", DispatchDtype.mxfp8),
+    ],
 )
 def test_env_override_maps_to_member(name, expected):
     """SGLANG_MORI_DISPATCH_DTYPE is the only way to reach this mode, so an
