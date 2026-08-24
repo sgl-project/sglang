@@ -185,6 +185,14 @@ backend.
       <td>Serialized metadata is auto-detected. NVIDIA and ROCm reuse SRT's dense MXFP8 kernels; Ascend keeps its native online path. Mixed per-layer checkpoints do not support FSDP.</td>
     </tr>
     <tr>
+      <td><code>comfy-w4a8-convrot</code></td>
+      <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 FL2VA / Ref2VA DiTs</td>
+      <td><code>comfy-kitchen&gt;=0.2.27</code></td>
+      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
       <td><code>qvg-kv</code></td>
       <td>Unquantized model with runtime causal KV-cache compression</td>
       <td><code>--kv-cache-quant &#123;int4,int2&#125;</code></td>
