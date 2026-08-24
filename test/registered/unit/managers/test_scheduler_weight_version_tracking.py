@@ -37,11 +37,27 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return serving
 
+    def _scheduler(
+        self, *, inflight=(), waiting=(), chunked=None, staging=()
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            collect_inflight_reqs=lambda: set(inflight),
+            waiting_queue=list(waiting),
+            chunked_req=chunked,
+            hisparse_coordinator=(
+                SimpleNamespace(
+                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
+                )
+                if staging
+                else None
+            ),
+        )
+
     def test_a_new_version_is_adopted(self):
         """The scheduler has to end up on the version it was told about, or nothing downstream can read it."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(SimpleNamespace(), new_version="v2")
+        Scheduler.record_weight_version_change(self._scheduler(), new_version="v2")
 
         self.assertEqual(serving.weight_version, "v2")
 
@@ -49,7 +65,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """Re-announcing the current version must not be treated as a change."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(SimpleNamespace(), new_version="v1")
+        Scheduler.record_weight_version_change(self._scheduler(), new_version="v1")
 
         self.assertEqual(serving.weight_version, "v1")
 
@@ -57,9 +73,27 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """An update that carries no version must leave the recorded one alone."""
         serving = self._serving("v1")
 
-        Scheduler.record_weight_version_change(SimpleNamespace(), new_version=None)
+        Scheduler.record_weight_version_change(self._scheduler(), new_version=None)
 
         self.assertEqual(serving.weight_version, "v1")
+
+    def test_every_source_of_live_requests_is_stamped(self):
+        """A request missed here keeps attributing its next tokens to the superseded version."""
+        self._serving("v1")
+        inflight, queued, chunked, staged = (object() for _ in range(4))
+        scheduler = self._scheduler(
+            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler.record_weight_version_events",
+            return_value=0,
+        ) as recorder:
+            Scheduler.record_weight_version_change(scheduler, new_version="v2")
+
+        self.assertEqual(
+            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
+        )
 
 
 class TestRecordWeightVersionAfterUpdate(CustomTestCase):
