@@ -161,6 +161,10 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
     def test_batch_32(self):
         self._check_shape(B=32, T_per_seq=32, H=16, K=128, V=128, pool_size=256)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "The read-only initial-state path is not implemented by the XPU chunk kernel",
+    )
     def test_read_only_initial_state_supports_duplicate_indices(self):
         """MIS item branches may share one query-end state without updating it."""
         device = get_device()
