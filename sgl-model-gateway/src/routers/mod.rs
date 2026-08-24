@@ -98,6 +98,22 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route a chat completion while preserving SGLang's optional request ID.
+    ///
+    /// The public OpenAI request type intentionally does not model SGLang's
+    /// `rid` extension. Routers that cannot forward extensions retain the
+    /// ordinary OpenAI behavior through this default implementation.
+    async fn route_chat_with_sglang_rid(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        sglang_rid: Option<&str>,
+    ) -> Response {
+        let _ = sglang_rid;
+        self.route_chat(headers, body, model_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,
