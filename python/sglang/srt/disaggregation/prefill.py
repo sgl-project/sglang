@@ -813,6 +813,17 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
+                if (
+                    batch.requeue_chunked_reqs is not None
+                    and req in batch.requeue_chunked_reqs
+                ):
+                    assert not self.enable_overlap
+                    assert not req.pending_bootstrap
+                    maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+                    self.send_kv_chunk(req, last_chunk=False)
+                    req.pp_batched_chunk_requeued = True
+                    self.waiting_queue.append(req)
+
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:
@@ -1083,6 +1094,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.requeue_chunked_reqs:
+                chunked_req_to_exclude.update(last_batch.requeue_chunked_reqs)
 
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))

@@ -3291,6 +3291,13 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _init_waiting_req_next_round(self, req: Req) -> None:
+        """Initialize a waiting request without discarding batched-chunk progress."""
+        if self.pp_batch_independent_chunks and req.pp_batched_chunk_requeued:
+            req.init_next_round_input()
+        else:
+            req.init_next_round_input(self.tree_cache)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3439,7 +3446,10 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            # ChunkCache has no searchable prefix tree. Re-matching a requeued
+            # middle chunk would replace its committed prefix with an empty one
+            # and restart the request from token zero.
+            self._init_waiting_req_next_round(req)
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"
@@ -3513,7 +3523,12 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
+        batched_chunked_reqs = adder.new_chunked_reqs
+        if batched_chunked_reqs:
+            assert self.chunked_req is None
+            for req in batched_chunked_reqs:
+                req.inflight_middle_chunks += 1
+        elif self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
@@ -3530,9 +3545,16 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
-        )
+        new_batch.requeue_chunked_reqs = batched_chunked_reqs or None
+        if batched_chunked_reqs:
+            chunked_set = set(batched_chunked_reqs)
+            new_batch.contains_last_prefill_chunk = any(
+                req not in chunked_set for req in can_run_list
+            )
+        else:
+            new_batch.contains_last_prefill_chunk = (
+                self.chunked_req is None or len(can_run_list) != 1
+            )
 
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

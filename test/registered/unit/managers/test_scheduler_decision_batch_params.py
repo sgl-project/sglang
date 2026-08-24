@@ -1,5 +1,7 @@
 import inspect
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -46,6 +48,39 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
                         "explicitly and return it via NextBatchPlan instead."
                     ),
                 )
+
+    def test_batched_middle_chunks_leave_previous_running_batch(self):
+        chunked_reqs = [
+            MagicMock(name="chunked_req_0"),
+            MagicMock(name="chunked_req_1"),
+        ]
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.chunked_req = None
+        last_batch.requeue_chunked_reqs = chunked_reqs
+        last_batch.batch_size.side_effect = [2, 0]
+        running_batch = SimpleNamespace(batch_is_full=True)
+
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            SimpleNamespace(chunked_req=None),
+            last_batch=last_batch,
+            running_batch=running_batch,
+        )
+
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertEqual(set(excluded), set(chunked_reqs))
+        self.assertFalse(running_batch.batch_is_full)
+
+    def test_requeued_batched_chunk_keeps_committed_chunk_cache_prefix(self):
+        req = MagicMock(pp_batched_chunk_requeued=True)
+        scheduler = SimpleNamespace(
+            pp_batch_independent_chunks=True,
+            tree_cache=MagicMock(),
+        )
+
+        Scheduler._init_waiting_req_next_round(scheduler, req)
+
+        req.init_next_round_input.assert_called_once_with()
 
 
 if __name__ == "__main__":
