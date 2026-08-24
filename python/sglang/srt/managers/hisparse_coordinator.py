@@ -283,21 +283,17 @@ class HiSparseCoordinator:
             shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
         self.enable_prefetch = any(self._is_shared_index_layer)
+        self._use_parallel_miss_copy = not _is_hip and not self.is_dsv4_hisparse
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
-        if not self.enable_prefetch:
-            return
 
-        # Small fixed grid for the copy-only kernel: low SM footprint so the
-        # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
-        max_group_size = max(len(g) for g in self._prefetch_groups.values())
-        self.prefetch_stream = device_module.Stream()
-        self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
-        # Plan recorded by the current anchor, replayed by its skip layers. One
-        # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
+        # CUDA generic MLA also uses this plan to parallelize the anchor (and
+        # non-IndexShare) Host->GPU miss copies. One buffer set is sufficient:
+        # launches on the decode stream are ordered, and shared-index skip
+        # layers keep the existing event ordering below.
+        if not (self.enable_prefetch or self._use_parallel_miss_copy):
+            return
         self._miss_src = torch.zeros(
             (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
         )
@@ -307,6 +303,16 @@ class HiSparseCoordinator:
         self._miss_count = torch.zeros(
             (max_num_req_slots,), dtype=torch.int32, device=self.device
         )
+
+        if not self.enable_prefetch:
+            return
+
+        # Small fixed grid for the copy-only kernel: low SM footprint so the
+        # copies overlap compute with little contention.
+        self._prefetch_copy_blocks = 4
+        max_group_size = max(len(g) for g in self._prefetch_groups.values())
+        self.prefetch_stream = device_module.Stream()
+        self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
         logger.info(
             "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
             "group(s), %d skip layer(s) of %d total.",
@@ -955,6 +961,7 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
+        record_plan = record_plan or self._use_parallel_miss_copy
         plan = (
             dict(
                 miss_src=self._miss_src[:num_reqs],
