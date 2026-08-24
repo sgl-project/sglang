@@ -169,6 +169,57 @@ def _drain():
         # Keep the evidence buffer; no further snapshots this forward.
 
 
+# ---- send-path split probe (§24.22: writer outside every trapped window) ----
+# The layer trap proved the r2t row is clean through every EXTEND forward's
+# layer loop, yet [mf-raw] (post-translate) sees garbage. The residual
+# windows are (a) decode/mixed forwards + the between-forward gap (overlap
+# loop, other batches' KV sends, scheduler) and (b) the send path itself
+# (translate / pool-side mapping). This probe splits them: a device-side
+# dirty-count of the PRE-translate segment, read out ONLY inside the
+# already-synchronized [mf-raw] branch -- the clean path pays one small
+# reduction kernel and zero extra D2H, preserving the §19 no-sync discipline.
+_send_probe: dict = {}
+
+
+def send_probe_record(kv_indices, rid, slot, seg_start, seg_end) -> None:
+    """Enqueue the pre-translate dirty-count for the current segment."""
+    if not _enabled():
+        return
+    try:
+        n = ((kv_indices < 0) | (kv_indices >= 1 << 30)).sum()
+        _send_probe.clear()
+        _send_probe.update(
+            n=n, rid=str(rid), slot=int(slot),
+            s0=int(seg_start), s1=int(seg_end),
+        )
+    except Exception:
+        _send_probe.clear()
+
+
+def send_probe_read(n_dirty_post: int, n_tot: int) -> None:
+    """Inside the [mf-raw] branch: confront pre- vs post-translate dirt.
+
+    pre>0  -> the row was ALREADY dirty at send-loop entry: writer acts in
+              decode/mixed forwards or the between-forward gap (NOT translate).
+    pre=0  -> garbage entered during translate/pool-side mapping: a new
+              kernel-side family (confront translate + scatter paths).
+    """
+    if not _enabled() or not _send_probe:
+        return
+    try:
+        pre = int(_send_probe["n"].item())
+    except Exception:
+        return
+    logger.error(
+        "[mf-trap] send pre-translate rid=%s slot=%d seg=[%d,%d) "
+        "n_dirty_pre=%d n_dirty_post=%d n_tot=%d",
+        _send_probe["rid"], _send_probe["slot"],
+        _send_probe["s0"], _send_probe["s1"],
+        pre, n_dirty_post, n_tot,
+    )
+    _send_probe.clear()
+
+
 def layer_trap_start(forward_batch) -> None:
     """Baseline snapshot before layer 0 (post-alloc: the legal state)."""
     if not _enabled():

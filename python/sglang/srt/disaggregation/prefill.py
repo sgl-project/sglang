@@ -1305,6 +1305,19 @@ class SchedulerDisaggregationPrefillMixin:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, seg_start:seg_end
             ]
+            # Send-loop trap checkpoint (layers/cp/layer_trap.py): device-side
+            # dirty-count BEFORE translate; read out only inside the [mf-raw]
+            # branch below (already synchronized) -- zero extra D2H in the
+            # clean path. Splits the residual writer window into pre-translate
+            # (decode/mixed forwards, between-forward gap) vs translate-side.
+            try:
+                from sglang.srt.layers.cp.layer_trap import send_probe_record
+
+                send_probe_record(
+                    kv_indices, req.rid, req.req_pool_idx, seg_start, seg_end
+                )
+            except Exception:
+                pass
             if envs.SGLANG_DEBUG_MEMORY_POOL.get():
                 _dbg = kv_indices.to(torch.int64)
                 if int(_dbg.min()) < 0 and rate_limited_hit("mf-stage-before"):
@@ -1351,6 +1364,12 @@ class SchedulerDisaggregationPrefillMixin:
                 _dirty = (_slots < 0) | (_slots >= 1 << 30)
                 _nsent = int((_slots == -123456789).sum())
                 _first = int(_dirty.nonzero()[0]) if bool(_dirty.any()) else -1
+                try:
+                    from sglang.srt.layers.cp.layer_trap import send_probe_read
+
+                    send_probe_read(int(_dirty.sum()), _slots.numel())
+                except Exception:
+                    pass
                 try:
                     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                         get_scatter_oob_counts as _oob,
