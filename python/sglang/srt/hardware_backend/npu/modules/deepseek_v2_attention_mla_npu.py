@@ -26,7 +26,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_kv_cache_finalize,
     cp_all_gather_rerange_kv_cache_launch,
 )
-from sglang.srt.utils import get_current_device_stream_fast
 from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
@@ -267,6 +266,8 @@ def forward_mha_core_npu(
         fp8_kv_scale=fp8_kv_scale,
     )
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    if m._enable_attn_o_tensor_parallel:
+        return m.forward_attn_out_with_o_tp(attn_output, forward_batch)
     output, _ = m.o_proj(attn_output)
     return output
 
@@ -566,6 +567,8 @@ def forward_mla_core_npu(
         )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    if m._enable_attn_o_tensor_parallel:
+        return m.forward_attn_out_with_o_tp(attn_bmm_output, forward_batch)
     output, _ = m.o_proj(attn_bmm_output)
 
     return output
@@ -702,10 +705,17 @@ def forward_dsa_prepare_npu(
                 m.cp_size,
                 forward_batch,
             )
-
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
-
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            q_nope_out = torch_npu.npu_transpose_batchmatmul(
+                q_nope,
+                m.w_kc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+        else:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+            q_nope_out = q_nope_out.transpose(0, 1)
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
@@ -775,37 +785,43 @@ def forward_dsa_core_npu(
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        if hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+                attn_output,
+                m.w_vc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+        else:
+            attn_output = attn_output.transpose(0, 1)
 
-        # attn_output = attn_output.transpose(0, 1)
-        #
-        # torch.bmm(
-        #     attn_output,
-        #     m.w_vc,
-        #     out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-        #         0, 1
-        #     ),
-        # )
+            torch.bmm(
+                attn_output,
+                m.w_vc,
+                out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+                    0, 1
+                ),
+            )
     else:
         attn_output = attn_output.contiguous()
         if is_npu_before_atlas_a5():
             torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
         else:
-            batch_matmul_transpose_npu(
-                tensor_a=attn_output,
-                tensor_b=m.w_vc,
-                tensor_c=attn_bmm_output,
+            attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+                attn_output,
+                m.w_vc,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
             )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
-    output, _ = m.o_proj(attn_bmm_output)
+    if m._enable_attn_o_tensor_parallel:
+        output = m.forward_attn_out_with_o_tp(attn_bmm_output, forward_batch)
+    else:
+        output, _ = m.o_proj(attn_bmm_output)
     if not m.next_skip_topk:
         return output, None
     else:
@@ -840,6 +856,13 @@ def npu_mla_preprocess(
                 hidden_states.device,
             ),
         )
+        from sglang.srt.server_args import get_global_server_args
+        if (
+            get_global_server_args().disaggregation_mode != "null"
+            and m.mla_preprocess.uses_mlaprolog()
+            and m.w_kc is not None
+        ):
+            m.w_kc.untyped_storage().resize_(0)
     else:
         m.mla_preprocess.runtime_refs["fak_descale_reciprocal"] = (
             _get_fp8_kv_runtime_scale(

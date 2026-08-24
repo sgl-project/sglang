@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-
+from sglang.srt.server_args import get_global_server_args
 from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
@@ -254,8 +254,131 @@ _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
 
-SHARED_EXPERTS = None
-ALT_STREAM = None
+
+_enable_attn_o_tensor_parallel = envs.SGLANG_ATTN_O_TP_SIZE.get() > 1
+if _enable_attn_o_tensor_parallel:
+    from sglang.srt.distributed import (
+        get_attn_o_tensor_parallel_rank,
+        get_attn_o_tensor_parallel_world_size,
+        attn_o_model_parallel_all_to_all,
+        attn_o_model_parallel_reduce_scatter,
+    )
+
+
+
+import triton
+import triton.language as tl
+from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
+FP8_E4M3_MAX: float = 448.0
+E8M0_BIAS: int = 127
+MX_BLOCK_SIZE: int = 32
+
+
+@triton.jit
+def _swiglu_quant_mxfp8_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    TOTAL_ROWS: tl.constexpr,
+    HALF_COLS: tl.constexpr,
+    MX_BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS_PER_ROW: tl.constexpr,
+    ROW_PER_PROGRAM: tl.constexpr,
+):
+    FP8_E4M3_MAX: tl.constexpr = 448.0
+    E8M0_BIAS: tl.constexpr = 127
+
+    pid = tl.program_id(0)
+    row_begin = pid * ROW_PER_PROGRAM
+    if row_begin >= TOTAL_ROWS:
+        return
+    row_end = tl.minimum((pid + 1) * ROW_PER_PROGRAM, TOTAL_ROWS)
+
+    # 2D block offsets: (NUM_BLOCKS_PER_ROW, MX_BLOCK_SIZE)
+    blk_ids = tl.arange(0, NUM_BLOCKS_PER_ROW)
+    elem_ids = tl.arange(0, MX_BLOCK_SIZE)
+    col_2d = blk_ids[:, None] * MX_BLOCK_SIZE + elem_ids[None, :]
+
+    for row_idx in range(row_begin, row_end):
+        # Load x1 and x2 as 2D blocks
+        x1 = tl.load(x_ptr + row_idx * 2 * HALF_COLS + col_2d).to(tl.float32)
+        x2 = tl.load(
+            x_ptr + row_idx * 2 * HALF_COLS + HALF_COLS + col_2d
+        ).to(tl.float32)
+
+        # SwiGLU (fully vectorized)
+        swiglu = x1 * tl.sigmoid(x1) * x2
+
+        # Per-block amax (reduce along axis=1)
+        amax = tl.max(tl.abs(swiglu), axis=1)
+
+        # e8m0 scale computation (vectorized over all blocks)
+        amax_safe = tl.where(amax > 0.0, amax, 1.0)
+        scale_exp = tl.ceil(tl.log2(amax_safe / FP8_E4M3_MAX) - 1e-6)
+        e8m0_val = scale_exp + E8M0_BIAS
+        e8m0_val = tl.where(amax > 0.0, e8m0_val, E8M0_BIAS)
+        e8m0_val = tl.minimum(tl.maximum(e8m0_val, 0.0), 255.0)
+        actual_scale = tl.exp2(e8m0_val - E8M0_BIAS)
+
+        # Store e8m0 scales
+        tl.store(
+            scale_ptr + row_idx * NUM_BLOCKS_PER_ROW + blk_ids,
+            e8m0_val.to(scale_ptr.dtype.element_ty),
+        )
+
+        # Quantize via broadcasting division and store
+        quantized = (swiglu / actual_scale[:, None]).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + row_idx * HALF_COLS + col_2d, quantized)
+
+
+def swiglu_quant_mxfp8(x):
+    """Fused SwiGLU + MXFP8 (e4m3 + e8m0) per-32-block quantization.
+
+    SwiGLU: out = x1 * sigmoid(x1) * x2, where x is split into [x1, x2].
+    Then each 32-element block is quantized to e4m3 with a shared e8m0 scale.
+
+    Args:
+        x: ``(S, H)`` bf16/fp16 input where ``H = 2 * output_dim``.
+
+    Returns:
+        (out, scale) where:
+        - out:   ``(S, H//2)``     ``torch.float8_e4m3fn``
+        - scale: ``(S, H//2//32)`` ``torch.uint8`` (e8m0: value represents ``2**(v-127)``)
+    """
+    s, h = x.shape
+    half_cols = h // 2
+
+    if half_cols % MX_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Output dimension ({half_cols}) must be divisible by "
+            f"MXFP8 block size ({MX_BLOCK_SIZE})"
+        )
+
+    num_blocks_per_row = half_cols // MX_BLOCK_SIZE
+    out = torch.empty((s, half_cols), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((s, num_blocks_per_row), dtype=torch.uint8, device=x.device)
+
+    _, num_vectorcore = get_device_properties()
+
+    # Choose rows per program to maximize occupancy
+    row_per_program = min(s, max(1, (s + num_vectorcore - 1) // num_vectorcore))
+    num_programs = triton.cdiv(s, row_per_program)
+
+    _swiglu_quant_mxfp8_kernel[(num_programs,)](
+        x,
+        out,
+        scale,
+        TOTAL_ROWS=s,
+        HALF_COLS=half_cols,
+        MX_BLOCK_SIZE=MX_BLOCK_SIZE,
+        NUM_BLOCKS_PER_ROW=num_blocks_per_row,
+        ROW_PER_PROGRAM=row_per_program,
+        num_stages=2,
+        multibuffer=True,
+    )
+    return out, scale
+
 
 def _get_shared_expert_fp8_block_size(
     gate_up_quant_method: Any, down_quant_method: Any
@@ -332,6 +455,19 @@ class DeepseekV2MLP(nn.Module):
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
 
+    def supports_split_forward(self) -> bool:
+        """Whether FC1+SwiGLU and FC2 can be invoked independently."""
+        if getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False):
+            return False
+        # This fast path fuses SwiGLU quantization and the down GEMM in one
+        # branch, so its output is already the final MLP output.
+        return not (
+            self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.uint8
+            and hasattr(self.down_proj, "weight_scale_inv")
+        )
+
     def forward(
         self,
         x,
@@ -366,6 +502,27 @@ class DeepseekV2MLP(nn.Module):
             )
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
+
+        x = self.forward_gate_up_act(
+            x,
+            gemm_output_zero_allocator=gemm_output_zero_allocator,
+            gateup_pre_quant=gateup_pre_quant,
+        )
+        return self.forward_down(x)
+
+    def forward_gate_up_act(
+        self,
+        x,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        """Run the first shared-expert GEMM and SwiGLU activation.
+
+        This split entry point is used by the fine-grained DeepEP overlap path.
+        The NVFP4 GEMM+SwiGLU+quant fusion is intentionally kept in ``forward``
+        because that kernel produces the down-projection input and cannot be
+        separated at its current API boundary.
+        """
 
         if gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
@@ -473,6 +630,10 @@ class DeepseekV2MLP(nn.Module):
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
+        return x
+
+    def forward_down(self, x):
+        """Run only the shared-expert down projection."""
         x, _ = self.down_proj(x)
         return x
 
@@ -1267,6 +1428,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1274,29 +1436,39 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
+        fine_grained_dual_stream = (
+            _is_npu
+            and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+            and hidden_states.shape[0] > 0
+            and hasattr(self, "shared_experts")
+            and self.shared_experts.supports_split_forward()
+            and isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+        )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not sbo_enabled_flag
+                and self.num_fused_shared_experts == 0
+                and not fine_grained_dual_stream
+            ):
                 if self.alt_stream is not None:
-                    global SHARED_EXPERTS
-                    global ALT_STREAM
-                    if SHARED_EXPERTS is None:
-                        SHARED_EXPERTS = self.shared_experts
-                        ALT_STREAM = self.alt_stream
-                    # self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    # with torch.cuda.stream(self.alt_stream):
-                    #     shared_output = self._forward_shared_experts(hidden_states)
-                    #     shared_output.record_stream(self.alt_stream)
-                    #     shared_event = self.alt_stream.record_event()
-                    # if is_in_breakable_cuda_graph():
-                    #     # The MoE call below is an eager break, so record
-                    #     # and wait must share one capture; joining here means
-                    #     # the shared experts overlap nothing. The alt stream
-                    #     # is kept for record_stream: without that marking the
-                    #     # allocator recycles shared_output across the break.
-                    #     torch.cuda.current_stream().wait_event(shared_event)
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                    if is_in_breakable_cuda_graph():
+                        # The MoE call below is an eager break, so record
+                        # and wait must share one capture; joining here means
+                        # the shared experts overlap nothing. The alt stream
+                        # is kept for record_stream: without that marking the
+                        # allocator recycles shared_output across the break.
+                        torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1322,7 +1494,65 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
-        if sbo_overlap_dispatch_flag:
+        if fine_grained_dual_stream:
+            shared_intermediate = None
+            shared_fc2_done = None
+
+            def _fine_grained_pre_dispatch_hook(
+                dispatcher: BaseDispatcher,
+                dispatch_hidden_states: torch.Tensor,
+                _dispatch_topk_output: TopKOutput,
+            ):
+                """Overlap shared FC1+SwiGLU with the full dispatch."""
+                nonlocal shared_intermediate
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_intermediate = self.shared_experts.forward_gate_up_act(
+                        dispatch_hidden_states
+                    )
+                    shared_intermediate.record_stream(self.alt_stream)
+                fine_pre_dispatch_hook_handle.remove()
+
+            def _fine_grained_pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                """Launch shared FC2 after routed GEMMs and beside combine."""
+                nonlocal shared_output, shared_fc2_done
+                assert shared_intermediate is not None
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self.shared_experts.forward_down(
+                        shared_intermediate
+                    )
+                    shared_output.record_stream(self.alt_stream)
+                    shared_fc2_done = self.alt_stream.record_event()
+                fine_pre_combine_hook_handle.remove()
+
+            def _fine_grained_post_combine_hook(
+                dispatcher: BaseDispatcher, combined_output: torch.Tensor
+            ):
+                """Join shared FC2 before the two MoE branches are added."""
+                assert shared_fc2_done is not None
+                torch.cuda.current_stream().wait_event(shared_fc2_done)
+                fine_post_combine_hook_handle.remove()
+
+            fine_pre_dispatch_hook_handle = (
+                self.experts.dispatcher.register_pre_dispatch_hook(
+                    _fine_grained_pre_dispatch_hook
+                )
+            )
+            fine_pre_combine_hook_handle = (
+                self.experts.dispatcher.register_pre_combine_hook(
+                    _fine_grained_pre_combine_hook
+                )
+            )
+            fine_post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(
+                    _fine_grained_post_combine_hook
+                )
+            )
+
+        elif sbo_overlap_dispatch_flag:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
@@ -1475,14 +1705,15 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
-        # if (
-        #     hidden_states.shape[0] > 0
-        #     and not sbo_enabled_flag
-        #     and self.num_fused_shared_experts == 0
-        #     and self.alt_stream is not None
-        #     and not is_in_breakable_cuda_graph()
-        # ):
-        #     torch.cuda.current_stream().wait_event(shared_event)
+        if (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+            and not is_in_breakable_cuda_graph()
+            and shared_event is not None
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             x = shared_output
@@ -1891,16 +2122,27 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
+        self._enable_attn_o_tensor_parallel = _enable_attn_o_tensor_parallel
         # O projection.
+        if _enable_attn_o_tensor_parallel:
+            self.attn_o_tp_size = get_attn_o_tensor_parallel_world_size()
+            self.attn_o_tp_rank = get_attn_o_tensor_parallel_rank()
+            self.o_groups = self.num_local_heads
+            assert (
+                    self.o_groups % self.attn_o_tp_size == 0
+            ), f"o_groups ({self.o_groups}) must be divisible by attn_o_tp_size ({self.attn_o_tp_size})"
+            assert (
+                    attn_tp_size <= 1
+            ), f"attn_o_tp and attn_tp cannot be enabled together"
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=reduce_results if not _enable_attn_o_tensor_parallel else False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=attn_tp_rank if not _enable_attn_o_tensor_parallel else self.attn_o_tp_rank,
+            tp_size=attn_tp_size if not _enable_attn_o_tensor_parallel else self.attn_o_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -2108,6 +2350,73 @@ class DeepseekV2AttentionMLA(
         else:
             state.hidden_states_after_attn = result
 
+    def _get_o_tp_max_bsz(self):
+        server_args = get_global_server_args()
+        max_running_requests_per_dp = (
+            server_args.max_running_requests // server_args.dp_size
+        )
+        spec_num_draft_tokens = server_args.speculative_num_draft_tokens
+        max_decode_tokens = (
+            max_running_requests_per_dp * spec_num_draft_tokens
+            if spec_num_draft_tokens is not None
+            else max_running_requests_per_dp
+        )
+        max_extend_tokens = getattr(server_args, "max_extend_tokens", None) or 0
+        return max(max_decode_tokens, max_extend_tokens)
+
+    def pre_process_for_o_tp(self, hidden_states, forward_batch):
+        # hidden_states arrives as 2D: (S, num_local_heads * v_head_dim)
+        # Reshape to 3D: (S, num_local_heads, v_head_dim) for head-group split.
+        max_bsz = self._get_o_tp_max_bsz()
+        if forward_batch.forward_mode.is_idle() or hidden_states.shape[0] == 0:
+            return torch.zeros(
+                (max_bsz, self.num_local_heads * self.v_head_dim),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        S, H = hidden_states.shape
+        pad_size = max_bsz - S
+        if pad_size > 0:
+            return F.pad(hidden_states, (0, 0, 0, pad_size), mode="constant", value=0)
+        return hidden_states
+
+    def post_process_for_o_tp(self, hidden_states, org_hidden_states, forward_batch):
+        if forward_batch.forward_mode.is_idle() or org_hidden_states.shape[0] == 0:
+            return org_hidden_states.new_zeros(
+                (org_hidden_states.shape[0], self.hidden_size)
+            )
+        bs = org_hidden_states.shape[0]
+        return hidden_states[:bs, ...].clone()
+
+    def forward_attn_out_with_o_tp(self, hidden_states, forward_batch):
+        org_hidden_states = hidden_states
+        hidden_states = self.pre_process_for_o_tp(hidden_states, forward_batch)
+        S, H = hidden_states.shape  # B, 128 128
+        # Split heads into attn_o_tp_size groups, then all-to-all so each
+        # rank receives all tokens for its head subset.
+        hidden_states = (
+            hidden_states.reshape(
+                S,
+                self.attn_o_tp_size,
+                H // self.attn_o_tp_size,
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+        hidden_states = attn_o_model_parallel_all_to_all(input_=hidden_states)
+        hidden_states = hidden_states.view(
+            S * self.attn_o_tp_size,
+            H // self.attn_o_tp_size,
+        )
+        # o_proj with reduce_results=False: only local matmul, no all-reduce.
+        output = self.o_proj(hidden_states)[0]  # [S * tp, V]
+        # reduce_scatter sums partial o_proj results across head groups and
+        # returns each rank's own S tokens.
+        output = attn_o_model_parallel_reduce_scatter(input_=output)
+        output = output.reshape(S, -1).contiguous()
+        output = self.post_process_for_o_tp(output, org_hidden_states, forward_batch)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2151,6 +2460,8 @@ class DeepseekV2AttentionMLA(
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
+                if _enable_attn_o_tensor_parallel:
+                    return hidden_states[0], None, forward_batch, None
                 return hidden_states[0]
         else:
             if (
@@ -2246,6 +2557,14 @@ class DeepseekV2AttentionMLA(
             intermediate_state
         )
         if inner_state is None:
+            if _enable_attn_o_tensor_parallel:
+                # Must still participate in the all-to-all / reduce-scatter
+                # collectives even with an empty batch, otherwise other ranks
+                # in the attn_o_tp group will deadlock waiting for us.
+                dummy = hidden_states.new_zeros(
+                    0, self.num_local_heads * self.v_head_dim
+                )
+                self.forward_attn_out_with_o_tp(dummy, forward_batch)
             return hidden_states
 
         if attn_forward_method == AttnForwardMethod.MHA:
@@ -2703,6 +3022,7 @@ class DeepseekV2Model(nn.Module):
                 _is_cuda
                 or _is_musa
                 or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                or envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
                 or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
             )
             else None
