@@ -201,6 +201,8 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mha",
     "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
+    "minicpm_flashattn",
+    "minicpm_flashinfer",
     # AMD specific
     "aiter",
     "wave",
@@ -241,6 +243,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "intel_xpu",
     "triton",
 ]
 
@@ -403,6 +406,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "nvidia_kda",
     "ptx_kda",
     "helion",
+    "intel_xpu",
 ]
 
 
@@ -967,7 +971,12 @@ class ServerArgs:
         NS("schedule"),
     ] = False
     disable_radix_cache: A[
-        bool, "Disable RadixAttention for prefix caching.", NS("memory")
+        bool,
+        Arg(
+            help="Disable RadixAttention for prefix caching.",
+            resolvable=True,
+        ),
+        NS("memory"),
     ] = False
     enable_page_major_kv_layout: A[
         bool,
@@ -1217,6 +1226,16 @@ class ServerArgs:
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        NS("parallel"),
+    ] = False
+    enable_shared_experts_attn_tp: A[
+        bool,
+        "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
+        NS("parallel"),
+    ] = False
+    enable_dense_mlp_attn_tp: A[
+        bool,
+        "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
     disable_attn_tp_gather: A[
@@ -8176,6 +8195,11 @@ class ServerArgs:
                 "decoding (--speculative-algorithm): the weight cache daemon does "
                 "not export the draft model's weights. Disable one of them "
                 "(--weight-cache-mode off) for this configuration."
+            )
+
+        if self.weight_cache_mode != "off" and self.enable_eplb:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with --enable-eplb."
             )
 
     def _is_mistral_native_format(self) -> bool:

@@ -13,6 +13,12 @@ from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
@@ -30,6 +36,7 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -79,6 +86,41 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     def test_non_encoder_decoder_keeps_automodel(self):
         # e.g. CLIP/Mistral/Qwen text encoders are not encoder-decoder.
         self.assertIs(self._resolve(False, ["CLIPTextModel"]), transformers.AutoModel)
+
+    def test_qwen_text_model_constructs_checkpoint_owned_embedding(self):
+        config = SimpleNamespace(
+            pad_token_id=0,
+            vocab_size=64,
+            hidden_size=256,
+            num_hidden_layers=0,
+            rms_norm_eps=1e-6,
+        )
+        quant_config = mock.Mock()
+        quant_config.quantizes_embedding.return_value = True
+        replacement = nn.Embedding(64, 256)
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.models.encoders.qwen3vl."
+            "VocabParallelEmbedding",
+            return_value=replacement,
+        ) as embedding_cls:
+            model = Qwen3VLTextModel(
+                config,
+                quant_config=quant_config,
+                use_tensor_parallel=True,
+                prefix="model.language_model",
+            )
+
+        self.assertIs(model.embed_tokens, replacement)
+        quant_config.quantizes_embedding.assert_called_once_with(
+            "model.language_model.embed_tokens"
+        )
+        embedding_cls.assert_called_once_with(
+            64,
+            256,
+            params_dtype=torch.get_default_dtype(),
+            quant_config=quant_config,
+            prefix="model.language_model.embed_tokens",
+        )
 
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
@@ -147,7 +189,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             "model.layers.49.self_attn.q_proj.weight": True,
             "model.layers.50.self_attn.q_proj.weight": False,
             "visual.blocks.0.attn.qkv.weight": True,
-            "language_model.layers.63.mlp.down_proj.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": False,
             "module.model.language_model.layers.63.mlp.down_proj.weight": True,
         }
         self.assertEqual(
@@ -295,6 +337,23 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
+    def test_explicit_online_quantization_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="kitchen_int8",
+        )
+
+        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
@@ -327,11 +386,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
             save_file(
                 {
-                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                    "visual.blocks.0.attn.qkv.weight": torch.ones(
                         (2, 256), dtype=torch.int8
                     ),
-                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones((2, 1)),
-                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                    "visual.blocks.0.attn.qkv.weight_scale": torch.ones((2, 1)),
+                    "visual.blocks.0.attn.qkv.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
                 },
@@ -355,7 +414,100 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
+            {"model.visual.blocks.0.attn.qkv_proj"},
+        )
+
+    def test_comfy_w4a4_weight_file_configures_native_encoder(self):
+        self.get_quant_config.return_value = None
+        marker = json.dumps(
+            {"format": "convrot_w4a4", "convrot_groupsize": 256}
+        ).encode()
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                        (2, 128), dtype=torch.int8
+                    ),
+                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones(2),
+                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                        list(marker), dtype=torch.uint8
+                    ),
+                },
+                checkpoint.name,
+            )
+            model_config = SimpleNamespace(quant_config=None)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+                return_value=None,
+            ):
+                _configure_encoder_quantization(
+                    model_config,
+                    MiniMaxH3Qwen3VLEncoder,
+                    {},
+                    "/model/text_encoder",
+                    checkpoint.name,
+                    "text_encoder",
+                )
+
+        self.assertIsInstance(model_config.quant_config, KitchenW4A4Config)
+        self.assertEqual(
+            set(model_config.quant_config.layer_markers),
             {"model.language_model.layers.0.self_attn.q_proj"},
+        )
+
+    def test_mixed_w4a8_weight_file_maps_embedding_and_linear_markers(self):
+        self.get_quant_config.return_value = None
+        layers = {
+            "model.embed_tokens": {"format": "int8_tensorwise"},
+            "model.layers.0.mlp.down_proj": {
+                "format": "asym_w4a8_int8",
+                "convrot": True,
+                "group_size": 16,
+                "convrot_groupsize": 256,
+            },
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.ones((4, 256), dtype=torch.int8),
+                    "model.embed_tokens.weight_scale": torch.tensor(0.25),
+                    "model.layers.0.mlp.down_proj.weight": torch.ones(
+                        (2, 128), dtype=torch.int8
+                    ),
+                    "model.layers.0.mlp.down_proj.weight_s_rel": torch.ones(
+                        (2, 16), dtype=torch.float8_e4m3fn
+                    ),
+                    "model.layers.0.mlp.down_proj.weight_s_channel": torch.ones(2),
+                    "model.layers.0.mlp.down_proj.weight_codebook": torch.ones(16),
+                },
+                checkpoint.name,
+                metadata={"_quantization_metadata": json.dumps({"layers": layers})},
+            )
+            model_config = SimpleNamespace(quant_config=None)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+                return_value=None,
+            ):
+                _configure_encoder_quantization(
+                    model_config,
+                    MiniMaxH3Qwen3VLEncoder,
+                    {},
+                    "/model/text_encoder",
+                    checkpoint.name,
+                    "text_encoder",
+                )
+
+        self.assertIsInstance(model_config.quant_config, KitchenW4A8Config)
+        self.assertTrue(
+            model_config.quant_config.quantizes_embedding(
+                "model.language_model.embed_tokens"
+            )
+        )
+        self.assertIn(
+            "model.language_model.layers.0.mlp.down_proj",
+            model_config.quant_config.layer_markers,
         )
 
     def test_encoder_must_use_native_loader(self):

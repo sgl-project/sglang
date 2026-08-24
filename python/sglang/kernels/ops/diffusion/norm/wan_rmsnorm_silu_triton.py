@@ -34,19 +34,6 @@ def _wan_rmsnorm_silu_kernel(
     bias_ptr,
     out_ptr,
     channels: tl.constexpr,
-    t_size,
-    h_size,
-    w_size,
-    x_stride_b,
-    x_stride_c,
-    x_stride_t,
-    x_stride_h,
-    x_stride_w,
-    out_stride_b,
-    out_stride_c,
-    out_stride_t,
-    out_stride_h,
-    out_stride_w,
     rms_scale,
     eps,
     has_bias: tl.constexpr,
@@ -55,20 +42,11 @@ def _wan_rmsnorm_silu_kernel(
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, block_c)
     mask = offsets < channels
+    # Dense channels-last-3d stores each pixel as one contiguous channel row.
+    # Address it directly instead of recovering b/t/h/w with integer div/mod.
+    row_offsets = row * channels + offsets
 
-    w = row % w_size
-    tmp = row // w_size
-    h = tmp % h_size
-    tmp = tmp // h_size
-    t = tmp % t_size
-    b = tmp // t_size
-
-    x_base = b * x_stride_b + t * x_stride_t + h * x_stride_h + w * x_stride_w
-    out_base = b * out_stride_b + t * out_stride_t + h * out_stride_h + w * out_stride_w
-
-    x = tl.load(x_ptr + x_base + offsets * x_stride_c, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     inv_norm = 1.0 / tl.maximum(norm, eps)
 
@@ -84,7 +62,7 @@ def _wan_rmsnorm_silu_kernel(
     y = y.to(tl.float32)
     y = y * tl.sigmoid(y)
 
-    tl.store(out_ptr + out_base + offsets * out_stride_c, y, mask=mask)
+    tl.store(out_ptr + row_offsets, y, mask=mask)
 
 
 def _fake_wan_rmsnorm_silu(
@@ -125,11 +103,6 @@ def _triton_wan_rmsnorm_silu_cuda(
             bias,
             out,
             channels,
-            t_size,
-            h_size,
-            w_size,
-            *x.stride(),
-            *out.stride(),
             rms_scale,
             eps,
             has_bias,
@@ -163,6 +136,9 @@ def can_use_wan_rmsnorm_silu(
         and x.numel() > 0
         and 0 < x.shape[1] <= _MAX_CHANNELS
         and x.is_contiguous(memory_format=torch.channels_last_3d)
+        # Size-one channel tensors can satisfy the memory-format predicate
+        # while retaining channel-first strides, so require dense rows too.
+        and x.stride(1) == 1
         and _affine_supported(x, gamma)
         and (bias is None or _affine_supported(x, bias))
     )
