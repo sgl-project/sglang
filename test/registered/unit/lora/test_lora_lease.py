@@ -38,6 +38,7 @@ def _make_tm(enable_lora: bool = True) -> TokenizerManager:
     tm.enable_lora = enable_lora
     tm.lora_registry = MagicMock()
     tm.lora_registry.release = AsyncMock()
+    tm._lora_release_tasks = set()
     return tm
 
 
@@ -72,11 +73,11 @@ class TestFinalizeLoraLease(CustomTestCase):
         tm.lora_registry.release.assert_not_awaited()
         self.assertFalse(state.lora_lease_released)
 
-    def test_no_lora_path_is_noop(self):
+    def test_lora_id_remains_owner_when_path_is_cleared(self):
         tm = _make_tm()
         state = _make_state(lora_path=None)
         self._finalize(tm, state)
-        tm.lora_registry.release.assert_not_awaited()
+        tm.lora_registry.release.assert_awaited_once_with("id-1")
 
     def test_lora_disabled_is_noop(self):
         tm = _make_tm(enable_lora=False)
