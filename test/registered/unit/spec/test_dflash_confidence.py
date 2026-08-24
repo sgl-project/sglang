@@ -4,16 +4,16 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.models.dspark import DSparkConfidenceHead
 from sglang.srt.speculative.dflash_confidence import (
     plan_verify_prefixes,
     select_sps_verify_token_budget,
     selector_confidence_from_scores,
 )
-from sglang.srt.models.dspark import DSparkConfidenceHead
-from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.dflash_confidence_observability import (
     DFlashConfidenceObserver,
 )
+from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.test.ci.ci_register import register_cpu_ci
