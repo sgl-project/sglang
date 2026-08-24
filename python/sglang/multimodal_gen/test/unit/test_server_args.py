@@ -494,6 +494,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "--component-weights-paths.text_encoder",
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
+                "--component-quantizations.text_encoder",
+                "kitchen_int8",
+                "--transformer-quantization=fp8",
                 "--component-attention-backends.transformer",
                 "fa3",
             ]
@@ -535,6 +538,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             {"transformer": "fa"},
             server_args.component_attention_backends,
+        )
+        self.assertEqual(
+            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            server_args.component_quantizations,
         )
 
     def test_serve_cli_defaults_warmup_on(self):
