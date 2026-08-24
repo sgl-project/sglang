@@ -102,6 +102,10 @@ def launch_server_internal(server_args):
 def launch_server_process_and_send_one_request(
     server_args: ServerArgs, compile_args: CompileArgs
 ):
+    # Keeps the device probe out of the fork below, for a caller that reaches
+    # this without resolving first.
+    server_args.resolve_once()
+
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
@@ -177,6 +181,8 @@ def compile_server_args(args, compile_args: CompileArgs) -> ServerArgs:
     args.watchdog_timeout = compile_args.timeout
     args.warmups = "compile-deep-gemm"
     server_args = ServerArgs.from_cli_args(args)
+    # `cuda_graph_config` is None until resolution parses it.
+    server_args.resolve_once()
     server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
     server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
     print(f"Disable CUDA Graph and Torch Compile to save time...")
