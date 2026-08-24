@@ -518,6 +518,7 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        self._inject_gate_armed: Optional[bool] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -545,7 +546,10 @@ class DsparkVerifyEpilogue:
             self.verify_lens_buf[:bs].copy_(verify_lens)
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
-        self.inject_gate_buf.fill_(1 if armed else 0)
+        if not _is_npu or self._inject_gate_armed != armed:
+            self.inject_gate_buf.fill_(1 if armed else 0)
+            if _is_npu:
+                self._inject_gate_armed = armed
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
