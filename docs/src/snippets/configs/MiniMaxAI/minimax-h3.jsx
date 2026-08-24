@@ -57,12 +57,14 @@ function consumerFlags(s) {
   if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
     flags.push("--dit-layerwise-resident-layers 4");
   }
-  // A 24 GB card on a 32 GB host has allocator headroom to keep ten DiT
-  // layers resident (measured 10.4 vs 11.6 s/step); a 16 GB card does not --
-  // there even four resident layers measured slower than none, so it keeps
-  // the plain recipe.
+  // A 24 GB card has headroom for resident DiT layers, but their benefit
+  // flattened once the decoder went fp16 and the courier overlapped the
+  // streaming: measured at a 22 GiB cap (2 GiB desktop headroom), r10/r6/r4
+  // land at 8.41/8.48/8.51 s/step. Six layers keep ~2.4 GiB more free than
+  // ten for under 1% of speed -- the desktop-safe point. A 16 GB card keeps
+  // the plain recipe; even four resident layers measured slower there.
   if (CONSUMER_24G.includes(s.hw) && s.host_ram === "ram32") {
-    flags.push("--dit-layerwise-resident-layers 10");
+    flags.push("--dit-layerwise-resident-layers 6");
   }
   if (WORKSTATION_48G.includes(s.hw)) {
     flags.push("--dit-layerwise-resident-layers 40");
@@ -97,13 +99,14 @@ function consumerHints(s) {
   if (bigHost) {
     if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
       hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
+      hints.push("fewer resident layers than the 32 GB rows is not a typo: with the DiT pinned in a big host, streamed layers arrive at pinned-copy speed and GPU residency buys little; on a 32 GB host the stream is the bottleneck residency cuts");
     } else {
       hints.push("~6 s per step once the host pins the DiT; the decode holds all 36 blocks in their fp16 decode dtype and takes ~10 s");
     }
     return hints;
   }
   if (CONSUMER_24G.includes(s.hw)) {
-    hints.push("measured at 32 GB host: ~10.4 s per denoise step with ten resident layers, ~9.6 s decode, ~230 s per request -- ahead of ComfyUI (249-260 s) under the same hard 24 GiB cap");
+    hints.push("measured at 32 GB host under a 22 GiB cap (desktop headroom): ~8.5 s per denoise step with six resident layers, ~9.6 s decode -- ahead of ComfyUI (249-260 s at the 24 GiB cap); a headless card can raise to ten layers for under 1% more");
   } else if (CONSUMER_16G.includes(s.hw)) {
     hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
   } else {

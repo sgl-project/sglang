@@ -1396,8 +1396,9 @@ Under that cap, Recipe A wins the whole request at every host size:
 
 Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
-and at 24 GiB (with `--dit-layerwise-resident-layers 10`, which only a 24 GB
-card has headroom for) ~230 vs 249–260 s. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
+22 GiB cap so a desktop's own allocations fit; a headless card can raise it
+to 10 for under 1% more) ~8.5 s/step vs ComfyUI's 249–260 s requests. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
 #35946), per-layer pinning with net-cost accounting (#35867), the courier
 thread that ships still-mapped layers through pinned slots (#35882), and
 decoder weights held in their decode dtype from load (#35967) — which is what
