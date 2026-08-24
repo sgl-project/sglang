@@ -26,6 +26,9 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.processors.qwen3_vl import (
+    preprocess_video as qwen3_preprocess_video,
+)
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.runtime_context import (
     get_device,
@@ -411,8 +414,16 @@ class EncoderPreprocessor:
 
         video_processor_kwargs = {}
         if "qwen" in self.model_type:
+            # Qwen3-VL/3.5 defer spatial resizing to the model processor; the
+            # legacy path pre-resizes and would double-resize them.
+            qwen3_model_types = ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+            video_preprocess = (
+                qwen3_preprocess_video
+                if self.model_type in qwen3_model_types
+                else preprocess_video
+            )
             video_processed = [
-                await preprocess_video(
+                await video_preprocess(
                     video, video_config=self.vision_config.get("video", {})
                 )
                 for video in video_items

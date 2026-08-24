@@ -110,25 +110,27 @@ class NativeMmFamily(msgspec.Struct, frozen=True, kw_only=True):
         return mm_processor_cls is cls and model_type in self.model_types
 
 
+_QWEN_VL_IMAGE_PROCESSORS = {
+    "Qwen2VLImageProcessor": "aten_u8",
+    "Qwen2VLImageProcessorFast": "aten_u8",
+    "Qwen2VLImageProcessorPil": "pil",
+}
+
 NATIVE_MM_FAMILIES: Tuple[NativeMmFamily, ...] = (
     NativeMmFamily(
         name="qwen_vl",
         mm_processor="sglang.srt.multimodal.processors.qwen_vl:QwenVLImageProcessor",
-        model_types=frozenset(
-            (
-                "qwen2_vl",
-                "qwen2_5_vl",
-                "qwen3_vl",
-                "qwen3_vl_moe",
-                "qwen3_5",
-                "qwen3_5_moe",
-            )
-        ),
-        image_processors={
-            "Qwen2VLImageProcessor": "aten_u8",
-            "Qwen2VLImageProcessorFast": "aten_u8",
-            "Qwen2VLImageProcessorPil": "pil",
-        },
+        model_types=frozenset(("qwen2_vl", "qwen2_5_vl")),
+        image_processors=_QWEN_VL_IMAGE_PROCESSORS,
+    ),
+    # Qwen3-VL/3.5 register their own processor subclass (qwen3_vl.py); the
+    # identity check in `serves` does not follow subclassing, so they need a
+    # separate entry pointing at that class.
+    NativeMmFamily(
+        name="qwen_vl",
+        mm_processor="sglang.srt.multimodal.processors.qwen3_vl:Qwen3VLImageProcessor",
+        model_types=frozenset(("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")),
+        image_processors=_QWEN_VL_IMAGE_PROCESSORS,
     ),
 )
 
