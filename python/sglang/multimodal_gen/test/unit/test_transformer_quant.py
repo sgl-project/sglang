@@ -50,6 +50,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
+    AutoRoundConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
     ComfyFp8Config,
     ComfyFullPrecisionFp8LinearMethod,
@@ -98,6 +101,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -141,6 +145,41 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
+        layer_config = {
+            "bits": 4,
+            "group_size": 128,
+            "sym": True,
+            "data_type": "int",
+            "act_bits": 16,
+        }
+        metadata = {
+            "quant_method": "auto-round",
+            "packing_format": "auto_round:auto_gptq",
+            **layer_config,
+            "block_name_to_quantize": "transformer_blocks",
+            "extra_config": {
+                "context_embedder": {**layer_config, "bits": 16},
+                **{
+                    f"transformer_blocks.0.attn.to_{shard}": layer_config
+                    for shard in ("q", "k", "v")
+                },
+            },
+        }
+
+        config = get_quant_config(
+            {"quantization_config": metadata}, "/unused/component/path"
+        )
+        self.assertIsInstance(config, AutoRoundConfig)
+        config.remap_checkpoint_prefixes(MiniMaxH3DiTModel.param_names_mapping)
+        self.assertEqual(
+            config.srt_config.get_layer_config(object(), "condition_proj")[0], 16
+        )
+        self.assertEqual(
+            config.srt_config.get_layer_config(object(), "blocks.0.attn.qkv_proj")[0],
+            4,
+        )
+
     def test_mps_layerwise_load_uses_residency_api(self):
         server_args = SimpleNamespace(
             should_configure_layerwise_offload_for_lazy_component=lambda name: (

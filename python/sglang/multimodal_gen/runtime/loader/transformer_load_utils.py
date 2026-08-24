@@ -797,6 +797,9 @@ def resolve_transformer_quant_load_spec(
         packed = getattr(model_cls, "packed_modules_mapping", None)
         if packed and hasattr(quant_config, "packed_modules_mapping"):
             quant_config.packed_modules_mapping = packed
+        quant_config.remap_checkpoint_prefixes(
+            vars(model_cls).get("param_names_mapping", {})
+        )
 
     nunchaku_config = server_args.nunchaku_config
 
@@ -873,7 +876,7 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name in ("modelopt_fp8", "comfy_fp8", "mxfp8"):
+    if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
     if quant_name == "kitchen_int8":
         assert isinstance(quant_config, KitchenInt8Config)
