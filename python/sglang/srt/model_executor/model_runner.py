@@ -868,36 +868,21 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_hisparse:
-            return
-        from sglang.srt.managers.hisparse_coordinator import (
-            HiSparseCoordinator,
-            resolve_shared_index_layers,
-        )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.mem_cache.sparsity import create_hisparse_coordinator
 
-        hisparse_cfg = parse_hisparse_config(self.server_args)
-        hisparse_top_k = getattr(
-            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-        )
-        self.hisparse_coordinator = HiSparseCoordinator(
+        self.hisparse_coordinator = create_hisparse_coordinator(
+            server_args=self.server_args,
+            model_config=self.model_config,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            top_k=hisparse_top_k,
-            device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
                 if get_parallel().enable_dp_attention
                 else self.tp_group.cpu_group
             ),
-            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            swap_in_block_size=hisparse_cfg.swap_in_block_size,
-            shared_index_layers=resolve_shared_index_layers(
-                hf_text_config=self.model_config.hf_text_config,
-                pp_size=self.ps.pp_size,
-                is_speculative=self.spec_algorithm.is_speculative(),
-            ),
+            pp_size=self.ps.pp_size,
+            is_speculative=self.spec_algorithm.is_speculative(),
         )
 
     def post_capture_resize_kv_pool(self):

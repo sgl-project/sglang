@@ -1,4 +1,11 @@
-# to be combined with the sparse coordinator class and sparse algorithm family
+"""The private-host HiSparse backing: a per-request pinned host pool.
+
+The whole prefix is staged out to this coordinator's own host pool when prefill
+finishes, so a swapped-out token always has exactly one home and nothing can
+evict it -- at the cost of bypassing the regular GPU pool and the radix tree.
+See `mem_cache/sparsity/factory.py` for the alternative and how one is chosen,
+and `managers/hisparse_protocol.py` for the interface both must satisfy.
+"""
 
 import logging
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -12,6 +19,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_protocol import HiSparseTokenStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -23,6 +31,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.sparsity.factory import HiSparseBacking
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -36,13 +45,6 @@ class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     req: Req
-
-
-class HiSparseTokenStats(NamedTuple):
-    device_tokens: int
-    device_token_usage: float
-    host_tokens: int
-    host_token_usage: float
 
 
 def resolve_shared_index_layers(
@@ -108,7 +110,17 @@ def _build_prefetch_groups(
     return groups, slot
 
 
-class HiSparseCoordinator:
+class PrivateHostHiSparseCoordinator:
+    """`HiSparseCoordinator` over a coordinator-owned pinned host pool.
+
+    Implements `managers/hisparse_protocol.py`; the extra entry points below the
+    protocol (`admit_request_direct`, `mem_pool_host`, `padded_buffer_size`,
+    shared-index prefetch) are private-host-only and their callers reach them
+    through the concrete class after checking `backing`.
+    """
+
+    backing = HiSparseBacking.PRIVATE_HOST
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -345,6 +357,17 @@ class HiSparseCoordinator:
             ),
         )
 
+    def on_prefill_complete(self, req: Req) -> bool:
+        """Stage the request's KV out to the host pool; it runs once that lands.
+
+        Always True for this backing: staging is what makes the KV reachable at
+        all, so there is no "declined, run as standard" path and no quota to
+        exhaust -- capacity was already reserved at prefill entry. The request is
+        not runnable until `collect_ready_reqs` returns it.
+        """
+        self.admit_request_into_staging(req)
+        return True
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -561,6 +584,26 @@ class HiSparseCoordinator:
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
+    # ------------------------------------------------------------------
+    # Protocol members with nothing to do on this backing
+    # ------------------------------------------------------------------
+
+    def admit_budget(self) -> None:
+        """No admission quota: every prefill that fits the pool is staged."""
+        return None
+
+    def set_tree_cache(self, tree_cache) -> None:
+        """This backing runs with the radix cache disabled -- there is no tree."""
+
+    def on_prefill_finished_early(self, req: Req) -> None:
+        """Nothing to settle: this backing holds no claim until staging starts,
+        and `request_finished` would add stream syncs this path never needs."""
+
+    def admit_pending(self) -> None:
+        """Nothing is deferred: `on_prefill_complete` starts the staging copy
+        itself, and what it allocates (host slots) is not the device pool the
+        result pass batches its frees for."""
+
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
@@ -590,14 +633,17 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
-    def map_last_loc_to_buffer(
+    def prepare_decode_batch(
         self,
+        *,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        """Back up the token the previous step produced, then point this step's
+        newest token at the request's reserved device-buffer slot."""
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -1002,8 +1048,32 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    # ------------------------------------------------------------------
+    # Data plane
+    # ------------------------------------------------------------------
+
+    def indexer_page_table(
+        self, *, req_pool_indices: torch.Tensor, num_pages: int
+    ) -> None:
+        """The standard table is already right: this backing's logical token
+        index space IS the (expanded) indexer space, and nothing rewrites a live
+        request's `req_to_token` row, so no hybrid table is needed."""
+        return None
+
+    def translate_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
+        """Resolve logical indices to attention-KV slots for the sparse kernels.
+
+        Attention KV lives in the small hot buffer, reached through the pool's
+        full -> device mapping. int32 because flash_mla_sparse_fwd / tilelang
+        require it.
+        """
+        return self.mem_pool_device.translate_loc_to_hisparse_device(page_table).to(
+            torch.int32
+        )
+
     def swap_in_selected_pages(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,

@@ -114,7 +114,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hisparse_protocol import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -280,6 +280,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.sparsity import HiSparseBacking
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1147,9 +1148,11 @@ class Scheduler(
         if not self.enable_hisparse:
             return
 
-        # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
+        # Coordinator was created inside ModelRunner.initialize() before CUDA graph
+        # capture, for whichever backing the cache configuration resolved to.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+        self.hisparse_coordinator.set_tree_cache(self.tree_cache)
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -3133,7 +3136,17 @@ class Scheduler(
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+        # A HiSparse backing that admits ASYNCHRONOUSLY brings its own
+        # prefill-to-decode transition: the request may not decode until its
+        # staging copy has landed, so it joins the running batch through
+        # collect_ready_reqs() and the standard last_batch merge below must not
+        # also run. A backing that admits synchronously (nothing is ever
+        # collectable) uses the standard merge -- skipping it there would drop
+        # every finished prefill on the floor.
+        hisparse_defers_prefill_merge = (
+            self.enable_hisparse
+            and self.hisparse_coordinator.backing is HiSparseBacking.PRIVATE_HOST
+        )
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -3142,12 +3155,11 @@ class Scheduler(
                     running_batch = new_batch
                 else:
                     running_batch.merge_batch(new_batch)
-                running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not hisparse_defers_prefill_merge
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
@@ -3172,6 +3184,12 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
+
+        if self.enable_hisparse:
+            # After every merge above, whichever batch object survived them: the
+            # decode path reaches HiSparse through the batch (pre-forward hook,
+            # request release), so a batch without it silently skips both.
+            running_batch.hisparse_coordinator = self.hisparse_coordinator
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3238,6 +3256,18 @@ class Scheduler(
         res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
+
+    def _hisparse_admit_budget(self):
+        """This prefill round's HiSparse admission quotas, or None.
+
+        None when HiSparse is off, and also when its backing rations nothing (the
+        private-host one reserves its capacity at prefill entry instead), which
+        keeps the adder's per-candidate path free of calls that would always
+        answer the same.
+        """
+        if not self.enable_hisparse:
+            return None
+        return self.hisparse_coordinator.admit_budget()
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
@@ -3356,6 +3386,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            hisparse_budget=self._hisparse_admit_budget(),
         )
 
         if self.chunked_req is not None:

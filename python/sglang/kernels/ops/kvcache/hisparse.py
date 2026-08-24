@@ -21,9 +21,11 @@ def _jit_sparse_module(
     is_dsv4_layout: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    pass_through_device_locs: bool = False,
+    late_bound_host_base: bool = False,
 ) -> Module:
-    # record_miss_plan / skip_io are compile-time kernel flags; the
-    # (False, False) production instantiation stays byte-identical.
+    # The four bool flags are compile-time kernel flags; the all-False
+    # private-host instantiation stays byte-identical.
     template_args = make_cpp_args(
         block_size,
         num_top_k,
@@ -32,6 +34,8 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        pass_through_device_locs,
+        late_bound_host_base,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -42,6 +46,8 @@ def _jit_sparse_module(
         is_dsv4_layout,
         record_miss_plan,
         skip_io,
+        pass_through_device_locs,
+        late_bound_host_base,
     )
     return load_jit(
         "sparse_cache",
@@ -120,7 +126,7 @@ def _load_cache_to_device_buffer_mla(
     device_buffer_tokens: torch.Tensor,
     host_cache_locs: torch.Tensor,
     device_buffer_locs: torch.Tensor,
-    host_cache: torch.Tensor,
+    host_cache: torch.Tensor | None,
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -136,12 +142,18 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    device_locs: torch.Tensor | None,
+    host_binding: torch.Tensor | None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
     record_miss_plan = miss_src is not None
+    # Both extra sources are opt-in per caller: passing the tensor compiles that
+    # branch in, omitting it keeps the two-source private-host kernel.
+    pass_through_device_locs = device_locs is not None
+    late_bound_host_base = host_binding is not None
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -151,6 +163,8 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        pass_through_device_locs=pass_through_device_locs,
+        late_bound_host_base=late_bound_host_base,
     )
 
     empty = torch.empty(0)
@@ -170,11 +184,37 @@ def _load_cache_to_device_buffer_mla(
         # Unused sentinels; the RecordMissPlan=false instantiation never reads them.
         miss_src = miss_dst = miss_count = empty
 
+    if pass_through_device_locs:
+        assert device_locs.dtype == torch.int32, (
+            "device_locs must be int32 (it is the pool's own index table), got "
+            f"{device_locs.dtype}"
+        )
+    else:
+        # Unused sentinel; the PassThroughDeviceLocs=false instantiation never
+        # reads it.
+        device_locs = empty
+
+    if late_bound_host_base:
+        # Both elements are read on the device at launch time, so a short tensor
+        # is a silently wrong stride rather than an error.
+        assert host_binding.dtype == torch.int64 and host_binding.numel() == 2, (
+            "host_binding must be a two-element int64 tensor [base address, row "
+            f"stride in bytes], got {host_binding.dtype} {host_binding.numel()=}"
+        )
+    else:
+        assert host_cache is not None, "no host source: pass host_cache or host_binding"
+        # Unused sentinel; the LateBoundHostBase=false instantiation never reads it.
+        host_binding = empty
+    # None only under the binding, whose caller has no per-layer view to pass.
+    host_cache = empty if host_cache is None else host_cache
+
     module.load_cache_to_device_buffer(
         top_k_tokens,
         device_buffer_tokens,
         host_cache_locs,
         device_buffer_locs,
+        device_locs,
+        host_binding,
         host_cache,
         empty,
         device_buffer,
@@ -197,7 +237,7 @@ def load_cache_to_device_buffer_mla(
     device_buffer_tokens: torch.Tensor,
     host_cache_locs: torch.Tensor,
     device_buffer_locs: torch.Tensor,
-    host_cache: torch.Tensor,
+    host_cache: torch.Tensor | None,
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -213,13 +253,29 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    device_locs: torch.Tensor | None = None,
+    host_binding: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
     Optional miss_src/miss_dst/miss_count record the miss plan for replay by
-    copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe, or the
+    plan-only half when the caller replays the recorded plan itself).
+
+    Optional device_locs adds the pool as a third source: `device_locs[req, pos]`
+    >= 0 means the position is live in the regular pool, so that slot is returned
+    with no hot-buffer slot and no copy; it also masks (-1) a lane the selector
+    left unfilled. Callers whose staging freed every pool slot leave it None.
+
+    Optional host_binding replaces `host_cache` as the source layout, reading the
+    host pool's [base address, row stride in bytes] from a two-element int64
+    tensor at run time: required when the host tier attaches after cuda-graph
+    capture, or when its rows are not one cell apart (HiCache's page_first
+    interleaves layers within a token).
     """
     _load_cache_to_device_buffer_mla(
+        device_locs=device_locs,
+        host_binding=host_binding,
         is_dsv4_layout=False,
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
@@ -262,6 +318,8 @@ def copy_cache_planned_mla(
 
     IO-only, no planning; the small fixed grid keeps the SM footprint low while
     overlapped on a side stream. The anchor's slot table stays valid (lockstep).
+    Only the private-host backing plans, and it owns its host pool from init, so
+    there is no late-bound host source here.
     """
     assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
     assert miss_count.dtype == torch.int32
@@ -286,7 +344,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     device_buffer_tokens: torch.Tensor,
     host_cache_locs: torch.Tensor,
     device_buffer_locs: torch.Tensor,
-    host_cache: torch.Tensor,
+    host_cache: torch.Tensor | None,
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -303,8 +361,14 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
 ) -> None:
-    """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
+    """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout.
+
+    No pool source: DeepSeek V4 is private-host only, so every selected position
+    is either in the request's hot buffer or on host.
+    """
     _load_cache_to_device_buffer_mla(
+        device_locs=None,
+        host_binding=None,
         is_dsv4_layout=True,
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,

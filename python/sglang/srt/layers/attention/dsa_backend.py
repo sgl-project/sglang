@@ -757,6 +757,73 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    def _hisparse_indexer_page_table(
+        self, *, req_pool_indices: torch.Tensor, num_pages: int
+    ) -> Optional[torch.Tensor]:
+        """HiSparse's replacement for the indexer's page table, or None.
+
+        Non-None only for a backing whose logical KV pool can move a live
+        request's attention KV out of the pool: those pages carry the -1 sentinel
+        in req_to_token, so the standard table would stride them into a negative
+        page id, and their indexer KV lives at a request-private page instead.
+        Rows of untracked requests come back unchanged, so the whole table can be
+        substituted in a mixed batch. One row per request.
+        """
+        if self.hisparse_coordinator is None or num_pages <= 0:
+            return None
+        return self.hisparse_coordinator.indexer_page_table(
+            req_pool_indices=req_pool_indices, num_pages=num_pages
+        )
+
+    def _real_page_table(
+        self, *, page_table: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The page table the indexer scores against, HiSparse-aware."""
+        standard = self._transform_table_1_to_real(page_table)
+        hybrid = self._hisparse_indexer_page_table(
+            req_pool_indices=req_pool_indices, num_pages=standard.shape[1]
+        )
+        if hybrid is None:
+            return standard
+        assert hybrid.shape[0] == standard.shape[0], (
+            "the indexer table has one row per request; a mode that fans a request "
+            "out into per-position rows has to repeat_interleave it to match"
+        )
+        return hybrid
+
+    def _patch_graph_indexer_page_table(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        metadata: DSAMetadata,
+    ) -> None:
+        """Substitute HiSparse's indexer page table into the graph-static buffer.
+
+        The metadata kernels rebuild real_page_table from req_to_token every
+        replay, sentinels included, so the substitution has to happen after them
+        and in place -- a fresh tensor would not be the one the captured graph
+        reads.
+        """
+        if self.hisparse_coordinator is None:
+            return
+        real_page_table = metadata.real_page_table
+        assert real_page_table is not metadata.page_table_1, (
+            "HiSparse would have to patch the indexer page table in place, but "
+            "this backend shares one table with attention (real_page_size == 1)."
+        )
+        # The row's whole static width, not this step's length (which is only on
+        # the device here): a row's tail keeps stale values by contract and
+        # consumers bound their reads by cache_seqlens.
+        hybrid = self._hisparse_indexer_page_table(
+            req_pool_indices=req_pool_indices, num_pages=real_page_table.shape[1]
+        )
+        if hybrid is None:
+            return
+        # A backing that substitutes the table rejects speculative decoding at
+        # startup, so nothing here fans a request out into per-position rows.
+        assert not self.speculative_num_draft_tokens
+        real_page_table[: hybrid.shape[0], : hybrid.shape[1]].copy_(hybrid)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1065,7 +1132,10 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=self._real_page_table(
+                page_table=page_table,
+                req_pool_indices=forward_batch.req_pool_indices,
+            ),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
@@ -1698,6 +1768,12 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
+        # After both table-building paths above, since it overrides what they
+        # wrote for pages HiSparse moved off the device pool.
+        self._patch_graph_indexer_page_table(
+            req_pool_indices=req_pool_indices, metadata=metadata
+        )
+
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
@@ -2008,10 +2084,7 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            page_table_1 = self.hisparse_coordinator.translate_page_table(page_table_1)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2260,10 +2333,10 @@ class DeepseekSparseAttnBackend(
 
         if self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                topk_indices,
-                layer.layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                compressed_seq_lens=forward_batch.seq_lens,
+                top_k_result=topk_indices,
+                layer_id=layer.layer_id,
             )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)

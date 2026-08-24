@@ -367,9 +367,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            # The multiple depends on the backing, and MUST match
+            # kv_cache_configurator's index_buf_size exactly or the reserved
+            # memory and the allocated buffer disagree.
+            from sglang.srt.mem_cache.sparsity import (
+                hisparse_indexer_expansion_ratio,
+            )
 
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+            indexer_ratio = hisparse_indexer_expansion_ratio(kvc.server_args)
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
