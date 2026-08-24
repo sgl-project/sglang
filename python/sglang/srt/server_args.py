@@ -8352,7 +8352,7 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
             "MiMoV2ForCausalLM",
-        ]:
+        ] + (["Gemma4ForConditionalGeneration"] if self.language_only else []):
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
