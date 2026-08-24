@@ -4,6 +4,9 @@ import torch
 
 from sglang.srt.mem_cache.storage.backend_factory import _get_hf3fs_bytes_per_page
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def test_hf3fs_uses_marker_page_for_logical_anchor():

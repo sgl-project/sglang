@@ -22,7 +22,9 @@ def _get_hf3fs_bytes_per_page(mem_pool_host: Any) -> int:
     the actual KV data is registered later through the hybrid pool v2 paths.
     """
     if getattr(mem_pool_host, "kv_buffer", None) is None:
-        return 4096 if mem_pool_host.layout in ["page_first", "page_first_direct"] else 1
+        return (
+            4096 if mem_pool_host.layout in ["page_first", "page_first_direct"] else 1
+        )
 
     if mem_pool_host.layout in ["page_first", "page_first_direct"]:
         return mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
