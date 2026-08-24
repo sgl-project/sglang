@@ -261,11 +261,14 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # eager); other prefill roles carry their width at the call site.
         pool.preallocate("p_c128", 64, fill=-1, width=SWA_WINDOW + w128)
 
-    def _compute_prep_in_cuda_graph(self, model_runner: ModelRunner) -> bool:
-        # trtllm + speculative + DP attention prepares metadata on the host:
-        # in-graph prep degrades draft acceptance under DP's padded/idle-rank
-        # batches. Otherwise prep metadata in-graph.
-        return not (self.mtp_enabled and model_runner.server_args.enable_dp_attention)
+    # Metadata prep runs in-graph (base-class default), same as FlashMLA.
+    # This subclass used to prep on the host for spec + DP attention (an
+    # early containment for a draft-acceptance drop later attributed to the
+    # idle-rank dummy-extend bug); the host-side copy path itself proved to
+    # carry a stale-buffer defect -- silent GSM8K 0.65 with collapsed
+    # acceptance once upstream's fused-mHC default shifted graph-pool
+    # layout -- while in-graph prep measures clean on the same recipe
+    # (15/15 bursts 0.945-0.970, accept 0.96+, idle-rank window healthy).
 
     def _forward_trtllm(
         self,
