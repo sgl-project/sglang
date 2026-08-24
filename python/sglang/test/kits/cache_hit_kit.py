@@ -202,7 +202,7 @@ async def async_request_openai_chat_completions(
                         completion_tokens if completion_tokens else len(output.itl) + 1
                     )
                     output.tpot = calculate_tpot(
-                        output.latency, output.ttft, completion_tokens
+                        output.latency, output.ttft, output.generated_len
                     )
                 else:
                     output.error = response.reason or ""

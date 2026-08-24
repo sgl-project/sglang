@@ -460,7 +460,7 @@ class WorkloadGenerator:
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
-                if getattr(response, "tpot", None) is not None:
+                if response.tpot is not None:
                     self.performance_metrics["tpot"].append(response.tpot)
                 self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
