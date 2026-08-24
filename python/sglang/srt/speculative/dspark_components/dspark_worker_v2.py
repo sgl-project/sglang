@@ -74,6 +74,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    commit_mamba_states_after_verify,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
@@ -909,6 +910,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         # layout would need the accept-index mapping the shared spec_utils
         # commit helper does.
         assert get_spec().speculative_eagle_topk in (None, 1)
+
+        req_pool = self.target_worker.model_runner.req_to_token_pool
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        use_gdn_replayssm_fold = (
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        )
+        if use_gdn_replayssm_fold:
+            bs = int(commit_lens.shape[0])
+            draft_token_num = int(self.verify_num_draft_tokens)
+            accept_index = torch.arange(
+                bs * draft_token_num,
+                dtype=commit_lens.dtype,
+                device=commit_lens.device,
+            ).view(bs, draft_token_num)
+            commit_mamba_states_after_verify(
+                target_worker=self.target_worker,
+                batch=batch,
+                accept_lens=commit_lens,
+                accept_index=accept_index,
+                draft_token_num=draft_token_num,
+            )
+            return
+
         attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
