@@ -664,6 +664,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def supports_host_pool_retraction(self, is_speculative: bool = False) -> bool:
+        # Unified KV has no separate SWA host entry. HiSparse owns most C4
+        # state outside the HiCache group. Speculative request-indexed state has
+        # not yet been admitted to the retraction transfer contract.
+        return (
+            not is_speculative
+            and self.swa_kv_pool is not None
+            and not isinstance(self.c4_kv_pool, HiSparseC4DevicePool)
+        )
+
     def get_ring_size(self, compress_ratio: int) -> int:
         is_speculative = get_spec().speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)

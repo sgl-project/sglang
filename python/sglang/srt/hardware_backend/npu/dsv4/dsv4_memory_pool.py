@@ -236,6 +236,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     accessors instead).
     """
 
+    def supports_host_pool_retraction(self, is_speculative: bool = False) -> bool:
+        # Generic V4 HostPool sidecars do not implement kernel_ascend transfers.
+        return False
+
     def __init__(self, *args, **kwargs):
         c128_page_size = get_schedule().c128_page_size
         if c128_page_size <= 0 or c128_page_size % 16 != 0:

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     validate_buffer_only_stack,
@@ -45,7 +46,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -82,6 +82,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -143,6 +144,11 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+class RetractionTransferUnsupportedError(RuntimeError):
+    """The retraction transfer invariants do not hold for this request; the
+    backup path aborts the request instead of crashing or corrupting."""
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -705,7 +711,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
         """Release the tree lock a request holds on its last_node, honoring the
-        components it skipped locking so it never drops a lock it never took."""
+        components it skipped locking so it never drops a lock it never took.
+        A retracted request has no lock until it is matched into the tree again."""
+        if req.last_node is None:
+            return
+
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(
@@ -1028,7 +1038,11 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, SWAKVPool):
+        if isinstance(kv_cache, BaseSWAKVPool) and (
+            kv_cache.supports_host_pool_retraction(
+                get_spec().speculative_algorithm is not None
+            )
+        ):
             return (
                 self.supports_swa()
                 and {
@@ -1067,16 +1081,45 @@ class UnifiedRadixCache(BasePrefixCache):
         aligned_len = ceil_align(len(indices), page_size)
         if aligned_len == len(indices):
             return indices
+
+        pad_len = aligned_len - len(indices)
+        # Paged allocators reserve the whole final page for one request. The
+        # synthetic tail is safe only while it remains inside that page.
+        last_page_offset = int(indices[-1].item()) % page_size
+        if last_page_offset + pad_len >= page_size:
+            raise RetractionTransferUnsupportedError(
+                "retraction padding would cross a device-page boundary"
+            )
+
         tail = indices[-1] + torch.arange(
             1,
-            aligned_len - len(indices) + 1,
+            pad_len + 1,
             dtype=torch.int64,
             device=indices.device,
         )
         return torch.cat([indices, tail])
 
+    def _retraction_swa_window_start(self, req: Req, kv_cache: BaseSWAKVPool) -> int:
+        assert self.sliding_window_size is not None
+        swa_page_size = kv_cache.swa_kv_pool.page_size
+        swa_evicted_seqlen = req.kv.swa_evicted_seqlen if req.kv else 0
+        if swa_evicted_seqlen % swa_page_size != 0:
+            raise RetractionTransferUnsupportedError(
+                f"unaligned SWA eviction frontier for request {req.rid}: "
+                f"frontier={swa_evicted_seqlen}, page_size={swa_page_size}"
+            )
+        num_tokens = req.seqlen - 1
+        window_start = max(0, num_tokens - self.sliding_window_size)
+        window_start = window_start // swa_page_size * swa_page_size
+        window_start = max(window_start, swa_evicted_seqlen)
+        if window_start >= num_tokens:
+            raise RetractionTransferUnsupportedError(
+                f"no live SWA window positions for request {req.rid}"
+            )
+        return window_start
+
     def _retraction_device_transfers(
-        self, req: Req
+        self, req: Req, *, expected_swa_window_start: Optional[int] = None
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
         full_indices = self.req_to_token_pool.req_to_token[
@@ -1087,21 +1130,30 @@ class UnifiedRadixCache(BasePrefixCache):
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
         if self.supports_swa():
             kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-            assert self.sliding_window_size is not None
-            window_start = max(0, num_tokens - self.sliding_window_size)
-            window_start = window_start // self.page_size * self.page_size
+            swa_page_size = kv_cache.swa_kv_pool.page_size
+            window_start = self._retraction_swa_window_start(req, kv_cache)
+            if (
+                expected_swa_window_start is not None
+                and window_start != expected_swa_window_start
+            ):
+                raise RetractionTransferUnsupportedError(
+                    f"SWA window changed for request {req.rid}: "
+                    f"backup_start={expected_swa_window_start}, "
+                    f"restore_start={window_start}"
+                )
             window_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, window_start:num_tokens
             ].to(torch.int64)
             swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
-            assert bool(
-                (swa_indices > 0).all()
-            ), f"unmapped SWA window positions for request {req.rid}"
+            if not bool((swa_indices > 0).all()):
+                raise RetractionTransferUnsupportedError(
+                    f"unmapped SWA window positions for request {req.rid}"
+                )
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
                     device_indices=self._pad_retraction_indices(
-                        swa_indices, self.page_size
+                        swa_indices, swa_page_size
                     ),
                 )
             ]
@@ -1130,7 +1182,25 @@ class UnifiedRadixCache(BasePrefixCache):
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
-        device_indices, extra_transfers = self._retraction_device_transfers(req)
+        try:
+            swa_window_start = (
+                self._retraction_swa_window_start(
+                    req, self.token_to_kv_pool_allocator.get_kvcache()
+                )
+                if self.supports_swa()
+                else None
+            )
+            device_indices, extra_transfers = self._retraction_device_transfers(
+                req, expected_swa_window_start=swa_window_start
+            )
+        except RetractionTransferUnsupportedError as exc:
+            logger.error(
+                "Host-pool retraction backup is unsupported for request %s: %s; "
+                "aborting the request.",
+                req.rid,
+                exc,
+            )
+            return None
         host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
             self._reclaim_retraction_host(len(device_indices))
@@ -1152,6 +1222,7 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices=host_indices,
             pool_transfers=[replace(x, device_indices=None) for x in resolved or []]
             or None,
+            swa_window_start=swa_window_start,
         )
         operation = CacheOperation(
             host_indices,
@@ -1174,35 +1245,65 @@ class UnifiedRadixCache(BasePrefixCache):
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
-        device_indices, current_transfers = self._retraction_device_transfers(req)
-        assert len(backup.host_indices) == len(device_indices), (
-            f"Host backup has {len(backup.host_indices)} slots, but restore has "
-            f"{len(device_indices)}"
-        )
-
-        current_by_name = {transfer.name: transfer for transfer in current_transfers}
-        saved_by_name = {
-            transfer.name: transfer for transfer in backup.pool_transfers or []
-        }
-        assert current_by_name.keys() == saved_by_name.keys(), (
-            f"Host backup pools {set(saved_by_name)} do not match restore pools "
-            f"{set(current_by_name)}"
-        )
-        restored_transfers = [
-            replace(
-                saved,
-                device_indices=current_by_name[name].device_indices,
+    def retraction_restore(self, req: Req, backup: RetractionBackup) -> bool:
+        try:
+            device_indices, current_transfers = self._retraction_device_transfers(
+                req, expected_swa_window_start=backup.swa_window_start
             )
-            for name, saved in saved_by_name.items()
-        ]
-        resolved = self.cache_controller._resolve_pool_transfers_allocation(
-            restored_transfers or None,
-            alloc_host=False,
-            kv_device_indices=device_indices,
-            kv_host_indices=backup.host_indices,
-        )
-        assert resolved is not None or not restored_transfers
+            if backup.host_indices is None or len(backup.host_indices) != len(
+                device_indices
+            ):
+                raise RetractionTransferUnsupportedError(
+                    f"FULL transfer length changed for request {req.rid}"
+                )
+
+            current_by_name = {
+                transfer.name: transfer for transfer in current_transfers
+            }
+            saved_by_name = {
+                transfer.name: transfer for transfer in backup.pool_transfers or []
+            }
+            if current_by_name.keys() != saved_by_name.keys():
+                raise RetractionTransferUnsupportedError(
+                    f"transfer pools changed for request {req.rid}: "
+                    f"backup={set(saved_by_name)}, restore={set(current_by_name)}"
+                )
+            restored_transfers = [
+                replace(
+                    saved,
+                    device_indices=current_by_name[name].device_indices,
+                )
+                for name, saved in saved_by_name.items()
+            ]
+            resolved = self.cache_controller._resolve_pool_transfers_allocation(
+                restored_transfers or None,
+                alloc_host=False,
+                kv_device_indices=device_indices,
+                kv_host_indices=backup.host_indices,
+            )
+            if resolved is None and restored_transfers:
+                raise RetractionTransferUnsupportedError(
+                    f"restore transfer allocation failed for request {req.rid}"
+                )
+            for transfer in resolved or []:
+                if (
+                    transfer.host_indices is None
+                    or transfer.device_indices is None
+                    or len(transfer.host_indices) != len(transfer.device_indices)
+                ):
+                    raise RetractionTransferUnsupportedError(
+                        f"{transfer.name} transfer length changed for request "
+                        f"{req.rid}"
+                    )
+        except RetractionTransferUnsupportedError as exc:
+            logger.error(
+                "Host-pool retraction restore is unsupported for request %s: %s; "
+                "aborting the request.",
+                req.rid,
+                exc,
+            )
+            self.retraction_discard(backup)
+            return False
 
         operation = CacheOperation(
             backup.host_indices,
@@ -1221,9 +1322,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         completion.finish_event.synchronize()
         self.retraction_discard(backup)
+        return True
 
     def retraction_discard(self, backup: RetractionBackup) -> None:
-        self.host_pool_group.free(backup.host_indices)
+        if backup.host_indices is not None:
+            self.host_pool_group.free(backup.host_indices)
         for transfer in backup.pool_transfers or []:
             if transfer.indices_from_pool is None:
                 assert transfer.host_indices is not None
