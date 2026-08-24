@@ -1,8 +1,4 @@
-"""Minimal SigLIP2 Vision Transformer and LightProjector for HunyuanImage-3.
-
-Ported from vllm-omni's ``siglip2.py`` without tensor-parallelism support.
-Used by the AR stage to encode conditional images for TI2I / I2I tasks.
-"""
+"""SigLIP2 Vision Transformer and LightProjector for HunyuanImage-3 (no TP)."""
 
 from collections.abc import Iterable
 
@@ -29,10 +25,6 @@ class _Config:
     def __setitem__(self, key, value):
         return setattr(self, key, value)
 
-
-# ---------------------------------------------------------------------------
-# SigLIP2 Vision Embeddings
-# ---------------------------------------------------------------------------
 
 class Siglip2VisionEmbeddings(nn.Module):
     def __init__(self, config):
@@ -83,10 +75,6 @@ class Siglip2VisionEmbeddings(nn.Module):
         return patch_embeds + packed_position_embs
 
 
-# ---------------------------------------------------------------------------
-# SigLIP2 Attention (plain nn.Linear, no TP)
-# ---------------------------------------------------------------------------
-
 class Siglip2Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -105,28 +93,23 @@ class Siglip2Attention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        """Packed attention with cumulative sequence lengths."""
+        """Packed attention via SDPA."""
         seq_length = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(seq_length, self.num_heads, self.head_dim)
 
-        # Build attention mask from cu_seqlens for packed sequence
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
         batch_size = cu_seqlens.shape[0] - 1
 
-        # Use SDPA with proper masking for packed sequences
-        # Expand to batch format (B, H, max_seqlen, head_dim)
         attn_output = self._packed_sdpa(q, k, v, cu_seqlens, batch_size, max_seqlen)
         attn_output = attn_output.reshape(seq_length, self.num_heads * self.head_dim)
         return self.out_proj(attn_output)
 
     def _packed_sdpa(self, q, k, v, cu_seqlens, batch_size, max_seqlen):
-        """Run scaled-dot-product attention on packed sequences."""
         head_dim = q.shape[-1]
         num_heads = q.shape[1]
 
-        # Create output buffer
         output = torch.zeros_like(q)
 
         for i in range(batch_size):
@@ -138,7 +121,6 @@ class Siglip2Attention(nn.Module):
             ki = k[start:end]
             vi = v[start:end]
 
-            # Transpose to (H, seq_len, D) for SDPA
             qi = qi.transpose(0, 1)
             ki = ki.transpose(0, 1)
             vi = vi.transpose(0, 1)
@@ -146,16 +128,12 @@ class Siglip2Attention(nn.Module):
             out_i = F.scaled_dot_product_attention(
                 qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0),
                 is_causal=False,
-            ).squeeze(0)  # (H, seq_len, D)
+            ).squeeze(0)
 
             output[start:end] = out_i.transpose(0, 1)
 
         return output
 
-
-# ---------------------------------------------------------------------------
-# SigLIP2 MLP
-# ---------------------------------------------------------------------------
 
 class Siglip2MLP(nn.Module):
     def __init__(self, config):
@@ -170,10 +148,6 @@ class Siglip2MLP(nn.Module):
         hidden_states = self.fc2(hidden_states)
         return hidden_states
 
-
-# ---------------------------------------------------------------------------
-# SigLIP2 Encoder Layer / Encoder
-# ---------------------------------------------------------------------------
 
 class Siglip2EncoderLayer(nn.Module):
     def __init__(self, config):
@@ -211,20 +185,8 @@ class Siglip2Encoder(nn.Module):
         return hidden_states
 
 
-# ---------------------------------------------------------------------------
-# SigLIP2 Vision Transformer
-# ---------------------------------------------------------------------------
-
 class Siglip2VisionTransformer(nn.Module):
-    """Minimal SigLIP2 Vision Transformer (no TP).
-
-    Input/output format matches vllm-omni's version:
-        pixel_values:   (B, max_patches, C*P*P)
-        attention_mask:  (B, max_patches) 1=real, 0=pad
-        spatial_shapes:  (B, 2) (h, w) per image
-    Returns:
-        (B, max_patches, hidden_size) with zeros at padding positions
-    """
+    """SigLIP2 ViT: (B, max_patches, C*P*P) → (B, max_patches, hidden_size)."""
 
     def __init__(self, config):
         super().__init__()
@@ -242,48 +204,31 @@ class Siglip2VisionTransformer(nn.Module):
         attention_mask: torch.Tensor,
         spatial_shapes: torch.LongTensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            pixel_values: Batched pixel values
-                (B, max_num_patches, num_channels * patch_size * patch_size)
-            attention_mask: (B, max_num_patches) with 1 for real, 0 for padding
-            spatial_shapes: (B, 2) with (height, width) per image
-
-        Returns:
-            (B, max_num_patches, hidden_size) with zeros at padding positions
-        """
+        """pixel_values: (B,P,C*P*P), attention_mask: (B,P), spatial_shapes: (B,2)."""
         batch_size, max_patches, _ = pixel_values.shape
 
-        # Ensure attention_mask is 2D (B, max_patches)
         if attention_mask.ndim > 2:
             attention_mask = attention_mask.reshape(batch_size, max_patches)
         elif attention_mask.ndim == 1:
             attention_mask = attention_mask.unsqueeze(0)
 
-        # Ensure spatial_shapes is 2D (B, 2)
         spatial_shapes = spatial_shapes.reshape(-1, 2)
 
-        # Pack: extract real tokens using attention_mask
         mask_bool = attention_mask.bool()
         packed_pixels = pixel_values[mask_bool]
 
-        # Compute cu_seqlens from spatial_shapes
         seq_lens = (spatial_shapes[:, 0] * spatial_shapes[:, 1]).to(torch.int32)
         cu_seqlens = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=pixel_values.device
         )
         cu_seqlens[1:] = seq_lens.cumsum(0)
 
-        # Embeddings (packed)
         hidden_states = self.embeddings(packed_pixels, spatial_shapes)
 
-        # Encoder (packed)
         hidden_states = self.encoder(hidden_states, cu_seqlens)
 
-        # Post layernorm
         hidden_states = self.post_layernorm(hidden_states)
 
-        # Unpack: scatter back to (B, max_patches, hidden_size)
         output = torch.zeros(
             batch_size, max_patches, self.embed_dim,
             dtype=hidden_states.dtype, device=hidden_states.device,
@@ -293,7 +238,6 @@ class Siglip2VisionTransformer(nn.Module):
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with qkv stacking (matches vllm-omni's load_weights)."""
         stacked_params_mapping = [
             ("q_proj", "q_proj", None),
             ("k_proj", "k_proj", None),
@@ -310,12 +254,8 @@ class Siglip2VisionTransformer(nn.Module):
         return loaded_params
 
 
-# ---------------------------------------------------------------------------
-# LightProjector (vision aligner)
-# ---------------------------------------------------------------------------
-
 class LightProjector(nn.Module):
-    """Simple projection layer for aligning ViT embeddings to transformer dim."""
+    """ViT embedding → transformer dim projection."""
 
     def __init__(self, config):
         config = _Config(config)

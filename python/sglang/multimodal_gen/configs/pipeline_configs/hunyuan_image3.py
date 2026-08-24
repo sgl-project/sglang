@@ -23,9 +23,9 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 @dataclass
 class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
-    """Configuration for the HunyuanImage-3 pipeline."""
+    """HunyuanImage-3 pipeline config."""
 
-    vae_precision: str = "fp32"  # VAE uses float32 per HF config
+    vae_precision: str = "fp32"
 
     should_use_guidance: bool = True
     task_type: ModelTaskType = ModelTaskType.TI2I
@@ -33,14 +33,10 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    # DiT config
     dit_config: DiTConfig = field(default_factory=HunyuanImage3DitConfig)
 
-    # VAE config
     vae_config: VAEConfig = field(default_factory=HunyuanImage3VAEConfig)
 
-    # Text encoder configs - HunyuanImage-3 uses built-in tokenizer
-    # For now, use T5 as placeholder (actual implementation uses custom tokenizer)
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (T5Config(T5ArchConfig(num_heads=6)),)
     )
@@ -65,7 +61,6 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
         return current_platform.is_npu()
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
-        """Get 2D RoPE frequencies for image generation."""
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
         hidden_states = torch.empty(1, 1, height, width, device=device, dtype=dtype)
@@ -75,30 +70,25 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Prepare positive conditioning kwargs for denoising."""
         kwargs = {
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
         return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Prepare negative conditioning kwargs for denoising."""
         kwargs = {
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
         return kwargs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        """Get scale and shift for latent decoding."""
         scaling_factor = self.vae_config.arch_config.scaling_factor
         shift_factor = getattr(self.vae_config.arch_config, "shift_factor", None)
         shift = shift_factor if shift_factor else 0.0
         return scaling_factor, shift
 
     def post_denoising_loop(self, latents, batch):
-        """Post-process latents after denoising."""
         return latents.bfloat16()
 
     def post_decoding(self, frames, server_args):
-        """Post-process decoded frames."""
         return self.image_processor.postprocess(frames, output_type="latent")
