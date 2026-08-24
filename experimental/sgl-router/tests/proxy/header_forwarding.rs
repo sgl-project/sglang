@@ -70,6 +70,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         .header("content-type", "application/json")
         .header("authorization", "Bearer test")
         .header("x-request-id", "abc-123")
+        .header("venus-request-id", "venus-456")
         .header("x-sgl-route-key", "k1")
         .header("cookie", "should-not-forward=true")
         .header("host", "example.com")
@@ -92,6 +93,11 @@ async fn forwards_whitelisted_headers_strips_others() {
         seen.headers.get("x-request-id").map(String::as_str),
         Some("abc-123"),
         "x-request-id must be forwarded with its inbound value verbatim",
+    );
+    assert_eq!(
+        seen.headers.get("venus-request-id").map(String::as_str),
+        Some("venus-456"),
+        "venus-request-id must be forwarded with its inbound value verbatim",
     );
     assert_eq!(
         seen.headers.get("x-sgl-route-key").map(String::as_str),
