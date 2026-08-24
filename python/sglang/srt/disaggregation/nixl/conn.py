@@ -523,8 +523,44 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("thread_count", str(num_threads))
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
+        if backend == "GPUNETIO":
+            # GPUNETIO starts a full-SM persistent progress kernel on its
+            # communication GPU. FlashInfer's first CuTe RMSNorm invocation can
+            # otherwise block after that kernel starts, even when the model is
+            # on another GPU. Materialize the model's exact RMSNorm variant
+            # before creating the backend; different hidden sizes do not warm
+            # the required CuTe specialization.
+            import torch
+            from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+
+            model_config = server_args.get_model_config()
+            if model_config.dtype in (torch.float16, torch.bfloat16):
+                torch.cuda.set_device(self.kv_args.gpu_id)
+                norm_sizes = {model_config.hidden_size}
+                for attr in ("q_lora_rank", "kv_lora_rank"):
+                    size = getattr(model_config.hf_text_config, attr, None)
+                    if size:
+                        norm_sizes.add(size)
+                for size in sorted(norm_sizes):
+                    warmup_x = torch.empty(
+                        (1, size),
+                        dtype=model_config.dtype,
+                        device=self.kv_args.gpu_id,
+                    )
+                    warmup_weight = torch.ones_like(warmup_x[0])
+                    rmsnorm(warmup_x, warmup_weight, 1e-6)
+                    warmup_residual = torch.empty_like(warmup_x)
+                    fused_add_rmsnorm(
+                        warmup_x, warmup_residual, warmup_weight, 1e-6
+                    )
+                torch.cuda.synchronize(self.kv_args.gpu_id)
+                del warmup_x, warmup_residual, warmup_weight
+                logger.info(
+                    "Prewarmed model norm kernels before GPUNETIO progress startup: "
+                    f"sizes={sorted(norm_sizes)} dtype={model_config.dtype}"
+                )
         self.agent.create_backend(backend, backend_params)
-        if self.enable_dcp_peer_rows:
+        if backend == "GPUNETIO":
             # GPUNETIO initializes its QP/progress context on the communication
             # GPU. Restore the model/KV owner before SGLang creates streams or
             # allocates the destination-ready pool.
@@ -549,6 +585,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._ready_poisoned_slots: Set[int] = set()
         if self.enable_dcp_peer_rows:
             self._init_peer_rows_ready_pool()
+            import torch
+
+            current_device = torch.cuda.current_device()
+            logger.info(
+                "SGLANG_DCP_DEVICE_RESTORE "
+                f"current_device={current_device} model_device={self.kv_args.gpu_id}"
+            )
+            # Memory registration and ready-pool setup can invoke backend CUDA
+            # APIs after backend creation. Keep the scheduler on the model/KV
+            # owner before it enters model execution.
+            torch.cuda.set_device(self.kv_args.gpu_id)
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
@@ -1268,6 +1315,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles: List[Any] = []
             ready_slots: Set[int] = set()
             try:
+                if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                    logger.info(
+                        "SGLANG_DCP_TRANSFER_DEQUEUE "
+                        f"room={room} chunk={kv_chunk.chunk_id} "
+                        f"last={kv_chunk.is_last_chunk} worker={worker_index}"
+                    )
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
                 # the predicate the abort ack relies on. The flag survives
@@ -2704,6 +2757,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
             )
         )
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            logger.info(
+                "SGLANG_DCP_TRANSFER_ENQUEUE "
+                f"room={bootstrap_room} chunk={chunk_id} last={is_last_chunk} "
+                f"kv_rows={len(kv_indices)} worker={shard_idx}"
+            )
         return None
 
     def update_transfer_status(self):
@@ -2801,6 +2860,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         wait_for_destination_ready_epoch(self._ready_pool.narrow(0, slot, 1), epoch)
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            logger.info(
+                "SGLANG_DCP_READY_ACQUIRED "
+                f"room={room} chunk={chunk_id} pp_rank={pp_rank} "
+                f"slot={slot} epoch={epoch}"
+            )
 
     def _release_peer_row_ready(self, room: int, chunk_id: int, pp_rank: int) -> None:
         self._ready_leases.pop((room, chunk_id, pp_rank), None)
@@ -3036,6 +3101,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._add_remote_peer(
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                        logger.info(
+                            "SGLANG_DCP_BOOTSTRAP_REGISTER "
+                            f"agent={agent_name} total={len(self.decode_kv_args_table)}"
+                        )
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
@@ -3047,6 +3117,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
+                if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                    logger.info(
+                        "SGLANG_DCP_BOOTSTRAP_ROOM "
+                        f"room={room} agent={agent_name} "
+                        f"seen={len(self.transfer_infos[room])} "
+                        f"required={required_dst_info_num}"
+                    )
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -3059,6 +3136,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
+                    if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                        logger.info(f"SGLANG_DCP_BOOTSTRAP_READY room={room}")
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
