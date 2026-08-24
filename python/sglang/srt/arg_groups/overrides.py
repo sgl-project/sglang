@@ -1235,14 +1235,19 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
             "minicpm_flashinfer": "flashinfer",
         }
-        for backend_field in (
-            "attention_backend",
-            "prefill_attention_backend",
-            "decode_attention_backend",
-        ):
-            dense_backend = dense_backends.get(getattr(server_args, backend_field))
-            if dense_backend is not None:
-                overrides[backend_field] = dense_backend
+        attention_backend = dense_backends.get(server_args.attention_backend)
+        if attention_backend is not None:
+            overrides["attention_backend"] = attention_backend
+        prefill_attention_backend = dense_backends.get(
+            server_args.prefill_attention_backend
+        )
+        if prefill_attention_backend is not None:
+            overrides["prefill_attention_backend"] = prefill_attention_backend
+        decode_attention_backend = dense_backends.get(
+            server_args.decode_attention_backend
+        )
+        if decode_attention_backend is not None:
+            overrides["decode_attention_backend"] = decode_attention_backend
     elif has_sparse_attention:
         uses_sparse_backend = server_args.is_attention_backend_not_set() or any(
             backend in ("minicpm_flashattn", "minicpm_flashinfer")
