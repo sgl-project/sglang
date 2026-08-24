@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import itertools
 import logging
 import random
@@ -514,7 +515,103 @@ def _cat_grid(dims, flatten_items=False):
             t = t.unsqueeze(0)
         valid.append(t)
 
-    return torch.cat(valid, dim=0) if valid else None
+    if not valid:
+        return None
+    return valid[0] if len(valid) == 1 else torch.cat(valid, dim=0)
+
+
+class SegmentedEmbedding:
+    """A logical concat over embedding parts that slices before copying.
+
+    The ZMQ receiver gets one CPU tensor per encoder part.  Multimodal
+    processors consume the result sequentially, one item slice at a time.
+    Materializing the complete modality with ``torch.cat`` first therefore
+    copies every token even when each requested item is already wholly inside
+    one received part.  This wrapper preserves the logical concatenated view
+    while returning a storage-sharing tensor for the common single-part slice.
+
+    A slice that really crosses part boundaries is materialized as a fallback,
+    but only the requested slice is copied rather than the entire modality.
+    """
+
+    def __init__(self, segments: List[torch.Tensor]):
+        if not segments:
+            raise ValueError("segments must contain at least one tensor")
+
+        first = segments[0]
+        if first.ndim == 0:
+            raise ValueError("embedding segments must have a leading dimension")
+        trailing_shape = first.shape[1:]
+        for segment in segments:
+            if segment.ndim == 0 or segment.shape[1:] != trailing_shape:
+                raise ValueError(
+                    "embedding segments must have matching trailing shapes: "
+                    f"expected {trailing_shape}, got {segment.shape}"
+                )
+
+        self._segments = segments
+        self._ends = []
+        total = 0
+        for segment in segments:
+            total += segment.shape[0]
+            self._ends.append(total)
+        self.shape = torch.Size((total, *trailing_shape))
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    @property
+    def dtype(self):
+        return self._segments[0].dtype
+
+    @property
+    def device(self):
+        return self._segments[0].device
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def materialize(self) -> torch.Tensor:
+        return (
+            self._segments[0]
+            if len(self._segments) == 1
+            else torch.cat(self._segments, dim=0)
+        )
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            index = key + len(self) if key < 0 else key
+            if index < 0 or index >= len(self):
+                raise IndexError("embedding index out of range")
+            return self[slice(index, index + 1)][0]
+
+        if not isinstance(key, slice):
+            # EPD processors only slice the leading token dimension.  Keep a
+            # correct fallback for uncommon advanced indexing.
+            return self.materialize()[key]
+
+        start, stop, step = key.indices(len(self))
+        if step != 1:
+            return self.materialize()[key]
+        if start >= stop:
+            return self._segments[0][:0]
+
+        pieces = []
+        segment_idx = bisect.bisect_right(self._ends, start)
+        while segment_idx < len(self._segments):
+            segment_start = 0 if segment_idx == 0 else self._ends[segment_idx - 1]
+            segment_end = self._ends[segment_idx]
+            if segment_start >= stop:
+                break
+            local_start = max(start, segment_start) - segment_start
+            local_stop = min(stop, segment_end) - segment_start
+            pieces.append(self._segments[segment_idx][local_start:local_stop])
+            segment_idx += 1
+
+        if not pieces:
+            return self._segments[0][:0]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
 
 class MultiModalEmbeddingData(EmbeddingData):
@@ -629,14 +726,27 @@ class MultiModalEmbeddingData(EmbeddingData):
     def __repr__(self):
         return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
 
-    def get_embedding(self, is_concat=False):
-        if is_concat:
-            groups = defaultdict(list)
-            for i, e in enumerate(self.embedding_list):
-                if e is not None:
-                    groups[self.modality_list[i]].append(e)
-            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
-        return self.embedding_list
+    def get_embedding(self, materialize: bool = False):
+        """Group received parts by modality.
+
+        ``materialize=False`` is the scheduler-side ZMQ fast path: multiple
+        CPU parts stay segmented until the processor asks for an item slice.
+        Other transports can request the historical materialized tensors.
+        """
+        groups = defaultdict(list)
+        for i, embedding in enumerate(self.embedding_list):
+            if embedding is not None:
+                groups[self.modality_list[i]].append(embedding)
+
+        if materialize:
+            return {
+                modality: tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+                for modality, tensors in groups.items()
+            }
+        return {
+            modality: tensors[0] if len(tensors) == 1 else SegmentedEmbedding(tensors)
+            for modality, tensors in groups.items()
+        }
 
     @property
     def ready(self):
@@ -659,7 +769,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             if not valid:
                 continue
             if attr in _VIDEO_META_TENSOR_ATTRS:
-                kwargs[attr] = torch.cat(valid, dim=0)
+                kwargs[attr] = valid[0] if len(valid) == 1 else torch.cat(valid, dim=0)
             else:
                 kwargs[attr] = list(itertools.chain(*valid))
         for attr in _GENERAL_IMAGE_META_ATTRS:
@@ -861,7 +971,8 @@ class WaitingMMRequestBase(ABC):
                 return
             if not self._is_valid_embedding_part(recv_obj):
                 return
-            # ZMQ materializes frame 1; RDMA already wrote the registered buffer.
+            # ZMQ exposes frame 1 as a tensor view; RDMA already wrote the
+            # registered buffer.
             self._extract_embedding_from_buffer(recv_obj, parts)
             self.recv_embedding_data = _aggregate_embedding_part(
                 self.recv_embedding_data, recv_obj, self.model_type
@@ -919,7 +1030,7 @@ class WaitingMMRequestBase(ABC):
     @abstractmethod
     def _prepare_embedding_buffer(self) -> bool:
         """Make ``embeddings_buffer`` ready for assembly, or leave it None
-        for the CPU-concat path. False = not ready yet, stay PENDING."""
+        for segmented CPU assembly. False = not ready yet, stay PENDING."""
 
     def _view_dtype(self):
         """dtype of the bytes in ``embeddings_buffer``."""
@@ -946,7 +1057,7 @@ class WaitingMMRequestBase(ABC):
                     self._view_dtype(),
                 )
             else:
-                recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+                recv_embedding = self.recv_embedding_data.get_embedding()
             self._finish_assemble(recv_embedding)
             # Releases whatever is still attached: no-op once the slot was
             # detached; RDMA's override also deregisters non-pool buffers.
@@ -1101,18 +1212,20 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         )
 
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
-        """ZMQ transport carries the embedding bytes as frame 1. Clone so we
-        don't depend on the ZMQ buffer after the next recv."""
+        """View the zero-copy ZMQ payload without duplicating it on CPU.
+
+        ``recv_multipart(copy=False)`` returns a reference-counted ``zmq.Frame``.
+        ``torch.frombuffer`` retains the exported buffer, so the payload remains
+        valid across subsequent receives until the tensor itself is released.
+        """
         buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-        recv_obj.embedding = (
-            torch.frombuffer(buffer, dtype=recv_obj.dtype)
-            .reshape(recv_obj.shape)
-            .clone()
+        recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
+            recv_obj.shape
         )
 
     def _prepare_embedding_buffer(self) -> bool:
         """Stage the CPU parts into the GPU pool when one is configured;
-        without a pool the CPU-concat path is used (buffer stays None)."""
+        without a pool they remain segmented (buffer stays None)."""
         if self.embedding_pool is None:
             return True
         return self._try_stage_into_pool()
@@ -1150,7 +1263,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                 self._pool_full_warned = True
             return False
         self.embeddings_buffer, self._pool_slot_id = staged
-        # Drop the CPU clones now that they live in the pool.
+        # Drop the CPU frame views now that their contents live in the pool.
         for i in range(len(parts)):
             parts[i] = None
         return True
@@ -1995,7 +2108,7 @@ class MMReceiverBase(ABC):
                     recv_embedding_data, recv_obj, self.model_type
                 )
 
-            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+            recv_embedding = recv_embedding_data.get_embedding(materialize=True)
             return mm_processor.get_mm_data(
                 prompt,
                 recv_embedding,

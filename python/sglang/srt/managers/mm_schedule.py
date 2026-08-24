@@ -50,6 +50,23 @@ def get_embedding_chunk(
         If there's no overlap between the requested range and the offset ranges,
         an empty tensor is returned with zeros for start and end indices.
     """
+    start_index, end_index = _get_embedding_chunk_indices(
+        extend_prefix_len=extend_prefix_len,
+        extend_seq_len=extend_seq_len,
+        items_offset=items_offset,
+    )
+    # some models' embedding is 3-dim, reshape it to 2-dim
+    embedding = embedding.reshape(-1, embedding.shape[-1])
+    embedding_chunk = embedding[start_index:end_index]
+    return embedding_chunk, start_index, end_index
+
+
+def _get_embedding_chunk_indices(
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    items_offset: List[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Map a text prefill range to the logical concatenated MM token range."""
     start_index, end_index = 0, 0
     extend_start_index = extend_prefix_len
     extend_end_index = extend_prefix_len + extend_seq_len - 1
@@ -64,10 +81,82 @@ def get_embedding_chunk(
             end_index += extend_end_index - start + 1
         elif extend_end_index > end:
             end_index += end - start + 1
-    # some models' embedding is 3-dim, reshape it to 2-dim
-    embedding = embedding.reshape(-1, embedding.shape[-1])
-    embedding_chunk = embedding[start_index:end_index]
-    return embedding_chunk, start_index, end_index
+    return start_index, end_index
+
+
+def _slice_concatenated_embedding_parts(
+    embeddings: List[torch.Tensor], start_index: int, end_index: int
+) -> List[torch.Tensor]:
+    """Return slices of a logical concat without materializing them.
+
+    Each returned tensor is a view of one precomputed item. Callers can copy
+    these parts directly to the target device instead of concatenating a large
+    temporary tensor on CPU first.
+    """
+    first = embeddings[0].reshape(-1, embeddings[0].shape[-1])
+    if start_index >= end_index:
+        return [first[:0]]
+
+    pieces = []
+    logical_start = 0
+    for embedding in embeddings:
+        flat = embedding.reshape(-1, embedding.shape[-1])
+        logical_end = logical_start + flat.shape[0]
+        if logical_end > start_index and logical_start < end_index:
+            local_start = max(start_index, logical_start) - logical_start
+            local_end = min(end_index, logical_end) - logical_start
+            pieces.append(flat[local_start:local_end])
+        if logical_end >= end_index:
+            break
+        logical_start = logical_end
+
+    return pieces or [first[:0]]
+
+
+def _assemble_embedding_parts(
+    parts: List[torch.Tensor], target_device: torch.device
+) -> torch.Tensor:
+    """Assemble CPU parts directly on device while preserving the GPU path."""
+    flat_parts = [part.reshape(-1, part.shape[-1]) for part in parts]
+    if len(flat_parts) == 1:
+        part = flat_parts[0]
+        return (
+            part
+            if part.device == target_device
+            else part.to(target_device, non_blocking=True)
+        )
+
+    # The P-side GPU embedding pool already eliminated the receiver CPU cat.
+    # Keep its established same-device concat path instead of launching one
+    # Python-level copy per item. The direct-copy path below is specifically
+    # for unpooled CPU embeddings (or an uncommon mixed-device input).
+    if target_device.type != "cpu" and all(
+        part.device.type == target_device.type
+        and (target_device.index is None or part.device.index == target_device.index)
+        for part in flat_parts
+    ):
+        return torch.cat(flat_parts, dim=0)
+
+    dtype = flat_parts[0].dtype
+    hidden_size = flat_parts[0].shape[-1]
+    for part in flat_parts[1:]:
+        dtype = torch.promote_types(dtype, part.dtype)
+        if part.shape[-1] != hidden_size:
+            raise ValueError(
+                "precomputed embedding parts must have matching hidden sizes"
+            )
+
+    result = torch.empty(
+        (sum(part.shape[0] for part in flat_parts), hidden_size),
+        dtype=dtype,
+        device=target_device,
+    )
+    offset = 0
+    for part in flat_parts:
+        next_offset = offset + part.shape[0]
+        result[offset:next_offset].copy_(part, non_blocking=True)
+        offset = next_offset
+    return result
 
 
 def _get_precomputed_embedding(
@@ -76,13 +165,14 @@ def _get_precomputed_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    target_device: Optional[torch.device] = None,
 ) -> Optional[torch.Tensor]:
     """
-    If all items have precomputed_embeddings, return their concatenation.
+    If all items have precomputed_embeddings, assemble them on target_device.
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
-    precomputed_embeddings = []
+    precomputed_embedding_parts: List[Optional[List[torch.Tensor]]] = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
     for i in range(max_iterations):
@@ -94,41 +184,38 @@ def _get_precomputed_embedding(
         items_offset = items_offset_list[i]
 
         if any(item.precomputed_embeddings is None for item in items_per_req):
-            chunk = None
+            chunk_parts = None
         else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
-            chunk, _, _ = get_embedding_chunk(
-                embedding=req_embeddings,
+            start_index, end_index = _get_embedding_chunk_indices(
                 extend_prefix_len=prefix_length[i],
                 extend_seq_len=extend_len,
                 items_offset=items_offset,
             )
+            chunk_parts = _slice_concatenated_embedding_parts(
+                [item.precomputed_embeddings for item in items_per_req],
+                start_index,
+                end_index,
+            )
 
-        if chunk is None and len(items_per_req) > 1:
+        if chunk_parts is None and len(items_per_req) > 1:
             return None
-        precomputed_embeddings.append(chunk)
+        precomputed_embedding_parts.append(chunk_parts)
 
-    if any(feature is not None for feature in precomputed_embeddings):
-        if not all(feature is not None for feature in precomputed_embeddings):
+    if any(parts is not None for parts in precomputed_embedding_parts):
+        if not all(parts is not None for parts in precomputed_embedding_parts):
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
 
-        # Normalize device across chunks before concat.
-        target_device = next(
-            (t.device for t in precomputed_embeddings if t.is_cuda),
-            precomputed_embeddings[0].device,
-        )
-        precomputed_embeddings = [
-            t if t.device == target_device else t.to(target_device, non_blocking=True)
-            for t in precomputed_embeddings
-        ]
-        result = torch.concat(precomputed_embeddings)
-        # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
-        result = result.reshape(-1, result.shape[-1])
-        return result
+        parts: List[torch.Tensor] = []
+        for request_parts in precomputed_embedding_parts:
+            assert request_parts is not None
+            parts.extend(request_parts)
+        if target_device is None:
+            target_device = next(
+                (part.device for part in parts if part.is_cuda), parts[0].device
+            )
+        return _assemble_embedding_parts(parts, target_device)
     return None
 
 
@@ -663,7 +750,12 @@ def get_embedding_and_mask(
 
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        target_device=input_ids.device,
     )
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
