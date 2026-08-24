@@ -31,6 +31,7 @@ BENCH_CONFIG: TypeAlias = "List[Tuple[Tuple[str, ...], List[Tuple[Any, ...]]]]"
 UNIT_SCALE = {"us": 1e-6, "ms": 1e-3, "s": 1.0}
 TYPE_LIST = (bool, int, float, str, torch.dtype, torch.device, None.__class__)
 DISABLE_LOG_BANDWIDTH = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH") == "1"
+DISABLE_LOG_FLOPS = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_FLOPS") == "1"
 PATTERN: TypeAlias = "Literal['pow2']"
 
 __all__ = [
@@ -154,6 +155,7 @@ class BenchResult(NamedTuple):
     metrics: Tuple[Metric, ...]
     times: List[float]  # in seconds
     memory_footprint: Optional[int]
+    flops: Optional[float] = None
 
 
 class Table:
@@ -180,6 +182,12 @@ class Table:
         if math.isnan(b):
             return "N/A"
         return f"{b:.2f}"
+
+    @staticmethod
+    def format_flops(f: float) -> str:
+        if math.isnan(f):
+            return "N/A"
+        return f"{f:.3f}"
 
     def col(
         self,
@@ -261,15 +269,18 @@ class Benchmark(Generic[F]):
             self._seen_args.add(name)
         self._configs.insert(0, (names, vals))
 
-    def _collect_results(self) -> Tuple[List[List[float]], List[List[float]], bool]:
+    def _collect_results(self):
         axis_names = [n for n, _ in self._configs]
         axis_vals = [v for _, v in self._configs]
         results: List[List[float]] = []
         bandwidth_results: List[List[float]] = []
+        flops_results: List[List[float]] = []
         should_log_bandwidth = False
+        should_log_flops = False
         for system in self._line_vals:
             latencies: List[float] = []
             bandwidths: List[float] = []
+            flops: List[float] = []
             for combo in itertools.product(*axis_vals):
                 kwargs: Dict[str, Any] = {self._line_arg: system}
                 for names, values in zip(axis_names, combo):
@@ -280,6 +291,8 @@ class Benchmark(Generic[F]):
                     latencies.append(float("nan"))
                     if not DISABLE_LOG_BANDWIDTH:
                         bandwidths.append(float("nan"))
+                    if not DISABLE_LOG_FLOPS:
+                        flops.append(float("nan"))
                     continue
                 except BaseException:
                     print(f"Benchmark failed at {system}, kwargs =", kwargs)
@@ -290,9 +303,19 @@ class Benchmark(Generic[F]):
                     bandwidths.append(
                         result.memory_footprint / (1024**3) / result.times[0]
                     )
+                if not DISABLE_LOG_FLOPS and result.flops is not None:
+                    should_log_flops = True
+                    flops.append(result.flops / (1e12) / result.times[0])
             results.append(latencies)
             bandwidth_results.append(bandwidths)
-        return results, bandwidth_results, should_log_bandwidth
+            flops_results.append(flops)
+        return (
+            results,
+            bandwidth_results,
+            flops_results,
+            should_log_bandwidth,
+            should_log_flops,
+        )
 
     def run(
         self,
@@ -316,7 +339,9 @@ class Benchmark(Generic[F]):
             f"{sorted(missing)}"
         )
 
-        results, bandwidths, should_log_bw = self._collect_results()
+        results, bandwidths, flops, should_log_bw, should_log_flops = (
+            self._collect_results()
+        )
 
         table = Table()
         table.col(min_width=0, pad=0, align="<")  # id column (tight, left-aligned)
@@ -325,18 +350,31 @@ class Benchmark(Generic[F]):
         table.sep()
         for system in self._line_vals:
             table.col(f"{system}({self._unit})", min_width=15)
+        # one entry per row, per system -- guards the skip/append paths above
+        row_count = math.prod(len(vals) for _, vals in self._configs)
         if should_log_bw:
             table.sep()
             for system in self._line_vals:
                 table.col(f"{system}(GB/s)", min_width=15)
+            assert all(len(b) == row_count for b in bandwidths)
+        if should_log_flops:
+            table.sep()
+            for system in self._line_vals:
+                table.col(f"{system}(TFLOPS)", min_width=15)
+            assert all(len(f) == row_count for f in flops)
 
         axis_vals = [v for _, v in self._configs]
         for row_id, combo in enumerate(itertools.product(*axis_vals)):
+            # skip entries that are skipped by all systems
+            if all(math.isnan(r[row_id]) for r in results):
+                continue
             cells: List[Any] = [row_id]
             cells.extend(v for vt in combo for v in vt)
             cells.extend(table.format_latency(r[row_id]) for r in results)
             if should_log_bw:
                 cells.extend(table.format_bandwidth(r[row_id]) for r in bandwidths)
+            if should_log_flops:
+                cells.extend(table.format_flops(r[row_id]) for r in flops)
             table.row(*cells)
 
         table.print(print_prefix, print_suffix)
@@ -465,6 +503,7 @@ def do_bench(
     memory_output: Iterable[Any] | Literal["out"] | None = "out",
     extra_memory_args: Iterable[Any] | None = None,
     extra_memory_footprint: int = 0,
+    flops: Optional[float] = None,
     graph_context_fn: Optional[Callable[[], ContextManager]] = None,
     sync_multigpu_fn: Optional[Callable[[], Any]] = None,
     estimated_time_ms: Optional[float] = 1.0,
@@ -493,6 +532,8 @@ def do_bench(
     :param extra_memory_args: Additional arguments to consider for memory footprint calculation.
     :param extra_memory_footprint: Additional memory footprint to consider.
                                    This is typically used when the load/store bytes is dynamic.
+    :param flops: The number of floating-point operations performed by the benchmark.
+                  Used for calculating the achieved computation utilization in the profile report.
     :param graph_context_fn: A callable returning a context manager that wraps the cuda graph capture.
     :param sync_multigpu_fn: A callable to synchronize multiple GPUs before each iteration. For precise
                              benchmark number in multi-GPU benchmark, it should be some synchronization
@@ -576,10 +617,10 @@ def do_bench(
         memory_footprint += _get_nbytes_recursive(memory_args)
         memory_footprint += _get_nbytes_recursive(memory_output)
 
-    return BenchResult(metrics, result, memory_footprint)
+    return BenchResult(metrics, result, memory_footprint, flops)
 
 
-def range(*args, pattern: PATTERN) -> List[int]:
+def range(*args: int, pattern: PATTERN) -> List[int]:
     # TODO: support other patterns
     assert pattern == "pow2", f"unsupported pattern: {pattern}"
     return [2**i for i in builtins.range(*args)]
