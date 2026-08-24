@@ -38,7 +38,9 @@ def _set_dispatch(monkeypatch, num_token, world_size, topk):
     from sglang.srt.layers.moe.token_dispatcher import moriep
 
     monkeypatch.setattr(
-        moriep, "LAST_DISPATCH_SEND_TOKENS", (num_token, world_size, topk),
+        moriep,
+        "LAST_DISPATCH_SEND_TOKENS",
+        (num_token, world_size, topk),
         raising=False,
     )
 
