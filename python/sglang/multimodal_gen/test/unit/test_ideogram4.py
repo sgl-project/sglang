@@ -510,6 +510,7 @@ class TestIdeogram4(unittest.TestCase):
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
             component_weights_paths={},
+            component_quantizations={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
