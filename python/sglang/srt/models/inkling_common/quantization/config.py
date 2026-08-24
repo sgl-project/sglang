@@ -148,6 +148,7 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
             use_per_token_activation=(
                 None
                 if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.is_set()
+                or is_checkpoint_nvfp4_serialized
                 else True
             ),
         )
