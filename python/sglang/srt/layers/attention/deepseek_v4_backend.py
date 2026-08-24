@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
@@ -557,15 +558,10 @@ class DeepseekV4AttnBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
-        self.enable_deepseek_v4_fp4_indexer: bool = (
-            model_runner.server_args.enable_deepseek_v4_fp4_indexer
-        )
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
-        )
-        self.dsv4_prefill_backend: str = getattr(
-            model_runner.server_args, "dsv4_prefill_backend", "auto"
-        )
+        schedule = get_schedule()
+        self.enable_deepseek_v4_fp4_indexer = schedule.enable_deepseek_v4_fp4_indexer
+        self.dsa_topk_backend = DSATopKBackend(schedule.dsa_topk_backend)
+        self.dsv4_prefill_backend = getattr(schedule, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not is_sm90_supported():
                 raise ValueError(

@@ -105,9 +105,7 @@ class XPUAttentionBackend(AttentionBackend):
         # non-deterministic number of partitions, so we pin num_splits to 1
         # when deterministic inference is enabled to keep attention reduction
         # order fixed. This mirrors the flash-attention (fa3) backend.
-        self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
-        )
+        self.num_splits = 1 if get_schedule().enable_deterministic_inference else 0
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

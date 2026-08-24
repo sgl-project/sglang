@@ -349,7 +349,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
+            get_exec().kernel.dsa_topk_backend
         )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -484,7 +484,7 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_buf: Optional[torch.Tensor] = None
         self._q8kv8_born_q_stash: Optional[Tuple[int, int]] = None
         self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
-        self._q8kv8_born_q_tbo = model_runner.server_args.enable_two_batch_overlap
+        self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
