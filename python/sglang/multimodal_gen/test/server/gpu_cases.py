@@ -1233,7 +1233,7 @@ ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
 
 
-# Intel Battlemage B580 has 24 GiB of XPU memory, so only sub-~5B-parameter
+# Intel Arc Pro B60 has 24 GiB of XPU memory, so only sub-~5B-parameter
 # checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.1-dev,
 # FLUX.2-dev, Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
 # 24 GiB, and the FP8/NVFP4 quant paths are CUDA-only.
