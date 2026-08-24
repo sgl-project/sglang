@@ -535,15 +535,16 @@ def eagle_prepare_for_verify(
     batch.forward_mode = (
         ForwardMode.IDLE if batch.forward_mode.is_idle() else ForwardMode.TARGET_VERIFY
     )
-    capture_mode = (
-        CaptureHiddenMode.NULL
-        if target_worker.model_runner.spec_algorithm.is_standalone()
-        else CaptureHiddenMode.FULL
-    )
+    capture_hidden_mode = verify_input.capture_hidden_mode
+    if capture_hidden_mode is None:
+        if target_worker.model_runner.spec_algorithm.is_standalone():
+            capture_hidden_mode = CaptureHiddenMode.NULL
+        else:
+            capture_hidden_mode = CaptureHiddenMode.FULL
     verify_forward_batch = ForwardBatch.init_new(
         batch,
         target_worker.model_runner,
-        capture_hidden_mode=capture_mode,
+        capture_hidden_mode=capture_hidden_mode,
         return_hidden_states_before_norm=False,
     )
 

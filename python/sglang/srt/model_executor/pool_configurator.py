@@ -137,7 +137,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
         # reuse the target architecture's attention config.
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+            kvc.spec_algorithm.is_eagle()
+            or kvc.spec_algorithm.is_dvr_eagle()
+            or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if (
@@ -151,7 +153,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family() or kvc.spec_algorithm.is_dvr_dflash()
+        ) and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -353,7 +357,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._draft_full_layers_num = 0
         self._draft_swa_full_layers_num = 0
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+            kvc.spec_algorithm.is_eagle()
+            or kvc.spec_algorithm.is_dvr_eagle()
+            or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:

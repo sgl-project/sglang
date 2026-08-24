@@ -190,13 +190,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # - Breakable EAGLE target: FULL.
         # - Return-hidden-states or DFLASH: FULL.
         # - Otherwise: NULL.
-        is_breakable_eagle = (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and model_runner.spec_algorithm.is_eagle()
+        is_breakable_eagle = self.prefill_backend_name == Backend.BREAKABLE and (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_dvr_eagle()
         )
         needs_full_hidden_states = (
             model_runner.server_args.enable_return_hidden_states
             or model_runner.spec_algorithm.is_dflash_family()
+            or model_runner.spec_algorithm.is_dvr_dflash()
         )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -306,7 +307,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_eagle()
+            and (
+                model_runner.spec_algorithm.is_eagle()
+                or model_runner.spec_algorithm.is_dvr_eagle()
+            )
         ):
             hidden_dim = get_draft_input_from_target_hidden_dim(model_runner)
             with torch.device(self.device):

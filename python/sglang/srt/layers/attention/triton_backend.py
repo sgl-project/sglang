@@ -977,7 +977,10 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill and not self.is_draft_runner:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (
+                    max_num_tokens
+                    * (self.max_context_len + (self.num_draft_tokens or 0))
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )

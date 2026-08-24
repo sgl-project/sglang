@@ -56,7 +56,7 @@ def hybrid_gdn_config(model_config: ModelConfig):
         | JetNemotronConfig
         | JetVLMConfig,
     ):
-        return config
+        return config if config.linear_layer_ids else None
     return None
 
 

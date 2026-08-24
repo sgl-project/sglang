@@ -1722,7 +1722,11 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
+        "NGRAM, DFLASH, DSPARK, DECODE_VERIFY_ROLLBACK, "
+        "DECODE_VERIFY_ROLLBACK_EAGLE, and DECODE_VERIFY_ROLLBACK_DFLASH. "
+        "Or any name registered via "
+        "`SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1756,7 +1760,8 @@ class ServerArgs:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH and DVR-DFLASH only. Block size (verify window length). "
+        "Alias of --speculative-num-draft-tokens.",
     ] = None
     speculative_dspark_block_size: A[
         Optional[int],
@@ -2978,6 +2983,19 @@ class ServerArgs:
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
         self._apply_inkling_prefill_cuda_graph_default()
+
+        is_dvr_algorithm = (self.speculative_algorithm or "").upper() in {
+            "DECODE_VERIFY_ROLLBACK",
+            "DECODE_VERIFY_ROLLBACK_EAGLE",
+            "DECODE_VERIFY_ROLLBACK_DFLASH",
+        }
+        if is_dvr_algorithm:
+            # Resolve DVR state tracking before generic Mamba/Radix validation.
+            # Keep the import lazy so ordinary servers do not load FLA/Triton.
+            from sglang.srt.speculative.dvr.server_args import handle_dvr_defaults
+
+            handle_dvr_defaults(self)
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -2995,6 +3013,13 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
+        if is_dvr_algorithm:
+            # Apply DVR constraints after generic graph batch defaults are final.
+            from sglang.srt.speculative.dvr.server_args import (
+                handle_dvr_cuda_graph_config,
+            )
+
+            handle_dvr_cuda_graph_config(self)
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()

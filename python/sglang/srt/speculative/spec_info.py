@@ -42,6 +42,9 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    DECODE_VERIFY_ROLLBACK = auto()
+    DECODE_VERIFY_ROLLBACK_EAGLE = auto()
+    DECODE_VERIFY_ROLLBACK_DFLASH = auto()
 
     @classmethod
     def from_string(
@@ -124,6 +127,18 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_dvr_self_draft(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+
+    def is_dvr_eagle(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
+
+    def is_dvr_dflash(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_DFLASH
+
+    def is_dvr(self) -> bool:
+        return self.is_dvr_self_draft() or self.is_dvr_eagle() or self.is_dvr_dflash()
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
@@ -179,7 +194,8 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        """Whether FutureMap must relay draft topk_p/topk_index, even for topk=1."""
+        return self.is_eagle() or self.is_dvr_eagle() or self.is_standalone()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.
@@ -200,7 +216,13 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_dvr():
+            from sglang.srt.speculative.dvr.server_args import (
+                _handle_dvr_speculative_decoding,
+            )
+
+            _handle_dvr_speculative_decoding(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
@@ -266,6 +288,13 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return FrozenKVMTPWorkerV2
+
+        if self.is_dvr():
+            from sglang.srt.speculative.dvr.worker import (
+                DecodeVerifyRollbackWorker,
+            )
+
+            return DecodeVerifyRollbackWorker
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
@@ -379,7 +408,12 @@ def create_dummy_verify_input(
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
     spec_info = None
-    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+    if (
+        spec_algorithm.is_eagle()
+        or spec_algorithm.is_dvr()
+        or spec_algorithm.is_standalone()
+    ):
+        # Every DVR draft backend is normalized to the same chain verify input.
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:
@@ -396,7 +430,11 @@ def create_dummy_verify_input(
                 spec_steps=server_args.speculative_num_steps,
                 topk=server_args.speculative_eagle_topk,
                 draft_token_num=server_args.speculative_num_draft_tokens,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if spec_algorithm.is_dvr_self_draft()
+                    else CaptureHiddenMode.FULL
+                ),
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )

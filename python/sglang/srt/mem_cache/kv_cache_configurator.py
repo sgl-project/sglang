@@ -699,6 +699,13 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        # DVR owns its recurrent verify/rollback workspace instead of using the
+        # generic per-draft-token Mamba snapshots.
+        mamba_snapshot_draft_tokens = (
+            None
+            if self.spec_algorithm.is_dvr()
+            else self.server_args.max_speculative_num_draft_tokens
+        )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=self.server_args.max_mamba_cache_size,
@@ -716,7 +723,7 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            speculative_num_draft_tokens=mamba_snapshot_draft_tokens,
             speculative_eagle_topk=self.server_args.speculative_eagle_topk,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -1546,6 +1553,16 @@ class KVCacheConfigurator:
                 / 1024,
             )
         rest_memory = available_gpu_memory - slack_gb
+        if self.spec_algorithm.is_dvr():
+            from sglang.srt.speculative.dvr.sampling import (
+                dvr_proposal_buffer_bytes,
+            )
+
+            rest_memory -= dvr_proposal_buffer_bytes(
+                spec_algorithm=self.spec_algorithm,
+                server_args=self.server_args,
+                vocab_size=self.model_config.vocab_size,
+            ) / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
@@ -1709,6 +1726,28 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+            workspace_slots_per_request = server_args.speculative_num_draft_tokens
+            if self.spec_algorithm.is_dvr():
+                from sglang.srt.layers.attention.dvr.gdn_backend import (
+                    dvr_gdn_workspace_state_slots,
+                )
+
+                num_local_layers = sum(
+                    self.layer_info.start_layer <= layer_id < self.layer_info.end_layer
+                    for layer_id in config.mamba2_cache_params.layers
+                )
+                workspace_slots_per_request = dvr_gdn_workspace_state_slots(
+                    config.mamba2_cache_params,
+                    server_args.speculative_num_draft_tokens,
+                    num_layers=num_local_layers,
+                )
+                # ReqToTokenPool allocates a CUDA-graph padding row in addition
+                # to the real request rows budgeted below.
+                total_rest_memory -= (
+                    workspace_slots_per_request
+                    * config.mamba2_cache_params.mamba_cache_per_req
+                    / (1 << 30)
+                )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -1727,7 +1766,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    * workspace_slots_per_request
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -1745,7 +1784,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * workspace_slots_per_request
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -1756,8 +1795,7 @@ class KVCacheConfigurator:
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            #   2. intermediate states: request_count * workspace_slots * per_req
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -1767,12 +1805,12 @@ class KVCacheConfigurator:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                        mamba_budget_bytes
+                        // (per_req * (1 + workspace_slots_per_request / ratio))
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -1781,7 +1819,7 @@ class KVCacheConfigurator:
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = per_req * capped_reqs * workspace_slots_per_request
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(
