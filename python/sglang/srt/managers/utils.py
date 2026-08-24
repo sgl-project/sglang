@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import Callable, TYPE_CHECKING, Any, List, Optional, Union
 
 import msgspec
 import torch
@@ -104,6 +104,10 @@ class GenerationBatchResult:
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    token_probe_scores: Optional[torch.Tensor] = None
+    # Deferred side-stream verify scoring; called (once) to materialize
+    # token_probe_scores before they are consumed.
+    token_probe_finish_func: Optional[Callable[[], Optional[torch.Tensor]]] = None
 
     # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
     fpm_start_event: Optional[torch.cuda.Event] = None
@@ -152,6 +156,12 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if self.token_probe_finish_func is not None:
+            self.token_probe_scores = self.token_probe_finish_func()
+            self.token_probe_finish_func = None
+        if self.token_probe_scores is not None:
+            self.token_probe_scores = _async_d2h(self.token_probe_scores)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)

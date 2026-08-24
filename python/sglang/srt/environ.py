@@ -1517,6 +1517,13 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # ===================================================================
+    # Token probe
+    # ===================================================================
+    SGLANG_TOKEN_PROBE_SAVE_DIR = EnvStr(None)
+    SGLANG_ENABLE_TOKEN_PROBE_PREFILL = EnvBool(False)
+    SGLANG_ENABLE_TOKEN_PROBE_OVERLAP = EnvBool(False)
+
+    # ===================================================================
     # Plugin system
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")

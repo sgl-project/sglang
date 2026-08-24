@@ -352,6 +352,9 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    # None until an accepted req carries token_probe_probs; earlier reqs are
+    # then back-filled with None.
+    token_probe_probs: Optional[list] = None
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -687,6 +690,20 @@ class _GenerationStreamAccumulator:
             if len(per_request_values) < len(self.output_ids):
                 per_request_values.append([None] * current_output_len)
 
+        # With SGLANG_TOKEN_PROBE_SAVE_DIR the scores go to disk only, not
+        # into the (potentially huge) API payload.
+        if not envs.SGLANG_TOKEN_PROBE_SAVE_DIR.get():
+            req_token_probe_probs = getattr(req, "token_probe_probs", None) or None
+            if self.token_probe_probs is None and req_token_probe_probs is not None:
+                self.token_probe_probs = [None] * (len(self.rids) - 1)
+            if self.token_probe_probs is not None:
+                safeprob_end = min(len(output_ids_), len(req_token_probe_probs or []))
+                self.token_probe_probs.append(
+                    req_token_probe_probs[send_token_offset:safeprob_end]
+                    if req_token_probe_probs is not None
+                    else None
+                )
+
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
@@ -770,5 +787,6 @@ class _GenerationStreamAccumulator:
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
             ),
+            token_probe_probs=self.token_probe_probs,
             dp_ranks=dp_ranks,
         )

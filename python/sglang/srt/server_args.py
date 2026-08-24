@@ -589,6 +589,9 @@ class ServerArgs:
         "A dictionary in JSON string format used to override default model configurations.",
         NS("model"),
     ] = "{}"
+    # No Arg metadata: registered manually as --probe-ckpt below, so
+    # add_cli_args_from_dataclass skips it.
+    probe_ckpt: Optional[str] = None
 
     # -------------------------------------------------------------------------
     # Quantization and data type
@@ -3973,6 +3976,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._handle_token_probe()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -9583,6 +9587,51 @@ class ServerArgs:
         if cfg.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
 
+    def _handle_token_probe(self):
+        cfg = resolving_view(self)
+        if cfg.probe_ckpt is None:
+            return
+
+        architectures = self.get_model_config().hf_config.architectures or []
+        if "BailingMoeV3ForCausalLM" not in architectures:
+            raise ValueError(
+                "--probe-ckpt currently supports only Bailing V3 MoE "
+                "(BailingMoeV3ForCausalLM); got "
+                f"architectures={architectures!r}."
+            )
+        if cfg.pp_size != 1:
+            raise ValueError("--probe-ckpt does not support pipeline parallelism")
+        if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+            raise ValueError("--probe-ckpt does not support context parallelism")
+
+        if cfg.speculative_algorithm is None:
+            return
+
+        draft_path = cfg.speculative_draft_model_path
+        same_checkpoint = draft_path is None
+        if draft_path is not None:
+            if os.path.exists(draft_path) or os.path.exists(cfg.model_path):
+                same_checkpoint = os.path.realpath(draft_path) == os.path.realpath(
+                    cfg.model_path
+                )
+            else:
+                same_checkpoint = draft_path.rstrip("/") == cfg.model_path.rstrip("/")
+
+        if (
+            cfg.speculative_algorithm != "EAGLE"
+            or cfg.speculative_eagle_topk != 1
+            or not same_checkpoint
+        ):
+            raise ValueError(
+                "--probe-ckpt currently supports speculative decoding only with "
+                "bundled MTP/NEXTN (internally EAGLE, top-k 1, and the target "
+                "checkpoint as the draft checkpoint). EAGLE, EAGLE3, DFlash, "
+                "and Standalone are not supported. Got "
+                f"algorithm={cfg.speculative_algorithm!r}, "
+                f"topk={cfg.speculative_eagle_topk!r}, "
+                f"draft_model={draft_path!r}."
+            )
+
     def _handle_other_validations(self):
         cfg = resolving_view(self)
         if cfg.default_chat_template_kwargs is not None and not isinstance(
@@ -9790,6 +9839,13 @@ class ServerArgs:
                 "'partial' checks the first 16 bytes of each real-KV slot. "
                 "'all' checks the full real-KV slot."
             ),
+        )
+        parser.add_argument(
+            "--probe-ckpt",
+            "--probe_ckpt",
+            type=str,
+            default=ServerArgs.probe_ckpt,
+            help="Path to a SingProbe checkpoint.",
         )
 
         # --- Configuration file support ---

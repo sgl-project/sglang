@@ -987,6 +987,11 @@ class CPUGraphRunner:
                 if output.hidden_states is not None
                 else None
             ),
+            token_probe_scores=(
+                output.token_probe_scores[: self.raw_num_token]
+                if output.token_probe_scores is not None
+                else None
+            ),
         )
 
     def get_spec_info(self, num_tokens: int):
