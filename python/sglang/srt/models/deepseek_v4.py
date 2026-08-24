@@ -3057,6 +3057,20 @@ class DeepseekV4Model(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
                 last_layer = layer
+                if i == self.start_layer:
+                    # req_to_token write trap (layers/cp/layer_trap.py): the
+                    # layer loop is write-frozen on extend forwards, so the
+                    # baseline snapshot here is the post-alloc legal state.
+                    # Guarded: a diagnostic hook must never kill the scheduler
+                    # (partial deploys, idle forwards, any surprise).
+                    try:
+                        from sglang.srt.layers.cp.layer_trap import (
+                            layer_trap_start,
+                        )
+
+                        layer_trap_start(forward_batch)
+                    except Exception:
+                        pass
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -3073,6 +3087,14 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+                # Trap checkpoint after every layer: a dirty hit names the
+                # layer window (label=L{i}); zero device sync (see module doc).
+                try:
+                    from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                    layer_trap_mark(forward_batch, f"L{i}")
+                except Exception:
+                    pass
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
@@ -3085,6 +3107,14 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
+            # Final trap drain: catches a writer in the last layer or in the
+            # post-loop path before the send-side [mf-raw] check.
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_end
+
+                layer_trap_end(forward_batch)
+            except Exception:
+                pass
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (

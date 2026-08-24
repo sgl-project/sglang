@@ -33,7 +33,6 @@ See docs/cc_read/pcp_cp_strategy_gap_analysis.md (§24).
 """
 
 import hashlib
-import itertools
 import logging
 import os
 from typing import Any, Mapping, Optional
@@ -41,8 +40,34 @@ from typing import Any, Mapping, Optional
 logger = logging.getLogger(__name__)
 
 # One counter for every instrumented site: collectives run in lockstep across
-# the ranks of a group, so paired lines should carry equal seqs.
-_gather_seq = itertools.count()
+# the ranks of a group, so paired lines should carry equal seqs. Peekable so
+# current_seq() can read the last value WITHOUT consuming (itertools.count
+# cannot peek; a next() there would desync every later line's seq).
+class _PeekableCount:
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def __next__(self) -> int:
+        v = self.n
+        self.n += 1
+        return v
+
+
+_gather_seq = _PeekableCount()
+
+
+def current_seq() -> int:
+    """Last emitted seq (-1 when logging is off). Zero side effects.
+
+    Lets non-logging probes (e.g. layers/cp/layer_trap.py) stamp their
+    findings with the collective stream position for direct correlation
+    with the [cp-size] lines.
+    """
+    if os.getenv("SGLANG_CP_SIZE_LOG", "0") not in ("1", "2"):
+        return -1
+    return _gather_seq.n - 1
 
 
 def _ext_key(forward_batch: Any) -> str:
