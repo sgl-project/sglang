@@ -197,14 +197,19 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
-        topo.prefill_ranks.insert(
-            (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
-            PrefillRankInfo {
-                rank_ip: body.rank_ip.clone(),
-                rank_port: body.rank_port,
-            },
-        );
-        topo.registered_count += 1;
+        let is_new_rank = topo
+            .prefill_ranks
+            .insert(
+                (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
+                PrefillRankInfo {
+                    rank_ip: body.rank_ip.clone(),
+                    rank_port: body.rank_port,
+                },
+            )
+            .is_none();
+        if is_new_rank {
+            topo.registered_count += 1;
+        }
         topo
     });
 
@@ -539,6 +544,12 @@ mod tests {
         assert_eq!(status, 200);
 
         // dp_size resolved to system_dp_size=2 → one registration isn't ready.
+        let (status, _) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 503);
+
+        // Retrying the same topology key must not satisfy readiness early.
+        let (status, _) = request(addr, "PUT", "/route", Some(&rank0));
+        assert_eq!(status, 200);
         let (status, _) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 503);
 
