@@ -10,6 +10,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -29,7 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 PLAMO3_POST_MIXER_NORM_OFFSET = 1.0 / 5
 PLAMO3_POST_MLP_NORM_OFFSET = 1.0 / (5**1.5)
@@ -40,20 +41,15 @@ def get_attention_sliding_window_size(config: "Plamo3Config") -> int:
     return max(config.window_size - 1, 0)
 
 
-class Plamo3RMSNorm(nn.Module):
+class Plamo3RMSNorm(RMSNorm):
     def __init__(self, hidden_size: int, eps: float = 1e-6, offset: float = 1.0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
+        super().__init__(hidden_size, eps=eps, cast_x_before_out_mul=True)
         self.offset = offset
+        nn.init.constant_(self.weight, offset)
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(in_dtype)
-        return (self.offset + self.weight) * x
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight + self.offset)
 
 
 class Plamo3MLP(nn.Module):
