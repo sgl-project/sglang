@@ -66,6 +66,39 @@ def test_existing_flashinfer_backend_preserves_triton_prefill():
     assert keyword["return_final_states"] is False
 
 
+def test_triton_prefill_does_not_forward_ssd_checkpoint_metadata():
+    backend = object.__new__(ssu_dispatch.TritonSSUBackend)
+    observed = {}
+
+    def triton_prefill(*args, **kwargs):
+        observed["call"] = (args, kwargs)
+        return "triton-prefill"
+
+    backend._prefill_kernel = triton_prefill
+    checkpoint_tokens = torch.tensor([-1, 128], dtype=torch.int32)
+    checkpoint_slots = torch.tensor([-1, 0], dtype=torch.int32)
+
+    assert (
+        backend.chunk_scan_combined(
+            "x",
+            chunk_size=128,
+            return_varlen_states=True,
+            checkpoint_seq_indices=(1,),
+            checkpoint_seq_starts=(0,),
+            checkpoint_lengths=(128,),
+            checkpoint_token_indices=checkpoint_tokens,
+            checkpoint_state_slots=checkpoint_slots,
+        )
+        == "triton-prefill"
+    )
+    assert observed == {
+        "call": (
+            ("x",),
+            {"chunk_size": 128, "return_varlen_states": True},
+        )
+    }
+
+
 def test_flashinfer_prefill_pads_with_identity_and_copies_token_major(monkeypatch):
     backend = _flashinfer_backend_without_imports()
     runner = _FakeSSDCombined()

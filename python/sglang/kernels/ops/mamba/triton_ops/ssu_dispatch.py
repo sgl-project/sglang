@@ -131,7 +131,18 @@ class TritonSSUBackend(MambaSSUBackend):
             cache_philox_rounds=self._cache_philox_rounds,
         )
 
-    def chunk_scan_combined(self, *args, **kwargs):
+    def chunk_scan_combined(
+        self,
+        *args,
+        checkpoint_seq_indices: tuple[int, ...] = (),
+        checkpoint_seq_starts: tuple[int, ...] = (),
+        checkpoint_lengths: tuple[int, ...] = (),
+        checkpoint_token_indices: torch.Tensor | None = None,
+        checkpoint_state_slots: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        # Radix checkpoint metadata is consumed only by SSDCombined backends.
+        # Keep the established Triton prefill signature unchanged.
         return self._prefill_kernel(*args, **kwargs)
 
 
