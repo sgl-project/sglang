@@ -1087,6 +1087,15 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
+        # Test empty input_embeds dimensions
+        for input_embeds in ([], [[]]):
+            with self.subTest(input_embeds=input_embeds):
+                with self.assertRaisesRegex(
+                    ValueError, "input_embeds cannot be empty"
+                ):
+                    req = GenerateReqInput(input_embeds=input_embeds)
+                    req.normalize_batch_and_arguments()
+
     def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
         req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
         req.normalize_batch_and_arguments()
