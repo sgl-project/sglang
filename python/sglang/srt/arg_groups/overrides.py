@@ -35,7 +35,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -167,9 +167,12 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """Accumulated declared values: declarations never mutate
-    ``server_args``, so mid-resolution readers overlay them from the
-    declaration stash (last writer wins, like the gate)."""
+    """What the declarations say so far, last writer wins.
+
+    Passes declare without touching the fields until
+    ``materialize_declarations``, so a mid-resolution reader needs this to see
+    them; handlers and hooks write as they declare, and for those the overlay
+    repeats what the field already holds."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -219,6 +222,44 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
         object.__setattr__(server_args, "_internal_write", False)
 
 
+def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Record a resolution write in the declaration stash, and apply it now.
+
+    The stash is what the projection reads, so a resolver that only assigns
+    the field leaves that write invisible to it. The immediate write keeps the
+    resolver's successors seeing the value where they read the field directly.
+
+    What it does change is which writer wins. A declaration is appended and
+    replayed last, so a resolver that declares a field a *deferred* writer (a
+    post-process pass, a registry entry) also decides now beats it, where its
+    bare assignment used to be overwritten by that writer's declaration. A
+    resolver that gates on such a field has to read the resolving view rather
+    than the raw field, or it decides from a value that is already stale.
+
+    For resolvers inside ``__post_init__``: the handlers on ``ServerArgs``
+    (through ``self._declare``) and the ``arg_groups`` hooks and hardware
+    defaults they call. Resolution that has to wait for the launcher stage
+    goes through ``declare_late_resolution`` instead.
+
+    Names arrive as keyword arguments, which accept anything; a misspelled one
+    would otherwise become a new attribute that nothing ever reads, so it is
+    rejected here. This is not the model-override whitelist: that one limits
+    which fields a *registry entry* may reach, while a resolver writing the
+    field it owns is the pipeline resolving by construction.
+    """
+    if dataclasses.is_dataclass(type(server_args)):
+        unknown = sorted(set(fields) - field_names(type(server_args)))
+        if unknown:
+            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
+    for name, value in fields.items():
+        setattr(server_args, name, value)
+
+
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Resolve fields on a config that is **not published yet**.
 
@@ -251,7 +292,59 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
         log = []
         object.__setattr__(server_args, "_runtime_mutations", log)
     log.append((source, dict(fields)))
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
     _apply_fields(server_args, fields)
+
+
+def declare_direct_writes(
+    server_args: Any, source: str, resolve: Callable[[Any], Any]
+) -> Any:
+    """Run a resolver that writes the fields directly, and declare what it moved.
+
+    Returns whatever the resolver returned, so a provider with a return value
+    can go through the same capture.
+
+    Out-of-tree platform plugins are handed the record and set fields on it.
+    Their implementations live outside this tree, so they cannot be converted
+    by editing the resolver; and the raw snapshot is taken before the pipeline
+    starts, so a plugin's default is neither declared nor raw.
+
+    Rebinding is what the diff sees, and rebinding is all it needs to see: a
+    plugin that mutates a value in place reaches the projection anyway, because
+    the raw snapshot and the stash entries hold the same object it mutated.
+
+    A stand-in record (tests drive the hooks with a plain namespace) has no
+    fields to diff and no projection to feed, so the resolver runs uncaptured.
+    """
+    if not dataclasses.is_dataclass(server_args):
+        return resolve(server_args)
+    before = {
+        field.name: getattr(server_args, field.name)
+        for field in dataclasses.fields(server_args)
+    }
+    already = len(getattr(server_args, "_resolved_overrides", None) or ())
+    result = resolve(server_args)
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    # A resolver reached this way can also declare properly -- the in-tree
+    # implementations of these hooks do. Those fields are already explained, and
+    # recording them again would attribute them to the wrapper and bury an
+    # actual direct write among the echoes.
+    declared = {name for _source, fields in stash[already:] for name in fields}
+    changed = {
+        name: getattr(server_args, name)
+        for name, previous in before.items()
+        if name not in declared and getattr(server_args, name) is not previous
+    }
+    if changed:
+        stash.append((source, changed))
+    return result
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -264,6 +357,27 @@ def materialize_declarations(server_args: Any) -> None:
         for field, value in declared.items():
             setattr(server_args, field, value)
     server_args._declarations_materialized = True
+
+
+def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
+    """What resolution decided for ``field``: the declaration if there is one,
+    otherwise what the caller supplied.
+
+    This is what the config projection reads. Reading the field instead would
+    work only for as long as declarations materialize onto the record -- and
+    the point of declaring is that they will not, so the projection must not
+    depend on it. A config that never ran the pipeline (a mock, a partial
+    fixture) carries no raw snapshot; its fields are all it has.
+    """
+    for _source, declared in reversed(
+        getattr(server_args, "_resolved_overrides", None) or ()
+    ):
+        if field in declared:
+            return declared[field]
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, default)
 
 
 def resolved_view(server_args: Any) -> ResolvedView:

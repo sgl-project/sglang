@@ -276,8 +276,17 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         if key not in canonical:
             raise ValueError(f"canonical request missing {key!r}")
     profile = minimax_h3_task_profile(str(canonical["task"]))
-    if profile.task == "fl2va":
-        conditions = canonical["conditions"]
+    conditions = canonical["conditions"]
+    keyframe_conditions = (
+        [
+            condition
+            for condition in conditions
+            if isinstance(condition, Mapping) and condition.get("role") == "keyframe"
+        ]
+        if isinstance(conditions, (list, tuple))
+        else []
+    )
+    if profile.task == "fl2va" or keyframe_conditions:
         signatures = (
             [
                 (
@@ -285,10 +294,9 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                     condition.get("role"),
                     condition.get("frame_index"),
                 )
-                for condition in conditions
+                for condition in keyframe_conditions
             ]
-            if isinstance(conditions, (list, tuple))
-            and all(isinstance(condition, Mapping) for condition in conditions)
+            if all(isinstance(condition, Mapping) for condition in keyframe_conditions)
             else []
         )
         frame_signature = tuple(signature[2] for signature in signatures)
@@ -298,7 +306,8 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
             or frame_signature not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES
         ):
             raise ValueError(
-                "fl2va ResolvedPlan requires one or two ordered image/keyframe "
+                f"{profile.task} ResolvedPlan requires one or two ordered "
+                "image/keyframe "
                 "conditions with frame_index [0], [-1], or [0, -1], got "
                 f"{signatures!r}"
             )
@@ -363,10 +372,15 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         if rule.audio_tokenizer_encode:
             audio_encode.append(index)
 
+    qwen_condition_indices = [
+        index
+        for index, condition in enumerate(canonical["conditions"])
+        if profile.task != "ref2va" or condition["role"] == "reference"
+    ]
     encoders = {
         "qwen": {
             "prompt": canonical["prompt"],
-            "ordered_condition_indices": list(range(len(canonical["conditions"]))),
+            "ordered_condition_indices": qwen_condition_indices,
         },
         "visual": visual_encode,
         "audio": audio_encode,
