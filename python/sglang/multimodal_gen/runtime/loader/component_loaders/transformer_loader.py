@@ -290,6 +290,15 @@ class TransformerLoader(ComponentLoader):
                 "Comfy quantized checkpoints do not support FSDP "
                 "inference; use TP and/or sequence parallelism instead"
             )
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name() == "auto-round"
+        ):
+            raise ValueError(
+                "AutoRound checkpoints do not support diffusion FSDP inference; "
+                "use TP and/or sequence parallelism instead"
+            )
 
         if quant_spec.gguf_file is not None:
             logger.info(
@@ -370,6 +379,7 @@ class TransformerLoader(ComponentLoader):
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
                     or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )
         )
