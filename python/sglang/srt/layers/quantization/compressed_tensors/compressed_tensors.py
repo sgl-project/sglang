@@ -69,11 +69,12 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -395,6 +396,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if _is_xpu:
+            if error:
+                raise RuntimeError(
+                    f"Quantization scheme requiring compute capability "
+                    f"{min_capability} is not supported on XPU."
+                )
+            return False
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -700,9 +709,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
-                is_fp8_w8a8_supported = self._check_scheme_supported(
-                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
-                )
+                if _is_xpu:
+                    is_fp8_w8a8_supported = True
+                else:
+                    is_fp8_w8a8_supported = self._check_scheme_supported(
+                        CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                    )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
@@ -939,7 +951,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if not _is_npu:
+        if _is_xpu:
+            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+                raise RuntimeError(
+                    f"{scheme.__class__.__name__} is not supported on XPU "
+                    "(no XPU kernel implementation)."
+                )
+        elif not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
