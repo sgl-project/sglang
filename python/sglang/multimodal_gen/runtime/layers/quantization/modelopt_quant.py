@@ -236,6 +236,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
         checkpoint_weight_scale_layout: str = "linear",
+        checkpoint_uses_comfy_quantization: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -248,6 +249,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
+        self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
 
     @classmethod
     def get_name(cls) -> str:
@@ -347,6 +349,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             swap_weight_nibbles=swap_weight_nibbles,
             checkpoint_weight_scale_layout=config.get(
                 "checkpoint_weight_scale_layout", "linear"
+            ),
+            checkpoint_uses_comfy_quantization=config.get(
+                "checkpoint_uses_comfy_quantization", False
             ),
         )
 
@@ -462,6 +467,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     """NVFP4 linear method using the selected FP4 GEMM backend."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        # the FlashInfer FP4 kernels this method dispatches to are Blackwell-only.
+        # without this the load succeeds and the failure surfaces much later as
+        # an opaque CUDA error inside the kernel. an undetectable capability is
+        # left alone rather than rejected, so this only ever converts a crash
+        # into a message and never blocks a card that would have worked.
+        capability = current_platform.get_device_capability()
+        min_capability = quant_config.get_min_capability()
+        if capability is not None and capability.to_int() < min_capability:
+            raise RuntimeError(
+                f"NVFP4 checkpoints need compute capability "
+                f"{min_capability // 10}.{min_capability % 10} or newer "
+                f"(Blackwell); this GPU is {capability.as_version_str()}. "
+                f"Load an FP8 or BF16 checkpoint instead."
+            )
         self.quant_config = quant_config
 
     def create_weights(
