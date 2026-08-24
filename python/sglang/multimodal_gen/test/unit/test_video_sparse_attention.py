@@ -8,9 +8,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
     VSA_TILE_SIZE,
-    _CakePlanSignature,
     VideoSparseAttentionImpl,
     VideoSparseAttentionMetadataBuilder,
+    _CakePlanSignature,
     _compute_cur_topk,
     _validate_cake_q2k_indices,
 )
