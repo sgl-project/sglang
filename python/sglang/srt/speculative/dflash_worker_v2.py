@@ -1360,6 +1360,17 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            # Freed-intermediate candidates for the [mf-fp] probe
+            # (SGLANG_MF_EAGLE_RETAIN=1; no-op when off). ctx_hidden is
+            # [chunk_tokens, H]: per-token, natural-order, and derived from
+            # the mask-token-driven draft context -- the exact shape class
+            # the payload fingerprint implies.
+            try:
+                from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import retain
+            except Exception:
+                retain = None
+            if retain is not None:
+                retain("draft.ctx_hidden", ctx_hidden)
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1388,7 +1399,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                for layer in self.draft_model.layers:
+                for li, layer in enumerate(self.draft_model.layers):
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
@@ -1398,6 +1409,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                    if retain is not None and (
+                        li == 0 or li == len(self.draft_model.layers) - 1
+                    ):
+                        retain(f"draft.kv{li}.k", k)
+                        retain(f"draft.kv{li}.v", v)
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,

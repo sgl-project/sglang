@@ -611,16 +611,32 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
-        for layer in self.layers:
+        # Freed-intermediate candidates for the [mf-fp] probe
+        # (SGLANG_MF_EAGLE_RETAIN=1; no-op when off). The draft model's own
+        # per-layer activations are request-independent (mask-token driven)
+        # and were never previously retained.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import retain
+        except Exception:
+            retain = None
+        if retain is not None:
+            retain("draft.embed", input_embeds)
+
+        for li, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            if retain is not None and li == len(self.layers) - 1:
+                retain(f"draft.layer{li}.hidden", hidden_states)
 
         if hidden_states.numel() != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        if retain is not None:
+            retain("draft.final_hidden", hidden_states)
 
         return LogitsProcessorOutput(
             next_token_logits=None,

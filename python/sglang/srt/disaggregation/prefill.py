@@ -1429,10 +1429,55 @@ class SchedulerDisaggregationPrefillMixin:
                             "[mf-fp] stride matcher self-test FAILED -- stride nulls are NOT verdicts"
                         )
 
+                    def _stride_hits_ring(buf):
+                        # Giant pool-ring buffers are skipped by the flat
+                        # stride matcher (>2^27 cells); probe the tail row
+                        # windows so the per-column stream of the most recent
+                        # ring slots is still compared.
+                        try:
+                            if buf is None or buf.ndim != 2 or _kv.numel() < 4:
+                                return 0, -1, -1
+                            if buf.dtype in (_t.bfloat16, _t.float16):
+                                _cols = buf.shape[-1] // 2
+                            elif buf.dtype == _t.int64:
+                                _cols = buf.shape[-1] * 2
+                            else:
+                                _cols = buf.shape[-1]
+                            if _cols < 1 or buf.shape[0] < 8:
+                                return 0, -1, -1
+                            rows = int(buf.shape[0])
+                            total = 0
+                            first_c = first_r = -1
+                            for r0 in range(max(0, rows - 32768), rows, 16384):
+                                cells = (
+                                    buf[r0 : r0 + 16384]
+                                    .view(_t.int32)
+                                    .reshape(-1, _cols)
+                                )
+                                m = cells == _kv[0]
+                                for k in range(1, 4):
+                                    m &= _t.roll(cells, -k, dims=0) == _kv[k]
+                                if bool(m.any()):
+                                    idx = m.nonzero()[0]
+                                    total += int(m.sum())
+                                    if first_c < 0:
+                                        first_c = int(idx[1].item())
+                                        first_r = r0 + int(idx[0].item())
+                            return total, first_c, first_r
+                        except Exception:
+                            return 0, -1, -1
+
                     _cands = []
                     for _pn in ("compress_state_pools", "indexer_compress_state_pools"):
-                        for _pool in getattr(_kc, _pn, None) or []:
-                            _cands.append((_pn + ".kv_score", getattr(getattr(_pool, "kv_score_buffer", None), "kv_score", None), "f"))
+                        for _pi, _pool in enumerate(getattr(_kc, _pn, None) or []):
+                            _kvb = getattr(
+                                getattr(_pool, "kv_score_buffer", None), "kv_score", None
+                            )
+                            _cands.append((_pn + ".kv_score", _kvb, "f"))
+                            # The ring buffer is usually >2^27 cells: the flat
+                            # stride matcher skips it. Probe its tail in row
+                            # windows via mode "r" (§24.16).
+                            _cands.append((f"{_pn}.ring{_pi}", _kvb, "r"))
                     for _pn, _pool in (("swa", getattr(_kc, "swa_kv_pool", None)), ("c4", getattr(_kc, "c4_kv_pool", None)), ("c128", getattr(_kc, "c128_kv_pool", None))):
                         _bufs = getattr(_pool, "kv_buffer", None) or []
                         for _li, _lb in enumerate(_bufs):
@@ -1505,18 +1550,29 @@ class SchedulerDisaggregationPrefillMixin:
                     for _name, _buf, _mode in _cands:
                         if _buf is None:
                             continue
-                        try:
-                            _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)
-                        except Exception:
+                        if _mode == "r":
+                            # Giant ring buffers: skip the contiguous matchers,
+                            # probe tail row windows by column instead.
                             _n = 0
-                        if _n:
-                            logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
-                        try:
-                            _s, _sc, _sr = (
-                                _stride_hits(_buf) if _stride_ok else (0, -1, -1)
-                            )
-                        except Exception:
-                            _s, _sc, _sr = 0, -1, -1
+                            try:
+                                _s, _sc, _sr = (
+                                    _stride_hits_ring(_buf) if _stride_ok else (0, -1, -1)
+                                )
+                            except Exception:
+                                _s, _sc, _sr = 0, -1, -1
+                        else:
+                            try:
+                                _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)
+                            except Exception:
+                                _n = 0
+                            if _n:
+                                logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
+                            try:
+                                _s, _sc, _sr = (
+                                    _stride_hits(_buf) if _stride_ok else (0, -1, -1)
+                                )
+                            except Exception:
+                                _s, _sc, _sr = 0, -1, -1
                         if _s:
                             logger.error(
                                 "[mf-fp] payload stride FOUND x%d col=%d row=%d in %s",
