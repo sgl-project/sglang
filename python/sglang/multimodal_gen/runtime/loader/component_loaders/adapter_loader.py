@@ -44,6 +44,9 @@ class AdapterLoader(PlainStateDictComponentLoader):
         *args,
     ):
         config = self.load_component_config(component_model_path, component_name)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
 
         cls_name = config.pop("_class_name", None)
         if cls_name is None:
@@ -74,7 +77,7 @@ class AdapterLoader(PlainStateDictComponentLoader):
             adapter_cfg.update_model_arch(config)
             model = model_cls(adapter_cfg).to(device=target_device, dtype=default_dtype)
 
-        loaded = load_safetensors_state_dict(component_model_path)
+        loaded = load_safetensors_state_dict(component_weights_path)
         mapping = adapter_cfg.arch_config.param_names_mapping
         loaded = {_remap_connector_key(k, mapping): v for k, v in loaded.items()}
 
@@ -84,7 +87,7 @@ class AdapterLoader(PlainStateDictComponentLoader):
         # else uninitialized would surface later as garbage embeddings.
         if missing or unexpected:
             raise ValueError(
-                f"Adapter weights at '{component_model_path}' do not match the "
+                f"Adapter weights at '{component_weights_path}' do not match the "
                 f"instantiated {cls_name}. Missing: {sorted(missing)}. "
                 f"Unexpected: {sorted(unexpected)}. This usually means the "
                 "adapter config or its weight-name mapping is wrong."
