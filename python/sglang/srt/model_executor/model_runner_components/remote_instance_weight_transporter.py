@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -24,6 +25,7 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    worker: str = "target"
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -101,24 +103,31 @@ class RemoteInstanceWeightTransporter:
         url = f"{bootstrap_url}/register_parallelism_config"
         payload = {
             "tp_rank": self.tp_rank,
+            "worker": self.worker,
             "parallelism_config": self.parallelism_config.to_dict(),
         }
-        try:
-            resp = http_requests.put(url, json=payload, timeout=5)
-            if resp.status_code == 200:
-                logger.info(
-                    f"Registered parallelism config for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_url}"
-                )
-            else:
-                logger.error(
-                    f"Failed to register parallelism config for tp_rank={self.tp_rank}: "
+        for attempt in range(24):
+            try:
+                resp = http_requests.put(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"Registered parallelism config for tp_rank={self.tp_rank} "
+                        f"with bootstrap server at {bootstrap_url}"
+                    )
+                    return
+                logger.warning(
+                    f"Register parallelism config attempt {attempt} for tp_rank={self.tp_rank}: "
                     f"{resp.status_code}, {resp.text}"
                 )
-        except Exception as e:
-            logger.error(
-                f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
-            )
+            except Exception as e:
+                logger.warning(
+                    f"Register parallelism config attempt {attempt} for tp_rank={self.tp_rank}: {e}"
+                )
+            if attempt < 23:
+                time.sleep(5)
+        raise RuntimeError(
+            f"Failed to register parallelism config for tp_rank={self.tp_rank} after 24 attempts"
+        )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
@@ -143,25 +152,32 @@ class RemoteInstanceWeightTransporter:
 
         payload = {
             "tp_rank": self.tp_rank,
+            "worker": self.worker,
             "transfer_engine_info": {
                 "session_id": self.session_id,
                 "weights_info_dict": self.weight_info,
             },
         }
 
-        try:
-            resp = http_requests.put(url, json=payload, timeout=5)
-            if resp.status_code == 200:
-                logger.info(
-                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
-                )
-            else:
-                logger.error(
-                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+        for attempt in range(24):
+            try:
+                resp = http_requests.put(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                        f"with bootstrap server at {bootstrap_na}"
+                    )
+                    return
+                logger.warning(
+                    f"Register transfer engine info attempt {attempt} for tp_rank={self.tp_rank}: "
                     f"{resp.status_code}, {resp.text}"
                 )
-        except Exception as e:
-            logger.error(
-                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
-            )
+            except Exception as e:
+                logger.warning(
+                    f"Register transfer engine info attempt {attempt} for tp_rank={self.tp_rank}: {e}"
+                )
+            if attempt < 23:
+                time.sleep(5)
+        raise RuntimeError(
+            f"Failed to register transfer engine info for tp_rank={self.tp_rank} after 24 attempts"
+        )

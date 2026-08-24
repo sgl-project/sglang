@@ -39,10 +39,12 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[int, Tuple] = {}
-        # Storage: {tp_rank: parallelism_config_dict}
-        self.parallelism_config: Dict[int, dict] = {}
+        # Storage: {(worker, tp_rank): (session_id, weights_info_dict)};
+        # worker is "target" or "draft" so a speculative-decoding draft model
+        # cannot overwrite the target model's registration.
+        self.transfer_engine_info: Dict[Tuple[str, int], Tuple] = {}
+        # Storage: {(worker, tp_rank): parallelism_config_dict}
+        self.parallelism_config: Dict[Tuple[str, int], dict] = {}
         self.lock = threading.Lock()
 
         app = FastAPI()
@@ -55,18 +57,19 @@ class EngineInfoBootstrapServer:
         def register_transfer_engine_info(data: dict):
             try:
                 tp_rank = data["tp_rank"]
+                worker = data.get("worker", "target")
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
 
                 with self.lock:
-                    self.transfer_engine_info[tp_rank] = (
+                    self.transfer_engine_info[(worker, tp_rank)] = (
                         session_id,
                         weights_info_dict,
                     )
 
                 logger.info(
-                    f"Registered transfer engine info for tp_rank={tp_rank}, "
+                    f"Registered transfer engine info for worker={worker} tp_rank={tp_rank}, "
                     f"session_id={session_id}"
                 )
                 return PlainTextResponse("OK")
@@ -75,17 +78,17 @@ class EngineInfoBootstrapServer:
                 raise HTTPException(status_code=400, detail=str(e))
 
         @app.get("/get_transfer_engine_info")
-        def get_transfer_engine_info(rank: int):
+        def get_transfer_engine_info(rank: int, worker: str = "target"):
             if rank < 0:
                 raise HTTPException(status_code=400, detail="Invalid rank parameter")
 
             with self.lock:
-                info = self.transfer_engine_info.get(rank)
+                info = self.transfer_engine_info.get((worker, rank))
 
             if info is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No transfer engine info for rank {rank}",
+                    detail=f"No transfer engine info for worker {worker} rank {rank}",
                 )
 
             return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
@@ -97,24 +100,27 @@ class EngineInfoBootstrapServer:
         def register_parallelism_config(data: dict):
             try:
                 tp_rank = data["tp_rank"]
+                worker = data.get("worker", "target")
                 config = data["parallelism_config"]
 
                 with self.lock:
-                    self.parallelism_config[tp_rank] = config
+                    self.parallelism_config[(worker, tp_rank)] = config
 
-                logger.info(f"Registered parallelism config for tp_rank={tp_rank}")
+                logger.info(
+                    f"Registered parallelism config for worker={worker} tp_rank={tp_rank}"
+                )
                 return PlainTextResponse("OK")
             except Exception as e:
                 logger.error(f"Failed to register parallelism config: {e}")
                 raise HTTPException(status_code=400, detail=str(e))
 
         @app.get("/get_parallelism_config")
-        def get_parallelism_config(rank: int):
+        def get_parallelism_config(rank: int, worker: str = "target"):
             if rank < 0:
                 raise HTTPException(status_code=400, detail="Invalid rank parameter")
 
             with self.lock:
-                config = self.parallelism_config.get(rank)
+                config = self.parallelism_config.get((worker, rank))
 
             if config is None:
                 raise HTTPException(
