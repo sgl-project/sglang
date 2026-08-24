@@ -989,6 +989,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
+            # Genuine-fp32 full-chunk family: probs/logits were transient and
+            # never probed. Retain a cloned column prefix (a view would pin the
+            # full [T, V] storage); gated by enabled() so off-flag is zero-cost.
+            try:
+                from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import (
+                    enabled,
+                    retain,
+                )
+            except Exception:
+                enabled = lambda: False  # noqa: E731
+            if enabled():
+                retain("draft.probs256", probs[..., :256].clone())
+                _dl = getattr(draft_logits_output, "next_token_logits", None)
+                if _dl is not None:
+                    retain("draft.logits256", _dl[..., :256].clone())
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values

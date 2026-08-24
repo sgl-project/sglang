@@ -45,8 +45,7 @@ def _nbytes(t) -> int:
         return 0
 
 
-def retain(name: str, tensor) -> None:
-    """Hold one detached reference (or nothing, under the NOP sham)."""
+def _ensure_flags() -> None:
     if not _flags:
         _flags["on"] = (
             os.getenv("SGLANG_MF_EAGLE_RETAIN", "0") == "1"
@@ -55,6 +54,21 @@ def retain(name: str, tensor) -> None:
         _flags["nop"] = os.getenv("SGLANG_MF_RETAIN_NOP", "0") == "1"
         if _flags["on"] and not _flags["nop"]:
             logger.info("[mf-er] eagle retention ON (budget %d MB)", _budget() // (1024 * 1024))
+
+
+def enabled() -> bool:
+    """True when retention is active; forces the one-time env read.
+
+    Callers use this to gate tensor SLICING (views would pin the full
+    backing storage alive), so the off-flag path stays zero-cost.
+    """
+    _ensure_flags()
+    return bool(_flags.get("on"))
+
+
+def retain(name: str, tensor) -> None:
+    """Hold one detached reference (or nothing, under the NOP sham)."""
+    _ensure_flags()
     if not _flags.get("on") or not torch.is_tensor(tensor):
         return
     if _flags.get("nop"):

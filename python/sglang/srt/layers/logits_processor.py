@@ -680,6 +680,19 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        # Genuine-fp32 full-chunk family: target logits are transient and were
+        # never probed. Retain a cloned column prefix (a view would pin the
+        # full [T, V] storage); gated by enabled() so off-flag is zero-cost.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.eagle_retention import (
+                enabled,
+                retain,
+            )
+        except Exception:
+            enabled = lambda: False  # noqa: E731
+        if enabled():
+            retain("target.logits256", logits[..., :256].clone())
+
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
