@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -640,7 +641,27 @@ class _QuantizedEncoder(nn.Module):
         self.unquantized = nn.Linear(2, 2, bias=False)
 
 
+class _SRTQuantizedLinear(SrtLinearBase):
+    def __init__(self, quant_method):
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.empty(2, 2), requires_grad=False)
+        self.quant_method = quant_method
+
+
 class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
+    def test_processes_srt_quantized_linear(self):
+        quant_method = _RecordingQuantMethod()
+        model = _SRTQuantizedLinear(quant_method)
+
+        processed = _process_quantized_encoder_weights(
+            model,
+            torch.device("cpu"),
+            "image_encoder",
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(quant_method.devices, [torch.device("cpu")])
+
     def test_rejects_native_encoder_without_quantized_layers(self):
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError,
