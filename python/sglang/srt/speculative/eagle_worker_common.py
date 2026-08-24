@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -32,11 +31,8 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cpu
-from sglang.srt.utils.common import rate_limited_hit
 
-logger = logging.getLogger(__name__)
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -316,35 +312,6 @@ def prepare_for_draft(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if (
-        envs.SGLANG_DEBUG_MEMORY_POOL.get()
-        and batch.out_cache_loc is not None
-        and draft_model_runner.token_to_kv_pool is not None
-    ):
-        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-
-        pool = draft_model_runner.token_to_kv_pool
-        locs = batch.out_cache_loc.to(torch.int64)
-        if isinstance(pool, BaseSWAKVPool):
-            # Hybrid-SWA draft locs are TARGET full-domain ids borrowed from the
-            # req_to_token row tail; store/read translate them via the registered
-            # full->swa mapping, so the raw id legitimately exceeds pool.size.
-            bound = pool.swa_kv_pool.size if pool.swa_kv_pool is not None else pool.size
-            write_locs = pool.translate_loc_from_full_to_swa(locs)
-        else:
-            bound = pool.size
-            write_locs = locs
-        bad = (write_locs < 0) | (write_locs >= bound)
-        if bool(bad.any()) and rate_limited_hit("mf-draftloc"):
-            logger.error(
-                "[mf-draftloc] draft write loc out of range: %d/%d bad, "
-                "bound=%d e.g. %s",
-                int(bad.sum()),
-                write_locs.numel(),
-                bound,
-                write_locs[bad][:8].tolist(),
-            )
-
     return forward_batch, can_run_decode_cuda_graph
 
 

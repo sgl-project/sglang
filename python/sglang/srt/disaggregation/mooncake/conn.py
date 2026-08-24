@@ -34,7 +34,6 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
-    debug_log_transfer_fragmentation,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -1109,15 +1108,6 @@ class MooncakeKVManager(CommonKVManager):
             plan.src_token_indices,
             plan.dst_token_indices,
         )
-        # The DCP relayout takes every dcp_size-th token, so src strides by
-        # dcp_size and cannot merge into runs; this surfaces as thousands of
-        # single-token blocks (the memfabric SQ flood signature).
-        debug_log_transfer_fragmentation(
-            "dcp",
-            plan.src_token_indices,
-            plan.dst_token_indices,
-            dcp_token_item_lens,
-        )
 
         layers_params = [
             (
@@ -1572,17 +1562,6 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
-                debug_log_transfer_fragmentation(
-                    f"state:{st}",
-                    np.array(src_indices, dtype=np.int32),
-                    np.array(dst_indices_local, dtype=np.int32),
-                    list(src_item_lens),
-                    list(
-                        self.kv_args.state_data_lens[i]
-                        if i < len(self.kv_args.state_data_lens)
-                        else []
-                    ),
-                )
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,

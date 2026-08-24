@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -86,12 +85,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int64,
                 device=self.device,
             )
-            if os.getenv("SGLANG_MF_SENTINEL", "0") == "1":
-                # Staleness detector, data-independent: if the row-write
-                # consumer ever sees UNFILLED out_indices, the sentinel value
-                # lands in req_to_token verbatim ([mf-raw] checks for it).
-                # Float garbage instead exonerates out_indices entirely.
-                out_indices.fill_(-123456789)
             max_num_extend_tokens = next_power_of_2(extend_num_tokens)
             bs = prefix_lens.shape[0]
             alloc_extend_kernel[(bs,)](
@@ -104,14 +97,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 self.page_size,
                 max_num_extend_tokens,
             )
-            if os.getenv("SGLANG_MF_ALLOC_SYNC", "0") == "1":
-                # Diagnostic sync ONLY between out_indices production and its
-                # first consumer (the row write), independent of debug_mode.
-                # If this alone stops the row corruption at DEBUG=0, the bug
-                # is a missing stream dependency on the async alloc kernel and
-                # the payload is torch.empty-recycled activations; the fix is
-                # then an event dependency, not this global sync.
-                torch.npu.synchronize()
 
         else:
             out_indices = torch.empty(
@@ -119,8 +104,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int32,
                 device=self.device,
             )
-            if os.getenv("SGLANG_MF_SENTINEL", "0") == "1":
-                out_indices.fill_(-123456789)
             alloc_extend_naive(
                 prefix_lens,
                 seq_lens,

@@ -29,22 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sglang.srt.utils.common import rate_limited_hit
-
 logger = logging.getLogger(__name__)
-
-from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
-    install as _install_quant_retention,
-)
-
-# Off by default: the wrapper perturbs timing/memory recycling enough to
-# mask the row clobber (a clean run with it installed vs dirty without is
-# itself diagnostic -- it pins the payload to the recycled dynamic_quant
-# output family). Enable with SGLANG_MF_QUANT_RETAIN=1 for fingerprinting.
-if os.getenv("SGLANG_MF_QUANT_RETAIN", "0") == "1" or os.getenv(
-    "SGLANG_MF_RETAIN_NOP", "0"
-) == "1":
-    _install_quant_retention()
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -505,16 +490,6 @@ class CompressorAscendBackendMixin:
         else:
             backend_fm = self.forward_metadata
             loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
-        # Keep the last few forwards' quant payloads alive so the send-path
-        # fingerprint can sequence-match them; pools churn every forward, so
-        # post-hoc matching only works against retained tensors.
-        _recent = getattr(self, "_mf_recent_payloads", None)
-        if _recent is None:
-            _recent = self._mf_recent_payloads = []
-        _recent.append(
-            (kv.detach(), None if kv_scale is None else kv_scale.detach())
-        )
-        del _recent[:-8]
         if loc is not None:
             if loc.numel() != kv.shape[0]:
                 raise RuntimeError(
@@ -1321,13 +1296,6 @@ class DeepseekV4AscendAttnBackend(
         # the buffers for large bs instead of reusing the fixed ones.
         if bs > 1024:
             _meta_len = max(1024, bs * 8)
-            if rate_limited_hit("mf-meta-buf"):
-                logger.error(
-                    "[mf-meta] bs=%d exceeds fixed 1024 kernel-metadata "
-                    "buffers; using right-sized %d-entry buffers",
-                    bs,
-                    _meta_len,
-                )
             metadata.kernel_metadata = {
                 k: torch.zeros(_meta_len, dtype=torch.int32, device=device)
                 for k in (

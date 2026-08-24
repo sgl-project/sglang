@@ -30,23 +30,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.runtime_context import get_schedule
 
 
-
-# Device-side OOB scatter accounting for the compressor/indexer sinks.
-# Kept on-device: reading it here would synchronize and mask the racing
-# writer (doc §19). Polled at the send path's existing D2H instead.
-_SCATTER_OOB = {}
-
-
-def _clamp_scatter_locs(loc: torch.Tensor, cap: int, slot: str) -> torch.Tensor:
+def _clamp_scatter_locs(loc: torch.Tensor, cap: int) -> torch.Tensor:
+    # Defensive clamp: a loc escaping its buffer would scatter-write into
+    # neighbouring device memory; route it to slot 0 instead.
     bad = (loc < 0) | (loc >= cap)
-    if slot not in _SCATTER_OOB:
-        _SCATTER_OOB[slot] = torch.zeros(1, dtype=torch.int64, device=loc.device)
-    _SCATTER_OOB[slot] += bad.sum().reshape(1).to(torch.int64)
     return torch.where(bad, torch.zeros_like(loc), loc)
-
-
-def get_scatter_oob_counts() -> dict:
-    return {k: int(v.item()) for k, v in _SCATTER_OOB.items()}
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -228,7 +216,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         # output (index_k: int8 [T, D], index_k_scale: fp16 [T, 1]).
         d = self.index_head_dim
         cap = self.index_k_buffer[layer_id].numel() // d
-        loc = _clamp_scatter_locs(loc, cap, "indexer")
+        loc = _clamp_scatter_locs(loc, cap)
         loc_long = loc.view(-1, 1).long()
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[layer_id].view(-1, 1, d),
@@ -511,7 +499,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
-        loc = _clamp_scatter_locs(loc, buf_flat.shape[0], "swa")
+        loc = _clamp_scatter_locs(loc, buf_flat.shape[0])
         # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
         # an explicit num_kv_heads=1 axis, so insert it.
         if cache.ndim == buf_flat.ndim - 1:
@@ -591,7 +579,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
             buf_flat = buf.flatten(0, 1)
-            loc = _clamp_scatter_locs(loc, buf_flat.shape[0], "compress")
+            loc = _clamp_scatter_locs(loc, buf_flat.shape[0])
             kv_view = kv.to(buf_flat.dtype)
             if kv_view.ndim == buf_flat.ndim - 1:
                 kv_view = kv_view.unsqueeze(1)
