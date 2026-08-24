@@ -104,6 +104,8 @@ MI30X_MINIMAX_M3_MODELS = [
             "triton",
             "--chunked-prefill-size",
             "8192",
+            # M3 is multimodal, so adjust_mem_fraction_for_vlm scales this down
+            # for the vision tower; 0.80 lands at ~0.68 effective.
             "--mem-fraction-static",
             "0.80",
             "--model-loader-extra-config",
