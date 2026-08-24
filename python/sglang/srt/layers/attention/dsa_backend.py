@@ -139,6 +139,16 @@ def _prepare_hisparse_mtp_native(
     ).reshape(expected_rows, -1)
 
 
+def _use_hisparse_mtp_union(*, coordinator, forward_mode, dsa_impl: str) -> bool:
+    """Select the raw-TopK union route before page-table transformation."""
+    return bool(
+        coordinator is not None
+        and getattr(coordinator, "mtp_union_enabled", False)
+        and forward_mode.is_target_verify()
+        and dsa_impl == "flashmla_kv"
+    )
+
+
 def _all_gather_dsa_trtllm_fp8_kv(
     forward_batch: ForwardBatch,
     k: torch.Tensor,
@@ -2008,8 +2018,22 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
         hisparse_demand = None
+        use_hisparse_mtp_union = _use_hisparse_mtp_union(
+            coordinator=self.hisparse_coordinator,
+            forward_mode=forward_batch.forward_mode,
+            dsa_impl=dsa_impl,
+        )
 
-        if self.use_fused_topk:
+        if use_hisparse_mtp_union:
+            page_table_1 = _prepare_hisparse_mtp_native(
+                coordinator=self.hisparse_coordinator,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                relative_topk=topk_indices,
+                layer_id=layer.layer_id,
+                num_steps=self.speculative_num_draft_tokens,
+            )
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2057,7 +2081,10 @@ class DeepseekSparseAttnBackend(
                     logical_topk=page_table_1,
                     layer_id=layer.layer_id,
                 )
-            elif forward_batch.forward_mode.is_target_verify():
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and not use_hisparse_mtp_union
+            ):
                 page_table_1 = _prepare_hisparse_mtp_native(
                     coordinator=self.hisparse_coordinator,
                     forward_batch=forward_batch,
@@ -2066,7 +2093,7 @@ class DeepseekSparseAttnBackend(
                     layer_id=layer.layer_id,
                     num_steps=self.speculative_num_draft_tokens,
                 )
-            else:
+            elif not forward_batch.forward_mode.is_target_verify():
                 # flash_mla_sparse_fwd / tilelang require int32 page indices.
                 page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1

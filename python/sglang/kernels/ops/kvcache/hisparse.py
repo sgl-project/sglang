@@ -143,7 +143,6 @@ def load_cache_to_device_buffer_spec_mla(
         num_steps,
         record_miss_plan,
     )
-
     module.load_cache_to_device_buffer_spec(
         top_k_tokens,
         device_buffer_tokens,

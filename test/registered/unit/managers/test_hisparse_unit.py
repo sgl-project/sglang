@@ -1164,6 +1164,33 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
 
 
 class TestHiSparseMTPNative(unittest.TestCase):
+    def test_union_target_verify_selects_raw_topk_route(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        coordinator = SimpleNamespace(mtp_union_enabled=True)
+        self.assertTrue(
+            dsa_backend._use_hisparse_mtp_union(
+                coordinator=coordinator,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                dsa_impl="flashmla_kv",
+            )
+        )
+        self.assertFalse(
+            dsa_backend._use_hisparse_mtp_union(
+                coordinator=coordinator,
+                forward_mode=ForwardMode.DECODE,
+                dsa_impl="flashmla_kv",
+            )
+        )
+        self.assertFalse(
+            dsa_backend._use_hisparse_mtp_union(
+                coordinator=coordinator,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                dsa_impl="tilelang",
+            )
+        )
+
     def test_native_target_verify_keeps_request_relative_topk(self):
         from sglang.srt.layers.attention import dsa_backend
         from sglang.srt.layers.attention.dsa.dsa_topk_backend import (

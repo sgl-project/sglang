@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    HiSparseSpecState,
     backup_mtp_demand_window_mla,
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     load_cache_to_device_buffer_mtp_mla,
+    load_cache_to_device_buffer_spec_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -39,6 +41,9 @@ device_module = get_device_module()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+MTP_UNION_SCRATCH_ROWS = 4096
+MTP_UNION_HASH_SIZE = 8192
 
 
 class HiSparseAct(NamedTuple):
@@ -202,9 +207,24 @@ class HiSparseCoordinator:
             )
         elif self.mtp_demand_buffer_enabled:
             logger.info("HiSparse MTP Demand buffer enabled")
+        self.mtp_union_enabled = bool(
+            not self.mtp_demand_buffer_enabled
+            and not self.is_dsv4_hisparse
+            and 2 <= self.mtp_num_rows <= 4
+            and self.top_k == 2048
+            and self.device_buffer_size == 4096
+        )
+        if self.mtp_union_enabled:
+            logger.info("HiSparse MTP union buffer enabled")
         self.mtp_demand_cache_rows = 4096
         self.mtp_staging_size = (
-            0 if self.mtp_demand_buffer_enabled else self.mtp_num_rows * self.top_k
+            0
+            if self.mtp_demand_buffer_enabled
+            else (
+                MTP_UNION_SCRATCH_ROWS
+                if self.mtp_union_enabled
+                else self.mtp_num_rows * self.top_k
+            )
         )
         self.mtp_side_reserve_size = (
             self.mtp_demand_cache_rows
@@ -304,6 +324,49 @@ class HiSparseCoordinator:
             self.mtp_demand_expanded_committed_lens = None
             self.mtp_demand_device_locs = None
             self.top_k_host_locs_buffer = None
+        if self.mtp_union_enabled:
+            self.mtp_union_cache_index = torch.full(
+                (layer_num, max_num_req_slots, 2, MTP_UNION_HASH_SIZE),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.mtp_union_cache_policy = torch.zeros(
+                (layer_num, max_num_req_slots + 1, self.device_buffer_size),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.mtp_union_scratch_locs = torch.full(
+                (max_num_req_slots, MTP_UNION_SCRATCH_ROWS),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata_occurrences = self.mtp_num_rows * self.top_k
+            self.mtp_union_scratch_state = torch.full(
+                (
+                    max_num_req_slots + 1,
+                    max(4 * max_num_req_slots, 5 * metadata_occurrences),
+                ),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.mtp_union_scratch_state[0].zero_()
+            hot_tokens = torch.arange(
+                self.device_buffer_size, dtype=torch.int64, device=device
+            )
+            self._mtp_union_hash_slots = (hot_tokens * 2654435761) & (
+                MTP_UNION_HASH_SIZE - 1
+            )
+            self._mtp_union_hash_entries = (hot_tokens << 32) | hot_tokens
+        else:
+            self.mtp_union_cache_index = None
+            self.mtp_union_cache_policy = None
+            self.mtp_union_scratch_locs = None
+            self.mtp_union_scratch_state = None
+            self._mtp_union_hash_slots = None
+            self._mtp_union_hash_entries = None
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -546,6 +609,33 @@ class HiSparseCoordinator:
         self.mtp_demand_cache_tags[:, req_pool_idx].zero_()
         self.mtp_demand_decode_calls[req_pool_idx].zero_()
 
+    def _reset_mtp_union_request_state(self, req_pool_idx: int) -> None:
+        if not getattr(self, "mtp_union_enabled", False):
+            return
+        assert self.mtp_union_cache_index is not None
+        assert self.mtp_union_cache_policy is not None
+        assert self.mtp_union_scratch_locs is not None
+        assert self.mtp_union_scratch_state is not None
+        self.mtp_union_cache_index[:, req_pool_idx].fill_(-1)
+        self.mtp_union_cache_policy[:, 0, req_pool_idx].zero_()
+        self.mtp_union_cache_policy[:, req_pool_idx + 1].zero_()
+        request_capacity = self.mtp_union_scratch_locs.shape[0]
+        for counter_group in range(4):
+            self.mtp_union_scratch_state[
+                0, counter_group * request_capacity + req_pool_idx
+            ] = 0
+        self.mtp_union_scratch_state[req_pool_idx + 1].fill_(-1)
+        self.mtp_union_scratch_locs[req_pool_idx].fill_(-1)
+
+    def _initialize_mtp_union_request_state(self, req_pool_idx: int) -> None:
+        assert self.mtp_union_enabled
+        assert self.mtp_union_cache_index is not None
+        assert self._mtp_union_hash_slots is not None
+        assert self._mtp_union_hash_entries is not None
+        self.mtp_union_cache_index[:, req_pool_idx, 0, self._mtp_union_hash_slots] = (
+            self._mtp_union_hash_entries
+        )
+
     def advance_mtp_demand_epoch(self, req_pool_indices: torch.Tensor) -> None:
         if not self.mtp_demand_buffer_enabled:
             return
@@ -769,6 +859,13 @@ class HiSparseCoordinator:
             self._bind_mtp_demand_buffer(req.kv.req_pool_idx, mtp_side_reserve)
         elif self.mtp_staging_size > 0:
             self.req_to_mtp_staging[req.kv.req_pool_idx].copy_(mtp_side_reserve)
+            if self.mtp_union_enabled:
+                assert self.mtp_union_scratch_locs is not None
+                self._reset_mtp_union_request_state(req.kv.req_pool_idx)
+                self.mtp_union_scratch_locs[req.kv.req_pool_idx].copy_(
+                    mtp_side_reserve[:MTP_UNION_SCRATCH_ROWS]
+                )
+                self._initialize_mtp_union_request_state(req.kv.req_pool_idx)
         self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
         self.req_device_buffer_tokens[
@@ -1676,6 +1773,7 @@ class HiSparseCoordinator:
 
         self._reset_mtp_demand_request_state(req.req_pool_idx)
         self._free_mtp_demand_buffer(req.req_pool_idx)
+        self._reset_mtp_union_request_state(req.req_pool_idx)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1870,6 +1968,30 @@ class HiSparseCoordinator:
 
         output = self.top_k_device_locs_mtp_buffer[:num_reqs, :num_steps]
         output.fill_(-1)
+        if self.mtp_union_enabled:
+            assert self.mtp_union_cache_index is not None
+            assert self.mtp_union_cache_policy is not None
+            assert self.mtp_union_scratch_locs is not None
+            assert self.mtp_union_scratch_state is not None
+            load_cache_to_device_buffer_spec_mla(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=output,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                state=HiSparseSpecState(
+                    cache_index=self.mtp_union_cache_index[layer_id],
+                    cache_policy=self.mtp_union_cache_policy[layer_id],
+                    scratch_locs=self.mtp_union_scratch_locs,
+                    scratch_state=self.mtp_union_scratch_state,
+                ),
+                num_real_reqs=self.num_real_reqs,
+            )
+            return output
         load_cache_to_device_buffer_mtp_mla(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
