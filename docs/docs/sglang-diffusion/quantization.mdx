@@ -145,6 +145,14 @@ backend.
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
     <tr>
+      <td><code>auto-round</code> W4A16</td>
+      <td>Transformer component repo with a self-describing <code>quantization_config</code> and <code>auto_round:auto_gptq</code> packing</td>
+      <td><code>--transformer-path</code></td>
+      <td>Native dense DiTs with compatible component parameter mappings; MiniMax-H3 Diffusers components are supported</td>
+      <td>None</td>
+      <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
       <td><code>modelopt-nvfp4</code></td>
       <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>

@@ -45,3 +45,7 @@ class QuantizationConfig(SRTQuantizationConfig):
     ) -> bool:
         """Whether a row-parallel shard preserves this format's input layout."""
         return True
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        """Translate checkpoint module names to the native model namespace."""
+        return
