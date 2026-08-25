@@ -201,6 +201,8 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mha",
     "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
+    "minicpm_flashattn",
+    "minicpm_flashinfer",
     # AMD specific
     "aiter",
     "wave",
@@ -241,6 +243,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "intel_xpu",
     "triton",
 ]
 
@@ -403,6 +406,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "nvidia_kda",
     "ptx_kda",
     "helion",
+    "intel_xpu",
 ]
 
 
@@ -967,7 +971,12 @@ class ServerArgs:
         NS("schedule"),
     ] = False
     disable_radix_cache: A[
-        bool, "Disable RadixAttention for prefix caching.", NS("memory")
+        bool,
+        Arg(
+            help="Disable RadixAttention for prefix caching.",
+            resolvable=True,
+        ),
+        NS("memory"),
     ] = False
     enable_page_major_kv_layout: A[
         bool,
@@ -1035,6 +1044,11 @@ class ServerArgs:
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
             aliases=["--nccl-init-addr"],
         ),
+        NS("parallel"),
+    ] = None
+    gated_launch_port: A[
+        Optional[int],
+        "The port of the gated launch control server. When set, every rank blocks right after the distributed environment is initialized, before any sizable GPU allocation, until `POST /gate/activate` is sent to this port on the host of the first rank. This lets an external orchestrator defer the memory hungry part of startup to a safe window. Defaults to None, which disables the gate.",
         NS("parallel"),
     ] = None
     nnodes: A[int, "The number of nodes.", NS("parallel")] = 1
@@ -1217,6 +1231,16 @@ class ServerArgs:
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
+        NS("parallel"),
+    ] = False
+    enable_shared_experts_attn_tp: A[
+        bool,
+        "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
+        NS("parallel"),
+    ] = False
+    enable_dense_mlp_attn_tp: A[
+        bool,
+        "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
     disable_attn_tp_gather: A[
@@ -8178,6 +8202,11 @@ class ServerArgs:
                 "(--weight-cache-mode off) for this configuration."
             )
 
+        if self.weight_cache_mode != "off" and self.enable_eplb:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with --enable-eplb."
+            )
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
@@ -10419,6 +10448,15 @@ class ServerArgs:
 
     def should_export_expert_balancedness_to_prometheus(self) -> bool:
         return self.expert_balancedness_report_mode in ("prometheus", "both")
+
+
+def compute_world_size(server_args: ServerArgs) -> int:
+    """Return the total GPU count across all data-parallel replicas."""
+    return (
+        (1 if server_args.enable_dp_attention else server_args.dp_size)
+        * server_args.tp_size
+        * server_args.pp_size
+    )
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
