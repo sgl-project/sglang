@@ -135,6 +135,16 @@ class AttentionBackend(ABC):
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        """Snapshot late prefill reads before a PRE_REPLAY event is published.
+
+        Runners call this only after the actual eager/replay query geometry is
+        known. Backends that retain scheduler-shared reads into the model
+        forward keep the default no-op and must not declare PRE_REPLAY.
+        """
+
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
     # assume that generic ForwardBatch metadata is sufficient for every

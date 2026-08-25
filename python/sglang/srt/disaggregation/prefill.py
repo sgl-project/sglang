@@ -23,8 +23,9 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -86,6 +87,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+@dataclass
+class StagedPrefillTransferIndices:
+    """Pinned CPU mirrors covered by GenerationBatchResult.copy_done."""
+
+    end_idx: int
+    full_page_indices: torch.Tensor
+    dsa_page_indices: Optional[torch.Tensor] = None
+    swa_seq_len: Optional[int] = None
+    swa_page_indices: Optional[torch.Tensor] = None
+    mamba_indices: Optional[torch.Tensor] = None
+
+
+@dataclass
+class StagedCachedPrefixTransferIndices:
+    """Pinned prefix page IDs staged before the DP admission collective."""
+
+    end_idx: int
+    page_indices: torch.Tensor
+    ready_event: object
+
+
+def _copy_page_indices_to_pinned_cpu(
+    kv_indices: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Queue a fixed-shape page-id D2H without synchronizing the caller."""
+    page_indices = kv_indices[::page_size].to(torch.int64) // page_size
+    cpu_indices = torch.empty(
+        page_indices.shape, dtype=page_indices.dtype, device="cpu", pin_memory=True
+    )
+    cpu_indices.copy_(page_indices, non_blocking=True)
+    page_indices.record_stream(torch.cuda.current_stream(page_indices.device))
+    return cpu_indices
+
+
+def _copy_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    cpu_tensor = torch.empty(
+        tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+    )
+    cpu_tensor.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return cpu_tensor
 
 
 def should_force_retry(req: Req) -> bool:
@@ -497,6 +541,156 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def stage_prefill_transfer_indices(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> Dict[str, StagedPrefillTransferIndices]:
+        """Queue page-index D2H copies on the existing result-copy stream.
+
+        The scheduler consumes these tensors only after ``copy_done``.  This
+        keeps send_kv_chunk() from executing a series of pageable ``.cpu()`` /
+        ``.numpy()`` calls after the forward, each of which otherwise drains the
+        schedule stream.  The pending-send set also closes the unified-memory
+        move gate while the staged physical addresses are waiting to be sent.
+        """
+        if _is_npu:
+            return {}
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = set(
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        staged: Dict[str, StagedPrefillTransferIndices] = {}
+
+        for req in batch.reqs:
+            if req.pending_bootstrap or is_aborted(req) or req.extend_range is None:
+                continue
+
+            transfer_input_len = len(req.origin_input_ids)
+            end_idx = min(req.extend_range.end, transfer_input_len)
+            if end_idx <= 0 or end_idx < req.start_send_idx:
+                continue
+
+            full_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :end_idx
+            ]
+            transfer_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    full_indices
+                )
+            )
+            entry = StagedPrefillTransferIndices(
+                end_idx=end_idx,
+                full_page_indices=_copy_page_indices_to_pinned_cpu(
+                    transfer_indices, page_size
+                ),
+            )
+
+            is_last_chunk = end_idx >= transfer_input_len
+            if is_last_chunk:
+                if StateType.MAMBA in state_types:
+                    mamba_indices = self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                    )
+                    entry.mamba_indices = _copy_to_pinned_cpu(mamba_indices)
+
+                if StateType.SWA in state_types:
+                    window_start = max(
+                        req.disagg_decode_prefix_len,
+                        end_idx - self.sliding_window_size,
+                    )
+                    window_start = (window_start // page_size) * page_size
+                    swa_indices = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            full_indices[window_start:end_idx]
+                        )
+                    )
+                    entry.swa_seq_len = end_idx
+                    entry.swa_page_indices = _copy_page_indices_to_pinned_cpu(
+                        swa_indices, page_size
+                    )
+
+                if (
+                    StateType.DSA in state_types
+                    or StateType.MINIMAX_INDEX_K in state_types
+                ):
+                    # Preserve the existing state-pool addressing semantics:
+                    # unlike the main KV transfer, this path intentionally uses
+                    # the req_to_token values before unified-pool translation.
+                    entry.dsa_page_indices = _copy_page_indices_to_pinned_cpu(
+                        full_indices, page_size
+                    )
+
+            staged[str(req.rid)] = entry
+            self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+        return staged
+
+    def stage_cached_prefix_transfer_indices(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> None:
+        """Stage early-send page IDs before DP admission can block the CPU.
+
+        ``maybe_send_cached_prefix_chunk`` runs immediately before the suffix
+        forward.  Converting the device mapping there with pageable ``.cpu()``
+        can drain an unrelated prior forward from the scheduler stream.  Queue
+        the fixed-shape D2H here, before the DP-attention collective, and make
+        the eventual sender wait only for this narrow copy event.
+        """
+        if (
+            batch is None
+            or _is_npu
+            or not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
+        ):
+            return
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        pending = []
+        for req in batch.reqs:
+            if req.pending_bootstrap or is_aborted(req):
+                continue
+            if self.enable_staging and req.early_send_prefix_end is None:
+                req.early_send_prefix_end = max(
+                    0, len(req.prefix_indices) - req.host_hit_length
+                )
+            cached_end = (
+                req.early_send_prefix_end
+                if self.enable_staging
+                else len(req.prefix_indices) - req.host_hit_length
+            )
+            if cached_end <= req.start_send_idx or cached_end % page_size != 0:
+                continue
+
+            full_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :cached_end
+            ]
+            transfer_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    full_indices
+                )
+            )
+            pending.append(
+                (
+                    req,
+                    cached_end,
+                    _copy_page_indices_to_pinned_cpu(transfer_indices, page_size),
+                )
+            )
+
+        if not pending:
+            return
+        ready_event = self.device_module.Event()
+        ready_event.record()
+        for req, cached_end, page_indices in pending:
+            req._staged_cached_prefix_transfer_indices = (
+                StagedCachedPrefixTransferIndices(
+                    end_idx=cached_end,
+                    page_indices=page_indices,
+                    ready_event=ready_event,
+                )
+            )
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -557,6 +751,7 @@ class SchedulerDisaggregationPrefillMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        self.stage_cached_prefix_transfer_indices(batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -683,6 +878,11 @@ class SchedulerDisaggregationPrefillMixin:
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
         auxiliary_output = result.auxiliary_host_output
+        staged_transfer_indices = result.disagg_transfer_indices or {}
+        for req in batch.reqs:
+            req._staged_prefill_transfer_indices = staged_transfer_indices.get(
+                str(req.rid)
+            )
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -981,6 +1181,7 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        req._staged_cached_prefix_transfer_indices = None
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -1117,6 +1318,20 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = (
+            req._staged_cached_prefix_transfer_indices
+        )
+        if (
+            staged_prefix is not None
+            and staged_prefix.end_idx >= cached_end
+            and not staged_prefix.ready_event.query()
+        ):
+            # Early-send is optional. Under overlap scheduling the pinned D2H
+            # can still be behind the previous forward. Waiting here blocks
+            # the scheduler and turns one slow DP rank into an all-gather idle
+            # gap on every rank. Retry on the request's next chunk; if there
+            # is no next chunk, the regular final send covers the full range.
+            return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
@@ -1169,6 +1384,13 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         state_indices: Optional[List] = None
+        staged: Optional[StagedPrefillTransferIndices] = (
+            req._staged_prefill_transfer_indices
+        )
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = (
+            req._staged_cached_prefix_transfer_indices
+        )
+        staged_prefix_ready = False
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1180,6 +1402,8 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
+                if staged is not None and staged.mamba_indices is not None:
+                    return [staged.mamba_indices.numpy()]
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
@@ -1191,6 +1415,12 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
+                if (
+                    staged is not None
+                    and staged.swa_seq_len == seq_len
+                    and staged.swa_page_indices is not None
+                ):
+                    return staged.swa_page_indices.numpy()
                 window_size = self.sliding_window_size
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -1205,6 +1435,14 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                if (
+                    staged is not None
+                    and staged.end_idx >= seq_len
+                    and staged.dsa_page_indices is not None
+                ):
+                    return staged.dsa_page_indices[
+                        : kv_to_page_num(seq_len, page_size)
+                    ].numpy()
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -1288,17 +1526,41 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+            if (
+                staged_prefix is not None
+                and staged_prefix.end_idx >= seg_end
+                and seg_start % page_size == 0
+            ):
+                if not staged_prefix_ready:
+                    staged_prefix.ready_event.synchronize()
+                    staged_prefix_ready = True
+                page_start = seg_start // page_size
+                page_count = kv_to_page_num(seg_end - seg_start, page_size)
+                page_indices = staged_prefix.page_indices[
+                    page_start : page_start + page_count
+                ].numpy()
+            elif (
+                staged is not None
+                and staged.end_idx >= seg_end
+                and seg_start % page_size == 0
+            ):
+                page_start = seg_start // page_size
+                page_count = kv_to_page_num(seg_end - seg_start, page_size)
+                page_indices = staged.full_page_indices[
+                    page_start : page_start + page_count
+                ].numpy()
+            else:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+                # physical ones. Per segment, since each is its own gather.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
                 )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
@@ -1310,10 +1572,13 @@ class SchedulerDisaggregationPrefillMixin:
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
+        if staged_prefix is not None and end_idx >= staged_prefix.end_idx:
+            req._staged_cached_prefix_transfer_indices = None
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
         if last_chunk:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            req._staged_prefill_transfer_indices = None
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
@@ -1329,6 +1594,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None
+        req._staged_cached_prefix_transfer_indices = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
         req.pending_bootstrap = True

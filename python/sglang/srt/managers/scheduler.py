@@ -1533,7 +1533,6 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
-
         if not self.enable_overlap:
             return
 
@@ -3823,6 +3822,13 @@ class Scheduler(
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
+                                if (
+                                    self.disaggregation_mode
+                                    == DisaggregationMode.PREFILL
+                                ):
+                                    batch_result.disagg_transfer_indices = (
+                                        self.stage_prefill_transfer_indices(batch)
+                                    )
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
@@ -3833,6 +3839,13 @@ class Scheduler(
                                 # gated by copy_done, so nothing on forward_stream waits.
                                 self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
+                                    if (
+                                        self.disaggregation_mode
+                                        == DisaggregationMode.PREFILL
+                                    ):
+                                        batch_result.disagg_transfer_indices = (
+                                            self.stage_prefill_transfer_indices(batch)
+                                        )
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
@@ -3873,6 +3886,10 @@ class Scheduler(
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
                 batch_result.copy_done = self.device_module.Event()
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    batch_result.disagg_transfer_indices = (
+                        self.stage_prefill_transfer_indices(batch)
+                    )
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
                     return_hidden_states=batch.return_hidden_states,
@@ -4030,6 +4047,10 @@ class Scheduler(
         # with subsequent forward computation.
         self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                batch_result.disagg_transfer_indices = (
+                    self.stage_prefill_transfer_indices(cur_batch)
+                )
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,

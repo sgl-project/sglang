@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
     ComponentAction,
+    FreeComponentDeviceSlot,
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -78,12 +79,14 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
@@ -134,6 +137,10 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Readiness of CUDA index tensors owned by this node. Direct HiCache
+        # eviction must not wait on unrelated, newer mutations elsewhere in
+        # the radix tree.
+        self.device_values_ready_event = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -939,7 +946,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeComponentDeviceSlot, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -990,9 +1000,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
+                full_value = value_slice[dup_start:consumed_from]
                 step_actions.append(
-                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                    FreeComponentDeviceSlot(
+                        [full_value], component_type=BASE_COMPONENT_TYPE
+                    )
                 )
+                if ComponentType.SWA in self.components_by_type:
+                    swa_start = max(
+                        dup_start,
+                        state.params.swa_evicted_seqlen - state.total_prefix_length,
+                    )
+                    if swa_start < consumed_from:
+                        step_actions.append(
+                            FreeComponentDeviceSlot(
+                                [value_slice[swa_start:consumed_from]],
+                                component_type=ComponentType.SWA,
+                            )
+                        )
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))
@@ -1096,6 +1121,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
+        self._record_device_values_ready(new_node)
+        self._record_device_values_ready(child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # A split of a backuped node tells the cache to fix its publish list.
@@ -1135,6 +1162,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+        self._record_device_values_ready(new_node)
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
@@ -1155,6 +1183,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
+        self._record_device_values_ready(node)
         self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
@@ -1982,19 +2011,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
         if self.is_write_back:
-            # Write-back may reclaim a duplicate host copy while H->D DMA is
-            # still reading it, so pin every source node until the ack.
-            for xfers in ([kv_xfer], *comp_xfers.values()):
-                for xfer in xfers:
-                    for nid in xfer.nodes_to_load or ():
-                        pinned = self.node_by_id(nid)
-                        # One live load-back per node; only the same anchor may
-                        # re-pin (a node can sit in Full and aux transfer lists).
-                        assert pinned.load_back_pending_id in (None, node_id), (
-                            f"node {nid} pinned by load-back "
-                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                        )
-                        pinned.load_back_pending_id = node_id
+            # Pin Full KV host slots against duplicate reclaim until the ack.
+            # Auxiliary pools have independent host locks and may legitimately
+            # load the same radix node under a different anchor.
+            for nid in kv_xfer.nodes_to_load or ():
+                pinned = self.node_by_id(nid)
+                assert pinned.load_back_pending_id in (None, node_id), (
+                    f"node {nid} pinned by load-back "
+                    f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                )
+                pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -2056,11 +2082,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
         node.component_data[component_type].value = value
+        self._record_device_values_ready(node)
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
+
+    def _record_device_values_ready(self, node: UnifiedTreeNode) -> None:
+        """Publish readiness of CUDA index mutations owned by ``node``."""
+        if torch.device(self.device).type == "cpu":
+            return
+        event = device_module.Event()
+        event.record()
+        node.device_values_ready_event = event
+
+    def device_values_ready_event(self, node_id: NodeId):
+        """Return the narrow dependency for direct D->H index conversion."""
+        return self.node_by_id(node_id).device_values_ready_event
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType

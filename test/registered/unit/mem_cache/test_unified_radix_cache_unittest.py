@@ -258,7 +258,7 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
 
 class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
     def _build_core(self, *, is_write_back: bool):
-        component_types = (ComponentType.FULL,)
+        component_types = (ComponentType.FULL, ComponentType.SWA)
         root = UnifiedTreeNode(component_types)
         shared = UnifiedTreeNode(component_types)
         anchor_a = UnifiedTreeNode(component_types)
@@ -272,7 +272,9 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         core.is_write_back = is_write_back
         core.root_node = root
         core.node_by_id.side_effect = nodes.__getitem__
-        core.components_by_type = {ComponentType.FULL: mock.Mock()}
+        core.components_by_type = {
+            component_type: mock.Mock() for component_type in component_types
+        }
         core.full_host_duplicates = {}
         core._is_settled_full_host_duplicate.side_effect = (
             lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
@@ -282,18 +284,27 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         )
         return core, shared, anchor_a, anchor_b
 
-    def _commit_load_back(self, core, anchor, source):
-        transfer = PoolTransfer(
+    def _commit_load_back(self, core, anchor, *, full_nodes=(), swa_nodes=()):
+        kv_xfer = PoolTransfer(
             name=PoolName.KV,
-            host_indices=torch.tensor([1], dtype=torch.int64),
-            nodes_to_load=[source.id],
+            host_indices=torch.tensor([1] * len(full_nodes), dtype=torch.int64),
+            nodes_to_load=[node.id for node in full_nodes],
         )
+        comp_xfers = {}
+        if swa_nodes:
+            comp_xfers[ComponentType.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor([2] * len(swa_nodes), dtype=torch.int64),
+                    nodes_to_load=[node.id for node in swa_nodes],
+                )
+            ]
         return UnifiedTreeCore.commit_load_back(
             core,
             anchor.id,
-            torch.tensor([2], dtype=torch.int64),
-            transfer,
-            {},
+            torch.tensor([3] * len(full_nodes), dtype=torch.int64),
+            kv_xfer,
+            comp_xfers,
         )
 
     def test_write_through_different_anchors_track_duplicate_without_pending(self):
@@ -302,8 +313,8 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         full.value = torch.tensor([1], dtype=torch.int64)
         full.host_value = torch.tensor([2], dtype=torch.int64)
 
-        self._commit_load_back(core, anchor_a, shared)
-        self._commit_load_back(core, anchor_b, shared)
+        self._commit_load_back(core, anchor_a, full_nodes=(shared,))
+        self._commit_load_back(core, anchor_b, full_nodes=(shared,))
         UnifiedTreeCore.finish_load_back(core, anchor_a.id)
 
         self.assertIsNone(shared.load_back_pending_id)
@@ -318,18 +329,43 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         full.value = torch.tensor([1], dtype=torch.int64)
         full.host_value = torch.tensor([2], dtype=torch.int64)
 
-        self._commit_load_back(core, anchor_a, shared)
+        self._commit_load_back(core, anchor_a, full_nodes=(shared,))
 
         self.assertEqual(shared.load_back_pending_id, anchor_a.id)
         self.assertFalse(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         with self.assertRaisesRegex(AssertionError, "new anchor"):
-            self._commit_load_back(core, anchor_b, shared)
+            self._commit_load_back(core, anchor_b, full_nodes=(shared,))
 
         UnifiedTreeCore.finish_load_back(core, anchor_a.id)
 
         self.assertIsNone(shared.load_back_pending_id)
         self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         core._update_duplicate_tracking.assert_called_once_with(shared)
+
+    def test_auxiliary_overlap_does_not_replace_full_pending_anchor(self):
+        core, shared, descendant, _ = self._build_core(is_write_back=True)
+        full = shared.component_data[ComponentType.FULL]
+        full.value = torch.tensor([1], dtype=torch.int64)
+        full.host_value = torch.tensor([2], dtype=torch.int64)
+
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        # A later request may load an auxiliary pool for the shared ancestor
+        # while the descendant's Full KV DMA is still in flight.
+        self._commit_load_back(core, shared, swa_nodes=(shared,))
+        UnifiedTreeCore.finish_load_back(core, shared.id)
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        UnifiedTreeCore.finish_load_back(core, descendant.id)
+        self.assertIsNone(shared.load_back_pending_id)
+
+    def test_full_overlap_with_different_anchor_is_still_rejected(self):
+        core, shared, descendant, _ = self._build_core(is_write_back=True)
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+
+        with self.assertRaisesRegex(AssertionError, "new anchor"):
+            self._commit_load_back(core, shared, full_nodes=(shared,))
 
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
@@ -623,6 +659,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        # Direct HiCache deliberately prepares transfer indices on a helper
+        # thread.  These helpers assert the final post-DMA cache state, so wait
+        # for that preparation before inspecting the acknowledgement queue;
+        # production scheduling remains asynchronous and polls it next step.
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -3688,6 +3729,7 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -4171,6 +4213,7 @@ class UnifiedRadixCacheSuite:
     def _finish_pending_loads(self, cache):
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -6185,24 +6228,61 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         UnifiedRadixCache._apply_cache_action(cache, action)
         component.apply_component_action.assert_called_once_with(action)
 
-    def test_apply_component_action_device_kv_full_swa_uses_full_attn(self):
+    def test_apply_component_action_device_kv_full_swa_uses_segment_release(self):
         cache = mock.MagicMock()
         cache.is_swa_enabled = True
         indices = torch.tensor([4, 5])
         _component_with_cache(ComponentType.FULL, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
         )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
-            indices
+        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
+            indices, start_pos=0
         )
 
-    def test_apply_component_action_device_kv_swa_uses_free_swa(self):
+    def test_flush_write_back_batch_waits_before_demoting(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.write_queue = [mock.sentinel.pending_write]
+        cache.ongoing_write_through = {}
+        cache.writing_check = mock.Mock()
+        cache._demote = mock.Mock()
+        tracker = {ComponentType.FULL: 0}
+        node_ids = [11, 12]
+        calls = mock.Mock()
+        calls.attach_mock(cache.cache_controller.start_writing, "start")
+        calls.attach_mock(cache.writing_check, "wait")
+        calls.attach_mock(cache._demote, "demote")
+
+        cache._flush_write_back_eviction_batch(node_ids, tracker)
+
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                mock.call.start(),
+                mock.call.wait(write_back=True),
+                mock.call.demote(11, tracker),
+                mock.call.demote(12, tracker),
+            ],
+        )
+        self.assertEqual(node_ids, [])
+
+    def test_flush_write_back_batch_is_noop_without_hicache(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = None
+        cache.ongoing_write_through = {}
+        tracker = {ComponentType.FULL: 0}
+
+        cache._flush_write_back_eviction_batch([], tracker)
+
+    def test_apply_component_action_device_kv_swa_uses_segment_release(self):
         cache = mock.MagicMock()
         indices = torch.tensor([4, 5])
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa_segment.assert_called_once_with(
+            indices, start_pos=0
+        )
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()
@@ -6298,9 +6378,11 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
-        kept_full = torch.tensor([1, 2], dtype=torch.int64)
-        incoming_full = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        alloc.page_size = 2
+        kept_full = torch.tensor([2, 3], dtype=torch.int64)
+        incoming_full = torch.tensor([4, 5], dtype=torch.int64)
+        swa_value = torch.tensor([6, 7], dtype=torch.int64)
+        alloc.translate_loc_from_full_to_swa.return_value = swa_value
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -6313,7 +6395,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.full_attn_allocator.free.assert_called_once_with(incoming_full)
+        alloc.full_attn_allocator.free_segment.assert_called_once_with(
+            incoming_full, start_pos=0
+        )
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
@@ -6515,7 +6599,9 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         )
         step = cache.tree_core.begin_insert(params)
         self.assertIsNotNone(step.result)
-        self.assertTrue(any(isinstance(a, FreeDeviceKV) for a in step.actions))
+        self.assertTrue(
+            any(isinstance(a, FreeComponentDeviceSlot) for a in step.actions)
+        )
         cache._apply_cache_actions(step.actions)
         cache.tree_core.end_insert()
         cache.sanity_check()

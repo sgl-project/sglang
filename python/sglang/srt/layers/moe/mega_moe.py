@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -44,6 +44,42 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
+def _resolve_mega_moe_deep_gemm_num_sms(current_num_sms: int) -> int:
+    explicit_num_sms = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_SMS.get()
+    if explicit_num_sms > 0:
+        target_num_sms = min(explicit_num_sms, current_num_sms)
+    else:
+        reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+        target_num_sms = current_num_sms - reserved_num_sms
+
+    target_num_sms = max(1, min(target_num_sms, current_num_sms))
+    if current_num_sms >= 2:
+        target_num_sms = max(2, target_num_sms)
+        target_num_sms -= target_num_sms % 2
+    return target_num_sms
+
+
+@contextmanager
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    current_num_sms = deep_gemm.get_num_sms()
+    # The SM90 MegaMoE implementation does not use the Blackwell whole-grid
+    # clustered launch that needs a residency margin.
+    if _device_sm < 100:
+        yield current_num_sms
+        return
+
+    target_num_sms = _resolve_mega_moe_deep_gemm_num_sms(current_num_sms)
+    if target_num_sms == current_num_sms:
+        yield current_num_sms
+        return
+
+    deep_gemm.set_num_sms(target_num_sms)
+    try:
+        yield target_num_sms
+    finally:
+        deep_gemm.set_num_sms(current_num_sms)
+
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -51,6 +87,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    num_sms: int,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -61,6 +98,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        num_sms,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -144,6 +182,27 @@ def _run_mega_routed(
 ) -> torch.Tensor:
     import deep_gemm
 
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm) as num_sms:
+        return _run_mega_routed_impl(
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            deep_gemm_num_sms=num_sms,
+        )
+
+
+def _run_mega_routed_impl(
+    moe: DeepseekV2MoE,
+    hidden_states: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+    input_ids_global: Optional[torch.Tensor],
+    num_tokens: int,
+    deep_gemm_num_sms: int,
+) -> torch.Tensor:
+    import deep_gemm
+
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -191,6 +250,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        num_sms=deep_gemm_num_sms,
     )
 
     if num_tokens > 0:
