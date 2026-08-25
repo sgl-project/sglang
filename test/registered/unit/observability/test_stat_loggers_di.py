@@ -182,7 +182,9 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
             mock.patch.object(StorageMetricsCollector, "_gauge_cls", _FakeMetric),
             mock.patch.object(StorageMetricsCollector, "_histogram_cls", _FakeMetric),
         ]
-        for patcher in self.patches:`n            patcher.start()`n            self.addCleanup(patcher.stop)
+        for patcher in self.patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.collector = StorageMetricsCollector(labels={"model": "test"})
         self.counter = next(
             metric
