@@ -45,6 +45,7 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 _MEGA_CACHE: dict = {}
 _MEGA_BUILD_LOGGED = False
 _MORI_SHMEM_READY = False
+_MEGA_RUNTIME_READY = False
 
 
 def is_mega_moe_aiter_enabled() -> bool:
@@ -76,12 +77,13 @@ def _validate_mtpr(mtpr: int) -> None:
 
 
 def _ensure_mori_shmem(ep_group) -> tuple[int, int]:
-    """Initialize mori symmetric shmem once for MegaMoEV2 EP communication.
+    """Initialize MegaMoEV2's process-global mori heap exactly once.
 
-    ATOM's MegaMoEV2 reads aiter's EP all2all manager (which constructs the
-    mori heap). SGLang does not initialize aiter parallel_state, so we bind
-    mori to SGLang's EP CPU group the same way ``moriep.py`` does, then try
-    the aiter manager if that package has already been set up.
+    MegaMoEV2 allocates through ``mori_shmem_create_tensor``, whose reference
+    harness registers the bootstrap group as ``default``.  Use SGLang's EP
+    Gloo group: unlike the device/RCCL WORLD group it supports the object
+    broadcast mori uses to distribute its unique id, and it remains correct
+    when EP is a proper subset of WORLD.
     """
     global _MORI_SHMEM_READY
 
@@ -91,27 +93,89 @@ def _ensure_mori_shmem(ep_group) -> tuple[int, int]:
 
     if not _MORI_SHMEM_READY:
         import mori
+        import torch._C._distributed_c10d as c10d
 
-        group_name = "mori"
-        cpu_group = ep_group.cpu_group
         try:
-            torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
+            c10d._register_process_group("default", ep_group.cpu_group)
         except Exception as exc:
             if "already registered" not in str(exc):
                 raise
-        else:
-            mori.shmem.shmem_torch_process_group_init(group_name)
+
+        torch.distributed.barrier(group=ep_group.cpu_group)
+        mori.shmem.shmem_torch_process_group_init("default")
+        mori.shmem.shmem_barrier_all()
+        torch.distributed.barrier(group=ep_group.cpu_group)
         _MORI_SHMEM_READY = True
+        logger.info(
+            "MegaMoE-ROCm: initialized mori shmem heap 'default' on EP Gloo "
+            "group (rank=%s world=%s)",
+            rank,
+            world_size,
+        )
 
-    try:
-        from aiter.dist.parallel_state import get_ep_group
+    return rank, world_size
 
-        # Load-bearing: constructing the all2all manager initializes mori's
-        # symmetric heap for MegaMoEV2 (see ATOM flydsl_mega_experts.py).
-        all2all = get_ep_group().device_communicator.all2all_manager
-        return int(all2all.rank), int(all2all.world_size)
-    except Exception:
-        return rank, world_size
+
+def initialize_mega_moe_aiter_runtime(model) -> None:
+    """Collectively build and warm MegaMoEV2 before CUDA graph capture."""
+    global _MEGA_RUNTIME_READY
+
+    if not is_mega_moe_aiter_enabled() or _MEGA_RUNTIME_READY:
+        return
+
+    ep_group = get_moe_ep_group()
+    rank, world_size = _ensure_mori_shmem(ep_group)
+
+    moe = next(
+        (
+            module
+            for module in model.modules()
+            if hasattr(module, "experts")
+            and getattr(module.experts, "_mega_moe_weights_built", False)
+        ),
+        None,
+    )
+    if moe is None:
+        raise RuntimeError(
+            "MegaMoE-ROCm runtime initialization found no prepared MoE layer. "
+            "It must run after model weight loading and before graph capture."
+        )
+
+    experts = moe.experts
+    mtpr = int(getattr(experts, "_mega_moe_mtpr", get_mega_moe_mtpr()))
+    _validate_mtpr(mtpr)
+    topk = int(moe.config.num_experts_per_tok + moe.num_fused_shared_experts)
+
+    _get_or_build_mega_moe(
+        rank=rank,
+        world_size=world_size,
+        model_dim=int(getattr(experts, "_mega_moe_model_dim", experts.hidden_size)),
+        inter_dim=int(
+            getattr(experts, "_mega_moe_inter_dim", experts.w13_weight.shape[1] // 2)
+        ),
+        experts=int(experts.num_experts),
+        topk=topk,
+        mtpr=mtpr,
+        swiglu_limit=float(getattr(experts, "_mega_moe_swiglu_limit", 0.0)),
+        w1=experts._mega_w1,
+        w1_scale=experts._mega_w1_scale,
+        w2=experts._mega_w2,
+        w2_scale=experts._mega_w2_scale,
+    )
+
+    import mori
+
+    mori.shmem.shmem_barrier_all()
+    torch.distributed.barrier(group=ep_group.cpu_group)
+    _MEGA_RUNTIME_READY = True
+    logger.info(
+        "MegaMoE-ROCm runtime ready before graph capture "
+        "(rank=%s world=%s mtpr=%s topk=%s)",
+        rank,
+        world_size,
+        mtpr,
+        topk,
+    )
 
 
 def build_mega_moe_aiter_weights(experts) -> None:
@@ -269,8 +333,23 @@ def run_mega_moe_aiter_routed(
 
     if not hasattr(experts, "_mega_w1"):
         raise RuntimeError("MegaMoE-ROCm weights were not prepared")
+    if not _MEGA_RUNTIME_READY:
+        raise RuntimeError(
+            "MegaMoE-ROCm runtime was not initialized before forward. "
+            "BaseRunner.warmup() must run before eager execution or graph capture."
+        )
+    is_empty = hidden_states.shape[0] == 0
+    if is_empty:
+        # MegaMoEV2 is an EP collective: idle DP-attention ranks still must
+        # participate, but its config selector rejects zero tokens. Dispatch a
+        # zero-weight dummy token and discard its output after the collective.
+        hidden_states = hidden_states.new_zeros((1, hidden_states.shape[1]))
+        topk_weights = topk_weights.new_zeros((1, topk_weights.shape[1]))
+        topk_ids = topk_ids.new_zeros((1, topk_ids.shape[1]))
 
-    rank, world_size = _ensure_mori_shmem(get_moe_ep_group())
+    parallel = get_parallel()
+    rank = int(parallel.moe_ep_rank)
+    world_size = int(parallel.moe_ep_size)
     mega = _get_or_build_mega_moe(
         rank=rank,
         world_size=world_size,
@@ -291,6 +370,8 @@ def run_mega_moe_aiter_routed(
     with torch.inference_mode(False), torch.no_grad():
         y = mega.forward(hidden_states.contiguous(), topk_weights, topk_ids)
 
+    if is_empty:
+        return y[:0]
     if not experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
     return y

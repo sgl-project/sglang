@@ -68,6 +68,12 @@ def handle_rocm_megamoe(server_args: ServerArgs) -> None:
             "that exports aiter.ops.flydsl.kernels.mega_moe.MegaMoEV2 "
             "(ROCm/aiter#4439)."
         )
+    if os.environ.get("MORI_SHMEM_MODE", "").lower() == "isolation":
+        raise ValueError(
+            "MegaMoE on ROCm does not support MORI_SHMEM_MODE=ISOLATION. "
+            "MegaMoEV2 uses the pure symmetric-address API (shmem_ptr_p2p), "
+            "which requires static heap mode or MORI_SHMEM_MODE=VMM_HEAP."
+        )
     logger.info(
         "MegaMoE on ROCm: using AITER FlyDSL MegaMoEV2 (mtpr=%s, ep_size=%s).",
         mtpr,

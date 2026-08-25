@@ -244,6 +244,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_rocm_mega_moe()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -297,6 +298,14 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_rocm_mega_moe(self):
+        """Initialize Mori and construct MegaMoEV2 before graph capture."""
+        from sglang.srt.layers.moe.mega_moe_aiter import (
+            initialize_mega_moe_aiter_runtime,
+        )
+
+        initialize_mega_moe_aiter_runtime(self.model_runner.model)
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
