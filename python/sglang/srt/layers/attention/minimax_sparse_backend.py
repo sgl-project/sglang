@@ -364,20 +364,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
             if extend_lens is not None:
                 self._max_seqlen_q = int(max(extend_lens))
-            elif (
-                forward_batch.forward_mode.is_target_verify()
-                and is_gfx95_supported()
-            ):
+            elif forward_batch.forward_mode.is_target_verify() and is_gfx95_supported():
                 self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
             else:
                 self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_npu and forward_batch.forward_mode.is_target_verify())
-            or (
-                is_gfx95_supported()
-                and forward_batch.forward_mode.is_target_verify()
-            )
+            or (is_gfx95_supported() and forward_batch.forward_mode.is_target_verify())
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -1374,9 +1368,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if self.is_npu and forward_batch.forward_mode.is_target_verify():
                 _ndt = self._target_verify_q_cap(forward_batch)
             else:
-                _ndt = self.speculative_num_draft_tokens or (
-                    q.shape[0] // max(_bs, 1)
-                )
+                _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
                 (_bs,),
                 int(_ndt),
@@ -1503,10 +1495,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-            if (
-                is_gfx95_supported()
-                and forward_batch.forward_mode.is_target_verify()
-            ):
+            if is_gfx95_supported() and forward_batch.forward_mode.is_target_verify():
                 # gfx950 EAGLE verify: per-draft decode rows (not extend prefill).
                 idx_o, o = self._forward_gfx950_triton_verify(
                     q,
