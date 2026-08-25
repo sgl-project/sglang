@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.ple_state_pool import PLE_NGRAM_STATE_LAYER_ID
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
@@ -1081,6 +1082,19 @@ class MoriKVManager(CommonKVManager):
             )
 
             if st == "mamba":
+                state_layer_ids = (
+                    self.kv_args.state_layer_ids[i]
+                    if i < len(self.kv_args.state_layer_ids)
+                    else []
+                )
+                if (
+                    peer_info.decode_tp_size != self.attn_tp_size
+                    and PLE_NGRAM_STATE_LAYER_ID in state_layer_ids
+                ):
+                    raise RuntimeError(
+                        "Qwen4 PLE PD state transfer currently requires matching "
+                        "prefill/decode attention TP sizes"
+                    )
                 statuses.extend(
                     self._send_mamba_state(
                         peer_info,
@@ -1094,7 +1108,15 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
+            elif st in (
+                "swa",
+                "dsa",
+                "qsa_pending",
+                "qsa_compressed",
+                "swa_ring",
+                "c128_state",
+                "minimax_index_k",
+            ):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1221,14 +1243,14 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
-        if state_type == "minimax_index_k":
+        if state_type in ("qsa_pending", "qsa_compressed", "minimax_index_k"):
             if self.pp_size is not None and self.pp_size > 1:
                 raise RuntimeError(
-                    "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                    f"PD disagg: PP>1 not supported for {state_type} yet."
                 )
             if peer_info.decode_tp_size != self.attn_tp_size:
                 raise RuntimeError(
-                    "PD disagg: heterogeneous TP not supported for MiniMax sparse index yet."
+                    f"PD disagg: heterogeneous TP not supported for {state_type} yet."
                 )
 
         common_len = min(src_state_indices.size, dst_state_indices.size)
@@ -1247,7 +1269,12 @@ class MoriKVManager(CommonKVManager):
             # These components are position- or request-indexed: truncating
             # silently misaligns rows and corrupts KV. Paged swa/dsa tolerate
             # a 1-page drift -> keep truncation.
-            if state_type in ("swa_ring", "c128_state"):
+            if state_type in (
+                "qsa_pending",
+                "qsa_compressed",
+                "swa_ring",
+                "c128_state",
+            ):
                 raise RuntimeError(
                     f"{state_type.upper()} state index length mismatch: "
                     f"src={src_state_indices.size}, dst={dst_state_indices.size}"

@@ -1096,28 +1096,28 @@ class MambaPool:
         }
     )
 
-    def _iter_transfer_state_tensors(self):
-        """Yield transferable state tensors with their per-slot slice axis."""
+    def _iter_transfer_state_entries(self):
+        """Yield ``[slot, ...]`` state entries and their transfer metadata."""
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
             tensors = value if isinstance(value, list) else [value]
             slice_axis = self.conv_slice_axis if field == "conv" else 0
             for state_tensor in tensors:
-                yield field, state_tensor, slice_axis
+                for layer_index, layer_id in enumerate(self.mamba_layer_ids):
+                    yield field, state_tensor[layer_index], slice_axis, layer_id
+
+        for sibling in self._slot_siblings:
+            yield from sibling.iter_transfer_state_entries()
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor, _ in self._iter_transfer_state_tensors():
-            data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
-            ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
-            item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
-            ]
+        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            data_ptrs.append(state_tensor.data_ptr())
+            data_lens.append(state_tensor.nbytes)
+            item_lens.append(state_tensor[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1127,13 +1127,11 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
-            axis = 2 + slice_axis
-            sliceable_dim = state_tensor.shape[axis]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
+            # transposes the two per-slot axes to [K-1, dim].
+            axis = 1 + slice_axis
+            dim_per_tensor.append(state_tensor.shape[axis])
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1143,15 +1141,14 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
-        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
-        return list(self.mamba_layer_ids) * state_tensor_count
+        return [layer_id for _, _, _, layer_id in self._iter_transfer_state_entries()]
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
-            outer_counts += [outer_count] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            outer_count = math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            outer_counts.append(outer_count)
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1166,14 +1163,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field, _, _ in self._iter_transfer_state_tensors():
+        for field, _, _, _ in self._iter_transfer_state_entries():
             # Only conv_state carries a q/k/v decomposition.
             subdims = (
                 list(self.conv_shard_groups)
                 if field == "conv" and self.conv_shard_groups is not None
                 else None
             )
-            subdims_per_tensor += [subdims] * self.num_mamba_layers
+            subdims_per_tensor.append(subdims)
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):

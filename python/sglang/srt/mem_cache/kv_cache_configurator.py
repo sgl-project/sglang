@@ -801,9 +801,23 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+
+        ple_kwargs = {}
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in self.mambaish_config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
+                ngram_context_len=self.mambaish_config.ngram_context_len,
+                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
+            )
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -825,6 +839,7 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            **ple_kwargs,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA

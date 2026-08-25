@@ -1057,6 +1057,7 @@ def setup_state_kv_args(
         HybridLinearKVPool,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -1147,6 +1148,29 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
+            if isinstance(token_to_kv_pool, QSATokenToKVPool):
+                qsa_ptrs, qsa_lens, qsa_item_lens = (
+                    token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_PENDING,
+                    qsa_ptrs,
+                    qsa_lens,
+                    qsa_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                )
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_COMPRESSED,
+                    compressed_ptrs,
+                    compressed_lens,
+                    compressed_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool

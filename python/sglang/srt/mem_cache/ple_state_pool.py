@@ -18,6 +18,11 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+# State layer IDs are serialized as uint32 by the disaggregation protocols.
+# Reserve the largest value for PLE's request-wide N-gram state, which is not
+# owned by any model layer.
+PLE_NGRAM_STATE_LAYER_ID = (1 << 32) - 1
+
 
 class SlotIndexedState(Protocol):
     """Per-request state owned by a MambaPool slot but not layer-major.
@@ -37,6 +42,8 @@ class SlotIndexedState(Protocol):
     def get_cpu_slots(self, indices: torch.Tensor) -> Any: ...
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None: ...
+
+    def iter_transfer_state_entries(self): ...
 
 
 class ShortConvPool:
@@ -127,6 +134,18 @@ class ShortConvPool:
         if self.conv_state is None or data is None:
             return
         self.conv_state[:, indices] = data.to(self.conv_state.device, non_blocking=True)
+
+    def iter_transfer_state_entries(self):
+        """Yield per-layer ``[slot, ...]`` tensors for PD state transfer."""
+        if self.conv_state is None:
+            return
+        for layer_id, layer_index in self.layer_map.items():
+            yield (
+                "ple_short_conv",
+                self.conv_state[layer_index],
+                0,
+                layer_id,
+            )
 
 
 class NGramPool:
@@ -222,3 +241,8 @@ class NGramPool:
         self.context[indices.to(dtype=torch.long)] = data.to(
             self.context.device, non_blocking=True
         )
+
+    def iter_transfer_state_entries(self):
+        """Yield the request-wide N-gram history for PD state transfer."""
+        if self.context is not None:
+            yield "ple_ngram", self.context, 0, PLE_NGRAM_STATE_LAYER_ID

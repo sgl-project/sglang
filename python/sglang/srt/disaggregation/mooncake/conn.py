@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.ple_state_pool import PLE_NGRAM_STATE_LAYER_ID
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -1253,13 +1254,20 @@ class MooncakeKVManager(CommonKVManager):
         return st in (
             StateType.SWA,
             StateType.DSA,
+            StateType.QSA_PENDING,
+            StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.C128_STATE,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         """State types whose page lists are positional and must not be truncated."""
-        return st in (StateType.SWA_RING, StateType.C128_STATE)
+        return st in (
+            StateType.QSA_PENDING,
+            StateType.QSA_COMPRESSED,
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+        )
 
     def maybe_send_extra(
         self,
@@ -1342,6 +1350,11 @@ class MooncakeKVManager(CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
+                    if PLE_NGRAM_STATE_LAYER_ID in src_state_layer_ids:
+                        raise RuntimeError(
+                            "Qwen4 PLE PD state transfer currently requires matching "
+                            "prefill/decode attention TP sizes"
+                        )
                     rc = (
                         self._send_mamba_state_slice(
                             req,
@@ -1421,6 +1434,10 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        force_flat=st
+                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
