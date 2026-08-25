@@ -118,7 +118,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
         hf_config = get_hf_config(
             model_path,
-            trust_remote_code=server_args.trust_remote_code,
+            trust_remote_code=True,
             revision=server_args.revision,
         )
         config_dict = hf_config.to_dict()
@@ -384,16 +384,11 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         return AutoTokenizer.from_pretrained(
             model_path,
             revision=server_args.revision,
-            trust_remote_code=server_args.trust_remote_code,
+            trust_remote_code=True,
         )
 
     def _load_processor(self, server_args: ServerArgs, model_path: str, hf_config):
         """Best-effort load of the repo's HunyuanImage3ImageProcessor."""
-        if not server_args.trust_remote_code:
-            logger.warning(
-                "trust_remote_code is disabled; skipping HunyuanImage3ImageProcessor loading"
-            )
-            return None
         try:
             from transformers.dynamic_module_utils import (
                 get_class_from_dynamic_module,

@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import torch
 from einops import rearrange
+from tqdm import tqdm
 
 from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
     align_hunyuan_image3_resolution,
@@ -479,7 +480,7 @@ class HunyuanImage3AR(PipelineStage):
     def _resolve_custom_tokenizer(self, server_args: ServerArgs):
         """Load base tokenizer + sglang-native HunyuanImage3 wrapper.
 
-        Uses ``AutoTokenizer.from_pretrained`` (without ``trust_remote_code``)
+        Uses ``AutoTokenizer.from_pretrained`` with ``trust_remote_code=True``
         to get the base ``PreTrainedTokenizerFast``, then wraps it in
         ``HunyuanImage3TokenizerWrapper`` which provides the multimodal
         ``apply_chat_template`` entry point.
@@ -497,10 +498,11 @@ class HunyuanImage3AR(PipelineStage):
 
         from .hunyuan_image3_tokenizer import HunyuanImage3TokenizerWrapper
 
-        # Load the base tokenizer (no trust_remote_code)
+        # Load the base tokenizer
         base_tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             revision=server_args.revision,
+            trust_remote_code=True,
         )
 
         # Wrap in our sglang-native tokenizer wrapper
@@ -542,7 +544,7 @@ class HunyuanImage3AR(PipelineStage):
             return self._processor
 
         model_path = self._model_path
-        if not model_path or not server_args.trust_remote_code:
+        if not model_path:
             return None
 
         try:
@@ -557,7 +559,7 @@ class HunyuanImage3AR(PipelineStage):
                 )
                 hf_config_obj = get_hf_config(
                     model_path,
-                    trust_remote_code=server_args.trust_remote_code,
+                    trust_remote_code=True,
                     revision=server_args.revision,
                 )
             processor_cls = get_class_from_dynamic_module(
@@ -1339,7 +1341,11 @@ class HunyuanImage3AR(PipelineStage):
         # step can rebuild the full sequence (text + image + special tokens).
         first_step_input_ids = input_ids
 
-        for step_idx, t in enumerate(timesteps):
+        for step_idx, t in enumerate(tqdm(
+            timesteps,
+            desc="Denoising",
+            total=len(timesteps),
+        )):
             first_step = step_idx == 0
 
             # Scale model input for scheduler
