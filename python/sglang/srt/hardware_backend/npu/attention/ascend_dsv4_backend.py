@@ -1217,6 +1217,7 @@ class DeepseekV4AscendAttnBackend(
 
         if ragged_layout is not None:
             metadata.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device
+            metadata.actual_seq_lengths_q_pa_cpu = None
             n_tok = int(ragged_layout.graph_num_tokens)
         else:
             metadata.actual_seq_lengths_q_pa = torch.arange(
@@ -1225,6 +1226,14 @@ class DeepseekV4AscendAttnBackend(
                 tokens_per_req,
                 dtype=torch.int32,
                 device=device,
+            )
+            # The draft-worker host metadata op consumes this fixed graph
+            # geometry without introducing a replay-time D2H synchronization.
+            metadata.actual_seq_lengths_q_pa_cpu = torch.arange(
+                0,
+                bs * tokens_per_req + tokens_per_req,
+                tokens_per_req,
+                dtype=torch.int32,
             )
             n_tok = bs * tokens_per_req
         metadata.actual_seq_lengths_q = metadata.actual_seq_lengths_q_pa[1:]
@@ -1784,6 +1793,8 @@ class DeepseekV4AscendAttnBackend(
                 device=device, dtype=torch.int32
             )
             fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
+            # Ragged target verify uses the device-side metadata operator.
+            fm.actual_seq_lengths_q_pa_cpu = None
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -1903,21 +1914,26 @@ class DeepseekV4AscendAttnBackend(
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
-        # The host metadata op reads CPU int32 mirrors — never a D2H sync of the
-        # device tensors (that would drain the stream and stall overlapped prep).
-        # cu_q mirror is sized for its graph bucket; slice down to this batch.
-        cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-        if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
-            cu_q_cpu = cu_q_cpu[: bs + 1]
-        host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-        if cu_q_cpu is not None:
-            host_inputs["cu_seqlens_q"] = cu_q_cpu
-        c1a_kwargs = base_kwargs | common | host_inputs
-        kernel_metadata = {
-            "c1a_metadata": torch.ops.npu.sparse_attn_sharedkv_metadata_host(
-                **c1a_kwargs
-            )
-        }
+        # Draft decode uses the host metadata operator to avoid replay-time D2H
+        # synchronization. Target verify/compressed attention keeps the device
+        # metadata operator because its ragged geometry is refreshed in place.
+        c1a_kwargs = base_kwargs | common
+        if self._is_dspark_draft_worker:
+            cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
+            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+                cu_q_cpu = cu_q_cpu[: bs + 1]
+            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
+            if cu_q_cpu is not None:
+                host_inputs["cu_seqlens_q"] = cu_q_cpu
+            c1a_kwargs = c1a_kwargs | host_inputs
+            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+        else:
+            c1a_kwargs = c1a_kwargs | {
+                "cu_seqlens_q": actual_seq_lengths_q_pa,
+                "seqused_kv": actual_seq_lengths_kv,
+            }
+            metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1927,7 +1943,7 @@ class DeepseekV4AscendAttnBackend(
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             kernel_metadata["c4a_metadata"] = (
-                torch.ops.npu.sparse_attn_sharedkv_metadata_host(**c4a_kwargs)
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
             )
 
             if actual_seq_lengths_q_pa is not None:
@@ -1957,7 +1973,7 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.npu.sparse_attn_sharedkv_metadata_host(**c128a_kwargs)
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
         return kernel_metadata
