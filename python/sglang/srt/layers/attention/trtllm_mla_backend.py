@@ -49,6 +49,10 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -230,6 +234,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
+        self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -648,6 +654,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if self._kv_shard_pool is not None:
+            prepare_kv_shard_forward(
+                self._kv_shard_pool,
+                self.req_to_token,
+                forward_batch,
+            )
+
         # Eager path: no capture-stable dense write loc; the pool's _full_translate
         # hook translates the write loc (safe out of a cuda graph).
         self._decode_dense_loc = None

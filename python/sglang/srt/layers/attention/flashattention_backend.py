@@ -18,6 +18,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -209,22 +213,11 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        # Logical-page KV sharding: the pool exposing begin_shard_extend /
-        # translate_loc_to_scratch, or None when sharding is off.
-        from sglang.srt.mem_cache.page_interleave_pool import (
-            PageInterleaveKVPoolMixin,
-        )
-
-        self.kv_shard_pool = (
-            model_runner.token_to_kv_pool
-            if isinstance(model_runner.token_to_kv_pool, PageInterleaveKVPoolMixin)
-            else None
-        )
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         # begin_shard_extend builds the owner-major gather plan from host-side
         # prefix/final lengths. Normal FA3 metadata is device-only, so opt the
         # sharded variant back into FutureMap's CPU mirror publication.
-        if self.kv_shard_pool is not None:
-            self.needs_cpu_seq_lens = True
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
 
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -1142,21 +1135,14 @@ class FlashAttentionBackend(AttentionBackend):
         # reduction: both stages consume token-space locations, and the shard
         # translate needs real pool locations, which is what the unified remap
         # produces. The two pools are alternatives, so at most one fires.
-        if self.kv_shard_pool is not None:
-            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-                include_draft_extend_v2=True
-            ):
-                self.kv_shard_pool.begin_shard_extend(
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.seq_lens_cpu,
-                )
-                metadata.page_table = self.kv_shard_pool.translate_loc_to_scratch(
-                    metadata.page_table
-                ).to(torch.int32)
-            else:
-                self.kv_shard_pool.end_shard_extend()
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+        ):
+            metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                metadata.page_table
+            ).to(torch.int32)
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:

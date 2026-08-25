@@ -2349,6 +2349,42 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support encoder-decoder"):
             args._handle_kv_cache_sharding()
 
+    def test_trtllm_mla_accepts_plain_tp_with_chunked_prefix_cache(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.attention_backend = "trtllm_mla"
+
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE, "get", return_value=False
+            ),
+            patch.object(envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False),
+        ):
+            args._handle_kv_cache_sharding(80 * 1024)
+
+        self.assertEqual(args.chunked_prefill_size, 2176)
+
+    def test_trtllm_mla_rejects_unsupported_shard_topologies(self):
+        cases = (
+            (False, 1, False, "requires an MLA model"),
+            (True, 2, False, "only supports plain-TP MLA"),
+            (True, 1, True, "requires chunked prefix caching"),
+        )
+        for is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
+            with self.subTest(error=error):
+                args = self._args()
+                args._resolved_attention_backends = lambda: (
+                    "trtllm_mla",
+                    "trtllm_mla",
+                )
+                args.use_mla_backend = lambda is_mla=is_mla: is_mla
+                view = SimpleNamespace(
+                    attn_cp_size=attn_cp_size,
+                    disable_chunked_prefix_cache=disable_chunked_prefix_cache,
+                )
+
+                with self.assertRaisesRegex(ValueError, error):
+                    args._validate_kv_shard_attention_backend(view)
+
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)
 

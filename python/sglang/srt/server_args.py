@@ -7063,6 +7063,28 @@ class ServerArgs:
             return view.tp_size
         return 1
 
+    def _validate_kv_shard_attention_backend(self, view) -> None:
+        prefill_backend, _ = self._resolved_attention_backends()
+        if prefill_backend == "fa3":
+            return
+        if prefill_backend != "trtllm_mla":
+            raise ValueError(
+                "--enable-kv-cache-sharding currently requires the fa3 "
+                "prefill attention backend, or trtllm_mla for plain-TP MLA; "
+                f"got {prefill_backend!r}."
+            )
+        if not self.use_mla_backend():
+            raise ValueError("KV sharding with trtllm_mla requires an MLA model.")
+        if view.attn_cp_size > 1:
+            raise ValueError(
+                "KV sharding with trtllm_mla only supports plain-TP MLA "
+                "(attn_cp_size must be 1)."
+            )
+        if view.disable_chunked_prefix_cache:
+            raise ValueError(
+                "KV sharding with trtllm_mla requires chunked prefix caching."
+            )
+
     def _handle_kv_cache_sharding(self, gpu_mem: Optional[float] = None):
         view = self._resolved()
         if not view.enable_kv_cache_sharding:
@@ -7161,12 +7183,7 @@ class ServerArgs:
                 "attention models yet: local-attention metadata is built from "
                 "the page table before the scratch translation."
             )
-        prefill_backend, _ = self._resolved_attention_backends()
-        if prefill_backend != "fa3":
-            raise ValueError(
-                "--enable-kv-cache-sharding currently requires the fa3 "
-                f"prefill attention backend, got {prefill_backend!r}."
-            )
+        self._validate_kv_shard_attention_backend(view)
         if view.disaggregation_transfer_backend not in ("mooncake", "nixl"):
             raise ValueError(
                 "--enable-kv-cache-sharding currently only supports the "
