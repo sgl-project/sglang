@@ -224,6 +224,20 @@ def _update_gather_batch(
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
+def should_skip_scheduler_all_gather(dp_size: int) -> bool:
+    """Return whether scheduler metadata is already local and rank-invariant.
+
+    With one attention-DP rank there is no cross-DP state to reconcile.  The
+    TP schedulers consume the same broadcast request stream, so gathering the
+    identical batch mode, graph eligibility, and token counts only adds a
+    device collective plus host synchronization.  Preserve the environment
+    override for deployments that explicitly guarantee this invariant beyond
+    DP1.
+    """
+
+    return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -264,7 +278,7 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    skip_all_gather = should_skip_scheduler_all_gather(dp_size)
     can_run_decode_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
