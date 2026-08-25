@@ -26,18 +26,12 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx imp
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
-from sglang.srt.utils import is_gfx95_supported, is_hip
 
 DEVICE = "cuda"
 FP8 = torch.float8_e4m3fn
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA (Triton fp8 kernels)"
-)
-# gfx950: fp8-Q + padding_option zero fails Triton compile; production uses bf16 Q.
-skip_fp8_q_on_gfx950 = pytest.mark.skipif(
-    is_hip() and is_gfx95_supported(),
-    reason="fp8-Q sparse kernels do not compile on gfx950 (widening mode tested instead)",
 )
 # fp8 PV (P quantized to e4m3, ~3-bit mantissa on [0,1] weights) dominates the
 # fp8-vs-dequantized-ref error; QK matches to fp32-accumulation noise.
@@ -153,7 +147,6 @@ def run_step3_decode(q, k, v, req_to_token, seq_lens, slot_ids, topk_idx, **kw):
 # ---------------------------------------------------------------------------
 
 
-@skip_fp8_q_on_gfx950
 def test_step3_decode_all_fp8_vs_dequant_ref():
     torch.manual_seed(0)
     q, k, v, r2t, seq_lens, sids, tidx = build_decode_inputs()
@@ -178,7 +171,6 @@ def test_step3_decode_widening_mode():
     )
 
 
-@skip_fp8_q_on_gfx950
 def test_step3_decode_scales():
     torch.manual_seed(2)
     q, k, v, r2t, seq_lens, sids, tidx = build_decode_inputs()
@@ -270,7 +262,6 @@ def _prefill_topk_idx(cu_seqlens, seq_lens, prefix_lens, num_kv_heads, topk, blo
     return tidx
 
 
-@skip_fp8_q_on_gfx950
 def test_step3_prefill_all_fp8_vs_dequant_ref():
     torch.manual_seed(4)
     q, k, v, r2t, sids, cu, seq_lens, prefix, max_q, _ = build_prefill_inputs()
@@ -284,7 +275,6 @@ def test_step3_prefill_all_fp8_vs_dequant_ref():
     torch.testing.assert_close(out8.float(), ref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
 
 
-@skip_fp8_q_on_gfx950
 def test_step3_prefill_scales():
     torch.manual_seed(5)
     q, k, v, r2t, sids, cu, seq_lens, prefix, max_q, _ = build_prefill_inputs()
@@ -364,7 +354,6 @@ def _topk_overlap(a: torch.Tensor, b: torch.Tensor) -> float:
     return hit / max(total, 1)
 
 
-@skip_fp8_q_on_gfx950
 def test_indexer_decode_all_fp8_vs_dequant_ref():
     torch.manual_seed(6)
     q, k, v, r2t, seq_lens, sids, _ = build_decode_inputs(
@@ -384,7 +373,6 @@ def test_indexer_decode_all_fp8_vs_dequant_ref():
     assert _topk_overlap(tidx8, tidxref) >= 0.9
 
 
-@skip_fp8_q_on_gfx950
 def test_indexer_decode_score_only_fp8():
     torch.manual_seed(7)
     q, k, _, r2t, seq_lens, sids, _ = build_decode_inputs(
@@ -429,7 +417,6 @@ def run_indexer_prefill(q, k, v, r2t, sids, cu, seq_lens, prefix, max_q, max_k, 
     )
 
 
-@skip_fp8_q_on_gfx950
 def test_indexer_prefill_all_fp8_vs_dequant_ref():
     torch.manual_seed(8)
     q, k, v, r2t, sids, cu, seq_lens, prefix, max_q, max_k = build_prefill_inputs(
