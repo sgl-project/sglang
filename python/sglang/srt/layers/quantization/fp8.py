@@ -1085,6 +1085,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        self._owns_moe_runner = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2142,7 +2143,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
+        ) and self._owns_moe_runner:
             self._prepare_flashinfer_trtllm_activation_params(layer)
 
         if get_moe_runner_backend().is_hpc_ops():
@@ -2319,6 +2320,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
@@ -2343,6 +2345,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self._owns_moe_runner = True
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -2422,7 +2425,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if use_intel_xpu_backend():
+        if use_intel_xpu_backend() and not (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_triton()
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
