@@ -16,7 +16,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
@@ -176,7 +180,9 @@ def _compile_deep_gemm_one_type_all(
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+        memory_budget = get_available_gpu_memory(
+            device="cuda", gpu_id=torch.cuda.current_device()
+        )
 
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
@@ -193,7 +199,7 @@ def _compile_deep_gemm_one_type_all(
                     kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
                 )
                 > memory_budget
-                and max_m > 4096
+                and max_m > 2048
             ):
                 max_m = max_m // 2
             logger.warning(
@@ -470,7 +476,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
 
     # In PD, prefill-only nodes never decode (indexer would OOM at large
     # bs) and decode-only nodes never extend.
-    disagg_mode = model_runner.server_args.disaggregation_mode
+    disagg_mode = get_disagg().disaggregation_mode
     run_decode = model_runner.is_generation and disagg_mode != "prefill"
     run_extend = disagg_mode != "decode"
 
