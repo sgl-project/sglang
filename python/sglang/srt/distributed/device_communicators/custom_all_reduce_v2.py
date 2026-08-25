@@ -31,15 +31,15 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     custom_all_reduce,
 )
-from sglang.srt.cuda_vmm_utils import (
-    VmmGraphInputManager,
-    compute_graph_capture_bases,
-    is_vmm_pointer,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.utils.cuda_vmm_utils import (
+    VmmGraphInputManager,
+    compute_graph_capture_bases,
+    is_vmm_pointer,
 )
 
 from .configs.custom_all_reduce_v2 import (
