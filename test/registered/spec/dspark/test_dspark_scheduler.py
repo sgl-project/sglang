@@ -567,6 +567,50 @@ class TestForcedBudgetVerifyAllTransition(CustomTestCase):
         planner.set_forced_budget_frac(None)
         self.assertTrue(planner.is_verify_all)
 
+    def test_fixed_verify_len_reports_full_width_only(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._is_verify_all = True
+        planner._budget_planner = None
+        planner._uniform_layout_cache = {"stale": object()}
+        planner.verify_num_draft_tokens = 16
+
+        planner._fixed_verify_len = 16
+        self.assertTrue(planner.is_verify_all)
+        planner.set_fixed_verify_len(10)
+        self.assertFalse(planner.is_verify_all)
+        self.assertEqual(planner.fixed_verify_len, 10)
+        self.assertEqual(planner._uniform_layout_cache, {})
+
+        with self.assertRaises(ValueError):
+            planner.set_fixed_verify_len(0)
+        with self.assertRaises(ValueError):
+            planner.set_fixed_verify_len(17)
+
+    def test_fixed_verify_len_selects_shared_dp_graph_tier(self):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._fixed_verify_len = 10
+        planner._uniform_layout_cache = {}
+        planner.verify_num_draft_tokens = 16
+        planner.model_runner = _fake_model_runner(
+            [8, 10, 12, 14, 16], max_bs=1
+        )
+
+        layout = planner.schedule_layout(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            prefix_lens=torch.tensor([8000], dtype=torch.int32),
+            device=torch.device("cpu"),
+            confidence=None,
+            budget=None,
+            global_num_reqs=1,
+            dp_tier_num_tokens=10,
+        )
+        self.assertEqual(layout.verify_lens_cpu, [10])
+        self.assertEqual(layout.total_verify_tokens, 10)
+        self.assertEqual(layout.graph_num_tokens, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

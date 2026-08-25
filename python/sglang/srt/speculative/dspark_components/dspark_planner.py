@@ -131,12 +131,29 @@ class DSparkVerifyPlanner:
 
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._fixed_verify_len = int(envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get())
+        if (
+            self._fixed_verify_len
+            and self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+        ):
+            raise ValueError(
+                "SGLANG_DSPARK_FIXED_VERIFY_LEN requires "
+                "SGLANG_RAGGED_VERIFY_MODE=compact."
+            )
+        if not 0 <= self._fixed_verify_len <= self.verify_num_draft_tokens:
+            raise ValueError(
+                "SGLANG_DSPARK_FIXED_VERIFY_LEN must be in "
+                f"[0, {self.verify_num_draft_tokens}], got {self._fixed_verify_len}."
+            )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
-        if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
+        if (
+            self._ragged_verify_mode is not RaggedVerifyMode.STATIC
+            and self._fixed_verify_len == 0
+        ):
             if self._confidence_head is None:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
@@ -206,10 +223,16 @@ class DSparkVerifyPlanner:
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
+        elif self._fixed_verify_len and tp_rank == 0:
+            logger.info(
+                "DSpark fixed compact-verify enabled (verify_len=%d, "
+                "confidence/SPS scheduling disabled).",
+                self._fixed_verify_len,
+            )
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._fixed_verify_len == 0 and self._confidence_head is not None
 
     @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
@@ -222,11 +245,22 @@ class DSparkVerifyPlanner:
         return self._budget_planner is not None
 
     @property
+    def fixed_verify_len(self) -> int:
+        return self._fixed_verify_len
+
+    @property
+    def has_fixed_verify_len(self) -> bool:
+        return self._fixed_verify_len > 0
+
+    @property
     def is_compact_mode(self) -> bool:
         return self._ragged_verify_mode is RaggedVerifyMode.COMPACT
 
     @property
     def is_verify_all(self) -> bool:
+        fixed_verify_len = getattr(self, "_fixed_verify_len", 0)
+        if fixed_verify_len:
+            return fixed_verify_len == self.verify_num_draft_tokens
         return self._is_verify_all and (
             self._budget_planner is None
             or self._budget_planner.forced_budget_frac is None
@@ -260,7 +294,7 @@ class DSparkVerifyPlanner:
         draft_tokens: torch.Tensor,
         confidence_tap: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        if self._confidence_head is None:
+        if self._fixed_verify_len or self._confidence_head is None:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
@@ -338,6 +372,16 @@ class DSparkVerifyPlanner:
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
+
+    def set_fixed_verify_len(self, verify_len: int) -> None:
+        verify_len = int(verify_len)
+        if not 1 <= verify_len <= self.verify_num_draft_tokens:
+            raise ValueError(
+                f"fixed verify_len must be in [1, {self.verify_num_draft_tokens}], "
+                f"got {verify_len}."
+            )
+        self._fixed_verify_len = verify_len
+        self._uniform_layout_cache.clear()
 
     def compute_budget_sync(
         self,
@@ -420,6 +464,41 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._fixed_verify_len:
+            bs = int(req_pool_indices.shape[0])
+            tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
+            tier_num_tokens = (
+                tier_num_reqs * self._fixed_verify_len
+                if dp_tier_num_tokens is None
+                else dp_tier_num_tokens
+            )
+            if ragged_layout_exceeds_captured_grid(
+                num_reqs=tier_num_reqs,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+                tier_tokens_hint=tier_num_tokens,
+            ):
+                return None
+            key = (
+                "fixed",
+                self._fixed_verify_len,
+                bs,
+                tier_num_reqs,
+                tier_num_tokens,
+            )
+            if key not in self._uniform_layout_cache:
+                verify_lens_cpu = [self._fixed_verify_len] * bs
+                self._uniform_layout_cache[key] = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=verify_lens_cpu,
+                    device=device,
+                    grid=verify_layout_grid(
+                        verify_lens_cpu=verify_lens_cpu,
+                        ragged_verify_mode=self._ragged_verify_mode,
+                        model_runner=self.model_runner,
+                    ),
+                    graph_num_tokens_floor=tier_num_tokens,
+                )
+            return self._uniform_layout_cache[key]
         if self.is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying

@@ -488,6 +488,10 @@ class Envs:
     # Optional compact-verify graph token buckets (for example "4,8,12").
     # Empty preserves the default request-batch-derived capture grid.
     SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS = EnvTuple(tuple())
+    # Fixed compact-verify width. Zero keeps confidence/SPS scheduling; a
+    # positive value skips that host path and uses the same width on every DP
+    # rank. This is especially useful for latency-sensitive bs=1 serving.
+    SGLANG_DSPARK_FIXED_VERIFY_LEN = EnvInt(0)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FUSED_LOCAL_TOP1 = EnvBool(False)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)

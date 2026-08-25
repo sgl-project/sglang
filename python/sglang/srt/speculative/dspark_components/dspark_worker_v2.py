@@ -218,6 +218,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
             and not self._verify_planner.is_verify_all
+            and not self._verify_planner.has_fixed_verify_len
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
@@ -424,6 +425,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
+    def set_dspark_fixed_verify_len(self, verify_len: int) -> None:
+        self._verify_planner.set_fixed_verify_len(verify_len)
+
     def dump_info_records(self) -> Optional[dict]:
         return self._observers.dump_info_records()
 
@@ -537,6 +541,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
+        if (
+            self._verify_planner.has_fixed_verify_len
+            and get_parallel().enable_dp_attention
+            and batch.global_num_tokens is not None
+        ):
+            global_bs = max(batch.global_num_tokens)
+            return global_bs * self._verify_planner.fixed_verify_len
         if not (
             self._draft_is_moe
             and get_parallel().enable_dp_attention
@@ -667,7 +678,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         global_num_reqs = (
             max(batch.global_num_tokens)
-            if self._draft_is_moe
+            if (self._draft_is_moe or self._verify_planner.has_fixed_verify_len)
             and get_parallel().enable_dp_attention
             and batch.global_num_tokens is not None
             else None
@@ -681,6 +692,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        if layout is not None and layout.total_verify_tokens is not None:
+            batch.spec_verify_tier_num_tokens = int(layout.total_verify_tokens)
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         if _is_npu:

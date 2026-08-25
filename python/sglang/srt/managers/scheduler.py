@@ -4586,6 +4586,7 @@ class Scheduler(
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
+                "dspark_fixed_verify_len",
                 "dspark_clear_info_records",
             ]
         )
@@ -4616,6 +4617,27 @@ class Scheduler(
                 if v is not None and not (0.0 < float(v) <= 1.0):
                     logging.warning(
                         f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dspark_fixed_verify_len":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "set_dspark_fixed_verify_len"
+                ):
+                    logging.warning(
+                        "dspark_fixed_verify_len requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                max_verify_len = int(self.draft_worker.verify_num_draft_tokens)
+                if (
+                    envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get() <= 0
+                    or not isinstance(v, int)
+                    or not 1 <= v <= max_verify_len
+                ):
+                    logging.warning(
+                        "dspark_fixed_verify_len must be enabled at startup and "
+                        f"updated within [1, {max_verify_len}], got {v}."
                     )
                     if_success = False
                     break
@@ -4650,6 +4672,9 @@ class Scheduler(
                 self.draft_worker.set_dspark_forced_budget_frac(
                     None if frac is None else float(frac)
                 )
+            fixed_verify_len = remaining.pop("dspark_fixed_verify_len", None)
+            if fixed_verify_len is not None:
+                self.draft_worker.set_dspark_fixed_verify_len(fixed_verify_len)
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
