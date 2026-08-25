@@ -1659,6 +1659,9 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
+    # state lives on the request pool instead, and the caller has to move it.
+    cpu_copy_carries_mamba: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3684,6 +3687,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
+
+    cpu_copy_carries_mamba = True
 
     def __init__(
         self,
