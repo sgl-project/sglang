@@ -560,12 +560,17 @@ class PrefillAdder:
         self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
-            # Estimate the offset in the remaining token space
-            self.rem_total_token_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
+            # Remaining-token-space estimate; tight-loop form because it runs
+            # over the whole running batch each pass (ratio factored out of
+            # the sum — this is a heuristic, float order is immaterial).
+            clip = CLIP_MAX_NEW_TOKENS
+            self.rem_total_token_offset += (
+                sum(
+                    rem if (rem := r.sampling_params.max_new_tokens - len(r.output_ids)) < clip
+                    else clip
                     for r in running_batch.reqs
-                ]
+                )
+                * self.new_token_ratio
             )
 
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
