@@ -25,6 +25,7 @@ on:
           - rocm724
           - rocm720
           - rocm714
+          - rocm714-aiter-a6d2b564
       target_stage_select:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
@@ -141,7 +142,7 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   # The test branch publishes ROCm 7.14 images to the scratch registry.
-  AMD_CI_IMAGE_REPO: ${{ inputs.rocm_version == 'rocm714' && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
+  AMD_CI_IMAGE_REPO: ${{ (inputs.rocm_version == 'rocm714' || inputs.rocm_version == 'rocm714-aiter-a6d2b564') && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
   ROCM_VERSION: ${{ inputs.rocm_version || 'rocm724' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}

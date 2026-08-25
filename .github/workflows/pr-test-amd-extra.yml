@@ -46,6 +46,7 @@ on:
           - rocm720
           - rocm700
           - rocm714
+          - rocm714-aiter-a6d2b564
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -98,7 +99,7 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   # The test branch publishes ROCm 7.14 images to the scratch registry.
-  AMD_CI_IMAGE_REPO: ${{ inputs.rocm_version == 'rocm714' && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
+  AMD_CI_IMAGE_REPO: ${{ (inputs.rocm_version == 'rocm714' || inputs.rocm_version == 'rocm714-aiter-a6d2b564') && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
