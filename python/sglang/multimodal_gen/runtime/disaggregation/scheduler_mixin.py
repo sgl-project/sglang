@@ -68,7 +68,7 @@ logger = init_logger(__name__)
 
 
 def _advertised_pool_work_endpoint(server_args) -> str:
-    host = server_args.host or server_args.disagg_p2p_hostname or "127.0.0.1"
+    host = server_args.disagg_p2p_hostname or server_args.host or "127.0.0.1"
     if host == "0.0.0.0":
         host = server_args.disagg_p2p_hostname or "127.0.0.1"
     return server_args.pool_work_endpoint.replace("0.0.0.0", host)
@@ -1522,7 +1522,13 @@ class SchedulerDisaggMixin:
         req.save_output = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
-            output_batch = self.worker.execute_forward([req])
+            if (
+                self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and max(1, int(req.num_outputs_per_prompt or 1)) > 1
+            ):
+                output_batch = next(self.worker.execute_forward_sequentially([req]))
+            else:
+                output_batch = self.worker.execute_forward([req])
 
         tensor_fields = {}
         scalar_fields = {"request_id": request_id}
