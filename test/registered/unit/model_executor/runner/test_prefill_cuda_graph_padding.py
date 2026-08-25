@@ -72,6 +72,11 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             forward_batch, num_qo_tokens=16
         )
 
+    def test_rejects_tokens_above_capture_limit(self):
+        runner = self._make_runner()
+
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(17)))
+
 
 if __name__ == "__main__":
     unittest.main()
