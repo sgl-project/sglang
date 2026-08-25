@@ -214,6 +214,18 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
+    # When a decode step's text is fully absorbed by the reasoning / tool-call
+    # parser buffers, no chunk is emitted even though the tokens are already
+    # counted in usage, so clients attribute them to TTFT and over-report decode
+    # speed. Emit an empty-delta chunk carrying usage instead:
+    #   "off"         - never (default, matches the previous behavior)
+    #   "first_token" - only before the first delta-carrying chunk, which is
+    #                   enough for an accurate TTFT and average decode speed
+    #   "all"         - on every buffered step, for a true ITL distribution at
+    #                   the cost of roughly doubling the chunk count
+    # Requires continuous_usage_stats, since the chunk is only useful for its
+    # usage payload.
+    step_usage_chunks: Optional[Literal["off", "first_token", "all"]] = "off"
 
 
 class JsonSchemaResponseFormat(BaseModel):
