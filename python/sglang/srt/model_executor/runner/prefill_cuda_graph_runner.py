@@ -184,6 +184,23 @@ def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     return layer_model
 
 
+def _build_layer_model_forward_kwargs(
+    layer_model: torch.nn.Module,
+    forward_batch: ForwardBatch,
+    pp_proxy_tensors: Optional[PPProxyTensors],
+) -> Dict[str, Any]:
+    """Bind optional transformer inputs by name across model signatures."""
+    parameters = inspect.signature(layer_model.forward).parameters
+    kwargs = {}
+    for embeds_name in ("input_embeds", "inputs_embeds"):
+        if embeds_name in parameters:
+            kwargs[embeds_name] = forward_batch.input_embeds
+            break
+    if pp_proxy_tensors is not None and "pp_proxy_tensors" in parameters:
+        kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+    return kwargs
+
+
 def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     """Slice every tensor leaf in a transformer-body output by token rows.
 
@@ -711,23 +728,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
                 input_ids = forward_batch.input_ids
-                input_embeds = forward_batch.input_embeds
-                kwargs = {}
                 pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
-                if (
-                    pp_proxy_tensors is not None
-                    and "pp_proxy_tensors"
-                    in inspect.signature(self.layer_model.forward).parameters
-                ):
-                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-                    if not self.model_runner.pp_group.is_first_rank:
-                        input_ids = None
-                        input_embeds = None
+                kwargs = _build_layer_model_forward_kwargs(
+                    self.layer_model, forward_batch, pp_proxy_tensors
+                )
+                if pp_proxy_tensors is not None:
+                    input_ids = None
+                    for embeds_name in ("input_embeds", "inputs_embeds"):
+                        if embeds_name in kwargs:
+                            kwargs[embeds_name] = None
+                            break
                 return self.layer_model.forward(
                     input_ids,
                     positions,
                     forward_batch,
-                    input_embeds,
                     **kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
