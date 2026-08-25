@@ -28,6 +28,7 @@ It is a ratchet, not a proof.
 """
 
 import ast
+import functools
 import inspect
 import pathlib
 import unittest
@@ -114,6 +115,7 @@ def _registry_functions():
     return functions
 
 
+@functools.lru_cache(maxsize=None)
 def _registered_entries():
     """Entries the import map cannot reach: passes and override providers.
 
@@ -138,13 +140,17 @@ def _registered_entries():
     # from the source. The entry carries the *defining* file: `_reaches_a_bag`
     # walks functions in the entry's file, so a call-site key walks nothing.
     by_value = set()
-    trees = {}
-    for path in sorted(_SRT.rglob("*.py")):
+    sources = {
+        path: path.read_text(encoding="utf-8-sig")
+        for path in sorted(_SRT.rglob("*.py"))
+    }
+    for path, source in sources.items():
+        if "run_post_process_pass" not in source:
+            continue
         try:
-            trees[path] = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             continue
-    for path, tree in trees.items():
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -154,6 +160,14 @@ def _registered_entries():
                 and isinstance(node.args[1], ast.Name)
             ):
                 by_value.add(node.args[1].id)
+    trees = {}
+    for path, source in sources.items():
+        if not any(name in source for name in by_value):
+            continue
+        try:
+            trees[path] = ast.parse(source)
+        except SyntaxError:
+            continue
     for name in sorted(by_value):
         defined_in = [
             path
@@ -173,14 +187,19 @@ def _registered_entries():
     return entries
 
 
-def _reaches_a_bag(path, entry):
-    """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
+@functools.lru_cache(maxsize=None)
+def _functions_in(path):
     tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-    functions = {
+    return {
         node.name: node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def _reaches_a_bag(path, entry):
+    """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
+    functions = _functions_in(path)
     seen = set()
 
     def walk(name):
