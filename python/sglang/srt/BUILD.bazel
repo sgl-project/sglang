@@ -6,6 +6,7 @@ package(default_visibility = ["//python/sglang:__subpackages__"])
 filegroup(
     name = "main_wheel_pep517_sources",
     srcs = pep517_source_glob(["**"]) + [
+        "//python/sglang/srt/rust_extensions:main_wheel_pep517_sources",
         "//python/sglang/srt/utils:main_wheel_pep517_sources",
         "//python/sglang/srt/weight_cache:main_wheel_pep517_sources",
     ],
@@ -57,6 +58,7 @@ py_library(
     imports = ["../.."],
     deps = [
         ":environ",
+        "//python/sglang/srt/rust_extensions:runtime_sources",
         "//python/sglang/srt/utils:runtime_sources",
         "//python/sglang/srt/utils/hf_transformers:runtime_sources",
         "//python/sglang/srt/weight_cache:runtime_sources",

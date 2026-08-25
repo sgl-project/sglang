@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
 load(
     "@sglang_crates//:defs.bzl",
@@ -5,8 +6,23 @@ load(
     "crate_deps",
     "crate_edition",
 )
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]),
+)
+
+py_library(
+    name = "runtime_sources",
+    srcs = [
+        "__init__.py",
+        "loader.py",
+    ],
+    imports = ["../../.."],
+)
 
 pyo3_extension(
     name = "_multimodal",
