@@ -26,7 +26,13 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase, LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
+    ModelOptFp8Config as FlatModelOptFp8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8LinearMethod as FlatModelOptFp8LinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config as HfModelOptFp8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod as HfModelOptFp8LinearMethod,
@@ -38,6 +44,10 @@ logger = logging.getLogger(__name__)
 # `quant_method=modelopt` exports vs `modelopt_fp8` hf_quant_config ones).
 # Both store the post-load weight as a column-major [in, out] FP8 view with a
 # scalar-or-channelwise weight_scale, so one W8A16 path serves both.
+MODELOPT_FP8_QUANT_CONFIGS = (
+    FlatModelOptFp8Config,
+    HfModelOptFp8Config,
+)
 MODELOPT_FP8_LINEAR_METHODS = (
     FlatModelOptFp8LinearMethod,
     HfModelOptFp8LinearMethod,

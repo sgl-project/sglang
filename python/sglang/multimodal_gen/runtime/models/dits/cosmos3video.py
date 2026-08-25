@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    MODELOPT_FP8_QUANT_CONFIGS,
     StepMixedPrecisionController,
     install_step_mixed_precision,
 )
@@ -1272,6 +1273,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # Installed in post_load_weights when step mixed precision is enabled.
         self.step_precision_controller: StepMixedPrecisionController | None = None
+        self.modelopt_fp8_checkpoint = isinstance(
+            quant_config, MODELOPT_FP8_QUANT_CONFIGS
+        )
 
         self.__post_init__()
 
@@ -1906,16 +1910,24 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     def _maybe_install_step_mixed_precision(self) -> None:
         """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
 
-        Runs at the end of post_load_weights so the base quant method has
-        already transposed weights and collapsed scales. The UND pathway runs
-        once per request, at step 0, so with first_steps >= 1 it naturally
-        executes in W8A16.
+        On by default for ModelOpt FP8 checkpoints; opt out with
+        SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0. Runs at the end of
+        post_load_weights so the base quant method has already transposed
+        weights and collapsed scales. The UND pathway runs once per request,
+        at step 0, so with first_steps >= 1 it naturally executes in W8A16.
         """
-        if not envs.SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION:
+        if not self.modelopt_fp8_checkpoint:
+            return
+        if not envs.SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION:
+            logger.info(
+                "Step mixed precision disabled by "
+                "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0; running "
+                "W8A8 on every denoising step."
+            )
             return
         controller = StepMixedPrecisionController(
-            first_steps=envs.SGLANG_DIFFUSION_FP8_MIXED_PRECISION_FIRST_STEPS,
-            last_steps=envs.SGLANG_DIFFUSION_FP8_MIXED_PRECISION_LAST_STEPS,
+            first_steps=envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS,
+            last_steps=envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS,
         )
         wrapped = install_step_mixed_precision(
             module_lists=[self.language_model.layers, self.gen_layers],
@@ -1923,9 +1935,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         if wrapped == 0:
             logger.warning(
-                "SGLANG_DIFFUSION_ENABLE_FP8_STEP_MIXED_PRECISION is set but no "
-                "ModelOpt FP8 linears were found; running without step mixed "
-                "precision."
+                "ModelOpt FP8 quant config detected but no ModelOpt FP8 "
+                "linears were found; running without step mixed precision."
             )
             return
         self.step_precision_controller = controller

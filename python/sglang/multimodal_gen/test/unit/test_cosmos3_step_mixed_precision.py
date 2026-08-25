@@ -47,6 +47,21 @@ def _make_loaded_fp8_linear(
     return layer, w_fp8, scale
 
 
+class TestDefaults(unittest.TestCase):
+    def test_step_mixed_precision_defaults_on(self):
+        # Cosmos3 ModelOpt FP8 runs step mixed precision unless the user
+        # opts out with SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0.
+        import os
+
+        import sglang.multimodal_gen.envs as envs
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", None)
+            self.assertTrue(envs.SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION)
+            self.assertEqual(envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS, 3)
+            self.assertEqual(envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS, 3)
+
+
 class TestStepPolicy(unittest.TestCase):
     def test_edge_steps_select_high_precision(self):
         controller = StepMixedPrecisionController(first_steps=3, last_steps=3)
