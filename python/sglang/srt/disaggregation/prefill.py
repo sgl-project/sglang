@@ -1473,7 +1473,12 @@ class SchedulerDisaggregationPrefillMixin:
                         # Giant pool-ring buffers are skipped by the flat
                         # stride matcher (>2^27 cells); probe the tail row
                         # windows so the per-column stream of the most recent
-                        # ring slots is still compared.
+                        # ring slots is still compared. §24.31: victims sit at
+                        # SMALL req slots (rows 15/16), i.e. the ring HEAD --
+                        # c128 head rows (req_pool_idx*128) are doubly blind
+                        # (flat skip + tail-only windows). Probe head windows
+                        # too; c128 row width 1024x2-rows also matches the
+                        # -2048 column fingerprint.
                         try:
                             if buf is None or buf.ndim != 2 or _kv.numel() < 4:
                                 return 0, -1, -1
@@ -1488,7 +1493,12 @@ class SchedulerDisaggregationPrefillMixin:
                             rows = int(buf.shape[0])
                             total = 0
                             first_c = first_r = -1
-                            for r0 in range(max(0, rows - 32768), rows, 16384):
+                            tail0 = max(0, rows - 32768)
+                            head_hi = min(tail0, 32768)
+                            starts = list(range(0, head_hi, 16384)) + list(
+                                range(tail0, rows, 16384)
+                            )
+                            for r0 in starts:
                                 cells = (
                                     buf[r0 : r0 + 16384]
                                     .view(_t.int32)
@@ -1602,12 +1612,20 @@ class SchedulerDisaggregationPrefillMixin:
                             continue
                         if _mode == "r":
                             # Giant ring buffers: skip the contiguous matchers,
-                            # probe tail row windows by column instead.
+                            # probe tail (and §24.31: head) row windows by
+                            # column instead, plus the WITHIN-ROW contiguous
+                            # stream (the dirty payload is consecutive along
+                            # the row, exactly what _seq_hits_fp32 would see
+                            # if the ring weren't flat-skipped).
                             _n = 0
                             try:
                                 _s, _sc, _sr = (
                                     _stride_hits_ring(_buf) if _stride_ok else (0, -1, -1)
                                 )
+                                if _s == 0 and _buf.ndim == 2:
+                                    _flat = _buf.view(-1)
+                                    if _flat.numel() <= (1 << 28):
+                                        _n = _seq_hits_fp32(_flat)
                             except Exception as _pe:
                                 _s, _sc, _sr = 0, -1, -1
                                 if _name not in _mf_fp_raised:
@@ -1615,6 +1633,10 @@ class SchedulerDisaggregationPrefillMixin:
                                     logger.error(
                                         "[mf-fp] probe raised on %s: %s", _name, _pe
                                     )
+                            if _n:
+                                logger.error(
+                                    "[mf-fp] payload sequence FOUND x%d in %s", _n, _name
+                                )
                         else:
                             try:
                                 _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)

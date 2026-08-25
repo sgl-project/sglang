@@ -45,6 +45,19 @@ def _clamp_scatter_locs(loc: torch.Tensor, cap: int, slot: str) -> torch.Tensor:
     return torch.where(bad, torch.zeros_like(loc), loc)
 
 
+def count_scatter_oob(mask: torch.Tensor, slot: str) -> None:
+    """§24.30 discriminator (3): device-side counter for an OOB predicate.
+
+    Same zero-sync discipline as :func:`_clamp_scatter_locs` (the value is
+    only ever read inside [mf-raw]'s existing piggyback D2H), but for a
+    boolean predicate instead of a clamped location tensor -- e.g. the
+    fused compressor's kernel-side table read index bound.
+    """
+    if slot not in _SCATTER_OOB:
+        _SCATTER_OOB[slot] = torch.zeros(1, dtype=torch.int64, device=mask.device)
+    _SCATTER_OOB[slot] += mask.sum().reshape(1).to(torch.int64)
+
+
 def get_scatter_oob_counts() -> dict:
     return {k: int(v.item()) for k, v in _SCATTER_OOB.items()}
 

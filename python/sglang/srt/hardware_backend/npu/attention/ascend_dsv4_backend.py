@@ -445,6 +445,41 @@ class CompressorAscendBackendMixin:
         except Exception:
             pass
 
+        # §24.30 discriminator (3): kernel-side READ-INDEX audit. The fused
+        # compressor's WriteToCacheState/ReadFromCacheState read
+        # stateBlockTable at row batchIdx, column
+        #   coff*cmpRatio + curSeqIdx - startPos
+        # (curSeqIdx walks the request's token positions; legal column range
+        # [0, width)). Discriminator (2) audits the table VALUES only: an
+        # out-of-range read index pulls off-table memory in as stateLoc even
+        # when every stored value is legal. Two faces, device-side zero-sync
+        # counters with the same [mf-scatter] read-out:
+        #   - compressor-index:bs -- table batch-dim != live batch size
+        #     (kernel batchIdx reads past the table's batch axis);
+        #   - compressor-index:hi -- seqused + coff*cmpRatio > table width
+        #     (kernel column reads past the history+capacity window the
+        #     table was built for; the verify path's draft-augmented
+        #     seq_lens is the prime suspect).
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob as _count_oob,
+            )
+
+            _bs = int(forward_batch.req_pool_indices.numel())
+            if int(state_block_table.shape[0]) != _bs:
+                _count_oob(
+                    torch.ones(1, dtype=torch.bool, device=x.device),
+                    "compressor-index:bs",
+                )
+            else:
+                _count_oob(
+                    fm.seqused.reshape(-1).to(torch.int64) + coff * ratio
+                    > int(state_block_table.shape[1]),
+                    "compressor-index:hi",
+                )
+        except Exception:
+            pass
+
         cmp_kv = torch.ops.npu.compressor(
             x,
             compressor._fused_wkv_w,
