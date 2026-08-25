@@ -23,6 +23,8 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    _DCP_PHASE_TIMING_FIELDS,
+    _READY_ITEM_SIZE,
     _set_rank_local_gpunetio_oob_port,
 )
 from sglang.srt.environ import envs
@@ -109,6 +111,101 @@ def _fake_staging_buffer_module(mock_gather=None):
 
 
 class TestDcpGpunetioPeerRows(CustomTestCase):
+    def test_compact_plan_builds_28_descriptors_and_preserves_dcp4_geometry(self):
+        mgr = object.__new__(NixlKVManager)
+        src_ptrs = [0x100000 + layer * 0x100000 for layer in range(27)]
+        dst_ptrs = [0x200000 + layer * 0x100000 for layer in range(27)]
+        src_indices = np.arange(128, 128 + 4 * 64, 4, dtype=np.int64)
+        dst_indices = np.arange(128, 192, dtype=np.int64)
+
+        src_layers, dst_layers, src_stride, dst_stride = (
+            mgr._build_compact_dcp_layer_descs(
+                src_ptrs,
+                dst_ptrs,
+                src_indices,
+                dst_indices,
+                [576] * 27,
+                1,
+                2,
+            )
+        )
+
+        self.assertEqual(src_layers.shape, (27, 3))
+        self.assertEqual(dst_layers.shape, (27, 3))
+        self.assertTrue(np.all(src_layers[:, 1] == 64 * 576))
+        self.assertTrue(np.all(dst_layers[:, 1] == 64 * 576))
+        self.assertEqual(int(src_layers[0, 0]), src_ptrs[0] + 128 * 576)
+        self.assertEqual(int(dst_layers[0, 0]), dst_ptrs[0] + 128 * 576)
+        self.assertEqual(src_stride, 4)
+        self.assertEqual(dst_stride, 1)
+        self.assertEqual(
+            set(_DCP_PHASE_TIMING_FIELDS),
+            {
+                "sglang_plan_us",
+                "nixl_compact_prepare_us",
+                "cuda_sync_owner_gpu_gather_post_us",
+                "dcp_completion_us",
+                "aux_post_us",
+                "all_completion_us",
+                "ready_publish_us",
+            },
+        )
+
+    def test_compact_plan_bypasses_row_descriptor_generic_path(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_dcp_peer_rows = True
+        mgr.enable_dcp_gpunetio_compact_plan = True
+        mgr.src_mem_kind = "VRAM"
+        mgr.kv_args = SimpleNamespace(
+            page_size=64,
+            kv_data_ptrs=[0x100000 + layer * 0x100000 for layer in range(27)],
+            gpu_id=1,
+        )
+        mgr._dcp_phase_by_peer = {}
+        mgr.agent = MagicMock()
+        mgr.agent.initialize_compact_dcp_xfer.return_value = "compact"
+        mgr._send_kvcache_generic = MagicMock(
+            side_effect=AssertionError("compact path must not call generic row builder")
+        )
+        dst_info = SimpleNamespace(
+            dst_homogeneous_mem_kind="VRAM",
+            dst_dcp_size=4,
+            dst_dcp_rank=0,
+            dcp_token_item_lens=[576] * 27,
+            dst_kv_ptrs=[0x200000 + layer * 0x100000 for layer in range(27)],
+            dcp_dst_region_indices=list(range(27)),
+            gpu_id=2,
+            ready_enabled=True,
+            ready_slot_count=8,
+            ready_base_ptr=0x400000,
+        )
+
+        result = mgr.send_kvcache_dcp(
+            "decode",
+            np.arange(2, 66, dtype=np.int32),
+            dst_info,
+            np.arange(2, 66, dtype=np.int32),
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=256,
+            notif="kv",
+            ready_slot=1,
+            ready_epoch=7,
+            ready_src_ptr=0x500000,
+            post=False,
+        )
+
+        self.assertEqual(result, "compact")
+        mgr.agent.initialize_compact_dcp_xfer.assert_called_once()
+        args, kwargs = mgr.agent.initialize_compact_dcp_xfer.call_args
+        self.assertEqual(args[0].shape, (27, 3))
+        self.assertEqual(args[1].shape, (27, 3))
+        self.assertEqual(kwargs["ready_src_ptr"], 0x500000)
+        self.assertEqual(kwargs["ready_dst_ptr"], 0x400000 + _READY_ITEM_SIZE)
+        self.assertEqual(kwargs["src_stride"], 4)
+        self.assertEqual(kwargs["dst_stride"], 1)
+        self.assertEqual(kwargs["notif_msg"], b"kv")
+
     def test_default_keeps_legacy_dcp_pack(self):
         mgr = object.__new__(CommonKVManager)
         with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(False):
@@ -132,6 +229,19 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
             with envs.SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST.override(True):
                 with self.assertRaisesRegex(ValueError, "requires .*PEER_ROWS"):
                     mgr._configure_dcp_pack_mode()
+
+    def test_compact_phase_timing_flag_is_captured(self):
+        mgr = object.__new__(CommonKVManager)
+        with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(True):
+            with envs.SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST.override(True):
+                with envs.SGLANG_DISAGG_DCP_GPUNETIO_COMPACT_PLAN.override(True):
+                    with envs.SGLANG_DISAGG_DCP_GPUNETIO_PHASE_TIMING.override(True):
+                        with envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.override(
+                            "GPUNETIO"
+                        ):
+                            mgr._configure_dcp_pack_mode()
+        self.assertTrue(mgr.enable_dcp_gpunetio_compact_plan)
+        self.assertTrue(mgr.enable_dcp_gpunetio_phase_timing)
 
     def test_peer_rows_skips_pack_and_keeps_cyclic_indices(self):
         mgr = object.__new__(NixlKVManager)

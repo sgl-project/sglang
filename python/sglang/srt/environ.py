@@ -720,6 +720,11 @@ class Envs:
     SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS = EnvBool(False)
     # Experimental GPUNETIO DCP4 post batching; requires peer-row mode.
     SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST = EnvBool(False)
+    # Experimental GPUNETIO DCP4 compact plan; bypasses per-row descriptor
+    # construction and requires the batch-post path above.
+    SGLANG_DISAGG_DCP_GPUNETIO_COMPACT_PLAN = EnvBool(False)
+    # Emit DCP phase timings for compact-plan serving experiments.
+    SGLANG_DISAGG_DCP_GPUNETIO_PHASE_TIMING = EnvBool(False)
     SGLANG_DISAGG_DCP_PACK_MAX_TOKENS = EnvInt(None)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.

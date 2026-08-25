@@ -71,6 +71,15 @@ GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 _READY_PROTOCOL_VERSION = "1"
 _READY_ITEM_SIZE = 8
+_DCP_PHASE_TIMING_FIELDS = (
+    "sglang_plan_us",
+    "nixl_compact_prepare_us",
+    "cuda_sync_owner_gpu_gather_post_us",
+    "dcp_completion_us",
+    "aux_post_us",
+    "all_completion_us",
+    "ready_publish_us",
+)
 
 
 def _set_rank_local_gpunetio_oob_port(
@@ -607,6 +616,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._dcp_phase_by_peer: Dict[str, Dict[str, float]] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -1363,6 +1373,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 pending_dcp_handles: List[Any] = []
                 pending_aux_requests: List[Tuple[Any, ...]] = []
+                phase_timing_enabled = getattr(
+                    self, "enable_dcp_gpunetio_phase_timing", False
+                )
+                dcp_phase_samples: List[Tuple[str, Dict[str, float]]] = []
+                ready_publish_us: Dict[Tuple[int, int], float] = {}
+                batch_post_start_ns: Optional[int] = None
+                batch_post_end_ns: Optional[int] = None
+                aux_post_us = 0.0
+                dcp_done_ns: Optional[int] = None
+                all_done_ns: Optional[int] = None
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1465,9 +1485,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     ready_slots.add(req.ready_slot)
                                     ready_key = (req.ready_slot, req.ready_epoch)
                                     if ready_key not in published_ready:
+                                        ready_start_ns = time.perf_counter_ns()
                                         published_ready[ready_key] = (
                                             self._publish_ready_epoch(*ready_key)
                                         )
+                                        if phase_timing_enabled:
+                                            ready_publish_us[ready_key] = (
+                                                time.perf_counter_ns() - ready_start_ns
+                                            ) / 1000.0
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1487,6 +1512,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     ),
                                     post=not batch_dcp_enabled,
                                 )
+                                if phase_timing_enabled and getattr(
+                                    self, "enable_dcp_gpunetio_compact_plan", False
+                                ):
+                                    phase = self._dcp_phase_by_peer.pop(
+                                        req.agent_name, None
+                                    )
+                                    if phase is not None:
+                                        phase["ready_publish_us"] = ready_publish_us.get(
+                                            ready_key, 0.0
+                                        )
+                                        dcp_phase_samples.append((req.agent_name, phase))
                             elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -1588,9 +1624,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST created "
                                 f"{len(pending_dcp_handles)} DCP handles, expected 4"
                             )
+                        batch_post_start_ns = time.perf_counter_ns()
                         batch_state = self.agent.transfer_batch4_gpunetio_experimental(
                             pending_dcp_handles
                         )
+                        batch_post_end_ns = time.perf_counter_ns()
                         if batch_state == "ERR":
                             raise RuntimeError(
                                 "NIXL GPUNETIO DCP batch post returned ERR"
@@ -1598,12 +1636,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         handles.extend(pending_dcp_handles)
                     # Aux remains on the existing path and is posted only after
                     # all DCP payload/ready requests have been submitted.
+                    aux_start_ns = time.perf_counter_ns()
                     handles.extend(
                         self.send_aux(*aux_request)
                         for aux_request in pending_aux_requests
                     )
+                    if phase_timing_enabled:
+                        aux_post_us = (time.perf_counter_ns() - aux_start_ns) / 1000.0
 
                 while handles:
+                    if phase_timing_enabled and pending_dcp_handles and dcp_done_ns is None:
+                        dcp_states = [
+                            self.agent.check_xfer_state(handle)
+                            for handle in pending_dcp_handles
+                        ]
+                        if all(state == "DONE" for state in dcp_states):
+                            dcp_done_ns = time.perf_counter_ns()
                     all_done = True
                     for handle in handles:
                         state = self.agent.check_xfer_state(handle)
@@ -1614,8 +1662,50 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         if state != "DONE":
                             all_done = False
                     if all_done:
+                        if phase_timing_enabled:
+                            all_done_ns = time.perf_counter_ns()
                         break
                     time.sleep(0)
+
+                if phase_timing_enabled and dcp_phase_samples:
+                    if batch_post_start_ns is None or batch_post_end_ns is None:
+                        raise RuntimeError("compact DCP phase timing missed batch post")
+                    if dcp_done_ns is None:
+                        dcp_done_ns = all_done_ns or time.perf_counter_ns()
+                    if all_done_ns is None:
+                        all_done_ns = time.perf_counter_ns()
+                    for peer_name, phase in dcp_phase_samples:
+                        phase.update(
+                            {
+                                "cuda_sync_owner_gpu_gather_post_us": (
+                                    batch_post_end_ns - batch_post_start_ns
+                                )
+                                / 1000.0,
+                                "dcp_completion_us": (
+                                    dcp_done_ns - batch_post_end_ns
+                                )
+                                / 1000.0,
+                                "aux_post_us": aux_post_us,
+                                "all_completion_us": (
+                                    all_done_ns - batch_post_end_ns
+                                )
+                                / 1000.0,
+                            }
+                        )
+                    logger.info(
+                        "SGLANG_DCP_PHASE %s",
+                        json.dumps(
+                            {
+                                "room": room,
+                                "chunk": kv_chunk.chunk_id,
+                                "peers": [
+                                    {"peer": peer_name, **phase}
+                                    for peer_name, phase in dcp_phase_samples
+                                ],
+                            },
+                            sort_keys=True,
+                        ),
+                    )
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -1946,6 +2036,63 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def _build_compact_dcp_layer_descs(
+        self,
+        src_kv_ptrs: list[int],
+        dst_kv_ptrs: list[int],
+        src_token_indices: npt.NDArray[np.integer],
+        dst_token_indices: npt.NDArray[np.integer],
+        token_item_lens: list[int],
+        src_gpu_id: int,
+        dst_gpu_id: int,
+    ) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """Build the 27-layer DCP4 plan without expanding its 1,728 rows."""
+        rows = 64
+        item_size = 576
+        if len(src_kv_ptrs) != 27 or len(dst_kv_ptrs) != 27:
+            raise RuntimeError("compact DCP requires exactly 27 source/destination layers")
+        if len(token_item_lens) != 27 or any(item_len != item_size for item_len in token_item_lens):
+            raise RuntimeError("compact DCP requires 27 layers of 576-byte rows")
+        src_indices = np.asarray(src_token_indices, dtype=np.int64)
+        dst_indices = np.asarray(dst_token_indices, dtype=np.int64)
+        if src_indices.size != rows or dst_indices.size != rows:
+            raise RuntimeError("compact DCP requires exactly 64 source and destination rows")
+        src_stride = int(src_indices[1] - src_indices[0])
+        dst_stride = int(dst_indices[1] - dst_indices[0])
+        if src_stride <= 0 or dst_stride <= 0:
+            raise RuntimeError("compact DCP row strides must be positive")
+        if not np.all(np.diff(src_indices) == src_stride) or not np.all(
+            np.diff(dst_indices) == dst_stride
+        ):
+            raise RuntimeError("compact DCP source and destination rows must be affine")
+        if src_stride != 4 or dst_stride != 1:
+            raise RuntimeError(
+                "compact DCP direct plan only supports source stride 4 and destination stride 1"
+            )
+
+        src_bases = np.asarray(src_kv_ptrs, dtype=np.uint64) + np.uint64(
+            int(src_indices[0]) * item_size
+        )
+        dst_bases = np.asarray(dst_kv_ptrs, dtype=np.uint64) + np.uint64(
+            int(dst_indices[0]) * item_size
+        )
+        layer_len = np.uint64(rows * item_size)
+        src_layers = np.column_stack(
+            (
+                src_bases,
+                np.full(27, layer_len, dtype=np.uint64),
+                np.full(27, src_gpu_id, dtype=np.uint64),
+            )
+        )
+        dst_layers = np.column_stack(
+            (
+                dst_bases,
+                np.full(27, layer_len, dtype=np.uint64),
+                np.full(27, dst_gpu_id, dtype=np.uint64),
+            )
+        )
+        return src_layers, dst_layers, src_stride, dst_stride
+
     def send_kvcache(
         self,
         peer_name: str,
@@ -2077,6 +2224,50 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 ),
                 dst_info.ready_base_ptr + ready_slot * _READY_ITEM_SIZE,
             )
+        if self.enable_dcp_gpunetio_compact_plan:
+            if post or ready_tail is None:
+                raise RuntimeError(
+                    "compact DCP plans must be created with post=False and a ready tail"
+                )
+            plan_start = time.perf_counter_ns()
+            src_layers, dst_layers, src_stride, dst_stride = (
+                self._build_compact_dcp_layer_descs(
+                    src_kv_ptrs,
+                    dst_kv_ptrs,
+                    src_token_indices,
+                    plan.dst_token_indices,
+                    token_item_lens,
+                    self.kv_args.gpu_id,
+                    dst_info.gpu_id,
+                )
+            )
+            plan_end = time.perf_counter_ns()
+            prepare_start = plan_end
+            xfer_handle = self.agent.initialize_compact_dcp_xfer(
+                src_layers,
+                dst_layers,
+                peer_name,
+                ready_src_ptr=ready_tail[0],
+                ready_dst_ptr=ready_tail[1],
+                src_stride=src_stride,
+                dst_stride=dst_stride,
+                src_mem_kind=self.src_mem_kind,
+                dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+                notif_msg=notif.encode("ascii"),
+            )
+            prepare_end = time.perf_counter_ns()
+            self._dcp_phase_by_peer[peer_name] = {
+                "sglang_plan_us": (plan_end - plan_start) / 1000.0,
+                "nixl_compact_prepare_us": (prepare_end - prepare_start) / 1000.0,
+                "descriptor_count": 28,
+                "rows": 64,
+                "item_size": 576,
+                "src_stride": src_stride,
+                "dst_stride": dst_stride,
+            }
+            if not xfer_handle:
+                raise Exception("KVSender failed to create compact DCP transfer")
+            return xfer_handle
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=src_kv_ptrs,
