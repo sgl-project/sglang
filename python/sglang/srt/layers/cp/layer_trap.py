@@ -361,3 +361,73 @@ def gap_probe_post_draft(worker) -> None:
     if _pend.get("fired"):
         return
     _snapshot_pool(pool, "gap:post-draft")
+
+
+# ---- glue probes (§24.34: bisect the scheduler glue window) ----------------
+# Run 19's re-observation analysis convicted the write to the sub-second
+# scheduler glue between the victim iteration's gap:post-draft snapshot
+# (clean) and its send-loop read (dirty): eagle-worker return ->
+# process_batch_result (copy_done.synchronize / result finalize ->
+# maybe_cache_unfinished_req radix insert + FreeDeviceKV free device ops ->
+# eagle output extraction incl. hidden_states[i].cpu().clone() D2H) ->
+# send entry. These row-scoped marks bisect exactly that window; the first
+# mark drains any pending gap snapshot, so the existing chain is preserved
+# and glue:pre-send is drained by the next iteration's layer_trap_start.
+
+
+def _snapshot_row(pool, row: int, width: int, label: str) -> None:
+    """Snapshot r2t[row, :width] -- per-request, deep-column capable."""
+    if not _enabled() or _pend.get("fired"):
+        return
+    r2t = getattr(pool, "req_to_token", None)
+    if not torch.is_tensor(r2t):
+        return
+    try:
+        w = max(1, min(int(width), int(r2t.shape[1])))
+    except Exception:
+        return
+    try:
+        buf = torch.empty((1, w), dtype=torch.int32, pin_memory=True)
+    except Exception:
+        try:
+            buf = torch.empty((1, w), dtype=torch.int32)
+        except Exception:
+            return
+    try:
+        buf.copy_(r2t[int(row) : int(row) + 1, :w], non_blocking=True)
+    except Exception:
+        return
+    try:
+        ev = (
+            torch.get_device_module(r2t.device)
+            .current_stream()
+            .record_event()
+        )
+    except Exception:
+        ev = None
+    _pend.clear()
+    _pend.update(buf=buf, ev=ev, label=label, rows=[int(row)], fired=False)
+
+
+def glue_probe(pool, row: int, width: int, label: str) -> None:
+    """Drain the pending snapshot, then snapshot this request's row.
+
+    Labels (call sites in disaggregation/prefill.py,
+    process_batch_result_disagg_prefill final-chunk branch):
+      glue:pre-cache  -- before maybe_cache_unfinished_req; a catch on the
+                         DRAINED snapshot (gap:post-draft) convicts the
+                         eagle-return tail / result-resolve prologue.
+      glue:post-cache -- right after the cache call; a catch here convicts
+                         the RADIX CACHE/FREE PATH (insert + FreeDeviceKV
+                         device ops; the §22 swa.py:330 crash family).
+      glue:pre-send   -- right before send_kv_chunk; a catch here convicts
+                         the eagle output extraction (cpu().clone() D2H) +
+                         logprob glue. This snapshot itself is drained at
+                         the next iteration's layer_trap_start.
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_row(pool, row, width, label)

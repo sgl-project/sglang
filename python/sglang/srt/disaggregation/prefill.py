@@ -725,7 +725,32 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                # Glue bisect mark 1 (§24.34): Run 19 convicted the write to
+                # (gap:post-draft, this send); this drains that pending gap
+                # snapshot and starts the row-scoped glue chain.
+                try:
+                    from sglang.srt.layers.cp.layer_trap import glue_probe
+
+                    glue_probe(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        len(req.origin_input_ids),
+                        "glue:pre-cache",
+                    )
+                except Exception:
+                    pass
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                # Glue bisect mark 2: a catch here convicts the radix
+                # cache/free path (insert + FreeDeviceKV device ops).
+                try:
+                    glue_probe(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        len(req.origin_input_ids),
+                        "glue:post-cache",
+                    )
+                except Exception:
+                    pass
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -761,6 +786,21 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
+                    # Glue bisect mark 3: a catch here convicts the eagle
+                    # output extraction (cpu().clone() D2H) + logprob glue;
+                    # the pre-send snapshot itself drains at the next
+                    # iteration's layer_trap_start.
+                    try:
+                        from sglang.srt.layers.cp.layer_trap import glue_probe
+
+                        glue_probe(
+                            self.req_to_token_pool,
+                            req.req_pool_idx,
+                            len(req.origin_input_ids),
+                            "glue:pre-send",
+                        )
+                    except Exception:
+                        pass
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
