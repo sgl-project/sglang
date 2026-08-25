@@ -332,6 +332,62 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         core._update_duplicate_tracking.assert_called_once_with(shared)
 
 
+class TestUnifiedRadixCacheFinishedWriteThrough(CustomTestCase):
+    def _make_cache(
+        self,
+        *,
+        write_policy="write_through",
+        parent=object(),
+        evicted=False,
+    ):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = mock.Mock(write_policy=write_policy)
+        cache.tree_core = mock.Mock()
+        cache.tree_core.node_by_id.return_value = mock.Mock(
+            parent=parent, evicted=evicted
+        )
+        action = mock.sentinel.backup_action
+        cache.tree_core.build_backup_action.return_value = action
+        cache._execute_and_commit_kv_backup = mock.Mock()
+        return cache, action
+
+    def test_finished_prefix_is_backed_up_under_write_through(self):
+        cache, action = self._make_cache()
+
+        cache._backup_finished_write_through(17)
+
+        cache.tree_core.build_backup_action.assert_called_once_with(17)
+        cache._execute_and_commit_kv_backup.assert_called_once_with(action)
+
+    def test_chunked_request_records_deferred_write_through(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.session = mock.Mock()
+        cache.session.try_cache_unfinished_req.return_value = True
+        req = mock.Mock(prefix_cache_chunked=False)
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertTrue(req.prefix_cache_chunked)
+
+    def test_finished_prefix_is_not_backed_up_under_write_back(self):
+        cache, _ = self._make_cache(write_policy="write_back")
+
+        cache._backup_finished_write_through(17)
+
+        cache.tree_core.node_by_id.assert_not_called()
+        cache._execute_and_commit_kv_backup.assert_not_called()
+
+    def test_root_and_evicted_nodes_are_not_backed_up(self):
+        for kwargs in ({"parent": None}, {"evicted": True}):
+            with self.subTest(**kwargs):
+                cache, _ = self._make_cache(**kwargs)
+
+                cache._backup_finished_write_through(17)
+
+                cache.tree_core.build_backup_action.assert_not_called()
+                cache._execute_and_commit_kv_backup.assert_not_called()
+
+
 def _write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
     return cache._execute_and_commit_kv_backup(

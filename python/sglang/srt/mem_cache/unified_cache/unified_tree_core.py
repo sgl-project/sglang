@@ -1808,6 +1808,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
 
+    def build_backup_action(
+        self, node_id: NodeId, write_back: bool = False
+    ) -> BackupKV:
+        """Build a backup action for a node and any required ancestors."""
+        return self._build_backup_kv_action(
+            self.node_by_id(node_id), write_back=write_back
+        )
+
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather missing Full and component transfers for Host backup."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value

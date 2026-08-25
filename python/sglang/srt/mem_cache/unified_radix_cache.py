@@ -813,6 +813,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 start_pos=req.cache_protected_len,
             )
 
+        if (
+            is_insert
+            and result is not None
+            and result.last_device_node is not None
+            and getattr(req, "prefix_cache_chunked", False)
+        ):
+            # Run before releasing the request's tree lock and before component
+            # cleanup clears request-owned checkpoint state.
+            self._backup_finished_write_through(result.last_device_node)
+
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         if is_insert and result is not None and result.last_device_node is not None:
@@ -832,7 +842,23 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 self.session_refs.register_session_ref(req)
 
+    def _backup_finished_write_through(self, node_id: NodeId) -> None:
+        """Back up a completed prefix that chunked inserts could not persist."""
+        if (
+            self.cache_controller is None
+            or self.cache_controller.write_policy != "write_through"
+        ):
+            return
+
+        node = self.tree_core.node_by_id(node_id)
+        if node.parent is None or node.evicted:
+            return
+
+        self._execute_and_commit_kv_backup(self.tree_core.build_backup_action(node_id))
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        if chunked:
+            req.prefix_cache_chunked = True
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
