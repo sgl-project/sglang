@@ -11,13 +11,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config,
     ModelOptFp8LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp8Config as HfModelOptFp8Config,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
     StepMixedPrecisionController,
     StepMixedPrecisionFp8LinearMethod,
     install_step_mixed_precision,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config as HfModelOptFp8Config,
 )
 
 
@@ -58,8 +58,12 @@ class TestDefaults(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", None)
             self.assertTrue(envs.SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION)
-            self.assertEqual(envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS, 3)
-            self.assertEqual(envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS, 3)
+            self.assertEqual(
+                envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS, 3
+            )
+            self.assertEqual(
+                envs.SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS, 3
+            )
 
 
 class TestStepPolicy(unittest.TestCase):
