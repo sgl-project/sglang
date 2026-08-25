@@ -17,13 +17,37 @@ from typing import Optional, Tuple
 import torch
 from parameterized import parameterized
 
-from sglang.srt.layers.moe.topk import (
-    _make_round_robin_expert_ids,
-    _simulate_balanced_routing,
-)
+from sglang.srt.layers.moe.topk import _simulate_balanced_routing
+from sglang.test.test_utils import CustomTestCase
 
 E = 256  # num_experts
 K = 8  # top-k
+
+
+def _make_round_robin_expert_ids(
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    layer_id: Optional[int] = None,
+) -> torch.Tensor:
+    # Deterministic, perfectly balanced expert assignment: each token's top-k is
+    # spread by num_experts//topk. Returns global expert ids of shape
+    # [num_tokens, topk].
+    if topk == 0:
+        return torch.empty((num_tokens, 0), device=device, dtype=dtype)
+
+    step = max(num_experts // topk, 1)
+    layer_offset = 0 if layer_id is None else layer_id
+    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(
+        1
+    )  # [num_tokens, 1]
+    steps = (
+        torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
+    )  # [1, topk]
+    return (offsets + layer_offset + steps) % num_experts  # [num_tokens, topk]
 
 
 def _alloc(
@@ -35,7 +59,7 @@ def _alloc(
     return ids, weights
 
 
-class TestSimulateBalancedRouting(unittest.TestCase):
+class TestSimulateBalancedRouting(CustomTestCase):
     def setUp(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA required")
@@ -82,6 +106,59 @@ class TestSimulateBalancedRouting(unittest.TestCase):
         # offset + j*step spreads the k experts out -> k distinct per row
         for row in ids[:64]:
             self.assertEqual(row.unique().numel(), K)
+
+    @parameterized.expand(
+        [
+            ("round_robin_dp2", False, 2),
+            ("round_robin_dp4", False, 4),
+            ("uniform_dp2", True, 2),
+            ("uniform_dp4", True, 4),
+        ]
+    )
+    def test_interleaved_dp_assignments_match_dp1(
+        self, _name: str, random: bool, dp_size: int
+    ) -> None:
+        # Interleaving the DP-local outputs must exactly reproduce the expert
+        # assignments for the equivalent DP=1 input. The fixed seed models
+        # independent processes entering the same uniform-routing call with
+        # the same initial seed.
+        T = 16
+        seed = 17
+        layer_id = 3
+        ids_by_rank = []
+        weights_by_rank = []
+        for dp_rank in range(dp_size):
+            ids, weights = _alloc(T, K)
+            _simulate_balanced_routing(
+                ids,
+                weights,
+                E,
+                random=random,
+                layer_id=layer_id,
+                token_shard_rank=dp_rank,
+                num_token_shards=dp_size,
+                seed=seed,
+            )
+            ids_by_rank.append(ids)
+            weights_by_rank.append(weights)
+
+        interleaved_ids = torch.stack(ids_by_rank, dim=1).reshape(T * dp_size, K)
+        interleaved_weights = torch.stack(weights_by_rank, dim=1).reshape(
+            T * dp_size, K
+        )
+
+        expected_ids, expected_weights = _alloc(T * dp_size, K)
+        _simulate_balanced_routing(
+            expected_ids,
+            expected_weights,
+            E,
+            random=random,
+            layer_id=layer_id,
+            seed=seed,
+        )
+
+        self.assertTrue(torch.equal(interleaved_ids, expected_ids))
+        torch.testing.assert_close(interleaved_weights, expected_weights)
 
 
 if __name__ == "__main__":
