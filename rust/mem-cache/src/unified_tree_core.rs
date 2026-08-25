@@ -2545,7 +2545,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         node: &Node<K>,
     ) -> (Tensor, HashMap<ComponentType, Vec<PoolTransfer>>) {
-        let device_value = node.device_value(FULL).shallow_clone();
+        // Overlapping backup chains may revisit a node whose Full KV already
+        // has a host copy. Keep building transfers for auxiliary components,
+        // but do not allocate and overwrite Full host KV a second time.
+        let device_value = if node.backuped() {
+            self.empty_device_indices.shallow_clone()
+        } else {
+            node.device_value(FULL).shallow_clone()
+        };
         let mut comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>> = HashMap::new();
         for i in 0..self.components.len() {
             let component_type = self.components[i].component_type();
@@ -2832,21 +2839,23 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         let node_id = self.arena.resolve(node_id);
         let mut cache_actions: Vec<CacheAction> = Vec::new();
-        let kv_xfer = PoolTransfer {
-            name: PoolName::Kv,
-            host_indices: Some(host_indices),
-            ..Default::default()
-        };
-        self.component_by_type_(BASE_COMPONENT_TYPE)
-            .commit_hicache_transfer(
-                self,
-                node_id,
-                CacheTransferPhase::BackupHost,
-                vec![kv_xfer],
-                &mut cache_actions,
-                /* insert_result = */ None,
-                /* pool_storage_result = */ None,
-            );
+        if host_indices.numel() > 0 {
+            let kv_xfer = PoolTransfer {
+                name: PoolName::Kv,
+                host_indices: Some(host_indices),
+                ..Default::default()
+            };
+            self.component_by_type_(BASE_COMPONENT_TYPE)
+                .commit_hicache_transfer(
+                    self,
+                    node_id,
+                    CacheTransferPhase::BackupHost,
+                    vec![kv_xfer],
+                    &mut cache_actions,
+                    /* insert_result = */ None,
+                    /* pool_storage_result = */ None,
+                );
+        }
         for (component_type, transfers) in comp_xfers {
             self.component_by_type_(component_type)
                 .commit_hicache_transfer(

@@ -3037,6 +3037,40 @@ fn build_backup_spec_reads_the_device_value() {
     assert!(comp_xfers.is_empty());
 }
 
+#[test]
+fn build_backup_spec_skips_full_kv_for_an_already_backuped_node() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+    assert!(tc.arena.node(tc.arena.resolve(leaf)).backuped());
+
+    let (device_value, comp_xfers) = tc.build_backup_spec(leaf);
+    assert_eq!(device_value.numel(), 0);
+    assert!(comp_xfers.is_empty());
+}
+
+#[test]
+fn commit_backup_preserves_full_kv_when_host_indices_are_empty() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+    tc.commit_backup(leaf, Tensor::from_slice(&[] as &[i64]), HashMap::new());
+
+    let node = tc.arena.node(tc.arena.resolve(leaf));
+    assert!(
+        node.host_value(FULL)
+            .equal(&Tensor::from_slice(&[100i64, 101]))
+    );
+}
+
 // Two backuped device nodes [1,2] -> [3,4]; returns (parent, child) ids.
 fn backuped_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
