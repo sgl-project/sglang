@@ -122,23 +122,39 @@ For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
 ### Quantization
 
-For a pre-quantized main transformer checkpoint, prefer:
-
-- `--model-path` for the base pipeline
-- `--transformer-path` for a quantized `transformers` transformer component folder
-- `--transformer-weights-path` for a quantized safetensors file, directory,
-  repo, or a supported GGUF transformer file
-- `--quantization` to override the quantization method used by the transformer loader
-- `--quantization-ignored-layers` transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
-
 Component checkpoint paths are selected separately, so changing DiT precision
-never silently changes prompt embeddings. Use
-`--component-paths.<component> {MODEL}` or its shorter
-`--<component>-path {MODEL}` form for any component key from `model_index.json`
-or a native pipeline's registered module name.
+never silently changes prompt embeddings. The component-scoped forms are the
+canonical interface for any component key from `model_index.json` or a native
+pipeline's registered module name:
+
+| Intent | Canonical option | Convenience alias | Behavior |
+| --- | --- | --- | --- |
+| Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
+| Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
+| Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
+
+For example, pair a replacement text-encoder configuration with a separate
+single-file checkpoint as follows:
+
+```bash
+--component-paths.text_encoder Qwen/Qwen3-VL-4B-Instruct \
+--component-weights-paths.text_encoder \
+  Comfy-Org/Krea-2/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+```
+
+The transformer-specific `--transformer-weights-path` spelling remains
+supported for the primary DiT. Do not mechanically replace it with
+`--component-weights-paths.transformer`: the component-scoped form requires an
+actual component name, which is pipeline-specific. Use `--quantization` only
+to override the method inferred by the transformer loader, and
+`--quantization-ignored-layers` to keep matching transformer layers
+unquantized during online quantization.
+
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- `--component-quantizations.text_encoder {METHOD}` applies supported online quantization to an unquantized native encoder; pair it with `--component-quantization-ignored-layers.text_encoder {PATTERN...}` when selected layers must remain unquantized
 - Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
@@ -198,6 +214,15 @@ vae_tiling: true
 vae_sp: true
 enable_torch_compile: false
 ```
+
+HunyuanVideo and FastHunyuan use tiled VAE decode by default so multi-GPU runs
+distribute VAE tiles instead of selecting spatial-shard decode. At
+HunyuanVideo's supported 960×544×77 shape, spatial-shard decode can consume
+99.8 GiB per rank before requesting another 49.61 GiB causal mask. At
+FastHunyuan's default 1280×720×125 shape, the mask alone would require
+197.75 GiB. You can still override the policy with
+`--vae-config.parallel-decode-mode`, but `spatial` and `spatial_shard` should
+only be used for smaller validated shapes.
 
 ## Generate
 
