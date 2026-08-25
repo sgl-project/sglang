@@ -2,9 +2,11 @@
 
 Triggered by ``--quantization mxfp_w4a8``.
 
-Online mode currently quantises only MoE expert weights to MXFP4. Other Linear
-layers stay in BF16 so the online accuracy experiment matches the expert-only
-W4A8 scope used by the offline recipe more closely.
+Online mode: FP16/BF16 weights are quantised to MXFP4 in
+``process_weights_after_loading``; activations are dynamically quantised to
+MXFP8 (``float8_e4m3fn`` + UE8M0 block scale) at inference time. Linear layers
+run through ``npu_quant_matmul`` with FP4 weights, MoE experts through the
+grouped matmuls in ``NPUW4A8MXFP4MoEMethod``.
 
 The config is device-agnostic and dispatches per device in
 ``get_quant_method``; only the Ascend NPU backend (Ascend 950 / A5) is
@@ -13,6 +15,7 @@ implemented today.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 
 import torch
@@ -28,13 +31,21 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
 
+logger = logging.getLogger(__name__)
+
+# MXFP4 group (block) size — fixed at 32 by the FP4 npu_quant_matmul kernel.
+# Same value as linear_method_npu.py:MXFP4_BLOCK_SIZE; duplicated here as a plain
+# int so this device-agnostic config never imports the NPU-only linear module.
+MXFP4_W4A8_GROUP_SIZE = 32
+
 
 class Mxfp4W4A8Config(QuantizationConfig):
-    """Expert-only MXFP4 W4A8 online quantization config.
+    """MXFP4 W4A8 online quantization config; dispatches per device.
 
-    MoE expert weights are quantised online to MXFP4 and their activations to
-    MXFP8 at inference time. Non-expert Linear layers stay unquantized while
-    isolating the accuracy impact of the online MoE path.
+    True W4(weight) A8(activation): weights are quantised online to MXFP4 and
+    activations to MXFP8 at inference time. ``get_quant_method`` covers both
+    ``LinearBase`` and ``FusedMoE`` experts and dispatches per device; only
+    Ascend NPU is wired up today.
     """
 
     def __init__(
@@ -89,7 +100,38 @@ class Mxfp4W4A8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            return UnquantizedLinearMethod()
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedLinearMethod()
+            # FP4 (A8W4) npu_quant_matmul requires the reduction dim K to be a
+            # multiple of the MXFP4 group size (32) — it has no partial-last-block
+            # support (unlike MXFP8's A8W8 kernel, which pads ceil(K/32) scales).
+            # Layers whose input dim isn't 32-aligned (e.g. Qwen3.5 vision MLP
+            # linear_fc2 with K=4304) fall back to BF16, mirroring how
+            # msmodelslim / vllm-ascend leave such layers unquantized offline.
+            if layer.input_size % MXFP4_W4A8_GROUP_SIZE != 0:
+                logger.warning(
+                    "mxfp_w4a8: skipping %s (input_size=%d not a multiple of %d); "
+                    "falling back to unquantized BF16.",
+                    prefix,
+                    layer.input_size,
+                    MXFP4_W4A8_GROUP_SIZE,
+                )
+                return UnquantizedLinearMethod()
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUMXFP4W4A8LinearMethod,
+                )
+
+                return NPUMXFP4W4A8LinearMethod(self)
+            raise NotImplementedError(
+                "mxfp_w4a8 (MXFP4 weights + MXFP8 activations, W4A8) is currently "
+                "only implemented for the Ascend NPU backend; no CUDA/other-device "
+                "kernel exists yet. Add a device branch here when one lands."
+            )
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix,
