@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -18,17 +19,27 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     npu_w8a8_block_fp8_linear,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
 class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
-    def test_rejects_unsupported_block_size(self):
-        with self.assertRaisesRegex(ValueError, r"block_size \[128, 128\]"):
-            npu_w8a8_block_fp8_linear(
-                torch.empty(1, 128, dtype=torch.bfloat16),
-                torch.empty(128, 64, dtype=torch.float8_e4m3fn),
-                [64, 128],
-                torch.empty(1),
-            )
+    def test_requantizes_non_128_block_fp8_weights_for_a5_mxfp8(self):
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.ones(64, 128, dtype=torch.float8_e4m3fn), requires_grad=False
+            ),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.ones(1, 1, dtype=torch.float32), requires_grad=False
+            ),
+        )
+        method = object.__new__(Fp8LinearMethod)
+        method.weight_block_size = [64, 128]
+
+        method._process_npu_a5_mxfp8_linear_weights(layer)
+
+        self.assertEqual(layer.weight.data.shape, (128, 64))
+        self.assertEqual(layer.weight_scale_inv.data.shape, (2, 64, 2))
+        self.assertTrue(layer.weight_scale_inv.format_ue8m0)
 
     def test_rejects_non_fp8_weight(self):
         with self.assertRaisesRegex(ValueError, "expects float8_e4m3fn weights"):
@@ -55,7 +66,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
             output = npu_w8a8_block_fp8_linear(
                 input_tensor,
                 weight,
-                [128, 128],
+                [64, 128],
                 weight_scale,
                 bias=bias,
             )

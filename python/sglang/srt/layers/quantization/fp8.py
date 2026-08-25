@@ -742,19 +742,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 del t
 
     def _process_npu_a5_mxfp8_linear_weights(self, layer: Module) -> None:
-        """Convert DeepSeek [128, 128] block-FP8 weights to A5 MXFP8 layout.
+        """Convert block-FP8 weights to the A5 MXFP8 layout.
 
-        The checkpoint stores arbitrary FP32 scale factors per 128x128 block,
-        while the A5 GEMM consumes one UE8M0 scale per 32 K elements. Extracting
-        the FP32 exponent alone would change the represented value whenever a
-        checkpoint scale has a non-zero mantissa. Requantize the dequantized
-        weights instead so the FP8 values and UE8M0 scales remain consistent.
+        The checkpoint stores arbitrary FP32 scale factors per quantization block,
+        while the A5 GEMM consumes one UE8M0 scale per 32 K elements. Requantize
+        the dequantized weights so the FP8 values and UE8M0 scales remain
+        consistent.
         """
-        if self.weight_block_size != [128, 128]:
-            raise ValueError(
-                "A5 MXFP8 linear only supports [128, 128] block-FP8 weights, "
-                f"got {self.weight_block_size}."
-            )
         weight = block_quant_dequant(
             layer.weight.data,
             layer.weight_scale_inv.data,
