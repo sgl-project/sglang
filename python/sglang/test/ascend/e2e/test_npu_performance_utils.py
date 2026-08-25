@@ -220,9 +220,9 @@ STDOUT_IDLE_TIMEOUT = 600  # > BENCHMARK_STDOUT_IDLE_TIMEOUT (300)
 STDOUT_WATCHDOG_POLL_INTERVAL = 30
 
 _last_stdout_activity = time.time()
-_stdout_watchdog_active = False   # only allow triggering while tests run
+_stdout_watchdog_active = False  # only allow triggering while tests run
 _stdout_watchdog_started = False  # started once per process
-_self_isolated = False            # whether setUpClass self-isolated into its own group
+_self_isolated = False  # whether setUpClass self-isolated into its own group
 
 
 class _ActivityStdout:
