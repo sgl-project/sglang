@@ -21,9 +21,9 @@ class TestCacheHitKitMetrics(CustomTestCase):
             {"choices": [{"delta": {"reasoning_content": output}}]}
             for output in ("a", "b", "c")
         ]
-        content = [
-            f"data: {json.dumps(chunk)}".encode("utf-8") for chunk in chunks
-        ] + [b"data: [DONE]"]
+        content = [f"data: {json.dumps(chunk)}".encode("utf-8") for chunk in chunks] + [
+            b"data: [DONE]"
+        ]
 
         class MockResponse:
             status = 200
