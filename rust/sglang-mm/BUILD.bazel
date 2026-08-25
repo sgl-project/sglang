@@ -5,6 +5,7 @@ load(
     "all_crate_deps",
     "crate_edition",
 )
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -17,6 +18,11 @@ exports_files([
 filegroup(
     name = "sglang_mm_srcs",
     srcs = glob(["src/**/*.rs"]),
+)
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]),
 )
 
 # This target intentionally leaves both `python` and `parallel` disabled. It is

@@ -1,6 +1,16 @@
 load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//python/sglang:__subpackages__"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]) + [
+        "//python/sglang/srt/utils:main_wheel_pep517_sources",
+        "//python/sglang/srt/weight_cache:main_wheel_pep517_sources",
+    ],
+    visibility = ["//visibility:public"],
+)
 
 # Keep the first SRT boundary deliberately small. environ.py is loaded before
 # torch in production and must remain usable in torch-free configurations.

@@ -1,7 +1,17 @@
 load("@rules_python//python:defs.bzl", "py_library")
 load("@runtime_import//:requirements.bzl", "requirement")
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]) + [
+        "//python/sglang/kernels:main_wheel_pep517_sources",
+        "//python/sglang/srt:main_wheel_pep517_sources",
+    ],
+    visibility = ["//visibility:public"],
+)
 
 py_library(
     name = "version",

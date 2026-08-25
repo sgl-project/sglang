@@ -4,6 +4,7 @@ load(
     "all_crate_deps",
     "crate_edition",
 )
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -30,4 +31,9 @@ rust_library(
     deps = [
         "//rust/sglang-mm:sglang_mm_core",
     ] + all_crate_deps(normal = True),
+)
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]),
 )

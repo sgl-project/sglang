@@ -1,7 +1,14 @@
 load("@rules_python//python:defs.bzl", "py_library")
 load("@srt_empty_bootstrap//:requirements.bzl", "requirement")
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//python/sglang:__subpackages__"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]),
+    visibility = ["//visibility:public"],
+)
 
 # Socket framing, cache fingerprints, and quantization allowlisting are
 # intentionally separate from CUDA IPC transport and daemon lifecycle.

@@ -1,3 +1,5 @@
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
@@ -5,3 +7,12 @@ exports_files([
     "Cargo.toml",
     "rust-toolchain.toml",
 ])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["*"]) + [
+        "//rust/sglang-grpc:main_wheel_pep517_sources",
+        "//rust/sglang-mm:main_wheel_pep517_sources",
+        "//rust/sglang-server:main_wheel_pep517_sources",
+    ],
+)

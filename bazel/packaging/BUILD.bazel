@@ -1,0 +1,43 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":pep517_wheel.bzl", "pep517_wheel")
+
+package(default_visibility = ["//visibility:public"])
+
+sh_binary(
+    name = "build_pep517_wheel",
+    srcs = ["build_pep517_wheel.sh"],
+)
+
+# This action deliberately preserves the existing release authority instead of
+# reimplementing wheel assembly. It is declared, but NOT hermetic: PEP 517 build
+# isolation downloads backend requirements, and setuptools-rust consumes the
+# host Cargo/Rust/C toolchains and system libraries. The implementation forces
+# local, unsandboxed, non-cacheable execution and prints the same warning.
+pep517_wheel(
+    name = "main_wheel_pep517",
+    srcs = [
+        "//:release_metadata",
+        "//proto/sglang/runtime/v1:main_wheel_pep517_sources",
+        "//python:main_wheel_pep517_sources",
+        "//rust:main_wheel_pep517_sources",
+    ],
+    builder = ":build_pep517_wheel",
+    tags = [
+        "local",
+        "manual",
+        "no-cache",
+        "no-remote",
+        "no-sandbox",
+        "requires-host-python",
+        "requires-network",
+        "transitional-pep517",
+    ],
+)
+
+py_binary(
+    name = "compare_main_wheels",
+    srcs = ["compare_wheels.py"],
+    main = "compare_wheels.py",
+    python_version = "PY3",
+)

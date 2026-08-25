@@ -1,5 +1,13 @@
 package(default_visibility = ["//visibility:public"])
 
+filegroup(
+    name = "release_metadata",
+    srcs = [
+        "LICENSE",
+        "README.md",
+    ],
+)
+
 test_suite(
     name = "bazel_smoke",
     tests = [

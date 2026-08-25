@@ -1,7 +1,14 @@
 load("@hf_management//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//python/sglang:__subpackages__"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]),
+    visibility = ["//visibility:public"],
+)
 
 py_library(
     name = "hub",

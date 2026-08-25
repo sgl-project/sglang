@@ -2,8 +2,17 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_library")
 load("@srt_empty_bootstrap//:requirements.bzl", "requirement")
+load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
 
 package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "main_wheel_pep517_sources",
+    srcs = pep517_source_glob(["**"]) + [
+        "//python/sglang/kernels/aot:main_wheel_pep517_sources",
+    ],
+    visibility = ["//visibility:public"],
+)
 
 # Torch-free metadata/dispatch layer. Native AOT and JIT implementations are
 # separate targets so a CPU analysis does not select a CUDA or ROCm toolchain.
