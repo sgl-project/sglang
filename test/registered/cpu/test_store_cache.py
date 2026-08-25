@@ -5,6 +5,10 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
+    CPUFP8KVCacheMethod,
+)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -30,38 +34,6 @@ def _random_tensor(shape, dtype):
     if dtype == torch.uint8:
         return torch.randint(0, 256, shape, dtype=torch.uint8, device=DEVICE)
     return torch.randn(shape, dtype=dtype, device=DEVICE)
-
-
-def _cpu_has_amx():
-    return cpu_has_amx_support()
-
-
-def _import_mha_pool():
-    pytest.importorskip(
-        "xgrammar.structural_tag",
-        reason="local xgrammar is too old for workspace sglang imports",
-    )
-    try:
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    except ImportError as exc:
-        if "AnyTokensFormat" in str(exc):
-            pytest.skip("local xgrammar is too old for workspace sglang imports")
-        raise
-    return MHATokenToKVPool
-
-
-def _import_mla_pool():
-    pytest.importorskip(
-        "xgrammar.structural_tag",
-        reason="local xgrammar is too old for workspace sglang imports",
-    )
-    try:
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-    except ImportError as exc:
-        if "AnyTokensFormat" in str(exc):
-            pytest.skip("local xgrammar is too old for workspace sglang imports")
-        raise
-    return MLATokenToKVPool
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
@@ -114,13 +86,7 @@ def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
     assert torch.equal(v_cache, v_cache_ref)
 
 
-@pytest.mark.skipif(not _cpu_has_amx(), reason="FP8 E4M3 KV cache requires AMX")
 def test_mha_fp8_e4m3_kv_pool_updates_scales():
-    MHATokenToKVPool = _import_mha_pool()
-    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-        CPUFP8KVCacheMethod,
-    )
-
     pool = MHATokenToKVPool(
         size=32,
         page_size=1,
@@ -167,10 +133,10 @@ def test_mha_fp8_e4m3_kv_pool_updates_scales():
     assert torch.equal(pool.v_scale_buffer[0][loc], v_scale_ref)
 
 
-@pytest.mark.skipif(not _cpu_has_amx(), reason="FP8 E4M3 KV cache requires AMX")
+@pytest.mark.skipif(
+    not cpu_has_amx_support(), reason="FP8 E4M3 MLA KV cache requires AMX"
+)
 def test_mla_fp8_e4m3_kv_pool_preserves_scales():
-    MLATokenToKVPool = _import_mla_pool()
-
     pool = MLATokenToKVPool(
         size=32,
         page_size=1,

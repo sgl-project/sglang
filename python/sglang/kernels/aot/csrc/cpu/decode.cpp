@@ -57,7 +57,6 @@ inline void pack_vnni_Nx32(
     _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
   }
 }
-
 #endif
 
 // [NOTE]: MLA vnni format conversion

@@ -391,5 +391,3 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
-
-// End of tinygemm declarations.

@@ -53,7 +53,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -101,9 +101,9 @@ logger = logging.getLogger(__name__)
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
-_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -705,6 +705,7 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
+
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)

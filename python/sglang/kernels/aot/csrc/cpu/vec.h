@@ -321,7 +321,6 @@ inline void quantize_row_int8<at::BFloat16>(
   }
   As = scale;
 }
-
 #endif
 
 // transpose utils

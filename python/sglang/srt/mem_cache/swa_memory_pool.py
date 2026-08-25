@@ -249,26 +249,15 @@ class SWAKVPool(BaseSWAKVPool):
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
             loc = swa_loc
-        if isinstance(pool, MLATokenToKVPool):
-            pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )
-        else:
-            pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )
+        pool.set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id_pool,
+        )
 
     def set_mla_kv_buffer(
         self,

@@ -27,7 +27,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )

@@ -29,7 +29,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
