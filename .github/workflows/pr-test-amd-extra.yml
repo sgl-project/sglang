@@ -142,7 +142,7 @@ jobs:
   # setup across scarce AMD GPUs to shave only a couple minutes of test time,
   # so one GPU running the whole suite sequentially is the better trade.
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm724' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -175,7 +175,7 @@ jobs:
   # pool as small (AMD GPUs carry enough VRAM that "large" here is a CUDA
   # memory-tier label, not a separate AMD runner pool).
   extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm724' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -205,7 +205,7 @@ jobs:
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
   # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm724' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
