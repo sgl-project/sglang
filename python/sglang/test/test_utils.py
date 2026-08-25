@@ -2105,6 +2105,20 @@ def server_args_variant(server_args, **fields):
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value
+        for name, value in fields.items()
+        if name in cls.__dataclass_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
         object.__setattr__(variant, name, value)
     return variant

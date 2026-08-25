@@ -32,6 +32,12 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/layout/usp_relayout_jit.py`
 - `python/sglang/multimodal_gen/runtime/layers/usp.py`
 - `python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/longcat_image.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/sana_video.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/lingbot_video_moe.py`
+- `python/sglang/multimodal_gen/runtime/models/decoders/ltx_2_5_diffusion_decoder.py`
+- `python/sglang/multimodal_gen/runtime/layers/moe.py`
+- `python/sglang/srt/layers/moe/topk.py`
 - `python/sglang/kernels/ops/diffusion/modulate/residual_gate_add_jit.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
 - `python/sglang/kernels/ops/diffusion/layout/varlen_pack_pad_triton.py`
@@ -112,8 +118,10 @@ framework-specific optimization workflow.
   fusions and decode-scoped VAE rewrites. Mounting is all-or-nothing per
   transformer/fusion family; VAE gates reset after every decode.
 - Current families include FLUX affine-folded LN+modulate / fused GELU sites,
-  GLM-Image fused GELU sites, generic KL VAE decoder rewrites used by
-  FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE RMSNorm+SiLU.
+  GLM/Qwen/Hunyuan/LTX fused GELU sites, LTX RMSNorm+modulate, Hunyuan QK
+  RMSNorm, Ideogram gated RMSNorm, SANA-Video linear attention, generic KL VAE
+  decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE
+  RMSNorm+SiLU.
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test_quality_gate.py`, `test_fused_ln_modulate.py`,
@@ -289,6 +297,55 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Request-Scoped DiT Fusions with Breakable CUDA Graphs**
+
+- `quality=high` DiT sites are mounted at a request boundary. BCG warmup uses
+  the model's lossless sampling default unless a quality-aware graph variant
+  was captured explicitly.
+- A graph captured before the high-quality mount retains the lossless module
+  branches. Replaying it after the mount silently bypasses the requested high
+  kernels even when the tensor signature matches.
+- Workflow rule: a high+BCG cell is valid only when the model has no
+  request-scoped DiT quality sites, or when logs prove those sites were mounted
+  before the matching graph capture. A mount after `[Diffusion BCG] captured`
+  invalidates the row; do not use its latency or output as high-quality
+  evidence.
+
+**Recent Model Audit Boundaries**
+
+- LongCat-Image supports breakable CUDA graph at fixed, captured resolutions.
+  Its DiT always receives a 512-token prompt body, so different raw prompt
+  lengths reuse the same graph signature without padding. A model-specific
+  pass-through padder prevents the generic buckets from expanding this fixed
+  shape into unused graph signatures.
+  The model still has split image/text QKV projections and performs
+  joint-stream `cat`/split inside each single block. Do not misclassify those
+  as a missed existing packed path; they are model-local structural
+  opportunities that need their own weight-loader and parity coverage.
+- SANA-Video already packs self QKV and cross KV. For fixed 832x480 serving,
+  its default 300-token prompt shape can reuse one breakable CUDA graph without
+  generic text-bucket padding. An H200 81-frame, 8-step run measured
+  920.6--925.3 ms/step eager versus 797.8--798.9 ms/step with BCG, with
+  bit-exact final videos; reserved peak memory increased by about 3.4 GB.
+  Its conv/modulation formulas mirror SANA, but it does not yet call SANA's
+  bit-exact bias-SiLU, bias-GLU, residual-gate, LayerNorm-modulation, or
+  one-time contiguous-layout helpers. Reuse or extract those helpers before
+  authoring a video-only kernel.
+- LingBot Video MoE's router implements sigmoid+bias grouped top-k in
+  `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
+  compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
+  writing a new router kernel. Its released eager path still expands RMSNorm
+  into `pow/mean/rsqrt` chains. #35969 is a measured `quality=high` candidate
+  that dispatches existing Triton row kernels by weight dtype and hidden size;
+  it is not current-main behavior until the PR merges.
+- LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
+  decoder separately: confirm NATTEN `na3d` is active, then inspect its
+  per-block 3D RoPE construction and split QKV/SwiGLU projections.
+- Cosmos3 Edge inherits the existing Cosmos3 attention-prep fusions. Profile
+  the dense squared-ReLU MLP before proposing another Cosmos kernel, and do not
+  repeat the closed experimental Cosmos BCG direction without solving its
+  model-state lifecycle problem.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
@@ -339,9 +396,25 @@ framework-specific optimization workflow.
 - Breakable CUDA graph: `runtime/breakable_cuda_graph/runner.py` captures
   fixed-resolution DiT segments around eager attention/collectives for
   supported pipelines. It is mutually exclusive with `torch.compile` and
-  Cache-DiT, requires every served resolution in `--warmup-resolutions`, and
-  uses `--bcg-text-buckets` for prompt signatures. Check this path before
-  proposing a second graph-capture mechanism for launch-bound traces.
+  Cache-DiT. The model's default resolution is captured automatically; put
+  every additional served resolution in `--warmup-resolutions`, and use
+  `--bcg-text-buckets` for prompt signatures. Check this path before proposing
+  a second graph-capture mechanism for launch-bound traces.
+- A valid BCG benchmark must show `[Diffusion BCG] captured` and no support
+  disable, capture failure, `serving signature MISSED`, or eager-fallback
+  marker. Width and height are not the whole signature: public
+  `--warmup-resolutions` does not override a video model's synthetic warmup
+  frame count, so a short profiling request can capture the default temporal
+  shape and then miss during serving. Reject that timing instead of labeling
+  it BCG.
+- LongCat-Image uses this generic runner directly: one 1024x1024 capture covers
+  short and long prompts because text conditioning is fixed at 512 tokens.
+  Keep eager as the baseline because the gain is hardware-dependent; an H200
+  50-step, three-prompt run measured 177.0--177.3 ms/step eager versus
+  173.1--173.3 ms/step with BCG, with bit-exact final images.
+- SANA-Video uses this runner directly at declared 832x480 resolutions. Its
+  default text pipeline always emits 300 prompt slots, so one graph covers
+  different raw prompt lengths without padding cross-attention to 512 slots.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
@@ -361,6 +434,12 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20429 Qwen-Image layernorm and `fuse_scale_shift_gate_select01` work.
   - #20530 MOVA fused RMSNorm + interleaved RoPE.
   - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
+  - #34172 LTX2 quality-high fusion; #34305/#34314 Ideogram eager fusions.
+  - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
+    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3; #35728
+    SANA-Video linear attention.
+  - #35961 SANA-Video lossless shared-kernel reuse and #35969 LingBot
+    `quality=high` RMSNorm are open candidates, not current-main fast paths.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -375,6 +454,10 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20447 TeaCache support for GLM-Image, Qwen-Image, and related models.
   - #19516 Qwen-Image CUDA Graph.
   - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
+  - #34174 automatic default-resolution BCG warmup; #34210 Z-Image BCG
+    correctness; #34929 LTX2.3 BCG; #35724 LongCat-Image BCG; #35729
+    SANA-Video fixed-300-token BCG. #34618 is a closed Cosmos BCG experiment,
+    not a reusable mainline fast path.
 
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.
