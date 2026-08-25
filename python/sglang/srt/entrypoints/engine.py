@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqType,
+    RegisterLoRAAdapterReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     ReturnHiddenStatesMode,
@@ -1414,21 +1415,37 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
-    def begin_weight_update(self, selector: str = "all"):
+    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session: unpack in-place-quantized weights on the
         selected runners so update_weights_from_{distributed,tensor} can load into
-        them. Must be closed with end_weight_update()."""
-        obj = BeginWeightUpdateReqInput(selector=selector)
+        them. sync_base=False declares an adapter-only session (no unpack; base
+        tensors rejected). Must be closed with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector, sync_base=sync_base)
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
-    def end_weight_update(self):
-        """Close the session opened by begin_weight_update() and finalize quantized
-        weights into kernel layout."""
-        obj = EndWeightUpdateReqInput()
+    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
+        """Close the session opened by begin_weight_update(): finalize quantized
+        weights into kernel layout (sync_base sessions) and apply the streamed
+        LoRA stash (optionally checksum-verified)."""
+        obj = EndWeightUpdateReqInput(expected_lora_checksums=expected_lora_checksums)
         return self.loop.run_until_complete(
             self.tokenizer_manager.end_weight_update(obj, None)
+        )
+
+    def register_lora_adapter(
+        self, lora_name: str, config_dict: Dict, pinned: bool = True
+    ):
+        """Create-or-refresh a LoRA adapter's identity and config. Weights are
+        untouched by the caller (new adapters start zeroed); the bytes arrive as
+        '{lora_name}:{hf_key}'-prefixed tensors in the update_weights_from_*
+        stream and are applied at end_weight_update."""
+        obj = RegisterLoRAAdapterReqInput(
+            lora_name=lora_name, config_dict=config_dict, pinned=pinned
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.register_lora_adapter(obj, None)
         )
 
     def update_weights_from_distributed(

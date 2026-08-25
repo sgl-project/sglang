@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -264,6 +265,11 @@ class BaseTpWorker(ABC):
             upsert=recv_req.upsert,
         )
         return result
+
+    def register_lora_adapter(self, recv_req: RegisterLoRAAdapterReqInput):
+        return self.model_runner.register_lora_adapter(
+            recv_req.to_ref(), recv_req.config_dict
+        )
 
     def load_lora_adapter_from_distributed(
         self, recv_req: LoadLoRAAdapterFromDistributedReqInput

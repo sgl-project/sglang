@@ -1274,6 +1274,10 @@ class ModelRunner:
         """Load a new lora adapter from disk or huggingface."""
         return self.lora_manager.load_lora_adapter(lora_ref)
 
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
+
     def load_lora_adapter_from_tensors(
         self,
         lora_ref: LoRARef,

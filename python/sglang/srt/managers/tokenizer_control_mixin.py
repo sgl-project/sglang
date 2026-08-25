@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     PullWeightsReqInput,
     PullWeightsReqOutput,
+    RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -820,6 +822,52 @@ class TokenizerControlMixin:
                 return result
         except ValueError as e:
             return LoadLoRAAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def register_lora_adapter(
+        self: TokenizerManager,
+        obj: RegisterLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh an adapter's identity and config (control plane).
+
+        Weight bytes arrive later as ``{lora_name}:{hf_key}``-prefixed tensors
+        in the update_weights_from_* stream and are applied at
+        end_weight_update."""
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            async with self.lora_update_lock:
+                # Same-name registration keeps its lora_id (config refresh /
+                # slot re-tenancy); a fresh name mints a new ref.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__stream__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=True,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                return result
+        except ValueError as e:
+            return RegisterLoRAAdapterReqOutput(
                 success=False,
                 error_message=str(e),
             )
