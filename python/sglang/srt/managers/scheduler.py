@@ -4456,20 +4456,26 @@ class Scheduler(
         ret["memory_usage"] = memory_usage
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-        # PD role switch: expose this instance's role and the decode CUDA graph
-        # batch sizes it has captured (empty on a prefill that has not flipped to
-        # decode). A router can query a live decode server here and pass the value
-        # as PdRoleSwitchReqInput.decode_cuda_graph_bs so the instance being
-        # flipped to decode captures a size-matched graph set.
-        ret["disaggregation_mode"] = get_disagg().disaggregation_mode
-        ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
-        ret["decode_cuda_graph_memory_gb"] = round(
-            sum(
-                memory_usage["graph"][phase]
-                for phase in ("decode", "target_verify", "draft_decode", "draft_extend")
-            ),
-            3,
-        )
+        # PD role switch: report this instance's role and the decode CUDA graph
+        # batch sizes it captured, which a router feeds back as
+        # PdRoleSwitchReqInput.decode_cuda_graph_bs. Unset until
+        # init_disaggregation runs, which also re-derives it on every flip.
+        disaggregation_mode = getattr(self, "disaggregation_mode", None)
+        if disaggregation_mode is not None:
+            ret["disaggregation_mode"] = disaggregation_mode.value
+            ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
+            ret["decode_cuda_graph_memory_gb"] = round(
+                sum(
+                    memory_usage["graph"][phase]
+                    for phase in (
+                        "decode",
+                        "target_verify",
+                        "draft_decode",
+                        "draft_extend",
+                    )
+                ),
+                3,
+            )
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
