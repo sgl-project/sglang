@@ -222,7 +222,6 @@ STDOUT_WATCHDOG_POLL_INTERVAL = 30
 _last_stdout_activity = time.time()
 _stdout_watchdog_active = False  # only allow triggering while tests run
 _stdout_watchdog_started = False  # started once per process
-_self_isolated = False  # whether setUpClass self-isolated into its own group
 
 
 class _ActivityStdout:
@@ -269,11 +268,6 @@ def _install_stdout_activity_tracking():
         logger.addHandler(_ActivityLogHandler())
 
 
-def _mark_self_isolated():
-    global _self_isolated
-    _self_isolated = True
-
-
 def _kill_current_test_group():
     """SIGKILL every process of this test: descendants (server subtree, running
     benchmark) + leftover reparented forkserver in the same group + self.
@@ -281,8 +275,8 @@ def _kill_current_test_group():
     Under option C the server shares the test's group, so killpg(self-group) also
     kills self; it must only be used for "already failed / already stuck" cases.
     setUpClass's setpgid(0,0) ensures this group excludes run_suite.py / ci_utils.
-    If setpgid failed (not self-isolated), killpg is skipped to avoid killing the
-    runner's process group.
+    killpg is only issued when this process is its own group leader (pgid == pid),
+    so it can never touch the runner's process group.
 
     The two cleanup calls below are complementary, not redundant -- do not remove
     either one:
@@ -298,13 +292,14 @@ def _kill_current_test_group():
         kill_process_tree(os.getpid(), include_parent=False)
     except Exception as e:
         logger.warning("kill_process_tree failed: %s", e)
-    if not _self_isolated:
-        # setpgid(0,0) failed earlier: this process still shares the runner's
-        # process group, so killpg would SIGKILL run_suite.py / ci_utils. Refuse
-        # it and rely only on the descendant cleanup above.
+    if os.getpgrp() != os.getpid():
+        # Not the leader of its own process group (e.g. still in the runner's
+        # group): killpg would SIGKILL run_suite.py / ci_utils. Refuse it and
+        # rely only on the descendant cleanup above.
         logger.error(
-            "Skipping killpg: process is not self-isolated, refusing to "
-            "SIGKILL the parent runner's process group"
+            "Skipping killpg: not a process group leader (pgid=%d != pid=%d)",
+            os.getpgrp(),
+            os.getpid(),
         )
         return
     _kill_pgid(os.getpgrp())
@@ -1250,7 +1245,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         # (all currently registered cases satisfy this).
         try:
             os.setpgid(0, 0)
-            _mark_self_isolated()
         except OSError as e:
             logger.warning("skip self-isolation setpgid: %s", e)
 
