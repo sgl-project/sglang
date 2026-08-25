@@ -9,7 +9,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
-    get_world_group,
+    get_replica_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -392,12 +392,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     canonical_frames.copy_(visual_frames)
                     visual_frames = canonical_frames
 
-        # DP is currently rejected by ServerArgs validation, so the world group
-        # is one request replica (TP/CFG/SP ranks), not a collection of
-        # independent requests. Decode the non-sharded audio VAE once per
-        # request and distribute its output to the ranks that decoded video.
-        world_group = get_world_group() if model_parallel_is_initialized() else None
-        is_audio_owner = world_group is None or world_group.rank_in_group == 0
+        # Decode the non-sharded audio VAE once per request and distribute its
+        # output to the ranks that decoded video. The request lives in one
+        # pipeline replica; the world group spans replicas when dp_size > 1,
+        # so a world-group collective would wait on idle replicas forever.
+        replica_group = get_replica_group() if model_parallel_is_initialized() else None
+        is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
         owner_exception = None
         owner_error = None
         audio_payload = None
@@ -407,16 +407,16 @@ class MiniMaxH3DecodingStage(DecodingStage):
             except Exception as exc:
                 owner_exception = exc
                 owner_error = f"{type(exc).__name__}: {exc}"
-        if world_group is not None:
-            owner_error = world_group.broadcast_object(owner_error, src=0)
+        if replica_group is not None:
+            owner_error = replica_group.broadcast_object(owner_error, src=0)
         if owner_error is not None:
             if owner_exception is not None:
                 raise owner_exception
             raise RuntimeError(
                 f"MiniMax H3 audio decode failed on rank 0: {owner_error}"
             )
-        if world_group is not None:
-            audio_payload = world_group.broadcast_tensor_dict(audio_payload, src=0)
+        if replica_group is not None:
+            audio_payload = replica_group.broadcast_tensor_dict(audio_payload, src=0)
         if not isinstance(audio_payload, dict):
             raise RuntimeError("MiniMax H3 audio decode produced no output payload")
         audio_waveform = _required_tensor(
