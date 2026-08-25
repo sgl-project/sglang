@@ -1,5 +1,5 @@
 {
-  "checksum": "b4dc94cb2a00bf5307c873dc3fa3d18904c4285036285fa2a82a64b2d7324eb7",
+  "checksum": "2ce2f1c600dc6c5f9267974c641be19900491b4b938aec5c69e21d17fcefbb63",
   "crates": {
     "addr2line 0.25.1": {
       "name": "addr2line",
@@ -39002,12 +39002,6 @@
         "compile_data_glob_excludes": [
           "**/*.rs"
         ],
-        "data": {
-          "common": [
-            "@@protobuf+//:well_known_protos"
-          ],
-          "selects": {}
-        },
         "data_glob": [
           "**"
         ],
@@ -39026,14 +39020,13 @@
         },
         "build_script_env": {
           "common": {
-            "PROTOC": "$(execpath @bazel_tools//tools/proto:protoc)",
-            "PROTOC_INCLUDE": "external/protobuf+/src"
+            "PROTOC": "$(execpath @@//bazel/rust:gateway_protoc)"
           },
           "selects": {}
         },
         "tools": {
           "common": [
-            "@bazel_tools//tools/proto:protoc"
+            "@@//bazel/rust:gateway_protoc"
           ],
           "selects": {}
         }
@@ -39327,12 +39320,6 @@
         "compile_data_glob_excludes": [
           "**/*.rs"
         ],
-        "data": {
-          "common": [
-            "@@protobuf+//:well_known_protos"
-          ],
-          "selects": {}
-        },
         "data_glob": [
           "**"
         ],
@@ -39351,14 +39338,13 @@
         },
         "build_script_env": {
           "common": {
-            "PROTOC": "$(execpath @bazel_tools//tools/proto:protoc)",
-            "PROTOC_INCLUDE": "external/protobuf+/src"
+            "PROTOC": "$(execpath @@//bazel/rust:gateway_protoc)"
           },
           "selects": {}
         },
         "tools": {
           "common": [
-            "@bazel_tools//tools/proto:protoc"
+            "@@//bazel/rust:gateway_protoc"
           ],
           "selects": {}
         }

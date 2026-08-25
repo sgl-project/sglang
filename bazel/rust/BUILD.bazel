@@ -1,4 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -6,6 +7,15 @@ exports_files([
     "sgl-model-gateway-crates.lock.json",
     "sglang-crates.lock.json",
 ])
+
+sh_binary(
+    name = "gateway_protoc",
+    srcs = ["gateway_protoc.sh"],
+    data = [
+        "@protobuf//:protoc",
+        "@protobuf//:well_known_protos",
+    ],
+)
 
 py_test(
     name = "sgl_model_gateway_lock_parity_test",
