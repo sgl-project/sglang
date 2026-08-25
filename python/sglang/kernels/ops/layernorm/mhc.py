@@ -543,7 +543,9 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
+
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
