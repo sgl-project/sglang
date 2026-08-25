@@ -107,8 +107,23 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
 // `::atomicAdd` expressions they replace, and `run_cumsum` keeps its original
 // body.
 // ---------------------------------------------------------------------------
+// Compile-time switch.  Overridable from the build so that an A/B against
+// this patch does not need a source edit:
+//
+//     -DSGL_TOPK_WAVE_OPT=0   original atomics and tree cumsum
+//     -DSGL_TOPK_WAVE_OPT=1   wave-aggregated atomics and wave cumsum
+//
+// Tested with #if rather than #ifdef throughout, so that an explicit 0
+// actually turns the path off instead of merely being defined.
 #ifdef USE_ROCM
+#ifndef SGL_TOPK_WAVE_OPT
 #define SGL_TOPK_WAVE_OPT 1
+#endif
+#else
+#define SGL_TOPK_WAVE_OPT 0
+#endif
+
+#if SGL_TOPK_WAVE_OPT
 #ifdef __AMDGCN_WAVEFRONT_SIZE
 constexpr int kWaveSize = __AMDGCN_WAVEFRONT_SIZE;
 #else
@@ -192,7 +207,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   __syncthreads();
 
   const auto run_cumsum = [&] {
-#ifdef SGL_TOPK_WAVE_OPT
+#if SGL_TOPK_WAVE_OPT
     // Same result (an inclusive suffix sum over s_histogram[0..RADIX)), but
     // confined to wave 0 and using shuffles, so the block pays 1 barrier
     // instead of 8.  s_histogram[RADIX] is not touched here; it is zeroed by
