@@ -1140,6 +1140,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
+            # Dense-drain mark D0 (§24.27 plan A): the target worker returned;
+            # only plain Python assignments sit between GL:C0/C1 and the gap
+            # snapshot. A hit here (with GL silent) convicts the return path
+            # itself or an off-stream writer landing in this interval.
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                layer_trap_mark(batch, "GL:D0-eagle")
+            except Exception:
+                pass
             # Gap probe 1 (layers/cp/layer_trap.py): the layer trap ends at
             # the last decoder layer; this drain covers the target post-loop
             # path (CP all-gather / norms / lm_head / logits capture) of the
