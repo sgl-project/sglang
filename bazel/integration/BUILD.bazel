@@ -19,3 +19,19 @@ sh_test(
     ],
     target_compatible_with = ["//bazel/platforms:cuda"],
 )
+
+# Pinned real-weight smoke. The model must be prefetched into HF_HOME; the test
+# resolves it offline and never downloads from inside a Bazel action.
+sh_test(
+    name = "qwen2_real_weight_e2e",
+    srcs = ["run_system_python.sh"],
+    args = ["$(location :qwen2_real_weight_e2e.py)"],
+    data = ["qwen2_real_weight_e2e.py"],
+    tags = [
+        "local",
+        "manual",
+        "requires-cuda",
+        "requires-gpu",
+    ],
+    target_compatible_with = ["//bazel/platforms:cuda"],
+)
