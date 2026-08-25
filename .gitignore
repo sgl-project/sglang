@@ -281,3 +281,9 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Bazel output symlinks (repository locks are intentionally tracked)
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-workspace

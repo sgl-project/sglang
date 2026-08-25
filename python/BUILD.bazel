@@ -1,0 +1,10 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "pyproject.toml",
+    "pyproject_cpu.toml",
+    "pyproject_npu.toml",
+    "pyproject_other.toml",
+    "pyproject_xpu.toml",
+    "setup.py",
+])

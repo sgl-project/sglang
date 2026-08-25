@@ -1,0 +1,22 @@
+common --enable_bzlmod
+common --lockfile_mode=error
+
+build --show_timestamps
+build --verbose_failures
+
+test --test_output=errors
+test --test_timeout=300
+
+build:ci --announce_rc
+build:ci --color=yes
+test:ci --flaky_test_attempts=1
+
+build:cpu --platforms=//bazel/platforms:linux_x86_64_cpu
+build:cuda --platforms=//bazel/platforms:linux_x86_64_cuda
+build:rocm --platforms=//bazel/platforms:linux_x86_64_rocm
+
+# Integration targets intentionally consume the already-provisioned SGLang
+# runtime used by hardware CI. They are transitional until every native wheel
+# is represented as a Bazel dependency.
+test:cuda --test_tag_filters=-manual,-requires-rocm
+test:rocm --test_tag_filters=-manual,-requires-cuda

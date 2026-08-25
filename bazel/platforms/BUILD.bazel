@@ -1,0 +1,128 @@
+package(default_visibility = ["//visibility:public"])
+
+constraint_setting(name = "accelerator")
+
+constraint_value(
+    name = "cpu",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "cuda",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "rocm",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "xpu",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "npu",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "musa",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "mps",
+    constraint_setting = ":accelerator",
+)
+
+constraint_value(
+    name = "hpu",
+    constraint_setting = ":accelerator",
+)
+
+config_setting(
+    name = "is_cpu",
+    constraint_values = [":cpu"],
+)
+
+config_setting(
+    name = "is_cuda",
+    constraint_values = [":cuda"],
+)
+
+config_setting(
+    name = "is_rocm",
+    constraint_values = [":rocm"],
+)
+
+config_setting(
+    name = "is_xpu",
+    constraint_values = [":xpu"],
+)
+
+config_setting(
+    name = "is_npu",
+    constraint_values = [":npu"],
+)
+
+config_setting(
+    name = "is_musa",
+    constraint_values = [":musa"],
+)
+
+config_setting(
+    name = "is_mps",
+    constraint_values = [":mps"],
+)
+
+config_setting(
+    name = "is_hpu",
+    constraint_values = [":hpu"],
+)
+
+platform(
+    name = "linux_x86_64_cpu",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":cpu",
+    ],
+)
+
+platform(
+    name = "linux_aarch64_cpu",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        ":cpu",
+    ],
+)
+
+platform(
+    name = "linux_x86_64_cuda",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":cuda",
+    ],
+)
+
+platform(
+    name = "linux_aarch64_cuda",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        ":cuda",
+    ],
+)
+
+platform(
+    name = "linux_x86_64_rocm",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":rocm",
+    ],
+)

@@ -1,0 +1,54 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python/uv:lock.bzl", "uv_lock")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "profiles.json",
+    "srt_empty_bootstrap.requirements.in",
+    "srt_empty_bootstrap.requirements.lock.txt",
+])
+
+uv_lock(
+    name = "srt_empty_bootstrap_requirements",
+    srcs = ["srt_empty_bootstrap.requirements.in"],
+    out = "srt_empty_bootstrap.requirements.lock.txt",
+    args = ["--generate-hashes"],
+    tags = ["manual"],
+)
+
+py_test(
+    name = "package_profiles_test",
+    srcs = ["package_profiles_test.py"],
+    data = [
+        "profiles.json",
+        "srt_empty_bootstrap.requirements.lock.txt",
+        "//python:pyproject.toml",
+        "//python:pyproject_cpu.toml",
+        "//python:pyproject_npu.toml",
+        "//python:pyproject_other.toml",
+        "//python:pyproject_xpu.toml",
+        "//test/registered/core:test_srt_empty_deps.py",
+    ],
+)
+
+py_test(
+    name = "environ_test",
+    srcs = ["environ_test.py"],
+    deps = ["//python/sglang/srt:environ"],
+)
+
+py_test(
+    name = "kernel_metadata_test",
+    srcs = ["kernel_metadata_test.py"],
+    deps = ["//python/sglang/kernels:metadata"],
+)
+
+test_suite(
+    name = "torch_free_tests",
+    tests = [
+        ":environ_test",
+        ":kernel_metadata_test",
+        ":package_profiles_test",
+    ],
+)

@@ -1,0 +1,64 @@
+{
+  "profiles": [
+    {
+      "name": "srt_empty",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "srt_empty",
+      "accelerator": "cpu"
+    },
+    {
+      "name": "cpu",
+      "manifest": "python/pyproject_cpu.toml",
+      "extra": "dev",
+      "accelerator": "cpu"
+    },
+    {
+      "name": "cuda",
+      "manifest": "python/pyproject.toml",
+      "extra": "dev",
+      "accelerator": "cuda"
+    },
+    {
+      "name": "rocm700",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "dev_hip",
+      "accelerator": "rocm"
+    },
+    {
+      "name": "rocm724",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "dev_hip_rocm724",
+      "accelerator": "rocm"
+    },
+    {
+      "name": "xpu",
+      "manifest": "python/pyproject_xpu.toml",
+      "extra": "dev",
+      "accelerator": "xpu"
+    },
+    {
+      "name": "npu",
+      "manifest": "python/pyproject_npu.toml",
+      "extra": "dev_npu",
+      "accelerator": "npu"
+    },
+    {
+      "name": "musa",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "dev_musa",
+      "accelerator": "musa"
+    },
+    {
+      "name": "mps",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "dev_mps",
+      "accelerator": "mps"
+    },
+    {
+      "name": "hpu",
+      "manifest": "python/pyproject_other.toml",
+      "extra": "dev_hpu",
+      "accelerator": "hpu"
+    }
+  ]
+}

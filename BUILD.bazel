@@ -1,0 +1,14 @@
+package(default_visibility = ["//visibility:public"])
+
+test_suite(
+    name = "bazel_smoke",
+    tests = [
+        "//bazel/python:torch_free_tests",
+        "//rust/sglang-mm:rlib_is_single_threaded_test",
+    ],
+)
+
+filegroup(
+    name = "bazel_migration_docs",
+    srcs = ["bazel/README.md"],
+)

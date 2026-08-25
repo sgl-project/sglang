@@ -1,0 +1,78 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "public_headers",
+    srcs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "include/**/*.cuh",
+    ]),
+)
+
+filegroup(
+    name = "cpu_sources",
+    srcs = glob([
+        "csrc/cpu/**/*.cc",
+        "csrc/cpu/**/*.cpp",
+        "csrc/cpu/**/*.h",
+        "csrc/cpu/**/*.hpp",
+    ]),
+    target_compatible_with = ["//bazel/platforms:cpu"],
+)
+
+filegroup(
+    name = "cuda_sources",
+    srcs = glob(
+        [
+            "cmake/**/*.cmake",
+            "csrc/**/*.cc",
+            "csrc/**/*.cpp",
+            "csrc/**/*.cu",
+            "csrc/**/*.cuh",
+            "csrc/**/*.h",
+            "csrc/**/*.hpp",
+        ],
+        exclude = [
+            "csrc/cpu/**",
+            "csrc/metal/**",
+            "csrc/musa/**",
+        ],
+    ),
+    target_compatible_with = ["//bazel/platforms:cuda"],
+)
+
+filegroup(
+    name = "rocm_sources",
+    srcs = glob([
+        "csrc/**/*.hip",
+        "csrc/**/*.h",
+        "csrc/**/*.hpp",
+        "setup_rocm.py",
+    ]),
+    target_compatible_with = ["//bazel/platforms:rocm"],
+)
+
+filegroup(
+    name = "musa_sources",
+    srcs = glob([
+        "csrc/musa/**",
+        "setup_musa.py",
+    ]),
+    target_compatible_with = ["//bazel/platforms:musa"],
+)
+
+filegroup(
+    name = "python_facade",
+    srcs = glob(["python/sgl_kernel/**/*.py"]),
+)
+
+filegroup(
+    name = "build_metadata",
+    srcs = [
+        "CMakeLists.txt",
+        "pyproject.toml",
+        "pyproject_cpu.toml",
+        "pyproject_musa.toml",
+        "pyproject_rocm.toml",
+    ],
+)

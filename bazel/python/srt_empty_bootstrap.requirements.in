@@ -1,0 +1,6 @@
+# Minimal third-party dependency needed by the first torch-free Bazel targets.
+#
+# This is intentionally not the complete srt_empty environment. Public package
+# metadata remains in python/pyproject_other.toml; the checked lock beside this
+# file only bootstraps Bazel's dependency-boundary and kernel-metadata tests.
+msgspec

@@ -1,0 +1,86 @@
+module(
+    name = "sglang",
+)
+
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3", dev_dependency = True)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_python", version = "2.3.2")
+bazel_dep(name = "rules_rust", version = "0.73.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+# Python 3.12 matches the hosted CPU/lint jobs. Accelerator-specific Python
+# hubs will be added separately because CUDA, ROCm, XPU, and NPU can share an
+# OS/CPU tuple while requiring mutually incompatible wheels.
+rules_python_config = use_extension(
+    "@rules_python//python/extensions:config.bzl",
+    "config",
+)
+rules_python_config.explicit_init_py(default = True)
+
+python = use_extension(
+    "@rules_python//python/extensions:python.bzl",
+    "python",
+)
+python.defaults(python_version = "3.12")
+python.toolchain(python_version = "3.12")
+use_repo(
+    python,
+    "python_3_12",
+    "python_versions",
+    "pythons_hub",
+)
+
+register_toolchains("@pythons_hub//:all")
+
+uv = use_extension(
+    "@rules_python//python/uv:uv.bzl",
+    "uv",
+    dev_dependency = True,
+)
+uv.configure(version = "0.12.5")
+use_repo(uv, "uv")
+
+pip = use_extension(
+    "@rules_python//python/extensions:pip.bzl",
+    "pip",
+)
+pip.parse(
+    hub_name = "srt_empty_bootstrap",
+    python_version = "3.12",
+    requirements_lock = "//bazel/python:srt_empty_bootstrap.requirements.lock.txt",
+)
+use_repo(pip, "srt_empty_bootstrap")
+
+# Keep the primary Cargo workspace authoritative. crate_universe mirrors its
+# checked Cargo.lock and writes only the Bazel rendering lock below.
+rust = use_extension(
+    "@rules_rust//rust:extensions.bzl",
+    "rust",
+)
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.92.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension(
+    "@rules_rust//crate_universe:extensions.bzl",
+    "crate",
+)
+crate.from_cargo(
+    name = "sglang_crates",
+    cargo_lockfile = "//rust:Cargo.lock",
+    lockfile = "//bazel/rust:sglang-crates.lock.json",
+    manifests = ["//rust:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "sglang_crates")

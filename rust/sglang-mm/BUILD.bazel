@@ -1,0 +1,48 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load(
+    "@sglang_crates//:defs.bzl",
+    "aliases",
+    "all_crate_deps",
+    "crate_edition",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "pyproject.toml",
+])
+
+# This target intentionally leaves both `python` and `parallel` disabled. It is
+# the dependency shape linked by sglang-server and the smallest native target
+# that can be built independently of Python, protobuf, CUDA, and ROCm.
+rust_library(
+    name = "sglang_mm_core",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "sglang_mm_core",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "rlib_is_single_threaded_test",
+    srcs = ["tests/rlib_is_single_threaded.rs"],
+    aliases = aliases(
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "rlib_is_single_threaded_test",
+    crate_root = "tests/rlib_is_single_threaded.rs",
+    edition = crate_edition(),
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":sglang_mm_core",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

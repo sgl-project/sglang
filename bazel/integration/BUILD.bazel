@@ -1,0 +1,21 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Transitional E2E: Bazel owns invocation and platform selection while the
+# existing hardware CI image still supplies torch and native extension wheels.
+# Run with:
+#   bazel test --config=cuda //bazel/integration:dummy_model_e2e
+sh_test(
+    name = "dummy_model_e2e",
+    srcs = ["run_system_python.sh"],
+    args = ["$(location :dummy_model_e2e.py)"],
+    data = ["dummy_model_e2e.py"],
+    tags = [
+        "local",
+        "manual",
+        "requires-cuda",
+        "requires-gpu",
+    ],
+    target_compatible_with = ["//bazel/platforms:cuda"],
+)

@@ -1,0 +1,13 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//visibility:private"])
+
+py_library(
+    name = "version",
+    srcs = ["version.py"],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+)

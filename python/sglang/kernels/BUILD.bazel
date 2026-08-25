@@ -1,0 +1,38 @@
+load("@rules_python//python:defs.bzl", "py_library")
+load("@srt_empty_bootstrap//:requirements.bzl", "requirement")
+
+package(default_visibility = ["//visibility:private"])
+
+# Torch-free metadata/dispatch layer. Native AOT and JIT implementations are
+# separate targets so a CPU analysis does not select a CUDA or ROCm toolchain.
+py_library(
+    name = "metadata",
+    srcs = [
+        "registry.py",
+        "selector.py",
+        "spec.py",
+    ],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+    deps = [requirement("msgspec")],
+)
+
+filegroup(
+    name = "jit_sources",
+    srcs = glob(
+        [
+            "jit/**/*.cc",
+            "jit/**/*.cpp",
+            "jit/**/*.cu",
+            "jit/**/*.cuh",
+            "jit/**/*.h",
+            "jit/**/*.hpp",
+            "jit/**/*.py",
+        ],
+        allow_empty = True,
+    ),
+    visibility = ["//visibility:public"],
+)
