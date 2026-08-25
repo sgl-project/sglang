@@ -792,11 +792,17 @@ class CommonKVManager(BaseKVManager):
             return endpoints
 
         if self.dist_init_addr:
+            # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
-            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
-                self.bootstrap_host, self.bootstrap_host
-            )
+            # Single-node case: bootstrap server's host is the same as http server's host
+            host = self.bootstrap_host
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         return [NetworkAddress(host, self.bootstrap_port)]
 

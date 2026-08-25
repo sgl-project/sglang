@@ -224,14 +224,14 @@ class TestRegisterToBootstrap(CustomTestCase):
                 (1, 0, "10.0.0.2", 8765),
                 (1, 1, "10.0.0.2", None),
             ):
-                self._make_manager(
-                    attn_dp_size=2,
-                    attn_dp_rank=dp_rank,
-                    attn_tp_size=2,
-                    attn_tp_rank=tp_rank,
-                    local_ip=local_ip,
-                    rust_http_port=rust_http_port,
-                ).register_to_bootstrap()
+                manager = self._make_manager()
+                manager.attn_dp_size = 2
+                manager.attn_dp_rank = dp_rank
+                manager.attn_tp_size = 2
+                manager.attn_tp_rank = tp_rank
+                manager.local_ip = local_ip
+                manager.kv_args.rust_http_port = rust_http_port
+                manager.register_to_bootstrap()
 
         topology_by_registry = {}
         for put_call in mock_put.call_args_list:
@@ -305,43 +305,41 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertNotIn("[::]", url_used)
         self.assertIn("[::1]", url_used)
 
-    def _make_manager(
-        self,
-        dist_init_addr=None,
-        system_dp_size=1,
-        attn_dp_size=1,
-        attn_dp_rank=0,
-        attn_tp_size=1,
-        attn_tp_rank=0,
-        local_ip="127.0.0.1",
-        rust_http_port=None,
-    ):
-        """Create a manager with only the state needed for registration."""
-        from sglang.srt.disaggregation.base.conn import KVArgs
+    def _make_manager(self, dist_init_addr=None):
+        """Create a lightweight mock manager that has the attributes needed
+        by register_to_bootstrap, without going through CommonKVManager.__init__
+        (which requires zmq, ServerArgs model resolution, etc.)."""
         from sglang.srt.disaggregation.common.conn import CommonKVManager
 
-        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr = MagicMock(spec=CommonKVManager)
+        # Bind the real methods to the mock
+        mgr.register_to_bootstrap = CommonKVManager.register_to_bootstrap.__get__(
+            mgr, CommonKVManager
+        )
+        mgr._bootstrap_registry_endpoints = (
+            CommonKVManager._bootstrap_registry_endpoints.__get__(mgr, CommonKVManager)
+        )
 
         # Set attributes that register_to_bootstrap reads
         mgr.dist_init_addr = dist_init_addr
         mgr.bootstrap_host = "127.0.0.1"
         mgr.bootstrap_port = 8765
-        mgr.attn_tp_size = attn_tp_size
-        mgr.attn_tp_rank = attn_tp_rank
+        mgr.attn_tp_size = 1
+        mgr.attn_tp_rank = 0
         mgr.attn_cp_size = 1
         mgr.attn_cp_rank = 0
-        mgr.attn_dp_size = attn_dp_size
-        mgr.attn_dp_rank = attn_dp_rank
+        mgr.attn_dp_size = 1
+        mgr.attn_dp_rank = 0
         mgr.pp_size = 1
         mgr.pp_rank = 0
-        mgr.system_dp_size = system_dp_size
+        mgr.system_dp_size = 1
         mgr.system_dp_rank = 0
-        mgr.local_ip = local_ip
+        mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
 
-        mgr.kv_args = KVArgs()
+        mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
-        mgr.kv_args.rust_http_port = rust_http_port
+        mgr.kv_args.rust_http_port = None
         # Resolved per-runner value threaded through KVArgs (the payload field).
         mgr.kv_cache_dtype_str = "auto"
 
