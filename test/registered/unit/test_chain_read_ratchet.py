@@ -47,8 +47,11 @@ def _declared_by_keyword():
     """Fields named as a keyword at a declaration site."""
     written = set()
     for path in sorted(_SRT.rglob("*.py")):
+        source = path.read_text(encoding="utf-8-sig")
+        if not any(declarer in source for declarer in _DECLARERS):
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             raise AssertionError(f"unparsable module in the census: {path}")
         for node in ast.walk(tree):
@@ -293,8 +296,11 @@ def _subtrees_with_their_own_record():
         rel = path.relative_to(_PACKAGE).as_posix()
         if rel.startswith("srt/") or "/" not in rel:
             continue
+        source = path.read_text(encoding="utf-8-sig")
+        if "ServerArgs" not in source:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             continue
         if any(
@@ -333,8 +339,11 @@ def _chain_reads(written):
             under_srt = rel[len("srt/") :]
             if path.name in _OWNERS or under_srt.startswith(_OWNERS[-1]):
                 continue
+        source = path.read_text(encoding="utf-8-sig")
+        if "server_args" not in source:
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             raise AssertionError(f"unparsable module in the census: {rel}")
         if (
