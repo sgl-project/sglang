@@ -44,7 +44,6 @@ export const DeepSeekOCR2Deployment = () => {
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
     } else if (hardware === 'arc_b') {
-      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }
     cmd += ` \\\n  --enable-multimodal`;
