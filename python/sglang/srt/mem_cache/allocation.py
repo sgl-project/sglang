@@ -66,10 +66,13 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
 ):
     if support_triton(get_exec().kernel.attention_backend):
+        pin_memory = is_pin_memory_available(req_to_token_pool.device) or (
+                _is_npu and str(req_to_token_pool.device).split(":", 1)[0] == "npu"
+        )
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
-            pin_memory=is_pin_memory_available(req_to_token_pool.device),
+            pin_memory=pin_memory,
         ).to(req_to_token_pool.device, non_blocking=True)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
@@ -322,9 +325,15 @@ def alloc_for_extend(
             for r in batch.reqs
         ]
 
-    # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    pin_memory = is_pin_memory_available(batch.device) or (
+            _is_npu and str(batch.device).split(":", 1)[0] == "npu"
+    )
+    prefix_lens_cpu = torch.tensor(
+        batch.prefix_lens, dtype=torch.int64, pin_memory=pin_memory
+    )
+    extend_lens_cpu = torch.tensor(
+        batch.extend_lens, dtype=torch.int64, pin_memory=pin_memory
+    )
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -332,7 +341,9 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor(
+        req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
+    )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
