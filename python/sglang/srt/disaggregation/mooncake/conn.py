@@ -2268,6 +2268,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        external_trace_header: Optional[Dict[str, str]] = None,
     ):
         super().__init__(
             mgr,
@@ -2279,7 +2280,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
-        self._init_trace_ctx()
+        self._init_trace_ctx(external_trace_header)
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2338,13 +2339,14 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         else:
             return self.conclude_state
 
-    def _init_trace_ctx(self):
+    def _init_trace_ctx(self, external_trace_header: Optional[Dict[str, str]] = None):
         if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
                 rid=str(hex(self.bootstrap_room)),
                 bootstrap_room=self.bootstrap_room,
                 role="Sender",
                 module_name="mooncake",
+                external_trace_header=external_trace_header,
             )
             if not self.trace_ctx.tracing_enable:
                 self.trace_ctx = TraceNullContext()

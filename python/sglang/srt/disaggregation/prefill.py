@@ -311,7 +311,7 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
-        req.disagg_kv_sender = kv_sender_class(
+        _sender_kwargs = dict(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
@@ -319,6 +319,18 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        # Propagate trace context to KV sender so Mooncake transfer spans
+        # link to the parent request's trace (W3C traceparent).
+        import inspect as _inspect
+        if "external_trace_header" in _inspect.signature(kv_sender_class.__init__).parameters:
+            _trace_carrier: Dict[str, str] = {}
+            _trace_ctx = getattr(getattr(req.time_stats, "trace_ctx", None), "root_span_context", None)
+            if _trace_ctx is not None:
+                from opentelemetry import propagate
+                propagate.inject(_trace_carrier, _trace_ctx)
+            if _trace_carrier:
+                _sender_kwargs["external_trace_header"] = _trace_carrier
+        req.disagg_kv_sender = kv_sender_class(**_sender_kwargs)
         self._process_req(req)
         req.pending_bootstrap = True
         return True
