@@ -736,54 +736,6 @@ def absorbed_bmm_concat_cast_q_fp8(
     )
 
 
-@triton.jit
-def q8kv8_topk_length_backscan_kernel(
-    indices_ptr,
-    out_ptr,
-    stride_row,
-    topk,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    base = indices_ptr + row * stride_row
-    off = topk
-    length = 1
-    found = 0
-    while (found == 0) & (off > 0):
-        off -= BLOCK
-        idx = off + tl.arange(0, BLOCK)
-        vals = tl.load(base + idx)
-        pos = tl.max(tl.where(vals >= 0, idx, -1), axis=0)
-        found = tl.where(pos >= 0, 1, found)
-        length = tl.where(pos >= 0, pos + 1, length)
-    tl.store(out_ptr + row, length)
-
-
-def q8kv8_topk_length_from_indices(indices: torch.Tensor) -> torch.Tensor:
-    """Per-row valid-topk count = last non-negative position + 1 (min 1).
-
-    ``indices``: [s_q, topk] int32 topk output whose pad slots are -1.
-    Backward block scan per row: the loop exits at the first block holding a
-    valid entry, so the cost is proportional to the trailing pad run — one
-    block (~topk/4 elements) for rows with a full topk, which dominate long
-    contexts. Semantics match the unfused ``(indices >= 0) * ramp).amax``
-    derivation exactly, including all-pad rows (length 1: one pad-only block
-    keeps the kernel on its clamp+mask path, contributing zero).
-    """
-    s_q, topk = indices.shape
-    assert indices.dtype == torch.int32 and indices.stride(1) == 1
-    out = torch.empty(s_q, dtype=torch.int32, device=indices.device)
-    block = 512 if topk % 512 == 0 else (256 if topk % 256 == 0 else 128)
-    q8kv8_topk_length_backscan_kernel[(s_q,)](
-        indices,
-        out,
-        indices.stride(0),
-        topk,
-        BLOCK=block,
-    )
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Decode Context Parallel (DCP) helpers.
 #
