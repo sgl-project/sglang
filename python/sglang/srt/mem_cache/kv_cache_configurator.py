@@ -97,6 +97,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
+        and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
 
