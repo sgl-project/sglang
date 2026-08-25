@@ -3220,6 +3220,15 @@ class Scheduler(
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
+        # Decode->extend conversion keeps a heterogeneous dp step replayable.
+        converted = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
+        if converted is running_batch and converted.forward_mode.is_extend():
+            # The converted batch re-enters via the last_batch extend-merge
+            # next iteration; empty running_batch or it merges with itself.
+            running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=running_batch.batch_is_full
+            )
+        ret = converted
         self._arm_prefill_decode_interval(ret)
 
         # Handle ngram embedding
