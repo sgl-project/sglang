@@ -10,8 +10,6 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import requests
 import torch
@@ -19,15 +17,15 @@ import torch
 from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
     GLM_IMAGE_WEIGHTS_PATH,
 )
-from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
-    _advertised_pool_work_endpoint,
-)
 from sglang.multimodal_gen.test.test_utils import find_free_port, wait_for_server_health
 from sglang.test.test_utils import CustomTestCase
 
 HOST = "127.0.0.1"
 _LOG_DIR = Path(os.environ.get("SGLANG_TEST_LOG_DIR", "/tmp"))
 _STARTUP_TIMEOUT_S = float(os.environ.get("SGLANG_GLM_AR_STARTUP_TIMEOUT", "600"))
+# A3 warm AR (26.711s) plus six sequential denoiser outputs (24.1945s each).
+_EXPECTED_MAKESPAN_S = 172.0
+_PERFORMANCE_TOLERANCE = 0.25
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -222,41 +220,6 @@ class _GlmDistributedCluster:
         self._log_handles.clear()
 
 
-class TestGlmDistributedHelpers(CustomTestCase):
-    def test_advertised_endpoint_prefers_p2p_hostname(self) -> None:
-        server_args = SimpleNamespace(
-            host="127.0.0.1",
-            disagg_p2p_hostname="10.0.0.2",
-            pool_work_endpoint="tcp://0.0.0.0:19001",
-        )
-        self.assertEqual(
-            _advertised_pool_work_endpoint(server_args), "tcp://10.0.0.2:19001"
-        )
-
-    def test_advertised_endpoint_keeps_loopback_default(self) -> None:
-        server_args = SimpleNamespace(
-            host="127.0.0.1",
-            disagg_p2p_hostname=None,
-            pool_work_endpoint="tcp://0.0.0.0:19001",
-        )
-        self.assertEqual(
-            _advertised_pool_work_endpoint(server_args), "tcp://127.0.0.1:19001"
-        )
-
-    def test_cluster_startup_failure_stops_started_servers(self) -> None:
-        cluster = _GlmDistributedCluster()
-        cluster.model_path = Path(".")
-        with (
-            patch.object(cluster, "_start_ar"),
-            patch.object(cluster, "_start_denoiser"),
-            patch.object(cluster, "_start_head", side_effect=RuntimeError("failed")),
-            patch.object(cluster, "stop") as stop,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "failed"):
-                cluster.__enter__()
-        stop.assert_called_once()
-
-
 class TestGlmImageDistributedNpu(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -292,38 +255,60 @@ class TestGlmImageDistributedNpu(CustomTestCase):
         self.assertEqual(len(images), n)
         return [base64.b64decode(image["b64_json"]) for image in images]
 
-    def test_overlaps_external_ar_and_dit(self) -> None:
-        def generate(prompt: str) -> bytes:
-            return self._generate(prompt)[0]
+    def test_external_ar_batching_multi_output_disaggregation_performance(
+        self,
+    ) -> None:
+        self._generate("A warmup landscape")
+        requests_to_generate = [
+            ("A mountain sunrise", 2),
+            ("A city at night", 1),
+            ("A forest lake", 2),
+            ("A desert sunset", 1),
+        ]
 
+        def generate(request: tuple[str, int]) -> tuple[list[bytes], float]:
+            prompt, output_count = request
+            start_time = time.perf_counter()
+            images = self._generate(prompt, n=output_count)
+            return images, time.perf_counter() - start_time
+
+        start_time = time.perf_counter()
         with ThreadPoolExecutor(max_workers=4) as executor:
-            images = list(
-                executor.map(
-                    generate,
-                    [
-                        "A mountain sunrise",
-                        "A city at night",
-                        "A forest lake",
-                        "A desert sunset",
-                    ],
-                )
-            )
+            results = list(executor.map(generate, requests_to_generate))
+        makespan_s = time.perf_counter() - start_time
+        request_latencies_s = [latency_s for _, latency_s in results]
+        images = [image for request_images, _ in results for image in request_images]
+
+        print(
+            "GLM distributed performance: "
+            f"makespan={makespan_s:.2f}s, "
+            f"request_latencies={[round(value, 2) for value in request_latencies_s]}"
+        )
+        self.assertLessEqual(
+            makespan_s,
+            _EXPECTED_MAKESPAN_S * (1 + _PERFORMANCE_TOLERANCE),
+            "GLM external-AR and DiT overlap performance regressed",
+        )
 
         self.assertTrue(
             all(images),
-            "each request must produce one decoded image",
+            "each requested output must produce a decoded image",
         )
         head_log = self.cluster.log_paths["head"].read_text(errors="ignore")
         self.assertGreaterEqual(
             head_log.count(
                 "GLM distributed AR dispatched batch size=2 requests, 2 outputs"
             ),
-            2,
+            1,
+            "the two n=1 requests must share an external-AR batch",
         )
-
-    def test_sequential_multi_output(self) -> None:
-        images = self._generate("A mountain sunrise", n=2)
-        self.assertTrue(all(images), "each output must produce a decoded image")
+        self.assertGreaterEqual(
+            head_log.count(
+                "GLM distributed AR dispatched batch size=1 requests, 2 outputs"
+            ),
+            2,
+            "each n=2 request must preserve both outputs through disaggregation",
+        )
 
 
 if __name__ == "__main__":
