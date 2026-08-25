@@ -113,10 +113,18 @@ def _sigmoid_gate_topk_renorm_kernel(
     active = tl.where(mask_k[None, :], routed_vals, shared)
 
     A: tl.constexpr = K + S
-    probs = tl.sigmoid(active)
     mask_a = offs_a < A
-    probs = tl.where(mask_a[None, :], probs, 0.0)
-    weights = probs / tl.sum(probs, axis=1, keep_dims=True)
+    # Normalize in LOG space, not as sigmoid(x) / sum(sigmoid(x)). The two are
+    # algebraically identical -- exp(log s_i - log sum_j s_j) == s_i / sum_j s_j --
+    # but fp32 sigmoid goes subnormal below x ~ -87 and flushes to 0 below x ~ -104,
+    # so once every one of the A active logits is in that region the explicit form
+    # divides 0/0 and every routed weight and shared gamma comes back NaN. This is
+    # the same form as the eager reference `_logsigmoid_normalize` (moe.py:140).
+    # log(sigmoid(x)) = min(x, 0) - log1p(exp(-|x|)), exact for large |x| either sign.
+    lp = tl.minimum(active, 0.0) - tl.log(1.0 + tl.exp(-tl.abs(active)))
+    lp = tl.where(mask_a[None, :], lp, float("-inf"))
+    e = tl.where(mask_a[None, :], tl.exp(lp - tl.max(lp, axis=1)[:, None]), 0.0)
+    weights = e / tl.sum(e, axis=1, keep_dims=True)
     weights *= (route_scale * tl.load(global_scale_ptr)).to(weights.dtype)
 
     mask_rk = mask_m[:, None] & mask_k[None, :]
