@@ -76,9 +76,11 @@ def decode_beam_search_output(
                 # Mixed batch: this item is not a beam request.
                 continue
             for beam in beam_output.sequences:
+                # A group's returned beams mix stop-finished and length-finished
+                # ones, so the leader's reason would trim the wrong ones.
                 trimmed_tokens = trim_matched_stop(
                     beam.tokens,
-                    recv_obj.finished_reasons[i],
+                    beam.finish_reason,
                     recv_obj.no_stop_trim[i],
                 )
                 beam.text = tokenizer.decode(
@@ -98,7 +100,7 @@ def decode_beam_search_output(
             trimmed_tokens = [
                 trim_matched_stop(
                     beam.tokens,
-                    recv_obj.finished_reasons[i],
+                    beam.finish_reason,
                     recv_obj.no_stop_trim[i],
                 )
                 for beam in beam_output.sequences
