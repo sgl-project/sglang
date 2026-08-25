@@ -1530,10 +1530,23 @@ Under that cap, Recipe A wins the whole request at every host size:
 | 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
 | 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
 
-Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
+figures are anchored at 480P — activations grow with the pixel count, so at
+768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
+decode still collides. And the host convention holds the weights in page
+cache; a physical 32 GB machine re-reads them from disk each step, so the
+page cache cannot hold the per-step weight sweep, so every step re-reads it
+from disk and the drive becomes the denoise clock: a real desktop 4090 with a
+990 Pro measured 38 s/step, reading 52.9 GB per step (faulted sequentially, so
+almost none of it shows in majflt — measure `read_bytes`, not major faults).
+Two things cut that read directly: resident DiT layers (~1 GB/step each — on a
+physically small host raise them as far as VRAM allows, the opposite of the
+capped-host guidance above), and more RAM (64 GB caches the sweep and returns
+to the quoted times). The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
-and at 24 GiB (with `--dit-layerwise-resident-layers 10`, which only a 24 GB
-card has headroom for) ~230 vs 249–260 s. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
+22 GiB cap so a desktop's own allocations fit; a headless card can raise it
+to 10 for under 1% more) ~8.5 s/step vs ComfyUI's 249–260 s requests. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
 #35946), per-layer pinning with net-cost accounting (#35867), the courier
 thread that ships still-mapped layers through pinned slots (#35882), and
 decoder weights held in their decode dtype from load (#35967) — which is what

@@ -24,17 +24,24 @@ const CONSUMER_24G = ["rtx4090", "rtx3090"];
 // their recipes are derived from the tier logic, not verified runs.
 const WORKSTATION_48G = ["rtx6000ada"];
 const WORKSTATION_96G = ["rtxpro6000"];
+// GB10 unified memory: 128 GB shared between CPU and GPU, so the VRAM/host
+// split that shapes every tier above does not exist. The whole 108 GB
+// deployment fits, and an offloaded component's "copy to device" is an
+// in-memory copy on the coherent bus. No hard-cap anchor was measured.
+const UNIFIED_128G = ["dgx-spark"];
 const CONSUMER_SINGLE = [
   ...CONSUMER_12G,
   ...CONSUMER_16G,
   ...CONSUMER_24G,
   ...WORKSTATION_48G,
   ...WORKSTATION_96G,
+  ...UNIFIED_128G,
 ];
 const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G];
 const CONSUMER_AMPERE = ["rtx3060", "rtx3090"];
 
 function consumerFlags(s) {
+  if (UNIFIED_128G.includes(s.hw)) return unified128Flags();
   if (WORKSTATION_96G.includes(s.hw)) return workstation96Flags();
   // The whole video decoder held for the decode only: residency arms at the
   // decoder's first block and releases when it finishes, so the denoise still
@@ -50,17 +57,30 @@ function consumerFlags(s) {
   if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
     flags.push("--dit-layerwise-resident-layers 4");
   }
-  // A 24 GB card on a 32 GB host has allocator headroom to keep ten DiT
-  // layers resident (measured 10.4 vs 11.6 s/step); a 16 GB card does not --
-  // there even four resident layers measured slower than none, so it keeps
-  // the plain recipe.
+  // A 24 GB card has headroom for resident DiT layers, but their benefit
+  // flattened once the decoder went fp16 and the courier overlapped the
+  // streaming: measured at a 22 GiB cap (2 GiB desktop headroom), r10/r6/r4
+  // land at 8.41/8.48/8.51 s/step. Six layers keep ~2.4 GiB more free than
+  // ten for under 1% of speed -- the desktop-safe point. A 16 GB card keeps
+  // the plain recipe; even four resident layers measured slower there.
   if (CONSUMER_24G.includes(s.hw) && s.host_ram === "ram32") {
-    flags.push("--dit-layerwise-resident-layers 10");
+    flags.push("--dit-layerwise-resident-layers 6");
   }
   if (WORKSTATION_48G.includes(s.hw)) {
     flags.push("--dit-layerwise-resident-layers 40");
   }
   return flags;
+}
+
+function unified128Flags() {
+  // Unified memory holds the whole deployment: the memory manager pins every
+  // component (the budget sees ~128 GB), and streamed copies move at memory
+  // speed on the coherent bus. video_vae=36 still buys the fast decode.
+  return [
+    "--performance-mode memory",
+    "--layerwise-offload-components dit,text_encoder,vae",
+    "--layerwise-resident-layers video_vae=36",
+  ];
 }
 
 function workstation96Flags() {
@@ -79,13 +99,14 @@ function consumerHints(s) {
   if (bigHost) {
     if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
       hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
+      hints.push("fewer resident layers than the 32 GB rows is not a typo: with the DiT pinned in a big host, streamed layers arrive at pinned-copy speed and GPU residency buys little; on a 32 GB host the stream is the bottleneck residency cuts");
     } else {
       hints.push("~6 s per step once the host pins the DiT; the decode holds all 36 blocks in their fp16 decode dtype and takes ~10 s");
     }
     return hints;
   }
   if (CONSUMER_24G.includes(s.hw)) {
-    hints.push("measured at 32 GB host: ~10.4 s per denoise step with ten resident layers, ~9.6 s decode, ~230 s per request -- ahead of ComfyUI (249-260 s) under the same hard 24 GiB cap");
+    hints.push("measured at 32 GB host under a 22 GiB cap (desktop headroom): ~8.5 s per denoise step with six resident layers, ~9.6 s decode -- ahead of ComfyUI (249-260 s at the 24 GiB cap); a headless card can raise to ten layers for under 1% more");
   } else if (CONSUMER_16G.includes(s.hw)) {
     hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
   } else {
@@ -93,6 +114,12 @@ function consumerHints(s) {
   }
   if (CONSUMER_AMPERE.includes(s.hw)) {
     hints.push("the recipe and its memory behavior are tier-exact for this card; the step times above were measured on 40-series compute, and Ampere lands above them");
+  }
+  if (UNIFIED_128G.includes(s.hw)) {
+    return [
+      "derived recipe, not yet verified: the 128 GB unified pool holds the whole 108 GB deployment, so the memory manager pins every component and offload copies run at memory speed on the coherent bus",
+      "expect step times above the discrete-GPU rows: the GB10's ~273 GB/s memory bandwidth is the denoise ceiling, not the placement",
+    ];
   }
   if (WORKSTATION_96G.includes(s.hw)) {
     hints.push("derived recipe, not yet verified: 96 GB holds the whole 61.7 GB DiT resident, so only the text encoder and VAEs stream -- expect near-datacenter step times rather than the offload figures above");
@@ -107,6 +134,9 @@ function consumerHints(s) {
     hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
   }
   hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
+  hints.push("every figure here is anchored at 480P: activations grow with the pixel count, so at 768P drop the resident DiT layers to 0 first, then video_vae to 24 if the decode still collides -- the flags trade speed for headroom in that order");
+  hints.push("on a physical 32 GB host the page cache cannot hold the per-step weight sweep, so every step re-reads ~40-65 GB from disk and the drive is the denoise clock: a real desktop 4090 with a 990 Pro measured 38 s/step (52.9 GB read per step). Resident DiT layers cut that read directly (~1 GB/step each), so raise them as far as VRAM allows; 64 GB of RAM caches the sweep and returns to the quoted times");
+  hints.push("on Windows run under WSL2, and keep the checkpoint inside the ext4 side (under ~), never on /mnt/c -- the NTFS bridge reads an order of magnitude slower and multiplies the disk clock");
   return hints;
 }
 
@@ -122,6 +152,7 @@ return {
     "mi355x",
     "rtxpro6000",
     "rtx6000ada",
+    "dgx-spark",
     "rtx5090",
     "rtx4090",
     "rtx3090",
@@ -158,7 +189,8 @@ return {
       scope: "serve",
       description: "System memory decides where the DiT weights wait between steps: pinned when they fit, on the checkpoint mapping when they do not.",
       default: "ram32",
-      showWhen: (s) => CONSUMER_SINGLE.includes(s.hw),
+      showWhen: (s) =>
+        CONSUMER_SINGLE.includes(s.hw) && !UNIFIED_128G.includes(s.hw),
       options: [
         { id: "ram32", label: "32 GB" },
         { id: "ram64", label: "48-64 GB" },
@@ -525,6 +557,7 @@ return {
         { id: "mi355x-resident-2", hw: "mi355x", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-4", hw: "mi355x", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-8", hw: "mi355x", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
+        { id: "dgx-spark-offload-1", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true, unverified: true },
         { id: "rtxpro6000-offload-1", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true, unverified: true },
         { id: "rtx6000ada-offload-1", hw: "rtx6000ada", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true, unverified: true },
         { id: "rtx5090-offload-1", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
