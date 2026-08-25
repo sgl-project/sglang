@@ -57,7 +57,7 @@ def resolve_minimax_h3_checkpoint_quantization(
 ) -> QuantizationConfig | None:
     formats = {str(marker.get("format")) for marker in layer_markers.values()}
     if "nvfp4" in formats:
-        unsupported = formats - {"nvfp4", "int8_tensorwise"}
+        unsupported = formats - {"nvfp4", "int8_tensorwise", "float8_e4m3fn"}
         if unsupported:
             raise NotImplementedError(
                 "Unsupported Comfy NVFP4 companion format(s): "
