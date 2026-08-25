@@ -448,3 +448,51 @@ def glue_probe_pool(pool, label: str) -> None:
     if _pend.get("fired"):
         return
     _snapshot_pool(pool, label)
+
+
+def glue_freeze_forward_stream(scheduler) -> None:
+    """Run 21 discriminator (§24.35): freeze the forward stream at pre-cache.
+
+    Run 20 convicted the write to the wall-clock window
+    (glue:pre-cache snapshot, glue:post-cache snapshot] -- but that window
+    only proves DEVICE-TIME ordering on the default stream: the NEXT batch's
+    forward (target + draft, incl. compressor-state writes) executes
+    concurrently on the forward stream, and the two probe copies cannot see
+    stream-C kernels. Freezing stream C here (host waits out all its queued
+    kernels) splits the candidates:
+      catch after=glue:post-cache -> stream C was IDLE across (pre-cache,
+                                     post-cache] (single-threaded scheduler
+                                     enqueues no C work inside the glue
+                                     window): DEFAULT-STREAM writer -- the
+                                     radix write-back (unified_radix_cache.py
+                                     req_to_token_pool.write planting
+                                     tree-held garbage indices) / free ops.
+      catch after=glue:pre-cache  -> dirt landed in (glue:entry snapshot,
+                                     post-freeze pre-cache snapshot]: the
+                                     freeze GUARANTEES C completion, so this
+                                     captures C-forward dirt but cannot
+                                     exclude the B prologue (finalize
+                                     scatters / move_logprobs D2H) -- weigh
+                                     against the col=0 glue:entry signature.
+      all silent + send pre>0     -> writer acts after the post-cache copy
+                                     (eagle extraction / later windows).
+    Single variable per §19 discipline: one added sync, nothing else.
+    """
+    if not _enabled():
+        return
+    fs = getattr(scheduler, "forward_stream", None)
+    if fs is None:
+        return
+    if not _on.get("freeze_logged"):
+        # Liveness marker (distinct wording from "armed" so the parser can
+        # count it separately): distinguishes "discriminator deployed" from
+        # "not synced" in a Run 21 log.
+        _on["freeze_logged"] = True
+        logger.info(
+            "[mf-trap] fwd-freeze on (§24.35 pre-cache freeze discriminator)"
+        )
+    try:
+        ev = fs.record_event()
+        ev.synchronize()
+    except Exception:
+        pass

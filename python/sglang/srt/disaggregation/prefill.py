@@ -738,9 +738,21 @@ class SchedulerDisaggregationPrefillMixin:
                 # Glue bisect mark 1 (§24.34): Run 19 convicted the write to
                 # (gap:post-draft, this send); this drains that pending gap
                 # snapshot and starts the row-scoped glue chain.
+                # Run 21 discriminator (§24.35): freeze the forward stream
+                # BEFORE the pre-cache snapshot. Run 20's post-cache catch is
+                # only a wall-clock window: the next batch's forward runs
+                # concurrently on stream C. With C drained here and idle
+                # through the cache call, a dirty post-cache catch convicts
+                # the default-stream radix write-back; a pre-cache catch
+                # captures C-forward dirt (or the B prologue -- see
+                # layer_trap.py docstring).
                 try:
-                    from sglang.srt.layers.cp.layer_trap import glue_probe
+                    from sglang.srt.layers.cp.layer_trap import (
+                        glue_freeze_forward_stream,
+                        glue_probe,
+                    )
 
+                    glue_freeze_forward_stream(self)
                     glue_probe(
                         self.req_to_token_pool,
                         req.req_pool_idx,
