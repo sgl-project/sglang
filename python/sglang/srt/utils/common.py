@@ -105,8 +105,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.safe_pickle import (
     SafeUnpickler,
-    safe_pickle_load,
-    safe_pickle_loads,
+    safe_pickle_load,  # noqa: F401 - compatibility re-export
+    safe_pickle_loads,  # noqa: F401 - compatibility re-export
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 

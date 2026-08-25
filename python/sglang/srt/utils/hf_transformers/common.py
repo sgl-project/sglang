@@ -75,13 +75,13 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import normalize_rope_scaling_compat
 from .hub import (
-    _cached_file_exists,
-    _remote_file_exists,
-    _resolve_local_or_cached_file,
+    _cached_file_exists,  # noqa: F401 - compatibility re-export
+    _remote_file_exists,  # noqa: F401 - compatibility re-export
+    _resolve_local_or_cached_file,  # noqa: F401 - compatibility re-export
     check_gguf_file,
     download_from_hf,
     gguf_sidecar_dir,
-    resolve_hf_gguf_reference,
+    resolve_hf_gguf_reference,  # noqa: F401 - compatibility re-export
 )
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
