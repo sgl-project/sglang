@@ -114,6 +114,21 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         caught = self._apply(old_name, _DeprecatedEnv())
         self.assertIn(f"{old_name} is deprecated", str(caught[0].message))
 
+    def test_w4a4_mxfp4_megamoe_envs_warn_to_use_cli_flag(self):
+        old_names = (
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND",
+        )
+        for old_name in old_names:
+            with self.subTest(old_name=old_name):
+                os.environ[old_name] = "1"
+                self.addCleanup(os.environ.pop, old_name, None)
+
+                caught = self._apply(old_name, _DEPRECATED_ENVS[old_name])
+
+                self.assertIn("--enable-w4a4-mxfp4-megamoe", str(caught[0].message))
+                self.assertIsNone(_DEPRECATED_ENVS[old_name].replacement)
+
     def test_renamed_env_forwards_value(self):
         old_name, new_name = "SGLANG_TEST_OLD_ENV", "SGLANG_TEST_NEW_ENV"
         os.environ[old_name] = "abc"

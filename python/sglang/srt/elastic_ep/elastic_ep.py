@@ -11,7 +11,11 @@ from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
@@ -87,9 +91,9 @@ class ElasticEPStateManager:
         if cls._instance is not None:
             return cls._instance
 
-        if server_args.elastic_ep_backend is not None:
+        if get_exec().moe.elastic_ep_backend is not None:
             world_size = torch.distributed.get_world_size()
-            active_rank_capacity = server_args.max_ep_size or world_size
+            active_rank_capacity = get_parallel().max_ep_size or world_size
             assert active_rank_capacity >= world_size, (
                 f"--max-ep-size ({active_rank_capacity}) must be >= "
                 f"world_size ({world_size})."
@@ -103,10 +107,10 @@ class ElasticEPStateManager:
                 inst.snapshot_active_to_last()
                 inst.sync_active_to_cpu()
 
-            if server_args.moe_a2a_backend == "nixl":
+            if get_exec().moe.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
 
-            inst.ep_join_rank_offset = server_args.ep_join_rank_offset
+            inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
             if server_args.is_ep_joiner:
                 cls._init_joiner_state(inst, server_args)
 
@@ -122,12 +126,13 @@ class ElasticEPStateManager:
         inst.snapshot_active_to_last()
         inst.sync_active_to_cpu()
 
-        if server_args.ep_join_mode == "scale":
+        if get_exec().moe.ep_join_mode == "scale":
             inst.effective_ep_size = (
-                server_args.ep_join_rank_offset + server_args.tp_size
+                get_parallel().ep_join_rank_offset + configured_tp_size()
             )
             inst.original_ep_size = (
-                server_args.elastic_ep_initial_size or server_args.ep_join_rank_offset
+                get_parallel().elastic_ep_initial_size
+                or get_parallel().ep_join_rank_offset
             )
             inst.has_scaled = True
         else:
