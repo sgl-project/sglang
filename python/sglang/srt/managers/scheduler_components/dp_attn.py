@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+_FALLBACK_TENSOR_CACHE: dict = {}
+
 
 def _resolve_elastic_world_dp_size(
     dp_size: int,
@@ -114,19 +116,26 @@ class MLPSyncBatchInfo:
         )
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_run_decode_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_prefill_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        # Constant idle-batch row; cache per (device, dtype) to avoid a device
+        # alloc + H2D + implicit sync on every decode iteration.
+        cache_key = (str(device), dtype)
+        fallback = _FALLBACK_TENSOR_CACHE.get(cache_key)
+        if fallback is None:
+            fallback = torch.tensor(
+                [
+                    0,  # num_tokens
+                    0,  # num_tokens_for_logprob
+                    1,  # can_run_decode_cuda_graph
+                    0,  # is_extend_in_batch
+                    1,  # local_can_run_tbo
+                    ForwardMode.IDLE.value,  # local_forward_mode
+                    0,  # can_run_prefill_cuda_graph
+                ],
+                device=device,
+                dtype=dtype,
+            )
+            _FALLBACK_TENSOR_CACHE[cache_key] = fallback
+        return fallback
 
     def all_gather(
         self,
