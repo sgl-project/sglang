@@ -117,6 +117,9 @@ def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
 @pytest.mark.skipif(not _cpu_has_amx(), reason="FP8 E4M3 KV cache requires AMX")
 def test_mha_fp8_e4m3_kv_pool_updates_scales():
     MHATokenToKVPool = _import_mha_pool()
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        CPUFP8KVCacheMethod,
+    )
 
     pool = MHATokenToKVPool(
         size=32,
@@ -127,18 +130,19 @@ def test_mha_fp8_e4m3_kv_pool_updates_scales():
         layer_num=1,
         device=DEVICE,
         enable_memory_saver=False,
+        quant_method=CPUFP8KVCacheMethod(),
     )
     loc = torch.tensor([3, 7], dtype=torch.int64, device=DEVICE)
     layer = SimpleNamespace(layer_id=0)
     cache_k = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
     cache_v = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
 
-    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=0.5, v_scale=0.25)
 
     assert pool.k_scale_buffer is not None
     assert pool.v_scale_buffer is not None
-    assert torch.all(pool.k_scale_buffer[0][loc] > 0)
-    assert torch.all(pool.v_scale_buffer[0][loc] > 0)
+    assert torch.all(pool.k_scale_buffer[0][loc] == 0.5)
+    assert torch.all(pool.v_scale_buffer[0][loc] == 0.25)
     assert isinstance(pool.get_key_buffer(0), torch.Tensor)
     assert isinstance(pool.get_value_buffer(0), torch.Tensor)
     k_scale, v_scale = pool.get_kv_scale_buffer(0)
@@ -183,7 +187,7 @@ def test_mla_fp8_e4m3_kv_pool_preserves_scales():
     cache_k = torch.randn((2, 1, 32), dtype=torch.bfloat16, device=DEVICE)
     cache_v = torch.empty((2, 1, 16), dtype=torch.bfloat16, device=DEVICE)
 
-    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=0.5, v_scale=0.5)
 
     assert hasattr(pool, "kv_scale_buffer")
     expected_bytes = sum(t.numel() * t.element_size() for t in pool.kv_buffer)

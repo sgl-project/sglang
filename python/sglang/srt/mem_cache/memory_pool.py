@@ -1970,9 +1970,6 @@ class MHATokenToKVPool(KVCache):
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
-        use_cpu_fp8_scale = (
-            _is_cpu and _cpu_has_amx_support and self.dtype == torch.float8_e4m3fn
-        )
         if self.is_quantized_kv_cache:
             if self.post_capture_active:
                 raise NotImplementedError(
@@ -1985,13 +1982,9 @@ class MHATokenToKVPool(KVCache):
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
-                if use_cpu_fp8_scale:
-                    raise NotImplementedError(
-                        "CPU FP8 E4M3 KV cache does not support post-capture KV backing."
-                    )
                 self._alloc_post_capture_buffers()
             else:
-                self._create_buffers_normal(use_cpu_fp8_scale)
+                self._create_buffers_normal()
         self._kv_buffer_descs = self._build_kv_buffer_descs()
         self._init_data_ptrs_and_strides()
 
@@ -2103,11 +2096,7 @@ class MHATokenToKVPool(KVCache):
             (rows, self.head_num, self.v_head_dim),
         )
 
-    def _create_buffers_normal(self, use_cpu_fp8_scale: bool):
-        if use_cpu_fp8_scale and self.use_hnd:
-            raise NotImplementedError(
-                "CPU FP8 E4M3 KV cache does not support SGLANG_USE_HND_KVCACHE."
-            )
+    def _create_buffers_normal(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -2159,23 +2148,6 @@ class MHATokenToKVPool(KVCache):
                         torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
-                    if use_cpu_fp8_scale:
-                        self.k_scale_buffer = [
-                            torch.zeros(
-                                (self.size + self.page_size, 1, 1),
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                            for _ in range(self.layer_num)
-                        ]
-                        self.v_scale_buffer = [
-                            torch.zeros(
-                                (self.size + self.page_size, 1, 1),
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                            for _ in range(self.layer_num)
-                        ]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
@@ -2457,35 +2429,19 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
-        cache_k_scale = None
-        cache_v_scale = None
         if cache_k.dtype != self.dtype:
-            if self.k_scale_buffer is not None and self.v_scale_buffer is not None:
-                cache_k_fp8, cache_k_scale = (
-                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_k)
-                )
-                cache_k = cache_k_fp8
-                cache_v_fp8, cache_v_scale = (
-                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_v)
-                )
-                cache_v = cache_v_fp8
-            else:
-                if k_scale is not None:
-                    cache_k.div_(k_scale)
-                if v_scale is not None:
-                    cache_v.div_(v_scale)
-                cache_k = cache_k.to(self.dtype)
-                cache_v = cache_v.to(self.dtype)
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
         if dcp_kv_mask is not None:
-            if self.k_scale_buffer is not None or self.v_scale_buffer is not None:
-                raise NotImplementedError(
-                    "CPU FP8 E4M3 KV cache does not support DCP KV masks."
-                )
             N, H, D = cache_k.shape
             masked_set_kv_buffer_kernel[(N,)](
                 cache_k,
@@ -2516,9 +2472,6 @@ class MHATokenToKVPool(KVCache):
             return
 
         self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
-        if cache_k_scale is not None and cache_v_scale is not None:
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_scale
 
     def _store_kv_layer(
         self,
@@ -4060,6 +4013,8 @@ class HybridLinearKVPool(KVCache):
                     write_loc,
                     cache_k,
                     cache_v,
+                    k_scale,
+                    v_scale,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -4268,6 +4223,8 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
@@ -4284,10 +4241,9 @@ class MLATokenToKVPool(KVCache):
                 cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
             if hasattr(self, "kv_scale_buffer"):
-                cache_k_fp8, cache_k_scale = (
-                    torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_k)
-                )
-                cache_k = cache_k_fp8
+                if k_scale is None:
+                    raise ValueError("CPU FP8 KV cache requires a static K scale.")
+                cache_k = (cache_k / k_scale).to(self.dtype)
             else:
                 cache_k = cache_k.to(self.dtype)
 
@@ -4296,9 +4252,7 @@ class MLATokenToKVPool(KVCache):
                 self.store_dtype
             )
             if hasattr(self, "kv_scale_buffer"):
-                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
-                    cache_k_scale.view(torch.float32)
-                )
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = k_scale
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 

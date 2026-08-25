@@ -14,90 +14,48 @@ inline index_t get_index(index_t* ind, int i) {
 
 #if defined(CPU_CAPABILITY_AVX512)
 
-template <typename scalar_t, typename func_t>
-void MM512_LOAD_VEC(
-    const scalar_t* __restrict__ src,
-    const float* __restrict__ src_scale,
-    int64_t ld_src,
-    int64_t index,
-    const func_t& get_mask,
-    __m512i& dst,
-    const int mask_type = 0) {
-  if (mask_type == 0) {
-    dst = _mm512_loadu_si512(src + index * ld_src);
-  } else if (mask_type == 1) {
-    __mmask32 vmask = get_mask();
-    dst = _mm512_maskz_loadu_epi16((__mmask32)vmask, src + index * ld_src);
-  } else if (mask_type == 2) {
-    __mmask16 vmask = get_mask();
-    dst = _mm512_maskz_loadu_epi32((__mmask16)vmask, src + index * ld_src);
-  } else {
-    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
-  }
+inline __mmask32 elem_mask(int n) {
+  return n >= 32 ? 0xFFFFFFFFu : static_cast<__mmask32>((1u << n) - 1);
+}
+
+template <typename scalar_t>
+inline void mm512_load_vec(
+    const scalar_t* __restrict__ src, const float* /*src_scale*/, int64_t ld, int64_t index, int n, __m512i& dst) {
+  const scalar_t* p = src + index * ld;
+  dst = n >= 32 ? _mm512_loadu_si512(p) : _mm512_maskz_loadu_epi16(elem_mask(n), p);
 }
 
 const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
 
-template <typename func_t>
-void MM512_LOAD_VEC(
+inline void mm512_load_vec(
     const at::Float8_e4m3fn* __restrict__ src,
-    const float* __restrict__ src_scale,
-    int64_t ld_src,
+    const float* __restrict__ scale,
+    int64_t ld,
     int64_t index,
-    const func_t& get_mask,
-    __m512i& dst,
-    const int mask_type = 0) {
-  const __m512 scale = _mm512_mul_ps(_mm512_set1_ps(src_scale[index]), vexp);
-  __m256i s8;
-  if (mask_type == 0) {
-    s8 = _mm256_loadu_si256((__m256i const*)(src + index * ld_src));
-  } else if (mask_type == 1) {
-    __mmask32 vmask = get_mask();
-    s8 = _mm256_maskz_loadu_epi8((__mmask32)vmask, src + index * ld_src);
-  } else if (mask_type == 2) {
-    __mmask16 vmask = get_mask();
-    s8 = _mm256_maskz_loadu_epi8((__mmask16)vmask, src + index * ld_src);
-  } else {
-    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
-  }
+    int n,
+    __m512i& dst) {
+  const __m512 s = _mm512_mul_ps(_mm512_set1_ps(scale[index]), vexp);
+  const auto* p = src + index * ld;
+  __m256i s8 =
+      n >= 32 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)) : _mm256_maskz_loadu_epi8(elem_mask(n), p);
+  const __mmask32 nz = _mm256_cmpneq_epi8_mask(s8, _mm256_setzero_si256());
+  s8 = _mm256_maskz_mov_epi8(nz, s8);
   // TODO: optimize the process of converting fp8 to bf16: fp8 -> bf16 -> fp32 -> bf16
   __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
   __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
   __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
-  f_lo = _mm512_mul_ps(f_lo, scale);
-  f_hi = _mm512_mul_ps(f_hi, scale);
-  bf16 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
-  dst = (__m512i)bf16;
+  dst = (__m512i)_mm512_cvtne2ps_pbh(_mm512_mul_ps(f_hi, s), _mm512_mul_ps(f_lo, s));
 }
 
-template <typename func_t>
-void MM512_LOAD_VEC(
-    const at::Float8_e5m2* __restrict__ src,
-    const float* __restrict__ src_scale,
-    int64_t ld_src,
-    int64_t index,
-    const func_t& get_mask,
-    __m512i& dst,
-    const int mask_type = 0) {
-  __m256i s8;
-  if (mask_type == 0) {
-    s8 = _mm256_loadu_si256((__m256i const*)(src + index * ld_src));
-  } else if (mask_type == 1) {
-    __mmask32 vmask = get_mask();
-    s8 = _mm256_maskz_loadu_epi8((__mmask32)vmask, src + index * ld_src);
-  } else if (mask_type == 2) {
-    __mmask16 vmask = get_mask();
-    s8 = _mm256_maskz_loadu_epi16((__mmask16)vmask, src + index * ld_src);
-  } else {
-    TORCH_CHECK(false, "unsupported mask_type=", mask_type);
-  }
+inline void mm512_load_vec(
+    const at::Float8_e5m2* __restrict__ src, const float* /*scale*/, int64_t ld, int64_t index, int n, __m512i& dst) {
+  const auto* p = src + index * ld;
+  __m256i s8 =
+      n >= 32 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)) : _mm256_maskz_loadu_epi8(elem_mask(n), p);
   __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-  __m256i ah = _mm512_extracti64x4_epi64(a, 0);
-  __m256i bh = _mm512_extracti64x4_epi64(a, 1);
-  __m512 a_ = _mm512_cvtph_ps(ah);
-  __m512 b_ = _mm512_cvtph_ps(bh);
-  __m512bh bf16 = _mm512_cvtne2ps_pbh(b_, a_);
-  dst = (__m512i)bf16;
+  __m512 f_lo = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(a, 0));
+  __m512 f_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(a, 1));
+  dst = (__m512i)_mm512_cvtne2ps_pbh(f_hi, f_lo);
 }
 
 // key: from [N, 32] to [32/2, N, 2]
@@ -115,7 +73,7 @@ inline void pack_vnni_Nx32(
   int n = 0;
   for (; n < N; ++n) {
     index_t index = get_index(ind, n);
-    MM512_LOAD_VEC(src, src_scale, ld_src, index, []() { return 0; }, vinputs[n]);
+    mm512_load_vec(src, src_scale, ld_src, index, 32, vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -144,12 +102,10 @@ inline void pack_vnni_N_remainder(
   __m512i vinputs[16];
 
   int K2 = K >> 1;
-  const __mmask16 vmask = (1 << K2) - 1;
-
   int n = 0;
   for (; n < N; ++n) {
     index_t index = get_index(ind, n);
-    MM512_LOAD_VEC(src, src_scale, ld_src, index, [vmask]() { return vmask; }, vinputs[n], 2);
+    mm512_load_vec(src, src_scale, ld_src, index, K, vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -180,7 +136,7 @@ inline void pack_vnni_Kx32(
   int k = 0;
   for (; k < K; ++k) {
     index_t index = get_index(ind, k);
-    MM512_LOAD_VEC(src, src_scale, ld_src, index, []() { return 0; }, vinputs[k]);
+    mm512_load_vec(src, src_scale, ld_src, index, 32, vinputs[k]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; k < 2; ++k) {
@@ -206,12 +162,10 @@ inline void pack_vnni_K_remainder(
     int ld_dst) {
   __m512i vinputs[2];
 
-  const __mmask32 vmask = (1 << N) - 1;
-
   int k = 0;
   for (; k < K; ++k) {
     index_t index = get_index(ind, k);
-    MM512_LOAD_VEC(src, src_scale, ld_src, index, [vmask]() { return vmask; }, vinputs[k], 1);
+    mm512_load_vec(src, src_scale, ld_src, index, N, vinputs[k]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; k < 2; ++k) {

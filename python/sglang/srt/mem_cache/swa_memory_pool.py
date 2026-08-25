@@ -255,6 +255,8 @@ class SWAKVPool(BaseSWAKVPool):
                 loc,
                 cache_k,
                 cache_v,
+                k_scale,
+                v_scale,
                 layer_id_override=layer_id_pool,
             )
         else:

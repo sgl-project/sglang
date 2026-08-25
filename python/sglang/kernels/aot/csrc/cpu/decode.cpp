@@ -31,7 +31,7 @@ inline void pack_vnni_Nx32(
   __m512i vinputs[16];
   int n = 0;
   for (; n < N; ++n) {
-    MM512_LOAD_VEC(src, src_scale, ld_src, ind[n], []() { return 0; }, vinputs[n]);
+    mm512_load_vec(src, src_scale, ld_src, ind[n], 32, vinputs[n]);
   }
   // padding with zero to avoid uninitialized vectors
   for (; n < 16; ++n) {
@@ -187,13 +187,13 @@ inline void copy_stub(at::Float8_e5m2* __restrict__ out, const scalar_t* __restr
 template <>
 inline void copy_stub(at::Float8_e5m2* __restrict__ out, const at::BFloat16* __restrict__ src, int64_t size) {
   int64_t i = 0;
-  for (; i < size - 31; i += 32) {
-    __m256i a_rne = CVT_BF16_TO_FP8(_mm512_loadu_si512(&src[i]));
-    _mm256_storeu_epi8(&out[i], a_rne);
+  for (; i + 32 <= size; i += 32) {
+    _mm256_storeu_epi8(&out[i], CVT_BF16_TO_FP8(_mm512_loadu_si512(&src[i])));
   }
-
-  for (; i < size; i++) {
-    out[i] = static_cast<at::Float8_e5m2>(src[i]);
+  const int n = static_cast<int>(size - i);
+  if (n > 0) {
+    const __mmask32 mask = static_cast<__mmask32>((1u << n) - 1);
+    _mm256_mask_storeu_epi8(&out[i], mask, CVT_BF16_TO_FP8(_mm512_maskz_loadu_epi16(mask, &src[i])));
   }
 }
 #endif
@@ -1379,60 +1379,6 @@ void decode_set_kv_buffer(
 
       // move to the next index
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
-    }
-  });
-}
-
-template <typename scalar_t>
-void decode_set_kv_buffer(
-    at::Float8_e4m3fn* __restrict__ k_buffer,
-    at::Float8_e4m3fn* __restrict__ v_buffer,
-    float* __restrict__ k_scale,
-    float* __restrict__ v_scale,
-    const scalar_t* __restrict__ key,
-    const scalar_t* __restrict__ value,
-    const int64_t* __restrict__ loc,
-    int64_t batches,
-    int64_t num_heads_kv,
-    int64_t head_size,
-    int64_t head_size_v,
-    int64_t k_strideN,
-    int64_t k_strideH,
-    int64_t v_strideN,
-    int64_t v_strideH,
-    int64_t nk_strideN,
-    int64_t nk_strideH,
-    int64_t nv_strideN,
-    int64_t nv_strideH,
-    bool is_mla) {
-  constexpr float eps = 1e-12;
-  at::parallel_for(0, batches, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t bs = begin; bs < end; bs++) {
-      int64_t loc_val = loc[bs];
-      quantize_tensor_fp8<scalar_t>(
-          k_buffer + loc_val * k_strideN,
-          k_scale[loc_val],
-          key + bs * nk_strideN,
-          1,
-          num_heads_kv,
-          head_size,
-          0,
-          0,
-          k_strideH,
-          nk_strideH);
-      if (!is_mla) {
-        quantize_tensor_fp8<scalar_t>(
-            v_buffer + loc_val * v_strideN,
-            v_scale[loc_val],
-            value + bs * nv_strideN,
-            1,
-            num_heads_kv,
-            head_size_v,
-            0,
-            0,
-            v_strideH,
-            nv_strideH);
-      }
     }
   });
 }

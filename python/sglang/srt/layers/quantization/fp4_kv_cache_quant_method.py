@@ -330,6 +330,69 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
         )
 
 
+class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
+    name = "cpu_fp8_e4m3"
+    SCALE_BLOCK_SIZE = 1
+
+    def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
+        buffer_shape = (size, head_num, head_dim)
+        scale_shape = (size, 1, 1)
+        return {
+            "k_buffer": [
+                torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
+                for _ in range(layer_num)
+            ],
+            "v_buffer": [
+                torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
+                for _ in range(layer_num)
+            ],
+            "k_scale_buffer": [
+                torch.zeros(scale_shape, dtype=torch.float32, device=device)
+                for _ in range(layer_num)
+            ],
+            "v_scale_buffer": [
+                torch.zeros(scale_shape, dtype=torch.float32, device=device)
+                for _ in range(layer_num)
+            ],
+            "dq_k_buffer": None,
+            "dq_v_buffer": None,
+            "store_dtype": torch.float8_e4m3fn,
+        }
+
+    def quantize_and_store(
+        self,
+        k_buffer,
+        v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+    ) -> None:
+        if k_scale is None or v_scale is None:
+            raise ValueError("CPU FP8 KV cache requires static K/V scales.")
+        k_buffer[loc] = (cache_k / k_scale).to(torch.float8_e4m3fn)
+        v_buffer[loc] = (cache_v / v_scale).to(torch.float8_e4m3fn)
+        k_scale_buffer[loc] = k_scale
+        v_scale_buffer[loc] = v_scale
+
+    def dequantize_prev_kv(
+        self, k_fp8, k_scales, v_fp8, v_scales, layer_id
+    ) -> tuple[Tensor, Tensor]:
+        raise NotImplementedError(
+            "CPU FP8 KV cache is consumed directly by the CPU attention kernels."
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        data_bytes = head_num * head_dim * num_layers * kv_size * 2
+        scale_bytes = torch.float32.itemsize * num_layers * kv_size * 2
+        return data_bytes + scale_bytes
+
+
 class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
@@ -779,6 +842,10 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_PREFILL, _ANY_BACKEND),
         _plain(_DECODE, _ANY_BACKEND),
     ),
+    CPUFP8KVCacheMethod.name: (
+        _plain(_PREFILL, _ANY_BACKEND),
+        _plain(_DECODE, _ANY_BACKEND),
+    ),
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
@@ -792,6 +859,7 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
 
 # Registry: explicit --kv-cache-dtype value -> method class.
 KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
+    "cpu_fp8_e4m3": CPUFP8KVCacheMethod,
     "nvfp4": NVFP4KVCacheMethod,
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
 }

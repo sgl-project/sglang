@@ -30,6 +30,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
         self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -100,6 +101,61 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         with self.assertRaises(ValueError):
             get_kv_cache_quant_method("unknown_method")
+
+
+class TestCPUFP8KVCacheMethod(CustomTestCase):
+    def test_static_scale_quantize_and_store(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            CPUFP8KVCacheMethod,
+        )
+
+        method = CPUFP8KVCacheMethod()
+        buffers = method.create_buffers(4, 2, 8, 1, "cpu")
+        loc = torch.tensor([1, 3])
+        cache_k = torch.randn(2, 2, 8, dtype=torch.bfloat16)
+        cache_v = torch.randn(2, 2, 8, dtype=torch.bfloat16)
+
+        method.quantize_and_store(
+            buffers["k_buffer"][0],
+            buffers["v_buffer"][0],
+            buffers["k_scale_buffer"][0],
+            buffers["v_scale_buffer"][0],
+            loc,
+            cache_k,
+            cache_v,
+            k_scale=0.5,
+            v_scale=0.25,
+        )
+
+        torch.testing.assert_close(
+            buffers["k_buffer"][0][loc].float(),
+            (cache_k / 0.5).to(torch.float8_e4m3fn).float(),
+        )
+        torch.testing.assert_close(
+            buffers["v_buffer"][0][loc].float(),
+            (cache_v / 0.25).to(torch.float8_e4m3fn).float(),
+        )
+        self.assertTrue(torch.all(buffers["k_scale_buffer"][0][loc] == 0.5))
+        self.assertTrue(torch.all(buffers["v_scale_buffer"][0][loc] == 0.25))
+
+    def test_requires_static_scales(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            CPUFP8KVCacheMethod,
+        )
+
+        method = CPUFP8KVCacheMethod()
+        buffers = method.create_buffers(1, 1, 8, 1, "cpu")
+        cache = torch.ones(1, 1, 8, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "static K/V scales"):
+            method.quantize_and_store(
+                buffers["k_buffer"][0],
+                buffers["v_buffer"][0],
+                buffers["k_scale_buffer"][0],
+                buffers["v_scale_buffer"][0],
+                torch.tensor([0]),
+                cache,
+                cache,
+            )
 
 
 class TestNVFP4KVCacheMethod(CustomTestCase):

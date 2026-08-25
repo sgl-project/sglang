@@ -246,16 +246,10 @@ class TestExtendAttention(CustomTestCase):
         k_scale = None
         v_scale = None
         if kvcache_dtype == torch.float8_e4m3fn:
-            k_scale = torch.empty((total_token_num, 1, 1), dtype=torch.float32)
-            v_scale = torch.empty((total_token_num, 1, 1), dtype=torch.float32)
-            k_buffer_fp8, k_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
-                k_buffer
-            )
-            v_buffer_fp8, v_scale0 = torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(
-                v_buffer
-            )
-            k_scale.copy_(k_scale0)
-            v_scale.copy_(v_scale0)
+            k_scale = torch.full((total_token_num, 1, 1), 0.5, dtype=torch.float32)
+            v_scale = torch.full((total_token_num, 1, 1), 0.5, dtype=torch.float32)
+            k_buffer_fp8 = (k_buffer / 0.5).to(torch.float8_e4m3fn)
+            v_buffer_fp8 = (v_buffer / 0.5).to(torch.float8_e4m3fn)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
         elif kvcache_dtype == torch.float8_e5m2:

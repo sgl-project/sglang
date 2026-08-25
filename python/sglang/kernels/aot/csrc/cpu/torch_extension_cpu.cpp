@@ -285,7 +285,6 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
-std::tuple<at::Tensor, at::Tensor> quantize_fp8_e4m3fn_cpu(at::Tensor& A);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -752,8 +751,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
-  m.def("quantize_fp8_e4m3fn_cpu(Tensor A) -> (Tensor, Tensor)");
-  m.impl("quantize_fp8_e4m3fn_cpu", torch::kCPU, &quantize_fp8_e4m3fn_cpu);
 
   // igemm
   m.def(

@@ -206,7 +206,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
             self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                layer,
+                KVWriteLoc(cache_loc, swa_loc),
+                k,
+                v,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
             )
 
         # Precomputed once per forward pass in init_forward_metadata (spec
@@ -296,6 +301,23 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        if (
+            save_kv_cache
+            and k is not None
+            and v is not None
+            and key_buffer.dtype == torch.float8_e4m3fn
+        ):
+            swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, swa_loc),
+                k,
+                v,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            k = None
+            v = None
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             key_buffer,
