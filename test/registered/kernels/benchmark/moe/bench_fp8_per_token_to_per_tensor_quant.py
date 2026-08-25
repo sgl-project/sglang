@@ -5,6 +5,10 @@ shipped with (a 1024-element tile, 8 warps, 32 programs per expert regardless of
 how many rows are live), so this isolates the launch geometry and not the
 scale-loading rewrite; ``tuned`` goes through the wrapper, which sizes the tile
 from the expert count and the m-grid from the dispatcher's expected rows.
+
+``skew`` covers the case the m-grid cannot see: ``expected_m`` is a global
+average, so a hot expert holding ``skew`` times its share serializes its rows
+over an m-grid sized for the average.
 """
 
 import torch
@@ -18,7 +22,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=45, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 FP8 = torch.float8_e4m3fn
@@ -28,17 +32,36 @@ LEGACY_WARPS = 8
 LEGACY_M_GRID = 32
 
 
-def _expected_m(num_experts, rows):
-    """What the dispatcher would report for a uniform dispatch of ``rows`` per expert.
+def _expected_m(num_experts, dispatched_rows):
+    """What the dispatcher would report for ``dispatched_rows`` in total.
 
     `_DeepEPDispatcherImplLowLatency.dispatch_a` computes
     ``(dispatched_rows + num_experts) // num_experts``, so an exact average
     arrives one higher; the production launch has to be benchmarked with that.
+    It is an average over the whole dispatch, so it is the same number however
+    those rows are distributed -- which is what makes ``skew`` interesting.
     """
-    return (rows * num_experts + num_experts) // num_experts
+    return (dispatched_rows + num_experts) // num_experts
 
 
-def _build(num_experts, m, k, rows):
+def _row_counts(num_experts, rows, skew):
+    """Live rows per expert: one hot expert at ``skew * rows``, the rest share.
+
+    A batch dispatches a fixed number of rows, so skew redistributes them rather
+    than adding any: the total stays at ``num_experts * rows`` and the average
+    the m-grid is sized from does not move, however lopsided the routing is.
+    That caps the achievable skew at ``num_experts`` -- one expert taking every
+    row.
+    """
+    if skew == 1:
+        return [rows] * num_experts
+    total = num_experts * rows
+    counts = [(total - rows * skew) // (num_experts - 1)] * num_experts
+    counts[0] = rows * skew
+    return counts
+
+
+def _build(num_experts, m, k, rows, skew=1):
     x = (torch.randn(num_experts, m, k, device="cuda") * 4).to(FP8)
     # DeepEP returns the last two scale dims column-major (for TMA).
     x_scale = (
@@ -48,10 +71,18 @@ def _build(num_experts, m, k, rows):
         .contiguous()
         .permute(0, 2, 1)
     )
-    masked_m = torch.full((num_experts,), rows, dtype=torch.int32, device="cuda")
+    counts = _row_counts(num_experts, rows, skew)
+    masked_m = torch.tensor(counts, dtype=torch.int32, device="cuda")
     output_scale = torch.tensor([2.0], dtype=torch.float32, device="cuda")
     output = torch.empty((num_experts, m, k), dtype=FP8, device="cuda")
-    return x, x_scale, masked_m, output_scale, output, _expected_m(num_experts, rows)
+    return (
+        x,
+        x_scale,
+        masked_m,
+        output_scale,
+        output,
+        _expected_m(num_experts, sum(counts)),
+    )
 
 
 def _tuned(x, x_scale, masked_m, output_scale, output, expected_m):
@@ -93,13 +124,16 @@ FN_MAP = {"tuned": _tuned, "legacy-geometry": _legacy_geometry}
 SHAPES = [(7168, 8, 1024), (3584, 8, 1024), (3584, 56, 256)]
 
 
-@marker.parametrize("hidden,num_experts,m", SHAPES, [(7168, 8, 1024)])
-@marker.parametrize("rows", [8, 32, 128, 256], [8, 256])
+@marker.parametrize("hidden,num_experts,m", SHAPES, [(7168, 8, 1024), (3584, 56, 256)])
+@marker.parametrize("rows", [8, 32, 128, 256], [8, 32, 256])
+@marker.parametrize("skew", [1, 4, 16], [1, 16])
 @marker.benchmark("impl", ["tuned", "legacy-geometry"])
-def benchmark(hidden: int, num_experts: int, m: int, rows: int, impl: str):
-    if rows > m:
+def benchmark(hidden: int, num_experts: int, m: int, rows: int, skew: int, impl: str):
+    if skew > num_experts:
+        marker.skip("one expert cannot hold more than the whole dispatch")
+    if rows * skew > m:
         marker.skip("more live rows than the payload holds")
-    args = _build(num_experts, m, hidden, rows)
+    args = _build(num_experts, m, hidden, rows, skew)
     return marker.do_bench(
         FN_MAP[impl],
         input_args=args,
