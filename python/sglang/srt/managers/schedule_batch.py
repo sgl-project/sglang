@@ -2834,6 +2834,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Stale residue from this object's life as a prefill batch; the
         # extend-merge path would exclude (silently drop) that req otherwise.
         self.chunked_req = None
+        # Also stale residue; None keeps the prefill result path from
+        # re-reporting old prefill stats for what is decode work.
+        self.prefill_stats = None
         for req in self.reqs:
             req._refresh_fill_ids()
             full_len = len(req.full_untruncated_fill_ids)

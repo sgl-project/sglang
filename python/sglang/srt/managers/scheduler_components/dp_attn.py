@@ -30,7 +30,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -269,26 +274,20 @@ def _local_prefill_cuda_graph_vote(
         return_logprob = local_batch.return_logprob
     elif (
         mode.is_decode()
-        # decode->extend conversion eligibility; spec needs degradation, TBO
-        # gathers its split before conversion, CP zigzag-splits extend batches.
-        # Requires a real captured-graph runner (PrefillCudaGraphRunner or its
-        # Mixed subclass); with the eager/None fallback, converting would only
-        # trade eager decode for eager extend.
+        # decode->extend conversion eligibility; needs a captured-graph runner
+        # (PrefillCudaGraphRunner or its Mixed subclass), not the eager fallback.
         and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
         and spec_algorithm.is_none()
         and not local_batch.return_logprob
-        # Grammar FSMs advance through the decode result path; the extend
-        # path assumes worker-side advancement and would leave them stale.
+        # Grammar FSMs advance through the decode result path only.
         and not local_batch.has_grammar
-        # A2A MoE (e.g. DeepEP) + BCG perturbs logits through the shared EP
-        # grouped GEMMs at small capture buckets (#30898); converted batches
-        # are exactly such small-bucket replays and amplify it into an
-        # accuracy loss (measured on DSV4-Flash), so keep conversion off.
+        # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
+        # into an accuracy loss.
         and get_moe_a2a_backend().is_none()
-        # SSM models need the mamba-track staging prepare_for_extend fills
-        # (mamba_track_seqlens etc.); the converted view lacks it and the
-        # GDN extend metadata dereferences it.
+        # The converted view lacks prepare_for_extend's mamba-track fills.
         and not uses_ssm_state(model_config)
+        # HiSparse decode has its own batch lifecycle and host-offloaded KV.
+        and not get_memory().enable_hisparse
         and not get_exec().overlap.enable_two_batch_overlap
         and get_cp_strategy() is None
     ):
