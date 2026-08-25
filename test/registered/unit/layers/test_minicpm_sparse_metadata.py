@@ -279,9 +279,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
 
         model_runner.server_args.attention_backend = "minicpm_flashinfer"
         flashinfer_adapter = object()
-        fake_fuse_kernel = ModuleType(
-            "sglang.srt.layers.attention.minicpm.fuse_kernel"
-        )
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
         fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
             return_value="prefill"
         )
@@ -291,9 +289,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         with (
             patch.dict(
                 sys.modules,
-                {
-                    "sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel
-                },
+                {"sglang.srt.layers.attention.minicpm.fuse_kernel": fake_fuse_kernel},
             ),
             patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
             patch.object(backend_module, "is_blackwell_supported", return_value=True),
@@ -1089,9 +1085,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend._get_fused_topk_kernel.assert_called_once_with(1, is_prefill=False)
 
     def test_fused_topk_prefill_kernels_compile_for_all_batches_at_startup(self):
-        fake_fuse_kernel = ModuleType(
-            "sglang.srt.layers.attention.minicpm.fuse_kernel"
-        )
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
         fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = Mock(
             side_effect=lambda **kwargs: f"prefill-{kwargs['batch_size']}"
         )
@@ -1122,9 +1116,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend.fused_kernel_kwargs = {"topk": 8}
         backend.prefill_kernel_max_seqlen_q_grid = 64
 
-        fake_fuse_kernel = ModuleType(
-            "sglang.srt.layers.attention.minicpm.fuse_kernel"
-        )
+        fake_fuse_kernel = ModuleType("sglang.srt.layers.attention.minicpm.fuse_kernel")
         prefill = Mock(return_value="prefill")
         decode = Mock(return_value="decode")
         fake_fuse_kernel.fused_attn_pooling_online_topk_prefill = prefill
