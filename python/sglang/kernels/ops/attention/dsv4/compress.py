@@ -453,8 +453,8 @@ def compress_norm_rope_store(
             kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
-        if norm_weight.dtype != torch.bfloat16:
-            norm_weight = norm_weight.to(dtype=torch.bfloat16)
+        if norm_weight.dtype != kv.dtype:
+            norm_weight = norm_weight.to(dtype=kv.dtype)
         fn(
             kv,
             plan[1],
