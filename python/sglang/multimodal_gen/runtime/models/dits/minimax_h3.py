@@ -503,6 +503,12 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _protect_upto_from_audio_pos(audio_pos: torch.Tensor | None) -> int:
+    if audio_pos is None or audio_pos.numel() == 0:
+        return 0
+    return int(audio_pos.reshape(-1).max().item()) + 1
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -514,6 +520,7 @@ def _minimax_h3_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
     ring_active: bool = False,
+    protect_upto: int = 0,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -557,6 +564,15 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
+        extra = {}
+        if (
+            protect_upto > 0
+            and attention._attention_backend_enum is AttentionBackendEnum.SLA_ATTN
+        ):
+            # Ulysses trades the row shard for head shards before attention,
+            # so each rank sees the full global packed sequence. The audio_pos
+            # bound therefore stays in global token coordinates here.
+            extra["protect_upto"] = protect_upto
         out = attention._attention_impl.forward_varlen(
             q,
             k,
@@ -564,6 +580,7 @@ def _minimax_h3_attention_core_impl(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
+            **extra,
         )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
@@ -820,6 +837,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        protect_upto: int = 0,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -896,6 +914,7 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            protect_upto=protect_upto,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -1438,6 +1457,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        protect_upto: int = 0,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
@@ -1468,6 +1488,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            protect_upto=protect_upto,
         )
         x = _modulate_gate(
             residual,
@@ -2308,6 +2329,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
+        protect_upto = _protect_upto_from_audio_pos(audio_pos)
 
         decoder_input, t_emb = self._embed(
             x=x,
@@ -2394,6 +2416,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 max_seqlen=max_seqlen,
                 ulysses_active=ulysses_ws > 1,
                 ring_active=ring_ws > 1,
+                protect_upto=protect_upto,
                 adaln_params=(
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),
