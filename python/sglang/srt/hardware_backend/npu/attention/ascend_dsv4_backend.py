@@ -427,6 +427,24 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
+        # S1 discriminator (doc §24.28/§24.29): count OOB rows in the
+        # state_block_table handed to the fused compressor. Device-side only,
+        # zero sync; read out by [mf-raw]'s existing [mf-scatter] D2H. A hit
+        # convicts the S1 model (garbage positions/req_pool_indices -> ring
+        # state_loc OOB -> fp32 ring write lands outside the ring).
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                _clamp_scatter_locs as _clamp_state,
+            )
+
+            _clamp_state(
+                state_block_table.view(-1),
+                state_cache.numel() // max(1, state_cache.shape[-1]),
+                "compressor-state",
+            )
+        except Exception:
+            pass
+
         cmp_kv = torch.ops.npu.compressor(
             x,
             compressor._fused_wkv_w,
