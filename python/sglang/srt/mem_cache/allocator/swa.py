@@ -96,8 +96,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
-        # True once a tail-only swa allocation installed zero mappings;
-        # fixed-shape frees then fall back to the filtering path.
         self._swa_mapping_may_be_partial = False
 
         self._kvcache = kvcache
@@ -284,8 +282,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if swa_tail_len < extend_num_tokens:
             self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
-            # Allocated-but-unmapped slots now exist; the in-place segment
-            # free must keep filtering (see free_swa_segment_inplace).
             self._swa_mapping_may_be_partial = True
         return alloc_full_indices
 
@@ -405,15 +401,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_reps = free_index[::ps]
         swa_reps = self.full_to_swa_index_mapping[page_reps]
         if self.swa_attn_allocator.debug_mode:
-            # Reference check of the fixed-shape contract (CPU; debug only).
             ref_pages = torch.unique(free_index.cpu() // ps)
             got_pages = torch.sort(page_reps.cpu() // ps)[0]
             assert torch.equal(ref_pages, got_pages), "range is not whole pages"
             assert bool(
                 (swa_reps.cpu() > 0).all()
             ), "out-of-window range has unmapped slots"
-        # Requests own disjoint pages, so the representatives are distinct; a
-        # fixed-shape sort reproduces free()'s unique ordering.
         swa_page_ids = torch.sort(swa_reps // ps).values
         self.swa_attn_allocator.free_page_ids(swa_page_ids)
         self.clear_full_to_swa_mapping(free_index)
@@ -568,10 +561,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
-        # Identity mapping (never zeroed) and page_size == 1: the only
-        # data-dependent op in free_swa is its `> 0` filter, and an
-        # out-of-window range holds real slot values, so drop the filter.
-        # In-group behavior is exactly free_swa's.
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:

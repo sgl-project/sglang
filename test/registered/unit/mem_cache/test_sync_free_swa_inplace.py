@@ -111,7 +111,7 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
             else:
                 alloc.free_swa(seg)
         if mixed_seg is not None:
-            alloc.free_swa(mixed_seg)  # a finished-request-style eager free
+            alloc.free_swa(mixed_seg)
         if group:
             alloc.free_group_end()
         return _bitwise_state(alloc)
@@ -137,25 +137,18 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
         _assert_states_equal(self, a, b)
 
     def test_partial_mapping_flag_falls_back(self):
-        # Tail-only-swa allocations leave zero mappings; the flag routes the
-        # inplace call to the filtering free_swa, so states stay identical.
         segs = _segments(seed=5, n_segments=3)
         a = self._run(segs, use_inplace=False, mapped_fraction=0.5, partial_flag=True)
         b = self._run(segs, use_inplace=True, mapped_fraction=0.5, partial_flag=True)
         _assert_states_equal(self, a, b)
 
     def test_unaligned_start_falls_back(self):
-        # start_pos not page-aligned -> legacy free_swa (which expands to full
-        # pages); states identical.
         segs = _segments(seed=13, n_segments=2)
         a = self._run(segs, use_inplace=False)
         b = self._run(segs, use_inplace=True, start_positions=[1, 1])
         _assert_states_equal(self, a, b)
 
     def test_tail_alloc_branchless_flag_set_semantics(self):
-        # The flag is what alloc_extend_swa_tail sets when it installs zero
-        # mappings; with it set, even a fully-mapped segment takes the legacy
-        # path and states stay identical.
         segs = _segments(seed=17, n_segments=2)
         a = self._run(segs, use_inplace=False, partial_flag=True)
         b = self._run(segs, use_inplace=True, partial_flag=True)
@@ -319,7 +312,6 @@ class TestSyncFreeSwaInplaceUnified(CustomTestCase):
             sa.virtual_to_physical.clone(),
             sa.physical_to_virtual.clone(),
             sa._free_phys_pages.clone(),
-            # None on the non-id-owner swa side.
             sa.free_virtual_ids.clone() if sa.free_virtual_ids is not None else None,
             sa.live_page_count,
         )
@@ -339,7 +331,7 @@ class TestSyncFreeSwaInplaceUnified(CustomTestCase):
             allocator = self._build_composite(page_size=1, lazy=True)
             v = allocator.alloc(8)
             self.assertIsNotNone(v)
-            seg = v[2:6]  # a contiguous sub-range, all swa-live
+            seg = v[2:6]
             if inplace:
                 allocator.free_swa_segment_inplace(seg, start_pos=2)
             else:
@@ -349,8 +341,6 @@ class TestSyncFreeSwaInplaceUnified(CustomTestCase):
         self._assert_swa_state_equal(run(False), run(True))
 
     def test_unified_eager_compaction_falls_back(self):
-        # Eager compaction has no sync-free formulation; the inplace call must
-        # route to free_swa and end in the same state.
         def run(inplace):
             allocator = self._build_composite(page_size=1, lazy=False)
             v = allocator.alloc(8)
@@ -373,18 +363,13 @@ class TestSyncFreeSwaInplaceUnified(CustomTestCase):
         self.assertEqual(a[2], b[2])
 
     def test_multi_ended_free_v_pages_lazy_twin_parity_paged(self):
-        # ps>1: free(v_tokens) runs unique(v // ps) (sorted); the twin takes
-        # the sorted distinct page ids. States must match bitwise.
         def run(twin):
             allocator = self._build_composite(page_size=4, lazy=True,
                                               n_full_pages=16, n_swa_pages=16)
             sa = allocator.swa_attn_allocator
             fa = allocator.full_attn_allocator
-            # Bind 3 virtual pages on the swa side the way alloc_extend would.
             v_pages = fa.free_virtual_ids[:3].clone()
             sa.alloc_with_virtual(v_pages)
-            # Tokens of those pages in request order (pages deliberately
-            # visited out of ascending order).
             order = torch.tensor([2, 0, 1])
             toks = (
                 v_pages[order][:, None] * 4 + torch.arange(4)[None, :]

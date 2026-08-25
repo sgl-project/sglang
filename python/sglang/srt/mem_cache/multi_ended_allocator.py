@@ -1053,9 +1053,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc.free_v_pages_lazy"):
             freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # Device-resident -1, not the python scalar: index_put_ with a
-            # python scalar copies it host->device with a blocking memcpy — a
-            # stream sync, the very thing this method exists to avoid.
             neg_one = torch.full(
                 (), -1, dtype=self.virtual_to_physical.dtype, device=self.device
             )
@@ -2167,8 +2164,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
-        # Parent's tail-only-swa alloc path (which installs unmapped slots) is
-        # unsupported here; stays False. Read by free_swa_segment_inplace.
         self._swa_mapping_may_be_partial = False
 
         logger.info(
@@ -2533,7 +2528,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return
         v = free_index.detach().to(torch.int64)
         if ps == 1:
-            free_v_pages = v  # raw order: _free_lazy skips unique at ps==1
+            free_v_pages = v
         else:
             free_v_pages = torch.sort(v[::ps] // ps).values
         sa.free_v_pages_lazy(free_v_pages)
