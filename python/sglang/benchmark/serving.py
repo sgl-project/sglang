@@ -330,28 +330,30 @@ async def async_request_openai_completions(
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # The trailing usage-summary chunk has no text,
+                            # and with include_usage it can have no choices
+                            # at all.
+                            choices = data.get("choices") or []
+                            text = (choices[0].get("text") if choices else "") or ""
+
+                            if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += text
+
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
                     output.generated_text = generated_text
                     output.success = True
