@@ -67,9 +67,13 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspector import (
+    UnifiedTreeCoreInspector,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
@@ -527,7 +531,19 @@ def build_fixture(
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
-    cache = UnifiedRadixCache(params=cache_init_params)
+    selected_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+    if selected_backend == "python":
+        with mock.patch.dict(
+            _TREE_CORE_REGISTRY,
+            {
+                "python": lambda params, components: UnifiedTreeCoreInspector(
+                    params, components
+                )
+            },
+        ):
+            cache = UnifiedRadixCache(params=cache_init_params)
+    else:
+        cache = UnifiedRadixCache(params=cache_init_params)
     assert isinstance(cache.tree_core, UnifiedTreeCoreInspectionInterface), (
         "The shared unified radix-cache unit suite requires a TreeCore backend "
         "that implements UnifiedTreeCoreInspectionInterface"
