@@ -219,13 +219,13 @@ BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 STDOUT_IDLE_TIMEOUT = 600  # > BENCHMARK_STDOUT_IDLE_TIMEOUT (300)
 STDOUT_WATCHDOG_POLL_INTERVAL = 30
 
-_last_stdout_activity = time.time()
-_stdout_watchdog_active = False  # only allow triggering while tests run
-_stdout_watchdog_started = False  # started once per process
+_stdout_last_activity_time = time.time()
+_if_stdout_watchdog_enable = False  # only allow triggering while tests run
+_if_stdout_watchdog_already_started = False  # started once per process
 
 
 class _ActivityStdout:
-    """Write-through proxy that refreshes _last_stdout_activity on each write.
+    """Write-through proxy that refreshes _stdout_last_activity_time on each write.
 
     Wraps sys.stdout so direct print() calls (benchmark forwarding, health
     check) are timestamped too.
@@ -235,18 +235,9 @@ class _ActivityStdout:
         self._real = real
 
     def write(self, s):
-        global _last_stdout_activity
-        _last_stdout_activity = time.time()
+        global _stdout_last_activity_time
+        _stdout_last_activity_time = time.time()
         return self._real.write(s)
-
-    def flush(self):
-        return self._real.flush()
-
-    def isatty(self):
-        return self._real.isatty()
-
-    def fileno(self):
-        return self._real.fileno()
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -257,15 +248,16 @@ class _ActivityLogHandler(logging.Handler):
     stream reference), so add a handler that only timestamps, never outputs."""
 
     def emit(self, record):
-        global _last_stdout_activity
-        _last_stdout_activity = time.time()
+        global _stdout_last_activity_time
+        _stdout_last_activity_time = time.time()
 
 
 def _install_stdout_activity_tracking():
     if not isinstance(sys.stdout, _ActivityStdout):
         sys.stdout = _ActivityStdout(sys.stdout)
-    if not any(isinstance(h, _ActivityLogHandler) for h in logger.handlers):
-        logger.addHandler(_ActivityLogHandler())
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, _ActivityLogHandler) for h in root_logger.handlers):
+        root_logger.addHandler(_ActivityLogHandler())
 
 
 def _kill_current_test_group():
@@ -309,9 +301,9 @@ def _stdout_idle_watchdog_loop():
     """Daemon thread: kill the group once stdout goes silent past the timeout."""
     while True:
         time.sleep(STDOUT_WATCHDOG_POLL_INTERVAL)
-        if not _stdout_watchdog_active:
+        if not _if_stdout_watchdog_enable:
             return
-        idle = time.time() - _last_stdout_activity
+        idle = time.time() - _stdout_last_activity_time
         if idle > STDOUT_IDLE_TIMEOUT:
             logger.error(
                 "Test produced no stdout for %.0fs (> %ds), killing test group",
@@ -325,12 +317,12 @@ def _stdout_idle_watchdog_loop():
 def _ensure_stdout_watchdog():
     """Install stdout timestamping and start the idle watchdog (once per process,
     idempotent)."""
-    global _stdout_watchdog_started
-    global _last_stdout_activity
-    if _stdout_watchdog_started:
+    global _if_stdout_watchdog_already_started
+    global _stdout_last_activity_time
+    if _if_stdout_watchdog_already_started:
         return
-    _stdout_watchdog_started = True
-    _last_stdout_activity = time.time()
+    _if_stdout_watchdog_already_started = True
+    _stdout_last_activity_time = time.time()
     _install_stdout_activity_tracking()
     threading.Thread(
         target=_stdout_idle_watchdog_loop,
@@ -1267,15 +1259,15 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         # Enable the idle watchdog only after the server is ready to avoid false
         # kills during loading: loading produces no Python-level output and server
         # logs write straight to fd 1, bypassing timestamping.
-        global _stdout_watchdog_active
-        _stdout_watchdog_active = True
+        global _if_stdout_watchdog_enable
+        _if_stdout_watchdog_enable = True
         _ensure_stdout_watchdog()
 
     @classmethod
     def tearDownClass(cls):
         # Stop the idle watchdog first to avoid a false self-kill during teardown.
-        global _stdout_watchdog_active
-        _stdout_watchdog_active = False
+        global _if_stdout_watchdog_enable
+        _if_stdout_watchdog_enable = False
 
         # Persist results before any kill-group action (under option C the
         # kill-group also kills this process).
