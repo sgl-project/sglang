@@ -35,7 +35,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
     the branch."""
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import _hf_attr, is_deepseek_dsa
 
     overrides: Dict[str, Any] = {}
 
@@ -44,7 +44,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
         # DSA/SWA models build their sparse backend separately and use this slot
         # for the dense SWA executor instead.
         if is_attention_backend_not_set(cfg):
-            if getattr(hf_config, "is_hybrid_swa", False):
+            if _hf_attr(hf_config, "is_hybrid_swa"):
                 overrides["attention_backend"] = "fa3"
                 logger.info(
                     "Use fa3 as the dense SWA backend for hybrid DSA/SWA; "
