@@ -1229,6 +1229,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     notif=notif,
                                     pack_buffer=pack_buffer,
                                 )
+                                # The worker owns one pack buffer, so its
+                                # asynchronous NIXL read must finish before the
+                                # next destination can repack that buffer.
+                                if (
+                                    kv_xfer_handle is not None
+                                    and pack_buffer is not None
+                                ):
+                                    while True:
+                                        state = self.agent.check_xfer_state(
+                                            kv_xfer_handle
+                                        )
+                                        if state == "ERR":
+                                            raise RuntimeError(
+                                                "NIXL DCP packed transfer encountered "
+                                                f"ERR room={room}"
+                                            )
+                                        if state == "DONE":
+                                            break
+                                        time.sleep(0)
                             elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -1689,16 +1708,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if pack_buffer is not None:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
-            src_tensors = self._pack_src_tensors(src_kv_ptrs)
-            packed = (
-                try_pack_dcp_src(
-                    pack_buffer=pack_buffer,
-                    kv_buffers=src_tensors,
-                    src_token_indices=src_token_indices,
-                    token_item_lens=token_item_lens[: len(src_kv_ptrs)],
-                )
-                if src_tensors is not None
-                else None
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=src_kv_ptrs,
+                src_token_indices=src_token_indices,
+                token_item_lens=token_item_lens[: len(src_kv_ptrs)],
             )
             if packed is not None:
                 src_kv_ptrs, src_token_indices = packed

@@ -7,6 +7,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from sglang.kernels.ops.kvcache.dcp_pack import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.runtime_context import get_schedule
 
@@ -43,39 +44,10 @@ def plan_packed_dcp_blocks(
     ]
 
 
-def _copy_mla_rows_into_pack(
-    kv_buffers: Sequence[torch.Tensor],
-    row_indices: torch.Tensor,
-    pack: torch.Tensor,
-    token_item_lens: Sequence[int],
-) -> None:
-    if len(kv_buffers) != len(token_item_lens):
-        raise ValueError(
-            "kv_buffers and token_item_lens length mismatch: "
-            f"{len(kv_buffers)} vs {len(token_item_lens)}"
-        )
-
-    n = int(row_indices.numel())
-    offset = 0
-    for buf, item_len in zip(kv_buffers, token_item_lens):
-        row_nbytes = int(buf[0].nbytes)
-        if row_nbytes != item_len:
-            raise ValueError(
-                "MLA token geometry mismatch during DCP pack: "
-                f"buffer row={row_nbytes} bytes, item_len={item_len}"
-            )
-        selected_rows = buf.index_select(0, row_indices).contiguous()
-        nbytes = n * item_len
-        pack[offset : offset + nbytes].view(selected_rows.dtype).copy_(
-            selected_rows.view(-1)
-        )
-        offset += nbytes
-
-
 def try_pack_dcp_src(
     *,
     pack_buffer: StagingBuffer,
-    kv_buffers: Sequence[torch.Tensor],
+    kv_data_ptrs: Sequence[int],
     src_token_indices: npt.NDArray[np.integer],
     token_item_lens: Sequence[int],
 ) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
@@ -100,7 +72,7 @@ def try_pack_dcp_src(
     gather_stream = pack_buffer.get_gather_stream()
     gather_stream.wait_stream(torch.cuda.default_stream(pack.device))
     with torch.cuda.stream(gather_stream):
-        _copy_mla_rows_into_pack(kv_buffers, row_indices, pack, token_item_lens)
+        copy_mla_rows_into_pack(kv_data_ptrs, row_indices, pack, token_item_lens)
     gather_stream.synchronize()
 
     packed_ptrs: List[int] = []

@@ -330,12 +330,6 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
-    def _pack_src_tensors(self, src_kv_ptrs: List[int]):
-        tensors = getattr(self.kv_args, "kv_data_tensors", None)
-        if tensors is None or len(tensors) != len(src_kv_ptrs):
-            return None
-        return tensors
-
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [

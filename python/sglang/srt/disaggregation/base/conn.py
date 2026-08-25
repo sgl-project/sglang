@@ -45,7 +45,6 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
-    kv_data_tensors: Optional[list]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
