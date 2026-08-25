@@ -96,7 +96,7 @@ jobs:
           bazel build --config=manylinux -c opt \
             --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
             //:bazel_components \
-            //bazel/packaging:main_wheel \
+            //bazel/packaging:main_wheel_manylinux \
             //sgl-model-gateway:sgl-model-gateway \
             //sgl-model-gateway:sglang_router_rs_abi3
 
@@ -111,6 +111,7 @@ jobs:
         run: |
           git diff --exit-code -- \
             MODULE.bazel.lock \
+            bazel/packaging/wheel_repair.requirements.lock.txt \
             bazel/python/hf_management.requirements.lock.txt \
             bazel/python/runtime_import.requirements.lock.txt \
             bazel/python/srt_empty_bootstrap.requirements.lock.txt \

@@ -18892,6 +18892,10 @@
             "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl": "sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
             "https://files.pythonhosted.org/packages/9a/8e/82a0fe20a541c03148528be8cac2408564a6c9a0cc7e9171802bc1d26985/attrs-26.1.0.tar.gz": "sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32"
           },
+          "auditwheel": {
+            "https://files.pythonhosted.org/packages/43/74/666146844344c9f899395030de5e70cae797fb67930577ed2c12e31f1d51/auditwheel-6.8.1.tar.gz": "sha256:120c345f5bfcc9fd86ae110f1d9d26665ddbf1defca700ee4b92536aaa7d0636",
+            "https://files.pythonhosted.org/packages/52/bd/879d404d56e486dcbda0e83261c1f686eec67f6498d460f9955df96d365e/auditwheel-6.8.1-py3-none-any.whl": "sha256:9cc3a9038d970c843ede84c6ebd3d837350162f6bb1843c11bda8a5d6b5fe39a"
+          },
           "backports-tarfile": {
             "https://files.pythonhosted.org/packages/86/72/cd9b395f25e290e633655a100af28cb253e4393396264a98bd5f5951d50f/backports_tarfile-1.2.0.tar.gz": "sha256:d75e02c268746e1b8144c278978b6e98e85de6ad16f8e4b0844a154557eca991",
             "https://files.pythonhosted.org/packages/b9/fa/123043af240e49752f1c4bd24da5053b6bd00cad78c2be53c0d1e8b975bc/backports.tarfile-1.2.0-py3-none-any.whl": "sha256:77e284d754527b01fb1e6fa8a1afe577858ebe4e9dad8919e34c862cb399bc34"
@@ -20586,6 +20590,17 @@
             "https://files.pythonhosted.org/packages/42/32/658973117bf0fd82a24abbfb94fe73a5e86216e49342985e10acce54775a/partial_json_parser-0.2.1.1.post7-py3-none-any.whl": "sha256:145119e5eabcf80cbb13844a6b50a85c68bf99d376f8ed771e2a3c3b03e653ae",
             "https://files.pythonhosted.org/packages/6a/6d/eed37d7ebc1e0bcd27b831c0cf1fe94881934316187c4b30d23f29ea0bd4/partial_json_parser-0.2.1.1.post7.tar.gz": "sha256:86590e1ba6bcb6739a2dfc17d2323f028cb5884f4c6ce23db376999132c9a922"
           },
+          "patchelf": {
+            "https://files.pythonhosted.org/packages/0c/f3/dffc8a228ff8a2a627c48c7356ae36eb6d0c2497ba549a98a3b5a55f24af/patchelf-0.19.1.0-py3-none-manylinux_2_31_riscv64.musllinux_1_1_riscv64.whl": "sha256:c2311d99eac1b9c40f5acd673e3b3581cde320bc4647e7f997e5e063731fc438",
+            "https://files.pythonhosted.org/packages/5a/0b/691b49b40201a80cb09dbf2003eef0e36270ae07b00de99baa915df1d274/patchelf-0.19.1.0.tar.gz": "sha256:8976fbdef7d3e461d623e703024b70db6b6e3308f7e389930f39a71a1e347a2c",
+            "https://files.pythonhosted.org/packages/83/03/29cd947cc94b2c91f5bd368c1b5d3469bec6b8ea538db67dcaf6e4ac065a/patchelf-0.19.1.0-py3-none-manylinux1_i686.manylinux_2_5_i686.musllinux_1_1_i686.whl": "sha256:f16f44fbcf0da4f2d1dd841d49f849fe9ea1b8fb952d5c4e9b8234f09d3f149a",
+            "https://files.pythonhosted.org/packages/99/fc/48c07d0f74251946e62881a89ef105bed242e855928ac4f834a9bde85f73/patchelf-0.19.1.0-py3-none-manylinux2014_s390x.manylinux_2_17_s390x.musllinux_1_1_s390x.whl": "sha256:efed44482d740e86d84e3f40e0ee9876c4249c7ac1128b5b1639e31287fa14a4",
+            "https://files.pythonhosted.org/packages/a5/05/816af7bf3a51106e3558d32e10dc021a306d64f257fc0c404e4a9fcb1fba/patchelf-0.19.1.0-py3-none-manylinux2014_ppc64le.manylinux_2_17_ppc64le.musllinux_1_1_ppc64le.whl": "sha256:89760f542fac28c7798e5f56e66601a78ef20e088fc80a493b6a9161438b8dc5",
+            "https://files.pythonhosted.org/packages/cc/44/e2d33d8adbe206bc003aeb24840f62ad27b0bc44ec8baf97692d2bd3e5ef/patchelf-0.19.1.0-py3-none-macosx_10_9_universal2.whl": "sha256:f97a0e9e657882b89d397418b76b667c0d8af7058a3775cf14c0e105e8ce3a58",
+            "https://files.pythonhosted.org/packages/cc/e6/1c78ad10adfc4b00a642ab518c246dd88dc826d641eb31faca5eaddc8b97/patchelf-0.19.1.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.musllinux_1_1_aarch64.whl": "sha256:b5c3dec03b89db2bb0df301d316360847eeaf72c6fb6ddde0227326655edabb4",
+            "https://files.pythonhosted.org/packages/e3/b8/a8bcf0a627b688ed0798048e585f1c1c8dbef5070db3f6c30c6895d73ce9/patchelf-0.19.1.0-py3-none-manylinux2014_armv7l.manylinux_2_17_armv7l.musllinux_1_1_armv7l.whl": "sha256:2ffad3734be73b83ac2f46709264a34dd2aee40a7dd5deccf84856684d606ec6",
+            "https://files.pythonhosted.org/packages/e7/03/afd9bdd2ba5f96997196109f25dadbe5141bc6e70dffd85f3f84cc85d69c/patchelf-0.19.1.0-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.musllinux_1_1_x86_64.whl": "sha256:a8f6331ccf40c345507279f755f4a38c2cb00b9efda746fd43c17713cce0aba4"
+          },
           "pexpect": {
             "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz": "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f",
             "https://files.pythonhosted.org/packages/9e/c3/059298687310d527a58bb01f3b1965787ee3b40dce76752eda8b44e9a2c5/pexpect-4.9.0-py2.py3-none-any.whl": "sha256:7236d1e080e4936be2dc3e326cec0af72acf9212a7e1d060210e70a47e253523"
@@ -21291,6 +21306,10 @@
           "pydantic-extra-types": {
             "https://files.pythonhosted.org/packages/17/c1/3226e6d7f5a4f736f38ac11a6fbb262d701889802595cdb0f53a885ac2e0/pydantic_extra_types-2.11.1-py3-none-any.whl": "sha256:1722ea2bddae5628ace25f2aa685b69978ef533123e5638cfbddb999e0100ec1",
             "https://files.pythonhosted.org/packages/66/71/dba38ee2651f84f7842206adbd2233d8bbdb59fb85e9fa14232486a8c471/pydantic_extra_types-2.11.1.tar.gz": "sha256:46792d2307383859e923d8fcefa82108b1a141f8a9c0198982b3832ab5ef1049"
+          },
+          "pyelftools": {
+            "https://files.pythonhosted.org/packages/46/2a/f9697576603dae937727827505a6126a066affb227034e77e6f9068910da/pyelftools-0.33-py3-none-any.whl": "sha256:f215ad5f47d3f1373a21496a6c9e0707c622840d0622f23ff7ce08678b020036",
+            "https://files.pythonhosted.org/packages/a3/11/767522582afab1b884d277de0e6e011640cb9d7292a38694b4b1a1df1ae8/pyelftools-0.33.tar.gz": "sha256:660d82dcbeb8e83d1702bd97f223f761625da06111c0cc988eac6b8ab0c1b61f"
           },
           "pygments": {
             "https://files.pythonhosted.org/packages/49/2e/ced460408999b33da6b31b0021b0f37d329e202d4169aeb164493778f25b/pygments-2.21.0.tar.gz": "sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c",

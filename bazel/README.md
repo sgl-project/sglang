@@ -36,7 +36,7 @@ bazel run //bazel/python:runtime_import_requirements.update
 bazel run --config=cpu //bazel/integration:sglang_cli -- version
 bazel test --config=cpu //bazel/integration:runtime_import_test
 
-# Main Rust extensions, gateway, and direct Bazel wheel assembly.
+# Main Rust extensions, gateway, direct wheel assembly, and policy repair.
 bazel build --config=cpu //:bazel_components
 bazel test --config=cpu \
   //bazel/rust:sgl_model_gateway_lock_parity_test \
@@ -45,6 +45,9 @@ bazel build --config=cpu //sgl-model-gateway:sgl-model-gateway
 bazel build --config=cpu \
   --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
   //bazel/packaging:main_wheel
+bazel build --config=manylinux -c opt \
+  --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
+  //bazel/packaging:main_wheel_manylinux
 
 # Hardware targets use the matching pre-provisioned PyTorch/toolchain image.
 bazel build --config=cpu //python/sglang/kernels/aot:cpu_wheel
@@ -84,6 +87,12 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
   extensions, gateway artifacts, and direct-wheel native modules require at
   most GLIBC 2.18 and have no dynamic `libssl`, `libcrypto`, or `libpcre2`
   dependency.
+- `main_wheel_manylinux` consumes the direct wheel without rebuilding its
+  native modules. SHA-locked auditwheel 6.8.1 and patchelf 0.19.1.0 repair it
+  to `manylinux_2_24_x86_64`, then validate the exact filename/WHEEL tag,
+  x86_64 ELF and GLIBC/RPATH policy, complete RECORD hashes, unchanged native
+  payloads, and imports of all three extensions. Its `audit` output group
+  exposes the JSON report.
 
 ## Ownership boundaries
 
@@ -158,7 +167,7 @@ complete. Bazel must not become the release authority yet:
   before the action can become sandboxed, cacheable, and remotely executable.
 - Vendored OpenSSL still consumes runner-provided Perl and Make during its
   build; a pinned execution image must provide those tools.
-- Release-only `auditwheel repair`, final ELF RPATH policy, architecture
-  matrices, and digest-pinned OCI image targets remain outside Bazel.
+- Architecture matrices and digest-pinned OCI image targets remain outside
+  Bazel.
 - Hardware wheel builds remain shadow artifacts until all ABI and numerical
   tests pass across supported CUDA/ROCm/Python variants.

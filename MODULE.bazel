@@ -217,11 +217,17 @@ pip.parse(
     python_version = "3.12",
     requirements_lock = "//bazel/python:runtime_import.requirements.lock.txt",
 )
+pip.parse(
+    hub_name = "wheel_repair",
+    python_version = "3.12",
+    requirements_lock = "//bazel/packaging:wheel_repair.requirements.lock.txt",
+)
 use_repo(
     pip,
     "hf_management",
     "runtime_import",
     "srt_empty_bootstrap",
+    "wheel_repair",
 )
 
 # Keep the primary Cargo workspace authoritative. crate_universe mirrors its

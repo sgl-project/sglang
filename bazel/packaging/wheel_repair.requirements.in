@@ -1,0 +1,2 @@
+auditwheel==6.8.1
+patchelf==0.19.1.0

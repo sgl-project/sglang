@@ -1,10 +1,29 @@
 load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@runtime_import//:requirements.bzl", "requirement")
+load("@wheel_repair//:requirements.bzl", wheel_repair_requirement = "requirement")
 load(":main_wheel.bzl", "main_wheel")
+load(":manylinux_wheel.bzl", "manylinux_wheel")
 load(":pep517_wheel.bzl", "pep517_wheel")
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "wheel_repair.requirements.in",
+    "wheel_repair.requirements.lock.txt",
+])
+
+uv_lock(
+    name = "wheel_repair_requirements",
+    srcs = ["wheel_repair.requirements.in"],
+    out = "wheel_repair.requirements.lock.txt",
+    args = [
+        "--python-version",
+        "3.12",
+    ],
+    tags = ["manual"],
+)
 
 sh_binary(
     name = "build_pep517_wheel",
@@ -41,6 +60,44 @@ main_wheel(
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
+)
+
+py_binary(
+    name = "repair_manylinux_wheel",
+    srcs = ["repair_manylinux_wheel.py"],
+    main = "repair_manylinux_wheel.py",
+    python_version = "PY3",
+    deps = [
+        wheel_repair_requirement("auditwheel"),
+        wheel_repair_requirement("patchelf"),
+    ],
+)
+
+# This consumes :main_wheel as a single input. It never invokes PEP 517 or a
+# second native build: auditwheel verifies the requested policy, then the
+# wrapper checks exact tags, ELF ABI/RPATH, RECORD hashes, payload identity,
+# and imports for all three extension modules.
+manylinux_wheel(
+    name = "main_wheel_manylinux",
+    abi = "cp312",
+    auditwheel_version = "6.8.1",
+    extension_suffix = ".cpython-312-x86_64-linux-gnu.so",
+    input_platform = "linux_x86_64",
+    max_glibc = "2.18",
+    native_modules = [
+        "sglang.srt.rust_extensions._grpc",
+        "sglang.srt.rust_extensions._multimodal",
+        "sglang.srt.rust_extensions._server",
+    ],
+    output_platform = "manylinux_2_24_x86_64",
+    patchelf_version = "0.19.1.0",
+    python_tag = "cp312",
+    target_compatible_with = [
+        "//bazel/platforms:glibc_2_24",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    wheel = ":main_wheel",
 )
 
 # This action deliberately preserves the existing release authority instead of
