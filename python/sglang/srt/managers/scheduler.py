@@ -3016,6 +3016,38 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
+        # Fast path: when there is absolutely nothing to schedule, skip the
+        # expensive merge / filter / prefill-admission logic and return
+        # immediately.  In PP low-load scenarios >99% of iterations are idle
+        # and each one otherwise burns ~1.5ms of pure CPU overhead.
+        if (
+            running_batch.is_empty()
+            and self.chunked_req is None
+            and (last_batch is None or not last_batch.forward_mode.is_extend())
+            and len(self.waiting_queue) == 0
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.grammar_manager.has_waiting_grammars()
+            and not self.enable_hierarchical_cache
+        ):
+            # An empty batch is never full — clear a stale flag so the next
+            # prefill-eligible iteration can schedule without an extra pass.
+            running_batch.batch_is_full = False
+            ret = None
+            # Preserve DP-attention MLP sync even when idle.
+            if self.require_mlp_sync:
+                ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    ret, need_sync=True
+                )
+            ret = self.ngram_embedding_manager.prepare_for_forward(
+                ret, chunked_req=self.chunked_req
+            )
+            if ret:
+                set_schedule_time_batch(ret)
+                if self.enable_fpm:
+                    ret.fpm_start_time = self._fpm_batch_t0
+            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
