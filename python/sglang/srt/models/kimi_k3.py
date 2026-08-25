@@ -20,6 +20,8 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -73,6 +75,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1386,13 +1389,15 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate", False
         )
 
-        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
+        # The full-rank [q, k, v, g] merged projection is explicitly sharded
+        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
+        # The low-rank fused path still uses full-TP-only projection helpers.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
-        )
+        self.do_fuse_qkvbfg = (
+            self.use_full_rank_gate or self.attn_tp_size == self.tp_size
+        ) and (quant_config is None or self.use_full_rank_gate)
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1414,8 +1419,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -2616,7 +2621,64 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        # Binary-search DBG: print at layer 1 (first standard transformer
+        # layer, right after embed_tokens), layer 46 (last layer of PP1,
+        # i.e. after PP0->PP1 boundary), and layer 92 (last layer of PP3,
+        # after PP2->PP3 boundary) so we can compare the exact hidden state
+        # at each PP stage boundary.
+        # Global debug switch: flip _DBG_ENABLED to False to disable ALL
+        # hidden-state norm printing below (back to no-debug behavior).
+        _DBG_ENABLED = False  # <-- set False to disable debug printing
+        _DBG_LAYERS = {1, 23}
+        # PREFILL-only: only print on prefill/extension phases, not decode,
+        # so a single-request prefill shows layer 1/23 norm without decode spam.
+        _DBG_PREFILL_ONLY = True
         for i in range(self.start_layer, self.end_layer):
+            # === DBG: per-layer hidden state norm (PP=4 prefill bug hunt) ===
+            # LOCAL-ONLY read, NO collective. The previous all_gather version
+            # was the FIRST device collective on the full TP group (TP=64 in
+            # baseline spans 4 machines; its lazy HCCL comm init hit the
+            # port-65536 bind race), failed with an inner HCCL error, was
+            # swallowed by except, poisoned the group, and OOMed
+            # causal_conv1d downstream (garbage seqlens -> 3244 GiB alloc).
+            # Activations are replicated across TP ranks, so the local norm
+            # is already the full-hidden norm on every rank.
+            # Whole block can be toggled off via SGLANG_K3_DBG=0.
+            if _DBG_ENABLED and i in _DBG_LAYERS:
+                try:
+                    _fm = forward_batch.forward_mode.name
+                except Exception:
+                    _fm = "?"
+                _is_prefill = "DECODE" not in _fm
+                if not (_DBG_PREFILL_ONLY and not _is_prefill):
+                    try:
+                        _pp_rank = get_pp_group().rank_in_group
+                    except Exception:
+                        _pp_rank = -1
+                    try:
+                        _pp_size = get_pp_group().world_size
+                    except Exception:
+                        _pp_size = -1
+                    try:
+                        _tp_rank = get_tensor_model_parallel_rank()
+                    except Exception:
+                        _tp_rank = -1
+                    try:
+                        _tp_size = get_tensor_model_parallel_world_size()
+                    except Exception:
+                        _tp_size = -1
+                    try:
+                        _h = hidden_states
+                        _hs = _h.float().norm().item()
+                        _shape = list(_h.shape)
+                    except Exception as _e:
+                        _hs = f"ERR:{_e!s:.30}"
+                        _shape = "?"
+                    print(
+                        f"[KIMI-K3-DBG pp={_pp_rank}/{_pp_size} tp={_tp_rank}/{_tp_size} "
+                        f"layer={i:3d} mode={_fm}] hidden_norm={_hs} shape={_shape}",
+                        flush=True,
+                    )
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
@@ -2727,6 +2789,10 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    packed_modules_mapping = {
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+    }
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2736,6 +2802,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None:
+            if isinstance(quant_config, ModelSlimConfig):
+                model_mapping = {
+                    **quant_config.packed_modules_mapping.get("model", {}),
+                    **self.packed_modules_mapping,
+                }
+                quant_config.update_packed_modules_mapping({"model": model_mapping})
+            else:
+                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
