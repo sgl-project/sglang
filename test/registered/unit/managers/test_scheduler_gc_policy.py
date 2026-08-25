@@ -42,24 +42,20 @@ class TestSchedulerGcPolicy(CustomTestCase):
             mock_gc.collect.return_value = 0
             mock_gc.get_freeze_count.return_value = 123
 
-            # First call activates: collect + freeze survivors + disable auto GC.
             policy.maybe_run()
             self.assertEqual(mock_gc.collect.call_count, 1)
             mock_gc.freeze.assert_called_once()
             mock_gc.disable.assert_called_once()
 
-            # Within the interval: no collection.
             clock[0] += 29.0
             policy.maybe_run()
             self.assertEqual(mock_gc.collect.call_count, 1)
 
-            # Interval elapsed: one manual collect, no re-freeze.
             clock[0] += 2.0
             policy.maybe_run()
             self.assertEqual(mock_gc.collect.call_count, 2)
             mock_gc.freeze.assert_called_once()
 
-            # Next interval boundary.
             clock[0] += 30.5
             policy.maybe_run()
             self.assertEqual(mock_gc.collect.call_count, 3)

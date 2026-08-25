@@ -640,10 +640,6 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
-
-    # Manual full GC every N seconds instead of automatic collection, whose
-    # gen2 passes pause the scheduler 100-350ms at large live sets (0 = stock
-    # automatic GC).
     SGLANG_OPT_SCHEDULER_GC_COLLECT_INTERVAL_S = EnvFloat(600)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
