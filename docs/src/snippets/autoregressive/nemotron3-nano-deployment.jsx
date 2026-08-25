@@ -78,7 +78,6 @@ export const Nemotron3NanoDeployment = () => {
     }
 
     if (hardware === 'arc_b') {
-      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += `  --device xpu \\\n`;
     }
 

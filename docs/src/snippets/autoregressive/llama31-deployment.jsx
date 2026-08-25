@@ -260,9 +260,6 @@ export const Llama31Deployment = () => {
     }
 
     let cmd = 'sglang serve \\\n';
-    if (hardware === 'arc_b') {
-      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
-    }
     cmd += `  ${args.join(' \\\n  ')}`;
 
     return cmd;
