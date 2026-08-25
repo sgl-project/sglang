@@ -55,10 +55,6 @@ def _load_megamoe_module(monkeypatch):
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
-    runtime_context._test_resources = types.SimpleNamespace(
-        flashinfer_megamoe_workspaces={}
-    )
-    runtime_context.get_resources = lambda: runtime_context._test_resources
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -110,7 +106,6 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
 
-    module._ensure_shared_workspace = lambda _mega: None
     hidden_states = torch.randn((3, 4), dtype=torch.bfloat16)
     topk_ids = torch.tensor([[0, 1], [1, 0], [0, 1]], dtype=torch.int32)
     topk_weights = torch.randn((3, 2), dtype=torch.float32)
@@ -157,7 +152,6 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
 
-    module._ensure_shared_workspace = lambda _mega: None
     hidden_states = torch.randn((2, 4), dtype=torch.bfloat16)
     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
     topk_weights = torch.ones((2, 2), dtype=torch.float32)
@@ -215,51 +209,6 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
         assert packed.dtype == torch.int32
 
     assert dgm.pack_ue8m0_to_int is original
-
-
-def test_shared_workspace_uses_runtime_resources_and_combine_dtype_key(monkeypatch):
-    module = _load_megamoe_module(monkeypatch)
-    runtime_context = sys.modules["sglang.srt.runtime_context"]
-
-    class Mega:
-        def __init__(self, combine_dtype, workspace):
-            self._workspace = None
-            self._bootstrap = types.SimpleNamespace(world_size=4)
-            self._fleet_params = types.SimpleNamespace(
-                num_experts=256,
-                max_tokens_per_rank=1024,
-                token_hidden_size=7168,
-            )
-            self._megakernel_config = types.SimpleNamespace(
-                kernel_name="nvfp4",
-                top_k=8,
-                intermediate_size=2048,
-                combine_dtype=combine_dtype,
-            )
-            self._mega_config = types.SimpleNamespace(quantize_input=True)
-            self.created_workspace = workspace
-            self.create_count = 0
-
-        def _ensure_workspace(self):
-            self.create_count += 1
-            self._workspace = self.created_workspace
-            return self._workspace
-
-    bf16_workspace = object()
-    nvfp4_workspace = object()
-    bf16 = Mega("bf16", bf16_workspace)
-    nvfp4 = Mega("nvfp4", nvfp4_workspace)
-    bf16_reuse = Mega("bf16", object())
-
-    module._ensure_shared_workspace(bf16)
-    module._ensure_shared_workspace(nvfp4)
-    module._ensure_shared_workspace(bf16_reuse)
-
-    assert bf16.create_count == 1
-    assert nvfp4.create_count == 1
-    assert bf16_reuse.create_count == 0
-    assert bf16_reuse._workspace is bf16_workspace
-    assert len(runtime_context._test_resources.flashinfer_megamoe_workspaces) == 2
 
 
 if __name__ == "__main__":

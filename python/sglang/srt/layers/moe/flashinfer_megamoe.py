@@ -477,45 +477,6 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
-def _ensure_shared_workspace(mega) -> None:
-    """Point this layer at a runtime-context-owned shared symmetric buffer.
-
-    The first mega layer's first forward creates it (collective; safe because
-    warmup runs the same layer on all ranks in lockstep); later layers reuse it.
-    """
-    if getattr(mega, "_workspace", None) is not None:
-        return
-    fp = mega._fleet_params
-    kc = mega._megakernel_config
-    mc = mega._mega_config
-    from sglang.srt.runtime_context import get_resources
-
-    key = (
-        getattr(kc, "kernel_name", kc.__class__.__name__),
-        mega._bootstrap.world_size,
-        fp.num_experts,
-        fp.max_tokens_per_rank,
-        fp.token_hidden_size,
-        kc.top_k,
-        kc.intermediate_size,
-        getattr(kc, "gate_up_clamp", None),
-        getattr(kc, "activation_clamp", None),
-        getattr(kc, "apply_topk_in_fc1", None),
-        getattr(kc, "kind", None),
-        getattr(kc, "in_kernel_fc2_reduce", None),
-        getattr(kc, "combine_dtype", None),
-        getattr(kc, "token_back_by_dispatch", None),
-        getattr(kc, "fast_math", None),
-        mc.quantize_input,
-    )
-    workspaces = get_resources().flashinfer_megamoe_workspaces
-    shared = workspaces.get(key)
-    if shared is None:
-        workspaces[key] = mega._ensure_workspace()
-    else:
-        mega._workspace = shared
-
-
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
@@ -535,9 +496,7 @@ def run_flashinfer_megamoe(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
-
     mega = quant_info.mega
-    _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
