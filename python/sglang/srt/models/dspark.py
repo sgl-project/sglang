@@ -433,7 +433,7 @@ class DSparkDraftMixin:
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
-        if not self.sample_from_anchor:
+        if self.is_nemotron_35_draft:
             self.markov_head = build_nemotron_35_markov_head(
                 config, quant_config, prefix
             )

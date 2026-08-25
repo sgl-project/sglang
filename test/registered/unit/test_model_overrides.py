@@ -103,6 +103,19 @@ class TestModelOverridableWhitelist(CustomTestCase):
         )
 
 
+class TestDSparkCheckpointConfig(CustomTestCase):
+    def test_sample_from_anchor_is_read_from_checkpoint_config(self):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            get_dspark_sample_from_anchor,
+        )
+
+        config = SimpleNamespace(
+            architectures=["UnrelatedDSparkModel"], sample_from_anchor=False
+        )
+        self.assertFalse(get_dspark_sample_from_anchor(config))
+        self.assertTrue(get_dspark_sample_from_anchor(SimpleNamespace()))
+
+
 class _IsolatedRegistry(CustomTestCase):
     """Run each test against empty registries (they are process-global)."""
 

@@ -10,10 +10,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import (
-    is_nemotron_35_draft_config,
-    parse_dflash_draft_config,
-)
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -30,7 +27,7 @@ DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 
 def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     """Return whether a DSpark checkpoint samples the anchor query row."""
-    return not is_nemotron_35_draft_config(draft_hf_config)
+    return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
 def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
