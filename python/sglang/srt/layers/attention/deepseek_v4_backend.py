@@ -633,6 +633,9 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    # Whether TP-sharded q heads must be padded up to 64 for this backend's
+    # kernels (FlashMLA's fp8 sparse decode specializes h_q for {64, 128}).
+    pads_tp_q_heads: bool = True
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
