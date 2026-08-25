@@ -128,8 +128,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
-    NetworkAddress,
-    get_free_port,
     get_zmq_socket,
     is_port_available,
 )
@@ -690,6 +688,15 @@ class Engine(EngineScoreMixin, EngineBase):
             )
         )
 
+        from sglang.srt.weight_cache.protocol import (
+            build_daemon_model_specs,
+            cleanup_stale_daemon_files,
+            compute_global_rank,
+            compute_local_gpu_id,
+            get_ready_path,
+            make_local_rendezvous,
+        )
+
         # Build the distributed init method (multi-node uses the user-provided
         # dist_init_addr so all nodes reach the same endpoint).
         if server_args.dist_init_addr:
@@ -699,27 +706,16 @@ class Engine(EngineScoreMixin, EngineBase):
             # Fresh free port for the daemons' own rendezvous, not the engine's
             # nccl_port: a pinned --nccl-port would otherwise collide with the
             # engine's own NCCL TCPStore.
-            dist_init_method = NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
-
-        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
-        from sglang.srt.weight_cache.protocol import (
-            build_daemon_model_specs,
-            cleanup_stale_daemon_files,
-            compute_global_rank,
-            compute_local_gpu_id,
-            get_ready_path,
-        )
+            dist_init_method = make_local_rendezvous()
 
         # Speculative decoding: the draft/MTP model is a separate nn.Module, so
         # each rank gets a second daemon on its own "_draft" socket. The draft
         # daemons form their own process group and need their own rendezvous
-        # port (single-node only; check_server_args rejects the multi-node
+        # endpoint (single-node only; check_server_args rejects the multi-node
         # combination).
         draft_dist_init_method = None
         if server_args.speculative_algorithm is not None:
-            draft_dist_init_method = NetworkAddress(
-                "127.0.0.1", get_free_port()
-            ).to_tcp()
+            draft_dist_init_method = make_local_rendezvous()
 
         daemon_specs = build_daemon_model_specs(
             model_path=server_args.model_path,
@@ -755,6 +751,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         is_draft_model=spec.is_draft_model,
                         draft_model_idx=spec.draft_model_idx,
                     )
+
+        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
 
         for spec in daemon_specs:
             for pp_rank in pp_rank_range:

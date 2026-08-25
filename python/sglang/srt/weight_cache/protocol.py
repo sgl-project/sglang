@@ -309,6 +309,25 @@ def format_daemon_role(
     return f"_draft{draft_model_idx if draft_model_idx is not None else 0}"
 
 
+def make_local_rendezvous() -> str:
+    """Allocate a fresh loopback ``tcp://`` endpoint for one daemon group.
+
+    ``init_distributed_environment`` forms the group through torch's TCPStore,
+    so the endpoint has to be a ``tcp://`` URL, and each group needs its own:
+    the target daemons and the draft daemons are two separate process groups
+    that would deadlock against each other on a shared endpoint. Loopback is
+    correct because an auto-allocated group never spans nodes -- multi-node
+    runs must pass an explicit rendezvous address instead. Single source of
+    truth for both launchers and the daemon's own fallback, so the three
+    copies of this formula can't drift.
+
+    Imported lazily so protocol.py stays cheap to import.
+    """
+    from sglang.srt.utils.network import NetworkAddress, get_free_port
+
+    return NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
+
+
 class DaemonModelSpec(NamedTuple):
     """Identity of one model a weight cache daemon can hold.
 
@@ -382,6 +401,10 @@ def build_daemon_model_specs(
     same helper the daemon uses, so the launcher's view and the daemon's load
     always describe the same checkpoint.
     """
+    # specs[0] is the target model by construction: every rank always serves
+    # the target weights, and the draft entry below is appended only when
+    # speculative decoding is on. The flag is the role of this entry, not a
+    # default guess about the model.
     specs = [
         DaemonModelSpec(
             is_draft_model=False,

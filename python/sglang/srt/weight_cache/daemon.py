@@ -64,6 +64,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    make_local_rendezvous,
     normalize_draft_model_idx,
     recv_msg,
     resolve_daemon_model_identity,
@@ -258,12 +259,7 @@ class WeightCacheDaemon:
         if not dist.is_initialized():
             if self.dist_init_method is None:
                 # Fallback: auto-assign a port. This only works for single-process.
-                import socket as sock_mod
-
-                with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
-                    s.bind(("127.0.0.1", 0))
-                    free_port = s.getsockname()[1]
-                self.dist_init_method = f"tcp://127.0.0.1:{free_port}"
+                self.dist_init_method = make_local_rendezvous()
 
             init_distributed_environment(
                 world_size=self.tp_size * self.pp_size,
@@ -754,8 +750,6 @@ def launch_weight_cache_daemons(
             --nnodes 2 --node-rank 1 \\
             --dist-init-method tcp://node0-ip:29500
     """
-    import socket as sock_mod
-
     # Replicate _calculate_rank_ranges logic from engine.py
     pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
     nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
@@ -777,14 +771,9 @@ def launch_weight_cache_daemons(
             "rendezvous address accessible from all nodes."
         )
 
-    def _free_local_rendezvous() -> str:
-        with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return f"tcp://127.0.0.1:{s.getsockname()[1]}"
-
     # Auto-allocate a free port for the distributed init method
     if dist_init_method is None:
-        dist_init_method = _free_local_rendezvous()
+        dist_init_method = make_local_rendezvous()
 
     draft_dist_init_method = None
     if server_args.speculative_algorithm is not None:
@@ -798,7 +787,7 @@ def launch_weight_cache_daemons(
                 "cross-node rendezvous endpoint. Launch with nnodes=1 or "
                 "disable speculative decoding for the daemon."
             )
-        draft_dist_init_method = _free_local_rendezvous()
+        draft_dist_init_method = make_local_rendezvous()
 
     specs = build_daemon_model_specs(
         model_path=server_args.model_path,

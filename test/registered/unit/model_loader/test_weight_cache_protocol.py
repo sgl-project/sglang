@@ -40,6 +40,7 @@ from sglang.srt.weight_cache.protocol import (
     get_socket_path,
     hash_quant_config,
     is_ipc_quant_supported,
+    make_local_rendezvous,
     normalize_draft_model_idx,
     recv_msg,
     resolve_daemon_model_identity,
@@ -297,6 +298,16 @@ class TestGlobalRankAndPaths(CustomTestCase):
 
 class TestDaemonModelSpecs(CustomTestCase):
     """The per-rank daemon set shared by the engine and the CLI launcher."""
+
+    def test_local_rendezvous_is_tcp_and_unique_per_group(self):
+        # Both launchers and the daemon fallback go through this helper, so a
+        # target group and a draft group can never be handed the same endpoint.
+        first = make_local_rendezvous()
+        second = make_local_rendezvous()
+        self.assertTrue(first.startswith("tcp://127.0.0.1:"))
+        self.assertTrue(second.startswith("tcp://127.0.0.1:"))
+        self.assertNotEqual(first, second)
+        self.assertGreater(int(first.rsplit(":", 1)[1]), 0)
 
     def test_target_only_without_speculative(self):
         specs = build_daemon_model_specs(
