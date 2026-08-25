@@ -18,7 +18,7 @@ from sglang.srt.entrypoints.sidecar import (
     build_sidecar_endpoint,
     start_sidecar,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -43,6 +43,37 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_api_keys_fall_back_to_secret_environment_variables(self):
+        args = ServerArgs(model_path="dummy")
+        with (
+            envs.SGLANG_API_KEY.override("user-secret"),
+            envs.SGLANG_ADMIN_API_KEY.override("admin-secret"),
+        ):
+            args.resolve_once()
+            self.assertEqual(args.api_key, "user-secret")
+            self.assertEqual(args.admin_api_key, "admin-secret")
+            self.assertNotIn("SGLANG_API_KEY", exportable_env_vars())
+            self.assertNotIn("SGLANG_ADMIN_API_KEY", exportable_env_vars())
+
+    def test_api_key_cli_values_take_precedence_over_environment(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--api-key",
+                "cli-user",
+                "--admin-api-key",
+                "cli-admin",
+            ]
+        )
+        with (
+            envs.SGLANG_API_KEY.override("env-user"),
+            envs.SGLANG_ADMIN_API_KEY.override("env-admin"),
+        ):
+            args.resolve_once()
+        self.assertEqual(args.api_key, "cli-user")
+        self.assertEqual(args.admin_api_key, "cli-admin")
+
     def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

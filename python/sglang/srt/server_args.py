@@ -1414,12 +1414,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     api_key: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        "Set API key of the server. It is also used in the OpenAI API compatible server. Falls back to SGLANG_API_KEY when omitted.",
         NS("serving"),
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key. Falls back to SGLANG_ADMIN_API_KEY when omitted.",
         NS("serving"),
     ] = None
     served_model_name: A[
@@ -3809,6 +3809,7 @@ class ServerArgs:
         handle_mega_moe(self)
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
+        self._handle_api_key_env()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
 
@@ -4004,6 +4005,18 @@ class ServerArgs:
                 "_handle_return_hidden_states_mode",
                 enable_return_hidden_states=True,
             )
+
+    def _handle_api_key_env(self):
+        resolved = {}
+        if self.api_key is None and (api_key := envs.SGLANG_API_KEY.get()) is not None:
+            resolved["api_key"] = api_key
+        if (
+            self.admin_api_key is None
+            and (admin_api_key := envs.SGLANG_ADMIN_API_KEY.get()) is not None
+        ):
+            resolved["admin_api_key"] = admin_api_key
+        if resolved:
+            self._declare("_handle_api_key_env", **resolved)
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
