@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
 
+# §24.39 (Run 23 discriminator): every _gather_stream created by the
+# transfer worker threads registers here so the scheduler-side layer_trap
+# probes can drain them (see layer_trap.freeze_gather_streams). Set ops are
+# GIL-atomic; readers copy a snapshot before iterating.
+_GATHER_STREAMS = set()
+
 
 @triton.jit
 def _fused_gather_to_staging_kernel(
@@ -356,6 +362,7 @@ def _gather_all_layers_torch(
 
     if not hasattr(staging_buffer, "_gather_stream"):
         staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+        _GATHER_STREAMS.add(staging_buffer._gather_stream)
 
     staging_buffer._gather_stream.wait_stream(
         torch.cuda.default_stream(torch.device(device))
@@ -436,6 +443,7 @@ def _gather_all_layers_triton(
 
     if not hasattr(staging_buffer, "_gather_stream"):
         staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+        _GATHER_STREAMS.add(staging_buffer._gather_stream)
 
     staging_buffer._gather_stream.wait_stream(
         torch.cuda.default_stream(torch.device(device))

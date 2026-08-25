@@ -42,6 +42,16 @@ _pend: dict = {}
 def _enabled() -> bool:
     if "v" not in _on:
         _on["v"] = os.getenv("SGLANG_MF_LAYER_TRAP", "0") == "1"
+        # §24.39 (Run 23): opt-in gather-stream freeze (env-gated so Run 22's
+        # behavior stays the default baseline).
+        _on["freeze_gather"] = (
+            os.getenv("SGLANG_MF_FREEZE_GATHER", "0") == "1"
+        )
+        if _on["v"] and _on["freeze_gather"]:
+            logger.info(
+                "[mf-trap] gather-freeze on (§24.39 Run 23: gather streams "
+                "drained at every pool snapshot)"
+            )
     return _on["v"]
 
 
@@ -482,6 +492,34 @@ def glue_probe(pool, row: int, width: int, label: str) -> None:
     _snapshot_row(pool, row, width, label)
 
 
+def _freeze_gather_streams() -> None:
+    """§24.39 (Run 23): drain every registered KV-transfer gather stream.
+
+    The transfer worker threads run their staging gathers on private
+    _gather_stream instances (staging_buffer.py) concurrently with the
+    scheduler; every hit window so far (glue:entry / glue:pre-inflight /
+    Run-20 post-cache) overlaps transfer activity. Draining them before a
+    pool snapshot splits the candidates:
+      catches vanish  -> transfer/gather-stream family convicted
+      catches persist -> stream-C CP collective kernels (NPU-side OOB,
+                         invisible to python audits) remain -> kernel dump
+    """
+    if not _enabled() or not _on.get("freeze_gather"):
+        return
+    try:
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            _GATHER_STREAMS,
+        )
+    except Exception:
+        return
+    for st in list(_GATHER_STREAMS):
+        try:
+            ev = st.record_event()
+            ev.synchronize()
+        except Exception:
+            pass
+
+
 def glue_probe_pool(pool, label: str) -> None:
     """Drain the pending snapshot, then a full-pool snapshot (batch scope).
 
@@ -493,6 +531,7 @@ def glue_probe_pool(pool, label: str) -> None:
     """
     if not _enabled() or _pend.get("fired"):
         return
+    _freeze_gather_streams()
     _drain()
     if _pend.get("fired"):
         return
