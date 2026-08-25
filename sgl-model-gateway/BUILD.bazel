@@ -25,59 +25,59 @@ cargo_build_script(
     srcs = ["build.rs"],
     aliases = aliases(
         build = True,
-        package = "sgl-model-gateway",
+        package_name = "sgl-model-gateway",
     ),
     crate_root = "build.rs",
     data = ["Cargo.toml"],
-    edition = crate_edition(package = "sgl-model-gateway"),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
     deps = all_crate_deps(
         build = True,
-        package = "sgl-model-gateway",
+        package_name = "sgl-model-gateway",
     ),
 )
 
 rust_library(
     name = "sgl_model_gateway",
     srcs = glob(["src/**/*.rs"]),
-    aliases = aliases(package = "sgl-model-gateway"),
+    aliases = aliases(package_name = "sgl-model-gateway"),
     crate_name = "smg",
     crate_root = "src/lib.rs",
     deps = [
         ":build_script",
     ] + all_crate_deps(
         normal = True,
-        package = "sgl-model-gateway",
+        package_name = "sgl-model-gateway",
     ),
-    edition = crate_edition(package = "sgl-model-gateway"),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
 )
 
 rust_binary(
     name = "sgl-model-gateway",
     srcs = ["src/main.rs"],
-    aliases = aliases(package = "sgl-model-gateway"),
+    aliases = aliases(package_name = "sgl-model-gateway"),
     crate_name = "sgl_model_gateway",
     crate_root = "src/main.rs",
     deps = [
         ":sgl_model_gateway",
     ] + all_crate_deps(
         normal = True,
-        package = "sgl-model-gateway",
+        package_name = "sgl-model-gateway",
     ),
-    edition = crate_edition(package = "sgl-model-gateway"),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
 )
 
 rust_shared_library(
     name = "sglang_router_rs_abi3",
     srcs = glob(["bindings/python/src/**/*.rs"]),
-    aliases = aliases(package = "sgl-model-gateway-python"),
+    aliases = aliases(package_name = "sgl-model-gateway/bindings/python"),
     crate_name = "sglang_router_rs",
     crate_root = "bindings/python/src/lib.rs",
     deps = [
         ":sgl_model_gateway",
     ] + all_crate_deps(
         normal = True,
-        package = "sgl-model-gateway-python",
+        package_name = "sgl-model-gateway/bindings/python",
     ),
-    edition = crate_edition(package = "sgl-model-gateway-python"),
+    edition = crate_edition(package_name = "sgl-model-gateway/bindings/python"),
     tags = ["manual"],
 )
