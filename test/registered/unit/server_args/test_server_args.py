@@ -2334,6 +2334,7 @@ class TestDcpKvEventContract(CustomTestCase):
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(args.kv_event_block_size, 8)
 
+
 class TestTrtllmMlaArchGuard(CustomTestCase):
     """trtllm_mla prefill kernels exist only for SM100/SM103; decode works on all
     Blackwell (SM120/SM121 auto-dispatch to xqa).
