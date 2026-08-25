@@ -109,9 +109,14 @@ def _legacy_geometry(x, x_scale, masked_m, output_scale, output, expected_m):
         output,
         x.size(1),
         x.size(2),
+        x.size(0),
+        # A cap at the padded rows leaves every row on its own expert, which is
+        # what the old launch did.
+        x.size(1),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         G_BLOCK_SIZE=LEGACY_G_BLOCK,
         HAS_G_TAIL=(num_groups % LEGACY_G_BLOCK != 0),
+        EXPERT_BLOCK=triton.next_power_of_2(x.size(0)),
         num_warps=LEGACY_WARPS,
     )
     return output

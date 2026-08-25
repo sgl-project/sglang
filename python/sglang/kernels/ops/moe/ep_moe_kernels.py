@@ -1932,6 +1932,46 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
 
 
 @triton.jit
+def _requant_row(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    output_ptr,
+    m,
+    k,
+    expert,
+    row,
+    output_scale_val_inv,
+    k_offsets,
+    scale_g_offsets,
+    g_mask,
+    HAS_G_TAIL: tl.constexpr,
+):
+    """Requantize one row of one expert.  Both phases below place rows; this
+    places the tile, so they cannot disagree about how a row is written."""
+    row_base = expert.to(tl.int64) * m + row
+    x_ptrs = x_ptr + row_base * k + k_offsets
+    output_ptrs = output_ptr + row_base * k + k_offsets
+    x_scale_ptrs = (
+        x_scale_ptr + expert * x_scale_stride0 + row * x_scale_stride1 + scale_g_offsets
+    )
+    if HAS_G_TAIL:
+        hidden = tl.load(x_ptrs, mask=g_mask[:, None], other=0.0)
+        group_scale = tl.load(x_scale_ptrs, mask=g_mask, other=0.0)
+    else:
+        hidden = tl.load(x_ptrs)
+        group_scale = tl.load(x_scale_ptrs)
+    scaled = hidden.to(tl.float32) * group_scale.to(tl.float32)[:, None]
+    scaled = scaled * output_scale_val_inv
+    quantized = scaled.to(output_ptr.dtype.element_ty)
+    if HAS_G_TAIL:
+        tl.store(output_ptrs, quantized, mask=g_mask[:, None])
+    else:
+        tl.store(output_ptrs, quantized)
+
+
+@triton.jit
 def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     x_ptr,
     x_scale_ptr,
@@ -1943,22 +1983,20 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     output_ptr,
     m,
     k,
+    num_experts,
+    row_cap,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
     G_BLOCK_SIZE: tl.constexpr,
     HAS_G_TAIL: tl.constexpr,
+    EXPERT_BLOCK: tl.constexpr,
 ):
     pid_g, pid_m, pid_e = (
         tl.program_id(axis=0),
         tl.program_id(axis=1),
         tl.program_id(axis=2),
     )
-    pid_m_dim = tl.num_programs(1)
+    m_grid = tl.num_programs(1)
 
-    token_id = pid_m
-    last_effective_id = tl.load(masked_m_ptr + pid_e)
-
-    if token_id >= last_effective_id:
-        return
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
 
     # The payload is a whole number of scale groups, so tile it as
@@ -1970,29 +2008,70 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         g_offsets[:, None] * K_SCALE_BLOCK_SIZE
         + tl.arange(0, K_SCALE_BLOCK_SIZE)[None, :]
     )
-    if HAS_G_TAIL:
-        g_mask = g_offsets < k // K_SCALE_BLOCK_SIZE
+    g_mask = g_offsets < k // K_SCALE_BLOCK_SIZE
+    scale_g_offsets = g_offsets * x_scale_stride2
 
-    x_ptrs = x_ptr + pid_e * m * k + k_offsets
-    output_ptrs = output_ptr + pid_e * m * k + k_offsets
-    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + g_offsets * x_scale_stride2
+    # Phase 1 -- this program's own expert, up to the cap the launch was sized
+    # for.  This is the whole job for a batch whose rows are spread evenly.
+    last_effective_id = tl.load(masked_m_ptr + pid_e)
+    for row in tl.range(pid_m, min(last_effective_id, row_cap), m_grid):
+        _requant_row(
+            x_ptr,
+            x_scale_ptr,
+            x_scale_stride0,
+            x_scale_stride1,
+            output_ptr,
+            m,
+            k,
+            pid_e,
+            row,
+            output_scale_val_inv,
+            k_offsets,
+            scale_g_offsets,
+            g_mask,
+            HAS_G_TAIL,
+        )
 
-    for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
-        if HAS_G_TAIL:
-            hidden = tl.load(x_ptrs + tok_idx * k, mask=g_mask[:, None], other=0.0)
-            group_scale = tl.load(
-                x_scale_ptrs + tok_idx * x_scale_stride1, mask=g_mask, other=0.0
-            )
-        else:
-            hidden = tl.load(x_ptrs + tok_idx * k)
-            group_scale = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
-        scaled = hidden.to(tl.float32) * group_scale.to(tl.float32)[:, None]
-        scaled = scaled * output_scale_val_inv
-        quantized = scaled.to(output_ptr.dtype.element_ty)
-        if HAS_G_TAIL:
-            tl.store(output_ptrs + tok_idx * k, quantized, mask=g_mask[:, None])
-        else:
-            tl.store(output_ptrs + tok_idx * k, quantized)
+    # Phase 2 -- rows any expert holds beyond the cap, flattened over the whole
+    # launch.  Tying rows to their own expert's slice of the grid is what makes
+    # a lopsided batch serialize: the hot expert's programs work while everyone
+    # else's exit.  Only the rows above the cap can be lopsided, so only those
+    # pay for being looked up, and a batch that has none finds out with one
+    # reduction per program rather than anything per row.
+    expert_ids = tl.arange(0, EXPERT_BLOCK)
+    counts = tl.load(masked_m_ptr + expert_ids, mask=expert_ids < num_experts, other=0)
+    overflow = tl.maximum(counts - row_cap, 0)
+    total_overflow = tl.sum(overflow)
+    if total_overflow == 0:
+        return
+
+    # Prefix sum over the overflow turns a flat index into (expert, row): the
+    # owning expert is however many experts finish at or before it, and the row
+    # is the cap plus the distance from where that expert's overflow started.
+    # An expert that does not overflow finishes where it starts, so it drops out
+    # of both without a special case.
+    overflow_before = tl.cumsum(overflow)
+    flat_id = pid_e * m_grid + pid_m
+    num_programs = m_grid * num_experts
+    for i in tl.range(flat_id, total_overflow, num_programs):
+        expert = tl.sum((overflow_before <= i).to(tl.int32))
+        started = tl.max(tl.where(overflow_before <= i, overflow_before, 0))
+        _requant_row(
+            x_ptr,
+            x_scale_ptr,
+            x_scale_stride0,
+            x_scale_stride1,
+            output_ptr,
+            m,
+            k,
+            expert,
+            row_cap + (i - started),
+            output_scale_val_inv,
+            k_offsets,
+            scale_g_offsets,
+            g_mask,
+            HAS_G_TAIL,
+        )
 
 
 # Hidden bytes each lane moves per tile.  This, not the element count, is the
@@ -2024,6 +2103,12 @@ _REQUANT_M_GRID_MIN = 4
 # neutral on H200 and 1.12x worse on MI350X.
 _REQUANT_TARGET_PROGRAMS = 1024
 _REQUANT_ROWS_SATURATED = 64
+# How far past the dispatcher's average an expert may go before its rows stop
+# being its own programs' problem.  Twice the average leaves ordinary variation
+# in the cheap per-expert phase and sends only real imbalance to the flattened
+# one, which costs 4% at even load and is what keeps a lopsided batch from
+# serializing (measured: an expert at 32x its share went 0.57x -> 3.39x).
+_REQUANT_ROW_CAP_SLACK = 2
 
 
 def _floor_pow2(value: int) -> int:
@@ -2042,25 +2127,20 @@ def requant_launch_geometry(
     group_size: int = 128,
     expected_rows: Optional[int] = None,
     warp_size: int = _REQUANT_DEFAULT_WARP_SIZE,
-) -> Tuple[int, int]:
-    """Pick (groups per program, m-grid) for the per-token -> per-tensor requant.
+    max_rows: int = 1 << 30,
+) -> Tuple[int, int, int]:
+    """Pick (groups per program, m-grid, row cap) for the requant.
 
-    Only a launch hint: the m-grid decides how many programs share an expert's
-    rows, so any value is correct and skew just means more rows per program.
-    It costs something, though: ``expected_rows`` is a dispatch-wide average and
-    cannot see which expert is holding the rows, so an expert with s times its
-    share serializes s times deeper.  Measured against the previous fixed 32-grid
-    the crossover is around s = 16 (worst ~7 us per layer at s = 32); at
-    ``expected_rows >= 64`` this returns 32 anyway, so a saturated batch is
-    exposed to none of it.  Bounding s is EPLB's job -- a kernel-side fix would
-    have to flatten (row, expert) onto one index over a ``masked_m`` prefix sum
-    so a hot expert can borrow the programs idle experts are not using.
-    One program per expected row, never above the historical 32 and additionally
-    capped by the expert count while rows are scarce, was the measured optimum
-    across hidden sizes and expert counts -- so this only ever shrinks the grid.
-    The row count is rounded down to a power of two because the dispatcher's
-    estimate already rounds up (it adds the expert count before dividing), so an
-    exact average of 8 rows arrives as 9 and must not launch 16 programs.
+    All three are launch hints; any values produce the same bytes.  The m-grid
+    decides how many programs share one expert's rows, and the cap decides how
+    many rows stay that expert's own problem -- past it they are shared with the
+    whole launch instead, so no value of either can make a lopsided batch
+    serialize.  One program per expected row, never above the historical 32 and
+    additionally capped by the expert count while rows are scarce, was the
+    measured optimum across hidden sizes and expert counts.  The row count is
+    rounded down to a power of two because the dispatcher's estimate already
+    rounds up (it adds the expert count before dividing), so an exact average of
+    8 rows arrives as 9 and must not launch 16 programs.
 
     ``warp_size`` widens the tile on a vendor whose warp is wider, keeping the
     bytes each lane moves -- the thing that was actually tuned -- constant. It is
@@ -2082,13 +2162,15 @@ def requant_launch_geometry(
     # moved the loss to another width, so the widths in between are left as-is.
     g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
     if expected_rows is None:
-        return g_block, _REQUANT_M_GRID_MAX
+        # Nothing to place a cap against, so leave every row with its own expert.
+        return g_block, _REQUANT_M_GRID_MAX, max_rows
     m_grid = min(_REQUANT_M_GRID_MAX, _floor_pow2(expected_rows))
     if expected_rows < _REQUANT_ROWS_SATURATED:
         m_grid = min(
             m_grid, _floor_pow2(_REQUANT_TARGET_PROGRAMS // max(1, num_experts))
         )
-    return g_block, max(_REQUANT_M_GRID_MIN, m_grid)
+    row_cap = min(max_rows, max(1, expected_rows) * _REQUANT_ROW_CAP_SLACK)
+    return g_block, max(_REQUANT_M_GRID_MIN, m_grid), row_cap
 
 
 def fp8_per_token_to_per_tensor_quant_triton(
@@ -2105,8 +2187,9 @@ def fp8_per_token_to_per_tensor_quant_triton(
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
     assert x.is_contiguous()
     assert output.shape == x.shape and output.is_contiguous()
-    # Every tensor is addressed with flat `pid_e * m * k` arithmetic and raw
-    # strides, so a shape that disagrees reads out of bounds rather than failing.
+    # Every tensor is addressed by flattening (expert, row) into one index and
+    # scaling it by raw strides, so a shape that disagrees with `x` reads out of
+    # bounds rather than failing.
     assert masked_m.shape[0] == x.size(0)
     assert x_scale.size(0) == x.size(0) and x_scale.size(1) == x.size(1)
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
@@ -2117,15 +2200,17 @@ def fp8_per_token_to_per_tensor_quant_triton(
     assert x_scale.dtype == torch.float32
     assert output_scale.numel() == 1
 
+    num_experts = x.size(0)
     num_groups = x.size(2) // K_SCALE_BLOCK_SIZE
-    g_block, m_grid = requant_launch_geometry(
+    g_block, m_grid, row_cap = requant_launch_geometry(
         num_groups=num_groups,
-        num_experts=x.size(0),
+        num_experts=num_experts,
         group_size=K_SCALE_BLOCK_SIZE,
         expected_rows=expected_rows,
         warp_size=requant_warp_size(x.device),
+        max_rows=x.size(1),
     )
-    grid = (triton.cdiv(num_groups, g_block), m_grid, x.size(0))
+    grid = (triton.cdiv(num_groups, g_block), m_grid, num_experts)
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,
         x_scale,
@@ -2135,9 +2220,12 @@ def fp8_per_token_to_per_tensor_quant_triton(
         output,
         x.size(1),
         x.size(2),
+        num_experts,
+        row_cap,
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         G_BLOCK_SIZE=g_block,
         HAS_G_TAIL=(num_groups % g_block != 0),
+        EXPERT_BLOCK=triton.next_power_of_2(num_experts),
         num_warps=_REQUANT_NUM_WARPS,
     )
 

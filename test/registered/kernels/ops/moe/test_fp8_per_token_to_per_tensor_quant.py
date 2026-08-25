@@ -129,8 +129,11 @@ def test_many_experts(num_experts, expected_rows):
 # CI happens to have.
 @pytest.mark.parametrize("g_block", [1, 8, 16, 32])
 @pytest.mark.parametrize("k", [7168, 3584])
-@pytest.mark.parametrize("m_grid", [4, 32])
-def test_every_launch_geometry_agrees(g_block, k, m_grid):
+@pytest.mark.parametrize("m_grid", [1, 4, 32])
+# 0 sends every row to the shared overflow path, 48 keeps every row on its own
+# expert, and 4 splits the batch across both.
+@pytest.mark.parametrize("row_cap", [0, 4, 48])
+def test_every_launch_geometry_agrees(g_block, k, m_grid, row_cap):
     num_experts, m = 4, 48
     masked = [0, 1, 17, 48]
     x, x_scale = _build(num_experts, m, k, seed=k + g_block, column_major_scales=True)
@@ -149,13 +152,33 @@ def test_every_launch_geometry_agrees(g_block, k, m_grid):
         output,
         m,
         k,
+        num_experts,
+        row_cap,
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         G_BLOCK_SIZE=g_block,
         HAS_G_TAIL=(num_groups % g_block != 0),
+        EXPERT_BLOCK=triton.next_power_of_2(num_experts),
         num_warps=4,
     )
 
     _assert_output(output, x, x_scale, masked)
+
+
+# An expert with no live rows sits in the middle of the flattened row sequence
+# and must be stepped over, not counted -- the case the prefix-sum mapping is
+# most likely to get wrong by one.
+@pytest.mark.parametrize(
+    "masked", [[0, 0, 0, 0], [0, 5, 0, 7], [9, 0, 0, 0], [0, 0, 0, 9]]
+)
+def test_experts_with_no_rows_are_skipped(masked):
+    _run_and_check(
+        num_experts=4,
+        m=48,
+        k=3584,
+        masked=masked,
+        expected_rows=2,
+        column_major_scales=True,
+    )
 
 
 if __name__ == "__main__":
