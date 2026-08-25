@@ -40,12 +40,14 @@ def test_hc_combine_matches_reference(m: int, hc: int, h: int, dtype: torch.dtyp
     assert (ref.float() - got.float()).abs().max() / scale < 5e-2
 
 
-def test_hc_combine_non_contiguous_pre_is_rejected_or_handled():
+def test_hc_combine_strided_pre():
     torch.manual_seed(0)
     m, hc, h = 32, 4, 128
     x_flat = torch.randn(m, hc * h, device="cuda", dtype=torch.bfloat16)
-    pre = torch.randn(m, hc, device="cuda", dtype=torch.bfloat16)
-    got = hc_combine(x_flat, pre.contiguous(), hc, torch.bfloat16)
+    # A non-contiguous view of pre, to check the kernel honours pre's strides.
+    pre = torch.randn(m, hc, 2, device="cuda", dtype=torch.bfloat16)[..., 0]
+    assert not pre.is_contiguous()
+    got = hc_combine(x_flat, pre, hc, torch.bfloat16)
     ref = _reference(x_flat, pre, hc, torch.bfloat16)
     scale = ref.float().abs().max().clamp(min=1e-6)
     assert (got.float() - ref.float()).abs().max() / scale < 5e-2

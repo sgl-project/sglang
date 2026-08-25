@@ -1627,6 +1627,8 @@ def _hc_combine_kernel(
     y_ptr,
     H,
     x_stride_m,
+    pre_stride_m,
+    pre_stride_k,
     y_stride_m,
     HC: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -1637,7 +1639,7 @@ def _hc_combine_kernel(
     mask = offs_h < H
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for k in tl.static_range(HC):
-        pk = tl.load(pre_ptr + pid_m * HC + k).to(tl.float32)
+        pk = tl.load(pre_ptr + pid_m * pre_stride_m + k * pre_stride_k).to(tl.float32)
         xv = tl.load(
             x_ptr + pid_m * x_stride_m + k * H + offs_h, mask=mask, other=0.0
         ).to(tl.float32)
@@ -1659,6 +1661,8 @@ def hc_combine(
         y,
         h,
         x_flat.stride(0),
+        pre.stride(0),
+        pre.stride(1),
         y.stride(0),
         HC=hc,
         BLOCK_H=block_h,

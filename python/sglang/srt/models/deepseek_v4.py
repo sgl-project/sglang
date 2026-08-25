@@ -1675,7 +1675,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            y = hc_combine(x_flat, pre.squeeze(1).contiguous(), self.hc_mult, dtype)
+            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
