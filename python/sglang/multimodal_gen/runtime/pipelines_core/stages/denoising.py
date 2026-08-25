@@ -25,12 +25,16 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
+    mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
+    mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
+    unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -181,6 +185,16 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
+    ),
+    (
+        "LingBot Video fused RMSNorm",
+        mount_lingbot_video_rmsnorm,
+        unmount_lingbot_video_rmsnorm,
+    ),
+    (
+        "SANA-Video BF16-input linear attention",
+        mount_sana_video_linear_attention,
+        unmount_sana_video_linear_attention,
     ),
 )
 
@@ -544,7 +558,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             apply_attention_backend_override(layer, target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
-        logger.info(
+        logger.debug(
             "Attention backend for this batch: %s (%d layers switched)",
             target.name.lower() if target else "server default",
             len(layers),
@@ -652,6 +666,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         mounted_fusions.add(description)
                 else:
                     unmount(transformer)
+
+        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
+                    unmount(transformer)
+            descriptions = ", ".join(sorted(mounted_fusions))
+            raise ValueError(
+                "quality='high' cannot be used with breakable CUDA graphs for "
+                f"this model because its request-scoped DiT fusions "
+                f"({descriptions}) do not match the lossless warmup graphs. "
+                "Disable breakable CUDA graphs or use quality='lossless'."
+            )
+
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
             logger.info("Mounted %s for quality=high", description)
@@ -1636,7 +1663,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available() and not is_warmup:
+        if (
+            torch.backends.mps.is_available()
+            and not is_warmup
+            and not is_layerwise_offloaded_module(self.transformer)
+        ):
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),

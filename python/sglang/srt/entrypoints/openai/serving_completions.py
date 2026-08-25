@@ -25,13 +25,16 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_spec_tokens_details_from_ret,
     should_include_usage,
+    spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -237,6 +240,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        spec_tokens_details = {}
 
         stream_started = False
         try:
@@ -264,6 +268,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if request.return_spec_tokens_details:
+                    spec_tokens_details[index] = spec_tokens_details_from_meta_info(
+                        content["meta_info"]
+                    )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
@@ -419,15 +427,36 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     (v for v in routed_experts.values() if v is not None), None
                 )
 
-            sglext_details = None
+            sglext_cached_tokens_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
                 first_details = next(
                     (v for v in cached_tokens_details.values() if v is not None), None
                 )
                 if first_details is not None:
-                    sglext_details = cached_tokens_details_from_dict(first_details)
+                    sglext_cached_tokens_details = cached_tokens_details_from_dict(
+                        first_details
+                    )
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_spec_tokens_details = None
+            if request.return_spec_tokens_details and spec_tokens_details:
+                spec_details = [
+                    spec_tokens_details[index]
+                    for index in sorted(spec_tokens_details)
+                    if spec_tokens_details[index] is not None
+                ]
+                if spec_details:
+                    sglext_spec_tokens_details = (
+                        spec_details if request.n > 1 else spec_details[0]
+                    )
+
+            if any(
+                obj is not None
+                for obj in [
+                    sglext_routed,
+                    sglext_cached_tokens_details,
+                    sglext_spec_tokens_details,
+                ]
+            ):
                 sglext_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,
@@ -436,7 +465,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     model=request.model,
                     sglext=SglExt(
                         routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
+                        cached_tokens_details=sglext_cached_tokens_details,
+                        spec_tokens_details=sglext_spec_tokens_details,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -517,11 +547,24 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_details = [
+            detail
+            for detail in (
+                process_spec_tokens_details_from_ret(item, request) for item in ret
+            )
+            if detail is not None
+        ]
+        spec_tokens_details = (
+            spec_details
+            if request.n > 1
+            else (spec_details[0] if spec_details else None)
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                spec_tokens_details=spec_tokens_details,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -592,7 +635,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 

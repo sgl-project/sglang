@@ -175,6 +175,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    V_POW2: tl.constexpr,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
 
@@ -201,25 +202,16 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    # v for head group i_qk: in the all_v region
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * TOTAL_QKVZ
-        + TOTAL_Q
-        + TOTAL_K
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
+    # Base offsets of the v/z regions for head group i_qk. tl.arange only
+    # accepts power-of-two extents, so non-power-of-two group sizes (e.g. the
+    # v/k head ratio 3 of the dense 27B hybrids) walk the group one
+    # HEAD_V-sized head at a time; power-of-two groups keep the single wide
+    # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
+    # dead branch is pruned before tl.arange validation.
+    v_ld_base = (
+        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
     )
-    # z for head group i_qk: in the all_z region
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * TOTAL_QKVZ
-        + TOTAL_Q
-        + TOTAL_K
-        + TOTAL_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
+    z_ld_base = v_ld_base + TOTAL_V
 
     # ── Write to output (identical layout to the interleaved kernel) ──
     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
@@ -230,24 +222,31 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    blk_v_st_ptr = (
+    v_st_base = (
         mixed_qkv
         + i_bs * QKV_DIM_T
         + NUM_HEADS_QK * HEAD_QK * 2
         + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
     )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
+    z_st_base = z + i_bs * NUM_HEADS_V * HEAD_V + i_qk * V_PER_GROUP * HEAD_V
 
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    if V_POW2:
+        offs_group = tl.arange(0, V_PER_GROUP * HEAD_V)
+        tl.store(v_st_base + offs_group, tl.load(v_ld_base + offs_group))
+        tl.store(z_st_base + offs_group, tl.load(z_ld_base + offs_group))
+    else:
+        offs_head = tl.arange(0, HEAD_V)
+        for i in tl.static_range(V_PER_GROUP):
+            tl.store(
+                v_st_base + i * HEAD_V + offs_head,
+                tl.load(v_ld_base + i * HEAD_V + offs_head),
+            )
+            tl.store(
+                z_st_base + i * HEAD_V + offs_head,
+                tl.load(z_ld_base + i * HEAD_V + offs_head),
+            )
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
@@ -301,6 +300,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     a = torch.empty_like(b)
     if _is_hip and batch * seq_len == 0:
         return mixed_qkv, z, b, a
+    v_per_group = num_heads_v // num_heads_qk
     grid = (batch * seq_len, num_heads_qk)
     # Each program moves `v_per_group * head_v` elements for both v and z. For
     # the small head-group ratios (<= 512 elements) a single warp is the best
@@ -323,6 +323,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
+        V_POW2=(v_per_group & (v_per_group - 1)) == 0,
         num_warps=num_warps,
         num_stages=3,
     )
