@@ -46,8 +46,13 @@ def _a2a_staging_buffer(
     """Reusable staging buffer for a Ulysses collective.
 
     A buffer of a given role is fully consumed (in stream order) before the
-    next collective with the same role overwrites it, so caching by
-    (role, shape, dtype) is exact and removes per-block allocator churn.
+    next collective with the same role overwrites it, so reusing one flat
+    buffer per (role, dtype, device) is exact and removes per-block
+    allocator churn. The buffer grows to the largest numel seen and is
+    viewed to each request's shape; keying by shape instead would retain
+    one buffer per distinct request shape, which accumulates without bound
+    across requests of varied resolutions/durations (observed multi-GiB
+    growth ending in OOM on serving workloads).
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
@@ -59,12 +64,15 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    key = (role, tuple(shape), dtype, device.index)
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    key = (role, dtype, device.index)
     buffer = _A2A_STAGING_BUFFERS.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=dtype, device=device)
+    if buffer is None or buffer.numel() < numel:
+        buffer = torch.empty(numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
-    return buffer
+    return buffer[:numel].view(shape)
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
