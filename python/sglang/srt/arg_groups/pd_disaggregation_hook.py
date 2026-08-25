@@ -5,6 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -20,8 +21,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
     if server_args.disaggregation_transfer_backend == "mooncake_tcp":
         os.environ.setdefault("MC_FORCE_TCP", "1")
-        server_args.disaggregation_transfer_backend = "mooncake"
-        server_args.disaggregation_ib_device = None
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_transfer_backend="mooncake",
+        )
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_ib_device=None,
+        )
         logger.info(
             "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
@@ -35,10 +44,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
-        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+        # Fake transfer moves no KV and is only used for synthetic decode
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        if server_args.disaggregation_transfer_backend not in (
+            "mooncake",
+            "nixl",
+            "fake",
+        ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake or nixl, got "
+                "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{server_args.disaggregation_transfer_backend!r}."
             )
         if server_args.disaggregation_decode_enable_radix_cache:
@@ -77,10 +92,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."
                 )
-            server_args.disable_radix_cache = False
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disable_radix_cache=False,
+            )
             logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
         else:
-            server_args.disable_radix_cache = True
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disable_radix_cache=True,
+            )
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
@@ -95,7 +118,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
-            server_args.disaggregation_decode_extra_slots = extra_slots
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disaggregation_decode_extra_slots=extra_slots,
+            )
 
     elif server_args.disaggregation_mode == "prefill":
         assert (
@@ -147,4 +174,8 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
             server_args.disaggregation_bootstrap_port,
             server_args.port,
         )
-        server_args.disaggregation_bootstrap_port = server_args.port
+        declare_resolution(
+            server_args,
+            "_alias_bootstrap_port_to_api_port",
+            disaggregation_bootstrap_port=server_args.port,
+        )
