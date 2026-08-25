@@ -966,10 +966,13 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Walk one path, with q over the K candidates for the verify. greedy_mask
-        rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Walk one path and return tokens, selected indices, and q rows.
+
+        ``path_indices[b, j]`` identifies the candidate selected at position ``j``
+        and therefore the predecessor row at position ``j + 1``. This lets
+        confidence scheduling score the exact selected path.
+        """
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1017,7 +1020,7 @@ class CandidateSelector(nn.Module):
         q_rows = torch.where(
             greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
         )
-        return tokens, q_rows
+        return tokens, path_indices, q_rows
 
 
 class DFlash2DraftModel(DFlashDraftModel):

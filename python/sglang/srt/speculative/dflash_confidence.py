@@ -36,24 +36,54 @@ class DFlashConfidenceDecision:
     low_confidence_tokens: int
 
 
-def selector_confidence_from_scores(scores: torch.Tensor) -> torch.Tensor:
-    """Return a conservative per-position selector certainty proxy in [0, 1].
+def selector_selected_path_confidence(
+    scores: torch.Tensor, path_indices: torch.Tensor
+) -> torch.Tensor:
+    """Return conditional probabilities for the selector path actually proposed.
 
-    ``scores`` is the selector lattice ``[batch, position, predecessor, token]``.
-    The first position has one valid predecessor (the verified anchor).  For later
-    positions we use the largest conditional next-token probability among possible
-    predecessor candidates.  This is intentionally a scheduling signal only; it
-    never participates in acceptance.
+    ``scores[b, j, p, c]`` describes candidate ``c`` at position ``j`` given
+    predecessor candidate ``p``. ``path_indices[b, j]`` identifies the candidate
+    selected by the selector walk. The returned factor is
+    ``P(path_j | anchor)`` for ``j=0`` and ``P(path_j | path_{j-1})`` afterward.
+    Prefix survival is then formed by ``plan_verify_prefixes`` with ``cumprod``.
+    The score uses the selector's native temperature rather than request sampling
+    temperature, so it remains a model-likelihood signal suitable for later STS.
     """
 
     if scores.ndim != 4:
         raise ValueError(f"expected selector scores [B, L, K, K], got {scores.shape}")
-    first = torch.softmax(scores[:, 0, 0].float(), dim=-1).amax(dim=-1)
-    if scores.shape[1] == 1:
-        return first.unsqueeze(1)
-    transitions = torch.softmax(scores[:, 1:].float(), dim=-1)
-    rest = transitions.amax(dim=-1).amax(dim=-1)
-    return torch.cat([first.unsqueeze(1), rest], dim=1)
+    batch, positions, predecessors, candidates = scores.shape
+    if predecessors != candidates:
+        raise ValueError(
+            "expected square selector lattice [B, L, K, K], got " f"{scores.shape}"
+        )
+    if path_indices.shape != (batch, positions):
+        raise ValueError(
+            "expected path_indices [B, L] matching selector scores, got "
+            f"{path_indices.shape} for scores {scores.shape}"
+        )
+    if path_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"path_indices must be int32 or int64, got {path_indices.dtype}"
+        )
+    if bool(((path_indices < 0) | (path_indices >= candidates)).any()):
+        raise ValueError("path_indices contains a candidate outside the selector top-k")
+
+    predecessor_indices = torch.cat(
+        (torch.zeros_like(path_indices[:, :1]), path_indices[:, :-1]), dim=1
+    )
+    selected_rows = scores.gather(
+        2,
+        predecessor_indices.to(torch.long)
+        .unsqueeze(-1)
+        .unsqueeze(-1)
+        .expand(-1, -1, 1, candidates),
+    ).squeeze(2)
+    return (
+        torch.softmax(selected_rows.float(), dim=-1)
+        .gather(-1, path_indices.to(torch.long).unsqueeze(-1))
+        .squeeze(-1)
+    )
 
 
 def select_sps_verify_token_budget(

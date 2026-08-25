@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections import Counter
+import time
+from collections import Counter, deque
 
 import torch
+
+from sglang.srt.environ import envs
 
 
 class DFlashConfidenceObserver:
@@ -21,6 +24,35 @@ class DFlashConfidenceObserver:
         self.deferred_requests = 0
         self.deferred_tokens = 0
         self.low_confidence_tokens = 0
+        self._sps_enabled = bool(envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get())
+        self._sps_records: deque[dict] = deque(maxlen=200_000)
+        self._step_started_at: float | None = None
+        self._forward_ct = 0
+        self._verify_num_draft_tokens: int | None = None
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+
+    def configure_sps(self, *, verify_num_draft_tokens: int) -> None:
+        self._verify_num_draft_tokens = int(verify_num_draft_tokens)
+
+    def begin_step(self) -> None:
+        """Start wall-clock timing for one uniform DFLASH2 decode step."""
+        if self._sps_enabled:
+            self._step_started_at = time.monotonic()
+
+    def finish_step(self, *, batch_size: int, verify_tokens: int) -> None:
+        if not self._sps_enabled or self._step_started_at is None:
+            return
+        elapsed_ms = (time.monotonic() - self._step_started_at) * 1_000.0
+        self._sps_records.append(
+            {
+                "forward_ct": self._forward_ct,
+                "num_running_reqs": int(batch_size),
+                "num_verify_tokens": int(verify_tokens),
+                "step_cpu_ms": elapsed_ms,
+            }
+        )
+        self._forward_ct += 1
+        self._step_started_at = None
 
     def observe(
         self,
@@ -55,8 +87,6 @@ class DFlashConfidenceObserver:
     def _quantile(self, q: float) -> float:
         if self._confidence_count == 0:
             return float("nan")
-        # Use the lower empirical rank. It is stable across Python versions
-        # (unlike banker's rounding) and makes percentile reporting conservative.
         rank = max(
             0, min(self._confidence_count - 1, int(q * (self._confidence_count - 1)))
         )
@@ -82,7 +112,12 @@ class DFlashConfidenceObserver:
             "deferred_requests": self.deferred_requests,
             "deferred_tokens": self.deferred_tokens,
             "low_confidence_tokens": self.low_confidence_tokens,
-            # This MVP discards non-verified suffixes rather than retaining a
-            # cross-round pending block, so there is no queue wait or starvation.
             "deferred_wait_ms": {"mean": 0.0, "max": 0.0},
+            "mode": "static" if self._sps_enabled else "confidence",
+            "verify_num_draft_tokens": self._verify_num_draft_tokens,
+            "components": ["core", "step_cpu_time"] if self._sps_enabled else [],
+            "simulate_acc_len": (
+                self._simulate_acc_len if self._simulate_acc_len > 0 else None
+            ),
+            "records": list(self._sps_records),
         }

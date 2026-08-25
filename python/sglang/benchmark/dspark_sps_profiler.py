@@ -31,11 +31,6 @@ def _load_module_by_path(name: str, path: Path):
 
 
 try:
-    from sglang.benchmark.one_batch_server import (
-        DEFAULT_TIMEOUT,
-        should_skip_due_to_max_running_requests,
-        should_skip_due_to_token_capacity,
-    )
     from sglang.benchmark.utils import get_tokenizer
     from sglang.srt.speculative.dspark_components.dspark_sps import (
         SpsAdditiveCostTable,
@@ -56,10 +51,9 @@ except ImportError as exc:
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
     load_sps_table_from_path = _table_module.load_sps_table_from_path
     profile_sps_table = _table_module.profile_sps_table
-    DEFAULT_TIMEOUT = 60
     get_tokenizer = None
-    should_skip_due_to_max_running_requests = None
-    should_skip_due_to_token_capacity = None
+
+DEFAULT_TIMEOUT = 60
 
 DEFAULT_OUT = "dspark_sps.json"
 DEFAULT_MAX_BATCH_SIZE = 256
@@ -105,6 +99,7 @@ class SpsRow(msgspec.Struct, frozen=True):
 # Server-side per-step record feed: the DsparkInfoDumper 'core' +
 # 'step_cpu_time' components exported on /server_info.
 INFO_RECORD_PAYLOAD_KEY = "dspark_info_record"
+DFLASH_INFO_RECORD_PAYLOAD_KEY = "dflash_confidence_info_record"
 INFO_RECORD_ENABLE_HINT = (
     "SGLANG_DSPARK_ENABLE_SPS_RECORD=1 (or SGLANG_DSPARK_DEBUG_DUMP="
     "core,step_cpu_time) and SGLANG_RAGGED_VERIFY_MODE=static"
@@ -418,12 +413,12 @@ def fetch_server_context(
     info = response.json()
 
     speculative_algorithm = info.get("speculative_algorithm")
-    if speculative_algorithm != "DSPARK":
+    if speculative_algorithm not in ("DSPARK", "DFLASH_CONFIDENCE"):
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DSpark or DFLASH_CONFIDENCE server: {base_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
-            "measured from real static-mode DSpark verify steps; relaunch with "
-            "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
+            "measured from real uniform static-mode verify steps; relaunch with "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
         )
     if info.get("disable_cuda_graph"):
         raise ValueError(
@@ -435,11 +430,16 @@ def fetch_server_context(
     internal_states = info.get("internal_states") or []
     if not internal_states:
         raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
-    sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
+    record_payload_key = (
+        DFLASH_INFO_RECORD_PAYLOAD_KEY
+        if speculative_algorithm == "DFLASH_CONFIDENCE"
+        else INFO_RECORD_PAYLOAD_KEY
+    )
+    sps_payloads = [state.get(record_payload_key) for state in internal_states]
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
             raise ValueError(
-                f"DP rank {rank_index} reports no {INFO_RECORD_PAYLOAD_KEY}; "
+                f"DP rank {rank_index} reports no {record_payload_key}; "
                 f"launch the server with {INFO_RECORD_ENABLE_HINT}."
             )
         if payload.get("mode") not in allowed_modes:
@@ -451,7 +451,7 @@ def fetch_server_context(
         missing = {"core", "step_cpu_time"} - set(components)
         if missing:
             raise ValueError(
-                f"DP rank {rank_index} {INFO_RECORD_PAYLOAD_KEY} is missing "
+                f"DP rank {rank_index} {record_payload_key} is missing "
                 f"component(s) {sorted(missing)}; launch with "
                 f"{INFO_RECORD_ENABLE_HINT}."
             )
@@ -494,6 +494,14 @@ def fetch_server_context(
             max_running_per_dp,
         )
         skip_max_running = float("inf")
+
+    if speculative_algorithm == "DFLASH_CONFIDENCE" and any(
+        payload.get("verify_num_draft_tokens") is None for payload in sps_payloads
+    ):
+        raise RuntimeError(
+            "DFLASH_CONFIDENCE SPS records omit verify_num_draft_tokens; "
+            "the worker must configure its static verify width before profiling."
+        )
 
     skip_token_capacity = 0.0
     for state in internal_states:
@@ -627,13 +635,10 @@ def run_one_round(
 ) -> Optional[RoundOutcome]:
     batch_size = batch_size_per_rank * context.dp_size
     max_new_tokens = round_max_new_tokens(settings=settings)
-    if should_skip_due_to_max_running_requests(
-        batch_size, context.skip_max_running_requests_threshold
-    ) or should_skip_due_to_token_capacity(
-        batch_size,
-        settings.input_len,
-        max_new_tokens,
-        context.skip_token_capacity_threshold,
+    if (
+        batch_size > context.skip_max_running_requests_threshold
+        or batch_size * (settings.input_len + max_new_tokens)
+        > context.skip_token_capacity_threshold
     ):
         return None
 
@@ -853,10 +858,16 @@ def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
 def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
-    internal_states = response.json().get("internal_states") or []
+    info = response.json()
+    record_payload_key = (
+        DFLASH_INFO_RECORD_PAYLOAD_KEY
+        if info.get("speculative_algorithm") == "DFLASH_CONFIDENCE"
+        else INFO_RECORD_PAYLOAD_KEY
+    )
+    internal_states = info.get("internal_states") or []
     rank_rows: list[list[SpsRow]] = []
     for state in internal_states:
-        payload = state.get(INFO_RECORD_PAYLOAD_KEY) or {}
+        payload = state.get(record_payload_key) or {}
         rows: list[SpsRow] = []
         for record in payload.get("records", []):
             step_cpu_ms = record.get("step_cpu_ms")
