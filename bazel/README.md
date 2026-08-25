@@ -23,8 +23,12 @@ bazel test --config=cpu //rust/sglang-mm:rlib_is_single_threaded_test
 # All currently hermetic foundation tests.
 bazel test --config=cpu //:bazel_smoke
 
-# Update the small checked Python bootstrap lock.
+# Compile the current native component set (Rust gRPC/MM and C++ n-gram core).
+bazel build --config=cpu //:bazel_components
+
+# Update checked Python locks.
 bazel run //bazel/python:srt_empty_bootstrap_requirements.update
+bazel run //bazel/python:hf_management_requirements.update
 
 # Smallest real Engine execution path. The current hardware CI image must
 # already contain SGLang's CUDA runtime wheels and Qwen3 config metadata.
@@ -38,13 +42,13 @@ bazel test --config=cuda //bazel/integration:dummy_model_e2e
 | Python profiles | `bazel/python/profiles.json` validates manifest/extra selection; each accelerator gets a separate future lock hub | `python/pyproject*.toml` |
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
-| Kernel JIT sources | `//python/sglang/kernels:jit_sources`; runtime compilation remains intentional | setuptools + Ninja/tvm-ffi |
+| Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_core` compiles the host C++ core; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
 | AOT CUDA/ROCm/CPU kernels | platform-constrained source and wrapper targets are the next native phase | scikit-build/CMake and platform setup scripts |
 | Main Rust extensions | one crate-universe closure from `rust/Cargo.lock`; `sglang-mm` is first | Cargo + setuptools-rust |
-| Rust gRPC | separate target over `//proto/sglang/runtime/v1`; generated API parity required before replacing `build.rs` | Cargo/tonic-build |
+| Rust gRPC | `//rust/sglang-grpc:sglang_grpc_core` runs the existing tonic build script with Bazel's declared protoc and proto input | Cargo/tonic-build |
 | Model gateway/router | separate crate universe and Python ABI because its Rust/PyO3/tonic versions differ | Cargo + maturin |
-| HF config/tokenizer/download | CPU/network-capable Python targets, separate from weight tensor loading | setuptools |
-| Weight loading/cache daemon | protocol and file I/O split from CUDA IPC daemon; daemon remains accelerator-constrained | setuptools |
+| HF config/tokenizer/download | `//python/sglang/srt/utils/hf_transformers:hub` and `//python/sglang/srt/utils:hf_transformers_patches` are torch-free; model config remains separate | setuptools |
+| Weight loading/cache daemon | `//python/sglang/srt/weight_cache:protocol` is torch-free; CUDA IPC transport and daemon remain accelerator-constrained | setuptools |
 | Model artifacts | runtime inputs except for a future pinned tiny smoke fixture | Hugging Face/runtime cache |
 
 `srt_empty` is represented as a profile, not as the CPU product. It selects
@@ -64,8 +68,10 @@ with the accelerator constraint.
 - Bzlmod, Bazel/Python/Rust/uv pins, module and language locks.
 - Explicit CPU/CUDA/ROCm/XPU/NPU/MUSA/MPS/HPU constraints.
 - CPU-safe packaging contract tests.
-- Leaf Python targets (`environ`, kernel metadata).
-- `sglang-mm` pure Rust library and test.
+- Leaf Python targets (`environ`, kernel metadata, HF Hub/compat, weight-cache
+  protocol).
+- `sglang-mm` pure Rust library/test and the gRPC PyO3 shared library.
+- A real C++ compile/link target for the host n-gram corpus core.
 - Additive CPU Bazel CI; no release changes.
 
 Acceptance: lockfiles are unchanged under `--lockfile_mode=error`, tests use no
