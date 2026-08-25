@@ -409,10 +409,11 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
-    # The CUDA C4/C128 kernels use BF16 APE values; keep the model parameter
-    # in FP32 but convert at the fused-kernel boundary.
-    if ape.dtype != torch.bfloat16:
-        ape = ape.to(dtype=torch.bfloat16)
+    # C4/C128 kernels use the same InputFloat type for APE and kv_score_input.
+    # Keep the model parameter in FP32 but convert it to the kernel input dtype
+    # at the fused-kernel boundary.
+    if ape.dtype != kv_score_input.dtype:
+        ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
