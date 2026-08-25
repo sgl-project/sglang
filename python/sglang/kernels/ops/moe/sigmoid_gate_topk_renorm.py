@@ -179,13 +179,16 @@ def sigmoid_gate_topk_renorm(
     A = k + n_shared_experts
     assert bias.numel() == N and bias.stride(-1) == 1, f"{bias.shape=} expected [{N}]"
 
-    # The production shape uses the specialized CUDA JIT kernel.
+    # The production shape uses the specialized CUDA JIT kernel. Both conjuncts are
+    # load-bearing: XPU satisfies `torch.version.hip is None`, and ROCm reports
+    # `.is_cuda` -- while the kernel needs `__reduce_max_sync`, which HIP lacks.
     if (
         k == 6
         and n_shared_experts == 2
         and G == 258
         and logits.stride(0) % 8 == 0
         and logits.data_ptr() % 32 == 0
+        and logits.is_cuda
         and torch.version.hip is None
         and envs.SGLANG_OPT_USE_GATE_TOPK_JIT.get()
     ):
