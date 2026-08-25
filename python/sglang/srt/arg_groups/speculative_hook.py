@@ -179,6 +179,41 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         )
 
 
+def _check_spec_pp(server_args: ServerArgs, algo_label: str) -> None:
+    """Gate speculative decoding + pipeline parallelism.
+
+    The draft model runs on PP rank 0 -- the only rank that holds this step's KV
+    slots -- while the auxiliary target hidden states are accumulated forward to
+    the last rank, so `pp_size > 1` needs an explicit opt-in. Overlap scheduling
+    is already force-disabled for PP by `_pipeline_parallel_overlap_disable`, so
+    it is only asserted here.
+    """
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if server_args.pp_size == 1:
+        return
+
+    if not server_args.enable_spec_pp:
+        raise ValueError(
+            f"Currently {algo_label} speculative decoding with pp_size > 1 requires "
+            "--enable-spec-pp (experimental)."
+        )
+
+    if not resolved_view(server_args).disable_overlap_schedule:
+        raise ValueError(
+            "--enable-spec-pp is not compatible with overlap scheduling "
+            "(pp is not compatible with overlap)."
+        )
+
+    # Phase 1 is centralized-only; PD disaggregation needs the per-microbatch
+    # spec state to be threaded through the two disagg event loops as well.
+    if server_args.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-spec-pp currently requires disaggregation_mode == 'null', "
+            f"got {server_args.disaggregation_mode!r}."
+        )
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -192,10 +227,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Currently DFLASH speculative decoding does not support dp attention."
         )
 
-    if server_args.pp_size != 1:
-        raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
-        )
+    _check_spec_pp(server_args, "DFLASH")
 
     if server_args.speculative_draft_model_path is None:
         raise ValueError(

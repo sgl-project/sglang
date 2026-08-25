@@ -61,6 +61,10 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        # Under --enable-spec-pp the output message also carries the projected
+        # target features that PP rank 0 writes into the draft KV cache, so a
+        # chunk whose output comm is skipped would leave a hole in that cache.
+        and batch.spec_algorithm.is_none()
     )
 
 
@@ -1037,6 +1041,10 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        if result.pp_spec_tensors:
+            # --enable-spec-pp: the accept result (and the projected target
+            # features rank 0 needs) ride the output edge.
+            tensor_dict.update(result.pp_spec_tensors)
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1172,27 +1180,127 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
-        )
+        spec_pp = getattr(self.model_worker, "pp_spec_enabled", False)
+        if not spec_pp:
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            # Spec-v2 carries them in next_draft_input instead.
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            next_token_ids=(
+                next_token_ids.to("cpu", non_blocking=True)
+                if spec_pp
+                else pp_outputs["next_token_ids"]
+            ),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        if spec_pp:
+            self._pp_prep_spec_result(
+                batch, pp_outputs, output_result, next_token_ids
+            )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
+
+    def _pp_prep_spec_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        pp_outputs: PPProxyTensors,
+        output_result: GenerationBatchResult,
+        next_token_ids: torch.Tensor,
+    ):
+        """Recover the accept result the last PP rank computed.
+
+        Every rank needs it: seq_lens and the next draft block are derived from
+        it, and the mamba verify states cannot be committed without it. Rank 0
+        additionally consumes `spec_ctx_hidden` and stops it from being relayed.
+        """
+        tensors = pp_outputs.tensors
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Prefill commits every prompt token, so the sampled token is the
+            # next block's anchor and seq_lens is already correct locally.
+            bonus_tokens, new_seq_lens, commit_lens = (
+                next_token_ids,
+                batch.seq_lens,
+                None,
+            )
+        else:
+            bonus_tokens = tensors["spec_bonus_tokens"]
+            new_seq_lens = tensors["spec_new_seq_lens"]
+            commit_lens = tensors["spec_commit_lens"]
+            dbg_pool = tensors.get("spec_dbg_out_req_pool_indices")
+            if dbg_pool is not None and (
+                dbg_pool.shape != batch.req_pool_indices.shape
+                or not torch.equal(
+                    dbg_pool.to(batch.req_pool_indices.dtype), batch.req_pool_indices
+                )
+            ):
+                logger.error(
+                    "[spec-pp] accept result paired with the wrong microbatch: "
+                    "message=%s batch=%s",
+                    dbg_pool.flatten()[:32].tolist(),
+                    batch.req_pool_indices.flatten()[:32].tolist(),
+                )
+            output_result.accept_lens = commit_lens.to("cpu", non_blocking=True)
+            output_result.speculative_num_draft_tokens = (
+                self.model_worker.speculative_num_draft_tokens
+            )
+
+        output_result.new_seq_lens = new_seq_lens
+        output_result.next_draft_input = self.model_worker.pp_rebuild_next_draft_input(
+            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
+        )
+        output_result.pp_spec_commit_lens = commit_lens
+
+        ctx_hidden = tensors.pop("spec_ctx_hidden", None)
+        if self.pp_group.is_first_rank:
+            output_result.pp_spec_ctx_hidden = ctx_hidden
+
+    def _pp_apply_spec_state(
+        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+    ):
+        """Land the accept result on this rank before the output is processed.
+
+        This mirrors what the non-PP spec path does inline in `run_batch`; under
+        PP those values do not exist locally until the message comes around.
+        """
+        launch_event = getattr(batch, "pp_spec_launch_event", None)
+        if launch_event is not None:
+            # The commits below read state this rank's own verify forward wrote
+            # on forward_stream.
+            self.device_module.current_stream().wait_event(launch_event)
+            batch.pp_spec_launch_event = None
+
+        if output_result.next_draft_input is not None:
+            batch.spec_info = output_result.next_draft_input
+        new_seq_lens = output_result.new_seq_lens
+        if new_seq_lens is not None:
+            batch.seq_lens = new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None  # rebuilt next iter from the draft block
+
+        commit_lens = output_result.pp_spec_commit_lens
+        if commit_lens is not None:
+            self.model_worker.pp_commit_mamba_after_verify(batch, commit_lens)
+        ctx_hidden = output_result.pp_spec_ctx_hidden
+        if ctx_hidden is not None:
+            self.model_worker.pp_write_draft_kv(batch, ctx_hidden, commit_lens)
+            output_result.pp_spec_ctx_hidden = None
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if getattr(self.model_worker, "pp_spec_enabled", False):
+            self._pp_apply_spec_state(batch, output_result)
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
@@ -1327,6 +1435,10 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                # --enable-spec-pp defers the mamba commit / draft-KV write to
+                # the rank that receives the accept result; it has to wait on
+                # this forward first.
+                cur_batch.pp_spec_launch_event = event
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

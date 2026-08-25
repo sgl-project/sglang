@@ -2308,6 +2308,16 @@ class ServerArgs:
         "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
         NS("spec"),
     ] = False
+    enable_spec_pp: A[
+        bool,
+        "EXPERIMENTAL. Allow speculative decoding with pipeline parallelism (pp_size > 1). "
+        "The draft model runs on PP rank 0 and samples through a replica of the target "
+        "lm_head; auxiliary target hidden states are accumulated forward along the PP "
+        "chain, and the last rank ships them back projected. Requires "
+        "--disable-overlap-schedule and centralized serving "
+        "(disaggregation_mode == 'null'). Currently DFLASH only.",
+        NS("spec"),
+    ] = False
     enable_multi_layer_eagle: A[
         bool,
         Arg(
@@ -9834,9 +9844,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            assert self.speculative_algorithm is None or self.enable_spec_pp, (
+                "Pipeline parallelism with speculative decoding requires "
+                "--enable-spec-pp (experimental)"
+            )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

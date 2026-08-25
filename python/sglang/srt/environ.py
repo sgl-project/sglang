@@ -1020,6 +1020,9 @@ class Envs:
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
+    # --enable-spec-pp: assert every PP rank's scheduler and allocator agree with
+    # rank 0 about req_pool_indices / seq_lens. Forces a per-step sync.
+    SGLANG_SPEC_PP_DEBUG_CHECK = EnvBool(False)
 
     # ===================================================================
     # Cache directories

@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import msgspec
 import torch
@@ -92,6 +92,17 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # Extra tensors the spec worker wants carried on the PP output message
+    # (see --enable-spec-pp). Keys are already `spec_`-prefixed; the scheduler
+    # merges them into the output dict and hands them back on the far side.
+    pp_spec_tensors: Optional[Dict[str, torch.Tensor]] = None
+
+    # Incoming side of the same channel, unpacked by _pp_prep_spec_result:
+    # the device-side accept length (every rank) and the projected target
+    # features destined for the draft KV cache (PP rank 0 only).
+    pp_spec_commit_lens: Optional[torch.Tensor] = None
+    pp_spec_ctx_hidden: Optional[torch.Tensor] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec

@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
     mamba_track_grid,
@@ -76,6 +77,10 @@ _is_npu = is_npu()
 
 
 logger = logging.getLogger(__name__)
+
+# Cross-rank scheduler-agreement assertions for --enable-spec-pp. Forces a sync,
+# so it is opt-in.
+_PP_DEBUG_CHECK = envs.SGLANG_SPEC_PP_DEBUG_CHECK.get()
 
 _FusedKVMaterializeHelper = None
 
@@ -405,6 +410,91 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
+        # --- Pipeline parallelism (see --enable-spec-pp).
+        #
+        # The draft runs on PP rank 0. That is forced by ordering, not by
+        # preference: the draft block's KV slots come from *this* step's
+        # allocation, and only the rank that is about to launch the step has
+        # them. Rank 0 also owns `embed_tokens`, which the noise embedding
+        # needs.
+        #
+        # What rank 0 lacks is `lm_head` (last rank) and the auxiliary target
+        # hidden states (complete only on the last rank). So:
+        #   - `lm_head` is replicated onto rank 0 once, at init;
+        #   - the last rank projects the aux hidden through the draft's
+        #     `fc`/`hidden_norm` (5x narrower than the packed capture) and ships
+        #     `spec_ctx_hidden` back over the existing last->0 output edge;
+        #     rank 0 writes it into the draft KV cache when it arrives.
+        self._pp_enabled = int(getattr(ps, "pp_size", 1)) > 1
+        self._pp_lm_head_replica = None
+        self._pp_group = None
+        self._pp_is_first = True
+        self._pp_is_last = True
+        if self._pp_enabled:
+            from sglang.srt.distributed import get_pp_group
+
+            self._pp_group = get_pp_group()
+            self._pp_is_first = self._pp_group.is_first_rank
+            self._pp_is_last = self._pp_group.is_last_rank
+            self._pp_lm_head_replica = self._build_pp_lm_head_replica()
+
+    def _build_pp_lm_head_replica(self):
+        """Replicate the target `lm_head` onto PP rank 0 for the draft's sampling.
+
+        Sent last->first over the PP group instead of re-read from the
+        checkpoint: the PP group pairs ranks that share a tp_rank, so rank 0
+        receives exactly the vocab shard its own TP rank would have loaded.
+        Middle ranks do not participate and pay nothing.
+
+        This runs before `alloc_memory_pool`, so the extra weight is already
+        accounted for when the KV pool is profiled (and PP min-reduces the
+        resulting token capacity across ranks).
+        """
+        pp_group = self._pp_group
+        target_model = self.model_runner.model
+        device_group = pp_group.device_group
+        first_global, last_global = pp_group.ranks[0], pp_group.ranks[-1]
+
+        if pp_group.is_last_rank:
+            head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            weight = getattr(head, "weight", None)
+            if weight is None:
+                raise RuntimeError(
+                    "--enable-spec-pp needs a dense target lm_head weight to "
+                    "replicate onto PP rank 0."
+                )
+            torch.distributed.send(
+                weight.data.contiguous(), dst=first_global, group=device_group
+            )
+            return None
+
+        if not pp_group.is_first_rank:
+            return None
+
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        text_config = self.model_runner.model_config.hf_text_config
+        replica = ParallelLMHead(
+            int(text_config.vocab_size),
+            int(text_config.hidden_size),
+            quant_config=None,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            prefix="pp_spec_lm_head",
+        ).to(device=self.device, dtype=self.model_runner.dtype)
+        torch.distributed.recv(replica.weight.data, src=last_global, group=device_group)
+        return replica
+
+    def _draft_lm_head(self):
+        """The head the draft samples through.
+
+        Under PP the draft runs on rank 0, which owns no `lm_head`; use the
+        replica built at init instead of the model's `PPMissingLayer`.
+        """
+        if self._pp_lm_head_replica is not None:
+            return self._pp_lm_head_replica
+        target_model = self._target_worker.model_runner.model
+        return unwrap_lora_layer(getattr(target_model, "lm_head", None))
+
     @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
@@ -453,6 +543,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
+        if self._pp_enabled and not self._pp_is_first:
+            # Only PP rank 0 ever runs the draft model.
+            capture_decode_cuda_graph = False
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -483,8 +576,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
-        target_model = self._target_worker.model_runner.model
-        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        lm_head = self._draft_lm_head()
         if lm_head is None:
             return _eager("no target lm_head")
 
@@ -1287,12 +1379,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        pre_projected: bool = False,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+
+        `pre_projected` says `target_hidden` already went through
+        `project_target_hidden`. Under PP the last rank projects before shipping
+        the features to rank 0, which shrinks the wire payload from the packed
+        capture width down to a single hidden_size.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1363,7 +1461,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            ctx_hidden = (
+                target_hidden
+                if pre_projected
+                else self.draft_model.project_target_hidden(target_hidden)
+            )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1651,8 +1753,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
+
+        if self._pp_enabled:
+            return self._pp_forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                on_publish=on_publish,
+                grammar_barrier=grammar_barrier,
+            )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
@@ -2166,3 +2277,733 @@ class DFlashWorkerV2(BaseSpecWorker):
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )
+
+    # ------------------------------------------------------------------
+    # Pipeline parallelism (--enable-spec-pp)
+    # ------------------------------------------------------------------
+    # Per-microbatch message layout:
+    #
+    #   proxy edge (0 -> 1 -> ... -> last), next to hidden_states/residual:
+    #     spec_draft_token       [bs, block_size]      int64
+    #
+    #   output edge (last -> 0 -> 1 -> ... ), next to next_token_ids:
+    #     spec_commit_lens       [bs]                  int32
+    #     spec_new_seq_lens      [bs]                  int64
+    #     spec_bonus_tokens      [bs]                  int64
+    #     spec_ctx_hidden        [num_tokens, hidden]  popped by rank 0
+    #
+    # Only `draft_token` travels: it is the one thing a rank cannot derive on its
+    # own. Positions and KV slots are recomputed per rank from that rank's own
+    # req_to_token -- see `_pp_block_layout` for why taking rank 0's copy is
+    # actively wrong.
+    #
+    # Everything that crosses a step boundary is cloned: the draft block
+    # scratch buffers are shared by every microbatch in flight and the sends
+    # are not ordered against the next microbatch's writes.
+    _PP_PROXY_SPEC_KEYS = ("spec_draft_token",)
+    # Present only when the selector drafted under temperature > 0, or under
+    # SGLANG_SPEC_PP_DEBUG_CHECK.
+    _PP_PROXY_SPEC_OPTIONAL_KEYS = (
+        "spec_selector_candidates",
+        "spec_selector_q",
+        "spec_dbg_req_pool_indices",
+        "spec_dbg_seq_lens",
+        "spec_dbg_verify_cache_loc",
+    )
+
+    def _pp_forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        *,
+        pp_proxy_tensors=None,
+        on_publish=None,
+        grammar_barrier=None,
+    ) -> GenerationBatchResult:
+        if batch.has_grammar:
+            raise NotImplementedError(
+                "--enable-spec-pp does not support grammar-constrained decoding yet."
+            )
+        if batch.forward_mode.is_idle():
+            raise NotImplementedError(
+                "--enable-spec-pp does not support idle batches (DP attention) yet."
+            )
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self._pp_forward_prefill(batch, pp_proxy_tensors, on_publish)
+        return self._pp_forward_verify(batch, pp_proxy_tensors, on_publish)
+
+    def _pp_relay_proxy_spec_keys(self, result, incoming) -> None:
+        """Keep the spec keys travelling forward past a middle rank.
+
+        The target model rebuilds its proxy dict from scratch, so anything the
+        spec step added has to be re-attached on the way out.
+        """
+        proxy = result.pp_hidden_states_proxy_tensors
+        if proxy is None or incoming is None:
+            return
+        for key in self._PP_PROXY_SPEC_KEYS:
+            proxy.tensors.setdefault(key, incoming[key])
+        for key in self._PP_PROXY_SPEC_OPTIONAL_KEYS:
+            if key in incoming.tensors:
+                proxy.tensors.setdefault(key, incoming[key])
+
+    def _pp_forward_prefill(
+        self, batch: ScheduleBatch, pp_proxy_tensors, on_publish
+    ) -> GenerationBatchResult:
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DFLASH expected extend_lens / prefix_lens to be populated in extend "
+                "mode, but got None."
+            )
+        if batch.out_cache_loc is None:
+            raise RuntimeError("DFLASH prefill expected out_cache_loc, but got None.")
+
+        if self._pp_is_first:
+            # Rank 0 performs the draft-KV write once the last rank ships the
+            # projected features back, so it is the only rank that needs the
+            # slot/position layout of this prefill.
+            device = self.device
+            ctx_lens = torch.tensor(
+                batch.extend_lens, dtype=torch.int32, device=device
+            )
+            draft_prefix_lens = torch.tensor(
+                batch.prefix_lens, dtype=torch.int32, device=device
+            )
+            positions, _ = compute_position(
+                self.model_runner.prefill_attention_backend_str,
+                draft_prefix_lens,
+                ctx_lens,
+                int(sum(batch.extend_lens)),
+            )
+            batch.pp_spec_ctx_positions = positions
+            batch.pp_spec_ctx_cache_loc = batch.out_cache_loc
+            batch.pp_spec_ctx_cache_loc_2d = None
+
+        batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        if not self._pp_is_last:
+            return batch_output
+
+        logits_output, next_token_ids = (
+            batch_output.logits_output,
+            batch_output.next_token_ids,
+        )
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "DFLASH requires target aux hidden capture for prefill, but got None. "
+                "Make sure the target model has DFlash layers-to-capture configured."
+            )
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(
+                logits_output.hidden_states
+            )
+        # Never leaves the GPU; the D2H in copy_to_cpu only handles small tensors.
+        logits_output.hidden_states = None
+
+        batch_output.pp_spec_tensors = {"spec_ctx_hidden": ctx_hidden}
+        batch_output.next_draft_input = self._make_next_draft_input_prefill(
+            bonus_tokens=next_token_ids,
+            seq_lens=batch.seq_lens,
+        )
+        return batch_output
+
+    def _pp_block_layout(self, batch: ScheduleBatch, bs: int):
+        """This step's verify-block positions and KV slots, computed locally.
+
+        Every rank derives these from its *own* req_to_token: the slots are the
+        ones this rank's allocator handed out, and its attention reads the same
+        table back. Taking rank 0's numbers over the wire instead would make a
+        rank write its KV at slots its own mapping does not point at, which
+        silently cross-contaminates requests.
+
+        Unlike the non-PP path these are freshly allocated rather than carved out
+        of the worker's scratch buffers: up to `pp_loop_size` microbatches are in
+        flight at once, and their tensors outlive the launch that produced them
+        (the accept result lands one PP iteration later), so a shared buffer
+        would hand a later microbatch's rows to an earlier one.
+        """
+        block_size = int(self.block_size)
+        prefix_lens = batch.seq_lens
+        positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
+        verify_out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + block_size,
+            batch_size=bs,
+            draft_token_num=block_size,
+            device=self.device,
+        )
+        return positions_2d, verify_out_cache_loc.view(bs, block_size)
+
+    def _pp_draft_block(
+        self,
+        batch: ScheduleBatch,
+        draft_input,
+        bs: int,
+        positions_2d: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+    ):
+        """Rank-0-only: run the draft over the block laid out by `_pp_block_layout`.
+
+        Returns `draft_tokens [bs, block_size]`.
+        """
+        block_size = int(self.block_size)
+        # Only for the scratch consumed inside this launch (compact rebuild).
+        self._ensure_draft_block_buffers(bs)
+        lm_head = self._draft_lm_head()
+        if lm_head is None or not (
+            hasattr(lm_head, "weight")
+            or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
+        ):
+            raise RuntimeError(
+                "DFLASH under PP requires the replicated target `lm_head` to expose "
+                "either `weight` or a `quant_method` that can produce logits."
+            )
+        embed_module = unwrap_lora_layer(
+            self._target_worker.model_runner.model.get_input_embeddings()
+        )
+
+        block_ids = torch.full(
+            (bs, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=self.device,
+        )
+        prefix_lens = batch.seq_lens
+        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
+        block_ids[:, 0].copy_(draft_input.bonus_tokens)
+
+        noise_embedding = embed_module(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
+        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        positions = positions_2d.reshape(-1)
+
+        seq_lens_cpu = torch.empty((bs,), dtype=torch.int32, device="cpu")
+        if self.use_compact_draft_cache:
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            self._fill_compact_seq_lens_cpu_bound(
+                batch_seq_lens_cpu=batch.seq_lens_cpu,
+                nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
+                draft_prefix_lens=draft_prefix_lens,
+                out=seq_lens_cpu,
+            )
+            self._rebuild_compact_draft_cache(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                draft_prefix_lens=draft_prefix_lens,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                bs=bs,
+                block_size=block_size,
+            )
+            draft_seq_lens = draft_prefix_lens
+            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+        else:
+            draft_seq_lens = prefix_lens
+            if batch.seq_lens_cpu is not None:
+                seq_lens_cpu.copy_(batch.seq_lens_cpu)
+                seq_lens_cpu.add_(block_size)
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+            else:
+                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
+                draft_seq_lens_sum = int(prefix_lens.sum().item())
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=block_ids.flatten(),
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=draft_seq_lens,
+            out_cache_loc=verify_out_cache_loc,
+            seq_lens_sum=draft_seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=positions,
+            input_embeds=input_embeds,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            spec_info=self._draft_block_spec_info,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+        if self.selector is not None:
+            self._selector_sample = None
+            if self._draft_sampler is not None:
+                self._draft_sampler.stage_sampling_params(
+                    bs=bs, sampling_info=batch.sampling_info
+                )
+
+        with torch.inference_mode():
+            draft_out = self.draft_model_runner.forward(forward_batch)
+        draft_logits_output = draft_out.logits_output
+
+        if self._draft_sampler is not None and draft_out.can_run_graph:
+            draft_next = self._draft_sampler.out[: bs * (block_size - 1)].view(
+                bs, block_size - 1
+            )
+            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
+        elif self.selector is not None:
+            draft_next = self._propose_selector_block(
+                draft_logits_output=draft_logits_output,
+                bs=bs,
+                lm_head=lm_head,
+                anchor_token_ids=block_ids[:, 0],
+                sampling_info=batch.sampling_info,
+            )
+        else:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, block_size, -1)
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, block_size - 1)
+
+        draft_tokens = torch.empty(
+            (bs, block_size), dtype=torch.long, device=self.device
+        )
+        draft_tokens[:, 0].copy_(block_ids[:, 0])
+        draft_tokens[:, 1:].copy_(draft_next)
+        return draft_tokens
+
+    def _pp_debug_check_alignment(
+        self, batch, pp_proxy_tensors, prefix_lens, verify_out_cache_loc_2d
+    ) -> None:
+        """Assert this rank's scheduler agrees with PP rank 0 about the batch.
+
+        Every rank runs its own copy of the scheduler and allocator, so the whole
+        design rests on them staying bit-identical. If they drift, each rank
+        attends to a different request's KV and the outputs cross-contaminate --
+        which reads as a model bug, not a scheduling bug. Gated behind
+        SGLANG_SPEC_PP_DEBUG_CHECK because the comparisons force a sync.
+        """
+        tensors = pp_proxy_tensors.tensors
+        for name, mine, key in (
+            ("req_pool_indices", batch.req_pool_indices, "spec_dbg_req_pool_indices"),
+            ("seq_lens", prefix_lens, "spec_dbg_seq_lens"),
+            (
+                "verify_cache_loc",
+                verify_out_cache_loc_2d,
+                "spec_dbg_verify_cache_loc",
+            ),
+        ):
+            expected = tensors.get(key)
+            if expected is None:
+                continue
+            if mine.shape != expected.shape or not torch.equal(
+                mine, expected.to(mine.dtype)
+            ):
+                logger.error(
+                    "[spec-pp] %s diverged from PP0: mine=%s pp0=%s",
+                    name,
+                    mine.flatten()[:32].tolist(),
+                    expected.flatten()[:32].tolist(),
+                )
+
+    def _pp_snapshot_mamba_state_indices(self, bs: int) -> Optional[torch.Tensor]:
+        """Pin this microbatch's mamba slot ids for the deferred verify commit.
+
+        `forward_metadata` is transient: by the time the accept result reaches a
+        non-last rank, it already describes a later microbatch.
+        """
+        if not self._need_mamba_verify_commit:
+            return None
+        backend = getattr(
+            self.target_worker.model_runner.attn_backend, "linear_attn_backend", None
+        )
+        indices = getattr(
+            getattr(backend, "forward_metadata", None), "mamba_cache_indices", None
+        )
+        return None if indices is None else indices[:bs].clone()
+
+    def _pp_forward_verify(
+        self, batch: ScheduleBatch, pp_proxy_tensors, on_publish
+    ) -> GenerationBatchResult:
+        block_size = int(self.block_size)
+        if batch.spec_info is None:
+            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInputV2):
+            raise RuntimeError(
+                "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
+            )
+
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+        bs = len(batch.seq_lens)
+        prefix_lens = batch.seq_lens
+
+        # Both are derived from state every rank owns a copy of, so each rank
+        # computes them itself; only `draft_token` has to travel.
+        positions_2d, verify_out_cache_loc_2d = self._pp_block_layout(batch, bs)
+        positions = positions_2d.reshape(-1)
+        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+
+        if self._pp_is_first:
+            draft_tokens = self._pp_draft_block(
+                batch, draft_input, bs, positions_2d, verify_out_cache_loc_2d
+            )
+        else:
+            draft_tokens = pp_proxy_tensors["spec_draft_token"].view(bs, block_size)
+            if _PP_DEBUG_CHECK:
+                self._pp_debug_check_alignment(
+                    batch, pp_proxy_tensors, prefix_lens, verify_out_cache_loc_2d
+                )
+
+        verify_input = DFlashVerifyInput(
+            draft_token=draft_tokens.reshape(-1),
+            positions=positions,
+            draft_token_num=block_size,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        batch.out_cache_loc = verify_out_cache_loc
+        sampling_info = batch.sampling_info
+
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+        )
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        if seq_lens_cpu_backup is not None:
+            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            batch.seq_lens_cpu = verify_host_seq_lens
+            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
+            batch, self.target_worker
+        )
+        batch.seq_lens_cpu = seq_lens_cpu_backup
+        batch.seq_lens_sum = seq_lens_sum_backup
+
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        # Post-verify work that needs the accept result: only the last rank has
+        # it, so every rank finishes the step later, when the output message
+        # comes around. Clone anything living in a shared scratch buffer.
+        batch.pp_spec_ctx_cache_loc = verify_out_cache_loc.clone()
+        batch.pp_spec_ctx_cache_loc_2d = verify_out_cache_loc_2d.clone()
+        batch.pp_spec_ctx_positions = positions.clone()
+        batch.pp_spec_seq_lens_pre_verify = seq_lens_pre_verify
+        batch.pp_spec_mamba_state_indices = self._pp_snapshot_mamba_state_indices(bs)
+        batch.pp_spec_req_pool_indices = batch.req_pool_indices.clone()
+        # `prepare_for_verify` rebuilt `batch.mamba_track_indices` *inside* the
+        # scheduler's forward isolation, which restores the field on the way out
+        # -- so the deferred commit cannot read it off the batch and needs its
+        # own copy. Losing it silently skips interval tracking, which leaves
+        # tracked mamba pages holding stale state for the next prefix hit.
+        batch.pp_spec_mamba_track_indices = (
+            None
+            if batch.mamba_track_indices is None
+            else batch.mamba_track_indices.clone()
+        )
+
+        if not self._pp_is_last:
+            proxy = target_out.pp_hidden_states_proxy_tensors
+            if self._pp_is_first:
+                proxy.tensors["spec_draft_token"] = draft_tokens.clone()
+                if self._selector_sample is not None:
+                    candidates, q_rows = self._selector_sample
+                    proxy.tensors["spec_selector_candidates"] = candidates.clone()
+                    proxy.tensors["spec_selector_q"] = q_rows.clone()
+                if _PP_DEBUG_CHECK:
+                    proxy.tensors["spec_dbg_req_pool_indices"] = (
+                        batch.req_pool_indices.clone()
+                    )
+                    proxy.tensors["spec_dbg_seq_lens"] = prefix_lens.clone()
+                    proxy.tensors["spec_dbg_verify_cache_loc"] = (
+                        batch.pp_spec_ctx_cache_loc_2d
+                    )
+            else:
+                self._pp_relay_proxy_spec_keys(target_out, pp_proxy_tensors)
+            return target_out
+
+        return self._pp_verify_accept(
+            batch=batch,
+            target_out=target_out,
+            draft_tokens=draft_tokens,
+            draft_input=draft_input,
+            sampling_info=sampling_info,
+            pp_proxy_tensors=pp_proxy_tensors,
+            prefix_lens=prefix_lens,
+            bs=bs,
+            on_publish=on_publish,
+        )
+    def _pp_verify_accept(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_out: GenerationBatchResult,
+        draft_tokens: torch.Tensor,
+        draft_input,
+        sampling_info,
+        pp_proxy_tensors,
+        prefix_lens: torch.Tensor,
+        bs: int,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Last-rank tail of a PP verify step: accept, then publish the result.
+
+        The mamba commit and the draft-KV write are deliberately *not* done here.
+        They are deferred to the point where the accept result has reached the
+        rank that owns the state -- which for the last rank is the same round
+        trip every other rank waits for, so all ranks run one code path.
+        """
+        block_size = int(self.block_size)
+        logits_output = target_out.logits_output
+        candidates = draft_tokens
+
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=block_size,
+            )
+
+        if (
+            self.selector is not None
+            and not _is_all_greedy(sampling_info)
+            and not self._pp_is_first
+        ):
+            if "spec_selector_candidates" not in pp_proxy_tensors.tensors:
+                raise RuntimeError(
+                    "--enable-spec-pp: the selector's sampling state did not reach "
+                    "the last rank; the draft rank must forward "
+                    "spec_selector_candidates / spec_selector_q."
+                )
+            self._selector_sample = (
+                pp_proxy_tensors["spec_selector_candidates"],
+                pp_proxy_tensors["spec_selector_q"],
+            )
+        if self._selector_sample is not None:
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif (
+            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        else:
+            # The Triton accept/bonus fast path writes into a rotating scratch
+            # buffer; under PP those tensors have to outlive the step, so stay
+            # on the allocating path here.
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, block_size
+            )
+            accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch,
+                logits_output,
+                out_tokens.reshape(-1),
+                chain_stride=block_size,
+            )
+
+        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError(
+                "DFLASH verify requires target hidden states, but got None."
+            )
+        # Project here rather than on the consuming rank: `fc` narrows the packed
+        # multi-layer capture down to one hidden_size, which is what keeps the
+        # extra last->0 message the same order as the proxy edge itself.
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(
+                hidden.view(-1, hidden.shape[-1])
+            )
+        logits_output.hidden_states = None
+
+        commit_lens = commit_lens.clone()
+        out_tokens = out_tokens.reshape(-1).clone()
+        bonus = bonus.clone()
+        new_seq_lens = new_seq_lens.clone()
+
+        target_out.next_token_ids = out_tokens
+        target_out.accept_lens = commit_lens
+        target_out.new_seq_lens = new_seq_lens
+        target_out.speculative_num_draft_tokens = block_size
+        target_out.next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
+        )
+        target_out.pp_spec_tensors = {
+            "spec_commit_lens": commit_lens,
+            "spec_new_seq_lens": new_seq_lens,
+            "spec_bonus_tokens": bonus,
+            "spec_ctx_hidden": ctx_hidden,
+        }
+        if _PP_DEBUG_CHECK:
+            # Which microbatch this accept result describes. The ring pairs the
+            # output message with a batch by position, so a desync silently
+            # applies one microbatch's accept result to another's requests.
+            target_out.pp_spec_tensors["spec_dbg_out_req_pool_indices"] = (
+                batch.req_pool_indices.clone()
+            )
+        return target_out
+    # --- Deferred post-verify work. The scheduler drives these once the accept
+    # --- result has come around the ring to this rank.
+
+    @property
+    def pp_spec_enabled(self) -> bool:
+        """True when this worker is running the --enable-spec-pp code path."""
+        return self._pp_enabled
+
+    def pp_rebuild_next_draft_input(
+        self, *, bonus_tokens: torch.Tensor, new_seq_lens: torch.Tensor
+    ) -> DFlashDraftInputV2:
+        """Rebuild the next step's draft state on a rank that never ran accept."""
+        return make_draft_input_v2(
+            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
+        )
+
+    def pp_commit_mamba_after_verify(
+        self, batch: ScheduleBatch, commit_lens: torch.Tensor
+    ) -> None:
+        """Commit this microbatch's mamba verify states on the local rank.
+
+        Must run after `batch.seq_lens` has been advanced to the post-accept
+        lengths: the tracking window is derived from them.
+        """
+        if not self._need_mamba_verify_commit:
+            return
+        state_indices = getattr(batch, "pp_spec_mamba_state_indices", None)
+        seq_lens_pre_verify = getattr(batch, "pp_spec_seq_lens_pre_verify", None)
+        if state_indices is None or seq_lens_pre_verify is None:
+            return
+        # Snapshot, not batch.mamba_track_indices: forward isolation reverted the
+        # field after the verify rebuilt it.
+        mamba_track_indices = getattr(batch, "pp_spec_mamba_track_indices", None)
+
+        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        # No interval-track scatter here, matching the non-PP call site: it
+        # reaches the commit with `batch.seq_lens` still at the pre-verify prefix
+        # (`prepare_for_verify` leaves it alone), so its `to_track_mask` compares
+        # a length against itself and every row comes out masked. Tracking the
+        # post-accept lengths instead would write track pages the TP path never
+        # writes, which shows up later as a prefix hit restoring a state from an
+        # offset nothing else agrees on.
+        mamba_track_indices = None
+        mamba_steps_to_track = None
+
+        model_runner = self.target_worker.model_runner
+        # The verify forward keyed its per-step scratch on req_pool_indices (see
+        # the spec-pp branch in the GDN backend), so the scatter has to walk that
+        # same row space: row r holds request r's snapshots, and rows no request
+        # in this microbatch owns are masked off with step -1. The scratch is
+        # allocated with one extra padding row (`spec_state_size + 1`), which is
+        # where padded/idle rows land, so size the walk to match.
+        pool_size = int(model_runner.req_to_token_pool.size) + 1
+        rows = batch.pp_spec_req_pool_indices.to(torch.int64).clamp(
+            min=0, max=pool_size - 1
+        )
+        scatter_state_indices = torch.zeros(
+            pool_size, dtype=state_indices.dtype, device=state_indices.device
+        )
+        scatter_state_indices[rows] = state_indices
+        scatter_steps = torch.full(
+            (pool_size,), -1, dtype=torch.int64, device=state_indices.device
+        )
+        scatter_steps[rows] = last_correct_step_indices
+        if mamba_track_indices is not None:
+            scatter_track_indices = torch.zeros(
+                pool_size,
+                dtype=mamba_track_indices.dtype,
+                device=mamba_track_indices.device,
+            )
+            scatter_track_indices[rows] = mamba_track_indices
+            scatter_track_steps = torch.full(
+                (pool_size,), -1, dtype=torch.int64, device=state_indices.device
+            )
+            scatter_track_steps[rows] = mamba_steps_to_track
+            mamba_track_indices = scatter_track_indices
+            mamba_steps_to_track = scatter_track_steps
+
+        model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=scatter_steps,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=model_runner.model,
+            state_indices_tensor=scatter_state_indices,
+        )
+        batch.pp_spec_mamba_state_indices = None
+        batch.pp_spec_seq_lens_pre_verify = None
+        batch.pp_spec_mamba_track_indices = None
+        batch.pp_spec_req_pool_indices = None
+
+    def pp_write_draft_kv(
+        self,
+        batch: ScheduleBatch,
+        ctx_hidden: torch.Tensor,
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        """Rank-0-only: land the projected target features in the draft KV cache.
+
+        `commit_lens` is None for prefill (every prompt token is committed) and
+        the per-request accept length for a verify step.
+        """
+        cache_loc = getattr(batch, "pp_spec_ctx_cache_loc", None)
+        positions = getattr(batch, "pp_spec_ctx_positions", None)
+        if cache_loc is None or positions is None:
+            raise RuntimeError(
+                "--enable-spec-pp: PP rank 0 received spec_ctx_hidden without the "
+                "matching draft-KV slot layout."
+            )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=ctx_hidden,
+            cache_loc=cache_loc,
+            cache_loc_2d=getattr(batch, "pp_spec_ctx_cache_loc_2d", None),
+            positions=positions,
+            commit_lens=commit_lens,
+            pre_projected=True,
+        )
+        batch.pp_spec_ctx_cache_loc = None
+        batch.pp_spec_ctx_cache_loc_2d = None
+        batch.pp_spec_ctx_positions = None
