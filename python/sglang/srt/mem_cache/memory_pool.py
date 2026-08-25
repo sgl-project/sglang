@@ -281,6 +281,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -329,6 +330,11 @@ class ReqToTokenPool:
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
+        # Per-row, so beam member rows release their aux entries too: they reach
+        # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
+        if self._aux_cache is not None:
+            for index in indices:
+                self._aux_cache.free(index)
         self.free_slots.extend(indices)
 
     def free(self, req: Req):
@@ -339,6 +345,33 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        if self._aux_cache is not None:
+            self._aux_cache.clear()
+
+    def attach_aux_cache(self, aux_cache: Any) -> None:
+        assert self._aux_cache is None
+        self._aux_cache = aux_cache
+
+    def reset_aux_cache_allocator(self) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.reset_allocator()
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        if self._aux_cache is None:
+            return physical_capacity
+        return self._aux_cache.dense_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.alloc_to_lengths(
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                target_seq_lens_cpu=target_seq_lens_cpu,
+            )
 
 
 class MambaPool:
@@ -1637,6 +1670,9 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
+    # state lives on the request pool instead, and the caller has to move it.
+    cpu_copy_carries_mamba: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3662,6 +3698,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
+
+    cpu_copy_carries_mamba = True
 
     def __init__(
         self,

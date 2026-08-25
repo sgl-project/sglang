@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.arg_groups.overrides import declare_resolution
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,8 +28,12 @@ def handle_moe_runner_backend_alias(server_args: ServerArgs) -> None:
             "--moe-a2a-backend %s.",
             server_args.moe_a2a_backend,
         )
-    server_args.moe_runner_backend = "auto"
-    server_args.moe_a2a_backend = "megamoe"
+    declare_resolution(
+        server_args,
+        "handle_moe_runner_backend_alias",
+        moe_runner_backend="auto",
+        moe_a2a_backend="megamoe",
+    )
 
 
 def handle_w4a4_mxfp4_megamoe_env(server_args: ServerArgs) -> None:

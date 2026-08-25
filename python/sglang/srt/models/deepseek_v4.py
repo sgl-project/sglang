@@ -138,7 +138,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    try_fused_hc_post_pre,
+    apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -168,7 +169,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -182,22 +182,38 @@ class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
     mhc_fused_post_pre: Optional[Callable[..., Any]]
     npu_hc_pre: Optional[Callable[..., Any]]
+    mhc_pre: Optional[Callable[..., Any]]
+    mhc_post: Optional[Callable[..., Any]]
+    fused_hc_head: Optional[Callable[..., Any]]
 
 
 @functools.cache
 def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
 
-    Model modules are imported eagerly by the registry.  Importing
+    Model modules are imported eagerly by the registry. Importing
     ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
     Import it only when a DeepSeek-V4 layer executes so registry discovery
     cannot initialize an optional CUDA runtime before unrelated models set up
-    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    their communication workspaces. DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn
+        from sgl_kernel import (
+            fused_hc_head,
+            hc_post,
+            hc_split_sinkhorn,
+            mhc_fused_post_pre,
+            mhc_pre,
+        )
 
-        return MhcOps(hc_split_sinkhorn, None, None)
+        return MhcOps(
+            hc_split_sinkhorn=hc_split_sinkhorn,
+            mhc_fused_post_pre=mhc_fused_post_pre,
+            npu_hc_pre=None,
+            mhc_pre=mhc_pre,
+            mhc_post=hc_post,
+            fused_hc_head=fused_hc_head,
+        )
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -205,7 +221,14 @@ def _get_mhc_ops() -> MhcOps:
         npu_hc_pre,
     )
 
-    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+    return MhcOps(
+        hc_split_sinkhorn=hc_split_sinkhorn,
+        mhc_fused_post_pre=mhc_fused_post_pre,
+        npu_hc_pre=npu_hc_pre,
+        mhc_pre=None,
+        mhc_post=None,
+        fused_hc_head=None,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -219,15 +242,11 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 ]
 
 
-def _is_fused_mhc_post_pre_enabled() -> bool:
-    # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
-    # not read that flag and dispatches independently for both small and large
-    # token batches, so the standalone pre flag must not veto the fused opt-in.
-    return (
-        envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
-    )
+def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
+    if _is_xpu:
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+
+    return False
 
 
 # FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
@@ -1792,7 +1811,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = (
+            is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
+        )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -1867,6 +1888,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, self.hc_mult), dtype=torch.float32, device=x.device
             )
             return y, post, comb, False
+
+        if _is_xpu:
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
+
+            post, comb, y = _get_mhc_ops().mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            return y, post, comb, norm is not None
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             y, post, comb = _flashinfer_hc_pre(
@@ -1973,6 +2014,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
+        if _is_xpu:
+            return _get_mhc_ops().mhc_post(x, residual, post, comb)
+
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post
 
@@ -2022,7 +2066,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
+            input_norm_weight = (
+                self._input_layernorm_weight_bf16
+                if self._input_layernorm_weight_bf16 is not None
+                else self.input_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -2030,19 +2079,63 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                self.hc_mult,
                 self.rms_norm_eps,
-                self.hc_eps,
                 self.hc_eps,
                 _MHC_POST_MULT_VALUE,
                 self.hc_sinkhorn_iters,
-                norm_weight=(
-                    self._input_layernorm_weight_bf16
-                    if self._input_layernorm_weight_bf16 is not None
-                    else self.input_layernorm.weight.data
-                ),
-                norm_eps=self.input_layernorm.variance_epsilon,
+                input_norm_weight,
+                self.input_layernorm.variance_epsilon,
+                fn_transpose=False,
             )
-            x_quant = None
+            if fused is not None:
+                residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre returns the layer input WITHOUT
+                    # the input layernorm applied (norm_fused=False). Apply it
+                    # (fp8-quant on aiter gfx95) before attention, exactly as the
+                    # unfused hc_pre path below does; otherwise unnormalized
+                    # activations reach self_attn.
+                    if _use_aiter and _is_gfx95_supported:
+                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.rms_norm_eps,
+                        )
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
+                        x_quant = None
+                else:
+                    x_quant = None
+            else:
+                # Fused dispatch declined: close the previous layer's deferred
+                # mHC post (prev_residual/prev_post/prev_comb) before opening this
+                # layer's pre. Skipping hc_post here would drop the previous-layer
+                # post state and corrupt all subsequent layers.
+                hidden_states = self.hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
+                residual = hidden_states
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
+                if not norm_fused:
+                    if _use_aiter and _is_gfx95_supported:
+                        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.rms_norm_eps,
+                        )
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
+                        x_quant = None
+                else:
+                    x_quant = None
         else:
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2075,12 +2168,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if use_fused:
-            fused_mhc = try_fused_hc_post_pre(
+            post_attn_norm_weight = (
+                self._post_attention_layernorm_weight_bf16
+                if self._post_attention_layernorm_weight_bf16 is not None
+                else self.post_attention_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 residual,
                 post,
                 comb,
-                self.hc_ffn_fn.T,
+                self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
                 self.hc_mult,
@@ -2088,32 +2186,30 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 _MHC_POST_MULT_VALUE,
                 self.hc_sinkhorn_iters,
-                _is_gfx95_supported,
+                post_attn_norm_weight,
+                self.post_attention_layernorm.variance_epsilon,
+                fn_transpose=True,
             )
-            if fused_mhc is not None:
-                residual, hidden_states, post, comb, norm_fused = fused_mhc
+            if fused is not None:
+                residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
             else:
-                residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
+                residual = hidden_states
+                hidden_states, post, comb, norm_fused = self.hc_pre(
                     hidden_states,
-                    residual,
-                    post.unsqueeze(-1) if post.ndim == 2 else post,
-                    comb,
                     self.hc_ffn_fn,
                     self.hc_ffn_scale,
                     self.hc_ffn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    _MHC_POST_MULT_VALUE,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=(
-                        self._post_attention_layernorm_weight_bf16
-                        if self._post_attention_layernorm_weight_bf16 is not None
-                        else self.post_attention_layernorm.weight.data
-                    ),
-                    norm_eps=self.post_attention_layernorm.variance_epsilon,
+                    norm=self.post_attention_layernorm,
+                    forward_batch=forward_batch,
                 )
-                norm_fused = True
+                if not norm_fused:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states
@@ -2352,11 +2448,63 @@ class DeepseekV4DecoderLayer(nn.Module):
     def op_mhc_post_attn_pre_mlp(self, state):
         # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
         # post-attention layernorm. Produces the 2D MoE input.
+        #
+        # Pop each boundary tensor from the state EXACTLY ONCE, up front, and
+        # reuse the locals for both the fused attempt and the non-fused
+        # fallback. apply_mhc_post_pre_boundary() returns None when it declines
+        # to fuse -- most importantly for the 0-token DP two-batch-overlap idle
+        # ubatch -- in which case control must fall through to the unfused
+        # hc_post. Popping in the fused call's arguments and again in the
+        # fallback would double-pop -> KeyError: 'hidden_states_after_attn' on
+        # every idle DP rank. use_fused_mhc_post_pre is on whenever the aiter
+        # gfx95 mHC path is available (is_cross_layer_mhc_fusion_enabled), so
+        # this fallback is reached under DP regardless of the TileLang env.
+        hidden_states_after_attn = state.pop("hidden_states_after_attn")
+        attn_residual = state.pop("attn_residual")
+        attn_post = state.pop("attn_post")
+        attn_comb = state.pop("attn_comb")
+
+        if self.use_fused_mhc_post_pre:
+            post_attn_norm_weight = (
+                self._post_attention_layernorm_weight_bf16
+                if self._post_attention_layernorm_weight_bf16 is not None
+                else self.post_attention_layernorm.weight.data
+            )
+            fused = apply_mhc_post_pre_boundary(
+                hidden_states_after_attn,
+                attn_residual,
+                attn_post,
+                attn_comb,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.hc_mult,
+                self.rms_norm_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
+                post_attn_norm_weight,
+                self.post_attention_layernorm.variance_epsilon,
+                fn_transpose=True,
+            )
+            if fused is not None:
+                ffn_residual, hidden_states, post, comb, norm_fused = fused
+                if not norm_fused:
+                    # The Triton fused post+pre skips the post-attention
+                    # layernorm (norm_fused=False); apply it before the MoE,
+                    # matching the unfused hc_pre path below.
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                state.ffn_residual = ffn_residual
+                state.ffn_post = post
+                state.ffn_comb = comb
+                state.hidden_states_mlp_input = hidden_states
+                return
+
         hidden_states = self.hc_post(
-            state.pop("hidden_states_after_attn"),
-            state.pop("attn_residual"),
-            state.pop("attn_post"),
-            state.pop("attn_comb"),
+            hidden_states_after_attn,
+            attn_residual,
+            attn_post,
+            attn_comb,
         )
         ffn_residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2630,7 +2778,7 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
@@ -2647,6 +2795,15 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_xpu:
+                return _get_mhc_ops().fused_hc_head(
+                    x.contiguous(),
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_eps=self.norm_eps,
+                    hc_eps=self.hc_eps,
+                )
             from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
@@ -3341,7 +3498,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
@@ -3415,7 +3572,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not _FP8_WO_A_GEMM:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
