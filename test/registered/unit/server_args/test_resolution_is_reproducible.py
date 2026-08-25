@@ -689,13 +689,14 @@ class TestForksResolveFirst(CustomTestCase):
                 continue
             try:
                 source = path.read_text(encoding="utf-8-sig")
+                if "Process" not in source:
+                    continue
                 tree = ast.parse(source)
             except (SyntaxError, UnicodeDecodeError):
                 continue
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                body = ast.get_source_segment(source, node) or ""
                 forks = [
                     call
                     for call in ast.walk(node)
@@ -714,6 +715,7 @@ class TestForksResolveFirst(CustomTestCase):
                 ]
                 if not forks:
                     continue
+                body = ast.get_source_segment(source, node) or ""
                 examined += 1
                 # `spawn` starts a fresh interpreter, so the child may probe.
                 if 'get_context("spawn")' in body or "'spawn'" in body:
@@ -939,7 +941,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "_run_resolution_pipeline" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             # The full (class, function, ...) scope chain, so the assertion can
@@ -988,7 +993,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "resolve_once" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
