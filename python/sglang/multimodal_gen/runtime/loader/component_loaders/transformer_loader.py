@@ -101,7 +101,14 @@ def _server_args_for_transformer_component(
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
     component_quantization = server_args.component_quantizations.get(component_name)
-    if component_weights_path is not None or component_quantization is not None:
+    component_ignored_layers = server_args.component_quantization_ignored_layers.get(
+        component_name
+    )
+    if (
+        component_weights_path is not None
+        or component_quantization is not None
+        or component_ignored_layers is not None
+    ):
         component_server_args = copy.copy(server_args)
         if component_weights_path is not None:
             component_server_args.transformer_weights_path = component_weights_path
@@ -118,6 +125,8 @@ def _server_args_for_transformer_component(
                 component_quantization,
                 component_name,
             )
+        if component_ignored_layers is not None:
+            component_server_args.quantization_ignored_layers = component_ignored_layers
         return component_server_args
 
     if component_name not in ("transformer_2", "unconditional_transformer"):
