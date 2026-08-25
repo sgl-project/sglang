@@ -7,7 +7,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from sglang.kernels.ops.kvcache.dcp_pack import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.runtime_context import get_schedule
 

@@ -2,14 +2,14 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.kvcache.dcp_pack import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-class TestDcpPackCopy(CustomTestCase):
+class TestPdDcpGather(CustomTestCase):
     def test_rejects_pointer_geometry_mismatch(self):
         with self.assertRaisesRegex(ValueError, "length mismatch"):
             copy_mla_rows_into_pack(
