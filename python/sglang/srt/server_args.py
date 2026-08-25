@@ -7431,7 +7431,8 @@ class ServerArgs:
             )
 
     def _validate_flashinfer_megamoe_model(self):
-        architectures = self.get_model_config().hf_config.architectures or []
+        model_config = self.get_model_config()
+        architectures = model_config.hf_config.architectures or []
         if not any(
             architecture in FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES
             for architecture in architectures
@@ -7440,6 +7441,20 @@ class ServerArgs:
                 "FlashInfer MegaMOE is not validated for model architectures "
                 f"{architectures}. Supported architectures: "
                 f"{sorted(FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES)}."
+            )
+
+        quantization = resolved_view(self).quantization
+        supports_megamoe_quantization = (
+            quantization in ("mxfp8", "modelopt_fp4")
+            or model_config.is_fp4_experts
+            or model_config.nvfp4_moe_meta is not None
+        )
+        if not supports_megamoe_quantization:
+            raise ValueError(
+                "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
+                "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
+                f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
+                "are not supported."
             )
 
     def _handle_a2a_moe(self):
@@ -7487,15 +7502,10 @@ class ServerArgs:
             assert (
                 self.moe_runner_backend == "flashinfer_megamoe"
             ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
-            if self.quantization == "modelopt_fp4":
-                assert is_sm100_supported(), (
-                    "FlashInfer MegaMOE NVFP4 requires Blackwell (sm_100+) "
-                    "CUDA devices."
-                )
-            if self.quantization == "mxfp8":
-                assert is_sm100_supported(), (
-                    "FlashInfer MegaMOE MXFP8 requires Blackwell (sm_100+) "
-                    "CUDA devices."
+            if not is_sm100_supported():
+                raise ValueError(
+                    "FlashInfer MegaMOE currently requires an SM100-family "
+                    "CUDA device for all supported quantization formats."
                 )
             logger.info(
                 f"FlashInfer MegaMOE is enabled. The expert parallel size is "

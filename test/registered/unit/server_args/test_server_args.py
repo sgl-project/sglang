@@ -1224,10 +1224,17 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
                 self._ikr_backup
             )
 
-    def _make_args(self, architecture="DeepseekV4ForCausalLM"):
+    def _make_args(
+        self,
+        architecture="DeepseekV4ForCausalLM",
+        quantization="modelopt_fp4",
+        *,
+        is_fp4_experts=False,
+        nvfp4_moe_meta=None,
+    ):
         server_args = ServerArgs(
             model_path="dummy",
-            quantization="modelopt_fp4",
+            quantization=quantization,
             moe_a2a_backend="flashinfer_megamoe",
             moe_runner_backend="flashinfer_megamoe",
             enable_dp_attention=True,
@@ -1237,7 +1244,8 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         server_args.get_model_config = MagicMock(
             return_value=SimpleNamespace(
                 hf_config=SimpleNamespace(architectures=[architecture]),
-                nvfp4_moe_meta=None,
+                is_fp4_experts=is_fp4_experts,
+                nvfp4_moe_meta=nvfp4_moe_meta,
             )
         )
         return server_args
@@ -1265,6 +1273,27 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "not validated for model architectures.*UnsupportedMoeForCausalLM",
         ):
             self._make_args("UnsupportedMoeForCausalLM")._handle_a2a_moe()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_supported_quantization_formats(self, _):
+        supported = (
+            {"quantization": "modelopt_fp4"},
+            {"quantization": "mxfp8"},
+            {"quantization": "fp8", "is_fp4_experts": True},
+            {"quantization": "modelopt_mixed", "nvfp4_moe_meta": {}},
+        )
+        for config in supported:
+            with self.subTest(config=config):
+                self._make_args(**config)._handle_a2a_moe()
+
+    def test_megamoe_rejects_standard_fp8(self):
+        with self.assertRaisesRegex(ValueError, "Standard FP8 MoE checkpoints"):
+            self._make_args(quantization="fp8")._handle_a2a_moe()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
+        with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
+            self._make_args(quantization="fp8", is_fp4_experts=True)._handle_a2a_moe()
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
