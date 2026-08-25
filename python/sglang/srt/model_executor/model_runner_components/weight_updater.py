@@ -335,6 +335,40 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+    def _update_bucketed_weights_from_distributed(
+        self: WeightUpdater, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (
+                        name,
+                        torch.empty(shape, dtype=target_dtype, device=self.device),
+                    )
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.get_model().load_weights(reconstructed_tensors)
+            return True, f"Succeeded to update parameter online."
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
