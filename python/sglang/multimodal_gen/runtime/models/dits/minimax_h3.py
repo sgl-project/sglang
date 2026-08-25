@@ -350,6 +350,96 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
+def _reorder_grouped_qkv_to_ulysses_qkv(
+    weight: torch.Tensor,
+    *,
+    num_query_groups: int,
+    head_dim: int,
+    tp_size: int,
+    ulysses_size: int,
+    ulysses_rank: int,
+) -> torch.Tensor:
+    """Select one Ulysses head shard while retaining logical TP ordering."""
+    if (
+        tp_size <= 0
+        or ulysses_size <= 0
+        or not 0 <= ulysses_rank < ulysses_size
+        or num_query_groups % (tp_size * ulysses_size)
+    ):
+        raise ValueError("invalid TP/Ulysses QKV weight partition")
+    expected_rows = num_query_groups * 3 * head_dim
+    if weight.shape[0] != expected_rows:
+        raise ValueError(
+            f"grouped QKV weight has {weight.shape[0]} rows, expected {expected_rows}"
+        )
+
+    rest_shape = weight.shape[1:]
+    groups_per_tp = num_query_groups // tp_size
+    groups_per_ulysses = groups_per_tp // ulysses_size
+    grouped = weight.view(num_query_groups, 3, head_dim, *rest_shape)
+    selected = torch.cat(
+        [
+            grouped.narrow(
+                0,
+                tp_rank * groups_per_tp + ulysses_rank * groups_per_ulysses,
+                groups_per_ulysses,
+            )
+            for tp_rank in range(tp_size)
+        ],
+        dim=0,
+    )
+    return torch.cat(
+        [selected[:, index].reshape(-1, *rest_shape) for index in range(3)],
+        dim=0,
+    )
+
+
+def _copy_grouped_qkv_tp_ulysses_shard(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    num_query_groups: int,
+    head_dim: int,
+    tp_rank: int,
+    tp_size: int,
+    ulysses_rank: int,
+    ulysses_size: int,
+) -> bool:
+    """Copy the dense checkpoint rows owned by one TP x Ulysses rank."""
+    if (
+        tp_size <= 0
+        or ulysses_size <= 0
+        or not 0 <= tp_rank < tp_size
+        or not 0 <= ulysses_rank < ulysses_size
+        or num_query_groups % (tp_size * ulysses_size)
+        or getattr(param, "output_dim", None) != 0
+        or getattr(param, "is_sharded_weight", False)
+        or getattr(param, "packed_dim", None) is not None
+        or param.dtype != _BF16_DTYPE
+        or loaded_weight.dtype != _BF16_DTYPE
+        or not param.is_contiguous()
+        or not loaded_weight.is_contiguous()
+    ):
+        return False
+
+    expected_rows = num_query_groups * 3 * head_dim
+    local_groups = num_query_groups // (tp_size * ulysses_size)
+    rest_shape = loaded_weight.shape[1:]
+    if loaded_weight.shape[0] != expected_rows or tuple(param.shape) != (
+        3 * local_groups * head_dim,
+        *rest_shape,
+    ):
+        return False
+
+    grouped = loaded_weight.view(num_query_groups, 3, head_dim, *rest_shape)
+    group_start = (tp_rank * ulysses_size + ulysses_rank) * local_groups
+    grouped = grouped.narrow(0, group_start, local_groups)
+    target = param.data.view(3, local_groups, head_dim, *rest_shape)
+    for index in range(3):
+        target[index].copy_(grouped[:, index])
+    return True
+
+
 def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
