@@ -1322,6 +1322,21 @@ class PrefillAdder:
     ) -> int:
         if self.memory_budget.prices_by_demand:
             return self._get_dllm_remain_tokens_by_demand(req, reuses_kv=reuses_kv)
+        if reuses_kv:
+            # A retained-KV reuse row allocates zero fresh tokens (and zero
+            # fresh SWA window), so neither rem_total_tokens (upfront
+            # max_new_tokens accounting) nor cur_rem_tokens (real pool
+            # headroom) applies — only the dLLM concurrency budget does.
+            # Branching here also keeps the grant monotone in the budgets:
+            # routing reuse rows through the paths below refused them at a
+            # small-positive rem_total_tokens (sub-block rounds to 0) yet
+            # admitted them at a negative one.
+            return (
+                self.dllm_block_size
+                if self.rem_dllm_tokens >= self.dllm_block_size
+                else 0
+            )
+
         separate_ctx = self.dllm_config.requires_separate_context_encoding
         _rem_tokens = min(self.rem_dllm_tokens, int(self.rem_total_tokens))
         if not (separate_ctx and req is not None and req.is_dllm_prefill()):
@@ -1340,18 +1355,18 @@ class PrefillAdder:
                 # larger nor a ragged row.
                 #
                 # But only override rem_total_tokens, not real pool exhaustion:
-                # a row that needs fresh KV must fit the full admission charge
-                # (`_update_prefill_budget` debits ceil_paged(extend) + one
-                # per_req_token_overhead of allocation rounding) in
-                # cur_rem_tokens, or `alloc_for_extend` fails loudly
-                # downstream. Rows reusing retained FDFO KV (reuses_kv)
-                # allocate zero fresh tokens, so gating them would strand
-                # their retained blocks.
+                # the row must fit the full admission charge in cur_rem_tokens,
+                # or `alloc_for_extend` fails loudly downstream. The staging
+                # admission's `_update_prefill_budget` debits current_offset by
+                # ceil_paged(extend) + page_size + (per_req_token_overhead -
+                # logical_page_size), with no request-slot reserve and no
+                # state-slot cost on a budget that does not price demands, so
+                # the charge is exactly the two terms below.
                 block_charge = (
                     self.ceil_paged_tokens(self.dllm_block_size)
                     + self.per_req_token_overhead
                 )
-                pool_fits = reuses_kv or int(self.cur_rem_tokens) >= block_charge
+                pool_fits = int(self.cur_rem_tokens) >= block_charge
                 _rem_tokens = (
                     self.dllm_block_size
                     if pool_fits and self.rem_dllm_tokens >= self.dllm_block_size
@@ -1364,10 +1379,10 @@ class PrefillAdder:
             # charge, while a small positive budget is genuine and a full
             # block would overshoot it. The min above caps at block_size, so
             # this yields exactly one block or nothing. No cur_rem_tokens gate
-            # here: the memory_budget's total_offset accrues everything its
-            # current_offset does plus max_new_tokens and the running-batch
-            # reservation (both >= 0), so cur_rem_tokens >= rem_total_tokens > 0
-            # on this path.
+            # here: a budget that does not price demands accrues in
+            # total_offset everything current_offset takes plus max_new_tokens
+            # and the running-batch reservation (both >= 0), so
+            # cur_rem_tokens >= rem_total_tokens > 0 on this path.
             _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
         if separate_ctx:
@@ -1489,8 +1504,9 @@ class PrefillAdder:
         assert self.dllm_config is not None
         # A retained incomplete block runs on the rows it holds: the extend
         # allocation reuses them (mem_cache/allocation.py `reuse_kv`, whose
-        # predicate this mirrors), so its grant needs no fresh rows. Only a
-        # budget pricing demands also charges it none.
+        # predicate this mirrors exactly: a row with incomplete ids but a freed
+        # req slot re-allocates a full fresh block), so its grant needs no fresh
+        # rows. Only a budget pricing demands also charges it none.
         reuses_kv = req.kv.holds_kv and bool(req.dllm_incomplete_ids)
         if (
             self.memory_budget.prices_by_demand
