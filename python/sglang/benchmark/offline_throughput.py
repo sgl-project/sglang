@@ -398,7 +398,7 @@ def _create_ray_engine_backend(server_args: ServerArgs):
             placement_group=pg,
             placement_group_bundle_index=0,
         ),
-    ).remote(**dataclasses.asdict(server_args))
+    ).remote(**dict(server_args._raw_input))
 
     class _Proxy:
         """Forwards method calls to the remote RayEngine actor."""
@@ -432,15 +432,18 @@ def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
+    # A programmatic caller may hand over a freshly constructed record, and
+    # the backends below read the resolved paths and the raw snapshot.
+    server_args.resolve_once()
     if bench_args.backend == "engine":
         if server_args.use_ray:
             backend = _create_ray_engine_backend(server_args)
         else:
-            backend = Engine(**dataclasses.asdict(server_args))
+            backend = Engine(server_args=server_args)
         if not backend:
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
-        backend = Runtime(**dataclasses.asdict(server_args))
+        backend = Runtime(**dict(server_args._raw_input))
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
 
@@ -569,6 +572,7 @@ def cli_main():
                 raise e
 
     server_args = ServerArgs.from_cli_args(args)
+    server_args.resolve_once()
     bench_args = BenchArgs.from_cli_args(args)
 
     logging.basicConfig(

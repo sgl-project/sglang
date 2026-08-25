@@ -51,7 +51,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -514,7 +518,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -845,7 +848,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            if model_runner.server_args.enable_lora:
+            if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
@@ -919,11 +922,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
-        if model_runner.server_args.enable_lora:
+        # Init lora information (None on a draft runner: it is unadapted)
+        if model_runner.lora_manager is not None:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
-            if not model_runner.server_args.enable_lora_overlap_loading:
+            if not get_lora().enable_lora_overlap_loading:
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
@@ -1321,7 +1324,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # graph; larger prefills fall back to eager and keep the
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
-        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
@@ -1535,9 +1538,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=1,
             )
 
-        # TODO: check if we need to pad other tensors
+        # Draft-extend padding uses the fixed per-request token width.
+        dummy_extend_len = 0
+        if (
+            self.spec_info is not None
+            and self.forward_mode.is_draft_extend_v2()
+            and self.spec_info.num_tokens_per_req > 0
+        ):
+            dummy_extend_len = self.spec_info.num_tokens_per_req
+
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, value=dummy_extend_len
+            )
+        if self.extend_prefix_lens is not None:
+            self.extend_prefix_lens = self._pad_tensor_to_size(
+                self.extend_prefix_lens, bs
+            )
+        if self.extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu.extend(
+                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            )
+        if self.extend_prefix_lens_cpu is not None:
+            self.extend_prefix_lens_cpu.extend(
+                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            )
+        if self.extend_logprob_start_lens_cpu is not None:
+            self.extend_logprob_start_lens_cpu.extend(
+                [0] * (bs - len(self.extend_logprob_start_lens_cpu))
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)

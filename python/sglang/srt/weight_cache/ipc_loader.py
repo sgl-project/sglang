@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
+"""IPC Model Loader — loads model weights from a Weight Cache Daemon.
 
-Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Only 1x GPU
-memory needed — engine and daemon share the same physical GPU memory via CUDA IPC.
-Engine depends on daemon staying alive.
+Zero-copy mode: param.data points directly to transport-mapped GPU memory.
+Backends are negotiated per daemon response (torch IPC by default, VMM FD when
+available). Engine depends on daemon staying alive.
 """
 
 import logging
@@ -22,7 +22,6 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
-from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
@@ -33,6 +32,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
+from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,7 @@ class IpcModelLoader(BaseModelLoader):
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
 
     def load_model(
         self,
@@ -119,7 +120,8 @@ class IpcModelLoader(BaseModelLoader):
 
         entries = cache_data["entries"]
         logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} IPC handles from daemon "
+            f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+            f"(transport={self._transport_backend.name}) "
             f"in {time.perf_counter() - tic:.2f}s"
         )
 
@@ -337,7 +339,7 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
-            imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+            imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
 
             if name in existing_names:
@@ -416,6 +418,9 @@ class IpcModelLoader(BaseModelLoader):
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
+        # Keep transport backend alive for the model lifetime (VMM backend owns
+        # VA mappings that must stay mapped while tensors are in use).
+        model._weight_cache_transport_backend = self._transport_backend
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -473,7 +478,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_parallel
+            from sglang.srt.runtime_context import get_exec, get_parallel
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -483,8 +488,11 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
+            moe_dp_size = ps.moe_dp_size
+            moe_dp_rank = ps.moe_dp_rank
+            moe_ep_rank = ps.moe_ep_rank
 
-            dp_size = get_parallel().dp_size
+            dp_size = ps.dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
@@ -501,6 +509,14 @@ class IpcModelLoader(BaseModelLoader):
                 pp_rank=pp_rank,
                 dp_size=dp_size,
                 ep_size=ep_size,
+                moe_dp_size=moe_dp_size,
+                moe_dp_rank=moe_dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                enable_dp_attention=ps.enable_dp_attention,
+                enable_dp_lm_head=ps.enable_dp_lm_head,
+                attn_cp_size=ps.attn_cp_size,
+                moe_dense_tp_size=ps.moe_dense_tp_size,
+                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
@@ -529,6 +545,9 @@ class IpcModelLoader(BaseModelLoader):
                     f"  Daemon config: {daemon_config}"
                 )
 
+            backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
+            self._transport_backend = get_client_transport_backend(backend_name)
+            result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result
 
         except RuntimeError:

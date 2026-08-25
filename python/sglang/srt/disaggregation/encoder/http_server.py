@@ -206,8 +206,6 @@ def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
 
     configure_logger(server_args, prefix=" encode_server")
-    # Publish before the launch path reads configuration; each encoder built
-    # below re-projects the same object in its process.
     publish(server_args, role="encoder")
     if get_parallel().dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
