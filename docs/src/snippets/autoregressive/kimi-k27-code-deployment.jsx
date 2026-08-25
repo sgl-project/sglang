@@ -14,6 +14,17 @@ export const KimiK27CodeDeployment = () => {
         { id: 'mi355x', label: 'MI355X', default: false },
       ],
     },
+    quantization: {
+      name: 'quantization',
+      title: 'Quantization',
+      getDynamicItems: (values) => {
+        const isMXFP4 = ['mi350x', 'mi355x'].includes(values.hardware);
+        return [
+          { id: 'int4', label: 'INT4', subtitle: 'Base checkpoint', default: !isMXFP4 },
+          { id: 'mxfp4', label: 'MXFP4', subtitle: 'AMD FP4', default: isMXFP4, disabled: !isMXFP4, disabledReason: !isMXFP4 ? 'MXFP4 only on AMD MI350X/MI355X' : '' },
+        ];
+      },
+    },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
@@ -112,11 +123,12 @@ export const KimiK27CodeDeployment = () => {
   };
 
   const generateCommand = () => {
-    const { hardware, reasoning, toolcall, dpattention } = values;
+    const { hardware, quantization, reasoning, toolcall, dpattention } = values;
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
+    const isMXFP4 = quantization === 'mxfp4';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
-    const modelName = 'moonshotai/Kimi-K2.7-Code';
+    const modelName = isMXFP4 ? 'moonshotai/Kimi-K2.7-Code-MXFP4' : 'moonshotai/Kimi-K2.7-Code';
 
     let cmd = '';
 
@@ -128,7 +140,7 @@ export const KimiK27CodeDeployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
     if (isAMD) {
-      cmd += ' \\\n  --mem-fraction-static 0.8';
+      cmd += isMXFP4 ? ' \\\n  --mem-fraction-static 0.765' : ' \\\n  --mem-fraction-static 0.8';
     }
     cmd += ' \\\n  --trust-remote-code';
 
