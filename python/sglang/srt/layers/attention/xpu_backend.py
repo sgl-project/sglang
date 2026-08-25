@@ -110,6 +110,21 @@ class XPUAttentionBackend(AttentionBackend):
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        if self.is_encoder_decoder:
+            from sglang.srt.model_executor.cuda_graph_config import (
+                cuda_graph_fully_disabled,
+            )
+
+            # Encoder-decoder cross-/self-attention below uses a dynamic-shape
+            # varlen KV gather (page_size=1 semantics) that cannot be captured.
+            # XPU disables CUDA graph by default, so this holds; the guard fails
+            # loudly if a future XPU graph path is force-enabled instead of
+            # silently mis-indexing through the paged graph-metadata path.
+            assert cuda_graph_fully_disabled(), (
+                "Encoder-decoder models (e.g. Whisper) on the intel_xpu attention "
+                "backend require CUDA graph disabled (off by default on XPU); the "
+                "graph decode path cannot run the varlen KV gather."
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -363,26 +378,30 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
-            assert (
-                forward_batch.encoder_lens.numel() == 1
-            ), "Only encoder size 1 is supported for now"
-
             metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
+            # Token-slot indices (page_size=1 semantics), capped per request by
+            # encoder_lens_int32; consumed by the varlen gather in forward_*.
             metadata.encoder_page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # Currently only support forward_batch.encoder_lens.numel() == 1
+            # Decoder self-attn KV: per-request token-granular slice starting at
+            # each request's own encoder offset encoder_lens[i], not a single max.
+            text_max = metadata.max_seq_len_k
+            arange_text = torch.arange(
+                text_max, device=forward_batch.req_pool_indices.device
+            )
+            text_col = forward_batch.encoder_lens.long().unsqueeze(
+                1
+            ) + arange_text.unsqueeze(0)
+            text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
+                text_row, text_col
             ]
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
@@ -417,8 +436,10 @@ class XPUAttentionBackend(AttentionBackend):
                     workspace_size, device=self.device, dtype=torch.uint8
                 )
 
-        # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+        # Convert the page table to a strided format which is needed by FA3 API.
+        # Encoder-decoder page_table holds token-slot indices for the varlen
+        # kernel (page_size=1 semantics), so it must not be page-strided.
+        if self.page_size > 1 and forward_batch.encoder_lens is None:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -574,6 +595,16 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                o = self._forward_encoder_decoder_mha(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    layer=layer,
+                    metadata=metadata,
+                    decode=False,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
@@ -767,6 +798,97 @@ class XPUAttentionBackend(AttentionBackend):
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
 
+    def _forward_encoder_decoder_mha(
+        self, *, q, key_cache, value_cache, layer, metadata, decode
+    ):
+        """Encoder-decoder MHA on XPU via the non-paged varlen kernel.
+
+        Whisper/Mllama/MossVL store encoder KV token-granularly in req_to_token
+        (page_size=1 semantics), but the intel_xpu backend forces page_size 64/128
+        and the paged flash_attn_with_kvcache has no page_size==1 variant. Cross-
+        attention (encoder KV) and decoder self-attention (its region begins at a
+        non-page-aligned slot) both misread that layout, so gather the scattered
+        token-slots densely and run flash_attn_varlen_func instead. Eager-only.
+        """
+        k_flat = key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim)
+        v_flat = value_cache.reshape(-1, layer.tp_v_head_num, layer.head_dim)
+        q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if layer.is_cross_attention:
+            page_table = metadata.encoder_page_table
+            cache_seqlens = metadata.encoder_lens_int32
+            causal = False
+        else:
+            page_table = metadata.page_table
+            cache_seqlens = metadata.cache_seqlens_int32
+            causal = True
+        return self._varlen_gather_attn(
+            q=q_rows,
+            k_flat=k_flat,
+            v_flat=v_flat,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            max_seqlen_q=1 if decode else metadata.max_seq_len_q,
+            scale=layer.scaling,
+            softcap=layer.logit_cap,
+            causal=causal,
+        )
+
+    def _varlen_gather_attn(
+        self,
+        *,
+        q,
+        k_flat,
+        v_flat,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        max_seqlen_q,
+        scale,
+        softcap,
+        causal,
+    ):
+        """Dense-gather + non-paged varlen attention (page_size=1 semantics).
+
+        q: (num_rows, Hq, D). k_flat/v_flat: (total_slots, Hk, D) token-slot-indexed
+        KV cache. page_table: (num_reqs, m) token-slot indices, valid entries packed
+        first per row and capped by cache_seqlens. GQA is handled inside the kernel
+        (native Hk, no repeat_interleave). Eager-only: the .item() sync below is
+        never valid under graph capture.
+        """
+        seqlens = cache_seqlens.to(torch.long)
+        max_seqlen_k = int(seqlens.max().item())
+        if max_seqlen_k == 0:
+            # Zero-length keys (e.g. Whisper text-only warmup, encoder_lens==0):
+            # the varlen kernel's empty-key behavior is unreliable on XPU, so
+            # short-circuit to a zero context instead of launching it.
+            return q.new_zeros((q.shape[0], q.shape[1], v_flat.shape[-1]))
+
+        m = page_table.shape[1]
+        valid = torch.arange(m, device=page_table.device).unsqueeze(
+            0
+        ) < seqlens.unsqueeze(1)
+        flat_slots = page_table.to(torch.long)[valid]
+        k_ragged = k_flat.index_select(0, flat_slots).contiguous()
+        v_ragged = v_flat.index_select(0, flat_slots).contiguous()
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens.to(torch.int32), dim=0, dtype=torch.int32),
+            (1, 0),
+        )
+        return flash_attn_varlen_func(
+            q=q.contiguous(),
+            k=k_ragged,
+            v=v_ragged,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=causal,
+            softcap=softcap,
+            return_softmax_lse=False,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -871,6 +993,17 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+
+            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+                o = self._forward_encoder_decoder_mha(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    layer=layer,
+                    metadata=metadata,
+                    decode=True,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
