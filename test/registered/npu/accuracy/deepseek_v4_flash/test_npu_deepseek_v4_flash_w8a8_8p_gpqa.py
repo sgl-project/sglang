@@ -14,6 +14,11 @@ register_npu_ci(
     suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
+register_npu_ci(
+    est_time=3600,
+    suite="nightly-acc-16-npu-a3-dsv4-gpqa",
+    nightly=True,
+)
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
