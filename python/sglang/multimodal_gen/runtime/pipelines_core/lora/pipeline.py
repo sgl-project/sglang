@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -688,6 +689,9 @@ class LoRAPipeline(ComposedPipelineBase):
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
+                        output_offset=self.lora_adapters[nickname].get(
+                            name + ".lora_output_offset"
+                        ),
                         lora_path=path,
                         strength=lora_strength,
                         merge_weights=merge_weights and not use_cache,
@@ -918,6 +922,11 @@ class LoRAPipeline(ComposedPipelineBase):
             adapter_lora_alpha,
             self.device,
         )
+        transformer = self.modules["transformer"]
+        if isinstance(transformer, BaseDiT):
+            self.lora_adapters[lora_nickname] = transformer.prepare_lora_adapter(
+                self.lora_adapters[lora_nickname]
+            )
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
