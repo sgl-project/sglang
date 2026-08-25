@@ -5790,9 +5790,10 @@ class ServerArgs:
                         dsa_topk_backend="torch",
                     )
                     # Disable fused topk (requires sgl-kernel ops not available on XPU)
-                    import os
-
-                    if os.environ.get("SGLANG_DSA_FUSE_TOPK", "0") != "0":
+                    if (
+                        envs.SGLANG_DSA_FUSE_TOPK.is_set()
+                        and envs.SGLANG_DSA_FUSE_TOPK.get()
+                    ):
                         logger.warning(
                             "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
                         )

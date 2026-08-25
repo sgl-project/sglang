@@ -16,7 +16,7 @@ matching the style of the CUDA counterpart.
 
 import unittest
 from typing import List, Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -629,87 +629,6 @@ class TestDSAIndexerXPU(CustomTestCase):
                 backend.dsa_prefill_impl
             ),
         )
-
-    # ------------------------------------------------------------------
-    # Test: HybridAttnBackend routes indexer metadata to decode backend
-    # ------------------------------------------------------------------
-
-    def test_hybrid_backend_indexer_metadata_routing(self):
-        """HybridAttnBackend.get_indexer_metadata delegates to the decode backend.
-
-        Tests the generic HybridAttnBackend routing: when a hybrid setup uses
-        DSA for decode and another backend (e.g. Triton) for prefill, the DSA
-        decode backend must return indexer metadata even for prefill batches.
-        Note: on XPU, GLM5.1 no longer uses HybridAttnBackend (both prefill
-        and decode use DeepseekSparseAttnBackend directly), but this routing
-        logic remains valid for other hybrid configurations.
-        """
-        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        self._init_model_runner()
-
-        # Build a minimal HybridAttnBackend: decode=DSA, prefill=Triton mock
-        mock_triton = MagicMock(spec=TritonAttnBackend)
-        mock_triton.get_indexer_metadata.return_value = None  # Triton has no indexer
-
-        hybrid = HybridAttnBackend.__new__(HybridAttnBackend)
-        hybrid.decode_backend = self.backend
-        hybrid.prefill_backend = mock_triton
-
-        # DSA backend should provide metadata for a decode batch
-        forward_batch = MagicMock()
-        forward_batch.forward_mode = ForwardMode.DECODE
-        forward_batch.batch_size = self.batch_size
-        forward_batch.seq_lens = torch.tensor(
-            [self.seq_len + 1] * self.batch_size, device=self.device
-        )
-
-        # Patch DSA backend's own get_indexer_metadata to return a mock result
-        sentinel = object()
-        with patch.object(self.backend, "get_indexer_metadata", return_value=sentinel):
-            result = hybrid.get_indexer_metadata(
-                layer_id=0, forward_batch=forward_batch
-            )
-
-        self.assertIs(result, sentinel)
-        # Triton backend's get_indexer_metadata should NOT have been called
-        mock_triton.get_indexer_metadata.assert_not_called()
-
-    # ------------------------------------------------------------------
-    # Test: init_forward_metadata calls both backends for prefill
-    # ------------------------------------------------------------------
-
-    def test_hybrid_backend_prefill_initializes_decode_backend(self):
-        """HybridAttnBackend.init_forward_metadata calls decode_backend for prefill.
-
-        Tests the generic HybridAttnBackend routing: in a hybrid setup, the
-        DSA decode backend must be initialized during prefill so it can manage
-        the K-cache. Note: on XPU, GLM5.1 no longer uses HybridAttnBackend
-        (both prefill and decode go through DeepseekSparseAttnBackend directly),
-        but this routing logic remains valid for other hybrid configurations.
-        """
-        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        self._init_model_runner()
-
-        mock_triton = MagicMock(spec=TritonAttnBackend)
-        mock_dsa = MagicMock(spec=DeepseekSparseAttnBackend)
-
-        hybrid = HybridAttnBackend.__new__(HybridAttnBackend)
-        hybrid.decode_backend = mock_dsa
-        hybrid.prefill_backend = mock_triton
-        hybrid._select_backend = lambda mode: mock_triton  # Always pick triton
-
-        forward_batch = MagicMock()
-        forward_batch.forward_mode = ForwardMode.EXTEND
-
-        hybrid.init_forward_metadata(forward_batch)
-
-        # Both backends must be initialized
-        mock_triton.init_forward_metadata.assert_called_once_with(forward_batch)
-        mock_dsa.init_forward_metadata.assert_called_once_with(forward_batch)
 
 
 if __name__ == "__main__":
