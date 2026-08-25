@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
+    prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -256,6 +257,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
@@ -349,8 +351,9 @@ class ComposedPipelineBase(ABC):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            # overridden with args like --vae-path
-            component_model_path = maybe_download_model(override_path)
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                override_path
+            )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
@@ -1061,6 +1064,10 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
