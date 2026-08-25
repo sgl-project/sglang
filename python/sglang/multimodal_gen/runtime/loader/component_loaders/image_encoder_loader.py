@@ -46,6 +46,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             component_model_path,
             component_weights_path,
             component_name,
+            server_args.component_quantizations.get(component_name),
         )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
