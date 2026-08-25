@@ -24,10 +24,10 @@ from typing import Any, Iterator, Optional
 
 import torch
 
-from sglang.srt.cuda_vmm_utils import BumpArenaStub
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
 
 logger = logging.getLogger(__name__)
 _active_graph_pool_user: Optional[str] = None
