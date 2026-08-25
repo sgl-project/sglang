@@ -1464,7 +1464,10 @@ class SWAComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, FreeComponentDeviceSlot):
-            for indices in action.indices:
+            indices_list = action.indices
+            if len(indices_list) > 1:
+                indices_list = [torch.cat(indices_list)]
+            for indices in indices_list:
                 # Component values are page-aligned copies of a kv row.
                 alloc.free_swa_segment(indices, start_pos=0)
             return

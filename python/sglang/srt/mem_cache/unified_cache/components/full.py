@@ -504,7 +504,10 @@ class FullComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
-            for indices in action.indices:
+            indices_list = action.indices
+            if len(indices_list) > 1:
+                indices_list = [torch.cat(indices_list)]
+            for indices in indices_list:
                 # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
                     alloc.full_attn_allocator.free_segment(indices, start_pos=0)
