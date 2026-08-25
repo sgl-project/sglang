@@ -887,6 +887,70 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestSpeculativeAttentionBackendValidation(CustomTestCase):
+    @patch("sglang.srt.server_args.ServerArgs.get_model_config")
+    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    def test_attention_backend_handler_runs_validation(
+        self, _mock_mla, mock_get_model_config
+    ):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="torch_native",
+            speculative_algorithm="NGRAM",
+        )
+        model_config = MagicMock()
+        model_config.hf_config.dual_chunk_attention_config = None
+        mock_get_model_config.return_value = model_config
+        args.cuda_graph_config = CudaGraphConfig()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Speculative decoding is currently not supported with the "
+            "torch_native attention backend",
+        ):
+            args._handle_attention_backend_compatibility()
+
+    def test_torch_native_rejects_speculative_decoding(self):
+        for backend_args in (
+            {"attention_backend": "torch_native"},
+            {
+                "attention_backend": "triton",
+                "prefill_attention_backend": "torch_native",
+            },
+            {
+                "attention_backend": "triton",
+                "decode_attention_backend": "torch_native",
+            },
+        ):
+            with self.subTest(backend_args=backend_args):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="NGRAM",
+                    **backend_args,
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Speculative decoding is currently not supported with the "
+                    "torch_native attention backend",
+                ):
+                    args._validate_speculative_attention_backends()
+
+    def test_torch_native_without_speculative_decoding_is_allowed(self):
+        args = ServerArgs(model_path="dummy", attention_backend="torch_native")
+
+        args._validate_speculative_attention_backends()
+
+    def test_speculative_decoding_with_supported_backend_is_allowed(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="triton",
+            speculative_algorithm="NGRAM",
+        )
+
+        args._validate_speculative_attention_backends()
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()

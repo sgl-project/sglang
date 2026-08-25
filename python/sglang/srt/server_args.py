@@ -6448,6 +6448,20 @@ class ServerArgs:
                 disable_radix_cache=True,
             )
 
+        self._validate_speculative_attention_backends()
+
+    def _validate_speculative_attention_backends(self):
+        if self.speculative_algorithm is None:
+            return
+
+        prefill_backend, decode_backend = self._resolved_attention_backends()
+        if "torch_native" in (prefill_backend, decode_backend):
+            raise ValueError(
+                "Speculative decoding is currently not supported with the "
+                "torch_native attention backend. Choose a different attention "
+                "backend or disable speculative decoding."
+            )
+
     def _handle_mxfp8_kv_cache_compatibility(self):
         """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
         if self.kv_cache_dtype != "mxfp8":
