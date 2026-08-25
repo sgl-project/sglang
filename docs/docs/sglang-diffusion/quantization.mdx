@@ -23,6 +23,8 @@ Use these paths:
   (local or Hub)
 - `--quantization`: override the quantization method used by the transformer loader
 - `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
+- `--component-quantizations.<component>`: explicitly apply supported online quantization to an unquantized component
+- `--component-quantization-ignored-layers.<component>`: component-local layer patterns to keep unquantized during that online quantization
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
@@ -78,13 +80,15 @@ paths:
 | Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
 | Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
 
-`--quantization` is the explicit override for the transformer loader; it is not
-the boundary of component quantization support. Other pre-quantized component
-repositories select their format through their own metadata and the capability
-of the selected loader. A generic string override without a matching
-materialization backend would advertise support that the component does not
-have, while a quantized weight file without matching config metadata cannot be
-identified or restored generically.
+`--quantization` is the explicit override for the primary transformer loader;
+`--component-quantizations.<component>` expresses the same intent for one
+supported component. Pair the latter with
+`--component-quantization-ignored-layers.<component>` to keep matching layers
+unquantized. Pre-quantized component repositories instead select their format
+through their own metadata and the capability of the selected loader. A generic
+string override without a matching materialization backend would advertise
+support that the component does not have, while a quantized weight file without
+matching config metadata cannot be identified or restored generically.
 
 ## Quant Families
 
@@ -158,7 +162,7 @@ backend.
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
       <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511, MiniMax-H3</td>
       <td>None</td>
-      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select their checkpoint layout automatically; omit <code>--quantization</code>.</td>
+      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select NVFP4 plus INT8 or FP8 companion linears automatically; omit <code>--quantization</code>.</td>
     </tr>
     <tr>
       <td><code>gguf</code></td>

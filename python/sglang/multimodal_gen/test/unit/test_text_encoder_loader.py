@@ -368,10 +368,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "/model/text_encoder",
             "text_encoder",
             explicit_quantization="kitchen_int8",
+            ignored_layers=["lm_head"],
         )
 
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
         self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)

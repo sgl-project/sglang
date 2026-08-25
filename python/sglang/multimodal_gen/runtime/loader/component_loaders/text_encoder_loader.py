@@ -12,6 +12,10 @@ from transformers import PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -251,6 +255,7 @@ def _configure_encoder_quantization(
     component_weights_path: str,
     component_name: str,
     explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
         if explicit_quantization is not None:
@@ -295,7 +300,9 @@ def _configure_encoder_quantization(
             get_quantization_config,
         )
 
-        model_config.quant_config = get_quantization_config(explicit_quantization)()
+        model_config.quant_config = get_quantization_config(explicit_quantization)(
+            ignored_layers=ignored_layers
+        )
         quant_config = model_config.quant_config
     if quant_config is None:
         return
@@ -314,6 +321,7 @@ def _resolve_and_configure_encoder_quantization(
     component_weights_path: str,
     component_name: str,
     explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
@@ -354,6 +362,7 @@ def _resolve_and_configure_encoder_quantization(
         component_weights_path,
         component_name,
         explicit_quantization,
+        ignored_layers,
     )
     return model_cls
 
@@ -734,6 +743,7 @@ class TextEncoderLoader(ComponentLoader):
             component_weights_path,
             component_name,
             server_args.component_quantizations.get(component_name),
+            server_args.component_quantization_ignored_layers.get(component_name),
         )
         if issubclass(model_cls, EncoderTensorParallelMixin):
             model_cls.configure_component_paths(
@@ -872,14 +882,16 @@ class TextEncoderLoader(ComponentLoader):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = (
-                    True
-                    if isinstance(
-                        server_args.pipeline_config, QwenImageEditPipelineConfig
-                    )
-                    else False
+                enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
                 )
                 model_config.enable_image_understanding = enable_image_understanding
+                # LongCat feeds its padded body to the DiT, so it must mask
+                # padding on the cache-free path; scoped so others are unchanged.
+                model_config.honor_cache_free_padding_mask = isinstance(
+                    server_args.pipeline_config, LongCatImagePipelineConfig
+                )
                 model = model_cls(model_config)
 
             if not isinstance(model, EncoderTensorParallelMixin):
