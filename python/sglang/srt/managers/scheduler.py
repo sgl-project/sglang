@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 from sglang.srt.runtime_context import (
     attention_backends,
     configured_attn_cp_size,
+    configured_dcp_size,
     configured_moe_dp_size,
     configured_pp_size,
     configured_tp_size,
@@ -43,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_serving,
     get_spec,
 )
@@ -82,7 +84,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -101,8 +103,9 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -135,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -176,6 +180,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -291,7 +297,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -309,6 +315,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
+    rank_consensus_checker,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -325,8 +332,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.weight_versions import (
+    compute_weight_version_spans,
+    record_weight_version_events,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -416,71 +426,75 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
-        self.schedule_policy = server_args.schedule_policy
-        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.schedule_policy = get_schedule().schedule_policy
+        self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
-            server_args.abort_on_priority_when_disabled
+            get_schedule().abort_on_priority_when_disabled
         )
         self.schedule_low_priority_values_first = (
-            server_args.schedule_low_priority_values_first
+            get_schedule().schedule_low_priority_values_first
         )
         self.priority_scheduling_preemption_threshold = (
-            server_args.priority_scheduling_preemption_threshold
+            get_schedule().priority_scheduling_preemption_threshold
         )
-        self.enable_lora = server_args.enable_lora
-        self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
-        self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
-        self.enable_pdmux = server_args.enable_pdmux
+        self.enable_lora = get_lora().enable_lora
+        self.enable_lora_overlap_loading = get_lora().enable_lora_overlap_loading
+        self.max_loras_per_batch = get_lora().max_loras_per_batch
+        self.enable_overlap = (
+            not get_schedule().disable_overlap_schedule and not use_mlx()
+        )
+        self.enable_overlap_mlx = (
+            not get_schedule().disable_overlap_schedule and use_mlx()
+        )
+        self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
-        self.stream_interval = server_args.stream_interval
+        self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.page_size = get_schedule().page_size
-        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_session_radix_cache = server_args.enable_session_radix_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_decode_hicache = (
-            server_args.disaggregation_decode_enable_radix_cache
+            get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
-        self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
                 get_parallel().enable_dp_attention,
                 tp_rank,
-                server_args.tp_size,
+                configured_tp_size(),
                 get_parallel().dp_size,
-                server_args.attn_cp_size,
+                configured_attn_cp_size(),
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=configured_tp_size(),
             pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
+            pp_size=configured_pp_size(),
             dp_rank=dp_rank,
             dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dcp_rank=tp_rank % server_args.dcp_size,
-            attn_dcp_size=server_args.dcp_size,
+            attn_cp_size=configured_attn_cp_size(),
+            attn_dcp_rank=tp_rank % configured_dcp_size(),
+            attn_dcp_size=configured_dcp_size(),
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
+            moe_dp_size=configured_moe_dp_size(),
             gpu_id=gpu_id,
         )
 
@@ -654,6 +668,8 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        self.init_rank_consensus_checker()
 
         self.is_initializing = False
         self.init_startup_timing_summary()
@@ -836,7 +852,7 @@ class Scheduler(
         if (
             self.model_config.is_multimodal
             and self.processor is not None
-            and not server_args.language_model_only
+            and not get_disagg().language_model_only
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
@@ -1279,7 +1295,7 @@ class Scheduler(
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def init_soft_watchdog(self, server_args: ServerArgs):
-        if (x := server_args.soft_watchdog_timeout) is not None:
+        if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
@@ -1600,6 +1616,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_ipc,
                 ),
                 (
+                    UpdateWeightVersionReqInput,
+                    self.handle_update_weight_version,
+                ),
+                (
                     GetWeightsByNameReqInput,
                     self.weight_updater.get_weights_by_name,
                 ),
@@ -1687,6 +1707,8 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+
+        rank_consensus_checker.shutdown()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -2114,6 +2136,16 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
         )
 
+    def init_rank_consensus_checker(self) -> None:
+        groups = []
+        if self.attn_cp_group is not None and self.attn_tp_group is not None:
+            groups += [self.attn_cp_group, self.attn_tp_group]
+        else:
+            groups += [self.tp_group]
+        if self.pp_group is not None:
+            groups += [self.pp_group]
+        rank_consensus_checker.configure(groups)
+
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
             kv_events_config=get_observability().kv_events_config,
@@ -2165,7 +2197,7 @@ class Scheduler(
         )
 
     def init_output_streamer(self) -> None:
-        self.output_streamer = SchedulerOutputStreamer(
+        self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
             ps=self.ps,
@@ -2176,6 +2208,9 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             rust_server=self.rust_server,
         )
+
+    def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
+        return SchedulerOutputStreamer
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -2557,13 +2592,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        uses_top_k_or_top_p_truncation = (
-            req.sampling_params.top_k != TOP_K_ALL or req.sampling_params.top_p < 1.0
-        )
-        if req.return_sampling_mask and not uses_top_k_or_top_p_truncation:
+        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
             error_msg = (
-                "return_sampling_mask cannot return the full vocabulary; set "
-                "top_p < 1 or a finite top_k."
+                "return_sampling_mask requires finite top_k; top_p-only sampling "
+                "is valid but can return huge masks in the tail, blowing up "
+                "metadata, so we need a safety cap."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
@@ -2800,13 +2833,13 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = AbortReq(
+            abort_req = _make_abort_req(
+                req,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
-                rid=req.rid,
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
@@ -2855,13 +2888,13 @@ class Scheduler(
                 message = "The request is aborted by a higher priority request."
 
         self.ipc_channels.send_to_tokenizer.send_output(
-            AbortReq(
+            _make_abort_req(
+                req_to_abort,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
-                rid=req_to_abort.rid,
             ),
             req_to_abort,
         )
@@ -2879,13 +2912,13 @@ class Scheduler(
             if 0 < entry_time < deadline:
                 self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
+                    _make_abort_req(
+                        req,
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                             "message": "Request waiting timeout reached.",
                         },
-                        rid=req.rid,
                     ),
                     req,
                 )
@@ -3017,7 +3050,7 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3609,10 +3642,7 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                    ),
+                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
 
@@ -3837,6 +3867,7 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
@@ -3874,6 +3905,7 @@ class Scheduler(
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3964,6 +3996,32 @@ class Scheduler(
         else:
             return
         self.future_map.stash(future_indices, payload)
+
+    def _copy_auxiliary_output_to_cpu(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        logits_output = result.logits_output
+        if (
+            logits_output is None
+            or logits_output.auxiliary_device_output is None
+            or result.auxiliary_host_output is not None
+        ):
+            return
+        # PP transports the device output to the first rank before copying it.
+        if self.ps.pp_size > 1:
+            return
+        if result.copy_done is not None:
+            raise RuntimeError(
+                "generation result has an uncopied auxiliary output after its "
+                "device-to-host copy was scheduled"
+            )
+        result.copy_done = self.device_module.Event()
+        result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
@@ -4350,6 +4408,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 
@@ -4376,6 +4435,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
+        ret["world_size"] = compute_world_size(get_server_args())
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
@@ -4417,6 +4477,9 @@ class Scheduler(
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
+
+        if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
+            ret["env_vars"] = exportable_env_vars()
 
         # These fields are not msgpack-serializable (a config object and a bound
         # signal handler); no reader consumes them.
@@ -4533,12 +4596,52 @@ class Scheduler(
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    def handle_update_weight_version(
+        self, recv_req: UpdateWeightVersionReqInput
+    ) -> UpdateWeightVersionReqOutput:
+        self.record_weight_version_change(new_version=recv_req.new_version)
+        return UpdateWeightVersionReqOutput()
+
+    def record_weight_version_change(self, new_version: Optional[str]) -> None:
+        if new_version is None or new_version == get_serving().weight_version:
+            return
+
+        old_version = get_serving().weight_version
+        get_context().override("scheduler.weight_version", weight_version=new_version)
+
+        live_reqs = {
+            *self.collect_inflight_reqs(),
+            *self.waiting_queue,
+            *([self.chunked_req] if self.chunked_req is not None else []),
+        }
+        if self.hisparse_coordinator is not None:
+            live_reqs.update(
+                act.req for act in self.hisparse_coordinator.ack_staging_queue
+            )
+        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
+        logger.info(
+            f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+        )
+
+    def collect_inflight_reqs(self) -> Set[Req]:
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.last_batch]
+        else:
+            inflight_batches = [*self.running_mbs, *self.mbs]
+        return {
+            req for batch in inflight_batches if batch is not None for req in batch.reqs
+        }
+
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        # Abort requests still waiting for encoder embeddings (EPD language-only)
+        if self.mm_receiver is not None:
+            self.mm_receiver.abort_waiting_requests(recv_req)
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -4552,7 +4655,7 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4584,7 +4687,7 @@ class Scheduler(
             ):
                 self._release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
+                    _make_abort_req(req), req
                 )
                 if (
                     req.req_pool_idx is not None
@@ -4659,20 +4762,14 @@ class Scheduler(
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
                         self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
+                            _make_abort_req(decode_req), decode_req
                         )
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
-        else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
-
-        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
-        for req in inflight_reqs:
+        for req in self.collect_inflight_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
@@ -5133,16 +5230,16 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     # Set up tracing
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
@@ -5187,3 +5284,17 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+    )
