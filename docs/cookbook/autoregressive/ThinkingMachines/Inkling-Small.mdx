@@ -216,7 +216,7 @@ Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_98f772f3a0044f45b80c
 
 ### 3.3 Multimodal Input (Image + Audio)
 
-Inkling-Small is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. The server must be started with `--enable-multimodal` (already included in every recipe above).
+Inkling-Small is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. Audio can also be sent as OpenAI's `input_audio` part, carrying the base64 bytes in `data` alongside a `format` of `wav` or `mp3`. The server must be started with `--enable-multimodal` (already included in every recipe above).
 
 <Accordion title="Image + Audio Example (Python)">
 
@@ -307,6 +307,6 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 ### 3.7 DSpark (Speculative Decoding)
 
-The **DSpark** deploy strategy is the second speculative-decoding path for Inkling-Small. Unlike **MTP**, which drives Inkling-Small's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-Small-DSpark-Preview` — served unquantized alongside the NVFP4 target.
+The **DSpark** deploy strategy is the second speculative-decoding path for Inkling-Small. Unlike **MTP**, which drives Inkling-Small's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-Small-DSpark` — served unquantized alongside the NVFP4 target.
 
 DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).

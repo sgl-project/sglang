@@ -244,9 +244,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_dcp_rank, 3)
         self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
-        self.assertIsNotNone(info.staging)
-        self.assertEqual(info.staging.base_ptr, staging_ptr)
-        self.assertEqual(info.staging.total_size, 1048576)
+        self.assertEqual(info.staging_base_ptr, staging_ptr)
+        self.assertEqual(info.staging_total_size, 1048576)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -272,7 +271,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertEqual(info.dst_dcp_size, 1)
         self.assertEqual(info.dst_dcp_rank, 0)
-        self.assertIsNone(info.staging)
+        self.assertEqual(info.staging_base_ptr, 0)
+        self.assertEqual(info.staging_total_size, 0)
 
 
 class TestNixlTransferStatus(CustomTestCase):
@@ -347,6 +347,9 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        # These cases cover the legacy no-ack behavior; the deferred-release ack
+        # path is exercised in test_nixl_deferred_kv_release.py.
+        mgr.enable_deferred_decode_kv_release = False
         return mgr
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
@@ -452,7 +455,8 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
                 gpu_id=0,
-                staging=None,
+                staging_base_ptr=0,
+                staging_total_size=0,
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
                 # Non-DCP peer. Without this the worker raises AttributeError
@@ -465,7 +469,9 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
+        mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
@@ -935,7 +941,8 @@ class TestNixlStaging(CustomTestCase):
             decode_tp_rank=0,
             dst_kv_item_len=128,
             dst_kv_item_lens=[],
-            staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
+            staging_base_ptr=0x8000,
+            staging_total_size=4096,
         )
         calls = []
         mgr.send_kvcache_staged = (

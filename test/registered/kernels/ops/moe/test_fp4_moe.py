@@ -16,7 +16,7 @@ from sglang.test.quant_ref_utils import (
     dequantize_nvfp4_to_dtype,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=300, stage="nightly", runner_config="4-gpu-b200")
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(

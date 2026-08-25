@@ -7,7 +7,7 @@ This page covers principles and essentials: folder layout, how to run tests, reg
 
 ## CI Pipeline Overview
 
-The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs `/rerun-stage`), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
+The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
 
 ## Folder Organization
 
@@ -50,8 +50,8 @@ python3 test/registered/jit/test_add_constant.py
 python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
 python3 test/run_suite.py --hw cuda --suite base-a-test-1-gpu-small
 
-# Nightly tests
-python3 test/run_suite.py --hw cuda --suite nightly-1-gpu --nightly
+# Nightly tests (CUDA nightly suites take no --nightly; the stage is in the name)
+python3 test/run_suite.py --hw cuda --suite nightly-test-1-gpu-large
 
 # With auto-partitioning (for parallel CI jobs)
 python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \

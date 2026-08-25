@@ -4,6 +4,7 @@ from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
+from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
@@ -14,6 +15,11 @@ from sglang.srt.configs.inkling import (
     InklingMMConfig,
     InklingModelConfig,
     InklingVisionConfig,
+)
+from sglang.srt.configs.interns2_mobius import (
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
+    InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
@@ -30,8 +36,13 @@ from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
+from sglang.srt.configs.muse_glimmer import (
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
+)
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -71,6 +82,8 @@ __all__ = [
     "Step3TextConfig",
     "Step3VisionEncoderConfig",
     "Olmo3Config",
+    "MuseGlimmerConfig",
+    "MuseGlimmerAssistantConfig",
     "KimiLinearConfig",
     "KimiK3Config",
     "KimiK25Config",
@@ -81,8 +94,12 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
+    "InternS2MobiusConfig",
+    "InternS2MobiusTextConfig",
+    "InternS2MobiusVisionConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
+    "Dots3Config",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
     "Lfm2Config",
@@ -97,6 +114,7 @@ __all__ = [
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
+    "MiniCPMHybridConfig",
     "Step3p5Config",
     "MiniMaxM3VLConfig",
     "Step3p7Config",

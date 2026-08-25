@@ -15,7 +15,10 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -25,7 +28,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_spec,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -40,7 +48,7 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -297,8 +305,8 @@ class MambaAttnBackendBase(AttentionBackend):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-        aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
+        aligned_len = (lens_to_track // chunk_size) * chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -316,7 +324,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -326,9 +334,9 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -338,17 +346,17 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
+        is_aligned = (lens_masked % chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
+        # TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
+            lens_masked[not_aligned] // chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
@@ -962,6 +970,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     @property
     def data_type(self):
@@ -994,6 +1005,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
@@ -1196,6 +1212,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         """
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
+
+        # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
+        if mamba_track_indices is not None:
+            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
+                mamba_track_indices
+            )
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
