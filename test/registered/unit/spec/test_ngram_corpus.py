@@ -13,6 +13,7 @@ from sglang.srt.speculative.cpp_ngram.external_corpus import (
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_precompute import (
     apply_precomputed_drafts_for_rows,
+    extract_local_accept_path_nodes,
     select_precomputed_drafts_for_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -581,6 +582,66 @@ class TestNgramCorpusIncremental(CustomTestCase):
 class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
     """Verify the runtime dense precompute/select path against fresh batch_get."""
 
+    def test_extract_local_accept_path_nodes(self):
+        draft_token_num = 4
+        accept_index = torch.tensor(
+            [
+                [0, 2, -1, -1],
+                [4, 7, 5, -1],
+                [-1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        accept_lens = torch.tensor([2, 3, 0], dtype=torch.int32)
+
+        path_nodes = extract_local_accept_path_nodes(
+            accept_index.flatten(), accept_lens, draft_token_num
+        )
+
+        torch.testing.assert_close(path_nodes, torch.tensor([2, 1, -1]))
+
+    def test_select_miss_uses_shallow_fallback_tree(self):
+        draft_token_num = 3
+        cached_bonus_tokens = torch.tensor([[[7], [-1], [-1]]])
+        cached_draft_tokens = torch.zeros(
+            1, draft_token_num, 1, draft_token_num, dtype=torch.int64
+        )
+        cached_draft_tokens[0, 0, 0] = torch.tensor([7, 8, 9])
+        cached_tree_masks = torch.zeros(
+            1,
+            draft_token_num,
+            1,
+            draft_token_num,
+            draft_token_num,
+            dtype=torch.bool,
+        )
+        cached_tree_masks[0, 0, 0] = torch.tril(
+            torch.ones(draft_token_num, draft_token_num, dtype=torch.bool)
+        )
+        accept_tokens = torch.tensor([[7, 0, 0], [11, 0, 0]], dtype=torch.int32)
+        fallback_tree_mask = (
+            torch.eye(draft_token_num, dtype=torch.bool)
+            | (torch.arange(draft_token_num) == 0)[None, :]
+        ).unsqueeze(0)
+
+        selected_drafts, selected_masks, cache_hits = (
+            select_precomputed_drafts_for_rows(
+                cache_rows=[0, -1],
+                accept_tokens=accept_tokens.flatten(),
+                accept_lens=torch.ones(2, dtype=torch.int32),
+                accept_path_nodes=torch.zeros(2, dtype=torch.long),
+                cached_bonus_tokens=cached_bonus_tokens,
+                cached_draft_tokens=cached_draft_tokens,
+                cached_tree_masks=cached_tree_masks,
+                fallback_tree_mask=fallback_tree_mask,
+            )
+        )
+
+        torch.testing.assert_close(cache_hits, torch.tensor([True, False]))
+        torch.testing.assert_close(selected_drafts[0], torch.tensor([7, 8, 9]))
+        torch.testing.assert_close(selected_drafts[1], torch.tensor([11, 0, 0]))
+        torch.testing.assert_close(selected_masks[1], fallback_tree_mask[0])
+
     @staticmethod
     def _make_branchy_corpus(
         draft_token_num: int,
@@ -625,41 +686,37 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
             req_ids, base_tokens, base_total_lens
         )
 
-        root_only_stats, _, _, _ = corpus.precompute_drafts_dense(
-            base_tokens,
-            base_total_lens,
-            current_drafts,
-            current_masks,
-            bonus_topk,
-            max_trie_depth,
-            1.0 / draft_token_num,
+        root_only_result = corpus.precompute_drafts_dense(
+            base_tokens=base_tokens,
+            total_lens=base_total_lens,
+            draft_tokens=current_drafts,
+            tree_mask=current_masks,
+            bonus_topk=bonus_topk,
+            max_trie_depth=max_trie_depth,
+            wide_bonus_ratio=1.0 / draft_token_num,
         )
-        (
-            wide_bonus_stats,
-            dense_bonus_tokens,
-            dense_draft_tokens,
-            dense_tree_masks,
-        ) = corpus.precompute_drafts_dense(
-            base_tokens,
-            base_total_lens,
-            current_drafts,
-            current_masks,
-            bonus_topk,
-            max_trie_depth,
-            0.5,
+        wide_bonus_result = corpus.precompute_drafts_dense(
+            base_tokens=base_tokens,
+            total_lens=base_total_lens,
+            draft_tokens=current_drafts,
+            tree_mask=current_masks,
+            bonus_topk=bonus_topk,
+            max_trie_depth=max_trie_depth,
+            wide_bonus_ratio=0.5,
         )
-        self.assertGreater(wide_bonus_stats[1], root_only_stats[1])
-        self.assertGreater(wide_bonus_stats[2], root_only_stats[2])
-        dense_bonus_tokens = dense_bonus_tokens.reshape(bs, draft_token_num, bonus_topk)
-        dense_draft_tokens = dense_draft_tokens.reshape(
-            bs, draft_token_num, bonus_topk, draft_token_num
+        self.assertGreater(wide_bonus_result.stats[1], root_only_result.stats[1])
+        self.assertGreater(wide_bonus_result.stats[2], root_only_result.stats[2])
+        dense_bonus_tokens = wide_bonus_result.bonus_tokens
+        dense_draft_tokens = wide_bonus_result.draft_tokens
+        dense_tree_masks = wide_bonus_result.tree_masks
+        self.assertEqual(dense_bonus_tokens.shape, (bs, draft_token_num, bonus_topk))
+        self.assertEqual(
+            dense_draft_tokens.shape,
+            (bs, draft_token_num, bonus_topk, draft_token_num),
         )
-        dense_tree_masks = dense_tree_masks.reshape(
-            bs,
-            draft_token_num,
-            bonus_topk,
-            draft_token_num,
-            draft_token_num,
+        self.assertEqual(
+            dense_tree_masks.shape,
+            (bs, draft_token_num, bonus_topk, draft_token_num, draft_token_num),
         )
         current_drafts = current_drafts.reshape(bs, draft_token_num)
         current_masks = current_masks.reshape(bs, draft_token_num, draft_token_num)
@@ -695,7 +752,7 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
                         base_total_lens[req_idx] + len(path_drafts) + 1
                     )
 
-        self.assertEqual(len(cache_rows), wide_bonus_stats[2])
+        self.assertEqual(len(cache_rows), wide_bonus_result.stats[2])
         self.assertGreaterEqual(len(cache_rows), bs)
         num_cases = len(cache_rows)
         accept_tokens = torch.zeros((num_cases, draft_token_num), dtype=torch.int32)
@@ -706,14 +763,14 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
         ).unsqueeze(0)
         selected_tokens, selected_masks, cache_hits = (
             select_precomputed_drafts_for_rows(
-                cache_rows,
-                accept_tokens.flatten(),
-                torch.ones(num_cases, dtype=torch.int32),
-                torch.tensor(path_nodes),
-                torch.from_numpy(dense_bonus_tokens),
-                torch.from_numpy(dense_draft_tokens),
-                torch.from_numpy(dense_tree_masks).bool(),
-                fallback_tree_mask,
+                cache_rows=cache_rows,
+                accept_tokens=accept_tokens.flatten(),
+                accept_lens=torch.ones(num_cases, dtype=torch.int32),
+                accept_path_nodes=torch.tensor(path_nodes),
+                cached_bonus_tokens=torch.from_numpy(dense_bonus_tokens),
+                cached_draft_tokens=torch.from_numpy(dense_draft_tokens),
+                cached_tree_masks=torch.from_numpy(dense_tree_masks).bool(),
+                fallback_tree_mask=fallback_tree_mask,
             )
         )
         self.assertTrue(cache_hits.all().item())
@@ -1041,38 +1098,20 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
 
             precompute_ms, precompute_result = self._avg_ms(
                 lambda: corpus.precompute_drafts_dense(
-                    base_tokens,
-                    total_lens,
-                    draft_tokens,
-                    tree_mask,
-                    draft_token_num,
-                    max_trie_depth,
-                    wide_bonus_ratio,
+                    base_tokens=base_tokens,
+                    total_lens=total_lens,
+                    draft_tokens=draft_tokens,
+                    tree_mask=tree_mask,
+                    bonus_topk=draft_token_num,
+                    max_trie_depth=max_trie_depth,
+                    wide_bonus_ratio=wide_bonus_ratio,
                 ),
                 precompute_repeats,
             )
-            (
-                precompute_stats,
-                dense_bonus_tokens,
-                dense_draft_tokens,
-                dense_tree_masks,
-            ) = precompute_result
-            dense_bonus_tokens = dense_bonus_tokens.reshape(
-                bs, draft_token_num, draft_token_num
-            )
-            dense_draft_tokens = dense_draft_tokens.reshape(
-                bs,
-                draft_token_num,
-                draft_token_num,
-                draft_token_num,
-            )
-            dense_tree_masks = dense_tree_masks.reshape(
-                bs,
-                draft_token_num,
-                draft_token_num,
-                draft_token_num,
-                draft_token_num,
-            )
+            precompute_stats = precompute_result.stats
+            dense_bonus_tokens = precompute_result.bonus_tokens
+            dense_draft_tokens = precompute_result.draft_tokens
+            dense_tree_masks = precompute_result.tree_masks
             root_bonus_tokens = dense_bonus_tokens[:, 0, 0]
             self.assertTrue(
                 np.all(root_bonus_tokens >= 0),
@@ -1112,16 +1151,18 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
                 )
                 select_ms, select_result = self._avg_ms(
                     lambda: apply_precomputed_drafts_for_rows(
-                        [req_id_to_row.get(req_id, -1) for req_id in req_ids],
-                        accept_tokens,
-                        accept_lens,
-                        accept_path_nodes,
-                        cached_bonus_tokens,
-                        cached_draft_tokens,
-                        cached_tree_masks,
-                        fallback_tree_mask,
-                        selected_draft_tokens,
-                        selected_tree_mask,
+                        cache_rows=[
+                            req_id_to_row.get(req_id, -1) for req_id in req_ids
+                        ],
+                        accept_tokens=accept_tokens,
+                        accept_lens=accept_lens,
+                        accept_path_nodes=accept_path_nodes,
+                        cached_bonus_tokens=cached_bonus_tokens,
+                        cached_draft_tokens=cached_draft_tokens,
+                        cached_tree_masks=cached_tree_masks,
+                        fallback_tree_mask=fallback_tree_mask,
+                        draft_tokens=selected_draft_tokens,
+                        tree_mask=selected_tree_mask,
                     ),
                     repeats,
                     device,

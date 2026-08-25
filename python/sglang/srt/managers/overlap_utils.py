@@ -32,8 +32,8 @@ def decide_needs_cpu_seq_lens(
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
     OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
-    CPU mirror outside the backend layer to split the batch) or ngram without precompute enabled (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    CPU mirror outside the backend layer to split the batch) or NGRAM without
+    precompute (its CPU corpus lookup consumes the previous verify result).
     """
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
@@ -165,7 +165,7 @@ class RelayPayload:
     `bonus_tokens`; which spec extras get relayed is decided by
     `FutureMap.spec_algo`, not by this payload's shape."""
 
-    bonus_tokens: Optional[torch.Tensor]
+    bonus_tokens: Optional[torch.Tensor] = None
     topk_p: Optional[torch.Tensor] = None
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
@@ -174,21 +174,25 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
-    accept_index: Optional[torch.Tensor] = None
+    accept_path_nodes: Optional[torch.Tensor] = None
 
     @classmethod
     def from_ngram(
         cls,
         draft_input: NgramVerifyInput,
-        relay_accept_index: bool = False,
+        relay_accept_path_nodes: bool = False,
     ) -> RelayPayload:
-        accept_index = (
+        if draft_input.accept_tokens is None or draft_input.accept_lens is None:
+            raise RuntimeError("NGRAM relay requires accept tokens and lengths.")
+        if relay_accept_path_nodes and draft_input.accept_index is None:
+            raise RuntimeError("NGRAM precompute relay requires accept indices.")
+        accept_path_nodes = (
             extract_local_accept_path_nodes(
                 draft_input.accept_index,
                 draft_input.accept_lens,
                 draft_input.draft_token_num,
             )
-            if relay_accept_index
+            if relay_accept_path_nodes
             else None
         )
         return cls(
@@ -197,7 +201,7 @@ class RelayPayload:
                 -1, draft_input.draft_token_num
             ),
             accept_lens=draft_input.accept_lens,
-            accept_index=accept_index,
+            accept_path_nodes=accept_path_nodes,
         )
 
     @classmethod
@@ -312,6 +316,9 @@ class FutureMap:
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
+        self.relay_ngram_accept_path_nodes = (
+            spec_algo.is_ngram() and not needs_cpu_seq_lens
+        )
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
         if _DEBUG_ASSERT:
@@ -348,7 +355,7 @@ class FutureMap:
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
-        self.accept_index_buf: Optional[torch.Tensor] = None
+        self.accept_path_nodes_buf: Optional[torch.Tensor] = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
         # Debug consume-once state: armed by a recording publish, consumed by
@@ -431,11 +438,12 @@ class FutureMap:
             dtype=payload.accept_lens.dtype,
             device=self.device,
         )
-        if payload.accept_index is not None:
-            self.accept_index_buf = torch.full(
+        if self.relay_ngram_accept_path_nodes:
+            assert payload.accept_path_nodes is not None
+            self.accept_path_nodes_buf = torch.full(
                 (self.req_pool_size,),
                 -1,
-                dtype=payload.accept_index.dtype,
+                dtype=payload.accept_path_nodes.dtype,
                 device=self.device,
             )
 
@@ -460,11 +468,8 @@ class FutureMap:
                 return
             draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
             draft_input.accept_lens = self.accept_lens_buf[indices]
-            # FutureMap stores one batch-independent local path node per
-            # request. This replaces the sampler's flattened batch-global
-            # accept_index after filter/merge has finalized request ordering.
-            if self.accept_index_buf is not None:
-                draft_input.accept_index = self.accept_index_buf[indices]
+            if self.accept_path_nodes_buf is not None:
+                draft_input.accept_path_nodes = self.accept_path_nodes_buf[indices]
             return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
@@ -603,9 +608,9 @@ class FutureMap:
             self._maybe_init_ngram_bufs(payload)
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
-            if self.accept_index_buf is not None:
-                assert payload.accept_index is not None
-                self.accept_index_buf[indices] = payload.accept_index
+            if self.accept_path_nodes_buf is not None:
+                assert payload.accept_path_nodes is not None
+                self.accept_path_nodes_buf[indices] = payload.accept_path_nodes
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)

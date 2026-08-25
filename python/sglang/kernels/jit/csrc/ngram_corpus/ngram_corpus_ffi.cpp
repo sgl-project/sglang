@@ -76,16 +76,13 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       double wide_bonus_ratio,
       const tvm::ffi::TensorView out_bonus_tokens,
       const tvm::ffi::TensorView out_draft_tokens,
-      const tvm::ffi::TensorView out_tree_mask,
+      const tvm::ffi::TensorView out_tree_masks,
       const tvm::ffi::TensorView out_stats) {
     if (bonus_topk < 0 || max_trie_depth <= 0) {
       throw std::runtime_error("precompute_drafts_dense received invalid bonus_topk or max_trie_depth");
     }
     auto* draft_data = static_cast<const int32_t*>(draft_tokens_tv.data_ptr());
     auto* mask_data = static_cast<const uint8_t*>(tree_mask_tv.data_ptr());
-    auto* bonus_out = static_cast<int32_t*>(out_bonus_tokens.data_ptr());
-    auto* draft_out = static_cast<int32_t*>(out_draft_tokens.data_ptr());
-    auto* mask_out = static_cast<uint8_t*>(out_tree_mask.data_ptr());
     auto* stats_out = static_cast<int64_t*>(out_stats.data_ptr());
     auto input = read_batch_(tokens_flat, offsets, total_lens_tv);
     std::vector<int32_t> draft_tokens(draft_data, draft_data + draft_tokens_tv.size(0));
@@ -101,15 +98,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
         wide_bonus_ratio,
         dense_cache);
 
-    if (out_bonus_tokens.size(0) < static_cast<int64_t>(dense_cache.bonus_tokens.size())) {
-      throw std::runtime_error("out_bonus_tokens buffer too small for precompute_drafts_dense");
-    }
-    if (out_draft_tokens.size(0) < static_cast<int64_t>(dense_cache.draft_tokens.size())) {
-      throw std::runtime_error("out_draft_tokens buffer too small for precompute_drafts_dense");
-    }
-    if (out_tree_mask.size(0) < static_cast<int64_t>(dense_cache.tree_mask.size())) {
-      throw std::runtime_error("out_tree_mask buffer too small for precompute_drafts_dense");
-    }
     if (out_stats.size(0) < 3) {
       throw std::runtime_error("out_stats buffer too small for precompute_drafts_dense");
     }

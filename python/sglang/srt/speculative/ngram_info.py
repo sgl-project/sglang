@@ -23,6 +23,7 @@ class NgramVerifyInput(SpecInput):
         accept_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
         accept_index: Optional[torch.Tensor] = None,
+        accept_path_nodes: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -40,10 +41,10 @@ class NgramVerifyInput(SpecInput):
         self.new_seq_lens = new_seq_lens
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
-        # Sampler output uses flattened batch-global indices. In NGRAM
-        # precompute overlap mode, FutureMap resolves this field to one local
-        # accepted path node per request after batch filter/merge.
+        # Raw sampler output uses flattened batch-global indices. FutureMap
+        # converts it to batch-independent local path nodes for precompute.
         self.accept_index = accept_index
+        self.accept_path_nodes = accept_path_nodes
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
@@ -133,18 +134,6 @@ class NgramVerifyInput(SpecInput):
         ]
         self.accept_tokens = self.accept_tokens.flatten()
         self.accept_lens = self.accept_lens[new_indices]
-        if self.accept_index is not None:
-            d = self.draft_token_num
-            accept_2d = self.accept_index.reshape(-1, d)[new_indices]  # (new_bs, d)
-            # Remap global indices: old row i had offset old_i*d, new row j needs offset j*d
-            old_indices = new_indices
-            new_i = torch.arange(len(old_indices), device=accept_2d.device)
-            shift = (
-                ((new_i - old_indices) * d).to(accept_2d.dtype).unsqueeze(1)
-            )  # (new_bs, 1)
-            self.accept_index = torch.where(
-                accept_2d != -1, accept_2d + shift, accept_2d
-            ).flatten()
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         if self.future_indices is not None:
@@ -154,8 +143,6 @@ class NgramVerifyInput(SpecInput):
             )
             return
 
-        self_bs = self.accept_lens.shape[0]
-        d = self.draft_token_num
         if self.new_seq_lens is not None:
             assert spec_info.new_seq_lens is not None
             self.new_seq_lens = torch.cat(
@@ -165,11 +152,3 @@ class NgramVerifyInput(SpecInput):
             (self.accept_tokens, spec_info.accept_tokens), dim=0
         )
         self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)
-        if self.accept_index is not None and spec_info.accept_index is not None:
-            # Shift incoming accept_index by self_bs * d for non-(-1) values
-            other_index = torch.where(
-                spec_info.accept_index != -1,
-                spec_info.accept_index + self_bs * d,
-                spec_info.accept_index,
-            )
-            self.accept_index = torch.cat((self.accept_index, other_index), dim=0)

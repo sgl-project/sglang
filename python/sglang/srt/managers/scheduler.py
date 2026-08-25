@@ -3975,7 +3975,7 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(
                     batch_result.next_draft_input,
-                    relay_accept_index=not self.future_map.needs_cpu_seq_lens,
+                    relay_accept_path_nodes=not self.future_map.needs_cpu_seq_lens,
                 )
                 self.future_map.stash(future_indices, payload)
             return

@@ -17,12 +17,14 @@ import torch
 import triton
 import triton.language as tl
 
+_NGRAM_MASK_BLOCK_SIZE = 256
+
 
 @triton.jit
 def _pack_ngram_full_mask_kernel(
     draft_tree_mask_ptr,
     seq_lens_ptr,
-    seq_len_cumsum_ptr,
+    seq_lens_cumsum_ptr,
     full_mask_ptr,
     num_draft_tokens: tl.constexpr,
     block_size: tl.constexpr,
@@ -33,8 +35,8 @@ def _pack_ngram_full_mask_kernel(
     draft_idx = row_idx % num_draft_tokens
 
     seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int64)
-    seq_len_cumsum = tl.load(seq_len_cumsum_ptr + batch_idx).to(tl.int64)
-    seq_len_prefix_sum = seq_len_cumsum - seq_len
+    seq_lens_cumsum = tl.load(seq_lens_cumsum_ptr + batch_idx).to(tl.int64)
+    seq_len_prefix_sum = seq_lens_cumsum - seq_len
     row_start = (
         seq_len_prefix_sum * num_draft_tokens
         + batch_idx * num_draft_tokens * num_draft_tokens
@@ -69,11 +71,13 @@ def _pack_ngram_full_mask_kernel(
 
 
 def pack_ngram_full_mask(
+    *,
     draft_tree_mask: torch.Tensor,
     seq_lens: torch.Tensor,
     num_draft_tokens: int,
+    max_seq_len: int,
     output: torch.Tensor,
-    seq_len_cumsum: Optional[torch.Tensor] = None,
+    seq_lens_cumsum: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build the packed NGRAM full mask using GPU sequence lengths only.
 
@@ -90,27 +94,33 @@ def pack_ngram_full_mask(
         )
     if num_draft_tokens <= 0 or num_draft_tokens > 256:
         raise ValueError("num_draft_tokens must be in [1, 256].")
-    if output.numel() < draft_tree_mask.numel():
-        raise ValueError("output is too small for the draft-tree portion of the mask.")
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive.")
+    required_capacity = (
+        seq_lens.numel() * num_draft_tokens * (max_seq_len + num_draft_tokens)
+    )
+    if output.numel() < required_capacity:
+        raise ValueError(
+            "output is too small for the configured maximum sequence length."
+        )
 
-    if seq_len_cumsum is None:
-        seq_len_cumsum = torch.empty_like(seq_lens)
+    if seq_lens_cumsum is None:
+        seq_lens_cumsum = torch.empty_like(seq_lens)
     elif (
-        not seq_len_cumsum.is_cuda
-        or seq_len_cumsum.device != seq_lens.device
-        or seq_len_cumsum.dtype != seq_lens.dtype
-        or seq_len_cumsum.numel() != seq_lens.numel()
+        not seq_lens_cumsum.is_cuda
+        or seq_lens_cumsum.device != seq_lens.device
+        or seq_lens_cumsum.dtype != seq_lens.dtype
+        or seq_lens_cumsum.numel() != seq_lens.numel()
     ):
-        raise ValueError("seq_len_cumsum must match seq_lens.")
-    torch.cumsum(seq_lens, dim=0, out=seq_len_cumsum)
-    block_size = 256
+        raise ValueError("seq_lens_cumsum must match seq_lens.")
+    torch.cumsum(seq_lens, dim=0, out=seq_lens_cumsum)
     _pack_ngram_full_mask_kernel[(seq_lens.numel() * num_draft_tokens,)](
         draft_tree_mask,
         seq_lens,
-        seq_len_cumsum,
+        seq_lens_cumsum,
         output,
         num_draft_tokens=num_draft_tokens,
-        block_size=block_size,
+        block_size=_NGRAM_MASK_BLOCK_SIZE,
     )
     return output
 

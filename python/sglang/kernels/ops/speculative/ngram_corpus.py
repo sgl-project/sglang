@@ -97,16 +97,17 @@ def get_ngram_corpus_cls():
                 np.int64
             )
 
-        def precompute_drafts_dense_wrapper(
+        def precompute_drafts_dense_host(
             self,
+            *,
             base_tokens: List[List[int]],
             total_lens: List[int],
-            draft_tokens,
-            tree_mask,
+            draft_tokens: np.ndarray,
+            tree_mask: np.ndarray,
             bonus_topk: int,
             max_trie_depth: int,
             wide_bonus_ratio: float = 0.5,
-        ):
+        ) -> tuple[tuple[int, int, int], np.ndarray, np.ndarray, np.ndarray]:
             batch_size = len(base_tokens)
             d = self._draft_token_num
 
@@ -117,7 +118,10 @@ def get_ngram_corpus_cls():
                 draft_tokens_t,
                 tree_mask_t,
             ) = self._make_precompute_inputs(
-                base_tokens, total_lens, draft_tokens, tree_mask
+                base_tokens=base_tokens,
+                total_lens=total_lens,
+                draft_tokens=draft_tokens,
+                tree_mask=tree_mask,
             )
             out_bonus_tokens = torch.empty(
                 batch_size * d * bonus_topk, dtype=torch.int32
@@ -125,7 +129,7 @@ def get_ngram_corpus_cls():
             out_draft_tokens = torch.empty(
                 (batch_size * d * bonus_topk * d,), dtype=torch.int32
             )
-            out_tree_mask = torch.empty(
+            out_tree_masks = torch.empty(
                 (batch_size * d * bonus_topk * d * d,), dtype=torch.uint8
             )
             out_stats = torch.empty(3, dtype=torch.int64)
@@ -141,14 +145,14 @@ def get_ngram_corpus_cls():
                 wide_bonus_ratio,
                 out_bonus_tokens,
                 out_draft_tokens,
-                out_tree_mask,
+                out_tree_masks,
                 out_stats,
             )
             return (
                 tuple(out_stats.tolist()),
                 out_bonus_tokens.numpy(),
                 out_draft_tokens.numpy().astype(np.int64),
-                out_tree_mask.numpy(),
+                out_tree_masks.numpy(),
             )
 
         @staticmethod

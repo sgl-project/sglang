@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import numpy as np
 
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
+
+
+class NgramPrecomputeResult(NamedTuple):
+    stats: tuple[int, int, int]
+    bonus_tokens: np.ndarray
+    draft_tokens: np.ndarray
+    tree_masks: np.ndarray
 
 
 class NgramCorpus:
@@ -32,6 +39,7 @@ class NgramCorpus:
             external_corpus_max_tokens=external_corpus_max_tokens,
         )
         self.external_corpus_max_tokens = external_corpus_max_tokens
+        self.draft_token_num = draft_token_num
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
         self._corpus_token_counts: Dict[str, int] = {}
@@ -104,6 +112,7 @@ class NgramCorpus:
 
     def precompute_drafts_dense(
         self,
+        *,
         base_tokens: List[List[int]],
         total_lens: List[int],
         draft_tokens,
@@ -111,15 +120,36 @@ class NgramCorpus:
         bonus_topk: int,
         max_trie_depth: int,
         wide_bonus_ratio: float = 0.5,
-    ):
-        return self._obj.precompute_drafts_dense_wrapper(
-            base_tokens,
-            total_lens,
-            draft_tokens,
-            tree_mask,
-            bonus_topk,
-            max_trie_depth,
-            wide_bonus_ratio,
+    ) -> NgramPrecomputeResult:
+        stats, bonus_tokens, next_draft_tokens, tree_masks = (
+            self._obj.precompute_drafts_dense_host(
+                base_tokens=base_tokens,
+                total_lens=total_lens,
+                draft_tokens=draft_tokens,
+                tree_mask=tree_mask,
+                bonus_topk=bonus_topk,
+                max_trie_depth=max_trie_depth,
+                wide_bonus_ratio=wide_bonus_ratio,
+            )
+        )
+        batch_size = len(base_tokens)
+        draft_token_num = self.draft_token_num
+        return NgramPrecomputeResult(
+            stats=stats,
+            bonus_tokens=bonus_tokens.reshape(batch_size, draft_token_num, bonus_topk),
+            draft_tokens=next_draft_tokens.reshape(
+                batch_size,
+                draft_token_num,
+                bonus_topk,
+                draft_token_num,
+            ),
+            tree_masks=tree_masks.reshape(
+                batch_size,
+                draft_token_num,
+                bonus_topk,
+                draft_token_num,
+                draft_token_num,
+            ),
         )
 
     def erase_match_state(self, req_ids: List[str]):

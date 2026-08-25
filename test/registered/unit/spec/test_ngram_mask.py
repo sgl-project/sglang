@@ -23,7 +23,7 @@ class TestNgramFullMask(CustomTestCase):
         ).flatten()
         seq_lens = torch.tensor([2, 4], device="cuda")
         seq_lens_host = [2, 4]
-        seq_len_cumsum = torch.empty_like(seq_lens)
+        seq_lens_cumsum = torch.empty_like(seq_lens)
         max_context_len = 8
         output = torch.zeros(
             2 * num_draft_tokens * (max_context_len + num_draft_tokens),
@@ -32,11 +32,12 @@ class TestNgramFullMask(CustomTestCase):
         )
 
         pack_ngram_full_mask(
-            draft_tree_mask,
-            seq_lens,
-            num_draft_tokens,
-            output,
-            seq_len_cumsum,
+            draft_tree_mask=draft_tree_mask,
+            seq_lens=seq_lens,
+            num_draft_tokens=num_draft_tokens,
+            max_seq_len=max_context_len,
+            output=output,
+            seq_lens_cumsum=seq_lens_cumsum,
         )
 
         expected = torch.cat(

@@ -44,42 +44,52 @@ std::vector<int32_t> appendTokenAndTrim(const std::vector<int32_t>& base, int32_
   return out;
 }
 
-std::vector<int32_t> directChildTokens(
+std::vector<int32_t>
+buildParentNodes(const std::vector<uint8_t>& tree_mask, size_t row_offset, size_t draft_token_num) {
+  std::vector<int32_t> parents(draft_token_num, -1);
+  for (size_t node = 1; node < draft_token_num; ++node) {
+    const auto node_row = row_offset + node * draft_token_num;
+    if (tree_mask[node_row + node] == 0) {
+      continue;
+    }
+    for (size_t col = 0; col < node; ++col) {
+      if (tree_mask[node_row + col] != 0) {
+        parents[node] = static_cast<int32_t>(col);
+      }
+    }
+  }
+  return parents;
+}
+
+std::vector<int32_t> pathDraftTokens(
     const std::vector<int32_t>& draft_tokens,
     const std::vector<uint8_t>& tree_mask,
     size_t token_offset,
-    size_t row_offset,
-    size_t d,
-    size_t parent) {
-  std::vector<int32_t> child_tokens;
-  std::unordered_set<int32_t> seen_tokens;
-  for (size_t child = parent + 1; child < d; ++child) {
-    const auto child_row = row_offset + child * d;
-    if (tree_mask[child_row + child] == 0 || tree_mask[child_row + parent] == 0) {
-      continue;
-    }
-    int last_ancestor = -1;
-    for (size_t col = 0; col < child; ++col) {
-      if (tree_mask[child_row + col] != 0) {
-        last_ancestor = static_cast<int>(col);
-      }
-    }
-    if (last_ancestor != static_cast<int>(parent)) {
-      continue;
-    }
-    const auto token = draft_tokens[token_offset + child];
-    if (seen_tokens.insert(token).second) {
-      child_tokens.emplace_back(token);
+    size_t node_row,
+    size_t draft_token_num) {
+  std::vector<int32_t> path_tokens;
+  path_tokens.reserve(draft_token_num);
+  for (size_t col = 1; col < draft_token_num; ++col) {
+    if (tree_mask[node_row + col] != 0) {
+      path_tokens.emplace_back(draft_tokens[token_offset + col]);
     }
   }
-  return child_tokens;
+  return path_tokens;
 }
 
-bool containsToken(const std::vector<int32_t>& tokens, int32_t token) {
-  return std::find(tokens.begin(), tokens.end(), token) != tokens.end();
+std::vector<std::unordered_set<int32_t>> buildDirectChildTokenSets(
+    const std::vector<int32_t>& draft_tokens, const std::vector<int32_t>& parents, size_t token_offset) {
+  std::vector<std::unordered_set<int32_t>> child_token_sets(parents.size());
+  for (size_t child = 1; child < parents.size(); ++child) {
+    const auto parent = parents[child];
+    if (parent >= 0) {
+      child_token_sets[parent].emplace(draft_tokens[token_offset + child]);
+    }
+  }
+  return child_token_sets;
 }
 
-size_t wideBonusTokenCount(size_t draft_token_num, double wide_bonus_ratio) {
+size_t wideBonusPathCount(size_t draft_token_num, double wide_bonus_ratio) {
   if (draft_token_num == 0) {
     return 0;
   }
@@ -357,11 +367,11 @@ PrecomputeDraftsStats Ngram::precomputeDraftsDense(
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
-  const auto wide_bonus_token_count = wideBonusTokenCount(d, wide_bonus_ratio);
-  const auto max_phase2_entries = bs * (wide_bonus_token_count * bonus_topk + (d - wide_bonus_token_count));
+  const auto wide_bonus_path_count = wideBonusPathCount(d, wide_bonus_ratio);
+  const auto max_phase2_entries = bs * (wide_bonus_path_count * bonus_topk + (d - wide_bonus_path_count));
   dense_cache.bonus_tokens.assign(bs * d * bonus_topk, -1);
   dense_cache.draft_tokens.assign(bs * d * bonus_topk * d, 0);
-  dense_cache.tree_mask.assign(bs * d * bonus_topk * d * d, 0);
+  dense_cache.tree_masks.assign(bs * d * bonus_topk * d * d, 0);
 
   struct Phase2Entry {
     size_t req_idx;
@@ -378,37 +388,20 @@ PrecomputeDraftsStats Ngram::precomputeDraftsDense(
   for (size_t req_idx = 0; req_idx < bs; ++req_idx) {
     const auto row_token_offset = req_idx * d;
     const auto row_mask_offset = req_idx * d * d;
+    const auto parent_nodes = buildParentNodes(tree_mask, row_mask_offset, d);
+    const auto direct_child_token_sets = buildDirectChildTokenSets(draft_tokens, parent_nodes, row_token_offset);
 
     for (size_t node = 0; node < d; ++node) {
       const auto node_row = row_mask_offset + node * d;
-      if (tree_mask[node_row + node] == 0) {
-        continue;
-      }
-
-      std::vector<int32_t> path_cols;
-      path_cols.reserve(d);
-      for (size_t col = 0; col < d; ++col) {
-        if (tree_mask[node_row + col] != 0) {
-          path_cols.emplace_back(static_cast<int32_t>(col));
-        }
-      }
-      if (path_cols.empty() || path_cols.front() != 0) {
+      if (tree_mask[node_row + node] == 0 || tree_mask[node_row] == 0) {
         continue;
       }
       ++stats.num_paths;
 
-      std::vector<int32_t> path_draft_tokens;
-      path_draft_tokens.reserve(path_cols.size());
-      for (const auto col : path_cols) {
-        if (col != 0) {
-          path_draft_tokens.emplace_back(draft_tokens[row_token_offset + col]);
-        }
-      }
-
-      auto current_child_tokens =
-          directChildTokens(draft_tokens, tree_mask, row_token_offset, row_mask_offset, d, node);
+      auto path_draft_tokens = pathDraftTokens(draft_tokens, tree_mask, row_token_offset, node_row, d);
+      const auto& current_child_tokens = direct_child_token_sets[node];
       size_t num_bonus_candidates = 0;
-      const auto path_bonus_topk = node < wide_bonus_token_count ? bonus_topk : std::min<size_t>(bonus_topk, 1);
+      const auto path_bonus_topk = node < wide_bonus_path_count ? bonus_topk : std::min<size_t>(bonus_topk, 1);
       if (path_bonus_topk == 0) {
         continue;
       }
@@ -421,7 +414,7 @@ PrecomputeDraftsStats Ngram::precomputeDraftsDense(
           buildRootCandidatesUnlocked(check_tokens, check_total_len, path_state, path_max_bonus_candidates);
 
       for (const auto bonus_token : bonus_candidates) {
-        if (containsToken(current_child_tokens, bonus_token)) {
+        if (current_child_tokens.contains(bonus_token)) {
           continue;
         }
         const auto bonus_slot = num_bonus_candidates++;
@@ -449,7 +442,7 @@ PrecomputeDraftsStats Ngram::precomputeDraftsDense(
       std::copy_n(
           res.mask.begin() + row * res.token.size(),
           result_size,
-          dense_cache.tree_mask.begin() + dense_mask_offset + row * d);
+          dense_cache.tree_masks.begin() + dense_mask_offset + row * d);
     }
   }
   stats.num_cache_entries = static_cast<int64_t>(phase2_entries.size());

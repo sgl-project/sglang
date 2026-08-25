@@ -28,7 +28,7 @@ struct PrecomputeDraftsStats {
 struct PrecomputeDraftsDenseCache {
   std::vector<int32_t> bonus_tokens;
   std::vector<int32_t> draft_tokens;
-  std::vector<uint8_t> tree_mask;
+  std::vector<uint8_t> tree_masks;
 };
 
 class Ngram {
