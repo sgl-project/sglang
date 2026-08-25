@@ -99,7 +99,6 @@ export const Llama33Deployment = () => {
       cmd += `  --disable-overlap-schedule \\\n`;
       cmd += `  --tp 6`;
     } else if (hardware === 'arc_b') {
-      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += `  --device xpu \\\n`;
       cmd += `  --tp 8`;
     } else {
