@@ -36,6 +36,9 @@ class QuantizationConfig(SRTQuantizationConfig):
     # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
     quantized_model_path: str | None = None
     checkpoint_uses_native_qkv_layout: bool = False
+    checkpoint_uses_comfy_quantization: bool = False
+    supports_srt_linear_layers: bool = False
+    supports_quantized_embeddings: bool = False
 
     def get_scaled_act_names(self) -> list[str]:
         return []
@@ -45,3 +48,11 @@ class QuantizationConfig(SRTQuantizationConfig):
     ) -> bool:
         """Whether a row-parallel shard preserves this format's input layout."""
         return True
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        """Whether this checkpoint config owns the named embedding table."""
+        return False
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        """Translate checkpoint module names to the native model namespace."""
+        return
