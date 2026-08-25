@@ -43,6 +43,8 @@ class AttentionBackendEnum(enum.Enum):
     LASER_ATTN = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
+    SOL_ATTN = enum.auto()
+    SUBBLOCK_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -60,6 +62,8 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.SOL_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
         }
 
 
@@ -184,6 +188,10 @@ class Platform:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
+    def is_device_type(self, device_type: str | None) -> bool:
+        """Return whether a device type belongs to this platform."""
+        return device_type == self.device_type
+
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
@@ -224,6 +232,10 @@ class Platform:
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         raise NotImplementedError
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        torch.get_device_module(device).set_device(device)
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -405,8 +417,8 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """Whether to enable DIT layerwise offload by default on the current platform."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
 
     @classmethod

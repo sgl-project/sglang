@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import _run_sgl_eval
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="base-b-test-cpu")
 
 
 def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None:
@@ -128,6 +128,56 @@ class TestRunSglEval(CustomTestCase):
                 _run_sgl_eval("gsm8k", args)
 
         self.assertNotIn("--num-examples", captured["cmd"])
+
+    def _capture_cmd(self, eval_name="gsm8k", **overrides):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            out_dir = Path(cmd[cmd.index("--out-dir") + 1])
+            _write_fake_metrics(
+                out_dir,
+                eval_name,
+                {
+                    "model": "test-model",
+                    "latency_seconds": 1.0,
+                    "output_throughput_tps": 1.0,
+                    "aggregate": {"score": 0.5},
+                },
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            args = self._args(td, **overrides)
+            with patch("sglang.test.run_eval.subprocess.run", side_effect=fake_run):
+                _run_sgl_eval(eval_name, args)
+        return captured["cmd"]
+
+    def test_omits_sampling_flags_when_unset(self):
+        """Unset top_p / seed / repeat must not reach the CLI -- sgl-eval's own
+        defaults differ from a forced value (seed unset != seed 0)."""
+        cmd = self._capture_cmd()
+        for flag in ("--top-p", "--seed", "--n-repeats"):
+            self.assertNotIn(flag, cmd)
+
+    def test_forwards_sampling_flags_when_set(self):
+        cmd = self._capture_cmd(top_p=0.95, seed=0, repeat=1)
+        for flag, value in (("--top-p", "0.95"), ("--seed", "0"), ("--n-repeats", "1")):
+            self.assertIn(flag, cmd)
+            self.assertEqual(cmd[cmd.index(flag) + 1], value)
+
+    def test_thinking_auto_detected_from_model_name(self):
+        self.assertIn(
+            "--thinking", self._capture_cmd(model="Qwen/Qwen3.5-397B-A17B-FP8")
+        )
+
+    def test_explicit_thinking_false_suppresses_auto_detect(self):
+        """A caller matching a harness that sent no chat_template_kwargs has to be
+        able to turn the model-name heuristic off."""
+        cmd = self._capture_cmd(
+            model="Qwen/Qwen3.5-397B-A17B-FP8", sgl_eval_thinking=False
+        )
+        self.assertNotIn("--thinking", cmd)
 
     def test_raises_on_nonzero_exit(self):
         def fake_run(cmd, **kwargs):
