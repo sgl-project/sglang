@@ -1,5 +1,3 @@
-#pragma once
-
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 
@@ -83,6 +81,9 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     }
     auto* draft_data = static_cast<const int32_t*>(draft_tokens_tv.data_ptr());
     auto* mask_data = static_cast<const uint8_t*>(tree_mask_tv.data_ptr());
+    auto* bonus_out = static_cast<int32_t*>(out_bonus_tokens.data_ptr());
+    auto* draft_out = static_cast<int32_t*>(out_draft_tokens.data_ptr());
+    auto* mask_out = static_cast<uint8_t*>(out_tree_masks.data_ptr());
     auto* stats_out = static_cast<int64_t*>(out_stats.data_ptr());
     auto input = read_batch_(tokens_flat, offsets, total_lens_tv);
     std::vector<int32_t> draft_tokens(draft_data, draft_data + draft_tokens_tv.size(0));
@@ -101,14 +102,19 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     if (out_stats.size(0) < 3) {
       throw std::runtime_error("out_stats buffer too small for precompute_drafts_dense");
     }
+    if (out_bonus_tokens.size(0) < static_cast<int64_t>(dense_cache.bonus_tokens.size()) ||
+        out_draft_tokens.size(0) < static_cast<int64_t>(dense_cache.draft_tokens.size()) ||
+        out_tree_masks.size(0) < static_cast<int64_t>(dense_cache.tree_masks.size())) {
+      throw std::runtime_error("output buffer too small for precompute_drafts_dense");
+    }
     if (!dense_cache.bonus_tokens.empty()) {
       std::memcpy(bonus_out, dense_cache.bonus_tokens.data(), dense_cache.bonus_tokens.size() * sizeof(int32_t));
     }
     if (!dense_cache.draft_tokens.empty()) {
       std::memcpy(draft_out, dense_cache.draft_tokens.data(), dense_cache.draft_tokens.size() * sizeof(int32_t));
     }
-    if (!dense_cache.tree_mask.empty()) {
-      std::memcpy(mask_out, dense_cache.tree_mask.data(), dense_cache.tree_mask.size() * sizeof(uint8_t));
+    if (!dense_cache.tree_masks.empty()) {
+      std::memcpy(mask_out, dense_cache.tree_masks.data(), dense_cache.tree_masks.size() * sizeof(uint8_t));
     }
     stats_out[0] = stats.num_paths;
     stats_out[1] = stats.num_phase2_contexts;
