@@ -35,7 +35,44 @@ bazel run //bazel/python:runtime_import_requirements.update
 # Python toolchain, checked wheels, SGLang sources, and runtime data.
 bazel run --config=cpu //bazel/integration:sglang_cli -- version
 bazel test --config=cpu //bazel/integration:runtime_import_test
+
+# Main Rust extensions, gateway, and direct Bazel wheel assembly.
+bazel build --config=cpu //:bazel_components
+bazel test --config=cpu \
+  //bazel/rust:sgl_model_gateway_lock_parity_test \
+  //sgl-model-gateway:internal_tests
+bazel build --config=cpu //sgl-model-gateway:sgl-model-gateway
+bazel build --config=cpu \
+  --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
+  //bazel/packaging:main_wheel
+
+# Hardware targets use the matching pre-provisioned PyTorch/toolchain image.
+bazel build --config=cpu //python/sglang/kernels/aot:cpu_wheel
+bazel build --config=cuda //python/sglang/kernels/aot:cuda_wheel
+bazel build --config=rocm //python/sglang/kernels/aot:rocm_wheel
+bazel test --config=cuda //bazel/integration:dummy_model_e2e
+bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 ```
+
+## Verified migration state
+
+- The Bazel-owned CPU runtime imports the public package, CLI, Engine class,
+  kernel registry, and environment layer from declared runfiles.
+- `_grpc`, `_multimodal`, and `_server` compile as Bazel native extensions with
+  their expected `PyInit_*` symbols.
+- The model gateway rlib, binary, abi3 shared library, lock parity test, tonic
+  0.12/0.14 contract test, and policy tests build successfully.
+- Native host JIT `ngram_corpus_ffi.so` links against a SHA-pinned TVM-FFI
+  wheel.
+- CPU and ROCm `sglang-kernel` wheels build and import through Bazel wrapper
+  targets. CUDA builds use immutable Bazel-fetched CUTLASS, fmt, Triton,
+  FlashInfer, sgl-attn, and FlashMLA sources.
+- Dummy-weight Qwen3 and pinned real-weight Qwen2-0.5B Engine tests passed on an
+  H200. The Qwen2 test verifies the model revision, weight digest, token IDs,
+  decoded text, and completion metadata.
+- The transitional PEP 517 wheel and authoritative wheel match at 4,230 paths,
+  3,377 imports, and three native modules. The direct Bazel wheel has the same
+  manifest, tags, version, native module destinations, and valid RECORD.
 
 ## Ownership boundaries
 
@@ -44,11 +81,11 @@ bazel test --config=cpu //bazel/integration:runtime_import_test
 | Python profiles | `bazel/python/profiles.json` validates manifest/extra selection; `runtime_import` is the checked Linux x86_64/cp312 CPU import lock; each accelerator gets a separate future lock hub | `python/pyproject*.toml` |
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
-| Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_core` compiles the host C++ core; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
-| AOT CUDA/ROCm/CPU kernels | platform-constrained source and wrapper targets are the next native phase | scikit-build/CMake and platform setup scripts |
-| Main Rust extensions | one crate-universe closure from `rust/Cargo.lock`; `sglang-mm` is first | Cargo + setuptools-rust |
+| Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_ffi.so` compiles and links the host TVM-FFI adapter; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
+| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA source downloads are immutable Bazel repositories | scikit-build/CMake and platform setup scripts |
+| Main Rust extensions | one crate-universe closure builds `_multimodal`, `_grpc`, `_server`, and the pure Rust libraries | Cargo + setuptools-rust |
 | Rust gRPC | `//rust/sglang-grpc:sglang_grpc_core` runs the existing tonic build script with Bazel's declared protoc and proto input | Cargo/tonic-build |
-| Model gateway/router | separate crate universe and Python ABI because its Rust/PyO3/tonic versions differ | Cargo + maturin |
+| Model gateway/router | separate 838-package crate universe builds the gateway binary and abi3 shared library while preserving dual tonic versions | Cargo + maturin |
 | HF config/tokenizer/download | `//python/sglang/srt/utils/hf_transformers:hub` and `//python/sglang/srt/utils:hf_transformers_patches` are torch-free; model config remains separate | setuptools |
 | Weight loading/cache daemon | `//python/sglang/srt/weight_cache:protocol` is torch-free; CUDA IPC transport and daemon remain accelerator-constrained | setuptools |
 | Model artifacts | runtime inputs except for a future pinned tiny smoke fixture | Hugging Face/runtime cache |
@@ -99,30 +136,16 @@ analysis.
 
 ### 3. Integration and artifact parity
 
-- Extend `//bazel/integration:runtime_import_test` to the dummy-weight,
-  tokenizer-free Engine smoke after the CUDA wheel closure is declared.
-- Add a real-weight Qwen2 0.5B Bazel smoke after model data and native wheels
-  are immutable inputs.
-- Compare Bazel and existing wheel manifests, Python ABI tags, exported
-  symbols, RPATH/`DT_NEEDED`, and runtime behavior.
-- Add digest-pinned OCI image/load targets.
-- Make a Bazel artifact authoritative only after parity on every supported
-  hardware/Python matrix entry.
+The runtime, real-model E2E, and wheel-manifest milestones are complete. Bazel
+must not become the release authority yet:
 
-`runtime_import` pins cp312/manylinux CPU Torch, TorchVision, and Triton wheels
-by URL and digest, then imports the real `Engine` class. A dummy Engine startup
-probe reaches `sglang.kernels.ops.kvcache.cache_move` and stops precisely at
-`sgl_kernel.copy_all_layer_kv_cache_cpu`: the CPU `sgl_kernel` extension is
-built by the platform wheel and is not available as an independent CPU wheel.
-
-A CUDA Engine target therefore needs a separate Linux/Python/CUDA hub. The
-current CUDA manifest's accelerator-native closure includes `torch==2.13.0`,
-`sglang-kernel==0.4.6.post1`, `flashinfer-python[cu13]==0.6.17`,
-`flash-attn-4>=4.0.0b18`, `humming-kernels[cu13]==0.1.12`,
-`quack-kernels==0.6.4`, `sgl-deep-gemm==0.1.5.post3`,
-`sgl-deep-ep==0.1.2`, `cuda-python>=13.0`, `cuda-tile==1.6.0rc5`,
-`nvidia-cutlass-dsl[cu13]==4.6.2`, `nvidia-mathdx==25.6.0`,
-`tilelang==0.1.12`, `tokenspeed-mla==0.1.8`, and
-`torch-memory-saver>=0.0.9.post1`. The tiny model configuration must also be a
-declared runtime artifact. Using installed site-packages or a mutable Hugging
-Face cache would hide those ABI and data boundaries.
+- Bazel Rust outputs currently inherit the host GLIBC and can require newer
+  symbols than the manylinux-built authoritative extensions. A pinned
+  manylinux-compatible Rust/C++ sysroot is required.
+- CPU/CUDA/ROCm wheel wrappers still consume the ambient PyTorch compiler ABI
+  and toolkit. CUDA source downloads are declared, but the compiler, sysroot,
+  Python development files, and PyTorch libraries must become toolchains.
+- Release-only `auditwheel repair`, ELF `DT_NEEDED`/RPATH policy, architecture
+  matrices, and digest-pinned OCI image targets remain outside Bazel.
+- Hardware wheel builds remain shadow artifacts until all ABI and numerical
+  tests pass across supported CUDA/ROCm/Python variants.
