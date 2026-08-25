@@ -60,6 +60,10 @@ try:
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    from sglang.kernels.ops.attention.aiter_unified_attention_mtp import (
+        qwen35_mtp_unified_attention,
+    )
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -2290,6 +2294,41 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
+                    use_qwen35_mtp_kernel = (
+                        is_gfx95_supported()
+                        and 1 < self.forward_metadata.max_q_len <= 4
+                        and max_kv_len > 512
+                        and layer.tp_q_head_num == 16
+                        and layer.tp_k_head_num == 1
+                        and layer.tp_v_head_num == 1
+                        and layer.qk_head_dim == 256
+                        and layer.v_head_dim == 256
+                        and self.page_size == 16
+                        and q_unified.dtype == torch.bfloat16
+                        and k_unified.dtype == fp8_dtype
+                        and window_size == (-1, -1)
+                        and not layer.logit_cap
+                        and sinks is None
+                    )
+                    if use_qwen35_mtp_kernel:
+                        qwen35_mtp_unified_attention(
+                            q=q_unified,
+                            k=k_unified,
+                            v=v_unified,
+                            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            cu_seqlens_q=self.forward_metadata.qo_indptr,
+                            seqused_k=(
+                                forward_batch.seq_lens + self.forward_metadata.max_q_len
+                            ),
+                            max_seqlen_q=self.forward_metadata.max_q_len,
+                            max_seqlen_k=max_kv_len,
+                            softmax_scale=layer.scaling,
+                            block_table=page_table,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                        )
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                     # GQA-packing fix: do NOT expand the single KV head to
                     # tp_q_head_num. Passing K/V with the true kv-head count (exactly
                     # like forward_decode) lets unified_attention derive
