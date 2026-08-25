@@ -61,7 +61,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap=True,
         enable_overlap_mlx=False,
         server_args=SimpleNamespace(),
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(think_start_ids=None, think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,

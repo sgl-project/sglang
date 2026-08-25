@@ -32,6 +32,9 @@ class ReasoningTokenUsageMixin:
             parser.detector.think_end_token
         )
         assert cls.think_end_token_id is not None
+        cls.think_start_token_id = cls.tokenizer.convert_tokens_to_ids(
+            parser.detector.think_start_token
+        )
 
     def _reasoning_chat_request(self, enable_thinking, stream=False):
         api_key = getattr(self, "api_key", None)
@@ -113,6 +116,27 @@ class ReasoningTokenUsageMixin:
         reported = data["meta_info"]["reasoning_tokens"]
         actual = data["output_ids"].index(self.think_end_token_id) + 1
         self.assertEqual(reported, actual)
+
+    def test_reasoning_tokens_generate_without_thinking_delimiter(self):
+        api_key = getattr(self, "api_key", None)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        resp = requests.post(
+            f"{self.base_url}/generate",
+            headers=headers,
+            json={
+                "text": "The capital city of France is",
+                "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+                "require_reasoning": True,
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        reported = data["meta_info"]["reasoning_tokens"]
+
+        if self.think_start_token_id in data["output_ids"]:
+            self.assertGreater(reported, 0)
+        else:
+            self.assertEqual(reported, 0)
 
 
 class SeparateReasoningMixin:
