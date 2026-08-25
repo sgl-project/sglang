@@ -19,6 +19,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
+    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
@@ -78,19 +80,13 @@ class PrefetchOperation(StorageOperation):
         )
         self.pool_transfers_done = not bool(pool_transfers)
 
-    def increment(self, num_tokens: int):
-        with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
-
     def mark_terminate(self):
         with self._lock:
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -112,6 +108,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -131,6 +128,7 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            host_memory_mode=host_memory_mode,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -587,6 +585,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        operation.all_hash_values = hash_value
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -637,26 +636,50 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
-    def _page_transfer(self, operation):
-        # KV pools first — determines actual completed page count
-        super()._page_transfer(operation)
+    def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        # KV pools and KV-derived pools first — determines actual completed page count
+        kv_completed_pages = super()._page_transfer(operation)
+
+        # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
+        self._page_transfer_sidecar(operation, kv_completed_pages)
+
+    def _page_transfer_sidecar(
+        self, operation: PrefetchOperation, kv_completed_pages: int
+    ) -> None:
+        if operation.pool_transfers is None:
+            return
 
         # Extra pools only after KV fully completes. If KV terminated early
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
-        kv_completed_pages = operation.completed_tokens // self.page_size
-        if (
-            operation.pool_transfers
-            and not operation.is_terminated()
-            and kv_completed_pages == len(operation.hash_value)
+        pool_hits: dict[str, int] = {}
+        if not operation.is_terminated() and kv_completed_pages == len(
+            operation.hash_value
         ):
+            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
+            # Only handle non-KV-derived sidecar pools here.
+            transfers_nonkv = [
+                transfer
+                for transfer in operation.pool_transfers
+                if transfer.indices_from_pool != PoolName.KV
+            ]
             self._sync_trailing_keys(
-                operation.pool_transfers, operation.hash_value, kv_completed_pages
+                transfers_nonkv, operation.hash_value, kv_completed_pages
             )
-            self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
-        operation.pool_transfers_done = True
+            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            pool_hits = count_pool_hits(results)
+        # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
+        # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
+        # to perform all_reduce.
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id,
+                operation=operation,
+                pool_hits=pool_hits,
+            )
+        )
+        return
 
     def _page_backup(self, operation):
         # MLA KV is replicated across TP ranks and should still be written only
@@ -668,9 +691,11 @@ class HybridCacheController(BaseHiCacheController):
         ]
 
         if backup_transfers:
-            self._resolve_sidecar_derived_pool_transfers(operation)
+            self._resolve_sidecar_kv_derived_pool_transfers(operation)
+            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(backup_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            pool_hits = count_pool_hits(results)
+            operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
             super()._page_backup(operation)
@@ -734,7 +759,14 @@ class HybridCacheController(BaseHiCacheController):
             except Empty:
                 continue
 
-    def _resolve_sidecar_derived_pool_transfers(self, operation):
+    def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
+        for transfer in operation.pool_transfers:
+            if transfer.indices_from_pool == PoolName.KV:
+                transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
+
+    def _resolve_sidecar_nonkv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool is None:
                 continue
@@ -757,9 +789,7 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                transfer.host_indices = operation.host_indices
-                if transfer.keys is None:
-                    transfer.keys = operation.hash_value
+                pass
 
     def _sync_trailing_keys(
         self,
@@ -780,6 +810,28 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            pool_page_size = (
+                entry.host_pool.page_size if entry is not None else self.page_size
+            )
+            needed = len(transfer.keys) * pool_page_size
+            if transfer.host_indices.numel() > needed:
+                # The hit undershot the pre-allocated window buffer. Backends
+                # fetch keys zipped against the buffer head, so shrink the
+                # transfer to match and release the tail now — otherwise the
+                # length mismatch makes batch_get_v2 fetch nothing and the
+                # whole window is silently lost downstream.
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices[needed:],
+                        )
+                    ]
+                )
+                transfer.host_indices = transfer.host_indices[:needed]
 
     def _resolve_pool_transfers_allocation(
         self,
@@ -863,3 +915,23 @@ class HybridCacheController(BaseHiCacheController):
             pool.host_indices = source.host_indices
             pool.device_indices = source.device_indices
         return extra_pools
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        # Handle KV-derived pool.
+        super()._reduce_prefetch_ack(ack)
+
+        # Handle other sidecar pools, e.g. SWA, Mamba.
+        if ack.pool_hits is not None:
+            # "for ... in PoolName" ensures the same order across all ranks.
+            # On prefetch failure, pool_hits may be empty dict.
+            packed = torch.tensor(
+                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                dtype=torch.int,
+            )
+            self._all_reduce(
+                packed,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            for i, pool in enumerate(PoolName):
+                ack.pool_hits[pool.value] = packed[i].item()

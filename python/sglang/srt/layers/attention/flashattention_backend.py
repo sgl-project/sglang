@@ -616,11 +616,14 @@ class FlashAttentionBackend(AttentionBackend):
             # upper bound) so captured graphs keep a valid address; each replay
             # refills a [:num_tokens] view.
             if self.use_sliding_window_kv_pool:
+                assert forward_batch.out_cache_loc is not None
                 m.swa_page_table = torch.zeros(
                     (bs, self.max_num_pages), dtype=torch.int32, device=device
                 )
                 self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
-                    (self.max_context_len,), dtype=torch.int64, device=device
+                    (forward_batch.out_cache_loc.shape[0],),
+                    dtype=torch.int64,
+                    device=device,
                 )
             self.full_cg_prefill_metadata = m
         m = self.full_cg_prefill_metadata
@@ -657,6 +660,11 @@ class FlashAttentionBackend(AttentionBackend):
             # SWA write targets for the new tokens (KVWriteLoc.swa_loc), refilled
             # into the pointer-stable buffer and bound as a [:num_tokens] view.
             num_out = forward_batch.out_cache_loc.shape[0]
+            assert_buffer_fits(
+                num_out,
+                self.full_cg_prefill_swa_out_cache_loc.shape[0],
+                "full-CG prefill SWA write-location buffer",
+            )
             self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
@@ -686,7 +694,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
             seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
+            if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
             else self.max_context_len
         )
 
@@ -1162,6 +1170,61 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def get_paged_mha_kv_cache(
+        self,
+        layer: RadixAttention,
+        *,
+        head_group_num: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        return (
+            key_cache.view(
+                -1,
+                self.page_size,
+                layer.tp_k_head_num // head_group_num,
+                layer.head_dim,
+            ),
+            value_cache.view(
+                -1,
+                self.page_size,
+                layer.tp_v_head_num // head_group_num,
+                layer.v_head_dim,
+            ),
+        )
+
+    def prepare_paged_mha_query(
+        self,
+        q: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+        layer: RadixAttention,
+        *,
+        logical_batch_size: int,
+        kv_head_num: int,
+        is_prefill: bool,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        k_descale = v_descale = None
+        if (
+            self.kv_cache_dtype_str != "auto"
+            and layer.head_dim <= 256
+            and not self.kv_cache_is_mxfp8
+            and (not is_prefill or self.fa_impl_ver != 4)
+        ):
+            if layer.k_scale is not None:
+                descale_shape = (logical_batch_size, kv_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        return q, q_rope, k_rope, k_descale, v_descale
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1274,24 +1337,15 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
-        fa_k_descale, fa_v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
-            and not self.kv_cache_is_mxfp8
-        ):
-            if layer.k_scale is not None:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                fa_k_descale = layer.k_scale.expand(descale_shape)
-                fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
+            q,
+            q_rope,
+            k_rope,
+            layer,
+            logical_batch_size=forward_batch.batch_size,
+            kv_head_num=layer.tp_k_head_num,
+            is_prefill=True,
+        )
         # Check if we should use local attention
         use_local_attn = (
             self.has_local_attention
@@ -1377,13 +1431,8 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            key_cache, value_cache = self.get_paged_mha_kv_cache(
+                layer,
             )
             if layer.is_cross_attention:
                 page_table = metadata.encoder_page_table
@@ -1861,34 +1910,23 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
 
-        fa_k_descale, fa_v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and not self.kv_cache_is_mxfp8
-        ):
-            if layer.k_scale is not None:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                fa_k_descale = layer.k_scale.expand(descale_shape)
-                fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
+            q,
+            q_rope,
+            k_rope,
+            layer,
+            logical_batch_size=forward_batch.batch_size,
+            kv_head_num=layer.tp_k_head_num,
+            is_prefill=False,
+        )
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
         if not self.use_mla:
             # Do multi-head attention
 
-            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            key_cache, value_cache = self.get_paged_mha_kv_cache(
+                layer,
             )
 
             if layer.is_cross_attention:

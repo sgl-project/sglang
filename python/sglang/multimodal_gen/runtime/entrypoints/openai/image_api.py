@@ -257,13 +257,15 @@ def _get_response_resize(
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
-            # Fall back to the aligned sampling canvas if the output cannot be
-            # inspected (for example, for a custom output transport).
+            # Fall back to request metadata if the output cannot be inspected
+            # (for example, for a custom output transport).
             pass
 
-    if sampling_params.width is None or sampling_params.height is None:
+    width = sampling_params.requested_width or sampling_params.width
+    height = sampling_params.requested_height or sampling_params.height
+    if width is None or height is None:
         return None
-    return sampling_params.output_size_str()
+    return f"{width}x{height}"
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -314,6 +316,12 @@ async def generations(
             use_system_prompt=_get_extra_field(request, "use_system_prompt"),
             use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
+            enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
+            cache_dit_params=_get_extra_field(request, "cache_dit_params"),
+            cfg_gate_step=_get_extra_field(request, "cfg_gate_step"),
+            attention_backend_override=_get_extra_field(
+                request, "attention_backend_override"
+            ),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
