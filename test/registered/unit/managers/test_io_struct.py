@@ -1075,17 +1075,22 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
     def test_error_cases(self):
         """Test various error cases."""
-        # Test when neither text, input_ids, nor input_embeds is provided
-        with self.assertRaises(ValueError):
-            req = GenerateReqInput()
-            req.normalize_batch_and_arguments()
-
-        # Test when all of text, input_ids, and input_embeds are provided
-        with self.assertRaises(ValueError):
-            req = GenerateReqInput(
-                text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
-            )
-            req.normalize_batch_and_arguments()
+        invalid_inputs = (
+            {},
+            {"text": "Hello", "input_ids": [1, 2, 3]},
+            {"text": "Hello", "input_embeds": [[0.1, 0.2]]},
+            {"input_ids": [1, 2, 3], "input_embeds": [[0.1, 0.2]]},
+            {
+                "text": "Hello",
+                "input_ids": [1, 2, 3],
+                "input_embeds": [[0.1, 0.2]],
+            },
+        )
+        for inputs in invalid_inputs:
+            with self.subTest(inputs=inputs), self.assertRaisesRegex(
+                ValueError, "Exactly one"
+            ):
+                GenerateReqInput(**inputs).normalize_batch_and_arguments()
 
     def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
         req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)

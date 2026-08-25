@@ -404,15 +404,13 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
+        num_inputs = sum(
+            value is not None
+            for value in (self.text, self.input_ids, self.input_embeds)
+        )
+        if num_inputs != 1:
             raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of text, input_ids, or input_embeds should be provided."
             )
         if (
             self.return_flat_raw_top_logprobs
