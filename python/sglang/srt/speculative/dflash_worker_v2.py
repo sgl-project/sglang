@@ -1790,7 +1790,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(_get_dflash_embedding_module(self.draft_model, target_model))
+        embed_module = unwrap_lora_layer(
+            _get_dflash_embedding_module(self.draft_model, target_model)
+        )
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")
