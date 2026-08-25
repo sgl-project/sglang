@@ -91,10 +91,12 @@ jobs:
 
       - name: Build independent components
         run: |
-          bazel build --config=cpu //:bazel_components
-          bazel build --config=cpu \
+          bazel build --config=manylinux -c opt \
             --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
-            //bazel/packaging:main_wheel
+            //:bazel_components \
+            //bazel/packaging:main_wheel \
+            //sgl-model-gateway:sgl-model-gateway \
+            //sgl-model-gateway:sglang_router_rs_abi3
 
       - name: Run CPU foundation tests
         run: |

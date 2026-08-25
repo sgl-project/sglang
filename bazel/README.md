@@ -73,6 +73,10 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 - The transitional PEP 517 wheel and authoritative wheel match at 4,230 paths,
   3,377 imports, and three native modules. The direct Bazel wheel has the same
   manifest, tags, version, native module destinations, and valid RECORD.
+- The `manylinux` configuration pins LLVM and a glibc 2.24 sysroot. Main
+  extensions, gateway artifacts, and direct-wheel native modules require at
+  most GLIBC 2.18 and have no dynamic `libssl`, `libcrypto`, or `libpcre2`
+  dependency.
 
 ## Ownership boundaries
 
@@ -136,16 +140,15 @@ analysis.
 
 ### 3. Integration and artifact parity
 
-The runtime, real-model E2E, and wheel-manifest milestones are complete. Bazel
-must not become the release authority yet:
+The runtime, real-model E2E, wheel-manifest, and manylinux ABI milestones are
+complete. Bazel must not become the release authority yet:
 
-- Bazel Rust outputs currently inherit the host GLIBC and can require newer
-  symbols than the manylinux-built authoritative extensions. A pinned
-  manylinux-compatible Rust/C++ sysroot is required.
 - CPU/CUDA/ROCm wheel wrappers still consume the ambient PyTorch compiler ABI
   and toolkit. CUDA source downloads are declared, but the compiler, sysroot,
   Python development files, and PyTorch libraries must become toolchains.
-- Release-only `auditwheel repair`, ELF `DT_NEEDED`/RPATH policy, architecture
+- Vendored OpenSSL still consumes runner-provided Perl and Make during its
+  build; a pinned execution image must provide those tools.
+- Release-only `auditwheel repair`, final ELF RPATH policy, architecture
   matrices, and digest-pinned OCI image targets remain outside Bazel.
 - Hardware wheel builds remain shadow artifacts until all ABI and numerical
   tests pass across supported CUDA/ROCm/Python variants.
