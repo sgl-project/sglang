@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import patch
 
 import torch
@@ -51,3 +52,9 @@ def test_empty_mxfp8_dispatch_uses_same_payload_dtype_as_nonempty_rank():
     ]
     assert output.hidden_states.dtype == torch.float8_e4m3fn
     assert output.hidden_states_scale.dtype == torch.uint8
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
