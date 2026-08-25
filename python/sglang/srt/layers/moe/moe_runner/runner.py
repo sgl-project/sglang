@@ -109,6 +109,10 @@ class MoeRunner:
             # Import here (not at module top, to avoid a circular import) to
             # register the hpc_ops fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
+        elif runner_backend.is_torch_native():
+            import sglang.srt.layers.moe.moe_runner.torch_native  # noqa: F401
+
+            self.runner_core = None  # Torch native only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
