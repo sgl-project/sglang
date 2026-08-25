@@ -22,6 +22,7 @@ class TestRingTailPadDispatch(unittest.TestCase):
         obj.backend = AttentionBackendEnum.FA
         obj.causal = False
         obj.dropout_p = 0.0
+        obj.attn_impl = object()
         return obj
 
     def test_tail_pad_meta_reaches_the_ring_kernel(self):
@@ -30,12 +31,12 @@ class TestRingTailPadDispatch(unittest.TestCase):
         meta = {"pad_start": 13, "pad_end": 16, "local_pad": 3}
         seen = {}
 
-        def fake_ring(qc, kc, vc, *, softmax_scale, real_seq_len, ring_ws):
+        def fake_ring(qc, kc, vc, *, attn_impl, real_seq_len, ring_ws):
             seen.update(
                 shape=tuple(qc.shape),
                 real=real_seq_len,
                 ws=ring_ws,
-                scale=softmax_scale,
+                impl=attn_impl,
             )
             return torch.ones_like(qc)
 
@@ -61,6 +62,7 @@ class TestRingTailPadDispatch(unittest.TestCase):
         self.assertEqual(out.shape, q.shape)
         self.assertEqual(seen["real"], 13)
         self.assertEqual(seen["ws"], 2)
+        self.assertIs(seen["impl"], obj.attn_impl)
         self.assertEqual(seen["shape"], (4, 2, 8))
         # Last ring rank holds global rows [12, 16): row 13 onward is pad.
         self.assertTrue(torch.all(out[0, 1:] == 0))

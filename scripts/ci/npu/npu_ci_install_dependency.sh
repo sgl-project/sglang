@@ -19,6 +19,7 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
+    ffmpeg \
     libgl1-mesa-glx \
     libgl1-mesa-dri \
     ca-certificates \
@@ -60,11 +61,11 @@ ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirror
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.8.10"
+SGLANG_KERNEL_NPU_TAG="2026.8.13"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
-&& ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \
+&& ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl ./attentions*.whl \
 && (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
 
 ### Install custom-ops
