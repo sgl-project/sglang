@@ -1,6 +1,9 @@
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
@@ -126,3 +129,7 @@ def test_waiting_timeout_invalidates_cached_generation(_mock_time):
 
     assert receiver._check_waiting_timeout() == KVPoll.Failed
     assert receiver.kv_mgr.connection_pool == {}
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
