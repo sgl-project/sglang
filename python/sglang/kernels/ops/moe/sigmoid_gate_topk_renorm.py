@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.gate_topk import (
 from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_topk_renorm_v2,
 )
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.environ import envs
 
 
@@ -207,6 +208,30 @@ def sigmoid_gate_topk_renorm(
             route_scale,
             return_packed=return_packed_topk,
             enable_pdl=is_arch_support_pdl(),
+        )
+
+    # On non-CUDA devices prefer the unified router's LOGSIGMOID_SINK epilogue: it
+    # is the same op with the `tl.topk` / `tl.bitonic_merge` sort below replaced by
+    # k masked-max passes in registers, worth 22-46x on Intel Xe. CUDA is excluded
+    # deliberately -- the win is an Xe measurement and there is no NVIDIA A/B or
+    # test for this epilogue, so CUDA keeps the sort-based kernel when it misses
+    # the JIT gate above.
+    if (
+        n_shared_experts > 0
+        and not logits.is_cuda
+        and envs.SGLANG_OPT_USE_ROUTER_GATE_EPILOGUE.get()
+    ):
+        return moe_fused_gate(
+            logits,
+            bias,
+            topk=k,
+            scoring_func="sigmoid",
+            renormalize=False,  # LOGSIGMOID_SINK always renormalizes
+            routed_scaling_factor=route_scale,
+            apply_routed_scaling_factor_on_output=False,  # ditto for the scale
+            shared_sink=n_shared_experts,
+            global_scale=global_scale,
+            return_packed=return_packed_topk,
         )
 
     shared_w = torch.empty(
