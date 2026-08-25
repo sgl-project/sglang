@@ -1423,22 +1423,13 @@ class ServerArgs:
         "Maximum total PCM audio seconds accepted per streaming ASR item before closing the session with a buffer_overflow error. This duration cap is independent of resident-buffer compaction. Default 60s.",
         NS("serving"),
     ] = 60
-    asr_long_audio_strategy: A[
-        str,
-        Arg(
-            help=(
-                "Realtime ASR strategy after the adapter's long-audio threshold. "
-                "'cumulative' preserves the original full-audio path; "
-                "'encoder_window' opts into encoder-aligned rolling context for "
-                "supported models. Encoder windowing currently requires a local "
-                "single-GPU runtime; unsupported distributed or disaggregated "
-                "deployments fall back to cumulative ASR and retain the adapter "
-                "threshold as the item limit."
-            ),
-            choices=("cumulative", "encoder_window"),
-        ),
+    enable_asr_encoder_window: A[
+        bool,
+        "Enable encoder-aligned rolling context for supported realtime ASR "
+        "models after the adapter's long-audio threshold. Raise "
+        "--asr-max-buffer-seconds above that threshold to process longer items.",
         NS("serving"),
-    ] = "cumulative"
+    ] = False
     asr_max_concurrent_sessions: A[
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",

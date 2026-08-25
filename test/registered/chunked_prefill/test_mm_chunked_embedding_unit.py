@@ -327,6 +327,44 @@ def test_encoder_windows_cache_complete_items_but_reencode_tail():
     assert not mm_schedule.embedding_cache.has(tail.hash)
 
 
+def test_chunked_prefill_routes_encoder_windows_across_a_chunk_boundary():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    complete = _encoder_window_item(2500, (2, 5))
+    tail = _encoder_window_item(2501, (9, 14), cacheable=False)
+    items = [complete, tail]
+    encoder_calls = []
+
+    def encoder(batch):
+        encoder_calls.append([item.hash for item in batch])
+        return _encoder_tensor(batch)
+
+    expected = torch.cat(
+        [
+            _item_embedding(complete)[2:],
+            _item_embedding(tail)[:2],
+        ],
+        dim=0,
+    )
+    input_ids = torch.zeros(16, dtype=torch.long)
+    for _ in range(2):
+        embedding, returned_input_ids = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            items_size=[0, len(items)],
+            prefix_length=[4],
+            extend_length=[7],
+            items_offset_list=[[item.offsets[0] for item in items]],
+            input_ids=input_ids,
+        )
+
+        torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+        assert returned_input_ids is input_ids
+
+    assert encoder_calls == [[complete.hash, tail.hash], [tail.hash]]
+    assert mm_schedule.embedding_cache.has(complete.hash)
+    assert not mm_schedule.embedding_cache.has(tail.hash)
+
+
 def test_encoder_batch_key_separates_incompatible_items():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = [

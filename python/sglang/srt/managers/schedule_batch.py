@@ -364,10 +364,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
-    # One-use items skip the embedding cache so they cannot evict reusable entries.
+    # On an explicitly keyed custom schedule, one-use items skip embedding-cache
+    # reads and writes so they cannot evict reusable entries.
     use_embedding_cache: bool = True
-    # Only items with equal keys may share one encoder call; None keeps the
-    # existing default batching behavior.
+    # A non-None key opts into custom scheduling; only equal keys may share one
+    # encoder call. None preserves the existing default batching and cache path.
     encoder_batch_key: Optional[tuple] = None
 
     def __post_init__(self) -> None:

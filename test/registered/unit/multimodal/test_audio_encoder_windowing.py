@@ -5,6 +5,7 @@ maybe_stub_sgl_kernel()
 import unittest
 from types import SimpleNamespace
 
+import msgspec
 import numpy as np
 import torch
 from transformers import WhisperFeatureExtractor
@@ -101,6 +102,14 @@ class TestAudioEncoderWindowing(CustomTestCase):
             [item.use_embedding_cache for item in tiny_tail_items], [True, False]
         )
         self.assertEqual(tiny_tail_items[0].hash, complete_items[0].hash)
+
+    def test_encoder_batch_key_survives_msgpack(self):
+        items, _ = self._build(36)
+        key = items[0].encoder_batch_key
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(key), type=tuple)
+
+        self.assertEqual(decoded, key)
+        hash(decoded)
 
     def test_tail_mask_prevents_complete_window_identity_collision(self):
         processor = SimpleNamespace(

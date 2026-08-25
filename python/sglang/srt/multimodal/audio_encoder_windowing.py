@@ -218,9 +218,11 @@ def _build_audio_window_items(
             feature=window.feature,
             use_embedding_cache=use_embedding_cache,
             encoder_batch_key=(
-                tuple(window.feature.shape[1:]),
+                "feature",
+                *(int(size) for size in window.feature.shape[1:]),
                 str(window.feature.dtype),
-                tuple(window.attention_mask.shape[1:]),
+                "attention_mask",
+                *(int(size) for size in window.attention_mask.shape[1:]),
                 str(window.attention_mask.dtype),
             ),
             model_specific_data={

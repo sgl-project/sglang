@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -495,8 +496,7 @@ def _get_chunked_embedding_by_item(
 
 # Encoder-window items need cache and batching rules that differ from images.
 # Keep them off the default helpers above so existing MM scheduling is unchanged.
-@dataclass
-class _EncoderWindowEmbeddingInfo:
+class _EncoderWindowEmbeddingInfo(msgspec.Struct):
     item: MultimodalDataItem
     token_count: int
     should_cache: bool
