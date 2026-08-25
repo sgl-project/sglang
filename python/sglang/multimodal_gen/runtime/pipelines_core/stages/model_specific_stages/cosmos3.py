@@ -167,7 +167,9 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
         if image_path is not None:
             image_sources = (
-                list(image_path) if isinstance(image_path, (list, tuple)) else [image_path]
+                list(image_path)
+                if isinstance(image_path, (list, tuple))
+                else [image_path]
             )
             if not image_sources:
                 raise ValueError("Cosmos3 I2V image list is empty")
@@ -336,7 +338,9 @@ class Cosmos3TokenizationStage(PipelineStage):
             seq_lens.append(seq_len)
 
         input_ids = torch.tensor(input_id_lists, dtype=torch.long, device=device)
-        attention_mask = torch.tensor(attention_mask_lists, dtype=torch.long, device=device)
+        attention_mask = torch.tensor(
+            attention_mask_lists, dtype=torch.long, device=device
+        )
         return input_ids, attention_mask, max(seq_lens)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
