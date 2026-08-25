@@ -11,6 +11,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
     ImageEncoderLoader,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    _configure_encoder_quantization,
+)
+from sglang.multimodal_gen.runtime.models.encoders.clip import CLIPVisionModel
+from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 
 
 class TestImageEncoderQuantizationAdmission(unittest.TestCase):
@@ -28,6 +33,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
                 native_only_components=(),
             ),
             component_weights_paths={},
+            component_quantizations={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
         )
@@ -51,6 +57,23 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def _load(self):
         return self.loader.load(
             "/model/image_encoder", self.server_args, "image_encoder", "transformers"
+        )
+
+    def test_clip_serialized_fp8_uses_srt_quantization(self):
+        encoder_config = CLIPVisionConfig()
+        _configure_encoder_quantization(
+            encoder_config,
+            CLIPVisionModel,
+            self._component_config("CLIPVisionModelWithProjection", quantized=True),
+            "/model/image_encoder",
+            "/model/image_encoder",
+            "image_encoder",
+        )
+
+        self.assertIsInstance(encoder_config.quant_config, SRTFp8Config)
+        self.assertEqual(
+            encoder_config.quant_config.packed_modules_mapping,
+            {"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
         )
 
     def test_unknown_quantized_architecture_does_not_fall_back(self):
