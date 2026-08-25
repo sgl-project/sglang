@@ -26,6 +26,7 @@ export const config = {
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
+    { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
   quantizations: [
     { id: "fp8", label: "FP8" },
@@ -51,6 +52,7 @@ export const config = {
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
+    "pro-official|fp4": "deepseek-ai/DeepSeek-V4-Pro-0813",
     // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
     "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
     "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
@@ -83,6 +85,7 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --random-range-ratio 1.0 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --warmup-requests 64 --flush-cache`,
     accuracy: {
@@ -255,11 +258,8 @@ sgl-eval run aime25 \\
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       ep: { label: "EP", values: [
@@ -289,11 +289,11 @@ sgl-eval run aime25 \\
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          hide: { variant: ["flash-official"] } },
+          hide: { variant: ["flash-official", "pro-official"] } },
         { id: "dspark",     label: "DSpark",
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
@@ -316,7 +316,6 @@ sgl-eval run aime25 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
-      showWhen: (base) => base.specAlgorithm !== "DSPARK",
       incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
@@ -421,7 +420,9 @@ sgl-eval run aime25 \\
       {
         id: "dsparkDraftTokens",
         title: "DSpark Proposed Draft Tokens",
-        showWhen: (base) => base.variant === "flash-official" && base.specAlgorithm === "DSPARK",
+        showWhen: (base) =>
+          (base.variant === "flash-official" || base.variant === "pro-official") &&
+          base.specAlgorithm === "DSPARK",
         control: "slider",
         stripPrefixes: ["--speculative-dspark-block-size"],
         options: [
@@ -1274,6 +1275,437 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
+    // ====================================================================
+    // GB300 + FP4 — Pro Official (0813)
+    //
+    // The 0813 checkpoint bundles a DSpark draft head, so the low-latency
+    // recipe uses `--speculative-algorithm DSPARK` and omits the EAGLE shape
+    // flags (SGLang reads gamma from the checkpoint). EAGLE loads on this
+    // checkpoint without erroring but accepts no draft tokens.
+    // ====================================================================
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // --max-running-requests is server-wide and floor-divided by attn_dp_size,
+      // so 512 gives 128 running slots per DP rank. That is the point where both
+      // the slot budget and the KV pool run full on this topology; the three
+      // memory flags together are what keep the KV pool large enough to reach it.
+      match: { hw: "gb300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.9",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 512",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B200 + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // DSpark is incompatible with DP attention -> target-only.
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--chunked-prefill-size 32768",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.92",
+        "--cuda-graph-max-bs-decode 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.835",
+        "--cuda-graph-max-bs-decode 544",
+        "--swa-full-tokens-ratio 0.075",
+        "--chunked-prefill-size 65536",
+        "--tokenizer-worker-num 8",
+        "--enable-prefill-delayer",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // B300 + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // DSpark is incompatible with DP attention -> target-only.
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--disable-flashinfer-autotune",
+        "--chunked-prefill-size 32768",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.92",
+        "--cuda-graph-max-bs-decode 256",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.835",
+        "--cuda-graph-max-bs-decode 544",
+        "--swa-full-tokens-ratio 0.075",
+        "--chunked-prefill-size 65536",
+        "--tokenizer-worker-num 8",
+        "--enable-prefill-delayer",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // GB200 + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: false,
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // DSpark is incompatible with DP attention -> target-only.
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: false,
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 64",
+        "--max-running-requests 128",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      verified: false,
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1", "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 64",
+        "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // H200 + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.88",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.88",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // H100 + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: false,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 16",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.9",
+        "--cuda-graph-max-bs-decode 8",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: false,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 16",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.9",
+        "--cuda-graph-max-bs-decode 8",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      verified: false,
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 16",
+        "--moe-runner-backend marlin",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // MI355X + FP4 — Pro Official (0813)
+    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
+    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // ====================================================================
+    {
+      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--enable-two-batch-overlap",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 65536",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
+      match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--enable-two-batch-overlap",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 65536",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ====================================================================
     // GB200 + NVFP4
     // ====================================================================

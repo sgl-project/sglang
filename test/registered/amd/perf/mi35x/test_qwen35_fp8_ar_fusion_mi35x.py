@@ -1,14 +1,11 @@
-"""MI35x PR-CI accuracy coverage for Qwen3.5-FP8 aiter AR-fusion.
+"""MI35x PR-CI accuracy coverage for Qwen3.5 aiter AR-fusion (8-GPU stage-c).
 
-PR-specific fused AR+RMSNorm+per-group-quant accuracy check. The file runs in
-the 8-GPU MI35x stage-c suite and launches two TP4 servers in parallel:
+Each test launches two parallel TP4 servers -- fused (GPUs 0-3) vs opt-out
+fallback (GPUs 4-7) -- and asserts matching GSM8K accuracy:
 
-* GPUs 0-3: fused AR+RMSNorm+per-group FP8 quant enabled.
-* GPUs 4-7: same launch with SGLANG_DISABLE_FUSED_AR_QUANT=1 fallback.
-
-Each server runs GSM8K and reports accuracy, invalid rate, latency, and output
-throughput. This is the PR-CI accuracy signal; the nightly throughput/latency
-perf benchmark lives separately in test_qwen35_fp8_perf_mi35x.py.
+* ``test_qwen35_fp8_ar_fusion_accuracy_and_perf`` -- Qwen3.5-FP8 per-group.
+* ``test_qwen35_mxfp4_ar_fusion_accuracy`` -- MXFP4, exercising the fp8_per_token
+  and mxfp4 epilogues (default-off, so untested by a plain CI run).
 """
 
 import os
@@ -33,11 +30,15 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file
 
-register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=9600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 QWEN35_FP8_MODEL_PATH = os.environ.get(
     "QWEN35_FP8_MODEL_PATH",
     "Qwen/Qwen3.5-397B-A17B-FP8",
+)
+QWEN35_MXFP4_MODEL_PATH = os.environ.get(
+    "QWEN35_MXFP4_MODEL_PATH",
+    "amd/Qwen3.5-397B-A17B-MXFP4",
 )
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
@@ -55,12 +56,13 @@ GSM8K_DATA_URL = (
 
 @dataclass
 class FusionVariant:
-    """A Qwen3.5-FP8 AR-fusion configuration to validate."""
+    """A Qwen3.5 AR-fusion configuration to validate."""
 
     variant: str
     hip_visible_devices: str
     port_offset: int
     env_vars: Dict[str, str] = field(default_factory=dict)
+    model: str = ""  # override; falls back to the class model
 
 
 COMMON_ARGS: List[str] = [
@@ -110,6 +112,38 @@ def get_fusion_variants() -> List[FusionVariant]:
                 "SGLANG_USE_AITER": "1",
                 "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
                 "SGLANG_DISABLE_FUSED_AR_QUANT": "1",
+            },
+        ),
+    ]
+
+
+def get_ptok_mxfp4_fusion_variants() -> List[FusionVariant]:
+    """MXFP4 variants. The fused side sets FP8_PER_TOKEN=1 to engage the
+    fp8_per_token + mxfp4 epilogues; the fallback disables both opt-outs
+    (SGLANG_DISABLE_FUSED_AR_QUANT + _MXFP4_QUANT) for a true unfused reference."""
+    return [
+        FusionVariant(
+            variant="fused-ar-rms-per-token-mxfp4-quant",
+            hip_visible_devices="0,1,2,3",
+            port_offset=0,
+            model=QWEN35_MXFP4_MODEL_PATH,
+            env_vars={
+                "SGLANG_USE_AITER": "1",
+                "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+                "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
+            },
+        ),
+        FusionVariant(
+            variant="disable-fused-ar-quant-opt-out",
+            hip_visible_devices="4,5,6,7",
+            port_offset=1,
+            model=QWEN35_MXFP4_MODEL_PATH,
+            env_vars={
+                "SGLANG_USE_AITER": "1",
+                "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+                "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
+                "SGLANG_DISABLE_FUSED_AR_QUANT": "1",
+                "SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT": "1",
             },
         ),
     ]
@@ -174,7 +208,7 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         base_url = _base_url_with_port_offset(variant.port_offset)
 
         process = popen_launch_server(
-            self.model,
+            variant.model or self.model,
             base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=list(COMMON_ARGS),
@@ -188,8 +222,9 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_qwen35_fp8_ar_fusion_accuracy_and_perf(self):
-        summary = "### Qwen3.5-FP8 aiter AR-fusion (MI35x, parallel TP4)\n\n"
+    def _assert_fusion_accuracy(self, variants: List[FusionVariant], title: str):
+        """Run each variant's GSM8K in parallel and assert accuracy >= threshold."""
+        summary = f"{title}\n\n"
         summary += (
             "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Output tok/s | "
             "Threshold | Status |\n"
@@ -197,10 +232,10 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         summary += "| ------- | ---- | -------- | ------- | ----------- | ------------ | --------- | ------ |\n"
 
         failures = []
-        with ThreadPoolExecutor(max_workers=len(self.variants)) as executor:
+        with ThreadPoolExecutor(max_workers=len(variants)) as executor:
             future_to_variant = {
                 executor.submit(self._run_variant, variant): variant
-                for variant in self.variants
+                for variant in variants
             }
             for future in as_completed(future_to_variant):
                 variant = future_to_variant[future]
@@ -226,7 +261,19 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         self.assertEqual(
             failures,
             [],
-            f"Qwen3.5-FP8 AR-fusion accuracy below {ACCURACY_THRESHOLD}: {failures}",
+            f"Qwen3.5 AR-fusion accuracy below {ACCURACY_THRESHOLD}: {failures}",
+        )
+
+    def test_qwen35_fp8_ar_fusion_accuracy_and_perf(self):
+        self._assert_fusion_accuracy(
+            self.variants,
+            "### Qwen3.5-FP8 aiter AR-fusion per-group (MI35x, parallel TP4)",
+        )
+
+    def test_qwen35_mxfp4_ar_fusion_accuracy(self):
+        self._assert_fusion_accuracy(
+            get_ptok_mxfp4_fusion_variants(),
+            "### Qwen3.5 MXFP4 aiter AR-fusion per-token+mxfp4 (MI35x, parallel TP4)",
         )
 
 

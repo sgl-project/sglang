@@ -1,6 +1,7 @@
 """Capture-state guard for the fused AR + RMSNorm + per-token FP8 quant wrapper.
 
-Regression coverage for the P0 in ``GroupCoordinator.fused_allreduce_rmsnorm_quant``
+Regression coverage for the P0 in
+``GroupCoordinator.fused_allreduce_rmsnorm_quant_per_token``
 (``srt/distributed/parallel_state.py``). Under AITER's TC-piecewise CUDA-graph
 replay state -- the global ``_IS_CAPTURING`` flag is set, the current stream is
 NOT capturing, and we are inside a piecewise graph -- the ``custom_fused_ar_rms_
@@ -60,11 +61,17 @@ class _FakeCaComm:
 
 def _call(ca_comm):
     # The wrapper only touches self.ca_comm; call it unbound with a fake self.
-    fake_self = types.SimpleNamespace(ca_comm=ca_comm)
+    fake_self = types.SimpleNamespace(ca_comm=ca_comm, world_size=2)
     x = torch.zeros(4, 16)
-    return GroupCoordinator.fused_allreduce_rmsnorm_quant(
-        fake_self, x, x.clone(), torch.ones(16), 1e-6
-    )
+    with patch(
+        "sglang.srt.distributed.parallel_state.is_hip", return_value=True
+    ), patch(
+        "sglang.srt.distributed.parallel_state.is_gfx95_supported",
+        return_value=True,
+    ):
+        return GroupCoordinator.fused_allreduce_rmsnorm_quant_per_token(
+            fake_self, x, x.clone(), torch.ones(16), 1e-6
+        )
 
 
 class TestFusedARQuantCaptureGuard(CustomTestCase):

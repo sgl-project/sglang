@@ -15,7 +15,10 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -28,6 +31,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_spec,
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -44,7 +48,7 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -1001,6 +1005,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
