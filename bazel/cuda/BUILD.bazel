@@ -1,0 +1,34 @@
+load(":toolchain.bzl", "kernel_cuda_toolchain")
+
+package(default_visibility = ["//visibility:public"])
+
+toolchain_type(name = "kernel_toolchain_type")
+
+# This is an explicit contract for the pre-provisioned H200 builder, not a
+# hermetic compiler toolchain. The wheel action verifies these values against
+# the ambient nvcc and PyTorch before CMake starts compiling.
+kernel_cuda_toolchain(
+    name = "local_cuda_13_0_abi1",
+    cuda_architectures = [
+        "80",
+        "86",
+        "89",
+        "90",
+        "90a",
+        "100f",
+        "120a",
+    ],
+    cuda_version = "13.0",
+    torch_cxx11_abi = 1,
+)
+
+toolchain(
+    name = "local_cuda_13_0_abi1_toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = ["//bazel/platforms:cuda"],
+    toolchain = ":local_cuda_13_0_abi1",
+    toolchain_type = ":kernel_toolchain_type",
+)

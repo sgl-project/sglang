@@ -142,6 +142,8 @@ register_execution_platforms(
     "//bazel/platforms:linux_x86_64_rocm",
 )
 
+register_toolchains("//bazel/cuda:local_cuda_13_0_abi1_toolchain")
+
 # Use a content-addressed Debian Stretch sysroot as the oldest supported Linux
 # ABI boundary. Its glibc 2.24 floor is below SGLang's MAX_GLIBC=2.35 policy.
 manylinux_sysroot = use_repo_rule(

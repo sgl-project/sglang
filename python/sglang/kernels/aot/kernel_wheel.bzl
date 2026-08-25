@@ -2,6 +2,7 @@
 
 load("//bazel/rocm:toolchain.bzl", "AmdgpuTargetInfo")
 
+_CUDA_TOOLCHAIN_TYPE = "//bazel/cuda:kernel_toolchain_type"
 _ROCM_TOOLCHAIN_TYPE = "//bazel/rocm:toolchain_type"
 _UV_TOOLCHAIN_TYPE = "@rules_python//python/uv:uv_toolchain_type"
 
@@ -20,6 +21,20 @@ def _dependency_root(dep):
 
 def _kernel_wheel_impl(ctx):
     wheel_dir = ctx.actions.declare_directory(ctx.label.name)
+    configuration_args = []
+    if ctx.attr.backend == "cuda":
+        cuda_toolchain = ctx.toolchains[_CUDA_TOOLCHAIN_TYPE]
+        if not cuda_toolchain:
+            fail("CUDA wheel requires a registered {}".format(_CUDA_TOOLCHAIN_TYPE))
+        cuda = cuda_toolchain.kernel_cuda
+        configuration_args = [
+            "--cuda-version={}".format(cuda.cuda_version),
+            "--cuda-architectures={}".format(",".join(cuda.cuda_architectures)),
+            "--torch-cxx11-abi={}".format(cuda.torch_cxx11_abi),
+        ]
+    elif ctx.attr.cmake_source_dirs:
+        fail("cmake_source_dirs are only supported by the CUDA wheel builder")
+
     dependency_args = sorted([
         "{}={}".format(fetchcontent_name, _dependency_root(dep))
         for dep, fetchcontent_name in ctx.attr.cmake_source_dirs.items()
@@ -55,7 +70,7 @@ def _kernel_wheel_impl(ctx):
             ctx.attr.backend,
             wheel_dir.path,
             ctx.attr.source_root,
-        ] + dependency_args,
+        ] + configuration_args + dependency_args,
         inputs = depset(
             direct = ctx.files.srcs + [ctx.file._builder],
             transitive = dependency_inputs + toolchain_inputs,
@@ -95,6 +110,9 @@ _kernel_wheel_attrs = {
 _kernel_wheel = rule(
     implementation = _kernel_wheel_impl,
     attrs = _kernel_wheel_attrs,
+    toolchains = [
+        config_common.toolchain_type(_CUDA_TOOLCHAIN_TYPE, mandatory = False),
+    ],
 )
 
 _rocm_kernel_wheel_attrs = dict(_kernel_wheel_attrs)
