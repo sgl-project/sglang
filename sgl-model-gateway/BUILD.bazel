@@ -1,0 +1,160 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load(
+    "@rules_rust//rust:defs.bzl",
+    "rust_binary",
+    "rust_library",
+    "rust_shared_library",
+    "rust_test",
+)
+load(
+    "@sgl_model_gateway_crates//:defs.bzl",
+    "aliases",
+    "all_crate_deps",
+    "crate_deps",
+    "crate_edition",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "bindings/python/Cargo.toml",
+])
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(
+        package_name = "sgl-model-gateway",
+        build = True,
+    ),
+    crate_root = "build.rs",
+    data = ["Cargo.toml"],
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = all_crate_deps(
+        package_name = "sgl-model-gateway",
+        build = True,
+    ),
+)
+
+# Standalone policy target that exercises gateway-owned concurrency and
+# prefix-cache code without pulling the OpenSSL-dependent server closure.
+rust_library(
+    name = "policy_tree",
+    srcs = ["src/policies/tree.rs"],
+    crate_name = "smg_policy_tree",
+    crate_root = "src/policies/tree.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = crate_deps(
+        [
+            "dashmap",
+            "parking_lot",
+            "tracing",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+)
+
+rust_test(
+    name = "policy_tree_test",
+    srcs = ["src/policies/tree.rs"],
+    crate_name = "smg_policy_tree_test",
+    crate_root = "src/policies/tree.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = crate_deps(
+        [
+            "dashmap",
+            "parking_lot",
+            "rand",
+            "tracing",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+)
+
+rust_test(
+    name = "dependency_contract_test",
+    srcs = ["bazel_dependency_contract_test.rs"],
+    aliases = aliases(
+        package_name = "sgl-model-gateway",
+        normal = True,
+        normal_dev = True,
+    ),
+    crate_name = "smg_dependency_contract_test",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = crate_deps(
+        [
+            "tonic",
+            "tonic_v12",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+)
+
+rust_library(
+    name = "version_info",
+    srcs = ["src/version.rs"],
+    crate_name = "smg_version_info",
+    crate_root = "src/version.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = [":build_script"],
+)
+
+test_suite(
+    name = "internal_tests",
+    tests = [
+        ":dependency_contract_test",
+        ":policy_tree_test",
+    ],
+)
+
+rust_library(
+    name = "sgl_model_gateway",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(package_name = "sgl-model-gateway"),
+    crate_name = "smg",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    proc_macro_deps = all_crate_deps(
+        package_name = "sgl-model-gateway",
+        proc_macro = True,
+    ),
+    deps = [
+        ":build_script",
+    ] + all_crate_deps(
+        package_name = "sgl-model-gateway",
+        normal = True,
+    ),
+)
+
+rust_binary(
+    name = "sgl-model-gateway",
+    srcs = ["src/main.rs"],
+    aliases = aliases(package_name = "sgl-model-gateway"),
+    crate_name = "sgl_model_gateway",
+    crate_root = "src/main.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+    deps = [
+        ":sgl_model_gateway",
+    ] + all_crate_deps(
+        package_name = "sgl-model-gateway",
+        normal = True,
+    ),
+)
+
+rust_shared_library(
+    name = "sglang_router_rs_abi3",
+    srcs = glob(["bindings/python/src/**/*.rs"]),
+    aliases = aliases(package_name = "sgl-model-gateway/bindings/python"),
+    crate_name = "sglang_router_rs",
+    crate_root = "bindings/python/src/lib.rs",
+    edition = crate_edition(package_name = "sgl-model-gateway/bindings/python"),
+    tags = ["manual"],
+    deps = [
+        ":sgl_model_gateway",
+    ] + all_crate_deps(
+        package_name = "sgl-model-gateway/bindings/python",
+        normal = True,
+    ),
+)

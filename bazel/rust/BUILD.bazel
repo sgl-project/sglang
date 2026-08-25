@@ -1,8 +1,33 @@
+load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust_pyo3//:defs.bzl", "rust_pyo3_toolchain")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["sglang-crates.lock.json"])
+exports_files([
+    "sgl-model-gateway-crates.lock.json",
+    "sglang-crates.lock.json",
+])
+
+sh_binary(
+    name = "gateway_protoc",
+    srcs = ["gateway_protoc.sh"],
+    data = [
+        "@protobuf//:protoc",
+        "@protobuf//:well_known_type_protos",
+    ],
+)
+
+py_test(
+    name = "sgl_model_gateway_lock_parity_test",
+    srcs = ["sgl_model_gateway_lock_parity_test.py"],
+    data = [
+        "sgl-model-gateway-crates.lock.json",
+        "//sgl-model-gateway:Cargo.lock",
+        "//sgl-model-gateway:Cargo.toml",
+        "//sgl-model-gateway:bindings/python/Cargo.toml",
+    ],
+)
 
 # Keep the pyo3 crate seen by extension sources identical to the one used by
 # crate-universe dependencies such as numpy.
