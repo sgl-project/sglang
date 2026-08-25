@@ -17,6 +17,16 @@ Run the server twice and diff the dumps:
 Requests go out one at a time so the batch is always size 1: batch composition
 changes matmul reduction order, and that difference alone would swamp the signal.
 
+`--temperature > 0` repurposes the same comparison for a second question: whether the
+*chain* path's sampling accept (`_selector_sampling_accept`, a different kernel from
+the greedy `accept_tree_greedy`) still behaves after the tree wiring landed. There the
+two dumps come from two *commits* at width 1, not from two paths of one build. Token
+equality is only meaningful if both servers ran with the same `--random-seed`: DFLASH
+draws its accept coins with `torch.rand` on the default generator and never reads a
+request's `sampling_seed`, so the request-level seed does nothing here. A whole-suffix
+mismatch starting at one token is more likely RNG-stream misalignment than a numerical
+bug -- read the accept lengths at that step before concluding anything.
+
 `--concurrency 4` exists but is **not** a gate. Measured 2026-08-24: the same server
 compared against itself at concurrency 4 diverges on 2 of 8 prompts, at the same
 token indices and the same logprob magnitudes (~1e-2) as a chain-vs-tree comparison
@@ -50,12 +60,17 @@ PROMPTS = [
 ]
 
 
-def _generate(port: int, prompt: str, max_new_tokens: int) -> dict:
+def _generate(
+    port: int, prompt: str, max_new_tokens: int, temperature: float = 0.0
+) -> dict:
     response = requests.post(
         f"http://127.0.0.1:{port}/generate",
         json={
             "text": prompt,
-            "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": max_new_tokens,
+            },
             # The only way to get token ids back; also gives the logprobs the
             # divergence triage needs.
             "return_logprob": True,
@@ -74,12 +89,19 @@ def _generate(port: int, prompt: str, max_new_tokens: int) -> dict:
     }
 
 
-def collect(*, port: int, max_new_tokens: int, concurrency: int) -> list:
+def collect(
+    *, port: int, max_new_tokens: int, concurrency: int, temperature: float = 0.0
+) -> list:
     if concurrency == 1:
-        return [_generate(port, prompt, max_new_tokens) for prompt in PROMPTS]
+        return [
+            _generate(port, prompt, max_new_tokens, temperature) for prompt in PROMPTS
+        ]
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         return list(
-            pool.map(lambda prompt: _generate(port, prompt, max_new_tokens), PROMPTS)
+            pool.map(
+                lambda prompt: _generate(port, prompt, max_new_tokens, temperature),
+                PROMPTS,
+            )
         )
 
 
@@ -137,6 +159,17 @@ def main() -> None:
     )
     parser.add_argument("--out", help="Write this run's dump here.")
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help=(
+            "0 compares the greedy accept path. >0 compares the sampling accept path "
+            "instead, which is a different kernel; reproducibility then rests on the "
+            "server's --random-seed, not on any per-request seed (DFLASH draws its "
+            "accept coins from the default generator and ignores sampling_seed)."
+        ),
+    )
+    parser.add_argument(
         "--compare", nargs=2, metavar=("CHAIN", "TREE"), help="Diff two dumps."
     )
     args = parser.parse_args()
@@ -150,6 +183,7 @@ def main() -> None:
         port=args.port,
         max_new_tokens=args.max_new_tokens,
         concurrency=args.concurrency,
+        temperature=args.temperature,
     )
     for record in dump:
         print(
