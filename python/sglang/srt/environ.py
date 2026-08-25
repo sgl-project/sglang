@@ -1511,6 +1511,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    SGLANG_DIFFUSION_PLATFORM = EnvStr("")
+    SGLANG_DIFFUSION_PLUGINS = EnvStr("")
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE = EnvStr("")
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

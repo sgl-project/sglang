@@ -12,7 +12,12 @@ import sys
 import types
 import uuid
 
-from sglang.srt.plugins.hook_registry import HookRegistry, HookType, plugin_hook
+from sglang.srt.plugins.hook_registry import (
+    HookRegistry,
+    HookSource,
+    HookType,
+    plugin_hook,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -440,6 +445,35 @@ class TestEdgeCases(_HookTestCase):
 
         mod.orig(1)
         self.assertEqual(call_count[0], 1)
+
+    def test_hook_registered_after_apply_is_reported(self):
+        """A second loader's late hook cannot be applied; it must not be silent."""
+
+        def orig(x):
+            return x
+
+        mod, name = _make_module(orig=orig)
+
+        def first(fn, x):
+            return fn(x) + 1
+
+        def late(fn, x):
+            return fn(x) + 100
+
+        HookRegistry.register(f"{name}.orig", first, HookType.AROUND)
+        HookRegistry.apply_hooks()
+
+        HookRegistry.register(
+            f"{name}.orig",
+            late,
+            HookType.AROUND,
+            source=HookSource(plugin_name="late_plugin", dist_name="late-dist"),
+        )
+        with self.assertLogs("sglang.srt.plugins.hook_registry", level="WARNING") as cm:
+            HookRegistry.apply_hooks()
+
+        self.assertEqual(mod.orig(0), 1)  # late hook was NOT applied
+        self.assertTrue(any("late_plugin" in message for message in cm.output))
 
 
 if __name__ == "__main__":

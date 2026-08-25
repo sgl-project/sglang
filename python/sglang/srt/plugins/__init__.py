@@ -8,6 +8,9 @@ Supports two types of plugins via setuptools entry_points:
 Plugins are discovered automatically when installed via pip.
 - Platform plugins: use ``SGLANG_PLATFORM`` to select when multiple are installed.
 - General plugins: use ``SGLANG_PLUGINS`` (comma-separated) to restrict which are loaded.
+
+The diffusion engine reuses this discovery machinery under its own entry point
+groups and env vars; see :mod:`sglang.multimodal_gen.plugins`.
 """
 
 import logging
@@ -15,7 +18,7 @@ from collections.abc import Callable
 from importlib.metadata import entry_points
 from typing import Any
 
-from sglang.srt.environ import envs
+from sglang.srt.environ import EnvField, envs
 from sglang.srt.plugins.hook_registry import (
     HookRegistry,
     HookSource,
@@ -35,6 +38,7 @@ _plugins_loaded = False
 def load_plugins_by_group(
     group: str,
     excluded_dists: set[str] | None = None,
+    whitelist_env: EnvField | None = None,
 ) -> dict[str, tuple[Callable[[], Any], str | None]]:
     """
     Discover and load plugins registered under the given entry point group.
@@ -44,13 +48,19 @@ def load_plugins_by_group(
         excluded_dists: Distribution names to skip. Plugins from these
             distributions are never ``ep.load()``-ed (avoids importing
             their modules and pulling hardware-specific dependencies).
+        whitelist_env: Env field holding the comma-separated name whitelist.
+            Defaults to ``SGLANG_PLUGINS``; the diffusion loader passes
+            ``SGLANG_DIFFUSION_PLUGINS`` so the two engines do not gate each
+            other's plugins.
 
     Returns:
         Dictionary mapping plugin name to ``(callable, dist_name)``.
     """
-    # SGLANG_PLUGINS whitelist (comma-separated plugin names)
+    # Name whitelist (comma-separated plugin names)
+    if whitelist_env is None:
+        whitelist_env = envs.SGLANG_PLUGINS
     allowed_set: set[str] | None = None
-    allowed_str = envs.SGLANG_PLUGINS.get()
+    allowed_str = whitelist_env.get()
     if allowed_str:
         allowed_set = {x.strip() for x in allowed_str.split(",") if x.strip()}
 
@@ -66,12 +76,12 @@ def load_plugins_by_group(
     plugins: dict[str, tuple[Callable[[], Any], str | None]] = {}
     for ep in discovered:
         if allowed_set is not None and ep.name not in allowed_set:
-            logger.info("Skipping plugin %s (not in SGLANG_PLUGINS)", ep.name)
+            logger.info("Skipping plugin %s (not in %s)", ep.name, whitelist_env.name)
             continue
         dist_name = ep.dist.name if ep.dist else None
         if excluded_dists and dist_name in excluded_dists:
             logger.info(
-                "Skipping plugin %s (dist %s excluded by SGLANG_PLATFORM)",
+                "Skipping plugin %s (dist %s excluded by platform selection)",
                 ep.name,
                 dist_name,
             )
@@ -86,6 +96,19 @@ def load_plugins_by_group(
     return plugins
 
 
+def excluded_dists_for(group: str, selected: str) -> set[str]:
+    """Dist names providing a platform plugin in ``group`` other than ``selected``.
+
+    Skipping those dists keeps an unselected platform package from registering
+    hooks that import its hardware dependencies. An empty ``selected`` (env var
+    unset) excludes nothing and, importantly, does not enumerate entry points.
+    """
+    if not selected:
+        return set()
+    platform_eps = entry_points(group=group)
+    return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
+
+
 def _get_excluded_dists() -> set[str]:
     """Compute dist names to skip when ``SGLANG_PLATFORM`` is set.
 
@@ -93,11 +116,7 @@ def _get_excluded_dists() -> set[str]:
     selected by ``SGLANG_PLATFORM``.  This prevents unselected platform
     packages from registering hooks that pull their hardware dependencies.
     """
-    selected = envs.SGLANG_PLATFORM.get()
-    if not selected:
-        return set()
-    platform_eps = entry_points(group=PLATFORM_PLUGINS_GROUP)
-    return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
+    return excluded_dists_for(PLATFORM_PLUGINS_GROUP, envs.SGLANG_PLATFORM.get())
 
 
 def load_plugins():
