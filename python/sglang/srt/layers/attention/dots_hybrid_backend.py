@@ -527,54 +527,50 @@ class DotsHybridAttnBackend(AttentionBackend):
         backend.init_mha_chunk_metadata(forward_batch)
 
 
-def _wrap_dots_swa_backend(backend: AttentionBackend) -> AttentionBackend:
-    """Add latent-cache SWA behavior when a backend uses FlashAttention."""
+def _require_dots_swa_backend(backend: AttentionBackend) -> DotsSWAMLAAttnBackend:
+    """Add latent-cache SWA behavior around a FlashAttention executor."""
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
 
-    if isinstance(backend, FlashAttentionBackend) or (
-        isinstance(backend, HybridAttnBackend)
-        and all(
-            isinstance(child, FlashAttentionBackend)
-            for child in (backend.prefill_backend, backend.decode_backend)
-        )
-    ):
-        return DotsSWAMLAAttnBackend(backend)
-    return backend
-
-
-def _require_dots_swa_backend(backend: AttentionBackend) -> DotsSWAMLAAttnBackend:
-    wrapped = _wrap_dots_swa_backend(backend)
-    if not isinstance(wrapped, DotsSWAMLAAttnBackend):
+    executors = (
+        (backend.prefill_backend, backend.decode_backend)
+        if isinstance(backend, HybridAttnBackend)
+        else (backend,)
+    )
+    # Dots SWA prefill reads sliding_window_size off the executor and SWA decode
+    # reads swa_page_table off its metadata; only FlashAttention supplies both.
+    if not all(isinstance(child, FlashAttentionBackend) for child in executors):
         raise ValueError(
-            "Dots hybrid DSA/SWA requires FlashAttention for both prefill and "
-            "decode SWA execution. Configure --attention-backend fa3, or set "
-            "both --prefill-attention-backend and --decode-attention-backend "
-            "to FA3/FA4."
+            "Dots SWA layers require FlashAttention for both prefill and decode "
+            f"execution, got {type(backend).__name__}. Configure "
+            "--attention-backend fa3, or set both --prefill-attention-backend "
+            "and --decode-attention-backend to fa3/fa4."
         )
-    return wrapped
+    return DotsSWAMLAAttnBackend(backend)
 
 
 def wrap_dots_draft_decode_backend(backend: AttentionBackend) -> AttentionBackend:
     """Wrap each per-step backend used by the Dots NextN draft container."""
     backend.attn_backends = [
-        _wrap_dots_swa_backend(child) for child in backend.attn_backends
+        _require_dots_swa_backend(child) for child in backend.attn_backends
     ]
     return backend
 
 
 def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
     """Construct the Dots target or draft attention backend."""
-    if runner.model_config.is_draft_model:
-        return _wrap_dots_swa_backend(full_attn_backend)
-
-    if runner.model_config.hf_text_config.index_topk is None:
-        return _require_dots_swa_backend(full_attn_backend)
+    swa_backend = _require_dots_swa_backend(full_attn_backend)
+    # Draft layers are pure SWA, and a target without an indexer has no DSA half.
+    if (
+        runner.model_config.is_draft_model
+        or runner.model_config.hf_text_config.index_topk is None
+    ):
+        return swa_backend
 
     from sglang.srt.layers.attention.attention_registry import create_dsa_backend
 
     return DotsHybridAttnBackend(
         dsa_backend=create_dsa_backend(runner),
-        swa_backend=_require_dots_swa_backend(full_attn_backend),
+        swa_backend=swa_backend,
     )

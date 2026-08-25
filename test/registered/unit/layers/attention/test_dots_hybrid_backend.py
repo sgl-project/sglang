@@ -16,8 +16,13 @@ from sglang.srt.layers.attention.dots_hybrid_backend import (
     _metadata_mismatches_dp_padded_batch,
     _normalize_cache_seqlens_rows,
     _require_dots_swa_backend,
+    wrap_dots_draft_decode_backend,
 )
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMetadata,
+)
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.swa_mla_fallback.ops import (
     gather_page64_kv_latent,
 )
@@ -33,6 +38,23 @@ def _batch(*, bs: int, num_tokens: int, original_bs: int | None = None):
         forward_mode=SimpleNamespace(),
         _original_batch_size=original_bs,
     )
+
+
+def _fa_backend():
+    """A real FlashAttentionBackend without a ModelRunner behind it."""
+    backend = object.__new__(FlashAttentionBackend)
+    backend.token_to_kv_pool = None
+    backend.req_to_token_pool = None
+    return backend
+
+
+def _split_backend(*, prefill, decode):
+    backend = object.__new__(HybridAttnBackend)
+    backend.prefill_backend = prefill
+    backend.decode_backend = decode
+    backend.token_to_kv_pool = None
+    backend.req_to_token_pool = None
+    return backend
 
 
 def _fa_metadata(*, bs: int, num_tokens: int):
@@ -102,9 +124,36 @@ def test_normalize_cache_seqlens_truncates_extra_rows():
     assert torch.equal(normalized, torch.tensor([17, 23], dtype=torch.int32))
 
 
-def test_dots_swa_backend_rejects_sparse_executor_during_initialization():
-    with pytest.raises(ValueError, match="requires FlashAttention"):
+def test_swa_backend_wraps_a_flash_attention_executor():
+    assert isinstance(_require_dots_swa_backend(_fa_backend()), DotsSWAMLAAttnBackend)
+
+
+def test_swa_backend_keeps_both_halves_of_a_split_flash_attention_backend():
+    split = _split_backend(prefill=_fa_backend(), decode=_fa_backend())
+
+    wrapped = _require_dots_swa_backend(split)
+
+    assert isinstance(wrapped, DotsSWAMLAAttnBackend)
+    assert wrapped.backend is split
+
+
+def test_swa_backend_rejects_a_non_flash_decode_executor():
+    split = _split_backend(prefill=_fa_backend(), decode=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="require FlashAttention"):
+        _require_dots_swa_backend(split)
+
+
+def test_swa_backend_rejects_a_sparse_executor_during_initialization():
+    with pytest.raises(ValueError, match="require FlashAttention"):
         _require_dots_swa_backend(SimpleNamespace())
+
+
+def test_draft_decode_container_rejects_a_non_flash_step_backend():
+    container = SimpleNamespace(attn_backends=[_fa_backend(), SimpleNamespace()])
+
+    with pytest.raises(ValueError, match="require FlashAttention"):
+        wrap_dots_draft_decode_backend(container)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
