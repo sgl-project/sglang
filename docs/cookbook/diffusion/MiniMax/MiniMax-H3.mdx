@@ -319,8 +319,9 @@ compute capability 10.0 or newer. Pass a pruned FL2VA / Ref2VA file such as
 `Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/MiniMax_H3_FL2VA_pruned_nvfp4.safetensors`
 to `--transformer-weights-path` and omit `--quantization`. SGLang infers the
 packed group size and Comfy scale layout from the checkpoint; FSDP is rejected.
-Mixed files may mark selected linears as `int8_tensorwise`; SGLang dispatches
-those layers to the serialized Kitchen INT8 ConvRot path automatically.
+Mixed files may mark selected linears as `int8_tensorwise` or dynamic/static
+FP8; SGLang dispatches those layers to their serialized Kitchen INT8 or native
+FP8 path automatically.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -367,6 +368,70 @@ create it, including its mode, step count, flow shifts, and condition noise
 values. SGLang rejects a request outside that coverage instead of silently
 changing conditioning. Cache mode supports the matching unquantized checkpoint
 only.
+
+### Serve MiniMax-H3 on Ascend NPUs
+
+For Ascend NPU, follow the
+[NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+before starting the server.
+
+The Ascend commands below explicitly enable the Cache-DiT configuration used
+for the reported performance measurements. Remove these `SGLANG_CACHE_DIT_*`
+variables to use lossless denoising. See the **Ascend NPU topology comparison**
+in the Benchmarks section for the measured eight- and four-NPU latency.
+
+The measured latency configuration also passes `--dit-cpu-offload false` to
+keep the transformer resident on the NPUs. Omit this flag when lower device
+memory usage is more important than avoiding CPU-to-NPU transfer latency.
+
+For an eight-NPU host, the validated topology is TP2 + SP4 with Laser
+Attention. Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
+
+```bash 8-NPU
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+HCCL_BUFFSIZE=256 sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-type diffusion \
+  --model-variant fl2va \
+  --dit-cpu-offload false \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --sp-degree 4 \
+  --attention-backend laser_attn \
+  --port 30088 \
+  --component-residency text_encoder=layerwise-offload
+```
+
+For a four-NPU host, use TP2 + SP2:
+
+```bash 4-NPU
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+HCCL_BUFFSIZE=256 sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-type diffusion \
+  --model-variant fl2va \
+  --dit-cpu-offload false \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --sp-degree 2 \
+  --attention-backend laser_attn \
+  --port 30088 \
+  --component-residency text_encoder=layerwise-offload
+```
 
 ## 4. Generate video and audio
 
@@ -995,6 +1060,19 @@ W4A4 Qwen3-VL files use the same overlay, for example:
 This checkpoint keeps its unmarked embedding and vision tower in their source
 precision; no explicit component quantization option is needed.
 
+The official Comfy NVFP4-AWQ encoder uses the same flagless overlay:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+```
+
+SGLang auto-detects its row-wise INT8 embedding, NVFP4 language linears, and
+AWQ input pre-scales. The weights stay compressed at rest; each active linear
+is dequantized for a BF16/FP16 matrix multiplication, so this path primarily
+reduces resident memory rather than encoder latency. Do not add a component or
+transformer quantization option.
+
 The same component option accepts a self-describing Quanto qint8 file without
 an additional quantization flag:
 
@@ -1086,9 +1164,26 @@ the configurations with collected measurements:
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
 | H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
+| Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
 | RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
+
+### Ascend NPU topology comparison
+
+Both topologies used Laser Attention and the explicit Cache-DiT configuration
+from the Ascend launch commands, with `--dit-cpu-offload false` keeping the DiT
+resident. The measured workload was one 5-second T2VA request at 1344×768,
+124 frames, 24 fps, and 50 inference steps.
+
+| NPU count | Topology | End-to-end latency |
+| ---: | --- | ---: |
+| 8 | TP2 + SP4 | **55.07 s** |
+| 4 | TP2 + SP2 | **103.57 s** |
+
+These are individual end-to-end measurements for each topology, not averages.
+The eight-NPU topology had 46.8% lower end-to-end latency than the four-NPU
+topology.
 
 ### B300 precision and encoder placement
 
@@ -1435,10 +1530,23 @@ Under that cap, Recipe A wins the whole request at every host size:
 | 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
 | 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
 
-Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. The
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
+figures are anchored at 480P — activations grow with the pixel count, so at
+768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
+decode still collides. And the host convention holds the weights in page
+cache; a physical 32 GB machine re-reads them from disk each step, so the
+page cache cannot hold the per-step weight sweep, so every step re-reads it
+from disk and the drive becomes the denoise clock: a real desktop 4090 with a
+990 Pro measured 38 s/step, reading 52.9 GB per step (faulted sequentially, so
+almost none of it shows in majflt — measure `read_bytes`, not major faults).
+Two things cut that read directly: resident DiT layers (~1 GB/step each — on a
+physically small host raise them as far as VRAM allows, the opposite of the
+capped-host guidance above), and more RAM (64 GB caches the sweep and returns
+to the quoted times). The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
-and at 24 GiB (with `--dit-layerwise-resident-layers 10`, which only a 24 GB
-card has headroom for) ~230 vs 249–260 s. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
+22 GiB cap so a desktop's own allocations fit; a headless card can raise it
+to 10 for under 1% more) ~8.5 s/step vs ComfyUI's 249–260 s requests. Four changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
 #35946), per-layer pinning with net-cost accounting (#35867), the courier
 thread that ships still-mapped layers through pinned slots (#35882), and
 decoder weights held in their decode dtype from load (#35967) — which is what
