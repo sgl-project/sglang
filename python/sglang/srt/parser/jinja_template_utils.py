@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData
 
 logger = logging.getLogger(__name__)
 
@@ -241,16 +241,21 @@ def process_content_for_template_format(
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
+                    preprocess_kwargs = {
+                        key: video_obj[key]
+                        for key in GLM_MEDIA_CONFIG_KEYS
+                        if video_obj.get(key) is not None
+                    }
+                    if not preprocess_kwargs and mdp is None:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        item = {"url": video_obj["url"]}
+                        if mdp is not None:
+                            item["max_dynamic_patch"] = mdp
+                        if preprocess_kwargs:
+                            item["preprocess_kwargs"] = preprocess_kwargs
+                        video_data.append(item)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

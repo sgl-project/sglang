@@ -354,7 +354,17 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                vid = load_video(data, frame_count_limit)
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "video",
+                        "video": vid,
+                        **media_metadata,
+                    }
+                return vid
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 

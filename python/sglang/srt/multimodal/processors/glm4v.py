@@ -16,6 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
@@ -33,12 +34,6 @@ GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
 GLM_VIDEO_PATCH_SIZE = 14
 GLM_VIDEO_MERGE_SIZE = 2
 GLM_VIDEO_PATCH_EXPAND_FACTOR = 4
-GLM_MEDIA_CONFIG_KEYS = (
-    "fps",
-    "max_frames",
-    "max_tokens_per_frame",
-    "max_image_tokens",
-)
 
 
 def _glm_video_metadata(total_num_frames, fps, duration, frames_indices):
