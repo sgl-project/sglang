@@ -49,9 +49,11 @@ class TestNightlyMiniMaxM3PerformanceMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # The leading 1 is repeated so the report helper drops it as a warmup
-        # run: this step launches its own server, so the first request pays for
-        # warmup and batch 1 is the row that distorts most.
+        # bench_one_batch_server already warms every unique batch size before it
+        # times anything, but only at output_len 16. The repeated leading 1 buys
+        # one throwaway full-length decode -- the report helper drops it -- so
+        # whatever is first touched over 1024 output tokens lands there instead
+        # of in a published row.
         cls.batch_sizes = [1, 1, 8, 16, MAX_BATCH_SIZE]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "1024"))
