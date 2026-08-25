@@ -128,7 +128,7 @@ export const KimiK27CodeDeployment = () => {
     const isMXFP4 = quantization === 'mxfp4';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
-    const modelName = isMXFP4 ? 'moonshotai/Kimi-K2.7-Code-MXFP4' : 'moonshotai/Kimi-K2.7-Code';
+    const modelName = isMXFP4 ? 'amd/Kimi-K2.7-Code-MXFP4' : 'moonshotai/Kimi-K2.7-Code';
 
     let cmd = '';
 
