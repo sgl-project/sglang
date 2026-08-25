@@ -48,6 +48,9 @@ bazel build --config=cpu \
 bazel build --config=manylinux -c opt \
   --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
   //bazel/packaging:main_wheel_manylinux
+bazel build --config=manylinux -c opt \
+  --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
+  //bazel/packaging:main_wheel_image
 
 # Hardware targets use the matching pre-provisioned PyTorch/toolchain image.
 bazel build --config=cpu //python/sglang/kernels/aot:cpu_wheel
@@ -74,9 +77,10 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
   wheel.
 - CPU, CUDA, and ROCm `sglang-kernel` wheels build through Bazel wrapper
   targets. ROCm requires an analysis-time `AMDGPU_TARGET`, never probes a
-  device while building, and has a wheel import test. CUDA builds use immutable
-  Bazel-fetched CUTLASS, fmt, Triton, FlashInfer, sgl-attn, and FlashMLA sources
-  with disconnected CMake.
+  device while building, and has a wheel import test. CUDA validates a declared
+  toolkit version, architecture matrix, and PyTorch C++ ABI, then builds from
+  immutable Bazel-fetched CUTLASS, fmt, Triton, FlashInfer, sgl-attn, and
+  FlashMLA sources with disconnected CMake.
 - Dummy-weight Qwen3 and pinned real-weight Qwen2-0.5B Engine tests passed on an
   H200. The Qwen2 test verifies the model revision, weight digest, token IDs,
   decoded text, and completion metadata.
@@ -93,6 +97,9 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
   x86_64 ELF and GLIBC/RPATH policy, complete RECORD hashes, unchanged native
   payloads, and imports of all three extensions. Its `audit` output group
   exposes the JSON report.
+- `main_wheel_image` layers the repaired wheel onto a digest-pinned Python
+  3.12 slim base. Its image and load targets build without changing existing
+  Docker release authority.
 
 ## Ownership boundaries
 
@@ -102,13 +109,13 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
 | Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_ffi.so` compiles and links the host TVM-FFI adapter; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
-| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA source downloads are immutable Bazel repositories; ROCm configuration enters through `//bazel/rocm:toolchain_type` | scikit-build/CMake and platform setup scripts |
+| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA configuration enters through `//bazel/cuda:kernel_toolchain_type`; ROCm configuration enters through `//bazel/rocm:toolchain_type` | scikit-build/CMake and platform setup scripts |
 | Main Rust extensions | one crate-universe closure builds `_multimodal`, `_grpc`, `_server`, and the pure Rust libraries | Cargo + setuptools-rust |
 | Rust gRPC | `//rust/sglang-grpc:sglang_grpc_core` runs the existing tonic build script with Bazel's declared protoc and proto input | Cargo/tonic-build |
 | Model gateway/router | separate 838-package crate universe builds the gateway binary and abi3 shared library while preserving dual tonic versions | Cargo + maturin |
 | HF config/tokenizer/download | `//python/sglang/srt/utils/hf_transformers:hub` and `//python/sglang/srt/utils:hf_transformers_patches` are torch-free; model config remains separate | setuptools |
 | Weight loading/cache daemon | `//python/sglang/srt/weight_cache:protocol` is torch-free; CUDA IPC transport and daemon remain accelerator-constrained | setuptools |
-| Model artifacts | runtime inputs except for a future pinned tiny smoke fixture | Hugging Face/runtime cache |
+| Model artifacts | pinned Qwen2 revision/digest for the real-weight smoke; production models remain runtime inputs | Hugging Face/runtime cache |
 
 `srt_empty` is represented as a profile, not as the CPU product. It selects
 `runtime_base` from `pyproject_other.toml` and must stay free of packages known
@@ -159,15 +166,19 @@ analysis.
 The runtime, real-model E2E, wheel-manifest, and manylinux ABI milestones are
 complete. Bazel must not become the release authority yet:
 
-- CPU/CUDA wheel wrappers still consume the ambient PyTorch compiler ABI and
-  toolkit. ROCm now isolates `/opt/rocm`, Python, PyTorch, the compiler, and the
-  wheel frontend behind `//bazel/rocm:toolchain_type`, but its default local
-  implementation still resolves those tools from the runner. A pinned
-  ROCm/PyTorch repository must populate the toolchain's declared `inputs`
-  before the action can become sandboxed, cacheable, and remotely executable.
+- The CPU wrapper still consumes ambient PyTorch, Python development files,
+  NUMA, and the host compiler.
+- CUDA validates declared toolkit/architecture/ABI values through
+  `//bazel/cuda:kernel_toolchain_type`, but toolkit files, PyTorch libraries,
+  Python headers, compiler, and sysroot still come from the runner.
+- ROCm isolates `/opt/rocm`, Python, PyTorch, the compiler, and wheel frontend
+  behind `//bazel/rocm:toolchain_type`, but its default local implementation
+  still resolves those tools from the runner. Pinned CUDA/ROCm/PyTorch
+  repositories must populate toolchain `inputs` before wheel actions can become
+  sandboxed, cacheable, and remotely executable.
 - Vendored OpenSSL still consumes runner-provided Perl and Make during its
   build; a pinned execution image must provide those tools.
-- Architecture matrices and digest-pinned OCI image targets remain outside
-  Bazel.
+- The OCI target is a CPU metadata/version smoke. A runnable CUDA server image
+  still needs a CUDA/Torch dependency layer and accelerator wheel closure.
 - Hardware wheel builds remain shadow artifacts until all ABI and numerical
   tests pass across supported CUDA/ROCm/Python variants.
