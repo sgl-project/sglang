@@ -15,7 +15,6 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
 )
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,16 +70,14 @@ class TestPlanPackedDcpBlocks(CustomTestCase):
 
 class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_from_page_item_lens(self):
-        with envs.SGLANG_DISAGG_DCP_PACK_MAX_TOKENS.override(128):
-            self.assertEqual(
-                dcp_pack_buffer_bytes([64 * 16, 64 * 16], page_size=64),
-                128 * (16 + 16),
-            )
+        self.assertEqual(
+            dcp_pack_buffer_bytes([64 * 16, 64 * 16], page_size=64, max_tokens=128),
+            128 * (16 + 16),
+        )
 
     def test_rejects_non_page_aligned_item_lens(self):
-        with envs.SGLANG_DISAGG_DCP_PACK_MAX_TOKENS.override(8):
-            with self.assertRaises(ValueError):
-                dcp_pack_buffer_bytes([100], page_size=64)
+        with self.assertRaises(ValueError):
+            dcp_pack_buffer_bytes([100], page_size=64, max_tokens=8)
 
 
 class TestDcpPackCopy(CustomTestCase):

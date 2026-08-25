@@ -8,23 +8,14 @@ import numpy.typing as npt
 import torch
 
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_schedule
 
 logger = logging.getLogger(__name__)
 
 
-def dcp_pack_max_tokens() -> int:
-    override = envs.SGLANG_DISAGG_DCP_PACK_MAX_TOKENS.get()
-    if override is not None and override > 0:
-        return int(override)
-    chunk = get_schedule().chunked_prefill_size
-    if chunk is not None and chunk > 0:
-        return int(chunk)
-    return 32768
-
-
-def dcp_pack_buffer_bytes(kv_item_lens: Sequence[int], page_size: int) -> int:
+def dcp_pack_buffer_bytes(
+    kv_item_lens: Sequence[int], page_size: int, max_tokens: int
+) -> int:
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}")
     token_item_lens = [item_len // page_size for item_len in kv_item_lens]
@@ -33,7 +24,7 @@ def dcp_pack_buffer_bytes(kv_item_lens: Sequence[int], page_size: int) -> int:
             "PD DCP pack requires page-aligned kv_item_lens, "
             f"got {list(kv_item_lens)} with page_size={page_size}"
         )
-    return dcp_pack_max_tokens() * sum(token_item_lens)
+    return max_tokens * sum(token_item_lens)
 
 
 def plan_packed_dcp_blocks(
@@ -130,7 +121,11 @@ def init_dcp_pack_buffers(
         _get_custom_mem_pool,
     )
 
-    size_bytes = dcp_pack_buffer_bytes(kv_args.kv_item_lens, kv_args.page_size)
+    chunk = get_schedule().chunked_prefill_size
+    max_tokens = int(chunk) if chunk is not None and chunk > 0 else 32768
+    size_bytes = dcp_pack_buffer_bytes(
+        kv_args.kv_item_lens, kv_args.page_size, max_tokens
+    )
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
     custom_mem_pool, _ = _get_custom_mem_pool(device)
@@ -144,6 +139,6 @@ def init_dcp_pack_buffers(
         "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
         count,
         size_bytes / (1024 * 1024),
-        dcp_pack_max_tokens(),
+        max_tokens,
     )
     return buffers
