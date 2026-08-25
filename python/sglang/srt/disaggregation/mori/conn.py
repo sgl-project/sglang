@@ -474,11 +474,9 @@ class MoriKVManager(CommonKVManager):
             self._conclude_room_failure(room)
             return
 
-        rc = self._wait_transfer_completion(statuses, room)
-        if rc != StatusCode.SUCCESS:
-            self._conclude_room_failure(
-                room, self._collect_transfer_failure_reason(statuses)
-            )
+        failure_reason = self._wait_transfer_completion(statuses)
+        if failure_reason is not None:
+            self._conclude_room_failure(room, failure_reason)
             return
 
         if kv_chunk.is_last_chunk:
@@ -487,28 +485,24 @@ class MoriKVManager(CommonKVManager):
 
     def _wait_transfer_completion(
         self, statuses: List[TransferStatus], room: int
-    ) -> StatusCode:
+    ) -> Optional[str]:
         if not statuses:
-            return StatusCode.SUCCESS
+            return None
 
         start = time.perf_counter()
         sla_ms = self._transfer_timeout_ms
-        sla_tripped = False
 
         while True:
             rc = self.engine.wait_all(statuses, timeout_ms=self._wait_poll_ms)
             if rc != StatusCode.IN_PROGRESS:
-                return rc
+                if rc == StatusCode.SUCCESS:
+                    return None
+                return self._collect_transfer_failure_reason(statuses)
             if (
                 sla_ms > 0
-                and not sla_tripped
                 and (time.perf_counter() - start) * 1000 >= sla_ms
             ):
-                sla_tripped = True
-                self._conclude_room_failure(
-                    room, f"KV transfer exceeded SLA {sla_ms}ms"
-                )
-                return StatusCode.IN_PROGRESS
+                return f"KV transfer exceeded SLA {sla_ms}ms"
 
     @staticmethod
     def _collect_transfer_failure_reason(statuses: List[TransferStatus]) -> str:
@@ -1536,26 +1530,7 @@ class MoriKVManager(CommonKVManager):
         return result_statuses, target_infos_snapshot
 
 
-class MoriFailureExceptionMixin:
-    """Shared failure_exception for Mori sender/receiver (mooncake/nixl pattern)."""
-
-    def failure_exception(self):
-        if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
-
-        self.clear()
-
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        is_propagated = failure_reason is None
-        if is_propagated:
-            failure_reason = "KV transfer failed"
-        raise KVTransferError(
-            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
-        )
-
-
-class MoriKVSender(MoriFailureExceptionMixin, CommonKVSender):
+class MoriKVSender(CommonKVSender):
     def __init__(
         self,
         mgr: MoriKVManager,
@@ -1635,6 +1610,26 @@ class MoriKVSender(MoriFailureExceptionMixin, CommonKVSender):
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         return status
+
+    def clear(self) -> None:
+        with self.kv_mgr._room_notify_lock:
+            self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
+        super().clear()
+
+    def failure_exception(self):
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        self.clear()
+
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        is_propagated = failure_reason is None
+        if is_propagated:
+            failure_reason = "KV transfer failed"
+        raise KVTransferError(
+            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
+        )
 
     def abort(self):
         super().abort()
