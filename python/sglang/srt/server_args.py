@@ -3613,8 +3613,10 @@ class ServerArgs:
     weight_cache_socket: A[
         Optional[str],
         Arg(
-            help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            help="Unix socket path for weight cache daemon (client mode). Being a "
+            "single scalar, it only addresses one daemon and is therefore "
+            "restricted to single-rank debugging. If not set, each rank derives "
+            "/tmp/sglang_weight_cache_gpu{physical_gpu_id}.sock",
         ),
         NS("model"),
     ] = None
@@ -3625,6 +3627,50 @@ class ServerArgs:
         ),
         NS("model"),
     ] = 1800
+    weight_cache_seed: A[
+        Optional[str],
+        Arg(
+            help="Seed the weight cache daemons from existing daemons instead of "
+            "from disk (mirror mode). Comma-separated source addresses indexed by "
+            "global rank (tp_size * pp_rank + tp_rank), one per rank: an absolute "
+            "Unix socket path for a same-node source, or host:port for a source "
+            "reached over the cross-node control plane. Only a same-shape replica "
+            "can seed: the source's rank i shard is byte-identical to this "
+            "replica's rank i only when model, revision, dtype, quantization and "
+            "parallel layout all match (verified at handshake).",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_seed_backend: A[
+        str,
+        Arg(
+            help="Mover used to copy weights from the seed daemon. 'peer_ipc': "
+            "same-node cudaMemcpyPeer over a CUDA IPC mapping (NVLink). 'rdma': "
+            "cross-machine pull via the mooncake transfer engine.",
+            choices=["peer_ipc", "rdma"],
+        ),
+        NS("model"),
+    ] = "peer_ipc"
+    weight_cache_listen_addr: A[
+        Optional[str],
+        Arg(
+            help="host:base_port for the weight cache daemon's cross-node seed "
+            "control plane; rank i listens on base_port + i. Requires "
+            "--weight-cache-seed-token. Only needed on a daemon that acts as a "
+            "seed for another machine.",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_seed_token: A[
+        Optional[str],
+        Arg(
+            help="Shared secret authenticating the cross-node seed control "
+            "plane. Mandatory whenever --weight-cache-listen-addr is set: the "
+            "peer-uid check that protects the node-local Unix socket has no "
+            "cross-machine equivalent.",
+        ),
+        NS("model"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -8168,6 +8214,16 @@ class ServerArgs:
                 "that selects IPC loading automatically."
             )
 
+        self._validate_weight_cache_options()
+
+    def _validate_weight_cache_options(self):
+        """Reject weight-cache configurations that cannot work.
+
+        Split out of _handle_load_format because none of these depend on the
+        load-format detection above (which probes the filesystem), and keeping
+        them together makes the whole set of weight-cache preconditions readable
+        and testable in one place.
+        """
         # Speculative decoding loads an extra draft model whose weights the
         # daemon does not export, so refuse the combination up front instead of
         # failing deep inside draft-worker load (draft-model daemon TBD).
@@ -8182,6 +8238,45 @@ class ServerArgs:
         if self.weight_cache_mode != "off" and self.enable_eplb:
             raise ValueError(
                 "--weight-cache-mode is not supported together with --enable-eplb."
+            )
+
+        # --weight-cache-socket is a scalar, but every rank needs its own daemon
+        # on its own GPU. Honoring it beyond one rank would point all of them at
+        # a single daemon and map another rank's shard -- silently wrong weights.
+        if self.weight_cache_socket is not None and self.tp_size * self.pp_size > 1:
+            raise ValueError(
+                f"--weight-cache-socket is only valid for a single rank, but "
+                f"tp_size={self.tp_size} pp_size={self.pp_size}. Each rank talks "
+                f"to the daemon on its own GPU, so one explicit path cannot "
+                f"address them all. Drop the option and let every rank derive "
+                f"its own path."
+            )
+
+        # Mirror mode pairs rank i with the source's rank i, so the seed list is
+        # indexed by global rank and must cover the whole replica. A short list
+        # would leave later ranks silently disk-loading.
+        if self.weight_cache_seed is not None:
+            seeds = [a for a in self.weight_cache_seed.split(",") if a.strip()]
+            world_size = self.tp_size * self.pp_size
+            if len(seeds) != world_size:
+                raise ValueError(
+                    f"--weight-cache-seed must list one source address per rank "
+                    f"(tp_size * pp_size = {world_size}), got {len(seeds)}. The "
+                    f"list is indexed by global rank because only the source's "
+                    f"rank i holds the shard this replica's rank i needs."
+                )
+
+        # The cross-node plane is reachable by anything that can route to the
+        # port, so refuse to open it without a secret rather than serving the
+        # model layout to unauthenticated peers.
+        if (
+            self.weight_cache_listen_addr is not None
+            and not self.weight_cache_seed_token
+        ):
+            raise ValueError(
+                "--weight-cache-listen-addr requires --weight-cache-seed-token: "
+                "the cross-node seed control plane has no equivalent of the "
+                "peer-uid check that protects the node-local Unix socket."
             )
 
     def _is_mistral_native_format(self) -> bool:

@@ -1106,9 +1106,7 @@ class ModelRunner:
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
             server_args=self.server_args,
-            tp_size=self.ps.tp_size,
-            pp_rank=self.ps.pp_rank,
-            tp_rank=self.ps.tp_rank,
+            gpu_id=self.gpu_id,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(

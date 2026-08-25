@@ -4391,22 +4391,23 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
 
-        if load_config.weight_cache_socket:
-            socket_path = load_config.weight_cache_socket
-        else:
-            from sglang.srt.runtime_context import get_parallel
-
-            ps = get_parallel()
-            global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
-            socket_path = get_socket_path(global_rank=global_rank)
+        # No fallback derivation here: the socket path is keyed by the physical
+        # GPU this worker owns, which only maybe_enable_ipc_weight_cache knows.
+        # Re-deriving it from get_parallel() would be a second, drifting copy of
+        # the formula (and would silently pick the wrong device once two
+        # same-shape replicas share a node).
+        if not load_config.weight_cache_socket:
+            raise ValueError(
+                "[weight_cache] load_format=ipc_cache requires "
+                "load_config.weight_cache_socket to be set by "
+                "maybe_enable_ipc_weight_cache(), which is the single authority "
+                "for that path. Reaching here means the IPC cache was enabled "
+                "without going through it."
+            )
         return IpcModelLoader(
             load_config=load_config,
-            socket_path=socket_path,
+            socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
         )
