@@ -56,7 +56,7 @@ export const Qwen38MambaRatioCalculator = () => {
   // unresolved `{{MODEL_NAME}}` there — so the checkpoint precision, which
   // decides what `--kv-cache-dtype auto` resolves to, is only knowable from the
   // selection's quant.
-  const [quant, setQuant] = useState("nvfp4");
+  const [quant, setQuant] = useState("nvfp4-bf16-head");
   useEffect(() => {
     const onSel = (e) => {
       if (e.detail && e.detail.quant) setQuant(e.detail.quant);
@@ -99,7 +99,7 @@ export const Qwen38MambaRatioCalculator = () => {
         ? "fp8_e4m3"
         : kvFlag === "bfloat16" || kvFlag === "bf16"
           ? "bfloat16"
-          : quant === "nvfp4"
+          : String(quant).startsWith("nvfp4")
             ? "fp8_e4m3"
             : "bfloat16";
 

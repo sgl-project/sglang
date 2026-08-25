@@ -33,6 +33,51 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
+## Out-of-Tree Models and Pipelines
+
+An installed package can register native component models and a pipeline
+without modifying SGLang-Diffusion. Register them in the package's
+`__init__.py`:
+
+```python
+from sglang.multimodal_gen.registry import register_pipeline
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+from .configs import CustomPipelineConfig, CustomSamplingParams
+from .pipeline import CustomPipeline
+
+
+ModelRegistry.register_model(
+    "CustomTransformer2DModel",
+    "custom_diffusion.models:CustomTransformer2DModel",
+)
+register_pipeline(
+    CustomPipeline,
+    sampling_param_cls=CustomSamplingParams,
+    pipeline_config_cls=CustomPipelineConfig,
+    hf_model_paths=["my-org/custom-diffusion-model"],
+    model_detectors=[lambda value: "custom-diffusion" in value.lower()],
+)
+```
+
+Install the package in the server environment and set the same environment
+variable used by SRT plugins:
+
+```bash
+pip install -e /path/to/custom-diffusion
+SGLANG_EXTERNAL_MODEL_PACKAGE=custom_diffusion \
+  sglang serve --model-path my-org/custom-diffusion-model
+```
+
+Notes:
+
+- The string form of `register_model` keeps component imports lazy.
+- `hf_model_paths` also supports checkpoints without `model_index.json`. Other
+  Diffusers checkpoints can select the pipeline through `_class_name`.
+- For a standalone safetensors file, pass `--pipeline CustomPipeline`.
+- Set the environment variable before startup. Each process imports the package
+  once. Use `overwrite=True` only to intentionally replace a built-in pipeline.
+
 ## Start With the Smallest Change
 
 Before adding files, decide which path fits the model.
