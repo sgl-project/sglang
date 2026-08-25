@@ -9,6 +9,10 @@ import torch
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
 from sglang.srt.speculative.ngram_precompute import extract_local_accept_path_nodes
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -64,7 +68,7 @@ def decide_needs_cpu_seq_lens(
             )
         return False
 
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
     if spec_algo.is_ngram():
@@ -85,7 +89,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if not algo.is_dspark():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
@@ -580,14 +584,8 @@ class FutureMap:
             self.confidence_relay.scatter(indices, confidence)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
-            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = device_module.Event()
-            else:
-                # Chain the records: event fire implies every prior publish is
-                # visible, so an off-forward-stream publish (PD-decode prebuilt
-                # seeding) cannot drop the in-flight forward's fence.
-                device_module.current_stream().wait_event(self.publish_ready)
+                self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
         if publish_confidence:

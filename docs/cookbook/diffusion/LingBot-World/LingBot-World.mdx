@@ -7,13 +7,13 @@ tag: REALTIME
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["realtime", "world model", "causal DiT", "camera control"]} />
+<DiffusionModelTags tags={["realtime", "world model", "continuous video", "camera control", "causal KV cache"]} />
 
 ## 1. Model Introduction
 
-[LingBot World](https://huggingface.co/robbyant/lingbot-world-fast-diffusers) is a realtime camera-controlled video world model. In SGLang-diffusion, it belongs to the realtime causal path: the server keeps a live session, samples control signals per chunk, reuses causal DiT state, and decodes video frames incrementally.
+[LingBot World](https://huggingface.co/robbyant/lingbot-world-fast-diffusers) is a realtime camera-controlled video world model. It keeps a live causal session, applies prompt and camera events between chunks, reuses DiT/VAE state, and streams decoded frames instead of finishing a bounded clip before returning.
 
-This is different from offline diffusion video models such as Wan or LTX. Offline models denoise a bounded latent sequence for one request. Realtime world models generate a continuing stream, so the runtime must manage session state, control events, causal attention cache, and VAE decode cache.
+Choose it for interactive exploration and continuous control, not one-shot cinematic generation. The causal window makes long sessions practical but gives up the global bidirectional context available to offline Wan or LTX pipelines; session state and cache policy are therefore part of the serving contract.
 
 ## 2. Deployment
 
@@ -79,6 +79,7 @@ Send this MessagePack map immediately after the WebSocket opens.
 | `num_inference_steps` | integer | No | Denoising steps per chunk. LingBot defaults to `4` when omitted. |
 | `guidance_scale` | number | No | Classifier-free guidance scale. Realtime LingBot commonly uses `1`. |
 | `negative_prompt` | string | No | Negative prompt passed to the diffusion pipeline. |
+| `quality` | `"lossless"`, `"high"` | No | `lossless` keeps FP32 VAE decode. `high` uses the validated BF16 decode path for lower per-chunk latency. |
 | `max_chunks` | integer | No | Stop after this many chunks. Omit for a continuous session. |
 | `realtime_causal_sink_size` | integer | No | Number of sink frames/tokens retained in the causal attention window. |
 | `realtime_causal_kv_cache_num_frames` | integer | No | Number of recent frames retained in the causal KV cache window. |
