@@ -41,11 +41,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
+from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     RequestMetrics,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
