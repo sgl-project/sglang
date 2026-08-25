@@ -1170,7 +1170,6 @@
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/development/contribution_guide",
                       "docs/hardware-platforms/ascend-npus/development/support_new_models",
-                      "docs/hardware-platforms/ascend-npus/development/kimi_k3_prefill_context_parallel",
                       "docs/hardware-platforms/ascend-npus/development/operator_development",
                       "docs/hardware-platforms/ascend-npus/development/operator_performance_optimizing"
                     ]
