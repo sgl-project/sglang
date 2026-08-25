@@ -2,21 +2,27 @@ package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "public_headers",
-    srcs = glob([
-        "include/**/*.h",
-        "include/**/*.hpp",
-        "include/**/*.cuh",
-    ]),
+    srcs = glob(
+        [
+            "include/**/*.h",
+            "include/**/*.hpp",
+            "include/**/*.cuh",
+        ],
+        allow_empty = True,
+    ),
 )
 
 filegroup(
     name = "cpu_sources",
-    srcs = glob([
-        "csrc/cpu/**/*.cc",
-        "csrc/cpu/**/*.cpp",
-        "csrc/cpu/**/*.h",
-        "csrc/cpu/**/*.hpp",
-    ]),
+    srcs = glob(
+        [
+            "csrc/cpu/**/*.cc",
+            "csrc/cpu/**/*.cpp",
+            "csrc/cpu/**/*.h",
+            "csrc/cpu/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
     target_compatible_with = ["//bazel/platforms:cpu"],
 )
 
@@ -32,6 +38,7 @@ filegroup(
             "csrc/**/*.h",
             "csrc/**/*.hpp",
         ],
+        allow_empty = True,
         exclude = [
             "csrc/cpu/**",
             "csrc/metal/**",
@@ -43,27 +50,36 @@ filegroup(
 
 filegroup(
     name = "rocm_sources",
-    srcs = glob([
-        "csrc/**/*.hip",
-        "csrc/**/*.h",
-        "csrc/**/*.hpp",
-        "setup_rocm.py",
-    ]),
+    srcs = glob(
+        [
+            "csrc/**/*.hip",
+            "csrc/**/*.h",
+            "csrc/**/*.hpp",
+            "setup_rocm.py",
+        ],
+        allow_empty = True,
+    ),
     target_compatible_with = ["//bazel/platforms:rocm"],
 )
 
 filegroup(
     name = "musa_sources",
-    srcs = glob([
-        "csrc/musa/**",
-        "setup_musa.py",
-    ]),
+    srcs = glob(
+        [
+            "csrc/musa/**",
+            "setup_musa.py",
+        ],
+        allow_empty = True,
+    ),
     target_compatible_with = ["//bazel/platforms:musa"],
 )
 
 filegroup(
     name = "python_facade",
-    srcs = glob(["python/sgl_kernel/**/*.py"]),
+    srcs = glob(
+        ["python/sgl_kernel/**/*.py"],
+        allow_empty = True,
+    ),
 )
 
 filegroup(

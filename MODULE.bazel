@@ -9,7 +9,11 @@ bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
-register_execution_platforms("//bazel/platforms:linux_x86_64_cpu")
+register_execution_platforms(
+    "//bazel/platforms:linux_x86_64_cpu",
+    "//bazel/platforms:linux_x86_64_cuda",
+    "//bazel/platforms:linux_x86_64_rocm",
+)
 
 # Python 3.12 matches the hosted CPU/lint jobs. Accelerator-specific Python
 # hubs will be added separately because CUDA, ROCm, XPU, and NPU can share an
