@@ -448,18 +448,14 @@ class MoriKVManager(CommonKVManager):
 
     def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
         room = kv_chunk.room
-        if (
-            room not in self.request_status
-            or self.check_status(room) == KVPoll.Failed
-        ):
-            logger.debug(
-                "Skipping chunk for room %s because it has already failed or been aborted",
-                room,
-            )
+        if self._should_skip_transfer(room):
             return
 
         if kv_chunk.wait_event is not None:
             kv_chunk.wait_event.synchronize()
+
+        if self._should_skip_transfer(room):
+            return
 
         statuses, target_infos = self._submit_kv_transfer(
             room,
@@ -470,21 +466,33 @@ class MoriKVManager(CommonKVManager):
             state_indices=kv_chunk.state_indices,
         )
 
-        if self.check_status(room) == KVPoll.Failed:
-            self._conclude_room_failure(room)
+        if self._should_skip_transfer(room):
             return
 
         failure_reason = self._wait_transfer_completion(statuses)
+        if self._should_skip_transfer(room):
+            return
         if failure_reason is not None:
             self._conclude_room_failure(room, failure_reason)
             return
 
         if kv_chunk.is_last_chunk:
-            self._notify_decode_for_room(room, KVPoll.Success, target_infos=target_infos)
+            self._notify_decode_for_room(
+                room, KVPoll.Success, target_infos=target_infos
+            )
             self.update_status(room, KVPoll.Success)
 
+    def _should_skip_transfer(self, room: int) -> bool:
+        if room not in self.request_status or self.check_status(room) == KVPoll.Failed:
+            logger.debug(
+                "Skipping chunk for room %s because it has already failed or been aborted",
+                room,
+            )
+            return True
+        return False
+
     def _wait_transfer_completion(
-        self, statuses: List[TransferStatus], room: int
+        self, statuses: List[TransferStatus]
     ) -> Optional[str]:
         if not statuses:
             return None
@@ -498,10 +506,7 @@ class MoriKVManager(CommonKVManager):
                 if rc == StatusCode.SUCCESS:
                     return None
                 return self._collect_transfer_failure_reason(statuses)
-            if (
-                sla_ms > 0
-                and (time.perf_counter() - start) * 1000 >= sla_ms
-            ):
+            if sla_ms > 0 and (time.perf_counter() - start) * 1000 >= sla_ms:
                 return f"KV transfer exceeded SLA {sla_ms}ms"
 
     @staticmethod
@@ -519,7 +524,7 @@ class MoriKVManager(CommonKVManager):
         target_infos: Optional[List[TransferInfo]] = None,
     ) -> None:
         with self._room_notify_lock:
-            if self._room_status_notified.get(room):
+            if room not in self.request_status or self._room_status_notified.get(room):
                 return
 
             emitted_status = status
@@ -533,7 +538,9 @@ class MoriKVManager(CommonKVManager):
                     emitted_reason = recorded
                 elif self.request_status.get(room) == KVPoll.Failed:
                     emitted_status = KVPoll.Failed
-                    emitted_reason = emitted_reason or "request marked Failed before notify"
+                    emitted_reason = (
+                        emitted_reason or "request marked Failed before notify"
+                    )
 
             if emitted_status == KVPoll.Failed:
                 with self.failure_lock:
@@ -546,7 +553,9 @@ class MoriKVManager(CommonKVManager):
             if infos is None:
                 with self.transfer_lock:
                     room_infos = self.transfer_infos.get(room)
-                    infos = list(room_infos.values()) if room_infos is not None else None
+                    infos = (
+                        list(room_infos.values()) if room_infos is not None else None
+                    )
 
             self._room_status_notified[room] = True
 
@@ -1464,19 +1473,17 @@ class MoriKVManager(CommonKVManager):
         with self.transfer_lock:
             transfer_infos = self.transfer_infos.get(bootstrap_room)
             if not transfer_infos:
-                reason = f"No transfer info found for bootstrap_room={bootstrap_room}"
-                self.record_failure(bootstrap_room, reason)
-                self.update_status(bootstrap_room, KVPoll.Failed)
-                return [], None
+                raise RuntimeError(
+                    f"No transfer info found for bootstrap_room={bootstrap_room}"
+                )
 
             self.update_status(bootstrap_room, KVPoll.Transferring)
             for info in transfer_infos.values():
                 peer_info = self.decode_kv_args_table.get(info.engine_key)
                 if not peer_info:
-                    reason = f"Peer info missing for engine {info.engine_key}"
-                    self.record_failure(bootstrap_room, reason)
-                    self.update_status(bootstrap_room, KVPoll.Failed)
-                    return [], list(transfer_infos.values())
+                    raise RuntimeError(
+                        f"Peer info missing for engine {info.engine_key}"
+                    )
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
             if is_last_chunk:
                 target_infos_snapshot = list(transfer_infos.values())
@@ -1517,15 +1524,11 @@ class MoriKVManager(CommonKVManager):
                         )
                     )
         except Exception as e:
-            reason = f"Transfer submission failed: {e}"
-            with self.transfer_lock:
-                self.record_failure(bootstrap_room, reason)
-                self.update_status(bootstrap_room, KVPoll.Failed)
             logger.exception(
                 "Mori KV transfer submission failed for bootstrap_room=%s",
                 bootstrap_room,
             )
-            return result_statuses, target_infos_snapshot
+            raise RuntimeError(f"Transfer submission failed: {e}") from e
 
         return result_statuses, target_infos_snapshot
 
@@ -1613,8 +1616,8 @@ class MoriKVSender(CommonKVSender):
 
     def clear(self) -> None:
         with self.kv_mgr._room_notify_lock:
+            super().clear()
             self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
-        super().clear()
 
     def failure_exception(self):
         if self.conclude_state is None:
