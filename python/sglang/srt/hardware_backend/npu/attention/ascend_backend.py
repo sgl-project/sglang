@@ -20,7 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import supports_fia_mixed_split
+from sglang.srt.hardware_backend.npu.device_op import get_npu_device_op
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -347,20 +347,22 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         fia_mixed_split_requested = envs.SGLANG_NPU_FIA_MIXED_SPLIT.get()
+        device_op = get_npu_device_op()
         self.enable_fia_mixed_split = (
             self.use_fia
             and fia_mixed_split_requested
             and not self.use_mla
-            and supports_fia_mixed_split()
+            and device_op.fia_splits_mixed_batch
         )
         if speculative_step_id == 0:
             logger.info(
                 "Ascend FIA mixed split is %s (ASCEND_USE_FIA=%s, "
-                "SGLANG_NPU_FIA_MIXED_SPLIT=%s, use_mla=%s)",
+                "SGLANG_NPU_FIA_MIXED_SPLIT=%s, use_mla=%s, device=%s)",
                 "enabled" if self.enable_fia_mixed_split else "disabled",
                 self.use_fia,
                 fia_mixed_split_requested,
                 self.use_mla,
+                device_op.target,
             )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens

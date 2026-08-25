@@ -9,7 +9,7 @@ import math
 
 import pytest
 import torch
-from sglang.srt.hardware_backend.npu.utils import supports_fia_mixed_split
+from sglang.srt.hardware_backend.npu.device_op import get_npu_device_op
 
 torch_npu = pytest.importorskip("torch_npu")
 
@@ -49,7 +49,7 @@ def _run_fia(
 def test_single_and_prefill_first_split_are_byte_identical(
     num_heads, num_kv_heads
 ):
-    if not supports_fia_mixed_split():
+    if not get_npu_device_op().fia_splits_mixed_batch:
         pytest.skip("FIA mixed split is only validated on Ascend 950 / A5")
 
     torch.manual_seed(0)

@@ -37,7 +37,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
-from sglang.srt.hardware_backend.npu.utils import supports_fia_mixed_split
+from sglang.srt.hardware_backend.npu.device_op import (
+    Ascend950DeviceOperator,
+    NPUDeviceOperator,
+    get_npu_device_op,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -167,28 +171,39 @@ class TestForwardMetadata(unittest.TestCase):
         self.assertEqual(names, expected)
 
 
-class TestSupportsFiaMixedSplit(unittest.TestCase):
+class TestNPUDeviceOperator(unittest.TestCase):
+    """Resolution of the runtime generation contracts (RFC #35709).
+
+    A SoC the table does not name, and a SoC query that fails outright, must
+    both land on the baseline contracts -- the single-call FIA path that every
+    generation supports -- rather than on the 950 ones.
+    """
+
     def setUp(self):
-        supports_fia_mixed_split.cache_clear()
+        get_npu_device_op.cache_clear()
         # The module-level torch_npu stub is installed with setdefault, so on a
         # host that really has torch_npu this is the genuine module and its
         # get_soc_version is a plain function. Patch it either way.
         patcher = patch.object(sys.modules["torch_npu"].npu, "get_soc_version")
         self.get_soc_version = patcher.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(supports_fia_mixed_split.cache_clear)
+        self.addCleanup(get_npu_device_op.cache_clear)
 
-    def test_a5_is_supported(self):
+    def test_a5_selects_the_950_contracts(self):
         self.get_soc_version.return_value = 260
-        self.assertTrue(supports_fia_mixed_split())
+        device_op = get_npu_device_op()
+        self.assertIsInstance(device_op, Ascend950DeviceOperator)
+        self.assertTrue(device_op.fia_splits_mixed_batch)
 
-    def test_non_a5_is_not_supported(self):
+    def test_non_a5_keeps_the_baseline_contracts(self):
         self.get_soc_version.return_value = 220
-        self.assertFalse(supports_fia_mixed_split())
+        device_op = get_npu_device_op()
+        self.assertIs(type(device_op), NPUDeviceOperator)
+        self.assertFalse(device_op.fia_splits_mixed_batch)
 
-    def test_query_failure_disables_split(self):
+    def test_query_failure_keeps_the_baseline_contracts(self):
         self.get_soc_version.side_effect = RuntimeError("SoC query failed")
-        self.assertFalse(supports_fia_mixed_split())
+        self.assertIs(type(get_npu_device_op()), NPUDeviceOperator)
 
 
 class TestFiaMixedSplitMetadata(unittest.TestCase):
