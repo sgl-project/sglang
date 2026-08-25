@@ -123,6 +123,7 @@ def _split_dim_absorbed_extend_kernel(
     stride_bvt,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_N_PREFIX: tl.constexpr,
     USE_FP8_PREFIX: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
@@ -142,7 +143,8 @@ def _split_dim_absorbed_extend_kernel(
 
     group = tl.arange(0, _GROUP_SIZE)
     tail = tl.arange(0, 64)
-    col_offsets = tl.arange(0, BLOCK_N)
+    col_offsets = tl.arange(0, BLOCK_N_PREFIX)
+    col_offsets_ext = tl.arange(0, BLOCK_N)
     q_row = (q_start + row).to(tl.int64)
     q_base = q_row[:, None] * stride_qt + head * stride_qh
     q0 = tl.load(Q + q_base + group[None, :], mask=row_mask[:, None], other=0.0)
@@ -180,7 +182,7 @@ def _split_dim_absorbed_extend_kernel(
     denominator = tl.zeros((BLOCK_M,), tl.float32)
     max_logit = tl.full((BLOCK_M,), -float("inf"), tl.float32)
 
-    for start_n in range(0, prefix_len, BLOCK_N):
+    for start_n in range(0, prefix_len, BLOCK_N_PREFIX):
         col = start_n + col_offsets
         col_mask = col < prefix_len
         slot = tl.load(kv_indices + prefix_start + col, mask=col_mask, other=0).to(
@@ -274,7 +276,7 @@ def _split_dim_absorbed_extend_kernel(
 
     extend_end = tl.minimum(q_len, (block_m + 1) * BLOCK_M)
     for start_n in range(0, extend_end, BLOCK_N):
-        col = start_n + col_offsets
+        col = start_n + col_offsets_ext
         col_mask = col < extend_end
         token = (q_start + col).to(tl.int64)
         k_base = token[None, :] * stride_kt
@@ -391,6 +393,7 @@ def split_dim_absorbed_extend_attention_fwd(
     v_slot_stride, _, _, _ = _extract_kv_strides(v_buffer, page_size)
     use_fp8_prefix = k_buffer.dtype == torch.float8_e4m3fn
     fp8_max = torch.finfo(k_buffer.dtype).max if use_fp8_prefix else 1.0
+    block_n_prefix = 64 if use_fp8_prefix else 32
     grid = (batch, heads, triton.cdiv(max_len_extend, 64))
     _split_dim_absorbed_extend_kernel[grid](
         q,
@@ -415,6 +418,7 @@ def split_dim_absorbed_extend_attention_fwd(
         v_slot_stride,
         BLOCK_M=64,
         BLOCK_N=32,
+        BLOCK_N_PREFIX=block_n_prefix,
         USE_FP8_PREFIX=use_fp8_prefix,
         FP8_MAX=fp8_max,
         num_warps=4,
