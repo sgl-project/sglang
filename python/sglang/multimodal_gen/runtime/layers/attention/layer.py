@@ -597,6 +597,8 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
+        is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
@@ -610,7 +612,11 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -740,7 +746,8 @@ class USPAttention(nn.Module):
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
             default_attention_backend:
-              fallback used only when no global or component override is active.
+              preferred fallback when the global backend is incompatible with
+              this layer. Explicit component overrides otherwise remain strict.
             is_cross_attention:
               sparse backend preferences may select a compatible dense backend
               for cross-attention while remaining strict for self-attention.
@@ -1296,7 +1303,7 @@ class USPAttention(nn.Module):
             q.squeeze(0),
             k.squeeze(0),
             v.squeeze(0),
-            softmax_scale=self.softmax_scale,
+            attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
         )
