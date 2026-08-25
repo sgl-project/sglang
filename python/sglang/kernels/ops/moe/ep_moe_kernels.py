@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -1994,19 +1995,33 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
             tl.store(output_ptrs + tok_idx * k, quantized)
 
 
-# Hidden elements per program, kept in elements rather than scale groups: 1024
-# over 4 warps is 8 B/thread, where Triton starts emitting vector accesses (8
-# warps give 4 B/thread and scalar b32).  2048 wins once there are enough experts
-# to fill the machine on the expert axis alone.
-_REQUANT_TILE_ELEMS = 1024
-_REQUANT_TILE_ELEMS_MANY_EXPERTS = 2048
+# Hidden bytes each lane moves per tile.  This, not the element count, is the
+# quantity that was tuned: it decides the access width Triton emits, and the two
+# vendors disagree on lanes per warp, so an element count that is right on one is
+# half the bytes per lane on the other.  Scored against the per-point best over
+# 16 (hidden x expert x row) points per part, at 4 warps:
+#
+#   B/lane |  2      4      8      16     32
+#   H200   |  -      2.44x  1.54x  1.09x  1.21x
+#   MI350X |  1.93x  1.41x  1.17x  1.08x  -
+#
+# 16 B/lane is the optimum on both -- 2048 elements on H200 (4 warps of 32) and
+# 4096 on MI350X (4 of 64).  Below a few dozen experts the grid is too small to
+# fill an NVIDIA part, and halving the tile to buy k-blocks wins there instead
+# (E=8, 1 row: 1.44 vs 1.55 us); that is an NVIDIA-only effect, and it costs
+# MI350X up to 5% at the same points, which is the cheaper side of the trade.
+_REQUANT_BYTES_PER_LANE = 16
+_REQUANT_BYTES_PER_LANE_FEW_EXPERTS = 8
 _REQUANT_MANY_EXPERTS = 32
 _REQUANT_NUM_WARPS = 4
+_REQUANT_DEFAULT_WARP_SIZE = 32
 _REQUANT_M_GRID_MAX = 32
 _REQUANT_M_GRID_MIN = 4
 # Target programs on the (m-grid x expert) plane while rows are scarce: 32 per
 # expert oversubscribes at >= 64 experts (measured 15-30%), but past this many
-# rows per expert the extra programs carry real work.
+# rows per expert the extra programs carry real work.  A fixed target, not one
+# scaled by the machine's core count: scaling it to 8 programs per core was
+# neutral on H200 and 1.12x worse on MI350X.
 _REQUANT_TARGET_PROGRAMS = 1024
 _REQUANT_ROWS_SATURATED = 64
 
@@ -2015,11 +2030,19 @@ def _floor_pow2(value: int) -> int:
     return 1 << (max(1, value).bit_length() - 1)
 
 
+@lru_cache(maxsize=None)
+def requant_warp_size(device: torch.device) -> int:
+    """Lanes per warp, which sets the tile width the requant launches."""
+    props = torch.cuda.get_device_properties(device)
+    return getattr(props, "warp_size", _REQUANT_DEFAULT_WARP_SIZE)
+
+
 def requant_launch_geometry(
     num_groups: int,
     num_experts: int,
     group_size: int = 128,
     expected_rows: Optional[int] = None,
+    warp_size: int = _REQUANT_DEFAULT_WARP_SIZE,
 ) -> Tuple[int, int]:
     """Pick (groups per program, m-grid) for the per-token -> per-tensor requant.
 
@@ -2031,12 +2054,19 @@ def requant_launch_geometry(
     The row count is rounded down to a power of two because the dispatcher's
     estimate already rounds up (it adds the expert count before dividing), so an
     exact average of 8 rows arrives as 9 and must not launch 16 programs.
+
+    ``warp_size`` widens the tile on a vendor whose warp is wider, keeping the
+    bytes each lane moves -- the thing that was actually tuned -- constant. It is
+    a launch hint like the rest: any width is correct, so a part that reports an
+    unexpected one only pays for it in bandwidth.
     """
-    tile_elems = (
-        _REQUANT_TILE_ELEMS_MANY_EXPERTS
+    # The payload is fp8, so a byte per lane is an element per lane.
+    bytes_per_lane = (
+        _REQUANT_BYTES_PER_LANE
         if num_experts >= _REQUANT_MANY_EXPERTS
-        else _REQUANT_TILE_ELEMS
+        else _REQUANT_BYTES_PER_LANE_FEW_EXPERTS
     )
+    tile_elems = bytes_per_lane * _REQUANT_NUM_WARPS * warp_size
     # Round down, so the tile never covers groups the payload does not have.
     g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
     if expected_rows is None:
@@ -2072,6 +2102,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
         num_experts=x.size(0),
         group_size=K_SCALE_BLOCK_SIZE,
         expected_rows=expected_rows,
+        warp_size=requant_warp_size(x.device),
     )
     grid = (triton.cdiv(num_groups, g_block), m_grid, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](

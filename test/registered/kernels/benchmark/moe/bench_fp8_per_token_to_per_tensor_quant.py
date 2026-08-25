@@ -4,7 +4,7 @@
 shipped with (a 1024-element tile, 8 warps, 32 programs per expert regardless of
 how many rows are live), so this isolates the launch geometry and not the
 scale-loading rewrite; ``tuned`` goes through the wrapper, which sizes the tile
-from the expert count and the m-grid from the dispatcher's expected rows.
+from the part's warp width and the m-grid from the dispatcher's expected rows.
 
 ``skew`` covers the case the m-grid cannot see: ``expected_m`` is a global
 average, so a hot expert holding ``skew`` times its share serializes its rows

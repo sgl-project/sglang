@@ -32,22 +32,49 @@ class TestRequantLaunchGeometry(CustomTestCase):
                 )
                 self.assertLessEqual(g_block, num_groups)
 
-    def test_tile_is_sized_in_elements_not_scale_groups(self):
-        """The tuned quantity is bytes per thread, so it must survive a group width.
+    def test_tile_holds_bytes_per_lane_across_warp_widths(self):
+        """The tuned quantity is bytes per lane, so a wider warp takes more elements.
 
-        Everything else in this file runs at the dispatcher's 128-wide groups; if
-        that width ever changes, the tile has to stay the size that was measured
-        rather than silently becoming half or double it.
+        16 B/lane scored 1.09x of the per-point best on H200 and 1.08x on
+        MI350X, and it is the same tile only once the warp width is applied:
+        2048 elements at warp 32, 4096 at warp 64. Sizing in elements alone
+        would hand a wave64 part half the bytes per lane, which measured 1.17x.
         """
-        for group_size in (64, 128, 256, 512):
-            for num_experts, want_elems in ((8, 1024), (56, 2048)):
+        for warp_size, want_elems in ((32, 2048), (64, 4096)):
+            for group_size in (64, 128, 256, 512):
                 g_block, _ = requant_launch_geometry(
                     num_groups=7168 // group_size,
-                    num_experts=num_experts,
+                    num_experts=56,
                     group_size=group_size,
                     expected_rows=16,
+                    warp_size=warp_size,
                 )
-                self.assertEqual(g_block * group_size, want_elems)
+                self.assertEqual(
+                    g_block * group_size, want_elems, f"warp_size={warp_size}"
+                )
+
+    def test_few_experts_halve_the_tile_on_either_warp_width(self):
+        """A grid too small to fill the part buys k-blocks by halving the tile."""
+        for warp_size, want_elems in ((32, 1024), (64, 2048)):
+            g_block, _ = requant_launch_geometry(
+                DSV3_GROUPS, 8, expected_rows=16, warp_size=warp_size
+            )
+            self.assertEqual(g_block * 128, want_elems, f"warp_size={warp_size}")
+
+    def test_warp_width_does_not_move_the_m_grid(self):
+        """The two knobs are independent: the m-grid answers to rows and experts."""
+        for num_experts in (8, 56, 256):
+            for expected_rows in (1, 8, 32, 1024):
+                grids = {
+                    requant_launch_geometry(
+                        DSV3_GROUPS,
+                        num_experts,
+                        expected_rows=expected_rows,
+                        warp_size=warp_size,
+                    )[1]
+                    for warp_size in (32, 64)
+                }
+                self.assertEqual(len(grids), 1, f"E={num_experts} rows={expected_rows}")
 
     def test_m_grid_never_exceeds_the_previous_fixed_grid(self):
         """The estimate only ever shrinks the grid, so no batch can regress."""
