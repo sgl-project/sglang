@@ -1575,6 +1575,13 @@ class SchedulerDisaggMixin:
             scalar_fields["error"] = output_batch.error
         if output_batch.usage is not None:
             scalar_fields["usage"] = output_batch.usage
+        if output_batch.metrics is not None:
+            scalar_fields["metrics"] = output_batch.metrics.to_dict()
+        if output_batch.metrics_list is not None:
+            scalar_fields["metrics_list"] = [
+                metrics.to_dict() if metrics is not None else None
+                for metrics in output_batch.metrics_list
+            ]
         scalar_fields["peak_memory_mb"] = output_batch.peak_memory_mb
         send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 

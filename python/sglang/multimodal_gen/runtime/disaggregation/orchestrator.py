@@ -41,6 +41,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
+    RequestMetrics,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
 if TYPE_CHECKING:
@@ -50,6 +54,25 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
+    if data is None:
+        return None
+
+    metrics = RequestMetrics(request_id=data["request_id"])
+    metrics.stages = data.get("stages", {})
+    metrics.steps = data.get("steps", [])
+    metrics.total_duration_ms = data.get("total_duration_ms", 0.0)
+    for name, snapshot in data.get("memory_snapshots", {}).items():
+        metrics.memory_snapshots[name] = MemorySnapshot(
+            allocated_mb=snapshot.get("allocated_mb", 0.0),
+            reserved_mb=snapshot.get("reserved_mb", 0.0),
+            peak_allocated_mb=snapshot.get("peak_allocated_mb", 0.0),
+            peak_reserved_mb=snapshot.get("peak_reserved_mb", 0.0),
+            peak_host_anon_mb=snapshot.get("peak_host_anon_mb", 0.0),
+        )
+    return metrics
 
 
 @dataclass
@@ -643,7 +666,26 @@ class DiffusionServer:
         event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
         if event == zmq.EVENT_DISCONNECTED:
             state.denoiser_worker_available[worker_idx] = False
-            logger.warning("GLM denoiser[%d] disconnected", worker_idx)
+            self._denoiser_free_slots[worker_idx] = 0
+            replayed_requests = [
+                request
+                for request in state.denoiser_requests.values()
+                if request.worker_idx == worker_idx
+            ]
+            for request in replayed_requests:
+                request.worker_idx = None
+                try:
+                    self._tracker.transition(
+                        request.client_request_id, RequestState.DENOISING_WAITING
+                    )
+                except ValueError:
+                    pass
+            state.pending_denoiser_requests.extendleft(reversed(replayed_requests))
+            logger.warning(
+                "GLM denoiser[%d] disconnected; requeued %d request(s)",
+                worker_idx,
+                len(replayed_requests),
+            )
         elif event == zmq.EVENT_CONNECTED:
             registered = worker_idx in self._denoiser_peers
             state.denoiser_worker_available[worker_idx] = True
@@ -686,6 +728,12 @@ class DiffusionServer:
         result = OutputBatch(
             output=output,
             error=error,
+            metrics=_deserialize_request_metrics(scalar_fields.get("metrics")),
+            metrics_list=[
+                _deserialize_request_metrics(metrics)
+                for metrics in scalar_fields.get("metrics_list", [])
+            ]
+            or None,
             peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
             usage=scalar_fields.get("usage"),
         )
