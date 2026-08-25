@@ -13,6 +13,8 @@ from typing import Optional
 from unittest import mock
 
 import torch
+from _unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+from _unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -69,12 +71,6 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspection_interface import (
-    UnifiedTreeCoreInspectionInterface,
-)
-from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspector import (
-    UnifiedTreeCoreInspector,
-)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,

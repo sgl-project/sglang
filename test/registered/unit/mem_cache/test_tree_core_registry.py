@@ -3,6 +3,8 @@
 import unittest
 from unittest import mock
 
+from _unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -18,9 +20,6 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     registered_tree_core_backends,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspection_interface import (
-    UnifiedTreeCoreInspectionInterface,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
