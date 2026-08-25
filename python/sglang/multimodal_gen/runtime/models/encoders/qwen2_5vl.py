@@ -194,6 +194,9 @@ class Qwen2_5_VLAttention(nn.Module):
     def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.layer_idx = layer_idx
         if layer_idx is None:
             logger.warning(
@@ -315,13 +318,14 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        # Honor the prepared mask on the cache-free path too; it is None when
-        # there is nothing to mask, which keeps the native causal kernel.
+        # LongCat masks padding on the cache-free path too; others keep the
+        # original mask-free fast path unchanged.
+        honor_mask = use_cache or self.honor_cache_free_padding_mask
         attn_output = self.attn(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
+            attn_mask=attention_mask if honor_mask else None,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -442,6 +446,9 @@ class Qwen2_5_VLTextModel(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -565,12 +572,11 @@ class Qwen2_5_VLTextModel(nn.Module):
                     create_sliding_window_causal_mask(**mask_kwargs)
                 )
 
-            # `create_causal_mask` yields None for this config's
-            # `_attn_implementation`, letting padding attend to itself. Only rows
-            # from the first pad on differ, so callers that drop padded rows are
-            # unaffected; LongCat-Image-Edit feeds them to the DiT.
+            # create_causal_mask returns None for this _attn_implementation, so
+            # build the causal+padding mask here. LongCat-only.
             if (
-                causal_mask_mapping["full_attention"] is None
+                self.honor_cache_free_padding_mask
+                and causal_mask_mapping["full_attention"] is None
                 and isinstance(attention_mask, torch.Tensor)
                 and attention_mask.dim() == 2
                 and not bool(attention_mask.all())
@@ -1150,7 +1156,12 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         super().__init__(config)
         enable_image_understanding = config.enable_image_understanding
         generation_config = config.generation_config
+        # LongCat-only; propagate to the text config (see TextEncoderLoader).
+        honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         config = config.arch_config
+        config.text_config.honor_cache_free_padding_mask = honor_cache_free_padding_mask
         self.model = Qwen2_5_VLModel(
             config, enable_image_understanding=enable_image_understanding
         )

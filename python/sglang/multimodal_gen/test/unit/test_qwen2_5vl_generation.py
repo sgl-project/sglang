@@ -174,11 +174,20 @@ def test_explicit_attention_mask_is_honored_without_a_cache(monkeypatch):
         "position_ids": torch.zeros(3, 1, 2, dtype=torch.long),
     }
 
+    # LongCat opts into masking the padded body on the cache-free path.
+    attention.honor_cache_free_padding_mask = True
     attention(**kwargs, use_cache=False)
     attention(**kwargs, use_cache=True)
-
-    # Cache-free diffusion text encoding must mask padding too.
     assert attention.attn.masks[0] is explicit_mask
+    assert attention.attn.masks[1] is explicit_mask
+
+    # Every other pipeline keeps the original behavior: mask dropped when
+    # cache-free, honored only under cached generation.
+    attention.attn.masks.clear()
+    attention.honor_cache_free_padding_mask = False
+    attention(**kwargs, use_cache=False)
+    attention(**kwargs, use_cache=True)
+    assert attention.attn.masks[0] is None
     assert attention.attn.masks[1] is explicit_mask
 
 
