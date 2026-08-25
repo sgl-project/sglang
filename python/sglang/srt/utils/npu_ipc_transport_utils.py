@@ -2,7 +2,7 @@ import logging
 import threading
 import time
 from multiprocessing import shared_memory
-from typing import Tuple
+from typing import Tuple, Optional
 
 import numpy as np
 import torch
@@ -127,7 +127,7 @@ class MmItemMemoryPool:
     def push_sync_buffer(self, sync_buffer):
         self.sync_flag_list.append(sync_buffer)
 
-    def get_available_chunk(self, src_tensor: torch.Tensor) -> MmItemMemoryChunk:
+    def get_available_chunk(self, src_tensor: torch.Tensor) -> Optional[MmItemMemoryChunk]:
         src_tensor_size = src_tensor.numel() * src_tensor.element_size()
         min_size = self.memory_pool.numel() * self.memory_pool.element_size() + 1
         selected_chunk = None
@@ -225,9 +225,6 @@ class MmItemMemoryPool:
 
         for chunk in to_recycle_chunks:
             self.reclaim_chunk(chunk)
-
-        if to_recycle_chunks:
-            total_recycled = sum(c.mem_size for c in to_recycle_chunks)
 
     def merge_chunks(self):
         if len(self.available_chunks) <= 1:
@@ -379,8 +376,8 @@ class NpuIpcTensorTransportProxy:
             self._sync_buffer.close()
             self._sync_buffer = None
 
-    def get_proxy_state(self, data, info_data):
-        state = {}
+    def get_proxy_state(self, data, info_data) -> dict:
+        state: dict = {}
 
         try:
             handle = reduce_tensor(data)
@@ -403,7 +400,7 @@ class NpuIpcTensorTransportProxy:
         return state
 
     def _reconstruct_from_ipc_extra(
-        self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
+        self, ipc_extra, *, rebuild_device_idx: int
     ):
         shape = ipc_extra["shape"]
         stride = ipc_extra["stride"]
@@ -479,28 +476,24 @@ class NpuIpcTensorTransportProxy:
                     _storage_to_cache,
                 ) = self._reconstruct_from_ipc_extra(
                     ipc_extra,
-                    use_cache=False,
                     rebuild_device_idx=rebuild_device_idx,
                 )
             else:
-                try:
-                    original_handle = ipc_extra["handle"]
-                    target_device = torch.device(f"npu:{rebuild_device_idx}")
-                    func, args = original_handle
-                    list_args = list(args)
-                    for i, arg in enumerate(list_args):
-                        if isinstance(arg, torch.device):
-                            list_args[i] = target_device
-                        elif isinstance(arg, str) and arg.startswith("npu:"):
-                            list_args[i] = str(target_device)
-                    rebuild_tensor = func(*tuple(list_args))
-                    slice_tensor = rebuild_tensor.as_strided(
-                        size=ipc_extra["shape"],
-                        stride=ipc_extra["stride"],
-                        storage_offset=ipc_extra["storage_offset"],
-                    )
-                except Exception as e:
-                    raise
+                original_handle = ipc_extra["handle"]
+                target_device = torch.device(f"npu:{rebuild_device_idx}")
+                func, args = original_handle
+                list_args = list(args)
+                for i, arg in enumerate(list_args):
+                    if isinstance(arg, torch.device):
+                        list_args[i] = target_device
+                    elif isinstance(arg, str) and arg.startswith("npu:"):
+                        list_args[i] = str(target_device)
+                rebuild_tensor = func(*tuple(list_args))
+                slice_tensor = rebuild_tensor.as_strided(
+                    size=ipc_extra["shape"],
+                    stride=ipc_extra["stride"],
+                    storage_offset=ipc_extra["storage_offset"],
+                )
 
             reconstructed_tensor = self._copy_slice_tensor_to_target(
                 slice_tensor,
@@ -519,37 +512,6 @@ class NpuIpcTensorTransportProxy:
         self.reconstruct_tensor = reconstructed_tensor
         self._acknowledge_consumption(consumer_count)
         return self.reconstruct_tensor
-
-    def get_reconstructed_tensor(
-        self, use_cache: bool = False, rebuild_device_idx: int = None
-    ):
-        if self.reconstruct_tensor is not None:
-            return self.reconstruct_tensor
-
-        ipc_extra = self.proxy_state.get("ipc_extra")
-        tensor_data = self.proxy_state.get("tensor_data")
-        if ipc_extra is not None:
-            if rebuild_device_idx is None:
-                rebuild_device_idx = ipc_extra["pool_device_index"]
-            (
-                self.reconstruct_tensor,
-                target_device,
-                cache_key,
-                storage_to_cache,
-            ) = self._reconstruct_from_ipc_extra(
-                ipc_extra, use_cache=use_cache, rebuild_device_idx=rebuild_device_idx
-            )
-        elif tensor_data is not None:
-            self.reconstruct_tensor = tensor_data
-
-        return self.reconstruct_tensor
-
-    def is_lazy(self):
-        return (
-            self.proxy_state.get("ipc_extra") is not None
-            and self.proxy_state.get("tensor_data") is None
-            and not self._consumer_acknowledged
-        )
 
     def serialize(self):
         serialized = {}
