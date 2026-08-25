@@ -189,6 +189,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     """DSV4 attention through the trtllm-gen sparse MLA kernel."""
 
     trtllm_attn: bool = True
+    # trtllm-gen handles per-rank head counts natively (verified
+    # bit-identical h=16 vs padded h=64); skip the TP head padding.
+    pads_tp_q_heads: bool = False
 
     def __init__(
         self,

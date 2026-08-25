@@ -662,7 +662,9 @@ class MqaAttentionBase(nn.Module):
         self.fuse_wqa_wkv = fuse
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self._attn_sink_local: Optional[torch.Tensor] = None
+        # Cached per-rank sink slices, keyed by whether the head dim is
+        # padded to match a padded q (see pads_tp_q_heads).
+        self._attn_sink_local: dict = {}
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -760,17 +762,19 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
-    def _local_attn_sink(self) -> torch.Tensor:
+    def _local_attn_sink(self, padded: bool = True) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
-        if self._attn_sink_local is None:
+        if self._attn_sink_local.get(padded) is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            padded_num_heads = (
+                (64 if num_heads <= 64 else self.n_heads) if padded else num_heads
+            )
             sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
+            self._attn_sink_local[padded] = sink
+        return self._attn_sink_local[padded]
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1587,16 +1591,20 @@ class MQALayer(MqaAttentionBase):
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
         skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
-        if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = (
-                self.n_local_heads
-                if skip_decode_pad
-                else (64 if self.n_local_heads <= 64 else self.n_heads)
-            )
+        # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64,
+        # 128}, so TP-sharded heads are padded up to 64 for it. The trtllm-gen
+        # kernel handles per-rank head counts natively (verified bit-identical
+        # h=16 vs padded h=64), so it opts out and skips the pad entirely.
+        pad_q_heads = (
+            self.attn_tp_size > 1
+            and not skip_decode_pad
+            and getattr(attn_backend, "pads_tp_q_heads", True)
+        )
+        if pad_q_heads:
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit,
+            # to dispatch the cheaper decode::head64 variant; attn_sink is
+            # sliced to this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
@@ -1607,7 +1615,7 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(padded=pad_q_heads)
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
