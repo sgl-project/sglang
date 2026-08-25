@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +16,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -103,21 +103,6 @@ def get_max_retries(datasets):
     if dataset in DATASET_FLUCTUATION:
         return MAX_RETRY_COUNT
     return 1
-
-
-def _kill_evalscope_session(process):
-    """Kill the whole evalscope session (process.pid is the leader == pgid)."""
-    if process is None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-        logger.info(f"run_evalscope killed session pgid={process.pid}")
-    except ProcessLookupError:
-        logger.info(f"run_evalscope session pgid={process.pid} already gone")
-    except PermissionError:
-        logger.warning(
-            f"run_evalscope no permission to kill session pgid={process.pid}"
-        )
 
 
 def run_evalscope(
@@ -215,7 +200,7 @@ def run_evalscope(
             f"returncode={process.returncode}"
         )
 
-        _kill_evalscope_session(process)
+        kill_process_group(process)
 
         if process.returncode != 0:
             logger.error(f"Command failed with return code: {process.returncode}")
@@ -272,14 +257,14 @@ def run_evalscope(
             logger.warning("Process did not terminate gracefully, killing it...")
             process.kill()
             logger.info("Process killed")
-        _kill_evalscope_session(process)
+        kill_process_group(process)
         raise
 
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
         process.wait(timeout=5)
-        _kill_evalscope_session(process)
+        kill_process_group(process)
         raise
 
 

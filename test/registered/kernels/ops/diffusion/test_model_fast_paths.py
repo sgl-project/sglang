@@ -43,6 +43,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_rmsnorm_scale_shift,
     can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
+    hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
     mark_hunyuan_qknorm_site,
     mark_ltx2_rms_norm_modulate_site,
@@ -98,7 +99,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
-    _sana_ln_modulate,
+    sana_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -360,7 +361,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
     # default-stream eager serving must stay on the untouched eager chain
     n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    _sana_ln_modulate(norm, x, scale, shift)
+    sana_ln_modulate(norm, x, scale, shift)
     assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
     # The fusion engages on non-default streams (the BCG warmup/capture path).
     # x/scale/shift were filled on the default stream, so the side stream must
@@ -372,9 +373,9 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        out = _sana_ln_modulate(norm, x, scale, shift)
+        out = sana_ln_modulate(norm, x, scale, shift)
         assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
@@ -639,6 +640,47 @@ def test_hunyuan_qkv_rope_pack_is_bit_exact(img_tokens, txt_tokens):
     assert torch.equal(q, q_ref)
     assert torch.equal(k, k_ref)
     assert torch.equal(v, v_ref)
+
+
+def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
+    if torch.cuda.get_device_properties(0).total_memory < 16 * 2**30:
+        pytest.skip("needs >= 16 GB GPU memory")
+
+    img_tokens, txt_tokens = 115200, 8
+    num_heads, head_dim = 24, 128
+    total_tokens = img_tokens + txt_tokens
+    projection_width = 21504
+
+    projection = torch.zeros(
+        (1, total_tokens, projection_width),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv = projection[..., : 3 * num_heads * head_dim].view(
+        1, total_tokens, 3, num_heads, head_dim
+    )
+    q = qkv[:, :, 0].contiguous()
+    k = qkv[:, :, 1].contiguous()
+    v = qkv[:, :, 2]
+    assert (img_tokens - 1) * v.stride(1) > torch.iinfo(torch.int32).max
+
+    cos = torch.ones((img_tokens, head_dim // 2), device="cuda")
+    sin = torch.zeros_like(cos)
+    packed = hunyuan_qkv_rope_pack(
+        q[:, :img_tokens],
+        k[:, :img_tokens],
+        v[:, :img_tokens],
+        q[:, img_tokens:],
+        k[:, img_tokens:],
+        v[:, img_tokens:],
+        cos,
+        sin,
+    )
+    torch.cuda.synchronize()
+
+    expected_shape = (1, total_tokens, num_heads, head_dim)
+    assert all(x.shape == expected_shape for x in packed)
+    assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
 
 
 def test_hunyuan_quality_qknorm_matches_rmsnorm():

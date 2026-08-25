@@ -321,6 +321,20 @@ def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
     return backend
 
 
+@register_attention_backend("minicpm_flashattn")
+def create_minicpm_flashattn_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=False)
+
+
+@register_attention_backend("minicpm_flashinfer")
+def create_minicpm_flashinfer_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=True)
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
