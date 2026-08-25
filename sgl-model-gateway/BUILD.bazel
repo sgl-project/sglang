@@ -4,11 +4,13 @@ load(
     "rust_binary",
     "rust_library",
     "rust_shared_library",
+    "rust_test",
 )
 load(
     "@sgl_model_gateway_crates//:defs.bzl",
     "aliases",
     "all_crate_deps",
+    "crate_deps",
     "crate_edition",
 )
 
@@ -34,6 +36,65 @@ cargo_build_script(
         build = True,
         package_name = "sgl-model-gateway",
     ),
+)
+
+# Standalone policy target that exercises gateway-owned concurrency and
+# prefix-cache code without pulling the OpenSSL-dependent server closure.
+rust_library(
+    name = "policy_tree",
+    srcs = ["src/policies/tree.rs"],
+    crate_name = "smg_policy_tree",
+    crate_root = "src/policies/tree.rs",
+    deps = crate_deps(
+        [
+            "dashmap",
+            "parking_lot",
+            "tracing",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+)
+
+rust_test(
+    name = "policy_tree_test",
+    srcs = ["src/policies/tree.rs"],
+    crate_name = "smg_policy_tree_test",
+    crate_root = "src/policies/tree.rs",
+    deps = crate_deps(
+        [
+            "dashmap",
+            "parking_lot",
+            "rand",
+            "tracing",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+)
+
+rust_test(
+    name = "header_utils_test",
+    srcs = ["src/routers/header_utils.rs"],
+    crate_name = "smg_header_utils_test",
+    crate_root = "src/routers/header_utils.rs",
+    deps = crate_deps(
+        [
+            "axum",
+            "http",
+            "reqwest",
+        ],
+        package_name = "sgl-model-gateway",
+    ),
+    edition = crate_edition(package_name = "sgl-model-gateway"),
+)
+
+test_suite(
+    name = "internal_tests",
+    tests = [
+        ":header_utils_test",
+        ":policy_tree_test",
+    ],
 )
 
 rust_library(

@@ -86,12 +86,6 @@ crate = use_extension(
     "@rules_rust//crate_universe:extensions.bzl",
     "crate",
 )
-crate.annotation(
-    crate = "openssl",
-    crate_features = ["vendored"],
-    repositories = ["sgl_model_gateway_crates"],
-    version = "0.10.81",
-)
 crate.from_cargo(
     name = "sglang_crates",
     cargo_lockfile = "//rust:Cargo.lock",

@@ -1,6 +1,19 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "sgl-model-gateway-crates.lock.json",
     "sglang-crates.lock.json",
 ])
+
+py_test(
+    name = "sgl_model_gateway_lock_parity_test",
+    srcs = ["sgl_model_gateway_lock_parity_test.py"],
+    data = [
+        "sgl-model-gateway-crates.lock.json",
+        "//sgl-model-gateway:Cargo.lock",
+        "//sgl-model-gateway:Cargo.toml",
+        "//sgl-model-gateway:bindings/python/Cargo.toml",
+    ],
+)
