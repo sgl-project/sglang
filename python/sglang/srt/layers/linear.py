@@ -184,12 +184,23 @@ class LinearBase(torch.nn.Module):
         self.params_dtype = params_dtype
         self.quant_config = quant_config
         if quant_config is None:
-            if _is_npu and get_server_args().online_quantization == "w8a8_int8":
+            online_quantization = get_server_args().online_quantization
+            if _is_npu and online_quantization in {
+                "w8a8_int8",
+                "w4a8_int8",
+                "w4a4_int4",
+            }:
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUOnlineW8A8Int8LinearMethod,
+                    NPUOnlineW4A4Int4LinearMethod,
+                    NPUOnlineW4A8Int8LinearMethod,
                 )
 
-                self.quant_method = NPUOnlineW8A8Int8LinearMethod()
+                self.quant_method = {
+                    "w8a8_int8": NPUOnlineW8A8Int8LinearMethod,
+                    "w4a8_int8": NPUOnlineW4A8Int8LinearMethod,
+                    "w4a4_int4": NPUOnlineW4A4Int4LinearMethod,
+                }[online_quantization]()
             else:
                 from sglang.srt.layers.quantization.unquant import (
                     UnquantizedLinearMethod,

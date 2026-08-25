@@ -180,9 +180,11 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
-# TODO: support other online quantization merhods, now supports only Ascend w8a8_int8 MoE
+# Ascend online quantization for full-precision checkpoints.
 ONLINE_QUANTIZATION_CHOICES = [
     "w8a8_int8",
+    "w4a8_int8",
+    "w4a4_int4",
 ]
 
 

@@ -123,6 +123,54 @@ class NPUOnlineW8A8Int8LinearMethod(_NPULinearMethodBase):
         return output.reshape(*input_shape[:-1], output.shape[-1])
 
 
+class _NPUOnlineW4LinearMethod(NPUOnlineW8A8Int8LinearMethod):
+    """Online INT4-weight linear method for full-precision NPU checkpoints."""
+
+    activation_dtype = torch.int8
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(
+            layer.weight.data, dst_type=torch.quint4x2
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight",
+            npu_format_cast(quantized_weight.transpose(0, 1).contiguous()),
+        )
+        copy_or_rebind_param(layer, "weight_scale", weight_scale.flatten())
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_shape = x.shape
+        original_dtype = x.dtype
+        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+            x.reshape(-1, x.shape[-1]), dst_type=self.activation_dtype
+        )
+        output = torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=dynamic_scale.flatten(),
+            bias=bias,
+            output_dtype=original_dtype,
+        )
+        return output.reshape(*input_shape[:-1], output.shape[-1])
+
+
+class NPUOnlineW4A8Int8LinearMethod(_NPUOnlineW4LinearMethod):
+    """Online W4A8 INT8 method for unquantized dense NPU linear layers."""
+
+
+class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineW4LinearMethod):
+    """Online W4A4 INT4 method for unquantized dense NPU linear layers."""
+
+    activation_dtype = torch.quint4x2
+
+
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):

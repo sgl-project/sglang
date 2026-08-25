@@ -885,10 +885,10 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-# NPUUnquantMoEMethod + w8a8 online quantization
+# NPUUnquantMoEMethod + integer online quantization
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
-    """BF16 MoE with optional online W8A8 INT8 quantization."""
+    """BF16 MoE with optional online integer quantization."""
 
     def __init__(self):
         super().__init__(quant_config=None)
@@ -903,9 +903,16 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        if get_server_args().online_quantization == "w8a8_int8":
+        online_quantization = get_server_args().online_quantization
+        if online_quantization == "w8a8_int8":
             self._apply_online_w8a8(layer, weight_prefix, weight_name)
             self._quant_mode = "w8a8_int8"
+            return
+        if online_quantization in {"w4a8_int8", "w4a4_int4"}:
+            self._apply_online_w4(
+                layer, weight_prefix, weight_name, online_quantization
+            )
+            self._quant_mode = online_quantization
             return
 
         weight: torch.Tensor = getattr(layer, weight_name)
@@ -931,6 +938,33 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
+        self.transposed = True
+
+    def _apply_online_w4(
+        self,
+        layer: torch.nn.Module,
+        weight_prefix: str,
+        weight_name: str,
+        quant_mode: str,
+    ) -> None:
+        weight = getattr(layer, weight_name)
+        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(
+            weight.data, dst_type=torch.quint4x2
+        )
+        quantized_weight = npu_format_cast(
+            quantized_weight.transpose(-2, -1).contiguous()
+        )
+
+        copy_or_rebind_param(layer, weight_name, quantized_weight)
+        copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(
+                layer, "int8" if quant_mode == "w4a8_int8" else "bf16"
+            )
+        activation_dtype = (
+            torch.int8 if quant_mode == "w4a8_int8" else torch.quint4x2
+        )
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(activation_dtype)
         self.transposed = True
 
     def apply(
