@@ -508,6 +508,7 @@ class _GraftReq:
         self.output_ids = array("q", [])
         self.req_pool_idx = req_pool_idx
         self.extra_key = None
+        self.cache_salt = None
         self.cache_protected_len = 0
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.last_node = None

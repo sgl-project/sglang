@@ -12,12 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import (
-    get_context,
-    get_memory,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,8 +31,6 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        # Publishes the config bags the configurator reads at construction.
-        get_context().override_server_args(model_path="dummy"),
         get_parallel().override(attn_tp_size=tp_size),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
