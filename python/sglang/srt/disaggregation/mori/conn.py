@@ -1615,8 +1615,8 @@ class MoriKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
+        super().clear()
         with self.kv_mgr._room_notify_lock:
-            super().clear()
             self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
@@ -1633,9 +1633,6 @@ class MoriKVSender(CommonKVSender):
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
-
-    def abort(self):
-        super().abort()
 
 
 class MoriKVReceiver(CommonKVReceiver):
