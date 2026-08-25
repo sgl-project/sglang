@@ -73,28 +73,18 @@ rust_test(
     edition = crate_edition(package_name = "sgl-model-gateway"),
 )
 
-rust_test(
-    name = "header_utils_test",
-    srcs = ["src/routers/header_utils.rs"],
-    crate_name = "smg_header_utils_test",
-    crate_root = "src/routers/header_utils.rs",
-    deps = crate_deps(
-        [
-            "axum",
-            "http",
-            "reqwest",
-        ],
-        package_name = "sgl-model-gateway",
-    ),
+rust_library(
+    name = "version_info",
+    srcs = ["src/version.rs"],
+    crate_name = "smg_version_info",
+    crate_root = "src/version.rs",
+    deps = [":build_script"],
     edition = crate_edition(package_name = "sgl-model-gateway"),
 )
 
 test_suite(
     name = "internal_tests",
-    tests = [
-        ":header_utils_test",
-        ":policy_tree_test",
-    ],
+    tests = [":policy_tree_test"],
 )
 
 rust_library(

@@ -40,7 +40,7 @@ class GatewayLockParityTest(unittest.TestCase):
         self.assertEqual(gateway_manifest["package"]["edition"], "2021")
         self.assertEqual(python_manifest["package"]["edition"], "2021")
         self.assertEqual(
-            gateway_manifest["dependencies"]["tonic-v12"],
+            gateway_manifest["dev-dependencies"]["tonic-v12"],
             {"version": "0.12.3", "package": "tonic"},
         )
         self.assertEqual(gateway_manifest["dependencies"]["tonic"]["version"], "0.14.2")
