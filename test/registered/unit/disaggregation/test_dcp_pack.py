@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
-    plan_packed_dcp_blocks,
     try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -20,26 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestPlanPackedDcpBlocks(CustomTestCase):
-    def test_empty(self):
-        self.assertEqual(plan_packed_dcp_blocks(np.array([], dtype=np.int64)), [])
-
-    def test_one_contiguous_dest_page(self):
-        dst = np.arange(64, dtype=np.int64) + 10 * 64
-        self.assertEqual(plan_packed_dcp_blocks(dst), [(0, 640, 64)])
-
-    def test_splits_on_dest_page_gap(self):
-        dst = np.concatenate(
-            [
-                np.arange(64, dtype=np.int64) + 3 * 64,
-                np.arange(64, dtype=np.int64) + 8 * 64,
-            ]
-        )
-        self.assertEqual(
-            plan_packed_dcp_blocks(dst),
-            [(0, 192, 64), (64, 512, 64)],
-        )
-
+class TestPackedDcpGrouping(CustomTestCase):
     def test_packed_groups_collapse_cyclic_src(self):
         page_size = 64
         dcp_size = 4

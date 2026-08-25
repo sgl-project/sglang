@@ -28,22 +28,6 @@ def dcp_pack_buffer_bytes(
     return max_tokens * sum(token_item_lens)
 
 
-def plan_packed_dcp_blocks(
-    dst_token_indices: npt.NDArray[np.integer],
-) -> List[Tuple[int, int, int]]:
-    dst = np.asarray(dst_token_indices, dtype=np.int64)
-    n = int(dst.size)
-    if n == 0:
-        return []
-    brk = np.where(np.diff(dst) != 1)[0] + 1
-    starts = np.concatenate((np.array([0], dtype=np.int64), brk))
-    ends = np.concatenate((brk, np.array([n], dtype=np.int64)))
-    return [
-        (int(start), int(dst[start]), int(end - start))
-        for start, end in zip(starts, ends)
-    ]
-
-
 def try_pack_dcp_src(
     *,
     pack_buffer: StagingBuffer,
