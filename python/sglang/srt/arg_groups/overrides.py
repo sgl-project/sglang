@@ -1927,6 +1927,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "AXK2ForCausalLM",
         "KimiK25ForConditionalGeneration",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",

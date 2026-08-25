@@ -23,6 +23,7 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.configs import (
     AfmoeConfig,
+    AXK2Config,
     BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
@@ -91,6 +92,7 @@ from transformers import PretrainedConfig
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
+        AXK2Config,
         AfmoeConfig,
         BailingHybridConfig,
         ChatGLMConfig,

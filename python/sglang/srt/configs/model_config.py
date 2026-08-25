@@ -126,6 +126,7 @@ def is_deepseek_dsa(config) -> bool:
             "LongcatFlashForCausalLMNextN",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
+            "AXK2ForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -906,6 +907,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "AXK2ForCausalLM" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures

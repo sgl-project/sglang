@@ -337,7 +337,13 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        # Architectures with projection semantics not implemented by the dense
+        # shortcut can opt out while all existing configs retain the default.
+        self.supports_mha_one_shot: bool = getattr(
+            model_runner.model_config.hf_config,
+            "supports_mha_one_shot",
+            True,
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
