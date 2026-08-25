@@ -6,10 +6,9 @@ Combined accuracy + performance test for DeepSeek-V4-Flash FP4 on MI35x ROCm 7.2
 
 Both tests share a single launched server.
 
-Runs the official `-0731` release rather than the superseded preview checkpoint.
-0731 bundles a DSpark draft head; this test serves the target only, and the DSV4
-loader skips the checkpoint's `mtp.*` modules outside a draft worker, so the
-served model and its memory footprint match the preview.
+The 0731 checkpoint bundles a DSpark draft head, but this test serves the target
+only: the DSV4 loader skips `mtp.*` outside a draft worker, so the draft weights
+never reach VRAM and `--mem-fraction-static 0.90` below stays valid.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
 """
