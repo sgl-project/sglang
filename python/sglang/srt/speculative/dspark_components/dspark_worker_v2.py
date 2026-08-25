@@ -713,43 +713,41 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.spec_verify_tier_num_tokens = int(layout.total_verify_tokens)
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        if _is_npu:
-            verify_ids_buf = self._verify_ids_buf
-            if verify_ids_buf is None or verify_ids_buf.shape[0] < bs:
-                verify_ids_buf = torch.empty(
-                    (bs, self.verify_num_draft_tokens),
-                    dtype=draft_block_ids.dtype,
-                    device=device,
-                )
-                self._verify_ids_buf = verify_ids_buf
-            verify_ids_2d = torch.cat(
-                [draft_block_ids[:, :1], draft_tokens],
-                dim=1,
-                out=verify_ids_buf[:bs],
-            )
-        else:
-            verify_ids_2d = torch.cat(
-                [draft_block_ids[:, :1], draft_tokens], dim=1
-            ).contiguous()
-
-        # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
-        )
-
-        # A live grammar forces the eager path: the folded epilogue accepts inside
-        # the cuda graph off its own buffers, where the mask below never lands.
+        # The target graph can accept directly from its compact input and the
+        # folded epilogue's buffers.  Avoid building the duplicate strided
+        # candidate tensor on the fixed NPU fast path; materialize it below
+        # only if graph replay falls back to eager accept.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
-            # sampling batches must take the eager accept path even when the
-            # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
         )
+        defer_verify_ids = (
+            _is_npu
+            and run_compact
+            and self._verify_planner.has_fixed_verify_len
+            and fold_eligible
+        )
+        verify_ids_2d = None
+        if not defer_verify_ids:
+            verify_ids_2d = self._build_verify_ids_2d(
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+            )
+
+        # Must stay ahead of the target verify launch below.
+        grammar_tree = None
+        if batch.has_grammar:
+            assert verify_ids_2d is not None
+            grammar_tree = GrammarTree.from_linear_chain(verify_ids_2d)
+
+        # A live grammar forces the eager path: the folded epilogue accepts inside
+        # the cuda graph off its own buffers, where the mask below never lands.
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -769,6 +767,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 )
             else:
+                assert verify_ids_2d is not None
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -794,6 +793,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        if verify_ids_2d is None and not folded_accept:
+            verify_ids_2d = self._build_verify_ids_2d(
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+            )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -880,6 +886,27 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _build_verify_ids_2d(
+        self, *, draft_block_ids, draft_tokens, bs: int, device
+    ) -> torch.Tensor:
+        if not _is_npu:
+            return torch.cat(
+                [draft_block_ids[:, :1], draft_tokens], dim=1
+            ).contiguous()
+        verify_ids_buf = self._verify_ids_buf
+        if verify_ids_buf is None or verify_ids_buf.shape[0] < bs:
+            verify_ids_buf = torch.empty(
+                (bs, self.verify_num_draft_tokens),
+                dtype=draft_block_ids.dtype,
+                device=device,
+            )
+            self._verify_ids_buf = verify_ids_buf
+        return torch.cat(
+            [draft_block_ids[:, :1], draft_tokens],
+            dim=1,
+            out=verify_ids_buf[:bs],
         )
 
     def _commit_target_mamba_states_after_verify(

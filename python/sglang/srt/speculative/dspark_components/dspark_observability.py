@@ -678,7 +678,7 @@ class ConfidenceMetricsProbe:
         carries_confidence: bool,
         is_compact_mode: bool,
         confidence_raw: Optional[torch.Tensor],
-        verify_ids_2d: torch.Tensor,
+        verify_ids_2d: Optional[torch.Tensor],
         target_logits: torch.Tensor,
         bs: int,
     ) -> None:
@@ -841,6 +841,7 @@ class DsparkStepObservers:
     ) -> None:
         planner = self._planner
         if not proposal_folded:
+            assert verify_ids_2d is not None
             self._maybe_record_sts_collect(
                 verify_ids_2d=verify_ids_2d,
                 target_logits=target_logits,

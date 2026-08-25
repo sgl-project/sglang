@@ -104,7 +104,7 @@ class TargetVerifyExecutor:
         *,
         folded_accept: bool,
         bs: int,
-        verify_ids_2d: torch.Tensor,
+        verify_ids_2d: Optional[torch.Tensor],
         target_logits: Optional[torch.Tensor],
         draft_block: DraftBlockResult,
         sampling_info,
@@ -123,6 +123,7 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        assert verify_ids_2d is not None
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
