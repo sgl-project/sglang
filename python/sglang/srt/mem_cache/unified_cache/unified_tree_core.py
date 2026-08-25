@@ -62,6 +62,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
     DecSwaLockOnlyResult,
@@ -73,7 +76,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
-    UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -380,7 +382,7 @@ class _InsertWalkState(msgspec.Struct):
     pending_actions: list[CacheAction | ComponentAction] = []
 
 
-class UnifiedTreeCore(UnifiedTreeCoreInterface):
+class UnifiedTreeCore(UnifiedTreeCoreInspectionInterface):
     """The radix tree mechanism: owns the tree structure, per-node values, the
     per-component LRUs, the size/leaf bookkeeping, and the component drivers,
     plus ``reset()``.

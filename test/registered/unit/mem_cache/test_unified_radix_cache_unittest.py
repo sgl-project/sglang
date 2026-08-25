@@ -68,6 +68,9 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -525,6 +528,10 @@ def build_fixture(
         is_eagle=cfg.is_eagle,
     )
     cache = UnifiedRadixCache(params=cache_init_params)
+    assert isinstance(cache.tree_core, UnifiedTreeCoreInspectionInterface), (
+        "The shared unified radix-cache unit suite requires a TreeCore backend "
+        "that implements UnifiedTreeCoreInspectionInterface"
+    )
     cache.cache_init_params = cache_init_params
 
     return cache, allocator, req_to_token_pool
