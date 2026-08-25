@@ -1532,6 +1532,20 @@ class Envs:
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
+    # ===================================================================
+    # Weight Cache Daemon
+    # ===================================================================
+    # Paths the daemon and the engine ranks it serves must agree on. Both are
+    # format templates and must keep the {global_rank} placeholder: each rank
+    # talks to the daemon on its own GPU, so a rank-independent path would point
+    # every rank at one daemon and map another rank's shard.
+    SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_rank{global_rank}.sock"
+    )
+    SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+    )
+
 
 envs = Envs()
 EnvField._allow_set_name = False
