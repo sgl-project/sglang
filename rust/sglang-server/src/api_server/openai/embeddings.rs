@@ -100,7 +100,7 @@ async fn embeddings(
             return openai_error(StatusCode::BAD_REQUEST, error.body_text(), false);
         }
     };
-    let parsed = match validate_request(request, &state) {
+    let parsed = match validate_request(request) {
         Ok(parsed) => parsed,
         Err((status, message)) => return openai_error(status, message, false),
     };
@@ -202,7 +202,7 @@ async fn embeddings(
     Json(CreateEmbeddingResponse {
         object: "list".into(),
         data,
-        model: state.server_args.served_model_name.clone(),
+        model: state.server_args.model_path.clone(),
         usage: EmbeddingUsage {
             prompt_tokens,
             total_tokens: prompt_tokens,
@@ -238,15 +238,7 @@ async fn wait_embedding(
 
 fn validate_request(
     request: CreateEmbeddingRequest,
-    state: &AppState,
 ) -> Result<ValidatedEmbeddingRequest, (StatusCode, String)> {
-    if request.model != "default" && request.model != state.server_args.served_model_name {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("The model `{}` does not exist", request.model),
-        ));
-    }
-
     reject_unsupported_fields(&request)?;
     let (items, is_batch) = parse_input(request.input)?;
     if items.len() > *MAX_BATCH_REQS_PER_HTTP_REQ {
@@ -307,7 +299,11 @@ fn normalize_embedding_rids(
 }
 
 fn reject_unsupported_fields(request: &CreateEmbeddingRequest) -> Result<(), (StatusCode, String)> {
-    if request.lora_path.is_some() {
+    let model_selects_lora = request
+        .model
+        .split_once(':')
+        .is_some_and(|(_, adapter)| !adapter.trim().is_empty());
+    if request.lora_path.is_some() || model_selects_lora {
         return bad("LoRA embeddings are not supported by the Rust frontend");
     }
     if request.embed_override_token_id.is_some() || request.embed_overrides.is_some() {
@@ -479,8 +475,7 @@ mod tests {
             "rid": ["left-rid", "right-rid"],
         }))
         .unwrap();
-        let state = app_state(live_senders().0);
-        let validated = validate_request(request, &state).unwrap();
+        let validated = validate_request(request).unwrap();
         assert_eq!(validated.rids[0].client_facing(), "left-rid");
         assert_eq!(validated.rids[1].client_facing(), "right-rid");
     }
@@ -608,6 +603,7 @@ mod tests {
             json!({"model": "model", "input": "ok", "return_pooled_hidden_states": true}),
             json!({"model": "model", "input": [{"text": "ok"}]}),
             json!({"model": "model", "input": "ok", "lora_path": "adapter"}),
+            json!({"model": "model:adapter", "input": "ok"}),
             json!({"model": "model", "input": ["a", "b"], "rid": ["only-one"]}),
             json!({"model": "model", "input": ["a", "b"], "rid": ["same", "same"]}),
             json!({"model": "model", "input": "ok", "unknown": true}),
@@ -616,13 +612,49 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert!(body_json(response).await["error"].is_object());
         }
-        let unknown = post_json(
-            app,
-            "/v1/embeddings",
-            json!({"model": "unknown", "input": "ok"}),
-        )
-        .await;
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handler_accepts_python_model_names_and_returns_model_path() {
+        use crate::message::config::ServerArgs;
+
+        let (senders, tm_rx, _abort_rx) = live_senders();
+        let mut state = app_state(senders);
+        Arc::get_mut(&mut state).unwrap().server_args = Arc::new(ServerArgs {
+            model_path: "org/base-model".into(),
+            served_model_name: "embedding-alias".into(),
+            ..Default::default()
+        });
+        let app = routes().with_state(state);
+        let responder = tokio::spawn(async move {
+            for _ in 0..4 {
+                let TmEvent::Intake(request) = tm_rx.recv_async().await.unwrap() else {
+                    panic!("expected ingress")
+                };
+                let event = EmbeddingEvent {
+                    rid: request.rid,
+                    embedding: vec![0.5],
+                    prompt_tokens: 1,
+                    finish_reason: None,
+                };
+                let ResponseSink::Local(sink) = request.sink;
+                sink.send(ResponseItem::Embedding(event)).await.unwrap();
+            }
+        });
+
+        for body in [
+            json!({"input": "omitted model"}),
+            json!({"model": "org/base-model", "input": "model path"}),
+            json!({"model": "embedding-alias", "input": "served alias"}),
+            json!({"model": "unrelated-name", "input": "arbitrary name"}),
+        ] {
+            let response = post_json(app.clone(), "/v1/embeddings", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: CreateEmbeddingResponse =
+                serde_json::from_value(body_json(response).await).unwrap();
+            assert_eq!(body.model, "org/base-model");
+        }
+        responder.await.unwrap();
     }
 
     #[tokio::test]
