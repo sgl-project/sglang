@@ -142,7 +142,6 @@ class TestDefaultBackend(unittest.TestCase):
         )
 
 
-
 class _FakeMetricChild:
     def __init__(self, metric, label_values):
         self.metric = metric
