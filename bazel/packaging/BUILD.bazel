@@ -1,3 +1,4 @@
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
 load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
@@ -6,6 +7,7 @@ load("@wheel_repair//:requirements.bzl", wheel_repair_requirement = "requirement
 load(":main_wheel.bzl", "main_wheel")
 load(":manylinux_wheel.bzl", "manylinux_wheel")
 load(":pep517_wheel.bzl", "pep517_wheel")
+load(":wheel_layer.bzl", "wheel_layer")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -36,6 +38,13 @@ py_binary(
     main = "build_main_wheel.py",
     python_version = "PY3",
     deps = [requirement("packaging")],
+)
+
+py_binary(
+    name = "build_wheel_layer",
+    srcs = ["build_wheel_layer.py"],
+    main = "build_wheel_layer.py",
+    python_version = "PY3",
 )
 
 # The release pipeline supplies the setuptools-scm result explicitly:
@@ -98,6 +107,44 @@ manylinux_wheel(
         "@platforms//os:linux",
     ],
     wheel = ":main_wheel",
+)
+
+wheel_layer(
+    name = "main_wheel_layer",
+    site_packages = "usr/local/lib/python3.12/site-packages",
+    tags = ["manual"],
+    wheel = ":main_wheel_manylinux",
+)
+
+# Shadow smoke artifact only. Existing Dockerfiles and release workflows remain
+# authoritative; this target intentionally has no oci_push companion.
+oci_image(
+    name = "main_wheel_image",
+    base = "@python_3_12_slim_bookworm_linux_amd64",
+    entrypoint = ["/usr/local/bin/sglang-wheel-version-smoke"],
+    env = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+    },
+    labels = {
+        "org.opencontainers.image.description": "Direct Bazel SGLang wheel smoke image",
+        "org.opencontainers.image.source": "https://github.com/sgl-project/sglang",
+        "org.opencontainers.image.title": "SGLang Bazel wheel smoke",
+    },
+    tags = ["manual"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    tars = [":main_wheel_layer"],
+    workdir = "/",
+)
+
+oci_load(
+    name = "main_wheel_image_load",
+    image = ":main_wheel_image",
+    repo_tags = ["local/sglang-bazel-wheel:smoke"],
+    tags = ["manual"],
 )
 
 # This action deliberately preserves the existing release authority instead of

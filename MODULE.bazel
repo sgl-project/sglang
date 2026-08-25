@@ -7,11 +7,25 @@ bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3", dev_dependency = Tr
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "protobuf", version = "33.4")
 bazel_dep(name = "rules_cc", version = "0.2.22")
+bazel_dep(name = "rules_oci", version = "2.2.7")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_pyo3", version = "0.73.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "toolchains_llvm", version = "1.8.0")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "python_3_12_slim_bookworm",
+    digest = "sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2",
+    image = "docker.io/library/python:3.12.13-slim-bookworm",
+    platforms = ["linux/amd64"],
+)
+use_repo(
+    oci,
+    "python_3_12_slim_bookworm",
+    "python_3_12_slim_bookworm_linux_amd64",
+)
 
 tvm_ffi_wheel = use_repo_rule(
     "@bazel_tools//tools/build_defs/repo:http.bzl",
