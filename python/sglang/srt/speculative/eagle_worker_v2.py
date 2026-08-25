@@ -813,7 +813,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
         with canary_ctx:
+            # §24.37 dense grid (Run 22): bracket the draft forward itself.
+            # First-hit discipline: the first dirty mark stops the chain, so
+            # extra marks only cost when everything stays clean.
+            try:
+                from sglang.srt.layers.cp.layer_trap import gap_probe_pre_draft
+
+                gap_probe_pre_draft(self)
+            except Exception:
+                pass
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+            try:
+                from sglang.srt.layers.cp.layer_trap import (
+                    layer_trap_mark_pool,
+                )
+
+                layer_trap_mark_pool(
+                    getattr(
+                        getattr(self, "_draft_worker", None),
+                        "draft_runner",
+                        None,
+                    ),
+                    "gap:post-draft-fwd",
+                )
+            except Exception:
+                pass
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -832,6 +856,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        # §24.37 dense grid: after the draft sampling/topk kernels.
+        try:
+            from sglang.srt.layers.cp.layer_trap import layer_trap_mark_pool
+
+            layer_trap_mark_pool(
+                getattr(self, "_draft_worker", None).draft_runner,
+                "gap:post-topk",
+            )
+        except Exception:
+            pass
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1131,6 +1165,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Gap probe 0 (§24.37 Run 22): drain the previous iteration's
+            # glue:entry snapshot (scheduler-stream) and snapshot BEFORE the
+            # target forward launches -- splits (entry, forward] into
+            # scheduler glue vs forward-internal windows.
+            try:
+                from sglang.srt.layers.cp.layer_trap import gap_probe_pre_target
+
+                gap_probe_pre_target(self)
+            except Exception:
+                pass
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -1182,6 +1226,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill
+            # Gap probe 1.5 (§24.37 Run 22): drain the post-target snapshot
+            # (verdict for the target forward + post-loop) and snapshot
+            # BEFORE the draft forward -- a catch after=gap:pre-draft
+            # convicts the TARGET side; after=gap:post-draft the DRAFT side.
+            try:
+                from sglang.srt.layers.cp.layer_trap import gap_probe_pre_draft
+
+                gap_probe_pre_draft(self)
+            except Exception:
+                pass
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group

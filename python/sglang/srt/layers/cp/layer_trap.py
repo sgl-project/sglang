@@ -338,6 +338,55 @@ def gap_probe_post_target(worker) -> None:
     _snapshot_pool(pool, "gap:post-target")
 
 
+def gap_probe_pre_target(worker) -> None:
+    """§24.37 (Run 22): call at the extend-branch ENTRY, before the target
+    forward is launched. Drains the pending snapshot (typically the previous
+    iteration's glue:entry, taken on the scheduler stream while THIS batch's
+    forward had not started), then snapshots: a catch here at the next drain
+    splits the N+1-forward window into (entry, target-start] (scheduler
+    glue / pure launch) vs the forward itself. Chain with post-target /
+    pre-draft / post-draft gives four segments per iteration.
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    pool = getattr(
+        getattr(worker, "_target_worker", None), "model_runner", None
+    )
+    pool = getattr(pool, "req_to_token_pool", None)
+    if pool is None:
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, "gap:pre-target")
+
+
+def gap_probe_pre_draft(worker) -> None:
+    """§24.37 (Run 22): call right BEFORE the draft prefill forward is
+    launched. Drains the post-target snapshot (naming the target post-loop
+    window) and snapshots: a catch here at the next drain (gap:pre-draft)
+    convicts the TARGET forward layers/post-loop; a catch after
+    gap:post-draft convicts the DRAFT forward family.
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    pool = getattr(
+        getattr(worker, "_draft_worker", None), "draft_runner", None
+    )
+    pool = getattr(pool, "req_to_token_pool", None) or getattr(
+        getattr(worker, "_target_worker", None),
+        "model_runner",
+        None,
+    )
+    pool = getattr(pool, "req_to_token_pool", None)
+    if pool is None:
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, "gap:pre-draft")
+
+
 def gap_probe_post_draft(worker) -> None:
     """Call right after the DRAFT prefill forward returns. Drains the
     post-target snapshot (naming the target post-loop window) and leaves a
@@ -443,6 +492,22 @@ def glue_probe_pool(pool, label: str) -> None:
     finalize scatters / move_logprobs_to_cpu D2H) into its own window.
     """
     if not _enabled() or _pend.get("fired"):
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, label)
+
+
+def layer_trap_mark_pool(runner, label: str) -> None:
+    """§24.37 dense grid: drain + full-pool snapshot from a model runner
+    (no forward_batch needed). Works anywhere the runner is reachable --
+    draft forward return, batch-result tail, etc. A catch names the window
+    (previous snapshot, this one]."""
+    if not _enabled() or _pend.get("fired"):
+        return
+    pool = getattr(runner, "req_to_token_pool", None)
+    if pool is None:
         return
     _drain()
     if _pend.get("fired"):

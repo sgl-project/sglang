@@ -654,6 +654,15 @@ class SchedulerDisaggregationPrefillMixin:
 
             self.process_disagg_prefill_inflight_queue()
 
+            # §24.37 dense grid: after the inflight-queue poll (the send
+            # polling / transfer engine path) and before sample launch.
+            try:
+                from sglang.srt.layers.cp.layer_trap import glue_probe_pool
+
+                glue_probe_pool(self.req_to_token_pool, "glue:pre-inflight")
+            except Exception:
+                pass
+
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
@@ -912,7 +921,23 @@ class SchedulerDisaggregationPrefillMixin:
                         pass
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+            # §24.37 dense grid: per-iteration loop tail (inside the req
+            # loop, after each req's branch completed).
+            try:
+                from sglang.srt.layers.cp.layer_trap import glue_probe_pool
 
+                glue_probe_pool(self.req_to_token_pool, "glue:mid-loop")
+            except Exception:
+                pass
+
+        # §24.37 dense grid: after the req loop (logprob glue / metrics
+        # below) -- the residual tail of process_batch_result.
+        try:
+            from sglang.srt.layers.cp.layer_trap import glue_probe_pool
+
+            glue_probe_pool(self.req_to_token_pool, "glue:post-loop")
+        except Exception:
+            pass
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
