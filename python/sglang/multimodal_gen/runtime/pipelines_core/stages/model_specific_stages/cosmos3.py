@@ -1997,9 +1997,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
 
         if isinstance(cond, tuple):
-            return tuple(
-                _combine(c, u) for c, u in zip(cond, uncond, strict=True)
-            )
+            return tuple(_combine(c, u) for c, u in zip(cond, uncond, strict=True))
         return _combine(cond, uncond)
 
     def _predict_noise_cfg_batched(
