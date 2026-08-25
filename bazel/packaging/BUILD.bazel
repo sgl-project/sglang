@@ -1,5 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@runtime_import//:requirements.bzl", "requirement")
+load(":main_wheel.bzl", "main_wheel")
 load(":pep517_wheel.bzl", "pep517_wheel")
 
 package(default_visibility = ["//visibility:public"])
@@ -7,6 +9,38 @@ package(default_visibility = ["//visibility:public"])
 sh_binary(
     name = "build_pep517_wheel",
     srcs = ["build_pep517_wheel.sh"],
+)
+
+py_binary(
+    name = "build_main_wheel",
+    srcs = ["build_main_wheel.py"],
+    main = "build_main_wheel.py",
+    python_version = "PY3",
+    deps = [requirement("packaging")],
+)
+
+# The release pipeline supplies the setuptools-scm result explicitly:
+#   bazel build --define=SGLANG_WHEEL_VERSION=<version> \
+#     //bazel/packaging:main_wheel
+main_wheel(
+    name = "main_wheel",
+    srcs = ["//python/sglang:main_wheel_sources"],
+    abi = "cp312",
+    distribution = "sglang",
+    extension_suffix = ".cpython-312-x86_64-linux-gnu.so",
+    native_extensions = {
+        "//python/sglang/srt/rust_extensions:_multimodal": "sglang.srt.rust_extensions._multimodal",
+        "//python/sglang/srt/rust_extensions:_server": "sglang.srt.rust_extensions._server",
+        "//rust/sglang-grpc:sglang_grpc_core": "sglang.srt.rust_extensions._grpc",
+    },
+    platform = "linux_x86_64",
+    pyproject = "//python:pyproject.toml",
+    python_tag = "cp312",
+    readme = "//:README.md",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
 )
 
 # This action deliberately preserves the existing release authority instead of

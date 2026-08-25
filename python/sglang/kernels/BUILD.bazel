@@ -14,6 +14,12 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "main_wheel_sources",
+    srcs = pep517_source_glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+
 # Torch-free metadata/dispatch layer. Native AOT and JIT implementations are
 # separate targets so a CPU analysis does not select a CUDA or ROCm toolchain.
 py_library(

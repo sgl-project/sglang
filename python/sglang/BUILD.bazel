@@ -13,6 +13,18 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# Wheel-complete, Bazel-declared source closure. This excludes the separately
+# distributed kernels/aot subtree while preserving every other tracked package
+# file selected by the authoritative setuptools-scm build.
+filegroup(
+    name = "main_wheel_sources",
+    srcs = pep517_source_glob(["**"]) + [
+        "//python/sglang/kernels:main_wheel_sources",
+        "//python/sglang/srt:main_wheel_pep517_sources",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 py_library(
     name = "version",
     srcs = ["version.py"],
