@@ -1,0 +1,35 @@
+load(":toolchain.bzl", "amdgpu_target", "rocm_toolchain")
+
+package(default_visibility = ["//visibility:public"])
+
+toolchain_type(name = "toolchain_type")
+
+amdgpu_target(
+    name = "amdgpu_target",
+    build_setting_default = "",
+)
+
+# This implementation makes the remaining host dependencies explicit behind a
+# toolchain boundary. A future pinned ROCm/PyTorch repository can replace it
+# without changing kernel_wheel. "inputs" is the seam for its declared SDK,
+# Python, PyTorch, and compiler files; uv is already a declared toolchain.
+rocm_toolchain(
+    name = "local_toolchain_impl",
+    cxx = "c++",
+    inputs = [],
+    python = "python3",
+    rocm_root = "/opt/rocm",
+)
+
+toolchain(
+    name = "local_toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "//bazel/platforms:rocm",
+    ],
+    toolchain = ":local_toolchain_impl",
+    toolchain_type = ":toolchain_type",
+)

@@ -14,6 +14,7 @@ test:ci --flaky_test_attempts=1
 build:cpu --platforms=//bazel/platforms:linux_x86_64_cpu
 build:cuda --platforms=//bazel/platforms:linux_x86_64_cuda
 build:rocm --platforms=//bazel/platforms:linux_x86_64_rocm
+build:rocm --extra_toolchains=//bazel/rocm:local_toolchain
 
 build:manylinux --platforms=//bazel/platforms:linux_x86_64_manylinux_cpu
 build:manylinux --extra_toolchains=@manylinux_llvm//:cc-toolchain-x86_64-linux

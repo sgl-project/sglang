@@ -1,5 +1,5 @@
 load("//bazel/packaging:source_glob.bzl", "pep517_source_glob")
-load(":kernel_wheel.bzl", "kernel_wheel")
+load(":kernel_wheel.bzl", "kernel_wheel", "kernel_wheel_import_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -48,6 +48,20 @@ kernel_wheel(
     source_root = "python/sglang/kernels/aot",
     tags = ["manual"],
     target_compatible_with = ["//bazel/platforms:rocm"],
+)
+
+kernel_wheel_import_test(
+    name = "rocm_wheel_import_test",
+    tags = [
+        "local",
+        "manual",
+        "no-cache",
+        "no-remote",
+        "no-sandbox",
+        "requires-rocm",
+    ],
+    target_compatible_with = ["//bazel/platforms:rocm"],
+    wheel = ":rocm_wheel",
 )
 
 filegroup(

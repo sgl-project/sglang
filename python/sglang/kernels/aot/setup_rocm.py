@@ -15,7 +15,6 @@
 
 import os
 import platform
-import sys
 from pathlib import Path
 
 import torch
@@ -63,22 +62,18 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-default_target = "gfx942"
-amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
-
-if torch.cuda.is_available():
-    try:
-        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception as e:
-        print(f"Warning: Failed to detect GPU properties: {e}")
-else:
-    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
-
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+supported_amdgpu_targets = ("gfx942", "gfx950", "gfx1250")
+amdgpu_target = os.environ.get("AMDGPU_TARGET")
+if not amdgpu_target:
+    raise RuntimeError(
+        "AMDGPU_TARGET must be set explicitly to one of "
+        f"{', '.join(supported_amdgpu_targets)}"
     )
-    sys.exit(1)
+if amdgpu_target not in supported_amdgpu_targets:
+    raise RuntimeError(
+        f"Unsupported AMDGPU_TARGET '{amdgpu_target}'. Expected one of "
+        f"{', '.join(supported_amdgpu_targets)}"
+    )
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"

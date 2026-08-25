@@ -196,6 +196,8 @@ uv = use_extension(
 uv.configure(version = "0.12.5")
 use_repo(uv, "uv")
 
+register_toolchains("@uv//:all")
+
 pip = use_extension(
     "@rules_python//python/extensions:pip.bzl",
     "pip",

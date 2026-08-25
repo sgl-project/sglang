@@ -87,7 +87,9 @@ jobs:
             //python/sglang/kernels/aot:cuda_wheel
 
           bazel build --nobuild --config=ci --config=rocm \
-            //python/sglang/kernels/aot:rocm_wheel
+            --//bazel/rocm:amdgpu_target=gfx942 \
+            //python/sglang/kernels/aot:rocm_wheel \
+            //python/sglang/kernels/aot:rocm_wheel_import_test
 
       - name: Build independent components
         run: |

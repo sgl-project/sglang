@@ -49,7 +49,12 @@ bazel build --config=cpu \
 # Hardware targets use the matching pre-provisioned PyTorch/toolchain image.
 bazel build --config=cpu //python/sglang/kernels/aot:cpu_wheel
 bazel build --config=cuda //python/sglang/kernels/aot:cuda_wheel
-bazel build --config=rocm //python/sglang/kernels/aot:rocm_wheel
+bazel build --config=rocm \
+  --//bazel/rocm:amdgpu_target=gfx950 \
+  //python/sglang/kernels/aot:rocm_wheel
+bazel test --config=rocm \
+  --//bazel/rocm:amdgpu_target=gfx950 \
+  //python/sglang/kernels/aot:rocm_wheel_import_test
 bazel test --config=cuda //bazel/integration:dummy_model_e2e
 bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 ```
@@ -64,9 +69,11 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
   0.12/0.14 contract test, and policy tests build successfully.
 - Native host JIT `ngram_corpus_ffi.so` links against a SHA-pinned TVM-FFI
   wheel.
-- CPU, CUDA, and ROCm `sglang-kernel` wheels build and import through Bazel
-  wrapper targets. CUDA builds use immutable Bazel-fetched CUTLASS, fmt,
-  Triton, FlashInfer, sgl-attn, and FlashMLA sources with disconnected CMake.
+- CPU, CUDA, and ROCm `sglang-kernel` wheels build through Bazel wrapper
+  targets. ROCm requires an analysis-time `AMDGPU_TARGET`, never probes a
+  device while building, and has a wheel import test. CUDA builds use immutable
+  Bazel-fetched CUTLASS, fmt, Triton, FlashInfer, sgl-attn, and FlashMLA sources
+  with disconnected CMake.
 - Dummy-weight Qwen3 and pinned real-weight Qwen2-0.5B Engine tests passed on an
   H200. The Qwen2 test verifies the model revision, weight digest, token IDs,
   decoded text, and completion metadata.
@@ -86,7 +93,7 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
 | Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_ffi.so` compiles and links the host TVM-FFI adapter; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
-| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA source downloads are immutable Bazel repositories | scikit-build/CMake and platform setup scripts |
+| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA source downloads are immutable Bazel repositories; ROCm configuration enters through `//bazel/rocm:toolchain_type` | scikit-build/CMake and platform setup scripts |
 | Main Rust extensions | one crate-universe closure builds `_multimodal`, `_grpc`, `_server`, and the pure Rust libraries | Cargo + setuptools-rust |
 | Rust gRPC | `//rust/sglang-grpc:sglang_grpc_core` runs the existing tonic build script with Bazel's declared protoc and proto input | Cargo/tonic-build |
 | Model gateway/router | separate 838-package crate universe builds the gateway binary and abi3 shared library while preserving dual tonic versions | Cargo + maturin |
@@ -143,9 +150,12 @@ analysis.
 The runtime, real-model E2E, wheel-manifest, and manylinux ABI milestones are
 complete. Bazel must not become the release authority yet:
 
-- CPU/CUDA/ROCm wheel wrappers still consume the ambient PyTorch compiler ABI
-  and toolkit. CUDA source downloads are declared, but the compiler, sysroot,
-  Python development files, and PyTorch libraries must become toolchains.
+- CPU/CUDA wheel wrappers still consume the ambient PyTorch compiler ABI and
+  toolkit. ROCm now isolates `/opt/rocm`, Python, PyTorch, the compiler, and the
+  wheel frontend behind `//bazel/rocm:toolchain_type`, but its default local
+  implementation still resolves those tools from the runner. A pinned
+  ROCm/PyTorch repository must populate the toolchain's declared `inputs`
+  before the action can become sandboxed, cacheable, and remotely executable.
 - Vendored OpenSSL still consumes runner-provided Perl and Make during its
   build; a pinned execution image must provide those tools.
 - Release-only `auditwheel repair`, final ELF RPATH policy, architecture
