@@ -2112,32 +2112,53 @@ _QUANTIZED_KV_CACHE_DTYPES = frozenset(
 )
 
 
+# The one (backend, kv_cache_dtype) tuple whose divergence has been measured.
+# Every other quantized combination is unvalidated, not known-broken -- keep the
+# two claims apart so one H100 measurement does not become a global statement
+# about the MXFP8 and FP4 kernels, which were never exercised.
+_MEASURED_DIVERGENT_KV_CACHE = ("fa3", "fp8_e4m3")
+
+_ISSUE_URL = "https://github.com/sgl-project/sglang/issues/25790"
+
+
 @register_post_process
 def _deterministic_quantized_kv_cache_warning(view: Any) -> dict:
     """Warn that a quantized KV cache is not covered by batch invariance.
 
     Deterministic inference pins SplitKV but not the attention kernel's
-    internal KV-block tiling, so with fp8 KV a one-row decode and an L-row
-    prefill stop agreeing over identical KV past kv_len 96 (measured, fa3 on
-    SM90; bf16 is bitwise equal). Warning only, declaring nothing: run-to-run
-    reproducibility still holds, so rewriting the user's dtype would be worse
-    than telling them. See sgl-project/sglang#25790.
+    internal KV-block tiling. Runs after _deterministic_attention_backend so
+    it sees the resolved backend rather than a None the fallback would fill
+    in. See sgl-project/sglang#25790.
     """
     if not view.enable_deterministic_inference:
         return {}
     if view.kv_cache_dtype not in _QUANTIZED_KV_CACHE_DTYPES:
         return {}
-    logger.warning(
-        "Deterministic inference does not guarantee batch invariance with "
-        "--kv-cache-dtype=%s: prefill and decode can disagree on the same "
-        "token, so input and output logprobs for it may differ (measured for "
-        "fp8_e4m3 on the fa3 backend at kv_len >= 97; see "
-        "https://github.com/sgl-project/sglang/issues/25790). Run-to-run "
-        "reproducibility is unaffected. Use a bf16 KV cache if you need "
-        "prefill/decode logprob consistency, for example for RL logprobs or "
-        "logprob-based evaluation.",
-        view.kv_cache_dtype,
-    )
+
+    if (view.attention_backend, view.kv_cache_dtype) == _MEASURED_DIVERGENT_KV_CACHE:
+        logger.warning(
+            "Deterministic inference does not guarantee batch invariance with "
+            "--kv-cache-dtype=fp8_e4m3 on the fa3 backend: prefill and decode "
+            "disagree on the same token past kv_len 96, so its input and "
+            "output logprobs may differ (measured on SM90; see %s). Run-to-run "
+            "reproducibility is unaffected. Use a bf16 KV cache if you need "
+            "prefill/decode logprob consistency, for example for RL logprobs "
+            "or logprob-based evaluation.",
+            _ISSUE_URL,
+        )
+    else:
+        logger.warning(
+            "Deterministic inference is not validated with "
+            "--kv-cache-dtype=%s on the %s backend: a quantized KV cache is "
+            "outside the batch-invariant regime, and this combination has not "
+            "been measured. The one measured combination (fp8_e4m3 on fa3, "
+            "SM90) has prefill and decode disagreeing past kv_len 96; see %s. "
+            "Use a bf16 KV cache if you need prefill/decode logprob "
+            "consistency.",
+            view.kv_cache_dtype,
+            view.attention_backend,
+            _ISSUE_URL,
+        )
     return {}
 
 

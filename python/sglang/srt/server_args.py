@@ -8288,7 +8288,6 @@ class ServerArgs:
             )
 
             run_post_process_pass(self, _deterministic_sampling_backend)
-            run_post_process_pass(self, _deterministic_quantized_kv_cache_warning)
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
@@ -8308,6 +8307,10 @@ class ServerArgs:
 
             # Check attention backend
             run_post_process_pass(self, _deterministic_attention_backend)
+
+            # Must follow the backend pass: the warning is backend-specific and
+            # would otherwise read a None that the fallback above fills in.
+            run_post_process_pass(self, _deterministic_quantized_kv_cache_warning)
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:

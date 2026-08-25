@@ -27,11 +27,15 @@ Deterministic inference is only supported with the following three attention bac
 
 ### Known Limitation: Quantized KV Cache
 
-Batch invariance is **not** guaranteed when deterministic inference is combined with a quantized KV cache (`--kv-cache-dtype fp8_e4m3`, `fp8_e5m2`, `mxfp8`, `nvfp4`, `fp4_mx_block16`). Run-to-run reproducibility still holds; what fails is agreement *between* the prefill and decode paths, so the input logprob and the output logprob for the same token can differ.
+A quantized KV cache (`--kv-cache-dtype fp8_e4m3`, `fp8_e5m2`, `mxfp8`, `nvfp4`, `fp4_mx_block16`) is **outside** the batch-invariance guarantee. What fails is agreement *between* the prefill and decode paths, so the input logprob and the output logprob for the same token can differ.
 
-Measured on H100 (SM90) with FA3 and `fp8_e4m3`: attention output is bitwise identical between a one-row decode and a full-sequence prefill through `kv_len` 96, then diverges from 97 onward, while a BF16 KV cache is bitwise identical at every length. The cause is the attention kernel's internal KV-block tiling, which `--enable-deterministic-inference` does not pin — it pins SplitKV, and the divergence is unchanged with SplitKV forced. See [#25790](https://github.com/sgl-project/sglang/issues/25790).
+**Measured — FA3 + `fp8_e4m3` on H100 (SM90).** Attention output is bitwise identical between a one-row decode and a full-sequence prefill through `kv_len` 96, then diverges from 97 onward, while a BF16 KV cache is bitwise identical at every length. Run-to-run reproducibility is unaffected. The cause is the attention kernel's internal KV-block tiling, which `--enable-deterministic-inference` does not pin — it pins SplitKV, and the divergence is unchanged with SplitKV forced. See [#25790](https://github.com/sgl-project/sglang/issues/25790).
 
-If you need prefill/decode logprob consistency — for RL logprobs or logprob-based evaluation — use a BF16 KV cache. The server logs a warning when it detects this combination.
+**Other dtype and backend combinations are unvalidated**, not known-good: they have not been measured, and no claim is made about their run-to-run reproducibility either.
+
+If you need prefill/decode logprob consistency — for RL logprobs or logprob-based evaluation — use a BF16 KV cache.
+
+The server logs a warning when the quantized dtype is requested **on the command line**. A KV cache that becomes FP8 through the checkpoint instead (`--kv-cache-dtype auto` with `kv_cache_quant_algo: FP8` in `hf_quant_config.json`) resolves later, in `ModelRunner.configure_kv_cache_dtype`, and is **not** covered by that warning yet — tracked as a follow-up.
 
 The following table shows feature compatibility for deterministic inference across different attention backends:
 

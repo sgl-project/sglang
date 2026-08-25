@@ -2282,29 +2282,52 @@ class TestDeterministicQuantizedKvCacheWarning(CustomTestCase):
     """A quantized KV cache under deterministic inference must not go
     unreported, and an unquantized one must not be reported (#25790)."""
 
-    def _run(self, **kwargs):
+    def _run(self, kv_cache_dtype, attention_backend="fa3", deterministic=True):
         from sglang.srt.arg_groups.overrides import (
             _deterministic_quantized_kv_cache_warning,
         )
 
-        view = SimpleNamespace(**kwargs)
+        view = SimpleNamespace(
+            enable_deterministic_inference=deterministic,
+            kv_cache_dtype=kv_cache_dtype,
+            attention_backend=attention_backend,
+        )
         return _deterministic_quantized_kv_cache_warning(view)
 
-    def test_warns_for_fp8_kv_cache_and_declares_nothing(self):
+    def test_measured_combination_states_the_divergence(self):
         import sglang.srt.arg_groups.overrides as overrides_module
 
         with self.assertLogs(overrides_module.logger, level="WARNING") as logs:
-            declared = self._run(
-                enable_deterministic_inference=True, kv_cache_dtype="fp8_e4m3"
-            )
+            declared = self._run("fp8_e4m3", attention_backend="fa3")
 
         # Warning only: changing the dtype under the user would be worse than
         # telling them, since the combination is still reproducible run to run.
         self.assertEqual(declared, {})
         self.assertEqual(len(logs.output), 1)
         self.assertIn("does not guarantee batch invariance", logs.output[0])
-        self.assertIn("fp8_e4m3", logs.output[0])
+        self.assertIn("kv_len 96", logs.output[0])
         self.assertIn("25790", logs.output[0])
+
+    def test_unmeasured_combinations_do_not_inherit_the_measured_claim(self):
+        """The fp8_e4m3-on-fa3 measurement must not be restated for dtypes and
+        backends that were never exercised, including the reproducibility
+        claim, which only holds where it was checked."""
+        import sglang.srt.arg_groups.overrides as overrides_module
+
+        for dtype, backend in (
+            ("nvfp4", "fa3"),
+            ("mxfp8", "fa3"),
+            ("fp8_e5m2", "fa3"),
+            ("fp8_e4m3", "flashinfer"),
+            ("fp8_e4m3", "triton"),
+        ):
+            with self.subTest(kv_cache_dtype=dtype, attention_backend=backend):
+                with self.assertLogs(overrides_module.logger, level="WARNING") as logs:
+                    self._run(dtype, attention_backend=backend)
+                self.assertIn("is not validated", logs.output[0])
+                self.assertNotIn("Run-to-run reproducibility", logs.output[0])
+                self.assertIn(dtype, logs.output[0])
+                self.assertIn(backend, logs.output[0])
 
     def test_silent_for_unquantized_kv_cache(self):
         import sglang.srt.arg_groups.overrides as overrides_module
@@ -2312,9 +2335,7 @@ class TestDeterministicQuantizedKvCacheWarning(CustomTestCase):
         for dtype in ("auto", "bf16", "bfloat16"):
             with self.subTest(kv_cache_dtype=dtype):
                 with self.assertNoLogs(overrides_module.logger, level="WARNING"):
-                    declared = self._run(
-                        enable_deterministic_inference=True, kv_cache_dtype=dtype
-                    )
+                    declared = self._run(dtype)
                 self.assertEqual(declared, {})
 
     def test_silent_when_deterministic_inference_is_off(self):
@@ -2323,9 +2344,7 @@ class TestDeterministicQuantizedKvCacheWarning(CustomTestCase):
         # fp8 KV on its own is a supported configuration; the divergence only
         # matters against the guarantee deterministic inference advertises.
         with self.assertNoLogs(overrides_module.logger, level="WARNING"):
-            declared = self._run(
-                enable_deterministic_inference=False, kv_cache_dtype="fp8_e4m3"
-            )
+            declared = self._run("fp8_e4m3", deterministic=False)
         self.assertEqual(declared, {})
 
 
