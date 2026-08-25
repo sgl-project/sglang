@@ -4,6 +4,10 @@ import unittest
 
 import torch
 
+from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmulSwigluQuant
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW4A4MXFP4MoEMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
     NPUW4A4MXFP4OnlineMoEMethod,
 )
@@ -37,6 +41,17 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
 
         with self.assertRaises(ValueError):
             ModelSlimW4A4MXFP4MoE({}, "w1")
+
+    def test_kernel_exposes_the_fused_gmm1_entry(self):
+        """AscendRunnerCore calls this by name once it takes the fused branch.
+
+        Renaming it, or dropping the GroupedMatmulSwigluQuant behind it, leaves
+        an AttributeError that nothing short of an A5 run reaches.
+        """
+        kernel = NPUW4A4MXFP4MoEMethod()
+
+        self.assertTrue(callable(kernel.apply_fused_gmm1_swiglu))
+        self.assertIsInstance(kernel.fused_gmm1, GroupedMatmulSwigluQuant)
 
     def test_config_resolves_w4a4_mxfp4_moe_scheme(self):
         prefix = "model.layers.0.mlp.experts"

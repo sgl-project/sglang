@@ -331,6 +331,10 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
         )
+        # Held next to self.matmul rather than picked by weight_prefix in
+        # __init__ (the MXFP8 shape) so one instance still serves both groups
+        # and the ModelSlim scheme keeps its no-argument constructor.
+        self.fused_gmm1 = GroupedMatmulSwigluQuant()
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -368,6 +372,52 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
 
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gate/up projection, swiglu and fp4 requantization in one kernel.
+
+        Returns the fp4 activations and their e8m0 block scale, i.e. what the w2
+        gmm takes directly, so the runner skips its activation step. The
+        unfused route through apply() spends two extra kernels and two bf16
+        round trips through HBM ([T, 2*inter] and [T, inter]) to reach the same
+        gmm2 input.
+
+        ``pertoken_scale`` is None whenever the dispatcher handed over BF16,
+        which for W4A4 is always: there is no fp4 routing quant, so the
+        activation quant happens here.
+        """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
+        return self.fused_gmm1.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            # Unlike e4m3, fp4 IS in the op's QUANT_DTYPES, so the x/weight
+            # dtypes must be named explicitly instead of left implicit.
+            quant_dtype=fp4_dtype,
+            x_dtype=fp4_dtype,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
+
     def apply(
         self,
         quant_info: "AscendQuantInfo",
@@ -383,7 +433,10 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        elif pertoken_scale is not None:
+        elif pertoken_scale.dim() == 2:
+            # A flat [T, K/32] scale still needs pairing; apply_fused_gmm1_swiglu
+            # already returns the paired form, which the MXFP8 w2 gmm likewise
+            # forwards untouched.
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 32, 2
             )
