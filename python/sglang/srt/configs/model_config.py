@@ -124,6 +124,8 @@ def is_deepseek_dsa(config) -> bool:
             "GlmMoeDsaForCausalLMNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            "Dots3NoteForCausalLM",
+            "Dots3NoteForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -630,6 +632,13 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        from sglang.srt.configs.dots3 import Dots3Config
+
+        if is_draft_model and isinstance(self.hf_text_config, Dots3Config):
+            self.hf_config.architectures[0] = (
+                self.hf_text_config.configure_draft_model()
+            )
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -866,6 +875,8 @@ class ModelConfig:
         self.hf_config.context_len = self.context_len
 
     def _derive_model_shapes(self):
+        from sglang.srt.configs.dots3 import Dots3Config
+
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
         if self.head_dim is None:
@@ -902,6 +913,8 @@ class ModelConfig:
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
+            or "Dots3NoteForCausalLM" in self.hf_config.architectures
+            or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
             or (
                 "PixtralForConditionalGeneration" in self.hf_config.architectures
@@ -917,6 +930,12 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
+            if isinstance(self.hf_text_config, Dots3Config):
+                self.swa_kv_lora_rank = self.hf_text_config.swa_kv_lora_rank
+                self.swa_qk_rope_head_dim = self.hf_text_config.swa_qk_rope_head_dim
+            else:
+                self.swa_kv_lora_rank = self.kv_lora_rank
+                self.swa_qk_rope_head_dim = self.qk_rope_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)
@@ -1893,6 +1912,7 @@ multimodal_model_archs = [
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
+    "Dots3NoteForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
     "NVILAForConditionalGeneration",
@@ -2118,7 +2138,10 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
-    elif any(arch in SWA_SINK_ARCHS for arch in model_architectures):
+    elif any(arch in SWA_SINK_ARCHS for arch in model_architectures) or any(
+        arch in ("Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN")
+        for arch in model_architectures
+    ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"

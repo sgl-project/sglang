@@ -253,7 +253,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
-        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
@@ -438,8 +438,7 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count
-                    < self.scheduler.server_args.optimistic_prefill_attempts
+                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
                     and not req.is_retracted  # engine paused
                 ):
                     if not self.ensure_metadata_buffer(req):
@@ -680,6 +679,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        auxiliary_output_starts = (
+            self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
+        )
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -818,6 +821,13 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if auxiliary_output is not None:
+            self.batch_result_processor.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(

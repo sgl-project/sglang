@@ -116,7 +116,12 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -262,7 +267,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # --- prefill graph config -------------------------------------
-        prefill_config = model_runner.server_args.cuda_graph_config.prefill
+        prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
@@ -424,7 +429,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{type(attn_backend).__name__} does not support chunked-prefix "
                 "Full prefill CUDA graphs"
             )
-            prefix_config = model_runner.server_args.cuda_graph_config.prefill
+            prefix_config = get_exec().graph.cuda_graph_config.prefill
             (
                 self._prefix_chunk_len,
                 self._prefix_chunk_capacity,
@@ -531,7 +536,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _is_mamba_track_enabled(self) -> bool:
         return self.model_runner.server_args.enable_mamba_extra_buffer() and (
-            not self.model_runner.server_args.disable_radix_cache
+            not get_memory().disable_radix_cache
         )
 
     def _cache_loc_dtype(self):
@@ -802,10 +807,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         model_runner, capture_req_slots: int
     ) -> tuple[int, int]:
         """Resolve per-request length and aggregate capacity of one chunk."""
-        prefix_config = model_runner.server_args.cuda_graph_config.prefill
+        prefix_config = get_exec().graph.cuda_graph_config.prefill
         requested_capacity = prefix_config.full_prefill_prefix_chunk_tokens
         if requested_capacity is None:
-            requested_capacity = model_runner.server_args.chunked_prefill_size
+            requested_capacity = get_schedule().chunked_prefill_size
             if requested_capacity is None or requested_capacity <= 0:
                 requested_capacity = prefix_config.max_bs
         if requested_capacity is None or requested_capacity <= 0:

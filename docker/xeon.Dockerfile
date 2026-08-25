@@ -39,7 +39,7 @@ RUN source /opt/.venv/bin/activate && \
     git checkout ${VER_SGLANG} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . && \
+    uv pip install ".[diffusion]" && \
     cd sglang/kernels/aot && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \

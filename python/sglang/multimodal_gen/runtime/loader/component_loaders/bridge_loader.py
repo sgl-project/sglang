@@ -4,7 +4,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
@@ -14,16 +14,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
 
-class BridgeLoader(ComponentLoader):
+class BridgeLoader(PlainStateDictComponentLoader):
     """Loader for MOVA dual tower bridge with FSDP support."""
 
     pipeline_bridge_config_attr: str = "bridge_config"
@@ -34,7 +31,7 @@ class BridgeLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = self.load_component_config(component_model_path, component_name)
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:

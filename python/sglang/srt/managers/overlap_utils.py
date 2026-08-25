@@ -8,6 +8,10 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -34,10 +38,10 @@ def decide_needs_cpu_seq_lens(
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
@@ -56,7 +60,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if not algo.is_dspark():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
