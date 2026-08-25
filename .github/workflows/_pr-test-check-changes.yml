@@ -17,6 +17,8 @@ on:
         type: string
         default: '.github/workflows/pr-test.yml'
     outputs:
+      bazel:
+        value: ${{ jobs.run.outputs.bazel }}
       main_package:
         value: ${{ jobs.run.outputs.main_package }}
       sgl_kernel:
@@ -43,6 +45,7 @@ jobs:
     name: check-changes
     runs-on: ubuntu-latest
     outputs:
+      bazel: ${{ steps.filter.outputs.bazel || steps.run-mode.outputs.run_all_tests }}
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
@@ -80,6 +83,28 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            bazel:
+              - ".bazelrc"
+              - ".bazelversion"
+              - "MODULE.bazel"
+              - "MODULE.bazel.lock"
+              - "**/BUILD.bazel"
+              - "bazel/**"
+              - "python/pyproject*.toml"
+              - "python/sglang/*.py"
+              - "python/sglang/cli/**"
+              - "python/sglang/kernels/**"
+              - "python/sglang/lang/**"
+              - "python/sglang/srt/**"
+              - "rust/Cargo.*"
+              - "rust/sglang-grpc/**"
+              - "rust/sglang-mm/**"
+              - "rust/sglang-server/**"
+              - "sgl-model-gateway/**"
+              - "proto/sglang/runtime/v1/sglang.proto"
+              - ".github/workflows/pr-test-bazel.yml"
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-check-changes.yml"
             main_package:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/_pr-test-*.yml"
@@ -231,6 +256,7 @@ jobs:
             echo ""
             echo "| Component         | Changed |"
             echo "|-------------------|---------|"
+            echo "| bazel             | ${{ steps.filter.outputs.bazel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"

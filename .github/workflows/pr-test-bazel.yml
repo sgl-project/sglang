@@ -19,7 +19,12 @@ on:
       - "rust/Cargo.*"
       - "rust/sglang-grpc/**"
       - "rust/sglang-mm/**"
+      - "rust/sglang-server/**"
+      - "sgl-model-gateway/**"
       - "proto/sglang/runtime/v1/sglang.proto"
+      - ".github/workflows/_pr-test-check-changes.yml"
+      - ".github/workflows/pr-test-amd-rocm720.yml"
+      - ".github/workflows/pr-test-extra.yml"
       - ".github/workflows/pr-test-bazel.yml"
   pull_request:
     paths:
@@ -38,7 +43,12 @@ on:
       - "rust/Cargo.*"
       - "rust/sglang-grpc/**"
       - "rust/sglang-mm/**"
+      - "rust/sglang-server/**"
+      - "sgl-model-gateway/**"
       - "proto/sglang/runtime/v1/sglang.proto"
+      - ".github/workflows/_pr-test-check-changes.yml"
+      - ".github/workflows/pr-test-amd-rocm720.yml"
+      - ".github/workflows/pr-test-extra.yml"
       - ".github/workflows/pr-test-bazel.yml"
   workflow_dispatch:
 
@@ -53,7 +63,7 @@ jobs:
   smoke:
     name: bazel-smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -69,11 +79,29 @@ jobs:
           bazel mod graph
           bazel query //...
 
+      - name: Analyze accelerator migration targets
+        run: |
+          bazel build --nobuild --config=ci --config=cuda \
+            //bazel/integration:dummy_model_e2e \
+            //bazel/integration:qwen2_real_weight_e2e \
+            //python/sglang/kernels/aot:cuda_wheel
+
+          bazel build --nobuild --config=ci --config=rocm \
+            //python/sglang/kernels/aot:rocm_wheel
+
       - name: Build independent components
-        run: bazel build --config=cpu //:bazel_components
+        run: |
+          bazel build --config=cpu //:bazel_components
+          bazel build --config=cpu \
+            --define=SGLANG_WHEEL_VERSION=0.0.0.dev0 \
+            //bazel/packaging:main_wheel
 
       - name: Run CPU foundation tests
-        run: bazel test --config=cpu --config=ci //:bazel_smoke
+        run: |
+          bazel test --config=cpu --config=ci \
+            //:bazel_smoke \
+            //bazel/rust:sgl_model_gateway_lock_parity_test \
+            //sgl-model-gateway:internal_tests
 
       - name: Check generated locks
         run: |
@@ -82,4 +110,5 @@ jobs:
             bazel/python/hf_management.requirements.lock.txt \
             bazel/python/runtime_import.requirements.lock.txt \
             bazel/python/srt_empty_bootstrap.requirements.lock.txt \
+            bazel/rust/sgl-model-gateway-crates.lock.json \
             bazel/rust/sglang-crates.lock.json
