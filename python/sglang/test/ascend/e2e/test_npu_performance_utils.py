@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -26,6 +25,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     CONFIGMAP_NAME,
     NAMESPACE,
     SERVICE_PORT,
+    _kill_pgid,
     check_role,
     kill_process_group,
     launch_pd_mix_node,
@@ -220,9 +220,9 @@ STDOUT_IDLE_TIMEOUT = 600  # > BENCHMARK_STDOUT_IDLE_TIMEOUT (300)
 STDOUT_WATCHDOG_POLL_INTERVAL = 30
 
 _last_stdout_activity = time.time()
-_current_server_proc = None  # server Popen of the current test class
-_stdout_watchdog_active = False  # only allow triggering while tests run
+_stdout_watchdog_active = False   # only allow triggering while tests run
 _stdout_watchdog_started = False  # started once per process
+_self_isolated = False            # whether setUpClass self-isolated into its own group
 
 
 class _ActivityStdout:
@@ -269,9 +269,9 @@ def _install_stdout_activity_tracking():
         logger.addHandler(_ActivityLogHandler())
 
 
-def _set_current_server_proc(proc):
-    global _current_server_proc
-    _current_server_proc = proc
+def _mark_self_isolated():
+    global _self_isolated
+    _self_isolated = True
 
 
 def _kill_current_test_group():
@@ -281,19 +281,33 @@ def _kill_current_test_group():
     Under option C the server shares the test's group, so killpg(self-group) also
     kills self; it must only be used for "already failed / already stuck" cases.
     setUpClass's setpgid(0,0) ensures this group excludes run_suite.py / ci_utils.
+    If setpgid failed (not self-isolated), killpg is skipped to avoid killing the
+    runner's process group.
+
+    The two cleanup calls below are complementary, not redundant -- do not remove
+    either one:
+    - kill_process_tree walks the process tree (parent/child), reaching every
+      descendant (server subtree, running benchmark) even if it escaped this
+      process group via start_new_session/setsid, which killpg would miss.
+    - killpg sweeps the entire process group, reaching re-parented orphans (e.g.
+      a leftover forkserver daemon) that left the process tree, which
+      kill_process_tree would miss.
+    Together they cover both escape paths.
     """
     try:
         kill_process_tree(os.getpid(), include_parent=False)
     except Exception as e:
         logger.warning("kill_process_tree failed: %s", e)
-    pgid = os.getpgrp()
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-        logger.error("Killed test process group pgid=%d", pgid)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        logger.warning("No permission to kill pgid=%d", pgid)
+    if not _self_isolated:
+        # setpgid(0,0) failed earlier: this process still shares the runner's
+        # process group, so killpg would SIGKILL run_suite.py / ci_utils. Refuse
+        # it and rely only on the descendant cleanup above.
+        logger.error(
+            "Skipping killpg: process is not self-isolated, refusing to "
+            "SIGKILL the parent runner's process group"
+        )
+        return
+    _kill_pgid(os.getpgrp())
 
 
 def _stdout_idle_watchdog_loop():
@@ -1236,6 +1250,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         # (all currently registered cases satisfy this).
         try:
             os.setpgid(0, 0)
+            _mark_self_isolated()
         except OSError as e:
             logger.warning("skip self-isolation setpgid: %s", e)
 
@@ -1255,8 +1270,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             _kill_current_test_group()
             raise
 
-        _set_current_server_proc(cls.process)
-
         # Enable the idle watchdog only after the server is ready to avoid false
         # kills during loading: loading produces no Python-level output and server
         # logs write straight to fd 1, bypassing timestamping.
@@ -1269,7 +1282,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         # Stop the idle watchdog first to avoid a false self-kill during teardown.
         global _stdout_watchdog_active
         _stdout_watchdog_active = False
-        _set_current_server_proc(None)
 
         # Persist results before any kill-group action (under option C the
         # kill-group also kills this process).

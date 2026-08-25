@@ -1082,6 +1082,19 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         )
 
 
+def _kill_pgid(pgid):
+    """SIGKILL a process group, tolerant of it already being gone."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={pgid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={pgid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={pgid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={pgid}: {e}")
+
+
 def kill_process_group(process):
     """SIGKILL the whole process group led by ``process.pid`` (== pgid).
 
@@ -1090,12 +1103,4 @@ def kill_process_group(process):
     """
     if process is None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-        logger.info(f"killed process group pgid={process.pid}")
-    except ProcessLookupError:
-        logger.info(f"process group pgid={process.pid} already gone")
-    except PermissionError:
-        logger.warning(f"no permission to kill process group pgid={process.pid}")
-    except OSError as e:
-        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")
+    _kill_pgid(process.pid)
