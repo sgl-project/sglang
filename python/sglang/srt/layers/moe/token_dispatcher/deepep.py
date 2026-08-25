@@ -57,7 +57,10 @@ try:
         )
 
     use_deepep = True
-except ImportError:
+except (ImportError, AssertionError):
+    # DeepEP may raise AssertionError during optional JIT initialization when
+    # a CUDA toolkit is absent.  Degrade to the available dispatcher instead
+    # of preventing all model modules from being imported.
     use_deepep = False
 
 from enum import Enum, IntEnum, auto

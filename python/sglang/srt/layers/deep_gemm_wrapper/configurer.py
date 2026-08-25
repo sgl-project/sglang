@@ -26,7 +26,11 @@ def _compute_enable_deep_gemm():
 
     try:
         import deep_gemm  # noqa: F401
-    except ImportError:
+    # Some DeepGEMM wheels locate CUDA during import and can raise an
+    # AssertionError when the CUDA toolkit is not installed locally.  Treat
+    # that the same as an unavailable optional dependency so SGLang can use
+    # its non-DeepGEMM kernels.
+    except (ImportError, AssertionError):
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()

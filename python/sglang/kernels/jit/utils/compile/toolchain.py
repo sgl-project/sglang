@@ -160,7 +160,16 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    cuda_root = pathlib.Path(cuda_home())
+    cuda_lib = cuda_root / "lib64"
+    if not cuda_lib.is_dir():
+        cuda_lib = cuda_root / "lib"
+    cudart_link = "-lcudart"
+    if not (cuda_lib / "libcudart.so").exists():
+        versioned = sorted(cuda_lib.glob("libcudart.so.*"))
+        if versioned:
+            cudart_link = f"-l:{versioned[-1].name}"
+    return flags + [f"-L{cuda_lib}", cudart_link]
 
 
 def compilers() -> Tuple[str, str]:

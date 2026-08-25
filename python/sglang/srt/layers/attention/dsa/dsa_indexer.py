@@ -102,7 +102,7 @@ if _use_aiter and not _use_aiter_preshuffle:
 if _is_cuda:
     try:
         import deep_gemm
-    except ImportError as e:
+    except (ImportError, AssertionError) as e:
         deep_gemm = e
 
 if _use_aiter:
