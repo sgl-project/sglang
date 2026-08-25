@@ -5,12 +5,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention.linear.kda_cp import (
-    all_gather_cp_heads,
-    head_to_sequence_a2a,
-    kda_use_prefill_cp,
-    sequence_to_head_a2a,
+    KDAFLACPContext,
+    compose_kda_cp_affine_states,
+    kda_use_fla_prefill_cp,
+    prepare_kda_cp_conv_states,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -30,106 +29,113 @@ class _ForwardMode:
         return False
 
 
-def _metadata():
-    # Ten logical rows, split into four zigzag blocks:
-    # rank0 = [0,1,2,8,9], rank1 = [3,4,5,6,7].  CP-v2 pads both ranks to 8.
-    return SimpleNamespace(
-        split_list=[3, 3, 2, 2],
-        cp_reverse_index=[0, 2, 3, 1],
-        reverse_split_len=[3, 2, 3, 2],
-        per_rank_logical_token=[5, 5],
-        per_rank_actual_token=[8, 8],
-        max_rank_len=[8, 8],
+class _FakeFixedShapeGatherGroup:
+    def __init__(self, all_rank_tensors, rank):
+        self.all_rank_tensors = all_rank_tensors
+        self.rank = rank
+
+    def all_gather_into_tensor(self, output, input_tensor):
+        torch.testing.assert_close(input_tensor, self.all_rank_tensors[self.rank])
+        torch.cat(self.all_rank_tensors, dim=0, out=output)
+
+
+def _context(group, rank, local_lens=(1, 1), split_list=(1, 1, 1, 1)):
+    return KDAFLACPContext(
+        group=group,
+        cp_size=2,
+        cp_rank=rank,
+        batch_size=1,
+        split_list=split_list,
+        local_segment_lens=local_lens,
+        local_cu_seqlens=torch.tensor(
+            [0, local_lens[0], sum(local_lens)], dtype=torch.int32
+        ),
+        local_segment_slots=((0, 6), (2, 4))[rank],
+        rank_segment_slots=((0, 6), (2, 4)),
+        fixed_segment_sources=(0, -1, 0, -1, 1, -1, 1, -1),
+        max_rank_segments=2,
+        fixed_segment_lens=tuple(
+            value for length in split_list for value in (length, 0)
+        ),
+        track_after_slots=(-1,),
+        track_state_indices=torch.tensor([-1]),
     )
 
 
-def _local_inputs():
-    natural = torch.arange(10 * 4, dtype=torch.float32).view(10, 4, 1)
-    rank_tokens = ([0, 1, 2, 8, 9], [3, 4, 5, 6, 7])
-    local = []
-    for indices in rank_tokens:
-        shard = natural[list(indices)]
-        local.append(torch.cat([shard, shard.new_zeros(3, 4, 1)], dim=0))
-    return natural, local
-
-
-class _SequenceToHeadGroup:
-    def __init__(self, all_rank_inputs, destination_rank):
-        self.all_rank_inputs = all_rank_inputs
-        self.destination_rank = destination_rank
-
-    def all_to_all_single(self, output, _input):
-        cp_size = len(self.all_rank_inputs)
-        for source_rank, source in enumerate(self.all_rank_inputs):
-            send = source.view(source.shape[0], cp_size, -1, *source.shape[2:])
-            send = send.transpose(0, 1).contiguous()
-            output[source_rank].copy_(send[self.destination_rank])
-
-
-class _HeadToSequenceGroup:
-    def __init__(self, all_head_shards, destination_rank):
-        self.all_head_shards = all_head_shards
-        self.destination_rank = destination_rank
-
-    def all_to_all_single(self, output, _input):
-        # Natural -> rank order [block0, block3, block1, block2].
-        rank_order = [0, 1, 2, 8, 9, 3, 4, 5, 6, 7]
-        for head_rank, natural in enumerate(self.all_head_shards):
-            ordered = natural[rank_order]
-            chunks = torch.split(ordered, [5, 5], dim=0)
-            send = natural.new_zeros((2, 8, *natural.shape[1:]))
-            for token_rank, chunk in enumerate(chunks):
-                send[token_rank, : chunk.shape[0]].copy_(chunk)
-            output[head_rank].copy_(send[self.destination_rank])
-
-
-class _AllGatherGroup:
-    def __init__(self, all_rank_inputs):
-        self.all_rank_inputs = all_rank_inputs
-
-    def all_gather_into_tensor(self, output, _input):
-        torch.cat(self.all_rank_inputs, dim=0, out=output)
-
-
 class TestKDAPrefillCP(unittest.TestCase):
-    def test_sequence_head_a2a_round_trip_with_cp_v2_padding(self):
-        metadata = _metadata()
-        forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
-        natural, local_inputs = _local_inputs()
-
-        head_shards = []
-        for cp_rank in range(2):
-            group = _SequenceToHeadGroup(local_inputs, cp_rank)
-            with get_parallel().override(attn_cp_rank=cp_rank, attn_cp_size=2):
-                shard = sequence_to_head_a2a(
-                    local_inputs[cp_rank], forward_batch, group=group
-                )
-            torch.testing.assert_close(
-                shard, natural[:, cp_rank * 2 : (cp_rank + 1) * 2]
+    def test_fla_affine_composes_natural_zigzag_order(self):
+        # Natural transforms are 2x+1, 3x+2, 4x+3, 5x+4.
+        all_rank_affine = [
+            torch.tensor([[[[1.0, 2.0]]], [[[4.0, 5.0]]]]),
+            torch.tensor([[[[2.0, 3.0]]], [[[3.0, 4.0]]]]),
+        ]
+        expected_initial = [
+            torch.tensor([[[[7.0]]], [[[191.0]]]]),
+            torch.tensor([[[[15.0]]], [[[47.0]]]]),
+        ]
+        for rank in range(2):
+            state_pool = torch.tensor([[[[7.0]]]])
+            context = _context(_FakeFixedShapeGatherGroup(all_rank_affine, rank), rank)
+            local_initial = compose_kda_cp_affine_states(
+                all_rank_affine[rank],
+                state_pool,
+                torch.tensor([0], dtype=torch.int32),
+                context,
             )
-            head_shards.append(shard)
+            torch.testing.assert_close(local_initial, expected_initial[rank])
+            torch.testing.assert_close(state_pool, torch.tensor([[[[959.0]]]]))
 
-        for cp_rank in range(2):
-            group = _HeadToSequenceGroup(head_shards, cp_rank)
-            with get_parallel().override(attn_cp_rank=cp_rank, attn_cp_size=2):
-                restored = head_to_sequence_a2a(
-                    head_shards[cp_rank], forward_batch, group=group
-                )
-            torch.testing.assert_close(restored, local_inputs[cp_rank])
-
-    def test_all_gather_cp_heads_restores_rank_order(self):
-        rank0 = torch.tensor([[[0.0], [1.0]]])
-        rank1 = torch.tensor([[[2.0], [3.0]]])
-        group = _AllGatherGroup([rank0.movedim(1, 0), rank1.movedim(1, 0)])
-        with get_parallel().override(attn_cp_size=2):
-            gathered = all_gather_cp_heads(rank0, head_dim=1, group=group)
-        torch.testing.assert_close(
-            gathered, torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
+    def test_fla_affine_supports_value_major_npu_state_pool(self):
+        all_rank_affine = [
+            torch.tensor([[[[1.0, 2.0]]], [[[4.0, 5.0]]]]),
+            torch.tensor([[[[2.0, 3.0]]], [[[3.0, 4.0]]]]),
+        ]
+        state_pool = torch.tensor([[[[7.0]]]])
+        context = _context(_FakeFixedShapeGatherGroup(all_rank_affine, 0), 0)
+        compose_kda_cp_affine_states(
+            all_rank_affine[0],
+            state_pool,
+            torch.tensor([0], dtype=torch.int32),
+            context,
+            state_value_major=True,
         )
+        torch.testing.assert_close(state_pool, torch.tensor([[[[959.0]]]]))
 
-    def test_kda_cp_is_prefill_only(self):
+    def test_fla_conv_uses_only_segment_tails(self):
+        local_inputs = [
+            torch.tensor([[1.0], [2.0], [7.0], [8.0]]),
+            torch.tensor([[3.0], [4.0], [5.0], [6.0]]),
+        ]
+        all_rank_tails = [
+            torch.tensor([[[0.0], [1.0], [2.0]], [[0.0], [7.0], [8.0]]]),
+            torch.tensor([[[0.0], [0.0], [3.0]], [[4.0], [5.0], [6.0]]]),
+        ]
+        local_lens = [(2, 2), (1, 3)]
+        expected = [
+            torch.tensor([[[-2.0, -1.0, 0.0]], [[4.0, 5.0, 6.0]]]),
+            torch.tensor([[[0.0, 1.0, 2.0]], [[1.0, 2.0, 3.0]]]),
+        ]
+        for rank in range(2):
+            state_pool = torch.tensor([[[-2.0, -1.0, 0.0]]])
+            context = _context(
+                _FakeFixedShapeGatherGroup(all_rank_tails, rank),
+                rank,
+                local_lens[rank],
+                (2, 1, 3, 2),
+            )
+            local_initial = prepare_kda_cp_conv_states(
+                local_inputs[rank],
+                state_pool,
+                torch.tensor([0], dtype=torch.int32),
+                context,
+            )
+            torch.testing.assert_close(local_initial, expected[rank])
+            torch.testing.assert_close(state_pool, torch.tensor([[[6.0, 7.0, 8.0]]]))
+
+    def test_fla_cp_is_npu_prefill_only(self):
         forward_batch = SimpleNamespace(
-            attn_cp_metadata=_metadata(), forward_mode=_ForwardMode()
+            attn_cp_metadata=SimpleNamespace(split_list=[1, 1, 1, 1]),
+            forward_mode=_ForwardMode(),
         )
         with (
             patch(
@@ -144,16 +150,7 @@ class TestKDAPrefillCP(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            self.assertTrue(kda_use_prefill_cp(forward_batch))
-
-        with patch(
-            "sglang.srt.layers.attention.linear.kda_cp.get_parallel",
-            return_value=SimpleNamespace(
-                enable_prefill_context_parallel=False,
-                attn_cp_size=2,
-            ),
-        ):
-            self.assertFalse(kda_use_prefill_cp(forward_batch))
+            self.assertTrue(kda_use_fla_prefill_cp(forward_batch))
 
 
 if __name__ == "__main__":

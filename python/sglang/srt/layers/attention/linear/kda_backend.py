@@ -10,10 +10,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_cp import (
-    all_gather_cp_heads,
-    head_to_sequence_a2a,
-    kda_use_prefill_cp,
-    sequence_to_head_a2a,
+    build_kda_fla_cp_context,
+    kda_use_fla_prefill_cp,
+    prepare_kda_cp_conv_states,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -37,7 +36,7 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 
 
 class KDAKernelDispatcher:
@@ -416,6 +415,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self._kda_fla_cp_logged = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -601,9 +601,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Convert ``[..., Q|K|V channels]`` to per-head Q/K/V blocks."""
         if num_heads is None:
             num_heads = layer.num_q_heads
-        if not (
-            layer.num_q_heads == layer.num_k_heads == layer.num_v_heads
-        ):
+        if not (layer.num_q_heads == layer.num_k_heads == layer.num_v_heads):
             raise NotImplementedError(
                 "KDA prefill CP currently requires equal Q/K/V head counts."
             )
@@ -628,96 +626,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             [layer.head_q_dim, layer.head_k_dim, layer.head_v_dim], dim=-1
         )
         return torch.cat((q.flatten(-2), k.flatten(-2), v.flatten(-2)), dim=-1)
-
-    def _transpose_kda_cp_inputs(
-        self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-    ):
-        """Transpose token sharding into head sharding for a full KDA scan."""
-        parallel = get_parallel()
-        cp_size = parallel.attn_cp_size
-        if layer.num_q_heads % cp_size != 0:
-            raise ValueError(
-                "KDA prefill CP requires local KDA heads divisible by CP size: "
-                f"heads={layer.num_q_heads}, cp_size={cp_size}."
-            )
-
-        qkv_by_head = self._qkv_channels_to_heads(mixed_qkv, layer)
-        qkv_by_head = sequence_to_head_a2a(qkv_by_head, forward_batch)
-
-        if a.ndim != 4 or a.shape[0] != 1:
-            raise ValueError(f"Unexpected KDA gate shape under CP: {tuple(a.shape)}")
-        if b.ndim != 3 or b.shape[0] != 1:
-            raise ValueError(f"Unexpected KDA beta shape under CP: {tuple(b.shape)}")
-        gates = torch.cat((a.squeeze(0), b.squeeze(0).unsqueeze(-1)), dim=-1)
-        gates = sequence_to_head_a2a(gates, forward_batch)
-
-        heads_per_cp_rank = layer.num_q_heads // cp_size
-        mixed_qkv = self._heads_to_qkv_channels(qkv_by_head, layer)
-        a = gates[..., : layer.head_k_dim].unsqueeze(0)
-        b = gates[..., layer.head_k_dim].unsqueeze(0)
-        head_start = parallel.attn_cp_rank * heads_per_cp_rank
-        return mixed_qkv, a, b, head_start, heads_per_cp_rank
-
-    def _track_kda_cp_conv_state(
-        self,
-        layer: RadixLinearAttention,
-        mixed_qkv: torch.Tensor,
-        conv_states: torch.Tensor,
-        num_heads: int,
-    ) -> None:
-        """Save a full-head convolution checkpoint from the CP head shard."""
-        tracked = mixed_qkv[self.forward_metadata.track_conv_indices]
-        tracked_by_head = self._qkv_channels_to_heads(
-            tracked, layer, num_heads=num_heads
-        )
-        tracked_full = all_gather_cp_heads(tracked_by_head, head_dim=-2)
-        tracked_full = self._heads_to_qkv_channels(tracked_full, layer).transpose(
-            -1, -2
-        )
-        conv_states[self.forward_metadata.conv_states_mask_indices] = (
-            tracked_full.to(conv_states.dtype, copy=False)
-        )
-
-    def _sync_kda_cp_final_states(
-        self,
-        layer: RadixLinearAttention,
-        cache_indices: torch.Tensor,
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        head_start: int,
-        num_heads: int,
-    ) -> None:
-        """Replicate final conv/KDA states for prefix cache and PD transfer."""
-        valid = cache_indices >= 0
-        if not bool(valid.any()):
-            return
-        active_indices = cache_indices[valid]
-
-        active_conv = conv_states.index_select(0, active_indices).transpose(-1, -2)
-        active_conv_by_head = self._qkv_channels_to_heads(active_conv, layer)
-        active_conv_local = active_conv_by_head.narrow(-2, head_start, num_heads)
-        active_conv_full = all_gather_cp_heads(active_conv_local, head_dim=-2)
-        active_conv_full = self._heads_to_qkv_channels(
-            active_conv_full, layer
-        ).transpose(-1, -2)
-        conv_states.index_copy_(
-            0, active_indices, active_conv_full.to(conv_states.dtype, copy=False)
-        )
-
-        active_ssm_local = (
-            ssm_states.index_select(0, active_indices)
-            .narrow(1, head_start, num_heads)
-            .contiguous()
-        )
-        active_ssm_full = all_gather_cp_heads(active_ssm_local, head_dim=1)
-        ssm_states.index_copy_(
-            0, active_indices, active_ssm_full.to(ssm_states.dtype, copy=False)
-        )
 
     def forward_extend(
         self,
@@ -747,41 +655,52 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
-        use_kda_cp = kda_use_prefill_cp(forward_batch)
-        head_start = 0
-        num_cp_heads = layer.num_q_heads
+        use_fla_cp = kda_use_fla_prefill_cp(forward_batch)
+        fla_cp_context = None
+        fla_conv_initial_states = None
+        cp_physical_tokens = None
 
-        if use_kda_cp:
-            mixed_qkv, a, b, head_start, num_cp_heads = (
-                self._transpose_kda_cp_inputs(
-                    layer, forward_batch, mixed_qkv, a, b
-                )
+        if use_fla_cp:
+            if not isinstance(mixed_qkv, torch.Tensor):
+                raise TypeError("KDA FLA CP requires a dense projected QKV tensor")
+            fla_cp_context = build_kda_fla_cp_context(
+                forward_batch, device=mixed_qkv.device
             )
+            cp_logical_tokens = sum(fla_cp_context.local_segment_lens)
+            cp_physical_tokens = mixed_qkv.shape[0]
+            if cp_physical_tokens < cp_logical_tokens:
+                raise ValueError(
+                    "KDA FLA CP input is shorter than the logical zigzag shard: "
+                    f"physical={cp_physical_tokens}, logical={cp_logical_tokens}."
+                )
+            mixed_qkv = mixed_qkv[:cp_logical_tokens]
+            a = a[:, :cp_logical_tokens]
+            b = b[:, :cp_logical_tokens]
+            fla_conv_initial_states = prepare_kda_cp_conv_states(
+                mixed_qkv,
+                conv_states,
+                cache_indices,
+                fla_cp_context,
+                has_initial_state=has_initial_state,
+            )
+            if not self._kda_fla_cp_logged:
+                rank0_log(
+                    "KDA prefill CP backend: FLA affine-state composition "
+                    "(zigzag adapter)"
+                )
+                self._kda_fla_cp_logged = True
 
-        if self.forward_metadata.has_mamba_track_mask:
+        if self.forward_metadata.has_mamba_track_mask and not use_fla_cp:
             # Snapshot the conv sliding window at the last track-aligned chunk
             # boundary into the ping-pong track slots (the prefix-cache restore
             # source). The KDA pool stores conv states as [kernel-1, dim], so
             # rows of the raw [tokens, dim] pre-conv input index in directly
             # (GDN needs a transpose here; KDA does not).
-            if use_kda_cp:
-                self._track_kda_cp_conv_state(
-                    layer, mixed_qkv, conv_states, num_cp_heads
-                )
-            else:
-                mamba_cache_params.conv[0][
-                    self.forward_metadata.conv_states_mask_indices
-                ] = mixed_qkv[self.forward_metadata.track_conv_indices]
+            mamba_cache_params.conv[0][
+                self.forward_metadata.conv_states_mask_indices
+            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        splits = (
-            [
-                num_cp_heads * layer.head_q_dim,
-                num_cp_heads * layer.head_k_dim,
-                num_cp_heads * layer.head_v_dim,
-            ]
-            if use_kda_cp
-            else [layer.q_dim, layer.k_dim, layer.v_dim]
-        )
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
         full_splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
@@ -795,27 +714,51 @@ class KDAAttnBackend(MambaAttnBackendBase):
         else:
             q_bias, k_bias, v_bias = None, None, None
 
-        if use_kda_cp:
-            q_channel_start = head_start * layer.head_q_dim
-            k_channel_start = head_start * layer.head_k_dim
-            v_channel_start = head_start * layer.head_v_dim
-            q_channels = num_cp_heads * layer.head_q_dim
-            k_channels = num_cp_heads * layer.head_k_dim
-            v_channels = num_cp_heads * layer.head_v_dim
-
-            q_conv_weight = q_conv_weight.narrow(0, q_channel_start, q_channels)
-            k_conv_weight = k_conv_weight.narrow(0, k_channel_start, k_channels)
-            v_conv_weight = v_conv_weight.narrow(0, v_channel_start, v_channels)
-            q_conv_state = q_conv_state.narrow(-2, q_channel_start, q_channels)
-            k_conv_state = k_conv_state.narrow(-2, k_channel_start, k_channels)
-            v_conv_state = v_conv_state.narrow(-2, v_channel_start, v_channels)
-            if q_bias is not None:
-                q_bias = q_bias.narrow(0, q_channel_start, q_channels)
-                k_bias = k_bias.narrow(0, k_channel_start, k_channels)
-                v_bias = v_bias.narrow(0, v_channel_start, v_channels)
+        if use_fla_cp:
+            assert fla_conv_initial_states is not None
+            q_conv_run_state, k_conv_run_state, v_conv_run_state = (
+                fla_conv_initial_states.split(splits, dim=1)
+            )
+        else:
+            q_conv_run_state = q_conv_state
+            k_conv_run_state = k_conv_state
+            v_conv_run_state = v_conv_state
 
         def run_conv(x, weight, bias, state):
-            if use_kda_cp and is_npu():
+            if use_fla_cp:
+                assert fla_cp_context is not None
+                local_indices = fla_cp_context.local_segment_indices
+                if local_indices is None or local_indices.dtype != cache_indices.dtype:
+                    local_indices = torch.arange(
+                        fla_cp_context.num_local_segments,
+                        device=cache_indices.device,
+                        dtype=cache_indices.dtype,
+                    )
+                local_has_initial_state = fla_cp_context.local_segment_has_initial_state
+                if local_has_initial_state is None:
+                    local_has_initial_state = torch.ones(
+                        fla_cp_context.num_local_segments,
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
+                state_work = state.to(weight.dtype).contiguous()
+                out = causal_conv1d_fn(
+                    x.to(weight.dtype),
+                    weight,
+                    bias,
+                    activation="silu",
+                    conv_states=state_work,
+                    has_initial_state=local_has_initial_state,
+                    cache_indices=local_indices,
+                    query_start_loc=fla_cp_context.local_cu_seqlens,
+                    seq_lens_cpu=(
+                        fla_cp_context.local_segment_lens_cpu
+                        or list(fla_cp_context.local_segment_lens)
+                    ),
+                )
+                return out.to(x.dtype).transpose(0, 1)
+
+            if is_npu():
                 # The Ascend varlen wrapper requires dense cache slots and uses
                 # the weight dtype for its workspace. Compact only active rows
                 # and explicitly copy the final BF16 cache state back.
@@ -865,41 +808,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)
 
-        q = run_conv(q, q_conv_weight, q_bias, q_conv_state)
-        k = run_conv(k, k_conv_weight, k_bias, k_conv_state)
-        v = run_conv(v, v_conv_weight, v_bias, v_conv_state)
+        q = run_conv(q, q_conv_weight, q_bias, q_conv_run_state)
+        k = run_conv(k, k_conv_weight, k_bias, k_conv_run_state)
+        v = run_conv(v, v_conv_weight, v_bias, v_conv_run_state)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        track_ssm = self.forward_metadata.has_mamba_track_mask
-        if use_kda_cp:
-            A_log = layer.A_log.narrow(2, head_start, num_cp_heads)
-            dt_bias = (
-                layer.dt_bias.view(layer.num_q_heads, layer.head_k_dim)
-                .narrow(0, head_start, num_cp_heads)
-                .flatten()
-            )
-            valid_cache_indices = cache_indices >= 0
-            safe_cache_indices = cache_indices.clamp_min(0)
-            ssm_states_for_kernel = (
-                ssm_states.index_select(0, safe_cache_indices)
-                .narrow(1, head_start, num_cp_heads)
-                .contiguous()
-            )
-            if not bool(valid_cache_indices.all()):
-                ssm_states_for_kernel[~valid_cache_indices].zero_()
-            kernel_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
-        else:
-            A_log = layer.A_log
-            dt_bias = layer.dt_bias
-            ssm_states_for_kernel = ssm_states
-            kernel_cache_indices = cache_indices
+        track_ssm = self.forward_metadata.has_mamba_track_mask and not use_fla_cp
+        kernel_query_start_loc = (
+            fla_cp_context.local_cu_seqlens if use_fla_cp else query_start_loc
+        )
 
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
@@ -907,11 +827,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             v=v,
             g=a,
             beta=b,
-            ssm_states=ssm_states_for_kernel,
-            cache_indices=kernel_cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=A_log,
-            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=kernel_query_start_loc,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
@@ -924,6 +844,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
+            cp_context=fla_cp_context,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -931,34 +852,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # ping-pong track slots (see _init_track_ssm_indices).
             core_attn_out, h = core_attn_out
 
-        if use_kda_cp:
-            active_state_indices = cache_indices[valid_cache_indices]
-            if active_state_indices.numel() > 0:
-                ssm_states.narrow(1, head_start, num_cp_heads).index_copy_(
-                    0,
-                    active_state_indices,
-                    ssm_states_for_kernel[valid_cache_indices],
-                )
-            self._sync_kda_cp_final_states(
-                layer,
-                cache_indices,
-                conv_states,
-                ssm_states,
-                head_start,
-                num_cp_heads,
-            )
-            if track_ssm:
-                h = all_gather_cp_heads(h, head_dim=2)
-
         if track_ssm:
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
             )
-
-        if use_kda_cp:
-            core_attn_out = head_to_sequence_a2a(
-                core_attn_out.squeeze(0), forward_batch
-            ).unsqueeze(0)
+        if (
+            use_fla_cp
+            and cp_physical_tokens is not None
+            and core_attn_out.shape[1] < cp_physical_tokens
+        ):
+            pad_tokens = cp_physical_tokens - core_attn_out.shape[1]
+            core_attn_out = torch.cat(
+                (
+                    core_attn_out,
+                    core_attn_out.new_zeros(
+                        core_attn_out.shape[0],
+                        pad_tokens,
+                        *core_attn_out.shape[2:],
+                    ),
+                ),
+                dim=1,
+            )
         return core_attn_out
 
     def _forward_target_verify(

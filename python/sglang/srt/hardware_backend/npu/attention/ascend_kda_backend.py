@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 from sgl_kernel_npu.fla.kda_chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_affine_npu,
     chunk_gated_delta_rule_fwd_h_npu,
 )
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
@@ -28,6 +29,9 @@ from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
 )
+from sglang.srt.layers.attention.linear.kda_cp import (
+    compose_kda_cp_affine_states,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -52,6 +56,7 @@ class _AscendKDAExtendKernel:
         **kwargs,
     ):
         chunk_size = 64
+        cp_context = kwargs.get("cp_context")
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
         v = v.contiguous()
@@ -89,13 +94,39 @@ class _AscendKDAExtendKernel:
             chunk_indices=chunk_indices,
         )
         del triangular
+        kernel_state_source = ssm_states
+        kernel_state_indices = cache_indices
+        if cp_context is not None:
+            local_affine = chunk_gated_delta_rule_fwd_affine_npu(
+                k=gated_k,
+                w=w,
+                u=u,
+                gk=g,
+                cu_seqlens=query_start_loc,
+            )
+            local_initial_kv = compose_kda_cp_affine_states(
+                local_affine,
+                ssm_states,
+                cache_indices,
+                cp_context,
+                state_value_major=True,
+            )
+            kernel_state_source = local_initial_kv.transpose(-1, -2).contiguous()
+            kernel_state_indices = cp_context.local_segment_indices
+            if kernel_state_indices is None:
+                kernel_state_indices = torch.arange(
+                    cp_context.num_local_segments,
+                    dtype=cache_indices.dtype,
+                    device=cache_indices.device,
+                )
+
         chunk_states, new_values = chunk_gated_delta_rule_fwd_h_npu(
             k=gated_k,
             w=w,
             u=u,
             gk=g,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
+            initial_state=kernel_state_source,
+            initial_state_indices=kernel_state_indices,
             cu_seqlens=query_start_loc,
             chunk_indices=chunk_indices,
             use_exp2=True,
@@ -539,9 +570,7 @@ class AscendKDAHybridLinearAttnBackend:
                     ]
                 )
 
-                mamba_caches = (
-                    self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-                )
+                mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
                 conv_states = mamba_caches.conv[0]
                 ssm_states = mamba_caches.temporal
