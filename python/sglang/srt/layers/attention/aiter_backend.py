@@ -29,7 +29,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -80,28 +79,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
-
-
-def _log_aiter_eagle_verify_path(
-    logged: set[tuple[str, int]],
-    tag: str,
-    layer_id: int,
-    forward_batch: ForwardBatch,
-    **extra: object,
-) -> None:
-    if not envs.SGLANG_MINIMAX_LOG_EAGLE_VERIFY.get():
-        return
-    if not forward_batch.forward_mode.is_target_verify():
-        return
-    key = (tag, layer_id)
-    if key in logged:
-        return
-    logged.add(key)
-    bs = int(forward_batch.seq_lens.shape[0])
-    parts = [f"tag={tag}", f"layer={layer_id}", f"bs={bs}"]
-    for name, value in extra.items():
-        parts.append(f"{name}={value}")
-    logger.info("Aiter EAGLE verify path: %s", " ".join(parts))
 
 
 # Use aiter mla persist design for fp8-kv cache
@@ -292,7 +269,6 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
-        self._eagle_verify_logged: set[tuple[str, int]] = set()
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2167,14 +2143,6 @@ class AiterAttnBackend(AttentionBackend):
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                _log_aiter_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "aiter_mla_verify",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=self.forward_metadata.max_q_len,
-                    use_mla_ps_kernel=_use_mla_ps_kernel,
-                )
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
@@ -2295,20 +2263,6 @@ class AiterAttnBackend(AttentionBackend):
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
                 ):
-                    _log_aiter_eagle_verify_path(
-                        self._eagle_verify_logged,
-                        "aiter_unified_verify",
-                        layer.layer_id,
-                        forward_batch,
-                        ndt=self.forward_metadata.max_q_len,
-                        unified_verify=True,
-                        sliding_window=layer.sliding_window_size,
-                        kv_cache_layout=(
-                            "vectorized_5d"
-                            if self.kv_cache_is_vectorized_5d
-                            else "nhd"
-                        ),
-                    )
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
@@ -2365,14 +2319,6 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-                _log_aiter_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "aiter_extend_verify",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=self.forward_metadata.max_extend_len,
-                    unified_verify=False,
-                )
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),

@@ -51,26 +51,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _log_eagle_verify_path(
-    logged: set[tuple[str, int]],
-    tag: str,
-    layer_id: int,
-    forward_batch: ForwardBatch,
-    **extra: object,
-) -> None:
-    if not envs.SGLANG_MINIMAX_LOG_EAGLE_VERIFY.get():
-        return
-    if not forward_batch.forward_mode.is_target_verify():
-        return
-    key = (tag, layer_id)
-    if key in logged:
-        return
-    logged.add(key)
-    bs = int(forward_batch.seq_lens.shape[0])
-    parts = [f"tag={tag}", f"layer={layer_id}", f"bs={bs}"]
-    for name, value in extra.items():
-        parts.append(f"{name}={value}")
-    logger.info("MiniMax EAGLE verify path: %s", " ".join(parts))
 
 
 def _kv_cache_to_bnsd(
@@ -166,7 +146,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
-        self._eagle_verify_logged: set[tuple[str, int]] = set()
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -1512,15 +1491,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         if self.is_npu:
             if forward_batch.forward_mode.is_target_verify():
-                _ndt = self._target_verify_q_cap(forward_batch)
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "npu_sparse_decode_verify",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=_ndt,
-                    disable_value=disable_value,
-                )
                 # TARGET_VERIFY runs under cuda-graph capture; use the
                 # capture-safe verify path (decode kernels, no .item()).
                 idx_o, o = self._forward_npu_triton_verify(
@@ -1558,18 +1528,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 and forward_batch.forward_mode.is_target_verify()
                 and not envs.SGLANG_MINIMAX_FORCE_SPARSE_PREFILL_VERIFY.get()
             ):
-                _ndt = self._target_verify_q_cap(forward_batch)
-                _prefix0 = int(prefix_lens[0].item()) if prefix_lens.numel() else 0
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "gfx950_sparse_decode_verify",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=_ndt,
-                    prefix0=_prefix0,
-                    fp8_attn_gemm=self.fp8_attn_gemm,
-                    disable_value=disable_value,
-                )
                 # gfx950 EAGLE verify: per-draft decode rows (not extend prefill).
                 idx_o, o = self._forward_gfx950_triton_verify(
                     q,
@@ -1587,19 +1545,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
                     minimax_sparse_prefill,
                 )
-
-                if forward_batch.forward_mode.is_target_verify():
-                    _ndt = self._target_verify_q_cap(forward_batch)
-                    _log_eagle_verify_path(
-                        self._eagle_verify_logged,
-                        "gpu_sparse_prefill_verify",
-                        layer.layer_id,
-                        forward_batch,
-                        ndt=_ndt,
-                        gfx95=is_gfx95_supported(),
-                        fp8_attn_gemm=self.fp8_attn_gemm,
-                        disable_value=disable_value,
-                    )
 
                 idx_o, o = minimax_sparse_prefill(
                     q,
@@ -1818,7 +1763,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
-        self._eagle_verify_logged: set[tuple[str, int]] = set()
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
@@ -1873,24 +1817,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if forward_batch.forward_mode.is_target_verify():
-            if layer.layer_id in self.sparse_layer_ids:
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "hybrid_sparse",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=q.shape[0] // max(int(forward_batch.seq_lens.shape[0]), 1),
-                )
-            else:
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "hybrid_dense",
-                    layer.layer_id,
-                    forward_batch,
-                    backend=type(self.dense).__name__,
-                    ndt=q.shape[0] // max(int(forward_batch.seq_lens.shape[0]), 1),
-                )
         if layer.layer_id in self.sparse_layer_ids:
             return self.sparse.forward(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
@@ -1931,24 +1857,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if forward_batch.forward_mode.is_target_verify():
-            if layer.layer_id in self.sparse_layer_ids:
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "hybrid_sparse_extend",
-                    layer.layer_id,
-                    forward_batch,
-                    ndt=q.shape[0] // max(int(forward_batch.seq_lens.shape[0]), 1),
-                )
-            else:
-                _log_eagle_verify_path(
-                    self._eagle_verify_logged,
-                    "hybrid_dense_extend",
-                    layer.layer_id,
-                    forward_batch,
-                    backend=type(self.dense).__name__,
-                    ndt=q.shape[0] // max(int(forward_batch.seq_lens.shape[0]), 1),
-                )
         if layer.layer_id in self.sparse_layer_ids:
             return self.sparse.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
