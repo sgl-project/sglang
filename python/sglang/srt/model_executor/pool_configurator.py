@@ -32,6 +32,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import MXFP4_BYTES_PER_TOKEN
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
@@ -542,6 +543,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_full_layers_num
                 )
 
+        # Bytes per token of max_total_num_tokens.
+        #
+        # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
+        # for both pools: F*nf + r*S*ns (where swa_tokens = full_tokens * r).
+        #
+        # All-SWA (full_layers == 0): max_total = swa_tokens directly. The ratio
+        # is meaningless here -- there is no full pool to relate to, and every
+        # token beyond the sliding window can be evicted. So cell_size = S*ns,
+        # with no ratio factor applied.
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
         # Bytes per token of max_total_num_tokens.
@@ -879,7 +889,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes_fp8 = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.kv_cache_dtype_str == "fp4_e2m1":
+            # All three DSV4 KV pools (SWA, C4, C128) use the MXFP4 layout.
+            kv_bytes = MXFP4_BYTES_PER_TOKEN
+        else:
+            kv_bytes = kv_bytes_fp8
 
         quant_block_size = 128
         indexer_bytes = (
