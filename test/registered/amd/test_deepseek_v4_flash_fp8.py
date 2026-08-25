@@ -30,6 +30,8 @@ register_amd_ci(
     est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
 )
 
+# Stays on the preview-derived repack while the FP4 leg runs `-0731`: the FP8
+# path needs a repackaged checkpoint and no 0731 repack has been published.
 DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
