@@ -1,5 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_test")
-load("@rules_python//python/uv:lock.bzl", "uv_lock")
+load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
 
 package(default_visibility = ["//visibility:public"])
 
