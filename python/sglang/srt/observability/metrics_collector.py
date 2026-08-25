@@ -1969,9 +1969,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             previous = self._last_prefetch_outcomes.get(outcome, 0.0)
             increment = current if current < previous else current - previous
             if increment > 0:
-                self.prefetch_outcomes_total.labels(
-                    **self.labels, outcome=outcome
-                ).inc(increment)
+                self.prefetch_outcomes_total.labels(**self.labels, outcome=outcome).inc(
+                    increment
+                )
             self._last_prefetch_outcomes[outcome] = current
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
