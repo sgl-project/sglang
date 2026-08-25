@@ -1399,10 +1399,14 @@ figures are anchored at 480P — activations grow with the pixel count, so at
 768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
 decode still collides. And the host convention holds the weights in page
 cache; a physical 32 GB machine re-reads them from disk each step, so the
-drive holding the checkpoint bounds the step time — roughly 15–20 s/step from
-a good NVMe, 35–50 from a SATA or fatigued QLC drive, unusable from a spinning
-archive drive. Put the checkpoint on the fastest drive in the machine, not the
-biggest. The
+page cache cannot hold the per-step weight sweep, so every step re-reads it
+from disk and the drive becomes the denoise clock: a real desktop 4090 with a
+990 Pro measured 38 s/step, reading 52.9 GB per step (faulted sequentially, so
+almost none of it shows in majflt — measure `read_bytes`, not major faults).
+Two things cut that read directly: resident DiT layers (~1 GB/step each — on a
+physically small host raise them as far as VRAM allows, the opposite of the
+capped-host guidance above), and more RAM (64 GB caches the sweep and returns
+to the quoted times). The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
 and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
 22 GiB cap so a desktop's own allocations fit; a headless card can raise it

@@ -135,7 +135,7 @@ function consumerHints(s) {
   }
   hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
   hints.push("every figure here is anchored at 480P: activations grow with the pixel count, so at 768P drop the resident DiT layers to 0 first, then video_vae to 24 if the decode still collides -- the flags trade speed for headroom in that order");
-  hints.push("on a physical 32 GB host the 108 GB checkpoint cannot stay cached, so the drive it sits on bounds the step time: a good NVMe supports ~15-20 s/step, a SATA or fatigued QLC drive ~35-50, a spinning archive drive is unusable -- put the checkpoint on the fastest drive in the machine, not the big one");
+  hints.push("on a physical 32 GB host the page cache cannot hold the per-step weight sweep, so every step re-reads ~40-65 GB from disk and the drive is the denoise clock: a real desktop 4090 with a 990 Pro measured 38 s/step (52.9 GB read per step). Resident DiT layers cut that read directly (~1 GB/step each), so raise them as far as VRAM allows; 64 GB of RAM caches the sweep and returns to the quoted times");
   return hints;
 }
 
