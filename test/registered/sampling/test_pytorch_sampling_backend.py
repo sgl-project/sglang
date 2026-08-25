@@ -28,7 +28,13 @@ class TestPyTorchSamplingBackend(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--sampling-backend", "pytorch", "--disable-radix-cache"],
+            other_args=[
+                "--sampling-backend",
+                "pytorch",
+                "--disable-radix-cache",
+                "--max-running-requests",
+                "64",
+            ],
         )
 
     @classmethod
