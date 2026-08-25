@@ -153,8 +153,82 @@ class ForwardMetadata:
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
-# Staging page size for the DCP extend path, independent of --page-size
-_DCP_PREFILL_PAGE_SIZE = 64
+# (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
+# instantiation for; copied from MLA_REDUCE_ROUTER in
+# aiter/csrc/kernels/mla/reduce.cu. An unlisted pair aborts the process host-side
+# ("kn_mla_reduce_v1 doesn't support the specified settings"), with no Python
+# frame to catch, so mla_fp8_prefill_attn is only safe on a listed one.
+_MLA_REDUCE_V1_HEADS = {
+    64: frozenset({64}),
+    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 64, 128}),
+    512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
+}
+
+
+def _pad_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """Append ``pad`` zero heads to a [tokens, heads, dim] tensor."""
+    zeros = x.new_zeros((x.shape[0], pad, x.shape[2]))
+    return torch.cat([x, zeros], dim=1)
+
+
+def _decode_head_pad_plan(num_head: int) -> tuple[int, int]:
+    """``(repeat_factor, zero_pad)`` bringing ``num_head`` up to 16 for mla_decode_fwd.
+
+    The kernel selects an asm variant by ``gqa = num_head / num_kv_head`` and has
+    variants for 4, 8 and the multiples of 16 in [16, 128]; anything else aborts
+    host-side ("get_heuristic_kernel_mla: cannot get heuristic kernel"), which is
+    why every count below 16 is brought up to it. A count that divides 16 is
+    repeated, so its extra columns carry real values; one that does not
+    (Kimi-K3's 12 at tp8) is zero-padded.
+    """
+    if num_head >= 16:
+        return 1, 0
+    if 16 % num_head == 0:
+        return 16 // num_head, 0
+    return 1, 16 - num_head
+
+
+def _fp8_prefill_num_head(
+    *, num_head: int, num_kv_head: int, v_head_dim: int
+) -> Optional[int]:
+    """Head count to run the asm fp8 MLA prefill at, or None to skip that path.
+
+    Returns ``num_head`` when mla_reduce_v1 already serves it, else the next
+    larger count it does serve -- q/k/v are zero-padded up to that and the extra
+    output columns sliced back off. None when the table has nothing to reach,
+    and the caller keeps flash_attn_varlen_func.
+
+    Padding holds q and k/v at the same count, so it is only offered at GQA
+    ratio 1, which is what MLA gives: k/v are materialized per query head, so
+    both sides pad by the same amount and the ratio the metadata is built for
+    does not move. A ratio above 1 would need the kv side padded by ratio-th as
+    much, which is unvalidated.
+    """
+    supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
+    if num_head in supported:
+        return num_head
+    if num_head != num_kv_head:
+        return None
+    larger = [h for h in supported if h > num_head]
+    return min(larger) if larger else None
+
+
+def _mla_decode_kernel_reachable(
+    *,
+    decode_attention_backend: Optional[str],
+    speculative_algorithm: Optional[str],
+    speculative_attention_mode: str,
+) -> bool:
+    """Whether an aiter MLA instance can reach ``mla_decode_fwd``.
+
+    ``HybridAttnBackend`` sends DECODE to the decode backend and TARGET_VERIFY /
+    DRAFT_EXTEND_V2 wherever ``speculative_attention_mode`` points; plain EXTEND
+    always goes to the prefill backend. Only the first group calls the decode
+    kernel, so an aiter serving prefill alone is free of its head-count limit.
+    """
+    if decode_attention_backend == "aiter":
+        return True
+    return speculative_algorithm is not None and speculative_attention_mode == "prefill"
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -212,6 +286,34 @@ class AiterAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
+
+        # The asm fp8 prefill reduces through mla_reduce_v1, which only has
+        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
+        # else is zero-padded up to one it does carry, or falls back to
+        # flash_attn_varlen_func when the table has nothing to reach.
+        self.fp8_prefill_num_head = (
+            _fp8_prefill_num_head(
+                num_head=self.num_head,
+                num_kv_head=self.num_kv_head,
+                v_head_dim=self.v_head_dim,
+            )
+            if self.use_mla
+            else None
+        )
+        self.use_fp8_prefill_attn = (
+            _use_fp8_prefill_attn and self.fp8_prefill_num_head is not None
+        )
+        # Padding is only offered at GQA ratio 1, so the kv side takes the same
+        # delta and the ratio the PS metadata is built for stays put.
+        self.fp8_prefill_num_kv_head = self.num_kv_head + (
+            (self.fp8_prefill_num_head or self.num_head) - self.num_head
+        )
+        if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
+            logger.info(
+                f"aiter asm fp8 MLA prefill pads {self.num_head} query heads to "
+                f"{self.fp8_prefill_num_head}; mla_reduce_v1 has no "
+                f"{self.num_head}-head instantiation at head_dim {self.v_head_dim}."
+            )
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -328,15 +430,28 @@ class AiterAttnBackend(AttentionBackend):
             _valid_heads = self.num_head in (4, 8) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
-            assert self.dcp_world_size > 1 or _valid_heads, (
+            # The head limit below is mla_decode_fwd's; plain EXTEND runs
+            # flash_attn_varlen_func / mla_prefill_fwd, which take any count.
+            runs_mla_decode = _mla_decode_kernel_reachable(
+                decode_attention_backend=model_runner.decode_attention_backend_str,
+                speculative_algorithm=get_spec().speculative_algorithm,
+                speculative_attention_mode=get_spec().speculative_attention_mode,
+            )
+            # _mla_decode_fwd_with_head_pad brings any count below 16 up to it,
+            # by repetition when it divides 16 and by zero-padding otherwise.
+            _pad_heads_to_16 = self.num_head < 16
+            assert (
+                self.dcp_world_size > 1
+                or _valid_heads
+                or _pad_heads_to_16
+                or not runs_mla_decode
+            ), (
                 f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
-                "Try adjusting tensor_parallel_size value."
+                "Try adjusting tensor_parallel_size value, or run decode on "
+                "another backend (--decode-attention-backend)."
             )
-            self.num_head_padded = 16 if self.num_head < 16 else self.num_head
-            self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
-
             # Under DCP, Q is all-gathered, so this operates on the gathered
             # head count num_head * dcp_world_size. No-op otherwise.
             _gathered_num_head = self.num_head * self.dcp_world_size
@@ -515,7 +630,7 @@ class AiterAttnBackend(AttentionBackend):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_ps_metadata_info_v1(
             batch_size=batch_size,
-            num_head_k=self.num_kv_head,
+            num_head_k=self.fp8_prefill_num_kv_head,
             max_qlen=max_qlen,
             qlen_granularity=qlen_granularity,
         )
@@ -560,8 +675,8 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map: torch.Tensor,
         is_causal: bool = True,
     ):
-        gqa_ratio = self.num_head // self.num_kv_head
-        num_heads_k = self.num_kv_head
+        gqa_ratio = self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
+        num_heads_k = self.fp8_prefill_num_kv_head
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
@@ -802,20 +917,41 @@ class AiterAttnBackend(AttentionBackend):
     ):
         """Wrap mla_decode_fwd with head-dimension padding for num_head < 16.
 
-        When head_repeat_factor > 1 (i.e. num_head is 4 or 8), q is
-        repeat-interleaved to reach num_head_padded (16) before the kernel
-        call, and the corresponding output columns are sliced back afterward.
-        q / o must already be shaped (..., num_head, head_dim).
+        The kernel picks an asm variant by ``gqa = num_head / num_kv_head`` and
+        only has variants for 4, 8 and the multiples of 16 in [16, 128]; anything
+        else aborts host-side ("get_heuristic_kernel_mla: cannot get heuristic
+        kernel"). ``mla_kernel_num_head_padded`` already builds the metadata at
+        16 for every count below it, so q is brought up to 16 here and the extra
+        output columns sliced back off.
 
-        When ``return_lse`` is set (DCP case), also returns the
-        per-(token, head) log-sum-exp so the caller can merge partial outputs
-        across dcp ranks.
+        A count that divides 16 (4, 8) is repeat-interleaved, so its extra
+        columns carry real values; one that does not (Kimi-K3 has 12 per rank at
+        tp8) is zero-padded, at 33% wasted query-head work. Only q is padded --
+        nhead_kv is 1 -- and decode is KV-bandwidth-bound, so that costs little:
+        measured -6.4% median ITL at 4k and -11.4% at 32k against triton decode.
+
+        q / o must already be shaped (..., num_head, head_dim). When
+        ``return_lse`` is set (DCP case), also returns the per-(token, head)
+        log-sum-exp so the caller can merge partial outputs across dcp ranks.
         """
         # Padding follows this call's actual head count, not self.num_head: under
         # DCP the gathered layer usually already has >= 16 heads.
         n_heads = layer.tp_q_head_num
-        repeat_factor = (16 // n_heads) if n_heads < 16 else 1
-        if repeat_factor > 1:
+        repeat_factor, head_pad = _decode_head_pad_plan(n_heads)
+        if head_pad:
+            q_in = _pad_heads(q, head_pad)
+            o = q.new_empty(
+                (q.shape[0], n_heads + head_pad, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            if return_lse:
+                _, lse = mla_decode_fwd(
+                    q_in, k_buffer_flat, o, return_lse=True, **kwargs
+                )
+                return o[:, :n_heads, :], lse[:, :n_heads]
+            mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
+            return o[:, :n_heads, :]
+        elif repeat_factor > 1:
             q_in = q.repeat_interleave(repeat_factor, dim=1)
             o = q.new_empty(
                 (q.shape[0], n_heads * repeat_factor, layer.v_head_dim),
@@ -1129,115 +1265,6 @@ class AiterAttnBackend(AttentionBackend):
         )
         return dcp_lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
 
-    def _mla_prefill_fwd_dcp(self, q, layer, k_descale, forward_batch):
-        """DCP prefill (extend), on the Gluon MLA kernel when it can serve the
-        batch and on aiter's Triton absorb-prefill kernel otherwise.
-
-        ``mla_gluon`` has no ``qo_indptr``: its MTP mode takes q as
-        ``[bs, qlen, nhead, dim]``, so one compiled kernel serves any qlen but
-        every request in the batch must contribute the SAME number of extend
-        tokens. A prefill batch is ragged in general, so this dispatches per
-        batch rather than per config, and the Triton path stays the fallback.
-        """
-        if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get():
-            extend_lens = forward_batch.extend_seq_lens_cpu
-            if extend_lens and len(set(extend_lens)) == 1:
-                return self._mla_prefill_fwd_dcp_gluon(
-                    q, layer, forward_batch, q_len=extend_lens[0]
-                )
-        return self._mla_prefill_fwd_dcp_triton(q, layer, k_descale, forward_batch)
-
-    def _mla_prefill_fwd_dcp_gluon(self, q, layer, forward_batch, q_len: int):
-        """DCP prefill (extend) on aiter's Gluon MLA kernel, MTP mode.
-
-        Same assembled-KV setup as the Triton path below, but taken in
-        ``mla_gluon``'s varlen form (``dcp_kv_indices`` + ``dcp_kv_indptr``), so
-        it needs neither the page repack nor a paged block table. MTP masking is
-        ``q_pos attends KV[0, seq_len - q_len + q_pos]``, which is exactly the
-        extend window: ``seq_len`` is the request's assembled prefix + extend and
-        ``q_len`` its extend count.
-        """
-        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
-
-        dcp_meta = forward_batch.attn_dcp_metadata
-        kv_indptr = dcp_meta.dcp_kv_indptr
-        bs = kv_indptr.shape[0] - 1
-        num_heads = layer.tp_q_head_num
-        kv_lora_rank = layer.v_head_dim
-
-        q4 = q.view(bs, q_len, num_heads, layer.qk_head_dim)
-        out = q.new_empty(
-            (q.shape[0], num_heads * kv_lora_rank), dtype=self.input_dtype
-        )
-        mla_gluon(
-            q4[..., :kv_lora_rank],
-            q4[..., kv_lora_rank:],
-            dcp_meta.dcp_kv_buffer.view(-1, layer.qk_head_dim),
-            out.view(bs, q_len, num_heads, kv_lora_rank),
-            dcp_meta.dcp_kv_indices,
-            kv_indptr[: bs + 1],
-            layer.scaling,
-            use_2d_view=False,
-            min_kv_seq_len=1,
-            return_lse=False,
-        )
-        return out
-
-    def _mla_prefill_fwd_dcp_triton(self, q, layer, k_descale, forward_batch):
-        """DCP prefill (extend) on aiter's MLA absorb-prefill kernel.
-
-        Reads the full sequence from ``attn_dcp_metadata.dcp_kv_buffer``, which
-        the model layer assembles, because the sharded local cache does not hold
-        it. Q is NOT gathered here: each rank attends the full KV with its own
-        local heads, so there is no cross-rank merge.
-        """
-        from aiter.ops.triton.attention.mla import mla_prefill_fwd
-
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            pack_dcp_kv_into_pages,
-        )
-
-        dcp_meta = forward_batch.attn_dcp_metadata
-        kv_buffer = dcp_meta.dcp_kv_buffer  # [seq_lens_sum, 1, qk_head_dim]
-        kv_indptr = dcp_meta.dcp_kv_indptr  # [bs + 1] full-seq boundaries
-        kv_indices = dcp_meta.dcp_kv_indices  # indices into dcp_kv_buffer
-        bs = kv_indptr.shape[0] - 1
-        num_heads = layer.tp_q_head_num
-        kv_lora_rank = layer.v_head_dim
-        qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
-
-        # The .item() below is a GPU->CPU sync, fine because this path is
-        # uncapturable anyway (pack_dcp_kv_into_pages allocates per batch). Do NOT
-        # guard it with ForwardMetadata.run_graph: that defaults True on prefill
-        # metadata and says nothing about capture state.
-        seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
-        max_kv = int(seqused_k.max().item())
-        # The KV tile is the paged block size, so block_size 1 collapses each
-        # tile to one token. Need to repack here.
-        paged_kv, block_tables = pack_dcp_kv_into_pages(
-            kv_buffer, kv_indptr, kv_indices, bs, _DCP_PREFILL_PAGE_SIZE
-        )
-
-        out = q.new_empty(
-            (q.shape[0], num_heads * kv_lora_rank), dtype=self.input_dtype
-        )
-        mla_prefill_fwd(
-            q.view(-1, num_heads, layer.qk_head_dim),
-            paged_kv,
-            out.view(-1, num_heads, kv_lora_rank),
-            self.forward_metadata.qo_indptr,  # extend query-token boundaries
-            seqused_k,
-            max_kv,
-            block_tables,
-            layer.scaling,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            True,  # causal
-            k_descale,
-            k_descale,
-        )
-        return out
-
     def mla_fp8_prefill_attn(
         self,
         q: torch.Tensor,
@@ -1248,6 +1275,17 @@ class AiterAttnBackend(AttentionBackend):
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
+        # mla_reduce_v1 dispatches on the head count, so a model it has no
+        # instantiation for runs on the next one up with the extra heads zeroed
+        # and sliced back off. Attention is independent per head, so the padded
+        # ones cost work and change nothing: their scores are a uniform softmax
+        # over zero logits and their output is a mean of zero values.
+        head_pad = self.fp8_prefill_num_head - nhead
+        if head_pad:
+            q = _pad_heads(q, head_pad)
+            k = _pad_heads(k, head_pad)
+            v = _pad_heads(v, head_pad)
+            nhead = self.fp8_prefill_num_head
 
         if q.dtype != fp8_dtype:
             q = q.to(fp8_dtype)
@@ -1313,7 +1351,7 @@ class AiterAttnBackend(AttentionBackend):
             output,
             final_lse,
         )
-        return output
+        return output[:, : layer.tp_q_head_num, :] if head_pad else output
 
     def init_forward_metadata_out_graph(
         self,
@@ -1854,9 +1892,11 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = None
                 fp8_prefill_kv_indices = None
 
-                if _use_fp8_prefill_attn:
+                if self.use_fp8_prefill_attn:
                     tile_q = 256
-                    qlen_granularity = tile_q // (self.num_head // self.num_kv_head)
+                    qlen_granularity = tile_q // (
+                        self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
+                    )
                     (
                         work_metadata,
                         work_indptr,
@@ -2887,13 +2927,9 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                if dcp_enabled():
-                    # DCP absorb-prefill over the assembled full-seq KV
-                    # (dcp_kv_buffer), since the local cache is round-robin sharded.
-                    return self._mla_prefill_fwd_dcp(q, layer, k_descale, forward_batch)
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if _use_fp8_prefill_attn:
+                    if self.use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
@@ -2913,6 +2949,46 @@ class AiterAttnBackend(AttentionBackend):
                             causal=True,
                         )
                     return output
+                elif dcp_enabled():
+                    # handle_attention_aiter routes every DCP extend to
+                    # MHA_ONE_SHOT, so the model has already assembled the full
+                    # sequence: all_gather_kv_cache_for_mha_extend gathers the
+                    # round-robin prefix and interleaves it with the in-hand
+                    # extend tokens, then kv_b_proj materializes it per head.
+                    # k/v are therefore complete and in sequence order;
+                    # rebuilding them the way the branch below does would read
+                    # this rank's shard alone.
+                    #
+                    # The with-prefix half of DCP. handle_attention_aiter routes
+                    # every DCP extend to MHA_ONE_SHOT, so the model has already
+                    # assembled the full sequence: all_gather_kv_cache_for_mha_extend
+                    # gathers the round-robin prefix and interleaves it with the
+                    # in-hand extend tokens, then kv_b_proj materializes it per
+                    # head. k/v are therefore complete and in sequence order --
+                    # rebuilding them the way the branch below does would read
+                    # this rank's shard alone.
+                    #
+                    # The asm path needs no DCP-specific metadata: its
+                    # fp8_prefill_kv_indices is an identity arange over
+                    # seq_lens_sum, which is exactly the assembled buffer's
+                    # layout, and the prefill updater's kv_indptr is
+                    # seq_lens.cumsum -- the same tensor dcp_kv_indptr holds.
+                    if self.use_fp8_prefill_attn:
+                        return self.mla_fp8_prefill_attn(q, k, v, layer)
+                    # dcp_kv_indptr is seq_lens.cumsum, so its per-request diffs
+                    # are seq_lens and max_kv_len -- seq_lens_cpu.max(), already
+                    # taken once per forward on the host -- is exactly their max.
+                    return flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        forward_batch.attn_dcp_metadata.dcp_kv_indptr,
+                        max_q_len,
+                        max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
                     kvc, k_pe = torch.split(
@@ -2926,7 +3002,7 @@ class AiterAttnBackend(AttentionBackend):
                         k_pe = k_pe.to(dtype)
 
                     if (
-                        _use_fp8_prefill_attn
+                        self.use_fp8_prefill_attn
                         and layer.kv_b_proj.weight.dtype == torch.uint8
                     ):
                         # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
@@ -2966,7 +3042,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if _use_fp8_prefill_attn:
+                    if self.use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
