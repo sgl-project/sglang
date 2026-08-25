@@ -397,6 +397,9 @@ def _publishing_functions():
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         if rel in _PUBLISH_HOMES:
             continue
+        source = path.read_text(encoding="utf-8-sig")
+        if not any(name in source for name in _PUBLISH_NAMES):
+            continue
         mod = _module(rel)
         if mod is None or not mod.publishers:
             continue
