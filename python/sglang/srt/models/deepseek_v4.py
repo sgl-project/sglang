@@ -3123,6 +3123,13 @@ class DeepseekV4Model(nn.Module):
             and not cp_v2_active
             and not run_tbo
         ):
+            # Post-loop bisect mark pre: baseline before the CP all-gather.
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                layer_trap_mark(forward_batch, "PL:pre-ag")
+            except Exception:
+                pass
             stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -3138,6 +3145,13 @@ class DeepseekV4Model(nn.Module):
                     )
                     for aux in dspark_aux_hidden_states
                 ]
+            # Post-loop bisect mark A: after the CP all-gather rerange family.
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                layer_trap_mark(forward_batch, "PL:A-ag")
+            except Exception:
+                pass
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -3149,6 +3163,13 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+        # Post-loop bisect mark B: after hc_head + final norm.
+        try:
+            from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+            layer_trap_mark(forward_batch, "PL:B-hcnorm")
+        except Exception:
+            pass
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
@@ -3314,7 +3335,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        ret = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -3324,6 +3345,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        # Post-loop bisect mark C: after lm_head + logits_processor (hidden
+        # capture / logits256 -- the retain-ring held names live here).
+        try:
+            from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+            layer_trap_mark(forward_batch, "PL:C-logits")
+        except Exception:
+            pass
+        return ret
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper
