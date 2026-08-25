@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -1079,3 +1080,22 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             expect_accuracy,
             f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
         )
+
+
+def kill_process_group(process):
+    """SIGKILL the whole process group led by ``process.pid`` (== pgid).
+
+    ``process`` is a ``subprocess.Popen`` launched with ``start_new_session=True``,
+    so its pid equals the process-group id. A ``None`` process is ignored.
+    """
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={process.pid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")
