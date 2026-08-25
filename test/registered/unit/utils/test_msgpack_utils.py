@@ -1,10 +1,12 @@
 """CPU-only regression tests for MessagePack transport helpers."""
 
+import unittest
 from array import array
 
 import msgspec
 import numpy as np
 import torch
+
 from sglang.srt.utils.msgpack_utils import (
     _MSGPACK_EXT_ARRAY,
     _MSGPACK_EXT_NP_ARRAY,
@@ -99,3 +101,7 @@ class TestMsgpackStateConversion(CustomTestCase):
         self.assertEqual(restored["shape"], torch.Size([2, 3]))
         self.assertEqual(restored["numpy_dtype"], np.dtype("<i4"))
         self.assertEqual(restored["nested"], (torch.float16, [torch.Size([1])]))
+
+
+if __name__ == "__main__":
+    unittest.main()
