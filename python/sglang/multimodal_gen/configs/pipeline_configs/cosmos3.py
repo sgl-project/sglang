@@ -170,7 +170,7 @@ class Cosmos3Config(PipelineConfig):
         return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        # Keep the DiT and VAE resident for both Nano and Super when the GPUs 
+        # Keep the DiT and VAE resident for both Nano and Super when the GPUs
         # have the headroom.
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=120,
