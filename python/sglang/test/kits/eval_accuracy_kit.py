@@ -191,6 +191,7 @@ class GSM8KMixin:
     gsm8k_num_shots: int = 5  # run_eval backend only
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
+    gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
     gsm8k_n_repeats: int = 1  # sgl_eval backend
 
     def test_gsm8k(self):
@@ -212,6 +213,7 @@ class GSM8KMixin:
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
+                max_tokens=self.gsm8k_max_tokens,
                 accept_length_thres=self.gsm8k_accept_length_thres,
             )
         else:

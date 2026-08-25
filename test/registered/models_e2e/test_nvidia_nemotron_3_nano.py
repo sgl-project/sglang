@@ -53,6 +53,7 @@ class _Nemotron35LightningServer:
     gsm8k_thinking = True
     gsm8k_num_examples = 200
     gsm8k_num_threads = 32
+    gsm8k_max_tokens = 16384
     gsm8k_score_threshold = GSM8K_SCORE_THRESHOLD
 
     @classmethod
