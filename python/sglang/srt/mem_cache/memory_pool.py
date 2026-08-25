@@ -81,6 +81,7 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_sm90_supported,
     is_xpu,
     next_power_of_2,
 )
@@ -137,6 +138,37 @@ def conv_window_dedup_enabled(
         and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
+
+
+def _assert_chunked_move_is_order_safe(
+    tgt_loc: torch.Tensor, src_loc: torch.Tensor, cap: int
+):
+    """Debug-only: assert no later chunk reads a slot an earlier chunk overwrote."""
+    n = tgt_loc.numel()
+    # Sorted lookup, not an all-pairs compare: n is the whole move, so [n, n] has no
+    # small bound. Stable, so ties give the earliest writer -- the one that clobbers first.
+    order = torch.argsort(tgt_loc, stable=True)
+    tgt_sorted = tgt_loc[order]
+    at = torch.searchsorted(tgt_sorted, src_loc).clamp_(max=max(n - 1, 0))
+    writes_it = tgt_sorted[at] == src_loc
+    writer = order[at]
+    reader = torch.arange(n, device=tgt_loc.device)
+    # slot 0 is the padding sentinel, not a real location
+    offenders = writes_it & (src_loc != 0) & ((writer // cap) < (reader // cap))
+    # Host-side and synchronous on purpose: a device-side assert poisons the CUDA context
+    # and caps the message at 255 chars, so it can name neither the aliasing pair nor be
+    # caught by a caller.
+    if offenders.any():
+        i = int(offenders.nonzero()[0])
+        raise AssertionError(
+            f"chunked KV move would read a slot an earlier chunk overwrote "
+            f"(cap={cap}, n={n}): entry {i} reads slot {int(src_loc[i])}, which "
+            f"entry {int(writer[i])} writes in an earlier chunk. The sequential "
+            f"chunk loop is only valid while no later chunk reads a slot an "
+            f"earlier chunk wrote -- the accept-time compaction gets that from "
+            f"moving rows backward or in place, and the draft-branch duplication "
+            f"from its source and target sets being disjoint."
+        )
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -2081,6 +2113,11 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
+        # Read once: EnvField.get() hits os.getenv on every call and the guarded
+        # path runs on most decode steps. Outside the branch so pools that never
+        # build a copy config still have the attribute.
+        self._check_chunked_move_order = envs.SGLANG_DEBUG_MEMORY_POOL.get()
+
         if enable_kv_cache_copy and not self.use_hnd:
             # The tiled byte copy assumes NHD slot-rows; HND uses a (page, off)
             # gather in move_kv_cache instead, so skip the slot-row copy config.
@@ -2117,8 +2154,33 @@ class MHATokenToKVPool(KVCache):
         else:
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
-        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
-        chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
+        # The kernel specialises on the tile AREA -- next_power_of_2(n_locs) rows by
+        # bytes_per_tile columns -- so bounding the loc count alone leaves the area
+        # unbounded, since bytes_per_tile varies 4x with the KV row stride. Deriving the
+        # cap from a target area bounds what actually reaches ptxas.
+        #
+        # Gated on SM90 because that is the only architecture this target was measured
+        # on. The derivation itself is architecture-independent -- nothing here or in the
+        # kernel branches on the GPU generation -- but the knee it aims at is a
+        # register-file property, so the value belongs to the hardware it was swept on.
+        # Other architectures keep the existing behaviour until there are numbers for
+        # them; adding one is a sweep and a second constant beside this one.
+        if is_sm90_supported():
+            _KV_COPY_TARGET_TILE_BYTES_SM90 = 16384
+            # The target must hold a full row of the widest tile, or the extent
+            # would collapse to one loc per launch.
+            assert _KV_COPY_TARGET_TILE_BYTES_SM90 >= _KV_COPY_TILE_SIZE_LARGE
+            chunk_upper = _KV_COPY_TARGET_TILE_BYTES_SM90 // bytes_per_tile
+            # tl.arange needs a power of two. Every value above is one because the
+            # target and the tile sizes are, but a future retune should not be able
+            # to break the kernel silently.
+            assert chunk_upper & (chunk_upper - 1) == 0, (
+                f"num_locs_upper must be a power of two, got {chunk_upper} from "
+                f"bytes_per_tile={bytes_per_tile}"
+            )
+        else:
+            # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+            chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
 
         self._kv_copy_config = {
             "bytes_per_tile": bytes_per_tile,
@@ -3115,6 +3177,11 @@ class MHATokenToKVPool(KVCache):
             )
             self._move_native_fp4_scales(tgt_loc, src_loc)
             return
+
+        # One launch loads every source before storing any target, so it is safe under any
+        # aliasing; the sequential loop below is not, and a violation corrupts KV silently.
+        if self._check_chunked_move_order:
+            _assert_chunked_move_is_order_safe(tgt_loc, src_loc, cap)
 
         # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
         for start in range(0, N, cap):
