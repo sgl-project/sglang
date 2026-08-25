@@ -2216,6 +2216,43 @@ def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
         time.sleep(0.1)
 
 
+def list_descendants(pid: int) -> list:
+    """Snapshot every live descendant of `pid`; empty if the process is gone.
+
+    Callers that are about to end `pid` need the snapshot taken first: once the
+    PID is gone the kernel reparents its children and the tree is unwalkable.
+    """
+    try:
+        return psutil.Process(pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        return []
+
+
+def kill_processes(
+    procs,
+    skip_pid: Optional[int] = None,
+    wait_timeout: Optional[float] = None,
+) -> list:
+    """SIGKILL each of `procs`, then optionally block until they are reaped.
+
+    Returns the processes that were still alive when signalled, so a caller
+    killing several batches can defer one shared reap wait to the end.
+    """
+    killed = []
+    for proc in procs:
+        if proc.pid == skip_pid:
+            continue
+        try:
+            proc.kill()
+            killed.append(proc)
+        except psutil.NoSuchProcess:
+            pass
+
+    if wait_timeout is not None and killed:
+        _wait_for_reap_or_raise(killed, wait_timeout)
+    return killed
+
+
 def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
@@ -2243,16 +2280,7 @@ def kill_process_tree(
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
-    killed = []
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-            killed.append(child)
-        except psutil.NoSuchProcess:
-            pass
+    killed = kill_processes(itself.children(recursive=True), skip_pid=skip_pid)
 
     if include_parent:
         try:

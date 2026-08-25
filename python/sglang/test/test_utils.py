@@ -27,7 +27,6 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
-import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -43,9 +42,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_xpu,
     kill_process_tree,
+    kill_processes,
+    list_descendants,
     retry,
 )
-from sglang.srt.utils.common import _wait_for_reap_or_raise
 from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import normalize_base_url
@@ -827,7 +827,7 @@ def popen_launch_server(
 def terminate_and_kill_process_tree(
     process,
     terminate_timeout: float = 60,
-    **kill_kwargs,
+    wait_timeout: Optional[float] = None,
 ) -> None:
     """Shut a launched server down gracefully, then SIGKILL whatever is left.
 
@@ -837,35 +837,19 @@ def terminate_and_kill_process_tree(
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
     resources in userspace.
     """
-    try:
-        descendants = psutil.Process(process.pid).children(recursive=True)
-    except psutil.NoSuchProcess:
-        descendants = []
+    # The launcher kills its children fire-and-forget and exits on SIGTERM, so
+    # kill_process_tree() below can find neither it nor them; the snapshot is
+    # the only remaining handle on the workers still holding GPU memory.
+    descendants = list_descendants(process.pid)
 
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
-    kill_process_tree(process.pid, **kill_kwargs)
 
-    # The launcher can exit after fire-and-forget killing its children. Once
-    # its PID is gone, kill_process_tree() can no longer rediscover those
-    # descendants, so retain and reap the pre-termination snapshot explicitly.
-    skip_pid = kill_kwargs.get("skip_pid")
-    killed_descendants = []
-    for descendant in descendants:
-        if descendant.pid == skip_pid:
-            continue
-        try:
-            descendant.kill()
-            killed_descendants.append(descendant)
-        except psutil.NoSuchProcess:
-            pass
-
-    wait_timeout = kill_kwargs.get("wait_timeout")
-    if wait_timeout is not None and killed_descendants:
-        _wait_for_reap_or_raise(killed_descendants, wait_timeout)
+    kill_process_tree(process.pid, wait_timeout=wait_timeout)
+    kill_processes(descendants, wait_timeout=wait_timeout)
 
 
 def popen_launch_pd_server(
