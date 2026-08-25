@@ -1268,6 +1268,56 @@ def _moonep_m_indices(
     return torch.where(group < num_groups, m_indices, torch.full_like(m_indices, -1))
 
 
+@triton.jit
+def _moonep_finalize_rows_kernel(
+    h_ptr,  # [rows, H] bf16, updated in place
+    w_ptr,  # [rows] fp32 route weights
+    m_ptr,  # [rows] int32 m_indices
+    H,
+    HAS_WEIGHTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < H
+    offs = h_ptr + row * H + col
+
+    if tl.load(m_ptr + row) < 0:
+        # DeepGEMM never wrote this row, so it still holds allocator garbage
+        # that may decode to NaN. It has to be *stored over*, not scaled --
+        # 0 * NaN is NaN. Nothing is read here, which is most of the saving:
+        # at decode these rows are the large majority of the buffer.
+        tl.store(offs, tl.zeros([BLOCK], dtype=h_ptr.dtype.element_ty), mask=mask)
+    elif HAS_WEIGHTS:
+        x = tl.load(offs, mask=mask).to(tl.float32) * tl.load(w_ptr + row)
+        tl.store(offs, x.to(h_ptr.dtype.element_ty), mask=mask)
+
+
+def _moonep_finalize_rows(
+    hidden_states: torch.Tensor,
+    m_indices: torch.Tensor,
+    route_weights_nvs: Optional[torch.Tensor],
+) -> None:
+    """Zero the rows DeepGEMM skipped and scale the rest by their route weight.
+
+    One pass instead of ``masked_fill_`` followed by ``mul_``. Both of those
+    walk the whole ``[NvS, H]`` buffer, and MoonEP's ``NvS`` is a static
+    worst case -- at K3/EP16 decode it is 22416 rows against a couple of
+    hundred live ones, which made this pair 16% of the whole decode step.
+    """
+    rows, hidden_size = hidden_states.shape
+    BLOCK = 1024
+    _moonep_finalize_rows_kernel[(rows, triton.cdiv(hidden_size, BLOCK))](
+        hidden_states,
+        route_weights_nvs,
+        m_indices,
+        hidden_size,
+        HAS_WEIGHTS=route_weights_nvs is not None,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+
+
 @register_pre_permute("moonep", "deep_gemm")
 def pre_permute_moonep_to_deep_gemm(
     dispatch_output: MoonEPDispatchOutput,
@@ -1384,21 +1434,16 @@ def post_permute_deep_gemm_to_moonep(
     No gather: MoonEP's ``combine`` consumes the ``[NvS, H]`` layout directly.
 
     Rows DeepGEMM skipped (``m_indices == -1``) were never written, so they
-    still hold whatever ``torch.empty`` left behind and must be zeroed before
-    combine reduces them. Zeroing cannot be folded into the route-weight
-    multiply below, because uninitialized memory may decode to NaN and
-    ``0 * NaN`` is NaN.
+    still hold whatever ``torch.empty`` left behind and have to be stored over
+    before combine reduces them. MoonEP's ``combine`` takes
+    ``route_weights_nvs`` but only gathers it back to token-major, so the
+    multiply is ours to do; both happen in one pass over the buffer.
     """
     from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPCombineInput
 
     hidden_states = runner_output.hidden_states
-    hidden_states.masked_fill_((running_state["m_indices"] < 0).unsqueeze(-1), 0.0)
-
     route_weights_nvs = running_state["route_weights_nvs"]
-    if route_weights_nvs is not None:
-        hidden_states.mul_(
-            route_weights_nvs.to(dtype=hidden_states.dtype).unsqueeze(-1)
-        )
+    _moonep_finalize_rows(hidden_states, running_state["m_indices"], route_weights_nvs)
 
     return MoonEPCombineInput(
         hidden_states=hidden_states,
