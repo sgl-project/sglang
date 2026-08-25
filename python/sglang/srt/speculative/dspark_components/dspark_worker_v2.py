@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -20,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_schedule,
@@ -105,7 +107,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
-        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
             not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -155,7 +157,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
@@ -190,13 +192,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
                 lm_head=lm_head,
             )
 
