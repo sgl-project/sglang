@@ -663,12 +663,16 @@ def maybe_download_lora(
         return os.path.join(source.local_path, selected_file)
 
     assert source.repo_id is not None
+    allow_patterns = ["*.json", selected_file]
+    selected_parent = os.path.dirname(selected_file)
+    if selected_parent:
+        allow_patterns.insert(1, f"{selected_parent}/*.json")
     local_path = maybe_download_model(
         source.repo_id,
         local_dir,
         download,
         is_lora=True,
-        allow_patterns=["*.json", selected_file],
+        allow_patterns=allow_patterns,
         revision=resolved_weight.inventory.resolved_revision or source.revision,
     )
     target = os.path.join(local_path, selected_file)

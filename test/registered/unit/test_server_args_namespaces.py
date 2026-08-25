@@ -47,6 +47,162 @@ def _field_names():
 
 
 class TestServerArgsNamespaces(CustomTestCase):
+    def test_no_module_shadows_a_bag_accessor(self):
+        """An accessor name bound twice in one module is a silent wrong read.
+
+        This has happened twice. Once a module imported `get_model` from the
+        context and a same-named helper from elsewhere, and once `get_device`
+        -- which names three different things in this tree: the bag accessor,
+        the device-string utility, and a platform method. The second import
+        wins, the converted line calls the wrong callable, and the failure is
+        an AttributeError on whichever branch reaches it, which for a
+        per-pass recorder or a specific accelerator can be none of the ones a
+        CPU suite runs. Nothing else notices; a name scan looks fine.
+        """
+        import ast
+        import collections
+        import pathlib as _pathlib
+
+        import sglang
+
+        srt = _pathlib.Path(sglang.__file__).resolve().parent / "srt"
+        context_module = ast.parse(
+            (srt / "runtime_context.py").read_text(encoding="utf-8-sig")
+        )
+        accessors = {
+            node.name
+            for node in context_module.body
+            if isinstance(node, ast.FunctionDef)
+            and (node.name.startswith("get_") or node.name.startswith("configured_"))
+        }
+        self.assertGreater(len(accessors), 20, "the accessor derivation broke")
+
+        shadowed = []
+        for path in sorted(srt.rglob("*.py")):
+            if path.name == "runtime_context.py":
+                continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "runtime_context" not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                self.fail(f"unparsable module in the census: {path}")
+            bindings = collections.defaultdict(set)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    origin = node.module or ""
+                    kind = (
+                        "context"
+                        if origin.endswith("runtime_context")
+                        else f"{origin or '.'}"
+                    )
+                    for alias in node.names:
+                        bindings[alias.asname or alias.name].add((kind, node.lineno))
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        bindings[(alias.asname or alias.name).split(".")[0]].add(
+                            ("import", node.lineno)
+                        )
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    bindings[node.name].add(("def", node.lineno))
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            bindings[target.id].add(("assign", node.lineno))
+            for name, where in bindings.items():
+                if name not in accessors:
+                    continue
+                kinds = {kind for kind, _ in where}
+                # The same accessor imported from the context more than once
+                # (module level plus a lazy import inside a function) is one
+                # object under one name; a *different* origin is the hazard.
+                if "context" in kinds and kinds - {"context"}:
+                    shadowed.append(
+                        f"{path.relative_to(srt)}: {name} <- "
+                        + ", ".join(
+                            f"{k}@{l}" for k, l in sorted(where, key=lambda w: w[1])
+                        )
+                    )
+        self.assertEqual(
+            shadowed,
+            [],
+            "a bag accessor shares its name with another binding in the same "
+            "module, so the converted reads call whichever import came last; "
+            "alias one of them:\n  " + "\n  ".join(shadowed),
+        )
+
+    def test_the_readers_agree_with_the_namespace_metadata(self):
+        """Two independent sources say where a leaf lives; they must match.
+
+        The metadata is one source and the ~2000 hand-written reads
+        (`get_schedule().chunked_prefill_size`) are the other. Checking the
+        projection against the metadata cannot catch a field assigned to the
+        wrong group -- both sides come from the same marker, so the check is
+        true by construction. The readers are written by hand, so a
+        disagreement means one of the two is wrong, and every reader on the
+        losing side raises `has no leaf/subgroup` at runtime on whichever
+        branch reaches it first.
+        """
+        import ast
+        import pathlib as _pathlib
+
+        import sglang
+
+        srt = _pathlib.Path(sglang.__file__).resolve().parent / "srt"
+        mapping = namespace_of(ServerArgs)
+        accessors = {
+            f"get_{group}" for group in {p.split(".")[0] for p in mapping.values()}
+        }
+
+        sites = 0
+        disagreements = []
+        for path in sorted(srt.rglob("*.py")):
+            source = path.read_text(encoding="utf-8-sig")
+            if not any(name in source for name in accessors):
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                self.fail(f"unparsable module in the census: {path}")
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                chain, cursor = [], node
+                while isinstance(cursor, ast.Attribute):
+                    chain.append(cursor.attr)
+                    cursor = cursor.value
+                if not (
+                    isinstance(cursor, ast.Call)
+                    and isinstance(cursor.func, ast.Name)
+                    and cursor.func.id in accessors
+                ):
+                    continue
+                chain.reverse()
+                field = chain[-1]
+                if field not in mapping:
+                    continue
+                sites += 1
+                read = [cursor.func.id[len("get_") :]] + chain[:-1]
+                if mapping[field].split(".") != read:
+                    disagreements.append(
+                        f"{path.relative_to(srt)}:{node.lineno} reads "
+                        f"{'.'.join(read)}.{field}, metadata says "
+                        f"{mapping[field]}.{field}"
+                    )
+        self.assertEqual(
+            disagreements,
+            [],
+            "a reader and the namespace metadata disagree about where a leaf "
+            "lives; one of them is wrong:\n  " + "\n  ".join(disagreements),
+        )
+        self.assertGreater(
+            sites,
+            1500,
+            f"only {sites} bag reads were matched; the scan broke and this "
+            "check stopped covering anything",
+        )
+
     def test_every_field_has_a_namespace(self):
         nsmap = namespace_of(ServerArgs)
         missing = sorted(_field_names() - set(nsmap))
