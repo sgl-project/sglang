@@ -3660,8 +3660,6 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    # ScheduleBatch field names, resolved once: fields() reflection is on
-    # the per-pass critical path.
     _schedule_batch_field_names: tuple[str, ...] | None = None
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):

@@ -1169,8 +1169,6 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_completion_time()
 
-        # Gated at the call site: per-request call overhead alone is
-        # measurable at large batches.
         if logits_output is not None and logits_output.customized_info is not None:
             self._maybe_collect_customized_info(i, req, logits_output)
 

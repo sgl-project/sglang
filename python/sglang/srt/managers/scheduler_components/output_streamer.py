@@ -144,7 +144,6 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
-        # One fused scan instead of four any() passes over the running batch.
         return_hidden_states = False
         return_routed_experts = False
         return_indexer_topk = False
