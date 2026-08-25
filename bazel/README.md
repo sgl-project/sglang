@@ -64,9 +64,9 @@ bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
   0.12/0.14 contract test, and policy tests build successfully.
 - Native host JIT `ngram_corpus_ffi.so` links against a SHA-pinned TVM-FFI
   wheel.
-- CPU and ROCm `sglang-kernel` wheels build and import through Bazel wrapper
-  targets. CUDA builds use immutable Bazel-fetched CUTLASS, fmt, Triton,
-  FlashInfer, sgl-attn, and FlashMLA sources.
+- CPU, CUDA, and ROCm `sglang-kernel` wheels build and import through Bazel
+  wrapper targets. CUDA builds use immutable Bazel-fetched CUTLASS, fmt,
+  Triton, FlashInfer, sgl-attn, and FlashMLA sources with disconnected CMake.
 - Dummy-weight Qwen3 and pinned real-weight Qwen2-0.5B Engine tests passed on an
   H200. The Qwen2 test verifies the model revision, weight digest, token IDs,
   decoded text, and completion metadata.
