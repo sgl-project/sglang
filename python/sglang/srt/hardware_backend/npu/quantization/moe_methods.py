@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
@@ -908,12 +909,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             return
 
         weight: torch.Tensor = getattr(layer, weight_name)
-        weight.data = npu_format_cast(weight)
-        setattr(
-            layer,
-            weight_name,
-            torch.nn.Parameter(weight, requires_grad=False),
-        )
+        copy_or_rebind_param(layer, weight_name, npu_format_cast(weight.data))
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
@@ -923,24 +919,15 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str, weight_name: str
     ) -> None:
         weight = getattr(layer, weight_name)
-        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
+        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight.data)
         quantized_weight = npu_format_cast(
             quantized_weight.transpose(-2, -1).contiguous()
         )
 
-        setattr(
-            layer,
-            weight_name,
-            torch.nn.Parameter(quantized_weight, requires_grad=False),
-        )
-        layer.register_parameter(
-            f"{weight_name}_scale",
-            torch.nn.Parameter(weight_scale, requires_grad=False),
-        )
+        copy_or_rebind_param(layer, weight_name, quantized_weight)
+        copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
         setattr(self, weight_name, quantized_weight)
         setattr(self, f"{weight_name}_scale", weight_scale)
-        torch.npu.empty_cache()
-
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "int8")
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)

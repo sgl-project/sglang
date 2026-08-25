@@ -6,6 +6,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.utils import copy_or_rebind_param
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -60,6 +61,66 @@ class _NPULinearMethodBase(LinearMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
     ):
         self.quant_config = quant_config
+
+
+class NPUOnlineW8A8Int8LinearMethod(_NPULinearMethodBase):
+    """Online W8A8 INT8 method for unquantized dense NPU linear layers."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.parameter import ModelWeightParameter
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=extra_weight_attrs["weight_loader"],
+        )
+        layer.register_parameter("weight", weight)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(
+            layer.weight.data
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight",
+            npu_format_cast(quantized_weight.transpose(0, 1).contiguous()),
+        )
+        copy_or_rebind_param(layer, "weight_scale", weight_scale.flatten())
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_shape = x.shape
+        original_dtype = x.dtype
+        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+            x.reshape(-1, x.shape[-1])
+        )
+        output = torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=dynamic_scale.flatten(),
+            bias=bias,
+            output_dtype=original_dtype,
+        )
+        return output.reshape(*input_shape[:-1], output.shape[-1])
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):

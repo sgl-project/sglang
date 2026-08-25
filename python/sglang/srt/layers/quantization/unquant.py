@@ -598,6 +598,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             # clobber a subclass that attached a quantized kernel instead.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
+            if layer.w13_kernel._quant_mode == "w8a8_int8":
+                torch.npu.empty_cache()
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
 
