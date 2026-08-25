@@ -352,16 +352,16 @@ class TestCompressorStateTableABI(unittest.TestCase):
             "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
             "Dsv4NpuRoPE.for_freqs",
             return_value=rope,
-        ), patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
-            custom_ops.compressor.return_value = torch.empty((0, 1))
+        ), patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops:
+            npu_ops.compressor.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
 
         self.assertIs(
-            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+            npu_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
         )
         self.assertIs(
-            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+            npu_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
         )
 
 
