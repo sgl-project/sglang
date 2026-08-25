@@ -1,5 +1,6 @@
 """CPU-only tests for multi-stream scheduling helpers."""
 
+import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -105,3 +106,7 @@ class TestMaybeExecuteInParallel(CustomTestCase):
                 "done.wait",
             ],
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
