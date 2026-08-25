@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from array import array
 from collections import defaultdict, deque
@@ -45,6 +46,79 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _pp_comm_debug_enabled() -> bool:
+    return os.getenv("SGLANG_PP_COMM_DEBUG", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _pp_debug_tensor_dict(
+    scheduler: Scheduler,
+    direction: str,
+    tensor_dict: Dict[str, torch.Tensor],
+    msg_type: str,
+) -> None:
+    """Log comparable tensor fingerprints at both ends of a PP transfer."""
+    if not _pp_comm_debug_enabled():
+        return
+
+    counter_name = f"_pp_comm_debug_{direction}_seq"
+    seq = getattr(scheduler, counter_name, 0)
+    setattr(scheduler, counter_name, seq + 1)
+    max_events = int(os.getenv("SGLANG_PP_COMM_DEBUG_MAX_EVENTS", "200"))
+    if max_events > 0 and seq >= max_events:
+        return
+
+    rank_in_group = scheduler.pp_group.rank_in_group
+    peer_offset = 1 if direction == "send" else -1
+    peer_rank = scheduler.pp_group.ranks[
+        (rank_in_group + peer_offset) % scheduler.pp_group.world_size
+    ]
+
+    summaries = []
+    for key in sorted(tensor_dict):
+        value = tensor_dict[key]
+        if not isinstance(value, torch.Tensor):
+            summaries.append(f"{key}={value!r}")
+            continue
+
+        tensor = value.detach()
+        summary = (
+            f"{key}:shape={tuple(tensor.shape)},dtype={tensor.dtype},"
+            f"device={tensor.device},numel={tensor.numel()}"
+        )
+        if tensor.numel() > 0:
+            try:
+                checksum_dtype = (
+                    torch.float32 if tensor.is_floating_point() else torch.int64
+                )
+                checksum = tensor.sum(dtype=checksum_dtype).item()
+                flat = tensor.reshape(-1)
+                if flat.numel() <= 8:
+                    sample = flat.cpu().tolist()
+                else:
+                    sample = torch.cat((flat[:4], flat[-4:])).cpu().tolist()
+                summary += f",sum={checksum!r},edge={sample!r}"
+            except Exception as exc:
+                summary += f",summary_error={exc!r}"
+        summaries.append(summary)
+
+    logger.warning(
+        "[PP-COMM] direction=%s seq=%d global_rank=%d pp_rank=%d peer_global_rank=%d "
+        "msg_type=%s tensors={%s}",
+        direction,
+        seq,
+        torch.distributed.get_rank(),
+        scheduler.ps.pp_rank,
+        peer_rank,
+        msg_type,
+        "; ".join(summaries),
+    )
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -1041,6 +1115,7 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        _pp_debug_tensor_dict(self, "send", tensor_dict, msg_type)
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1073,6 +1148,7 @@ class SchedulerPPMixin:
                 all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
+            _pp_debug_tensor_dict(self, "recv", tensor_dict, received_kind)
             if received_kind == expected_kind:
                 if received_kind == "default":
                     logger.warning_once(
