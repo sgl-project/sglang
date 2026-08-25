@@ -408,6 +408,10 @@ class DSV4AttnMetadata:
     trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
+    # Backend-owned persistent storage backing the trtllm tables above
+    # (TrtllmSparseTablePool; duck-typed to avoid an import cycle). Shared by
+    # every metadata object the backend creates; never copied.
+    trtllm_table_pool: Optional[object] = None
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
@@ -524,62 +528,68 @@ class DSV4AttnMetadata:
         assert self.swa_page_indices.shape[0] == num_tokens
         assert swa_width >= SWA_WINDOW
 
-        # VarSeq reads rows to the 64-token tile boundary. Back every live view
-        # with an aligned parent whose extra rows contain inert values.
+        # Every per-token tensor the kernel reads lives in the backend's
+        # persistent table pool (TrtllmSparseTablePool): constant-address,
+        # 64-row-aligned (the VarSeq kernel reads rows to the tile boundary),
+        # inert-filled parents rewritten in place each step. Kernel-visible
+        # addresses are therefore independent of allocator state, and row
+        # over-reads (tile boundary / DP-padding overhang) land on inert or
+        # previously-written entries instead of unallocated memory.
+        pool = self.trtllm_table_pool
+        assert pool is not None, "trtllm metadata requires the table pool"
+
+        # seq_lens_casual and swa_page_indices are NOT pool-backed. Unlike the
+        # trtllm tables below (written by this step and read only by this
+        # step's kernels), these two are ordinary metadata fields with readers
+        # outside this function (e.g. per-layer reads in the eager prefill
+        # forward), so re-pointing them at pool storage that the next decode
+        # replay's recorded init rewrites gives them a cross-step lifetime
+        # they were never designed for. Empirically that sharing caused a
+        # large silent accuracy drop (GSM8K 0.70 vs 0.97 with this per-step
+        # handling, all else equal). Keep the original per-step tile-aligned
+        # parents for them.
         n_pad = (num_tokens + 63) // 64 * 64
-
-        def _tile_padded(fill, src=None, width=None):
-            shape = (n_pad,) if width is None else (n_pad, width)
-            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-            if src is not None:
-                buf[:num_tokens].copy_(src)
-            return buf[:num_tokens]
-
         if n_pad != num_tokens:
-            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
-            self.swa_page_indices = _tile_padded(
-                -1, self.swa_page_indices, width=swa_width
+
+            def _tile_padded_step(fill, src, width=None):
+                shape = (n_pad,) if width is None else (n_pad, width)
+                buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+                buf[:num_tokens].copy_(src)
+                return buf[:num_tokens]
+
+            self.seq_lens_casual = _tile_padded_step(1, self.seq_lens_casual)
+            self.swa_page_indices = _tile_padded_step(
+                -1, self.swa_page_indices, width=SWA_WINDOW
             )
-        self.trtllm_swa_lens = _tile_padded(
-            SWA_WINDOW,
-            self.swa_topk_lengths.clamp_min(SWA_WINDOW)
-            if swa_width > SWA_WINDOW
-            else None,
-        )
-        for ratio in self.low_ratios:
-            lengths = self.sparse_topk_lengths(ratio)
-            if lengths is not None:
-                # The FlashMLA metadata clamps empty compressed histories to
-                # one. TRT-LLM needs the true zero length: -1 loads zero KV,
-                # but does not by itself remove its softmax contribution.
-                torch.minimum(lengths, self.seq_lens_casual // ratio, out=lengths)
-        indexed_tables = [
-            table
-            for ratio in (1, 2, 4)
-            if ratio in self.present_ratios
-            if (table := self.sparse_page_indices(ratio)) is not None
-        ]
-        if indexed_tables:
-            assert swa_width == SWA_WINDOW
-            # Ratio 1/2/4 all select index_topk entries. Reuse the per-layer
-            # table; its contents are overwritten before every attention call.
-            w4 = indexed_tables[0].shape[-1]
-            assert all(table.shape[-1] == w4 for table in indexed_tables)
+        self.trtllm_swa_lens = pool.view("d_swa_lens", num_tokens, fill=SWA_WINDOW)
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
             assert w4 % 4 == 0, f"{w4=}"
-            # Unwritten indexed rows remain inert until the per-layer fill.
-            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
+            # The c4 tail + lens are per-layer values written by the decode
+            # forward; between the inert re-fill here and the per-layer fill
+            # the rows are -1 / SWA-only, never allocator garbage.
+            self.trtllm_c4_indices = pool.view(
+                "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + w4
+            )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
+            self.trtllm_c4_lens = pool.view("d_c4_lens", num_tokens, fill=SWA_WINDOW)
         if self.c128_page_indices is not None:
             assert swa_width == SWA_WINDOW
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
-            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
-            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
-            self.trtllm_c128_lens = _tile_padded(
-                SWA_WINDOW,
-                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
+            # The pool's c128 parent is preallocated at full-context width;
+            # this step writes the first w128 compressed columns and the
+            # per-row lens bound what the kernel reads beyond them.
+            table = pool.view("d_c128", num_tokens, fill=-1)
+            assert table.shape[1] >= SWA_WINDOW + w128, f"{table.shape=} {w128=}"
+            table[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            table[:, SWA_WINDOW : SWA_WINDOW + w128].copy_(self.c128_page_indices)
+            self.trtllm_c128_indices = table
+            self.trtllm_c128_lens = pool.view(
+                "d_c128_lens",
+                num_tokens,
+                fill=SWA_WINDOW,
+                src=(self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
             )
 
     def copy_(self, other: DSV4AttnMetadata) -> None:
@@ -640,6 +650,9 @@ class DSV4AttnMetadata:
                 "trtllm_prefill_swa_lens",
                 "trtllm_prefill_c4_indices",
                 "trtllm_prefill_c128",
+                # Shared backend-owned pool object; same reference on both
+                # sides, never content-copied.
+                "trtllm_table_pool",
             ],
         )
 
@@ -697,6 +710,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
+            if (
+                dst_val.data_ptr() == src_val.data_ptr()
+                and dst_val.shape == src_val.shape
+            ):
+                # Persistent-pool-backed fields (TrtllmSparseTablePool) alias
+                # the same memory in both metadata objects; content is
+                # already in place.
+                continue
             dst_val.copy_(src_val)
 
         # Safe to replace: captured kernels read only the per-replay objects, or
@@ -4055,6 +4076,7 @@ class DeepseekV4AttnBackend(
             swa_out_cache_loc=(
                 request_layout.write_loc if request_layout is not None else None
             ),
+            trtllm_table_pool=getattr(self, "trtllm_table_pool", None),
         )
 
         if need_compress:
