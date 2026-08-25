@@ -9,7 +9,6 @@ from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 if is_xpu():
     from sgl_kernel import (
-        copy_cache_planned_mla,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
     )
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 device_module = get_device_module()
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +288,12 @@ class HiSparseCoordinator:
                 "KV pool layer_num %d; using synchronous swap-in.",
                 len(shared_index_layers),
                 layer_num,
+            )
+            shared_index_layers = None
+        if shared_index_layers is not None and _is_xpu:
+            logger.warning(
+                "HiSparse shared-index prefetch disabled on XPU: "
+                "copy_cache_planned_mla is unavailable; using synchronous swap-in."
             )
             shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
