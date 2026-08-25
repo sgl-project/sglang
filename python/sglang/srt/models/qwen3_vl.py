@@ -74,7 +74,6 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1156,7 +1155,7 @@ class Qwen3LLMModel(Qwen3Model):
         # Use HF deepstack order only if rl_on_policy_target is set;
         # otherwise, retain original order for inference accuracy.
         self.use_hf_deepstack_order = (
-            get_global_server_args().rl_on_policy_target is not None
+            get_exec().deterministic.rl_on_policy_target is not None
         )
 
     def get_deepstack_embeds(

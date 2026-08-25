@@ -31,7 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         # Use HF deepstack order only if rl_on_policy_target is set;
         # otherwise, retain original order for inference accuracy.
         self.use_hf_deepstack_order = (
-            get_global_server_args().rl_on_policy_target is not None
+            get_exec().deterministic.rl_on_policy_target is not None
         )
 
     def get_input_embeddings(self) -> nn.Embedding:
