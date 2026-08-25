@@ -15,6 +15,7 @@
 import html
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List
 
@@ -22,7 +23,7 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
-from sglang.srt.function_call.utils import safe_literal_eval
+from sglang.srt.function_call.utils import is_json_finite, safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ def _convert_param_value(
     elif param_type.startswith("num") or param_type.startswith("float"):
         try:
             float_param_value = float(param_value)
+            if not math.isfinite(float_param_value):
+                raise ValueError
             return (
                 float_param_value
                 if float_param_value - int(float_param_value) != 0
@@ -109,8 +112,9 @@ def _convert_param_value(
             or param_type.startswith("list")
         ):
             try:
-                param_value = json.loads(param_value)
-                return param_value
+                parsed = json.loads(param_value)
+                if is_json_finite(parsed):
+                    return parsed
             except (json.JSONDecodeError, TypeError, ValueError):
                 logger.warning(
                     "Parsed value '%s' of parameter '%s' cannot be "
@@ -121,7 +125,7 @@ def _convert_param_value(
                     func_name,
                 )
         try:
-            param_value = safe_literal_eval(param_value)
+            parsed = safe_literal_eval(param_value)
         except (ValueError, SyntaxError, TypeError):
             logger.warning(
                 "Parsed value '%s' of parameter '%s' cannot be "
@@ -131,7 +135,8 @@ def _convert_param_value(
                 param_name,
                 func_name,
             )
-        return param_value
+            return param_value
+        return parsed if is_json_finite(parsed) else param_value
 
 
 class MiMoDetector(BaseFormatDetector):
