@@ -801,61 +801,6 @@ def _pack_dcp_kv_pages_kernel(
     )
 
 
-def pack_dcp_kv_into_pages(
-    kv_buffer: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    bs: int,
-    page_size: int,
-):
-    """Repack the assembled ``dcp_kv_buffer`` into pages for ``mla_prefill_fwd``.
-
-    Args:
-        kv_buffer:  [total_tokens, 1, D] the all-gathered full-sequence latent KV
-        kv_indptr:  [bs + 1] per-request boundaries into ``kv_indices``
-        kv_indices: [total_tokens] sequence position -> row of ``kv_buffer``
-        bs:         number of requests
-        page_size:  staging page size (``_DCP_PREFILL_PAGE_SIZE``, independent of
-                    the KV pool's --page-size)
-
-    Returns:
-        paged_kv:     [n_pages, page_size, 1, D] page-aligned per request
-        block_tables: [bs, max_pages] int32
-    """
-    total, _, dim = kv_buffer.shape[0], kv_buffer.shape[1], kv_buffer.shape[-1]
-    device = kv_buffer.device
-    lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
-    pages = (lens + page_size - 1) // page_size
-    page_start = torch.cumsum(pages, dim=0) - pages
-    # sequence position -> row in the padded buffer
-    shift = page_start * page_size - kv_indptr[:bs].to(torch.int64)
-    n_tokens = int(kv_indptr[bs].item())
-    dst_idx = torch.repeat_interleave(shift, lens) + torch.arange(
-        n_tokens, device=device, dtype=torch.int64
-    )
-
-    n_pages = int(pages.sum().item())
-    # zeros, not empty: the kernel reads the whole last page of a sequence and masks
-    # by seqused_k, so uninitialized tail rows could feed NaNs into the QK GEMM.
-    paged = torch.zeros(
-        (n_pages * page_size, 1, dim), dtype=kv_buffer.dtype, device=device
-    )
-    if n_tokens > 0:
-        _pack_dcp_kv_pages_kernel[(n_tokens,)](
-            kv_buffer,
-            paged,
-            kv_indices,
-            dst_idx,
-            D=dim,
-            BLOCK=triton.next_power_of_2(dim),
-        )
-    max_pages = int(pages.max().item()) if bs > 0 else 0
-    block_tables = page_start[:, None] + torch.arange(
-        max_pages, device=device, dtype=torch.int64
-    )
-    return paged.view(-1, page_size, 1, dim), block_tables.to(torch.int32)
-
-
 @triton.jit
 def _dcp_reduce_kv_segments_kernel(
     out_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]

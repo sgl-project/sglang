@@ -6147,7 +6147,14 @@ class ServerArgs:
         # AMD platforms backends
         if resolved_view(self).attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                # EXPERIMENT 2026-08-26 (uncommitted): derate disabled to measure
+                # what an honest 0.90 buys. The 0.85 is a flat fraction of TOTAL
+                # memory, so on Kimi-K3 (195 GB of weights) it costs ~39 GiB of
+                # KV -- measured 899,968 tokens vs vLLM's 2,804,052 at the same
+                # 0.9 on the same card. It cannot be compensated from the CLI
+                # either: reaching an effective 0.90 would need an input of
+                # 1.059. Restore this line before committing anything else here.
+                pass  # self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)

@@ -803,7 +803,7 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
-    # Run the DCP MLA paths on aiter's Gluon kernel
+    # Run the DCP MLA decode and spec-verify paths on aiter's Gluon kernel
     # (aiter.ops.triton.gluon.mla_gluon) instead of the Triton MLA kernel
     # reached via aiter.ops.triton.attention.mla.mla_decode_fwd. Needs
     # triton >= 3.7 (it passes cga_layout= to PaddedSharedLayout); aiter's own
