@@ -116,6 +116,7 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
                 mgr._configure_dcp_pack_mode()
 
         self.assertFalse(mgr.enable_dcp_peer_rows)
+        self.assertFalse(mgr.enable_dcp_gpunetio_batch_post)
         self.assertTrue(mgr.enable_dcp_pack)
 
     def test_peer_rows_rejects_non_gpunetio_backend(self):
@@ -123,6 +124,13 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
         with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(True):
             with envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.override("UCX"):
                 with self.assertRaisesRegex(ValueError, "requires .*GPUNETIO"):
+                    mgr._configure_dcp_pack_mode()
+
+    def test_batch_post_requires_peer_rows(self):
+        mgr = object.__new__(CommonKVManager)
+        with envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.override(False):
+            with envs.SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST.override(True):
+                with self.assertRaisesRegex(ValueError, "requires .*PEER_ROWS"):
                     mgr._configure_dcp_pack_mode()
 
     def test_peer_rows_skips_pack_and_keeps_cyclic_indices(self):
@@ -167,6 +175,7 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
                 ready_slot=1,
                 ready_epoch=7,
                 ready_src_ptr=0x3000,
+                post=False,
             )
 
         self.assertEqual(result, "transfer")
@@ -180,6 +189,7 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
             args["dst_data_indices"], np.arange(448, 512, dtype=np.int32)
         )
         self.assertEqual(args["ready_tail"], (0x3000, 0x4008))
+        self.assertFalse(args["post"])
 
 
 class TestNixlTransferInfo(CustomTestCase):
@@ -592,6 +602,40 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
             {"backends": ["GPUNETIO"], "custom_param": b"gpunetio_qp=0"},
         )
 
+    def test_generic_can_create_without_posting(self):
+        class NoPostAgent:
+            def get_xfer_descs(self, reqs, _mem_kind):
+                return reqs
+
+            def initialize_xfer(self, *args, **kwargs):
+                return "handle"
+
+            def transfer(self, _handle):
+                raise AssertionError("deferred transfer was posted")
+
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = NoPostAgent()
+        mgr.is_mla_backend = True
+        mgr.kv_args = SimpleNamespace(gpu_id=0)
+        mgr.get_mla_kv_ptrs_with_pp = lambda src, dst, state: (src, dst, 1)
+
+        handle = mgr._send_kvcache_generic(
+            peer_name="peer",
+            src_data_ptrs=[0x1000],
+            dst_data_ptrs=[0x2000],
+            item_lens=[16],
+            prefill_data_indices=np.array([1], dtype=np.int32),
+            dst_data_indices=np.array([3], dtype=np.int32),
+            dst_gpu_id=1,
+            notif="9_kv_0_1_0",
+            force_flat=True,
+            bypass_prepped=True,
+            ready_tail=(0x3000, 0x4000),
+            post=False,
+        )
+
+        self.assertEqual(handle, "handle")
+
 
 class TestNixlKVSenderChunkPolicy(CustomTestCase):
     def test_last_zero_page_chunk_is_sent_for_aux_only_completion(self):
@@ -600,6 +644,167 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(0, last_chunk=True))
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
+
+
+class TestDcpGpunetioBatchPost(CustomTestCase):
+    def test_worker_rejects_non_four_peer_topology(self):
+        room = 32
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_dcp_gpunetio_batch_post = True
+        mgr.enable_staging = False
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        mgr.transfer_infos = {
+            room: {
+                "peer0": TransferInfo(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=1000,
+                    agent_name="peer0",
+                    dst_kv_indices=np.array([0], dtype=np.int32),
+                    dst_aux_index=0,
+                    required_dst_info_num=1,
+                    dst_state_indices=[],
+                    is_dummy_rank=False,
+                )
+            }
+        }
+        mgr.exceptions = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.enable_deferred_decode_kv_release = False
+        mgr.check_status = MagicMock(return_value=KVPoll.WaitingForInput)
+        mgr.update_status = MagicMock()
+        mgr.record_failure = MagicMock()
+
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([0], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=True,
+            chunk_id=0,
+            prefill_aux_index=0,
+            state_indices=[],
+            num_kv_tokens=1,
+        )
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertIn("exactly four DCP peers", str(mgr.exceptions[room]))
+
+    def test_worker_batches_four_dcp_handles_before_aux(self):
+        room = 31
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_dcp_peer_rows = True
+        mgr.enable_dcp_gpunetio_batch_post = True
+        mgr.enable_staging = False
+        mgr.enable_deferred_decode_kv_release = False
+        mgr.is_mla_backend = True
+        mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = 1
+        mgr.transfer_source_rank = 0
+        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0x1000])
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        mgr.transfer_infos = {}
+        mgr.decode_kv_args_table = {}
+        mgr.req_to_decode_prefix_len = {room: 0}
+        mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.exceptions = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._publish_ready_epoch = MagicMock(
+            side_effect=lambda slot, _epoch: 0x3000 + slot * 8
+        )
+
+        reqs = {}
+        dst_infos = {}
+        for peer_idx in range(4):
+            peer_name = f"peer{peer_idx}"
+            reqs[peer_name] = TransferInfo(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=1000 + peer_idx,
+                agent_name=peer_name,
+                dst_kv_indices=np.array([peer_idx], dtype=np.int32),
+                dst_aux_index=peer_idx,
+                required_dst_info_num=1,
+                dst_state_indices=[],
+                decode_prefix_len=0,
+                is_dummy_rank=False,
+                ready_slot=peer_idx,
+                ready_epoch=7,
+            )
+            dst_infos[peer_name] = SimpleNamespace(
+                decode_tp_size=1,
+                staging_base_ptr=0,
+                staging_total_size=0,
+                requires_dcp_relayout=True,
+                ready_enabled=True,
+                ready_slot_count=8,
+                ready_base_ptr=0x4000,
+                dst_aux_ptrs=[0x5000],
+            )
+        mgr.transfer_infos[room] = reqs
+        mgr.decode_kv_args_table = dst_infos
+
+        events = []
+        dcp_handles = iter(["dcp0", "dcp1", "dcp2", "dcp3"])
+        aux_handles = iter(["aux0", "aux1", "aux2", "aux3"])
+
+        def send_dcp(*_args, **kwargs):
+            events.append(("dcp", kwargs["post"]))
+            return next(dcp_handles)
+
+        def send_aux(*_args):
+            events.append("aux")
+            return next(aux_handles)
+
+        def batch_post(handles):
+            events.append(("batch", list(handles)))
+            return "PROC"
+
+        def check_state(handle):
+            events.append(("check", handle))
+            return "DONE"
+
+        mgr.send_kvcache_dcp = MagicMock(side_effect=send_dcp)
+        mgr.send_aux = MagicMock(side_effect=send_aux)
+        mgr.agent = SimpleNamespace(
+            transfer_batch4_gpunetio_experimental=batch_post,
+            check_xfer_state=check_state,
+        )
+
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([2], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=True,
+            chunk_id=0,
+            prefill_aux_index=0,
+            state_indices=[],
+            num_kv_tokens=1,
+        )
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(
+            [
+                event
+                for event in events
+                if isinstance(event, tuple) and event[0] == "dcp"
+            ],
+            [("dcp", False)] * 4,
+        )
+        batch_events = [event for event in events if event[0] == "batch"]
+        self.assertEqual(batch_events, [("batch", ["dcp0", "dcp1", "dcp2", "dcp3"])])
+        self.assertEqual(events[4], ("batch", ["dcp0", "dcp1", "dcp2", "dcp3"]))
+        self.assertEqual(events[5:9], ["aux"] * 4)
+        self.assertEqual(mgr.send_aux.call_count, 4)
 
 
 class TestNixlAbortHandling(CustomTestCase):

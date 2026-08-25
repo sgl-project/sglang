@@ -336,6 +336,14 @@ class CommonKVManager(BaseKVManager):
 
     def _configure_dcp_pack_mode(self) -> None:
         self.enable_dcp_peer_rows = envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.get()
+        self.enable_dcp_gpunetio_batch_post = (
+            envs.SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST.get()
+        )
+        if self.enable_dcp_gpunetio_batch_post and not self.enable_dcp_peer_rows:
+            raise ValueError(
+                "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST=1 requires "
+                "SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS=1"
+            )
         if self.enable_dcp_peer_rows:
             backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
             if backend != "GPUNETIO":

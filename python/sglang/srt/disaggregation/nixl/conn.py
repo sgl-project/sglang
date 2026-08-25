@@ -1350,6 +1350,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
+                batch_dcp_enabled = getattr(
+                    self, "enable_dcp_gpunetio_batch_post", False
+                )
+                dcp_peer_reqs = [
+                    req for req in reqs_to_be_processed if not req.is_dummy()
+                ]
+                if batch_dcp_enabled and len(dcp_peer_reqs) != 4:
+                    raise RuntimeError(
+                        "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST requires exactly "
+                        f"four DCP peers, got {len(dcp_peer_reqs)}"
+                    )
+                pending_dcp_handles: List[Any] = []
+                pending_aux_requests: List[Tuple[Any, ...]] = []
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1472,6 +1485,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         if self.enable_dcp_peer_rows
                                         else None
                                     ),
+                                    post=not batch_dcp_enabled,
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1512,7 +1526,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 )
 
                         if kv_xfer_handle is not None:
-                            handles.append(kv_xfer_handle)
+                            if batch_dcp_enabled and is_dcp_transfer:
+                                pending_dcp_handles.append(kv_xfer_handle)
+                            else:
+                                handles.append(kv_xfer_handle)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1548,18 +1565,43 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"_nokv_{self.transfer_source_rank}"
                                 f"_{kv_chunk.chunk_id}"
                             )
-                        aux_xfer_handle = self.send_aux(
+                        aux_request = (
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
                             dst_info.dst_aux_ptrs,
                             req.dst_aux_index,
                             aux_notif,
                         )
-                        handles.append(aux_xfer_handle)
+                        if batch_dcp_enabled:
+                            pending_aux_requests.append(aux_request)
+                        else:
+                            handles.append(self.send_aux(*aux_request))
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
                     continue
+
+                if batch_dcp_enabled:
+                    if pending_dcp_handles:
+                        if len(pending_dcp_handles) != 4:
+                            raise RuntimeError(
+                                "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST created "
+                                f"{len(pending_dcp_handles)} DCP handles, expected 4"
+                            )
+                        batch_state = self.agent.transfer_batch4_gpunetio_experimental(
+                            pending_dcp_handles
+                        )
+                        if batch_state == "ERR":
+                            raise RuntimeError(
+                                "NIXL GPUNETIO DCP batch post returned ERR"
+                            )
+                        handles.extend(pending_dcp_handles)
+                    # Aux remains on the existing path and is posted only after
+                    # all DCP payload/ready requests have been submitted.
+                    handles.extend(
+                        self.send_aux(*aux_request)
+                        for aux_request in pending_aux_requests
+                    )
 
                 while handles:
                     all_done = True
@@ -1721,6 +1763,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         force_flat: bool = False,
         bypass_prepped: bool = False,
         ready_tail: Optional[Tuple[int, int]] = None,
+        post: bool = True,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1760,9 +1803,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+            if post:
+                state = self.agent.transfer(xfer_handle)
+                if state == "ERR":
+                    raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -1896,9 +1940,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        if post:
+            state = self.agent.transfer(xfer_handle)
+            if state == "ERR":
+                raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
     def send_kvcache(
@@ -1940,6 +1985,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ready_slot: Optional[int] = None,
         ready_epoch: Optional[int] = None,
         ready_src_ptr: Optional[int] = None,
+        post: bool = True,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -2045,6 +2091,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             force_flat=True,
             bypass_prepped=True,
             ready_tail=ready_tail,
+            post=post,
         )
 
     def send_kvcache_mixed(

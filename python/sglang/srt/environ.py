@@ -718,6 +718,8 @@ class Envs:
     # GPUNETIO-only DCP relayout experiment: retain cyclic direct rows instead
     # of gathering them into the legacy DCP pack buffer.
     SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS = EnvBool(False)
+    # Experimental GPUNETIO DCP4 post batching; requires peer-row mode.
+    SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST = EnvBool(False)
     SGLANG_DISAGG_DCP_PACK_MAX_TOKENS = EnvInt(None)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
