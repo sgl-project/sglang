@@ -306,6 +306,13 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Component-local layer name patterns to skip during online quantization.
+    component_quantization_ignored_layers: dict[str, list[str]] = field(
+        default_factory=dict
+    )
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
@@ -946,6 +953,23 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
             if (
@@ -1722,6 +1746,47 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
+        normalized_ignored_layers: dict[str, list[str]] = {}
+        for component, layers in self.component_quantization_ignored_layers.items():
+            component = str(component).strip().replace("-", "_")
+            if isinstance(layers, str):
+                layers = [layers]
+            if (
+                not component
+                or not isinstance(layers, (list, tuple))
+                or not all(isinstance(layer, str) and layer.strip() for layer in layers)
+            ):
+                raise ValueError(
+                    "Component quantization ignored layers require a component "
+                    "and non-empty layer patterns"
+                )
+            normalized_ignored_layers[component] = [layer.strip() for layer in layers]
+        missing_quantization = set(normalized_ignored_layers) - set(
+            self.component_quantizations
+        )
+        if missing_quantization:
+            raise ValueError(
+                "Component quantization ignored layers require a matching "
+                "quantization override for: "
+                f"{', '.join(sorted(missing_quantization))}"
+            )
+        self.component_quantization_ignored_layers = normalized_ignored_layers
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -2833,6 +2898,61 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix="-weights-path",
         )
 
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
+    @staticmethod
+    def _extract_component_quantization_ignored_layers(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        ignored_layers: dict[str, list[str]] = {}
+        remaining: list[str] = []
+        i = 0
+        prefixes = (
+            "--component-quantization-ignored-layers.",
+            "--component_quantization_ignored_layers.",
+        )
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            if "=" in arg:
+                values = [arg.split("=", 1)[1]]
+            else:
+                values = []
+                while i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    values.append(unknown_args[i])
+            if component and values:
+                ignored_layers[component] = values
+            else:
+                remaining.append(arg)
+            i += 1
+        return ignored_layers, remaining
+
     @staticmethod
     def _extract_component_attention_backends(
         unknown_args: list[str],
@@ -2880,9 +3000,15 @@ class ServerArgs(DisaggServerArgsMixin):
         if unknown_args is None:
             unknown_args = []
 
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
+        dynamic_ignored_layers, remaining = (
+            cls._extract_component_quantization_ignored_layers(remaining)
+        )
         # Extract the more specific weights suffix before the generic path alias.
         dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
-            unknown_args
+            remaining
         )
         dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
@@ -2915,6 +3041,18 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_weights_paths)
             provided_args["component_weights_paths"] = existing
             explicit_arg_names.add("component_weights_paths")
+        if dynamic_quantizations:
+            existing = dict(provided_args.get("component_quantizations") or {})
+            existing.update(dynamic_quantizations)
+            provided_args["component_quantizations"] = existing
+            explicit_arg_names.add("component_quantizations")
+        if dynamic_ignored_layers:
+            existing = dict(
+                provided_args.get("component_quantization_ignored_layers") or {}
+            )
+            existing.update(dynamic_ignored_layers)
+            provided_args["component_quantization_ignored_layers"] = existing
+            explicit_arg_names.add("component_quantization_ignored_layers")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
