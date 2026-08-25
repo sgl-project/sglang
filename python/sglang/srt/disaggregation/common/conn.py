@@ -343,9 +343,9 @@ class CommonKVManager(BaseKVManager):
             )
         return src_token_lens
 
-    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} does not support DCP pack buffer registration"
+            f"{type(self).__name__} does not support staging memory registration"
         )
 
     def _init_dcp_pack_buffers_once(self) -> None:
@@ -356,7 +356,7 @@ class CommonKVManager(BaseKVManager):
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
         self._dcp_pack_buffers = init_dcp_pack_buffers(
-            self._register_dcp_pack_memory,
+            self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),
         )

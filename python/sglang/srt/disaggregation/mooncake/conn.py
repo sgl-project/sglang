@@ -340,13 +340,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
         }
 
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        self.engine.batch_register([ptr], [size])
+
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
@@ -359,7 +362,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
         )
         self.kv_buffer_tensors = None
@@ -865,9 +868,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
-
-    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
 
     def send_kvcache_dcp(
         self,

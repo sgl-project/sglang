@@ -95,6 +95,8 @@ def init_dcp_pack_buffers(
 
     chunk = get_schedule().chunked_prefill_size
     max_tokens = int(chunk) if chunk is not None and chunk > 0 else 32768
+    # NOTE(kpham-sgl): pack_buffer_bytes = max_tokens x sum(per-layer token bytes).
+    # At 32,768 tokens and 61 MLA layers x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
     size_bytes = dcp_pack_buffer_bytes(
         kv_args.kv_item_lens, kv_args.page_size, max_tokens
     )

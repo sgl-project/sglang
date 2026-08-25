@@ -546,9 +546,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             init_staging_buffers,
         )
 
-        gpu_id = self.kv_args.gpu_id
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
+            self._register_staging_memory,
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
@@ -559,15 +558,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             init_staging_allocator,
         )
 
-        gpu_id = self.kv_args.gpu_id
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
+            self._register_staging_memory,
             self.kv_args,
         )
 
-    def _register_staging_memory(self, ptr: int, size: int, gpu_id: int):
+    def _register_staging_memory(self, ptr: int, size: int):
         """Register a staging buffer with the NIXL agent."""
-        addrs = [(ptr, size, gpu_id, "")]
+        addrs = [(ptr, size, self.kv_args.gpu_id, "")]
         descs = self.agent.register_memory(addrs, "VRAM")
         if not descs:
             raise RuntimeError(
@@ -1080,9 +1078,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_mem_kind=src_mem_kind,
                 dst_mem_kind=dst_mem_kind,
             )
-
-    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
-        self._register_staging_memory(ptr, size, self.kv_args.gpu_id)
 
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
