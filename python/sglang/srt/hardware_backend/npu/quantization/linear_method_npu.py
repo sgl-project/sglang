@@ -318,16 +318,11 @@ def npu_w8a8_block_fp8_linear(
     """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
     backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
 
-    The DeepSeek [128, 128] block scales are reinterpreted into the A5 MXFP8
-    layout by ``Fp8LinearMethod.process_weights_after_loading``; activations are
-    quantized per call. ``input_scale`` is unused — activation scales are always
-    dynamic here.
+    The loading path requantizes block-FP8 weights into the A5 MXFP8 layout;
+    activations are quantized per call. ``block_size`` is retained for the shared
+    block-FP8 backend interface and ``input_scale`` is unused because activation
+    scales are always dynamic here.
     """
-    if block_size != [128, 128]:
-        raise ValueError(
-            f"npu_w8a8_block_fp8_linear only supports block_size [128, 128], "
-            f"got {block_size}"
-        )
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(
             f"npu_w8a8_block_fp8_linear expects float8_e4m3fn weights, "
