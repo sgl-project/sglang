@@ -216,7 +216,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         try:
             import timm
         except ImportError:
-            raise ImportError("Please install timm") from ImportError
+            raise ImportError("Please install timm") from None
 
         model = timm.create_model(
             "vit_so400m_patch14_siglip_384.webli",
@@ -281,12 +281,12 @@ class DeepseekVL2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Build the final image features expected by the language model."""
         # TODO: can it be batched ?
+        target_dtype = next(vision.parameters()).dtype
         images_in_this_batch = []
         for item in items:
             assert item.feature.dim() == 4
-            image_feature = vision.forward_features(
-                item.feature.type(next(vision.parameters()).dtype)
-            )
+            assert item.images_spatial_crop.dim() == 3
+            image_feature = vision.forward_features(item.feature.type(target_dtype))
             images_embeds = projector(image_feature)
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
@@ -372,13 +372,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return torch.cat(images_in_this_batch, dim=0)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-
-        images_spatial_crop = torch.cat(
-            [item.images_spatial_crop for item in items], dim=0
-        )
-
-        assert images_spatial_crop.dim() == 3
-
         return self.build_image_features(
             items=items,
             vision=self.vision,
