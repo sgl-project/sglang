@@ -225,6 +225,16 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
+        # §24.41 (Run 25): rolling gather-site registry (catch-time nearest
+        # buffer distance report; see layer_trap.py).
+        try:
+            from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+            layer_trap_note_gather(
+                "il", {"in": padded_x, "out": gathered}
+            )
+        except Exception:
+            pass
         attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
 
         # Equal per-rank lengths: one interleave copy restores the original

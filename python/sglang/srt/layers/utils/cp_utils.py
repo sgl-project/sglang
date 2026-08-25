@@ -255,6 +255,14 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             device=input_tensor.device,
             dtype=input_tensor.dtype,
         )
+    try:
+        from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+        layer_trap_note_gather(
+            "reorg", {"in": input_tensor, "out": input_tensor_full}
+        )
+    except Exception:
+        pass
 
     group.all_gather_into_tensor(input_tensor_full, input_tensor)
 
@@ -314,6 +322,14 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
             device=input_tensor.device,
             dtype=input_tensor.dtype,
         )
+    try:
+        from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+        layer_trap_note_gather(
+            "reorg-kv", {"in": input_tensor, "out": input_tensor_full}
+        )
+    except Exception:
+        pass
 
     group.all_gather_into_tensor(input_tensor_full, input_tensor)
 
@@ -363,6 +379,18 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
         output_tensor = input_tensor.new_empty(
             (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
         )
+    # §24.41 (Run 25): rolling gather-site registry for the catch-time
+    # nearest-buffer distance report (layer_trap.py). Async comm-stream site
+    # -- the top OOB suspect (fp32 kv_score, sized-from-local output).
+    try:
+        from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+        layer_trap_note_gather(
+            "ov:" + str(event_key[0] if isinstance(event_key, tuple) else event_key),
+            {"in": input_tensor, "out": output_tensor},
+        )
+    except Exception:
+        pass
     # Sized-from-local-metadata discriminator (see layers/cp/size_log.py).
     # output rows = local send rows * cp_size; the collective writes the SUM
     # of the per-rank sends, so any cross-rank send-row difference overflows
@@ -456,6 +484,14 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
             )
+        try:
+            from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+            layer_trap_note_gather(
+                "rr", {"in": input_tensor, "out": output_tensor}
+            )
+        except Exception:
+            pass
         attn_cp_all_gather_into_tensor(
             output_tensor,
             input_tensor,

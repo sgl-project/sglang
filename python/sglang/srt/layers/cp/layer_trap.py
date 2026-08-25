@@ -28,9 +28,11 @@ sizes the window with no device sync; without it the full row width is
 copied (a few MB worst case, still cheap next to a layer's kernels).
 """
 
+import collections
 import logging
 import os
 import struct
+import time
 
 import torch
 
@@ -43,6 +45,42 @@ _pend: dict = {}
 # layer_trap_register_tensors); a catch prints the dirty byte address
 # against every registered range.
 _addrs: dict = {}
+# §24.41 (Run 25): rolling registry of CP gather-site buffers. The Run-24
+# static map cannot cover the gather outputs -- they are FRESHLY allocated
+# at every call (once per layer), so a one-time registration sees only the
+# last one. Every gather call site appends its {input, output} addresses
+# here; a catch reports the dirty address's signed distance to the nearest
+# sites:
+#   dist == 0   -> the dirty address is INSIDE this buffer: r2t and the
+#                  gather output share storage (aliasing / allocator bug).
+#   dist > 0    -> dirty sits `dist` bytes PAST this buffer's end: the
+#                  sized-from-local overflow pattern (collective writes the
+#                  SUM of per-rank sends into an output sized from local
+#                  rows; see cp_utils.py / size_log.py discriminators).
+#   dist < 0    -> dirty sits before the buffer's start (underflow write).
+# Cross-rank identical (row,col,val) + a shared small dist across ranks
+# convicts the deterministic collective kernel, not freed-memory noise.
+_gather_sites: collections.deque = collections.deque(maxlen=512)
+
+
+def layer_trap_note_gather(tag: str, tensors: dict) -> None:
+    """Record one gather call site's buffers into the rolling registry."""
+    if not _enabled():
+        return
+    try:
+        entry = {"tag": str(tag), "t": time.time()}
+        for k, v in tensors.items():
+            if torch.is_tensor(v) and v.numel() > 0 and v.data_ptr() != 0:
+                entry[k] = (
+                    v.data_ptr(),
+                    v.data_ptr() + v.numel() * v.element_size(),
+                    tuple(int(s) for s in v.shape),
+                    str(v.dtype).replace("torch.", ""),
+                )
+        if len(entry) > 2:  # tag + t + at least one buffer
+            _gather_sites.append(entry)
+    except Exception:
+        pass
 
 
 def layer_trap_register_tensors(tensors: dict) -> None:
@@ -229,6 +267,43 @@ def _drain():
                     fp,
                     " ".join(parts),
                 )
+                # §24.41 (Run 25): nearest gather-site buffers. dist==0 ->
+                # dirty INSIDE the buffer (shared storage); dist>0 -> dirty
+                # PAST the buffer end by dist bytes (sized-from-local
+                # overflow); dist<0 -> dirty BEFORE the start.
+                try:
+                    now = time.time()
+                    near = []
+                    for e in _gather_sites:
+                        for role, v in e.items():
+                            if role in ("tag", "t") or not isinstance(v, tuple):
+                                continue
+                            lo, hi, shape, dt = v
+                            if lo <= dirty < hi:
+                                d = 0
+                            elif dirty >= hi:
+                                d = dirty - hi
+                            else:
+                                d = dirty - lo
+                            near.append((abs(d), d, e, role, lo, hi, shape, dt))
+                    near.sort(key=lambda x: x[0])
+                    for _d0, d, e, role, lo, hi, shape, dt in near[:6]:
+                        logger.error(
+                            "[mf-trap] gsites tag=%s %s=[%#x,%#x) dist=%+d "
+                            "shape=%s dtype=%s age=%.1fs",
+                            e.get("tag", "?"),
+                            role,
+                            lo,
+                            hi,
+                            d,
+                            "x".join(str(s) for s in shape),
+                            dt,
+                            now - e.get("t", now),
+                        )
+                    if not near:
+                        logger.error("[mf-trap] gsites (registry empty)")
+                except Exception:
+                    pass
         except Exception:
             pass
         _pend["fired"] = True

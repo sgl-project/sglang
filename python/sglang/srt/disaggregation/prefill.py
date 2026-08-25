@@ -722,6 +722,50 @@ class SchedulerDisaggregationPrefillMixin:
                     if isinstance(vb, list) and vb and torch.is_tensor(vb[0]):
                         cand["kv_v0"] = vb[0]
                     break
+            # §24.41 (Run 25): DSV4 NPU pool family -- PERSISTENT allocations
+            # (static map applies). Run 24's 13 catches all missed the then-
+            # registered candidates, and the k_buffer probe above silently
+            # no-ops on the DSV4 NPU pool (attribute names differ), so the
+            # writer's neighborhood was largely unregistered. Register the
+            # first layer of every sub-pool: swa KV, c4/c128 KV, indexer
+            # (index_k/index_scale), and the c4 attention/indexer compress
+            # state rings (state_cache_3d -- the fused compressor's dst). A
+            # catch reporting <name>HIT convicts that pool's scatter family
+            # (set_swa_buffer / set_compress_buffer index_put, S2/S3).
+            dsv4 = getattr(self, "token_to_kv_pool", None)
+            for pool_name in ("swa_kv_pool", "c4_kv_pool", "c128_kv_pool"):
+                sub = getattr(dsv4, pool_name, None)
+                kvs = getattr(sub, "kv_buffer", None)
+                if isinstance(kvs, list) and kvs and torch.is_tensor(kvs[0]):
+                    cand[pool_name] = kvs[0]
+            idxp = getattr(dsv4, "c4_indexer_kv_pool", None)
+            for attr, name in (
+                ("index_k_buffer", "idx_k0"),
+                ("index_scale_buffer", "idx_s0"),
+            ):
+                lst = getattr(idxp, attr, None)
+                if isinstance(lst, list) and lst and torch.is_tensor(lst[0]):
+                    cand[name] = lst[0]
+            for attr, prefix in (
+                ("compress_state_pools", "c4st"),
+                ("indexer_compress_state_pools", "c4sti"),
+            ):
+                pools = getattr(dsv4, attr, None)
+                if isinstance(pools, list):
+                    for _i, _pool in enumerate(pools):
+                        if _pool is None or getattr(_pool, "ratio", None) != 4:
+                            continue
+                        st = getattr(
+                            getattr(_pool, "kv_score_buffer", None),
+                            "kv_score",
+                            None,
+                        )
+                        if torch.is_tensor(st):
+                            cand[f"{prefix}0"] = st
+                        sc = getattr(_pool, "state_cache_3d", None)
+                        if torch.is_tensor(sc):
+                            cand[f"{prefix}sc0"] = sc
+                        break
             layer_trap_register_tensors(cand)
         except Exception:
             pass

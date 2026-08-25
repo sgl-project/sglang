@@ -94,6 +94,18 @@ def dsa_cp_gather_hidden_states(
         },
         forward_batch,
     )
+    # §24.41 (Run 25): rolling gather-site registry (catch-time nearest
+    # buffer distance report; see layer_trap.py). PERSISTENT output buffer
+    # sized by set_dp_buffer_len -- a stale/short length overflows into
+    # whatever is allocated next to it.
+    try:
+        from sglang.srt.layers.cp.layer_trap import layer_trap_note_gather
+
+        layer_trap_note_gather(
+            "dsa-ag", {"in": local_hidden_states, "out": hidden_states}
+        )
+    except Exception:
+        pass
     attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
     return hidden_states
 
