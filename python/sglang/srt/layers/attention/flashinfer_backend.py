@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 
 """
 Support different attention backends.
@@ -18,7 +21,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -403,7 +406,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
         # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
         self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
+            get_exec().deterministic.enable_deterministic_inference
         )
         self.prefill_split_tile_size = None
         self.decode_split_tile_size = None
@@ -1057,6 +1060,23 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+
+    def get_cuda_graph_decode_wrappers(
+        self,
+        *,
+        bs: int,
+        num_tokens: int,
+    ) -> list:
+        wrappers = self.decode_cuda_graph_metadata.get(bs)
+        if wrappers is None:
+            self._prepare_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                ForwardMode.DECODE,
+                spec_info=None,
+            )
+            wrappers = self.decode_cuda_graph_metadata[bs]
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether

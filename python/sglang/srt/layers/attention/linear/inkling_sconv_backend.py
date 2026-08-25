@@ -445,16 +445,21 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[:rows]
         rows = forward_batch.batch_size
         query_start_loc = self.sconv_metadata.query_start_loc
+        # A capture batch is built directly rather than through
+        # ForwardBatch.init_new, so it carries no prefix lengths; its rows are
+        # masked off, so zeros keep the indices in bounds. A replayed or eager
+        # batch always has them, and must still fail rather than track against
+        # an invented prefix.
+        prefix_lens = forward_batch.extend_prefix_lens
+        if prefix_lens is None and on_graph_path:
+            prefix_lens = torch.zeros_like(forward_batch.mamba_track_seqlens)
         live = min(
             rows,
             forward_batch.mamba_track_seqlens.shape[0],
-            forward_batch.extend_prefix_lens.shape[0],
+            prefix_lens.shape[0],
         )
 
-        lens_to_track = (
-            forward_batch.mamba_track_seqlens[:live]
-            - forward_batch.extend_prefix_lens[:live]
-        )
+        lens_to_track = forward_batch.mamba_track_seqlens[:live] - prefix_lens[:live]
         chunk_aligned = (
             lens_to_track // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size

@@ -1,14 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention import (
     DualChunkAttentionCase,
     make_dual_chunk_cases,
@@ -23,6 +17,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dual_chunk_attention 
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dual_chunk_cuda_graph_decode_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 # Container gate (KNOWN_FAILURES.md §1): `DualChunkFlashAttentionBackend` calls

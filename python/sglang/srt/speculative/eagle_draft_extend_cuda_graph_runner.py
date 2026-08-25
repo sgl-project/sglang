@@ -35,7 +35,11 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_flags,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -95,7 +99,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -130,9 +134,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_extend", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
@@ -591,10 +593,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family war-publish phase; last write wins the mailbox).
+        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
         read_done = self.device_module.Event()
         read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        self.model_runner.shared_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs

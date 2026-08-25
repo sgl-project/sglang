@@ -150,18 +150,20 @@ class TestSWA(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
+        self.assertEqual(len(first_insert_events), 1)
+        self.assertEqual(list(first_insert_events[0].token_ids), [1, 2, 3, 4])
 
         _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual([e.token_ids[0] for e in second_insert_events], [5, 6])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
 
         stored_hashes = [
-            e.block_hashes[0] for e in first_insert_events + second_insert_events
+            block_hash
+            for event in first_insert_events + second_insert_events
+            for block_hash in event.block_hashes
         ]
 
         # Evicting only SWA tokens tombstones nodes but keeps full KV blocks.
@@ -189,15 +191,15 @@ class TestSWA(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        split_parent_hash = first_insert_events[1].block_hashes[0]
+        self.assertEqual(len(first_insert_events), 1)
+        split_parent_hash = first_insert_events[0].block_hashes[1]
 
         _insert(tree, allocator, [1, 2, 5, 6])
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
@@ -223,6 +225,43 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    def test_clearing_the_mapping_does_not_synchronize(self):
+        """Clearing the full-to-SWA mapping must not block the stream; writing a
+        host-resident scalar into it does.
+        """
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        full_indices = _swa_alloc(allocator, 4)
+        mapping = allocator.full_to_swa_index_mapping
+
+        # Warm up outside the window: a first-time cudaMalloc can synchronize on
+        # its own, which the detector would report as this call's fault.
+        allocator.clear_full_to_swa_mapping(full_indices)
+
+        def sync_error(fn):
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                fn()
+            except RuntimeError as exc:
+                return exc
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+            return None
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the assert below no matter how the mapping is cleared.
+        pre_fix_error = sync_error(
+            lambda: mapping.__setitem__(full_indices.to(torch.int64), 0)
+        )
+        if pre_fix_error is None:
+            self.skipTest("sync debug mode does not flag a blocking H2D copy here")
+
+        self.assertIsNone(
+            sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
+        )
 
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
@@ -607,6 +646,7 @@ class TestSWA(unittest.TestCase):
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
+        req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
         req.kv.swa_evicted_seqlen = 0
@@ -644,6 +684,7 @@ class TestSWA(unittest.TestCase):
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
+        req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
         req2.kv.swa_evicted_seqlen = 0

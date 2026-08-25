@@ -82,6 +82,10 @@
       "destination": "/docs/advanced_features/cuda_graph_for_multi_modal_encoder"
     },
     {
+      "source": "/advanced_features/dcp.html",
+      "destination": "/docs/advanced_features/dcp"
+    },
+    {
       "source": "/advanced_features/deterministic_inference.html",
       "destination": "/docs/advanced_features/deterministic_inference"
     },
@@ -932,7 +936,9 @@
               "docs/advanced_features/separate_reasoning",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
@@ -1006,6 +1012,7 @@
             "pages": [
               "docs/developer_guide/overview",
               "docs/developer_guide/contribution_guide",
+              "docs/developer_guide/serve_backend_plugins",
               {
                 "group": "Development",
                 "pages": [
@@ -1117,7 +1124,8 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b",
-                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct"
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max"
                         ]
                       },
                       {
@@ -1235,6 +1243,7 @@
                     "group": "Qwen",
                     "pages": [
                       "cookbook/autoregressive/Qwen/Qwen3.8",
+                      "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
@@ -1280,11 +1289,23 @@
                     ]
                   },
                   {
+                    "group": "RedNote",
+                    "pages": [
+                      "cookbook/autoregressive/RedNote/Dots3-Note"
+                    ]
+                  },
+                  {
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
+                    ]
+                  },
+                  {
+                    "group": "IBM",
+                    "pages": [
+                      "cookbook/autoregressive/IBM/Granite-4.2"
                     ]
                   },
                   {
@@ -1321,6 +1342,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
@@ -1454,8 +1476,10 @@
                   },
                   {
                     "group": "LTX",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3",
+                      "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
@@ -1496,10 +1520,24 @@
                     ]
                   },
                   {
+                    "group": "SANA Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-Video/SANA-Video"
+                    ]
+                  },
+                  {
                     "group": "MiniMax",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "LingBot Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
                   },
                   {
@@ -1576,6 +1614,7 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",

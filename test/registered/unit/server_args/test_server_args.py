@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=12, suite="base-c-test-cpu")
+register_cpu_ci(est_time=11, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -43,19 +43,88 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            try:
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe"]
+                )
+            except SystemExit as exc:
+                self.fail(
+                    "--enable-w4a4-mxfp4-megamoe must be accepted by the CLI "
+                    f"parser, got SystemExit({exc.code})"
+                )
+
+            args.resolve_once()
+
+            self.assertTrue(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
+
+    def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            args = prepare_server_args(["--model-path", "dummy"])
+            # Resolve, or the check that the environment stays untouched has
+            # nothing to be untouched by.
+            args.resolve_once()
+
+            self.assertFalse(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
+
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        args.resolve_once()
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+
+    def test_dsv4_prefill_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        base_args = ["--model-path", "dummy-model"]
+
+        default_args = parser.parse_args(base_args)
+        self.assertEqual(default_args.dsv4_prefill_backend, "auto")
+
+        q8_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
+        )
+        self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+
     def test_return_hidden_states_mode_configuration(self):
-        disabled = ServerArgs(model_path="dummy")
+        def _resolved(**kwargs):
+            server_args = ServerArgs(**kwargs)
+            server_args.resolve_once()
+            return server_args
+
+        disabled = _resolved(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
         self.assertIsNone(disabled.return_hidden_states_mode)
 
-        last = ServerArgs(
+        last = _resolved(
             model_path="dummy",
             return_hidden_states_mode="last",
         )
         self.assertTrue(last.enable_return_hidden_states)
         self.assertEqual(last.return_hidden_states_mode, "last")
 
-        legacy_full = ServerArgs(
+        legacy_full = _resolved(
             model_path="dummy",
             enable_return_hidden_states=True,
         )
@@ -70,14 +139,16 @@ class TestPrepareServerArgs(CustomTestCase):
                 "last",
             ]
         )
+        parsed_last.resolve_once()
         self.assertTrue(parsed_last.enable_return_hidden_states)
         self.assertEqual(parsed_last.return_hidden_states_mode, "last")
 
+        # The rejection is resolution's, not the constructor's.
         with self.assertRaisesRegex(
             ValueError,
             "return_hidden_states_mode must be one of",
         ):
-            ServerArgs(
+            _resolved(
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
@@ -262,19 +333,17 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_multimodal_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_multimodal_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy")
         self._set_model_type(server_args, is_multimodal=True)
 
         with patch.dict(os.environ, {}, clear=False):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
                 server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.os.path.exists", return_value=True)
     @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
@@ -362,7 +431,7 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
+    def test_default_transport_is_cpu_for_language_only_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", language_only=True)
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -370,8 +439,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
             server_args._handle_multimodal_feature_transport()
 
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
@@ -518,11 +587,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_allows_fake_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
             disaggregation_transfer_backend="fake",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
-            server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.disable_radix_cache)
 
     def test_pd_decode_dcp_rejects_radix_cache(self):
         server_args = ServerArgs(
@@ -1234,9 +1313,11 @@ class TestSSLArgs(unittest.TestCase):
 
 class TestHiCacheArgs(unittest.TestCase):
     def _make_args(self, **overrides) -> ServerArgs:
-        args = ServerArgs(model_path="dummy")
-        for key, value in overrides.items():
-            setattr(args, key, value)
+        # Not resolved: a dummy model path takes the pipeline's early return,
+        # so `_handle_hicache` would never run. Its one prerequisite (the
+        # host/device ratio default) is run by hand.
+        args = ServerArgs(model_path="dummy", **overrides)
+        args._handle_hicache_ratio_default()
         return args
 
     def _assert_hicache_fields(
@@ -1326,12 +1407,32 @@ class TestHiCacheArgs(unittest.TestCase):
             attention_backend="fa3",
             decode_attention_backend=None,
         )
-
         args._handle_hicache()
 
         self.assertEqual(args.hicache_io_backend, "kernel")
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
+
+    def test_decode_offload_rejects_host_pool_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            args._handle_cache_compatibility()
+
+    def test_decode_offload_allows_cpu_tensor_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="cpu_tensor",
+        )
+
+        args._handle_cache_compatibility()
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
@@ -1582,16 +1683,22 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         mock_backend = mock_get_moe_a2a_backend.return_value
         mock_backend.is_deepep.return_value = False
         mock_backend.is_mooncake.return_value = False
-        server_args = SimpleNamespace(
+        from sglang.srt.runtime_context import get_context
+
+        # The graph configuration is a bag leaf; the debug switch is raw input
+        # and stays on the argument.
+        override = get_context().override_server_args(
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(
                     backend=Backend.TC_PIECEWISE,
                     bs=[32, 64],
                     tc_compiler="eager",
                 )
-            ),
-            enable_torch_compile_debug_mode=False,
+            )
         )
+        override.install()
+        self.addCleanup(override.restore)
+        server_args = SimpleNamespace(enable_torch_compile_debug_mode=False)
 
         config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
 
@@ -1962,15 +2069,15 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_sidecar_builds_loopback_grpc_endpoints(self):
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            build_sidecar_endpoint("0.0.0.0", 50051),
             "http://127.0.0.1:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            build_sidecar_endpoint("::", 50051),
             "http://[::1]:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            build_sidecar_endpoint("[::]", 50051),
             "http://[::1]:50051",
         )
 
@@ -1982,6 +2089,8 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(parsed.sidecar_args, argv)
 
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        from sglang.srt.runtime_context import get_context as get_context_for_config
+
         server_args = SimpleNamespace(
             sidecar="example.sidecar",
             sidecar_args=[
@@ -1991,8 +2100,11 @@ class TestGrpcServerArgs(CustomTestCase):
                 "2",
             ],
             host="127.0.0.1",
-            grpc_port=50051,
         )
+        # The port the sidecar dials is the resolved one, off the bag.
+        override = get_context_for_config().override_server_args(grpc_port=50051)
+        override.install()
+        self.addCleanup(override.restore)
         with (
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
             patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
@@ -2121,8 +2233,6 @@ class TestGrpcServerArgs(CustomTestCase):
         arg-parsing tests above never call start_server, so a stray kwarg (e.g.
         the removed max_prefill_tokens) would only surface as a TypeError at
         launch. This mocks the native extension and locks the kwarg set."""
-        import sys
-
         from sglang.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
@@ -2130,22 +2240,25 @@ class TestGrpcServerArgs(CustomTestCase):
         server_args = SimpleNamespace(
             host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
         )
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
-                "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
-            },
+        with (
+            patch(
+                "sglang.srt.rust_extensions.load_rust_extension",
+                return_value=fake_core,
+            ) as load_rust_extension,
+            patch.dict(
+                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
+            ),
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
                 server_args=server_args,
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
+                grpc_port=server_args.grpc_port,
             )
 
         self.assertEqual(handle, "handle")
+        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
@@ -2190,6 +2303,36 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestDcpKvEventContract(CustomTestCase):
+    """DCP widens the radix-tree page to page_size * dcp_size, which the
+    advertised KV-event block size must reflect."""
+
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Advertising the physical page_size made every KV-aware router hash
+        prompts at a width no emitted block can match, silently pinning its
+        hit rate to zero while stores kept applying cleanly."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=self.KV_EVENTS,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(
+            model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
+    def test_kv_event_block_size_widens_a_single_token_page(self):
+        # page_size=1 + DCP is a real deployment shape: the allocator is still
+        # paged, at dcp_size.
+        args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
+        self.assertEqual(args.kv_event_block_size, 8)
 
 
 if __name__ == "__main__":

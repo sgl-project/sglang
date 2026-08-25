@@ -12,7 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -21,7 +23,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -32,15 +37,45 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
+    is_dense_head_weight,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+except ImportError:
+    _flashinfer_top_k = None
+
+
+def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    # The selector's largest single cost: it reads the whole logits tensor.
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    return torch.topk(scores, k, dim=-1)
+
+
+def _project_candidate_logits(
+    hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
+) -> torch.Tensor:
+    """Project draft hiddens through the target head, restricted to the org vocab."""
+    if not use_quant_head:
+        weight = lm_head.weight
+        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+    # A packed weight can't be row-sliced to the org vocab like the dense path,
+    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
+    # mask the padded tail out of the top-k instead.
+    logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
+    if logits.shape[-1] > num_org:
+        logits[:, num_org:] = float("-inf")
+    return logits
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -309,10 +344,91 @@ class DFlashMLP(nn.Module):
         return x
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    out = coefficients[:, 0] * blocks
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    if block_size & (block_size - 1) == 0:
+        position = position & (block_size - 1)
+    else:
+        position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return out.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise K-tap convolution across one DFlash block.
+
+    Each sublayer is wrapped: `prepare` convolves its input and returns the kernel
+    for `finish` to convolve its output, both from one projection of the input.
+    """
+
+    def __init__(
+        self, hidden_size: int, block_size: int, taps: int, group_size: int
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
+        hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = hidden_size // self.group_size
+        # [input/output, tap, channel], the layout training exports.
+        base_kernel = torch.zeros(2, self.taps, hidden_size)
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        self.kernel_projection = nn.Linear(
+            hidden_size, 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        # Marked here, not inside: by the time the compiled function traces, the dim
+        # is symbolic and the group index costs an integer div and mod per element.
+        torch._dynamo.mark_static(hidden_states, 1)
+        torch._dynamo.mark_static(delta, 1)
+        torch._dynamo.mark_static(delta, 2)
+        return _grouped_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor):
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        attention_conv: Optional[DFlashGroupedConv] = None,
+        mlp_conv: Optional[DFlashGroupedConv] = None,
+        quant_config=None,
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -323,6 +439,9 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+
+        self.attention_conv = attention_conv
+        self.mlp_conv = mlp_conv
 
     def forward(
         self,
@@ -344,13 +463,26 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -373,11 +505,30 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        draft_config = self.draft_config = parse_dflash_draft_config(
+            draft_hf_config=config
+        )
+        self.block_size = draft_config.resolve_block_size(default=16)
+        self.candidate_selector: Optional[nn.Module] = None
+
+        def grouped_conv():
+            if not draft_config.conv_kernel_size:
+                return None
+            return DFlashGroupedConv(
+                hidden_size,
+                self.block_size,
+                draft_config.conv_kernel_size,
+                draft_config.conv_group_size,
+            )
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    attention_conv=grouped_conv(),
+                    mlp_conv=grouped_conv(),
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
@@ -387,7 +538,6 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        draft_config = parse_dflash_draft_config(draft_hf_config=config)
         if draft_config.num_target_layers is not None:
             target_num_layers = int(draft_config.num_target_layers)
         elif draft_config.target_layer_ids is not None:
@@ -405,7 +555,18 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = draft_config.resolve_block_size(default=16)
+    def set_block_size(self, block_size: int) -> None:
+        """Adopt the block size the worker resolved.
+
+        The convolutions are built from the checkpoint's block_size, which
+        --speculative-num-draft-tokens may override; the layout they index
+        depends on it, so the resolved value has to reach them.
+        """
+        self.block_size = int(block_size)
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None:
+                    conv.block_size = self.block_size
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -625,8 +786,246 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _score_edges(
+    *,
+    predecessor_table: torch.Tensor,
+    successor_table: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    keys = successor_table[candidate_ids]
+    # Concatenate the ids and look them up once. Concatenating the looked-up rows
+    # instead moves a [b, slots, k, rank] float tensor where this moves one id per
+    # candidate, and it costs a second gather for the anchor.
+    predecessor_ids = torch.cat(
+        [anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]],
+        dim=1,
+    )
+    predecessors = predecessor_table[predecessor_ids]
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
+    )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _follow_maps(maps, initial_indices, edges: int):
+    index = initial_indices
+    path = [index]
+    for edge in range(edges):
+        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
+        path.append(index)
+    return torch.stack(path, dim=1)
+
+
+class CandidateSelector(nn.Module):
+    """Scores the K x K transitions between adjacent proposal slots, then walks them.
+
+    The [vocab, r] tables are replicated on every TP rank rather than sharded like
+    the LM head: candidate ids are gathered globally, so any rank can need any row.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        vocab_size: int,
+        state_rank: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        if _flashinfer_top_k is None:
+            logger.warning(
+                "flashinfer is unavailable; the DFlash2 selector falls back to "
+                "torch.topk, which roughly halves end-to-end throughput on a large "
+                "vocabulary."
+            )
+        state_rank = int(state_rank)
+        self.top_k = int(top_k)
+        self.predecessor_codebook = nn.Parameter(
+            torch.zeros(int(vocab_size), state_rank), requires_grad=False
+        )
+        self.successor_codebook = nn.Parameter(
+            torch.zeros(int(vocab_size), state_rank), requires_grad=False
+        )
+        self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
+
+    def build_lattice(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
+
+        pred is cand[b,e-1], and the verified anchor for slot 0.
+        """
+        # Everything but the batch is a model constant. Left symbolic, inductor
+        # recovers indices with an integer division per element instead of folding.
+        hidden = self.hidden_projection(hidden_states)
+        for tensor in (candidate_ids, unary_logits, hidden):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+        return _score_edges(
+            predecessor_table=self.predecessor_codebook,
+            successor_table=self.successor_codebook,
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden=hidden,
+            anchor_token_ids=anchor_token_ids,
+            top_k=self.top_k,
+        )
+
+    def sample_path(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Walk one path, with q over the K candidates for the verify. greedy_mask
+        rows take the argmax, selected rather than branched, so one captured graph
+        serves greedy and sampling batches alike."""
+        if scores.is_cuda:
+            return selector_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=uniforms,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+            )
+        top_k = self.top_k
+        temps = temperatures.view(-1, 1)
+        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
+        initial_indices = (
+            uniforms[:, :1]
+            .ge(initial_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        transition_probs = torch.softmax(
+            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
+        )
+        local_maps = (
+            uniforms[:, 1:, None, None]
+            .ge(transition_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        initial_indices = torch.where(
+            greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
+        )
+        local_maps = torch.where(
+            greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
+        )
+        torch._dynamo.mark_static(local_maps, 1)
+        torch._dynamo.mark_static(local_maps, 2)
+        path_indices = _follow_maps(
+            local_maps, initial_indices, int(scores.shape[1]) - 1
+        )
+        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+        realized_rows = transition_probs.gather(
+            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
+        )[:, :, 0]
+        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
+        # Greedy rows walk the argmax, so their q is the point mass there, not
+        # the temperature-1 softmax above. The triton walk stores the same.
+        q_rows = torch.where(
+            greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
+        )
+        return tokens, q_rows
+
+
+class DFlash2DraftModel(DFlashDraftModel):
+    """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        draft_config = self.draft_config
+        if not draft_config.selector_rank:
+            raise ValueError(
+                "DFlash selector draft requires dflash_config.selector_rank."
+            )
+        self.candidate_selector = CandidateSelector(
+            hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
+            state_rank=draft_config.selector_rank,
+            top_k=draft_config.selector_top_k,
+        )
+        # The draft has no head of its own; the worker points this at the target's
+        # before capture.
+        self.lm_head: Optional[nn.Module] = None
+
+    def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        if self.draft_config.output_multiplier != 1.0:
+            logits.mul_(self.draft_config.output_multiplier)
+        softcap = self.draft_config.final_logit_softcapping
+        if softcap is not None:
+            logits.div_(softcap).tanh_().mul_(softcap)
+        return logits
+
+    def compute_candidates(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k base candidates via the target lm_head: hidden [N, H] -> global
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
+        assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        k = self.candidate_selector.top_k
+        # The worker screens the head before capture, but its eager fallback
+        # (_propose_selector_block) attaches whatever the target has.
+        weight = getattr(self.lm_head, "weight", None)
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
+        if not use_quant_head and not is_dense_head_weight(weight):
+            raise RuntimeError(
+                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
+                "or a supported lm_head.quant_method."
+            )
+        if get_parallel().tp_size == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(
+                _project_candidate_logits(
+                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
+                ),
+                k,
+            )
+            return ids.long(), self._transform_unary_logits(vals)
+        shard = self.lm_head.shard_indices
+        vals, ids = _radix_topk(
+            _project_candidate_logits(
+                hidden,
+                self.lm_head,
+                num_org=int(shard.num_org_elements),
+                use_quant_head=use_quant_head,
+            ),
+            k,
+        )
+        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+        return torch.gather(gathered_ids, -1, sel).long(), self._transform_unary_logits(
+            top_vals
+        )
+
+
 class MuseGlimmerAssistantModel(DFlashDraftModel):
     """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, MuseGlimmerAssistantModel]
+EntryClass = [
+    DFlashDraftModel,
+    DFlashLagunaForCausalLM,
+    MuseGlimmerAssistantModel,
+    DFlash2DraftModel,
+]
