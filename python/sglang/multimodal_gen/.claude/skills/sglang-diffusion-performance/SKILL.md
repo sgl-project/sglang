@@ -12,8 +12,11 @@ Before running any `sglang generate` command below inside the diffusion containe
 - export `HF_TOKEN` first when the selected model lives in a gated Hugging Face repo such as `black-forest-labs/FLUX.*`
 - export `FLASHINFER_DISABLE_VERSION_CHECK=1`
 - when a run downloads weights, use a task-owned cache and delete that model's
-  cache after its eager/compile/BCG/profile group finishes; the benchmark skill
-  provides `--model-cache-root --cleanup-model-cache` plus a cleanup ledger
+  cache after its eager/BCG/quality/profile group finishes; the benchmark
+  skill's `--quality-bcg-matrix --model-cache-root --cleanup-model-cache`
+  keeps one cache for the group and writes a zero-residual cleanup ledger
+- hold one idle GPU set for the complete A/B matrix and verify no foreign
+  process appears at run boundaries
 - `cd` to the repo root resolved from `sglang.__file__`
 
 ## Native Backend Gate
@@ -37,7 +40,7 @@ These options are intended to preserve output quality. In practice, some paths (
 |---|---|---|---|---|
 | **Performance Mode** | `--performance-mode auto\|speed\|memory\|manual` (`--mode` alias) | Applies model-aware residency, FSDP/CFG, and compile defaults without overriding explicit flags. `auto` is the safe default; `speed` favors GPU residency; `memory` favors offload; `manual` leaves performance args explicit. | Fastest way to establish a sensible deployment baseline | `speed` may OOM and enables `torch.compile` only when the model deployment config allows it. Explicit offload/FSDP/parallelism/compile flags win. Use `manual` for controlled A/B benchmarks. |
 | **torch.compile** | `--enable-torch-compile` | Applies `torch.compile` to the DiT forward pass. Treat it as a measured comparator, not an assumed upgrade. | Model- and shape-dependent; recent B300 coverage found eager or valid BCG faster or within 1% for every valid compile control | First request is slow and some models time out or drift numerically. Keep eager as the ground truth, use a warmup watchdog, and validate the target model. See the [H200/B300 survey](https://github.com/BBuf/how-to-optim-algorithm-in-cuda/issues/21). |
-| **Breakable CUDA Graph** | `--enable-breakable-cuda-graph` plus optional `--warmup-resolutions <WxH...>` and `--bcg-text-buckets ...` | Captures fixed-resolution DiT segments while leaving attention/collectives eager, reducing launch overhead on supported pipelines. | Large on launch-bound paths; merged SANA and LTX-2 cases show material e2e gains | Mutually exclusive with `torch.compile` and Cache-DiT; BCG takes priority. The model's default resolution is captured automatically; declare every additional production resolution. Current support is model-specific (Ideogram4, LTX-2/2.3, LongCat-Image, MiniMax-H3, Qwen-Image, SANA1.5, SANA-Video, Z-Image, GLM-Image); benchmark before keeping it. |
+| **Breakable CUDA Graph** | `--enable-breakable-cuda-graph` plus optional `--warmup-resolutions <WxH...>` and `--bcg-text-buckets ...` | Captures fixed-resolution DiT segments while leaving attention/collectives eager, reducing launch overhead on supported pipelines. | Large on launch-bound paths; merged SANA and LTX-2 cases show material e2e gains | Mutually exclusive with `torch.compile` and Cache-DiT; BCG takes priority. The model's default resolution is captured automatically; declare every additional production resolution. Current support is model-specific (Ideogram4, LTX-2/2.3, LongCat-Image, MiniMax-H3, Qwen-Image, SANA1.5, SANA-Video, Z-Image, GLM-Image), but an allowlisted model is not automatically a validated recipe. A valid run must log capture and no disable/failure/signature miss. `--warmup-resolutions` covers only `WxH`; video frame/conditioning mismatches can still fall back to Eager. MiniMax-H3 remains eager in the validated deployment because prompt-dependent packed host boundaries can miss the captured signature. |
 | **Warmup** | `--warmup-mode request` | Runs dummy forward passes to warm up CUDA caches, JIT, and `torch.compile`. Eliminates cold-start penalty. | Removes first-request latency spike | Adds startup time. Without `--warmup-resolutions`, warmup happens on first request. |
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
 | **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. For Wan2.2 video, start by benchmarking pure Ulysses before assuming a mixed Ulysses/Ring layout is fastest. |
@@ -59,7 +62,7 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 
 | Option | CLI Flag / Env Var | What It Does | Speedup | Quality Impact / Limitations |
 |---|---|---|---|---|
-| **Request Quality Fast Paths** | `--quality high` (`lossless` is default) | Mounts model-owned accelerated DiT/VAE paths that are validated for high quality but are not bit-exact to the reference path. | Model- and shape-specific | Support is per model and may be a no-op. Keep `--quality lossless` as the A/B ground truth. Do not confuse this with `--output-quality`, which controls file compression. |
+| **Request Quality Fast Paths** | `--quality high` (`lossless` is default) | Mounts model-owned accelerated DiT/VAE paths that are validated for high quality but are not bit-exact to the reference path. | Model- and shape-specific | Support is per model and may be a no-op. Keep `--quality lossless` as the A/B ground truth. Report aggregate and worst-frame SSIM/PSNR; defaults are 0.95/28 dB for images and 0.92/24 dB for video unless checked-in model metadata overrides them. Do not confuse this with `--output-quality`, which controls file compression. |
 | **Approximate Attention** | Server-wide: `--attention-backend sage_attn` / `sage_attn_3` / `sliding_tile_attn` / `video_sparse_attn` / `sparse_video_gen_2_attn` / `vmoba_attn` / `sla_attn` / `sage_sla_attn`. Per-request (dense drop-ins only): `--attention-backend-override sage_attn` sampling param / API `extra_body` — valid values `fa`, `torch_sdpa`, `sage_attn`, `sage_attn_3`; rejected (with a log) under BCG, torch.compile, sparse server backends, or a non-ring-capable target with ring parallelism. | Replaces exact attention with approximate or sparse variants. `sage_attn`: INT8/FP8 quantized Q·K; `sliding_tile_attn`: spatial-temporal tile skipping; others: model-specific sparse patterns. | ~1.5–2x on attention (varies by backend) | Quality degradation varies by backend and model. `sage_attn` is the most general; sparse backends (`sliding_tile_attn`, `video_sparse_attn`, etc.) are video-model-specific, may require config files (e.g. `--mask-strategy-file-path` for STA), and are server-level only. Requires corresponding packages installed. |
 | **Cache-DiT** | Native: per-request `--enable-cache-dit true\|false` + `--cache-dit-params <json>` (sampling params; also via API `extra_body`). `SGLANG_CACHE_DIT_ENABLED` / `SGLANG_CACHE_DIT_*` env vars are the server-wide defaults for requests that leave them unset. Diffusers backend: `--backend diffusers --cache-dit-config <yaml-or-json>` | Caches intermediate residuals across denoising steps and skips redundant computations via DBCache, TaylorSeer, and optional SCM. | ~1.5-2x on supported models | Quality depends on cache policy. Incompatible with `--dit-layerwise-offload`. Do not pass `--cache-dit-config` for native SGLang tuning unless you are intentionally using the diffusers backend flow. |
 | **CFG Gating** | Per-request `--cfg-gate-step 0.5` (sampling param; also via API `extra_body`). `SGLANG_DIFFUSION_CFG_GATE_STEP` is the server-wide default (1.0 = off). | After the given fraction of denoising steps, reuses the cached cond-uncond residual instead of running the unconditional branch each step. | Up to ~2x on the gated tail of CFG models (skips one of two branches) | Lossy; no-op without classifier-free guidance or with `--enable-cfg-parallel`. Lower fractions gate earlier and drift more. |
@@ -243,6 +246,21 @@ sglang serve --model-path Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers \
 Keep `torch.compile` off, declare every production resolution, and benchmark
 the exact prompt-length distribution. Add `--bcg-text-buckets` only when the
 default buckets create excessive padding or miss a served prompt signature.
+Do not keep the timing unless the log contains `[Diffusion BCG] captured` and
+contains no disable, capture-failure, or `serving signature MISSED` message.
+For video, also match the captured frame and conditioning shape; `WxH` alone
+does not prove replay.
+
+For a repeated discovery sweep, use the benchmark/profile helper. This runs
+lossless and high-quality Eager/BCG ABBA pairs on one GPU set, then deletes the
+model group cache once:
+
+```bash
+python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+  --model <PRESET> --quality-bcg-matrix \
+  --model-cache-root /path/to/task-owned/model-caches \
+  --cleanup-model-cache
+```
 
 ### Compare request-scoped high-quality fast paths
 
@@ -357,7 +375,7 @@ Use these as first commands to benchmark, not as universal winners.
 
 | Model family | First performance shape | Starting flags | Notes |
 |---|---|---|---|
-| MiniMax-H3 | 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video/audio steps | H200: `--num-gpus 4 --ulysses-degree 4 --performance-mode speed --enable-torch-compile false`; H100: TP2 + Ulysses2 | Root ID plus `--model-variant fl2va` for T2VA/FL2VA or `ref2va` for Ref2VA. Ulysses only; no Ring/CFG/SageAttention. Preserve tiled video-VAE decode. Profile joint denoise, video VAE, audio VAE/vocoder, encoder, and collectives separately. |
+| MiniMax-H3 | 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video/audio steps | H200: `--num-gpus 4 --ulysses-degree 4 --performance-mode speed --enable-torch-compile false --enable-breakable-cuda-graph false`; H100: TP2 + Ulysses2 | Root ID plus `--model-variant fl2va` for T2VA/FL2VA or `ref2va` for Ref2VA. Ulysses only; no Ring/CFG/SageAttention. Preserve tiled video-VAE decode. BCG is not part of the validated H3 recipe: warmup and serving can have different packed host boundaries, and a replay-capable experiment must still beat eager without excessive graph memory. Profile joint denoise, video VAE, audio VAE/vocoder, encoder, and collectives separately. |
 | FLUX.1 / FLUX.2 image | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
 | FLUX.2 Klein / Klein Base | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request --dit-layerwise-offload false` | Current registry has `black-forest-labs/FLUX.2-klein-4B`, `FLUX.2-klein-9B`, and base variants. Klein is step-distilled; Klein Base is not. |
 | Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup-mode request`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
@@ -366,7 +384,7 @@ Use these as first commands to benchmark, not as universal winners.
 | Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
 | Wan2.2 TI2V 5B | 1280x720, 81 frames, 1 GPU | `--enable-torch-compile --warmup-mode request` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
 | Wan2.1 / FastWan / TurboWan variants | 480p or 720p video, family defaults | `--enable-torch-compile --warmup-mode request`; add `--ulysses-degree` / CFG parallel only after measuring | Current registry includes Wan2.1, FastWan2.1, FastWan2.2 TI2V, TurboWan2.1, TurboWan2.2 I2V, and Wan2.1-Fun InP. Use the compatibility matrix and benchmark presets before choosing topology. |
-| Cosmos3 Nano / Super | T2I: 1024x1024 with `--num-frames 1`; T2V/I2V: 480p/720p video | `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` for benchmark isolation; `--enable-torch-compile --warmup-mode request` | One checkpoint serves T2I/T2V/I2V. Mode is request-driven: `num_frames == 1` means T2I, `--image-path` means I2V. |
+| Cosmos3 Nano / Super | T2I: 1024x1024 with `--num-frames 1`; T2V/I2V: 480p/720p video | Start with `--performance-mode auto --warmup-mode request`; use `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` only for benchmark isolation, and compare compile separately | One checkpoint serves T2I/T2V/I2V. Mode is request-driven: `num_frames == 1` means T2I, `--image-path` means I2V. On GPUs with at least 120 GiB available, auto mode keeps Cosmos3 Nano's DiT and VAE resident; a 1xH200 832x480x9f, 4-step eager ABBA reduced e2e from 1.576 to 0.428 seconds with exact output parity. The override is Nano-only; keep Super on its conservative multi-GPU policy. |
 | Cosmos3 Edge / distilled Super | Edge T2I: 640x640, 35 steps, 1 GPU; distilled Super T2I: 640x640, fixed 4-step schedule, 4 GPUs | Start eager with `--performance-mode manual`; use `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` only for benchmark isolation | Edge is trained for 256p/480p shapes. Distilled checkpoints own their sigma schedule and force guidance 1.0; do not override steps or flow shift. Do not retry the closed experimental Cosmos BCG path without a new lifecycle design. |
 | Ideogram 4 FP8/NVFP4 | 1024x1024, native preset defaults | `--enable-torch-compile --warmup-mode request` | Do not set `--num-inference-steps` or `--guidance-scale` directly unless you also update the Ideogram preset; sampling params derive them from `preset`. |
 | ERNIE-Image / GLM-Image / SANA / SD3 | 1024-class image, family defaults | `--enable-torch-compile --warmup-mode request`; disable offload only after checking VRAM | Treat these as current native image families. Start with benchmark/profile presets for ERNIE, GLM, and SANA; use registry/config defaults for SD3 unless you add a new preset. |
@@ -378,7 +396,7 @@ Use these as first commands to benchmark, not as universal winners.
 | JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
 | FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
-| LingBot Video MoE 30B | 384x640, 17 frames, 12 steps for the current GPU case | `--model-path robbyant/lingbot-video-moe-30b-a3b --text-encoder-cpu-offload` | Native T2V path. Prompts are structured JSON captions, not raw free text; keep that contract when comparing latency or quality. |
+| LingBot Video MoE 30B | 384x640, 17 frames, 12 steps for the current GPU case | `--model-path robbyant/lingbot-video-moe-30b-a3b --text-encoder-cpu-offload` | Native T2V path. Prompts are structured JSON captions, not raw free text; keep that contract when comparing latency or quality. Main still expands RMSNorm into PyTorch reduction chains; #35969 is an open `quality=high` Triton-dispatch candidate, not a current-main option until merged. |
 | MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
 
 ## Historical PR Watchlist
@@ -392,13 +410,19 @@ about whether the work has merged:
   default-resolution BCG warmup, #34210 Z-Image BCG correctness, #34305/#34314
   Ideogram eager fusions, #34584 Wan TI2V modulation/RoPE, #34616 FLUX2,
   #34617 Hunyuan, #34619 GLM, #34620 ERNIE, #34928 SANA, #34929 LTX2.3,
-  and #34932 Cosmos3. Re-check open/merged state before reusing a path.
+  #34932 Cosmos3, #35724 LongCat BCG, #35728 SANA-Video high-quality linear
+  attention, and #35729 SANA-Video BCG. #35961/#35969/#35981 are open
+  SANA-Video, LingBot, and Wan VAE candidates. Re-check open/merged state
+  before reusing a path.
 - VAE/decode: #22531 LTX2 parallel VAE, #20927 batched tiled VAE decode.
 - Runtime/parallel/cache: #22805 FLUX.2 packed QKV for A2A, #21742 hybrid attention schedule, #24053 USP replicated-prefix fix, #21613 TeaCache refactor, #24227 WanVideo TeaCache fix, #18764 dynamic batching, #24200 disaggregated diffusion.
 
 ## Tips
 
 - **Benchmarking**: establish eager first (`--performance-mode manual`, compile/BCG/cache off), always use `--warmup-mode request`, and look for the line ending with `(with warmup excluded)` for accurate timing. Add compile or BCG as separate labeled controls.
+- **PR gate**: use repeated same-GPU ABBA measurements and saved-request wall
+  time. Require at least 1.5% mean e2e improvement for this optimization sweep;
+  attach a representative baseline/candidate profile and generated-media A/B.
 - **Checkpoint cleanup**: finish every variant for one model, then delete only
   its task-owned cache and verify the cleanup ledger reports zero residual
   weight files. Never point cleanup at a shared Hugging Face or ModelScope cache.

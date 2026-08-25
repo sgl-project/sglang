@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -236,6 +237,13 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             req_to_token_pool=None,
             model_config=SimpleNamespace(context_len=2048),
         )
+        # The backend takes the mode from the published configuration, not from
+        # the runner it is handed.
+        override = get_context().override_server_args(
+            speculative_attention_mode=spec_mode
+        )
+        override.install()
+        self.addCleanup(override.restore)
         return HybridAttnBackend(runner, backend(prefill_flag), backend(decode_flag))
 
     def test_delegation(self):
