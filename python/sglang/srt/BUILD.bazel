@@ -7,9 +7,48 @@ package(default_visibility = ["//python/sglang:__subpackages__"])
 py_library(
     name = "environ",
     srcs = ["environ.py"],
-    imports = ["python"],
+    imports = ["../.."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
+    ],
+)
+
+py_library(
+    name = "runtime_sources",
+    srcs = glob(
+        ["**/*.py"],
+        exclude = [
+            "**/*_test.py",
+            "**/test_*.py",
+            "**/tests/**",
+            "environ.py",
+        ],
+    ),
+    data = glob(
+        [
+            "**/*.c",
+            "**/*.cc",
+            "**/*.cpp",
+            "**/*.cu",
+            "**/*.cuh",
+            "**/*.h",
+            "**/*.hpp",
+            "**/*.jinja",
+            "**/*.jinja2",
+            "**/*.json",
+            "**/*.txt",
+            "**/*.yaml",
+            "**/*.yml",
+        ],
+        allow_empty = True,
+        exclude = ["**/tests/**"],
+    ),
+    imports = ["../.."],
+    deps = [
+        ":environ",
+        "//python/sglang/srt/utils:runtime_sources",
+        "//python/sglang/srt/utils/hf_transformers:runtime_sources",
+        "//python/sglang/srt/weight_cache:runtime_sources",
     ],
 )

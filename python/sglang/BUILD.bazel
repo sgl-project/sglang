@@ -1,13 +1,88 @@
 load("@rules_python//python:defs.bzl", "py_library")
+load("@runtime_import//:requirements.bzl", "requirement")
 
 package(default_visibility = ["//visibility:private"])
 
 py_library(
     name = "version",
     srcs = ["version.py"],
-    imports = ["python"],
+    imports = [".."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
+    ],
+)
+
+# Source-complete package surface for Bazel-owned import and CLI targets.
+# Accelerator extensions remain wheel dependencies; this target declares the
+# repository Python and runtime data that those wheels plug into.
+py_library(
+    name = "runtime_sources",
+    srcs = glob(
+        [
+            "*.py",
+            "cli/**/*.py",
+            "lang/**/*.py",
+        ],
+        exclude = ["version.py"],
+    ),
+    imports = [".."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":version",
+        "//python/sglang/kernels:runtime_sources",
+        "//python/sglang/srt:runtime_sources",
+        requirement("aiohttp"),
+        requirement("anthropic"),
+        requirement("blobfile"),
+        requirement("build"),
+        requirement("compressed-tensors"),
+        requirement("datasets"),
+        requirement("dill"),
+        requirement("easydict"),
+        requirement("einops"),
+        requirement("fastapi"),
+        requirement("gguf"),
+        requirement("huggingface-hub"),
+        requirement("interegular"),
+        requirement("ipython"),
+        requirement("llguidance"),
+        requirement("mistral-common"),
+        requirement("modelscope"),
+        requirement("msgspec"),
+        requirement("ninja"),
+        requirement("numpy"),
+        requirement("openai"),
+        requirement("openai-harmony"),
+        requirement("orjson"),
+        requirement("outlines"),
+        requirement("packaging"),
+        requirement("partial-json-parser"),
+        requirement("pillow"),
+        requirement("prometheus-client"),
+        requirement("psutil"),
+        requirement("pybase64"),
+        requirement("pydantic"),
+        requirement("python-multipart"),
+        requirement("pyzmq"),
+        requirement("requests"),
+        requirement("scipy"),
+        requirement("sentencepiece"),
+        requirement("setproctitle"),
+        requirement("smg-grpc-servicer"),
+        requirement("soundfile"),
+        requirement("starlette"),
+        requirement("tiktoken"),
+        requirement("timm"),
+        requirement("torch"),
+        requirement("torchvision"),
+        requirement("tqdm"),
+        requirement("transformers"),
+        requirement("triton"),
+        requirement("uvicorn"),
+        requirement("uvloop"),
+        requirement("xgrammar"),
+        requirement("xxhash"),
+        requirement("zstandard"),
     ],
 )

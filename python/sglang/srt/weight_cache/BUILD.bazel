@@ -8,7 +8,7 @@ package(default_visibility = ["//python/sglang:__subpackages__"])
 py_library(
     name = "protocol",
     srcs = ["protocol.py"],
-    imports = ["python"],
+    imports = ["../../.."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
@@ -17,4 +17,13 @@ py_library(
         "//python/sglang/srt/utils:safe_pickle",
         requirement("msgspec"),
     ],
+)
+
+py_library(
+    name = "runtime_sources",
+    srcs = glob(
+        ["*.py"],
+        exclude = ["test_*.py"],
+    ),
+    imports = ["../../.."],
 )

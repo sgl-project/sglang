@@ -1,0 +1,58 @@
+# CPU dependencies for the Bazel-owned public API, CLI, and Engine-module
+# import smoke test. This tracks the runtime portion of pyproject_cpu.toml.
+#
+# Exact cp312/manylinux CPU wheels keep this profile runnable on hosted x86_64
+# builders without letting the PyTorch wheel index shadow unrelated packages.
+# Other architectures and accelerators require separate ABI-specific hubs.
+aiohttp
+anthropic>=0.20.0
+blobfile==3.0.0
+build
+compressed-tensors
+datasets
+dill
+easydict
+einops
+fastapi
+gguf
+huggingface-hub>=1.5.0,<2.0
+interegular
+ipython
+llguidance>=1.7.6,<2.0.0
+mistral-common>=1.11.5
+modelscope
+msgspec
+ninja
+numpy
+openai==2.6.1
+openai-harmony==0.0.4
+orjson
+outlines==0.1.11
+packaging
+partial-json-parser
+pillow
+prometheus-client>=0.20.0
+psutil
+pybase64
+pydantic
+python-multipart
+pyzmq>=25.1.2
+requests
+scipy
+sentencepiece
+setproctitle
+smg-grpc-servicer>=0.5.0
+soundfile==0.13.1
+starlette
+tiktoken
+timm==1.0.16
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5e3dc83725581fa38b7b2e45c58692e30b2a3cde19191af54b675ffcac3840a6
+torchvision @ https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=912a8b008d95fc9f8f8507e0663238aa01abfeb29f38e218116217560a1b6401
+tqdm
+transformers==5.12.1
+triton @ https://download-r2.pytorch.org/whl/triton-3.7.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=1f70c2b92b45a1ad978f9cc04872fec0ba2c838bfb975c1f6369d4ce4d83f54e
+uvicorn
+uvloop
+xgrammar==0.2.1
+xxhash
+zstandard

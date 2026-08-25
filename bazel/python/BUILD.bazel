@@ -7,6 +7,8 @@ exports_files([
     "hf_management.requirements.in",
     "hf_management.requirements.lock.txt",
     "profiles.json",
+    "runtime_import.requirements.in",
+    "runtime_import.requirements.lock.txt",
     "srt_empty_bootstrap.requirements.in",
     "srt_empty_bootstrap.requirements.lock.txt",
 ])
@@ -15,6 +17,17 @@ uv_lock(
     name = "hf_management_requirements",
     srcs = ["hf_management.requirements.in"],
     out = "hf_management.requirements.lock.txt",
+    args = [
+        "--python-version",
+        "3.12",
+    ],
+    tags = ["manual"],
+)
+
+uv_lock(
+    name = "runtime_import_requirements",
+    srcs = ["runtime_import.requirements.in"],
+    out = "runtime_import.requirements.lock.txt",
     args = [
         "--python-version",
         "3.12",

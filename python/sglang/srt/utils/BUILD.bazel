@@ -5,7 +5,7 @@ package(default_visibility = ["//python/sglang:__subpackages__"])
 py_library(
     name = "safe_pickle",
     srcs = ["safe_pickle.py"],
-    imports = ["python"],
+    imports = ["../../.."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
@@ -15,10 +15,29 @@ py_library(
 py_library(
     name = "hf_transformers_patches",
     srcs = ["hf_transformers_patches.py"],
-    imports = ["python"],
+    imports = ["../../.."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
     ],
     deps = ["//python/sglang/srt:environ"],
+)
+
+py_library(
+    name = "runtime_sources",
+    srcs = glob(
+        ["**/*.py"],
+        exclude = [
+            "**/*_test.py",
+            "**/test_*.py",
+            "**/tests/**",
+            "hf_transformers_patches.py",
+            "safe_pickle.py",
+        ],
+    ),
+    imports = ["../../.."],
+    deps = [
+        ":hf_transformers_patches",
+        ":safe_pickle",
+    ],
 )

@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -34,4 +35,19 @@ sh_test(
         "requires-gpu",
     ],
     target_compatible_with = ["//bazel/platforms:cuda"],
+)
+
+# Bazel owns the interpreter, repository sources, runtime data, and every
+# third-party wheel on this CPU import/CLI path. It imports Engine without
+# instantiating it; accelerator startup additionally needs platform wheels.
+py_binary(
+    name = "sglang_cli",
+    srcs = ["sglang_cli.py"],
+    deps = ["//python/sglang:runtime_sources"],
+)
+
+py_test(
+    name = "runtime_import_test",
+    srcs = ["runtime_import_test.py"],
+    deps = ["//python/sglang:runtime_sources"],
 )

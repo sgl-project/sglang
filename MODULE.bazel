@@ -75,9 +75,15 @@ pip.parse(
     python_version = "3.12",
     requirements_lock = "//bazel/python:hf_management.requirements.lock.txt",
 )
+pip.parse(
+    hub_name = "runtime_import",
+    python_version = "3.12",
+    requirements_lock = "//bazel/python:runtime_import.requirements.lock.txt",
+)
 use_repo(
     pip,
     "hf_management",
+    "runtime_import",
     "srt_empty_bootstrap",
 )
 

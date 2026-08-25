@@ -3,6 +3,7 @@ package(default_visibility = ["//visibility:public"])
 test_suite(
     name = "bazel_smoke",
     tests = [
+        "//bazel/integration:runtime_import_test",
         "//bazel/python:torch_free_tests",
         "//rust/sglang-mm:rlib_is_single_threaded_test",
     ],

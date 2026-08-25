@@ -13,12 +13,42 @@ py_library(
         "selector.py",
         "spec.py",
     ],
-    imports = ["python"],
+    imports = ["../.."],
     visibility = [
         "//bazel/python:__subpackages__",
         "//python/sglang:__subpackages__",
     ],
     deps = [requirement("msgspec")],
+)
+
+# Python/JIT side of the installed sglang.kernels package.  The AOT
+# sgl_kernel extension is a separate wheel and is intentionally not folded
+# into this source target.
+py_library(
+    name = "runtime_sources",
+    srcs = glob(
+        ["**/*.py"],
+        exclude = [
+            "**/*_test.py",
+            "**/benchmark/**",
+            "**/test_*.py",
+            "**/tests/**",
+        ],
+    ),
+    data = glob(
+        [
+            "jit/**",
+            "ops/**",
+        ],
+        allow_empty = True,
+        exclude = [
+            "**/*.py",
+            "**/benchmark/**",
+            "**/tests/**",
+        ],
+    ),
+    imports = ["../.."],
+    visibility = ["//python/sglang:__pkg__"],
 )
 
 # Host-only core of the speculative n-gram corpus. The TVM-FFI adapter remains

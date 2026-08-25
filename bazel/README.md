@@ -29,17 +29,19 @@ bazel build --config=cpu //:bazel_components
 # Update checked Python locks.
 bazel run //bazel/python:srt_empty_bootstrap_requirements.update
 bazel run //bazel/python:hf_management_requirements.update
+bazel run //bazel/python:runtime_import_requirements.update
 
-# Smallest real Engine execution path. The current hardware CI image must
-# already contain SGLang's CUDA runtime wheels and Qwen3 config metadata.
-bazel test --config=cuda //bazel/integration:dummy_model_e2e
+# Repository CLI and widest CPU runtime import boundary. Both use Bazel's
+# Python toolchain, checked wheels, SGLang sources, and runtime data.
+bazel run --config=cpu //bazel/integration:sglang_cli -- version
+bazel test --config=cpu //bazel/integration:runtime_import_test
 ```
 
 ## Ownership boundaries
 
 | Boundary | Initial Bazel ownership | Current release authority |
 | --- | --- | --- |
-| Python profiles | `bazel/python/profiles.json` validates manifest/extra selection; each accelerator gets a separate future lock hub | `python/pyproject*.toml` |
+| Python profiles | `bazel/python/profiles.json` validates manifest/extra selection; `runtime_import` is the checked Linux x86_64/cp312 CPU import lock; each accelerator gets a separate future lock hub | `python/pyproject*.toml` |
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
 | Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_core` compiles the host C++ core; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
@@ -97,8 +99,8 @@ analysis.
 
 ### 3. Integration and artifact parity
 
-- Run the dummy-weight, tokenizer-free Engine smoke under the existing GPU CI
-  runtime (`//bazel/integration:dummy_model_e2e`).
+- Extend `//bazel/integration:runtime_import_test` to the dummy-weight,
+  tokenizer-free Engine smoke after the CUDA wheel closure is declared.
 - Add a real-weight Qwen2 0.5B Bazel smoke after model data and native wheels
   are immutable inputs.
 - Compare Bazel and existing wheel manifests, Python ABI tags, exported
@@ -107,7 +109,20 @@ analysis.
 - Make a Bazel artifact authoritative only after parity on every supported
   hardware/Python matrix entry.
 
-The current E2E target is intentionally tagged `local` and `manual`: Bazel owns
-the target/platform boundary, while the existing CI installer still supplies
-torch and native wheels. Removing that transitional dependency is a Phase 2
-acceptance criterion, not something hidden behind ambient host discovery.
+`runtime_import` pins cp312/manylinux CPU Torch, TorchVision, and Triton wheels
+by URL and digest, then imports the real `Engine` class. A dummy Engine startup
+probe reaches `sglang.kernels.ops.kvcache.cache_move` and stops precisely at
+`sgl_kernel.copy_all_layer_kv_cache_cpu`: the CPU `sgl_kernel` extension is
+built by the platform wheel and is not available as an independent CPU wheel.
+
+A CUDA Engine target therefore needs a separate Linux/Python/CUDA hub. The
+current CUDA manifest's accelerator-native closure includes `torch==2.13.0`,
+`sglang-kernel==0.4.6.post1`, `flashinfer-python[cu13]==0.6.17`,
+`flash-attn-4>=4.0.0b18`, `humming-kernels[cu13]==0.1.12`,
+`quack-kernels==0.6.4`, `sgl-deep-gemm==0.1.5.post3`,
+`sgl-deep-ep==0.1.2`, `cuda-python>=13.0`, `cuda-tile==1.6.0rc5`,
+`nvidia-cutlass-dsl[cu13]==4.6.2`, `nvidia-mathdx==25.6.0`,
+`tilelang==0.1.12`, `tokenspeed-mla==0.1.8`, and
+`torch-memory-saver>=0.0.9.post1`. The tiny model configuration must also be a
+declared runtime artifact. Using installed site-packages or a mutable Hugging
+Face cache would hide those ABI and data boundaries.

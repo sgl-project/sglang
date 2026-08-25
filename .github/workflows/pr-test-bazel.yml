@@ -11,14 +11,11 @@ on:
       - "**/BUILD.bazel"
       - "bazel/**"
       - "python/pyproject*.toml"
-      - "python/sglang/kernels/{registry,selector,spec}.py"
-      - "python/sglang/kernels/jit/csrc/ngram_corpus/**"
-      - "python/sglang/srt/environ.py"
-      - "python/sglang/srt/utils/hf_transformers/common.py"
-      - "python/sglang/srt/utils/hf_transformers/hub.py"
-      - "python/sglang/srt/utils/hf_transformers_patches.py"
-      - "python/sglang/srt/utils/safe_pickle.py"
-      - "python/sglang/srt/weight_cache/protocol.py"
+      - "python/sglang/*.py"
+      - "python/sglang/cli/**"
+      - "python/sglang/kernels/**"
+      - "python/sglang/lang/**"
+      - "python/sglang/srt/**"
       - "rust/Cargo.*"
       - "rust/sglang-grpc/**"
       - "rust/sglang-mm/**"
@@ -33,14 +30,11 @@ on:
       - "**/BUILD.bazel"
       - "bazel/**"
       - "python/pyproject*.toml"
-      - "python/sglang/kernels/{registry,selector,spec}.py"
-      - "python/sglang/kernels/jit/csrc/ngram_corpus/**"
-      - "python/sglang/srt/environ.py"
-      - "python/sglang/srt/utils/hf_transformers/common.py"
-      - "python/sglang/srt/utils/hf_transformers/hub.py"
-      - "python/sglang/srt/utils/hf_transformers_patches.py"
-      - "python/sglang/srt/utils/safe_pickle.py"
-      - "python/sglang/srt/weight_cache/protocol.py"
+      - "python/sglang/*.py"
+      - "python/sglang/cli/**"
+      - "python/sglang/kernels/**"
+      - "python/sglang/lang/**"
+      - "python/sglang/srt/**"
       - "rust/Cargo.*"
       - "rust/sglang-grpc/**"
       - "rust/sglang-mm/**"
@@ -86,5 +80,6 @@ jobs:
           git diff --exit-code -- \
             MODULE.bazel.lock \
             bazel/python/hf_management.requirements.lock.txt \
+            bazel/python/runtime_import.requirements.lock.txt \
             bazel/python/srt_empty_bootstrap.requirements.lock.txt \
             bazel/rust/sglang-crates.lock.json
