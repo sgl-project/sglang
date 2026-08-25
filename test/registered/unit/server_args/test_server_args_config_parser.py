@@ -9,11 +9,12 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestConfigArgumentMerger(unittest.TestCase):
+class TestConfigArgumentMerger(CustomTestCase):
     def test_canonical_store_action_wins_shared_destination(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--mamba-radix-cache-strategy")
