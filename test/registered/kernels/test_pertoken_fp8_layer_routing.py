@@ -1,12 +1,11 @@
-"""Genuine layer-path routing test for the per-token fp8 fold (PR #34502, MI35x).
+"""Genuine layer-path routing test for the per-token fp8 fold (MI35x).
 
 Unlike the kernel-level parity test (which calls ``apply_fp8_linear`` directly),
 this drives the fold's ``(fp8, scale[M,1], dtype)`` tuple through a REAL
 ``ColumnParallelLinear`` whose weight is quantized AND preshuffled by the actual
 Quark ``W8A8Fp8`` scheme -- ``create_weights`` -> load -> ``process_weights_after_
 loading`` (which runs ``shuffle_weight`` and sets ``_fp8_weight_preshuffled``) --
-then calls ``layer.forward()``. That exercises the production routing the reviewer
-asked for:
+then calls ``layer.forward()``. That exercises the production routing:
 
     ColumnParallelLinear.forward
         -> quant_method.apply (QuarkLinearMethod)

@@ -125,7 +125,7 @@ def _try_fused_allreduce_rmsnorm_quant(
     ``fuse_quant`` is opt-in per model: enable it only once the model's consumers
     can ingest the quantized tuple. hidden_states comes back as
     ``(quant, scale)``, or ``(bf16, quant, scale)`` under ``emit_bf16`` for
-    consumers that also need the unquantized bf16 (Qwen3.5 GDN ``in_proj_ba``).
+    layers that also feed an unquantized bf16 projection off the same norm.
     """
     if not fuse_quant:
         return None
@@ -180,7 +180,7 @@ def _try_fused_allreduce_rmsnorm_quant(
 
     # FP8 per-token fused AR+RMSNorm+quant. Engages when the consumer GEMM
     # expects per-token (1xK) activation scales (SGLANG_USE_AITER_FP8_PER_TOKEN),
-    # e.g. a MXFP4-AttnFP8 model whose attention/GDN input projections are FP8.
+    # i.e. entry projections carrying per-channel FP8 weights.
     # Shares the SGLANG_DISABLE_FUSED_AR_QUANT opt-out with the per-group path.
     if (
         quant_format == "fp8_per_token"
@@ -707,7 +707,7 @@ class LayerCommunicator:
                         fuse_quant=fuse_quant,
                     )
                     # Else per-group FP8 fused path (opt-in via
-                    # enable_fused_ar_quant, #24651). Needs a positive per-group
+                    # enable_fused_ar_quant). Needs a positive per-group
                     # FP8 signal (quant_format == "fp8"); an empty quant_format
                     # means a bf16 consumer that must get a plain tensor, not a
                     # (fp8, scale) tuple. "fp8_per_token"/"mxfp4" handled above.
@@ -720,15 +720,13 @@ class LayerCommunicator:
                             "forward_with_allreduce_fusion_quant_per_token",
                         )
                     ):
-                        # Kimi PTPC: fold entry-proj per-token fp8 quant into the
-                        # fused AR+RMSNorm kernel when fuse_quant is not set (Qwen
-                        # uses fuse_quant=True via _try_fused_allreduce above).
-                        quant_result = (
-                            self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
-                                hidden_states,
-                                residual,
-                                use_attn_tp_group=False,
-                            )
+                        # Fold the entry-proj per-token fp8 quant into the fused
+                        # AR+RMSNorm kernel for models that report the format
+                        # without opting into fuse_quant above.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
                         )
                     elif (
                         quant_result is None
@@ -834,8 +832,8 @@ class LayerCommunicator:
                     ):
                         # gemma_weight (weight + 1) makes the aiter rmsnorm match
                         # GemmaRMSNorm; plain RMSNorm falls back to raw weight.
-                        # emit_bf16 (GDN in_proj_ba sidecar) is unsupported by
-                        # this 2-tuple fast path, so those layers use plain norm.
+                        # emit_bf16 (bf16 sidecar) is unsupported by this 2-tuple
+                        # fast path, so those layers use plain norm.
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
                             getattr(
@@ -903,7 +901,7 @@ class LayerCommunicator:
                         and not emit_bf16
                     ):
                         # See the residual-is-None branch above: gemma_weight for
-                        # Gemma norms, and ``emit_bf16`` layers (GDN bf16 sidecar)
+                        # Gemma norms, and ``emit_bf16`` layers (bf16 sidecar)
                         # fall through to the plain fused norm below.
                         if post_residual_addition is not None:
                             residual = residual + post_residual_addition

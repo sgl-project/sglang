@@ -387,8 +387,8 @@ def _forward_with_allreduce_fusion_quant_per_token(
     """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter path).
 
     Per-token counterpart of ``_forward_with_allreduce_fusion_quant_per_group``,
-    for FP8 GEMM consumers needing per-token (1xK) activation scales (Kimi PTPC
-    entry projections, Qwen3.5 attention ``qkv_proj`` / GDN ``in_proj_qkvz``).
+    for FP8 GEMM consumers needing per-token (1xK) activation scales, i.e. entry
+    projections carrying per-channel FP8 weights.
 
     Returns ``((fp8, scale, orig_dtype), residual)`` when ``keep_bf16=False``;
     ``((bf16, fp8, scale), residual)`` when ``keep_bf16=True``; or ``None`` if
@@ -427,7 +427,7 @@ def _forward_with_allreduce_fusion_quant_per_token(
 
     # Preferred: single kernel collapsing AR+RMSNorm and the per-token quant.
     # It emits no bf16 sidecar, so it only serves keep_bf16=False; keep_bf16
-    # (GDN bf16 gating consumer) uses the 2-kernel fallback below.
+    # (bf16 gating consumer) uses the 2-kernel fallback below.
     if not keep_bf16:
         result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
             x, residual, weight, norm_module.variance_epsilon
@@ -1018,7 +1018,7 @@ class RMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
     ):
-        """Alias for ``forward_with_allreduce_fusion_quant_per_token`` (Kimi PTPC)."""
+        """Alias for ``forward_with_allreduce_fusion_quant_per_token``."""
         return self.forward_with_allreduce_fusion_quant_per_token(
             x, residual, use_attn_tp_group, keep_bf16=False
         )

@@ -95,7 +95,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
                     expected = metric["value"]
                     measured = results["results"][task["name"]][metric["name"]]
                     passed = bool(np.isclose(expected, measured, rtol=rtol))
-                    status = "✅" if passed else "❌"
+                    status = "PASS" if passed else "FAIL"
                     summary += f"| {task['name']} | {metric['name']} | {expected:.4f} | {measured:.4f} | {status} |\n"
                     print(
                         f"{task['name']} | {metric['name']}: "
@@ -112,7 +112,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
 
 
 class TestQwen35MXFP4AttnFP8ARFusionMI35x(TestQwen35EvalMI35x):
-    """Same eval with the fused AR+RMSNorm+quant path (PR #29723) enabled.
+    """Same eval with the fused AR+RMSNorm+quant path enabled.
 
     `--enable-aiter-allreduce-fusion` folds the TP all-reduce, the following
     RMSNorm and the per-token quant of the next GEMM into one aiter kernel. This

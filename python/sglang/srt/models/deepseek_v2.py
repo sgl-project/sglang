@@ -2439,7 +2439,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # ("fp8_per_token"): folds the entry-proj activation quant into
             # input_layernorm so the standalone per-token quant before
             # fused_qkv_a_proj_with_mqa is eliminated. Gated on the real layout
-            # contract (dynamic, per-channel, preshuffled) — per-tensor / static
+            # contract (dynamic, per-channel, preshuffled): per-tensor / static
             # / non-preshuffled fp8 must keep the bf16 + separate-quant path.
             if _is_per_channel_dynamic_fp8(proj):
                 return "fp8_per_token"

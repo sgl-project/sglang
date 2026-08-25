@@ -1,7 +1,7 @@
 """Unit tests for the fused per-token FP8 eligibility predicate.
 
 Covers ``_is_per_channel_dynamic_fp8`` in
-``srt/models/deepseek_common/utils.py`` — the gate that decides whether a
+``srt/models/deepseek_common/utils.py``, the gate that decides whether a
 projection's activation quant may be folded into the upstream RMSNorm and its
 ``(fp8, per-token scale)`` tuple fed straight to ``gemm_a8w8_bpreshuffle``.
 
@@ -16,7 +16,7 @@ This guards the real regressions: per-tensor / static-input-scale / block-scale
 / non-preshuffled fp8 must NOT be folded; a scale sized to the input dim ``K``
 must NOT be accepted; a per-channel scale (1-D or 2-D) MUST be folded.
 
-Pure logic, no server/engine — runs on CPU CI.
+Pure logic, no server/engine: runs on CPU CI.
 """
 
 import types

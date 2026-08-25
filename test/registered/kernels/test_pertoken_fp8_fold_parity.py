@@ -4,13 +4,12 @@ Compares the "direct-write" pre-quantized tuple path (what the fused
 RMSNorm+quant fold feeds into ``apply_fp8_linear``) against the standard
 non-tuple path that quantizes the activation itself, and checks:
 
-  * numerical parity  — feeding a pre-quantized ``(fp8, per-token scale)`` tuple
+  * numerical parity: feeding a pre-quantized ``(fp8, per-token scale)`` tuple
     produces the same GEMM output as the standard path (same quant kernel, same
     ``gemm_a8w8_bpreshuffle``), and
-  * dtype preservation — the tuple path honors the carried original dtype, so an
-    FP16 activation stays FP16 and is NOT silently promoted to BF16 (review
-    blocker 2), while a 2-tuple (no dtype) falls back to ``pre_quant_output_dtype``
-    or BF16.
+  * dtype preservation: the tuple path honors the carried original dtype, so an
+    FP16 activation stays FP16 and is NOT silently promoted to BF16, while a
+    2-tuple (no dtype) falls back to ``pre_quant_output_dtype`` or BF16.
 
 Requires ROCm/aiter on gfx95 (MI35x); skipped elsewhere.
 """

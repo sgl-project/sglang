@@ -14,7 +14,7 @@ used by SGLang on ROCm/aiter for Qwen3.5-style models:
          _mxfp4_quant.
 
 Supported quant variants (``--quant``):
-  * per_group - #24651's per-1x128 FP8 path (default; numeric correctness).
+  * per_group - per-1x128 FP8 path (default; numeric correctness).
   * per_token - per-1x1 (per-token) FP8 path (numeric correctness).
   * mxfp4     - per-1x32 microscaling FP4 path (bf16-domain correctness; the
                 fp4 payload is checked structurally).
@@ -26,12 +26,12 @@ Default shape sets cover the Qwen3.5-397B-A17B layout:
   * Decode batch sizes 1-512 covering typical steady-state running_req values.
 
 Usage:
-  # per-group FP8 (original #24651 path)
+  # per-group FP8 (original path)
   torchrun --nproc_per_node=8 \
     benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
     --dtype bf16 --quant per_group --group-size 128
 
-  # per-token FP8 / mxfp4 paths added on top of #24651
+  # per-token FP8 / mxfp4 paths added on top of the per-group path
   torchrun --nproc_per_node=8 \
     benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
     --dtype bf16 --quant per_token
@@ -69,9 +69,9 @@ from sglang.srt.distributed.parallel_state import (
 Shape = Tuple[int, int]
 FP8_DTYPE = torch.float8_e4m3fnuz
 
-# Quant variants this benchmark can target. The default (per_group) is #24651's
+# Quant variants this benchmark can target. The default (per_group) is the
 # original per-1x128 FP8 path; per_token and mxfp4 exercise the entry points added
-# on top of #24651 (MXFP4-AttnFP8 / plain-MXFP4 checkpoints).
+# on top of it (per-channel-FP8 attention / plain-MXFP4 checkpoints).
 QUANT_CHOICES = ("per_group", "per_token", "mxfp4")
 
 
@@ -510,7 +510,7 @@ def main() -> None:
         choices=QUANT_CHOICES,
         help=(
             "Quant variant of the fused AR+RMSNorm+quant kernel to benchmark: "
-            "per_group (#24651 per-1x128 FP8), per_token (per-1x1 FP8), or "
+            "per_group (per-1x128 FP8), per_token (per-1x1 FP8), or "
             "mxfp4 (per-1x32 microscaling). group_size only applies to per_group."
         ),
     )
