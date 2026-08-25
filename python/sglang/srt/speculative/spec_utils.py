@@ -796,6 +796,23 @@ def _verify_commit_step_indices(
     mamba-track interval-crossing step (-1 = no crossing; None when tracking
     is off)."""
     bs = accept_lens.shape[0]
+    if accept_index.is_cuda:
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_commit_track_indices,
+        )
+
+        track_interval = (
+            get_exec().mamba.mamba_track_interval
+            if batch.mamba_track_indices is not None
+            else 0
+        )
+        return fused_commit_track_indices(
+            accept_index.contiguous(),
+            accept_lens,
+            batch.seq_lens if track_interval > 0 else None,
+            draft_token_num,
+            track_interval,
+        )
     accept_indices_offset = torch.arange(
         0,
         bs * draft_token_num,
