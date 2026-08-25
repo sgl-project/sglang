@@ -98,7 +98,7 @@ import { KimiK27CodeDeployment } from '/src/snippets/autoregressive/kimi-k27-cod
 - **Reasoning Parser**: Add `--reasoning-parser kimi_k2` to separate thinking and content in model outputs.
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
 - **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
-- **MXFP4 Checkpoint**: The [MXFP4 checkpoint](https://huggingface.co/amd/Kimi-K2.7-Code-MXFP4) is validated on MI350X/MI355X (TP=4) with the `rocm/sgl-dev:v0.5.16-rocm720-mi35x-20260804` image (ROCm 7.2). Select `MXFP4` in the Quantization control to target `amd/Kimi-K2.7-Code-MXFP4`. The MXFP4 quantization is auto-detected from the checkpoint, so no `--quantization` flag is required; the generator uses `--mem-fraction-static 0.765` and FP8 KV cache for MXFP4.
+- **MXFP4 Checkpoint**: The [MXFP4 checkpoint](https://huggingface.co/amd/Kimi-K2.7-Code-MXFP4) is validated on MI350X/MI355X (TP=4) with the `rocm/sgl-dev:v0.5.17-rocm720-mi35x-20260812` image (ROCm 7.2). Select `MXFP4` in the Quantization control to target `amd/Kimi-K2.7-Code-MXFP4`. The MXFP4 quantization is auto-detected from the checkpoint, so no `--quantization` flag is required; the generator emits the AITER/ROCm environment block plus `--attention-backend aiter`, `--mem-fraction-static 0.90`, FP8 KV cache, `--disable-radix-cache`, and `--enable-aiter-allreduce-fusion`. The reasoning and tool-call parsers are auto-detected, so they are not passed explicitly.
 
 ## 4. Model Invocation
 
@@ -504,18 +504,29 @@ sglang serve \
 
 For GB300, use `--tp 4`.
 
-Deploy the MXFP4 checkpoint on AMD MI350X/MI355X:
+Deploy the MXFP4 checkpoint on AMD MI350X/MI355X (reasoning and tool-call parsers are auto-detected from the checkpoint):
 
 ```shell Command
-SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0 \
+SGLANG_USE_AITER=1 \
+HIP_FORCE_DEV_KERNARG=1 \
+SGLANG_EXPERT_PARALLEL_SIZE=1 \
+SGLANG_USE_DYNAMIC_MXFP4_LINEAR=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+TENSILE_STREAMK_DYNAMIC_GRID=6 \
+AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
+AITER_USE_FLYDSL_MOE_SORTING=1 \
+AITER_AR_1STAGE_MAX_KB=512 \
+AITER_MXFP4_INTERMEDIATE=1 \
+ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
 sglang serve \
   --model-path amd/Kimi-K2.7-Code-MXFP4 \
   --tp 4 \
-  --mem-fraction-static 0.765 \
   --trust-remote-code \
-  --reasoning-parser kimi_k2 \
-  --tool-call-parser kimi_k2 \
+  --attention-backend aiter \
+  --mem-fraction-static 0.90 \
   --kv-cache-dtype fp8_e4m3 \
+  --disable-radix-cache \
+  --enable-aiter-allreduce-fusion \
   --host 0.0.0.0 \
   --port 30000
 ```

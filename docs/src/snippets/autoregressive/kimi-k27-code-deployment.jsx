@@ -28,6 +28,7 @@ export const KimiK27CodeDeployment = () => {
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
+      condition: (values) => values.quantization !== 'mxfp4',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled', label: 'Enabled', default: true },
@@ -36,6 +37,7 @@ export const KimiK27CodeDeployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
+      condition: (values) => values.quantization !== 'mxfp4',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled', label: 'Enabled', default: true },
@@ -44,6 +46,7 @@ export const KimiK27CodeDeployment = () => {
     dpattention: {
       name: 'dpattention',
       title: 'DP Attention',
+      condition: (values) => values.quantization !== 'mxfp4',
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency', default: true },
         { id: 'enabled', label: 'Enabled', subtitle: 'High Throughput', default: false },
@@ -128,7 +131,38 @@ export const KimiK27CodeDeployment = () => {
     const isMXFP4 = quantization === 'mxfp4';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
-    const modelName = isMXFP4 ? 'amd/Kimi-K2.7-Code-MXFP4' : 'moonshotai/Kimi-K2.7-Code';
+
+    if (isMXFP4) {
+      const mxfp4Env = [
+        'SGLANG_USE_AITER=1',
+        'HIP_FORCE_DEV_KERNARG=1',
+        'SGLANG_EXPERT_PARALLEL_SIZE=1',
+        'SGLANG_USE_DYNAMIC_MXFP4_LINEAR=0',
+        'TORCH_BLAS_PREFER_HIPBLASLT=1',
+        'TENSILE_STREAMK_DYNAMIC_GRID=6',
+        'AITER_QUICK_REDUCE_QUANTIZATION=INT4',
+        'AITER_USE_FLYDSL_MOE_SORTING=1',
+        'AITER_AR_1STAGE_MAX_KB=512',
+        'AITER_MXFP4_INTERMEDIATE=1',
+        'ROCM_QUICK_REDUCE_QUANTIZATION=INT4',
+      ].join(' \\\n');
+      return (
+        mxfp4Env + ' \\\n' +
+        'sglang serve \\\n' +
+        '  --model-path amd/Kimi-K2.7-Code-MXFP4 \\\n' +
+        '  --tp 4 \\\n' +
+        '  --trust-remote-code \\\n' +
+        '  --attention-backend aiter \\\n' +
+        '  --mem-fraction-static 0.90 \\\n' +
+        '  --kv-cache-dtype fp8_e4m3 \\\n' +
+        '  --disable-radix-cache \\\n' +
+        '  --enable-aiter-allreduce-fusion \\\n' +
+        '  --host 0.0.0.0 \\\n' +
+        '  --port 30000'
+      );
+    }
+
+    const modelName = 'moonshotai/Kimi-K2.7-Code';
 
     let cmd = '';
 
@@ -140,7 +174,7 @@ export const KimiK27CodeDeployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
     if (isAMD) {
-      cmd += isMXFP4 ? ' \\\n  --mem-fraction-static 0.765' : ' \\\n  --mem-fraction-static 0.8';
+      cmd += ' \\\n  --mem-fraction-static 0.8';
     }
     cmd += ' \\\n  --trust-remote-code';
 
