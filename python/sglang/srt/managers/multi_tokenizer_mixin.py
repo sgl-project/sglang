@@ -20,6 +20,7 @@ This file uses multiple processes to handle requests and tokenization, reducing 
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -45,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
+    ElasticScaleUpdateReq,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
@@ -62,7 +64,9 @@ from sglang.srt.managers.load_snapshot import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_disagg,
+    get_parallel,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -445,6 +449,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -471,11 +476,14 @@ class MultiTokenizerRouter:
         # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
         # read SHM only. Drain it event-driven via the socket's fd instead of
         # polling on a timer.
+        owns_zmq_reader = zmq_reader_owner("MultiTokenizerRouter")
         self.load_snapshot_reader = None
-        if zmq_reader_owner("MultiTokenizerRouter"):
+        if owns_zmq_reader or server_args.load_reporter_port is not None:
             self.load_snapshot_reader = create_load_snapshot_reader(
                 port_args, caller="MultiTokenizerRouter"
             )
+
+        if owns_zmq_reader:
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
@@ -484,6 +492,8 @@ class MultiTokenizerRouter:
         self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
+
+        self._load_reporter_handle: Optional[Any] = self._start_load_reporter_owner()
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -504,6 +514,80 @@ class MultiTokenizerRouter:
         )
         # Drain anything already queued before the fd was registered.
         self.load_snapshot_reader.poll()
+
+    def _start_load_reporter_owner(self) -> Optional[Any]:
+        """Start the router-owned reporter; block until the listener binds so an occupied port fails construction."""
+        if self.server_args.load_reporter_port is None:
+            return None
+
+        assert self.load_snapshot_reader is not None
+
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.snapshot_source import RouterLoadSnapshotSource
+
+        source = RouterLoadSnapshotSource(
+            self.load_snapshot_reader, range(get_parallel().dp_size)
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            start_load_reporter(self.server_args, source),
+            self._loop,
+        )
+        return self._await_reporter_startup(future, timeout=10.0)
+
+    def _await_reporter_startup(
+        self, future: concurrent.futures.Future, timeout: float
+    ) -> Optional[Any]:
+        """Block on the router reporter startup future; on timeout, cancel it, close any raced handle, and re-raise."""
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+
+            def _close_if_produced(fut: concurrent.futures.Future) -> None:
+                # A won cancel cleans up via coroutine teardown; a lost cancel leaves a real handle that must not leak.
+                if fut.cancelled():
+                    return
+                try:
+                    handle = fut.result()
+                except Exception:
+                    return
+                if handle is not None:
+                    self._loop.call_soon_threadsafe(
+                        lambda: self._loop.create_task(handle.close())
+                    )
+
+            future.add_done_callback(_close_if_produced)
+            logger.warning("Timed out starting the router-owned load reporter")
+            raise TimeoutError("router load reporter startup timed out")
+
+    def _update_load_reporter_expected_ranks(self, effective_ep_size: int) -> None:
+        """Update the reporter's expected ranks on an elastic scale change."""
+        if self._load_reporter_handle is None:
+            return
+        self._load_reporter_handle.update_expected_dp_ranks(range(effective_ep_size))
+
+    async def _close_load_reporter_owner(self) -> None:
+        """Close the router-owned reporter handle on the router event loop."""
+        handle = self._load_reporter_handle
+        if handle is not None:
+            self._load_reporter_handle = None
+            await handle.close()
+
+    def _close_load_snapshot_reader(self) -> None:
+        """Close the Router-owned snapshot reader on the Router event loop."""
+        reader = self.load_snapshot_reader
+        if reader is None:
+            return
+        self.load_snapshot_reader = None
+        fileno = getattr(reader, "fileno", None)
+        if callable(fileno):
+            self._loop.remove_reader(fileno())
+        reader.close()
+
+    async def _close_router_owned_resources(self) -> None:
+        """Close reporter tasks before their underlying snapshot reader."""
+        await self._close_load_reporter_owner()
+        self._close_load_snapshot_reader()
 
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
@@ -545,6 +629,16 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
+        """Route one scheduler result and update Router-owned scale state.
+
+        Args:
+            recv_obj: Scheduler or detokenizer result carrying worker IPC metadata.
+
+        Returns:
+            None.
+        """
+        if isinstance(recv_obj, ElasticScaleUpdateReq) and recv_obj.success:
+            self._update_load_reporter_expected_ranks(recv_obj.effective_ep_size)
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
@@ -555,6 +649,31 @@ class MultiTokenizerRouter:
         for i, ipc_name in enumerate(ipc_names):
             new_recv_obj = _handle_output_by_index(recv_obj, i)
             self.socket_mapping.send_output(ipc_name, new_recv_obj)
+
+    def close(self, timeout_seconds: float = 7.0) -> None:
+        """Close the router-owned load reporter from the parent HTTP thread.
+
+        Args:
+            timeout_seconds: Maximum time to wait for async reporter shutdown.
+
+        Returns:
+            None.
+        """
+        if self._load_reporter_handle is None and self.load_snapshot_reader is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_router_owned_resources(), self._loop
+        )
+        try:
+            future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            logger.warning(
+                "Timed out after %.1fs while closing router-owned load reporter",
+                timeout_seconds,
+            )
+        except Exception:
+            logger.exception("Failed to close router-owned load reporter")
 
 
 class MultiDetokenizerRouter:

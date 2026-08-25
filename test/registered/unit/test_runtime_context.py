@@ -360,6 +360,11 @@ class TestEnsurePublished(_IsolatedServerArgs):
                     "TokenizerManager",
                     "ensure_published",
                 ),
+                (
+                    "managers/multi_tokenizer_mixin.py",
+                    "MultiTokenizerRouter",
+                    "ensure_published",
+                ),
                 ("model_executor/model_runner.py", "ModelRunner", "ensure_published"),
             },
             "a constructor publishes and this census does not know which kind "

@@ -1624,6 +1624,13 @@ class ServerArgs:
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         NS("observability"),
     ] = 15
+    load_reporter_port: A[
+        Optional[int],
+        "Port on which this worker listens for load reporter gRPC connections. "
+        "None (default) disables load reporting with zero socket, task, or "
+        "optional-dependency overhead.",
+        NS("observability"),
+    ] = None
     tokenizer_metrics_custom_labels_header: A[
         str,
         "Specify the HTTP header for passing custom labels for tokenizer metrics.",
@@ -3804,6 +3811,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_load_reporter_config()
         from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
         handle_mega_moe(self)
@@ -9304,6 +9312,16 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self._declare("_handle_debug_utils", soft_watchdog_timeout=300)
+
+    def _handle_load_reporter_config(self):
+        """Validate the reporter port range; transport and staleness knobs live in the reporter, not ServerArgs."""
+        if self.load_reporter_port is not None and not (
+            1 <= self.load_reporter_port <= 65535
+        ):
+            raise ValueError(
+                f"--load-reporter-port must be between 1 and 65535 "
+                f"(got {self.load_reporter_port})."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
