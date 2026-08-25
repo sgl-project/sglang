@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -64,6 +65,12 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_force_token_id_value = os.environ.get("SGLANG_SAMPLER_FORCE_TOKEN_ID")
+_FORCE_TOKEN_ID = (
+    int(_force_token_id_value) if _force_token_id_value is not None else None
+)
+if _FORCE_TOKEN_ID is not None and _FORCE_TOKEN_ID < 0:
+    raise ValueError("SGLANG_SAMPLER_FORCE_TOKEN_ID must be non-negative")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
@@ -231,6 +238,9 @@ class Sampler(nn.Module):
                         else torch.log(probs)
                     )
                 del probs
+
+        if _FORCE_TOKEN_ID is not None:
+            batch_next_token_ids.fill_(_FORCE_TOKEN_ID)
 
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
