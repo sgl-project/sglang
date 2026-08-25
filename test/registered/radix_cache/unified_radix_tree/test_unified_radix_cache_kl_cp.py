@@ -24,7 +24,6 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
     max_running_requests = 32
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
-    mmlu_threshold = 0.7
 
     @classmethod
     def setUpClass(cls):
@@ -40,7 +39,9 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "4",
                 "--attn-cp-size",
                 "2",
-                "--enable-prefill-context-parallel",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "zigzag",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-max-bs-decode",

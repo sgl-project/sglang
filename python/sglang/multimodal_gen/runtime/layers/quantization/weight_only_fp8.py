@@ -76,6 +76,11 @@ def _apply_weight_only_fp8_linear(
     compute_dtype: torch.dtype,
     enable_fused_w8a8: bool,
 ) -> torch.Tensor:
+    if weight.dtype != FP8_WEIGHT_DTYPE:
+        # Weight was dequantized to the compute dtype once at load time
+        # (see dequantize_weight_only_fp8_linears_at_load).
+        bias = bias.to(weight.dtype) if bias is not None else None
+        return F.linear(x.to(weight.dtype), weight, bias)
     x = x.to(compute_dtype)
     bias = bias.to(compute_dtype) if bias is not None else None
     if enable_fused_w8a8 and _can_apply_fused_w8a8_fp8_linear(
@@ -117,6 +122,7 @@ class WeightOnlyFP8Linear(nn.Module):
         self.out_features = out_features
         self.compute_dtype = compute_dtype
         self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
+        self._fp8_dequant_decided = False
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
             requires_grad=False,
@@ -137,6 +143,8 @@ class WeightOnlyFP8Linear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
         compute_dtype = self.compute_dtype or x.dtype
         return _apply_weight_only_fp8_linear(
             x,
@@ -171,6 +179,7 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         self.tp_size = get_group_size(self.tp_group)
         self.tp_rank = get_group_rank(self.tp_group)
         self.out_features_per_partition = divide(out_features, self.tp_size)
+        self._fp8_dequant_decided = False
         self.weight = nn.Parameter(
             torch.empty(
                 self.out_features_per_partition,
@@ -231,6 +240,8 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
         compute_dtype = self.compute_dtype or x.dtype
         output_parallel = _apply_weight_only_fp8_linear(
             x,
@@ -321,6 +332,7 @@ class WeightOnlyFP8RowParallelLinear(nn.Module):
         self.tp_size = get_group_size(self.tp_group)
         self.tp_rank = get_group_rank(self.tp_group)
         self.in_features_per_partition = divide(in_features, self.tp_size)
+        self._fp8_dequant_decided = False
         self.weight = nn.Parameter(
             torch.empty(
                 out_features,
@@ -380,6 +392,8 @@ class WeightOnlyFP8RowParallelLinear(nn.Module):
                 x, num_partitions=self.tp_size
             )[self.tp_rank].contiguous()
 
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
         compute_dtype = self.compute_dtype or x.dtype
         bias = None if self.tp_rank > 0 else self.bias
         output_parallel = _apply_weight_only_fp8_linear(
@@ -414,6 +428,68 @@ def _log_w8a8_fp8_gemm_warning_once() -> None:
         W8A8_FP8_GEMM_ENV,
     )
     _w8a8_fp8_gemm_warning_logged = True
+
+
+# Free-memory headroom to preserve when caching dequantized weights; the
+# activation workspace and NCCL buffers still grow after the first forward.
+_DEQUANT_CACHE_RESERVE_BYTES = 4 << 30
+_dequant_cache_logged = False
+_dequant_low_memory_logged = False
+
+
+def _maybe_promote_fp8_weight(module: nn.Module, x_dtype: torch.dtype) -> None:
+    """Dequantize the FP8 weight once, on the first device-resident forward.
+
+    Every later forward then runs a plain compute-dtype GEMM instead of
+    re-materializing the full weight matrix per call; outputs are
+    bit-identical because the same dequantized values feed the same GEMM.
+    The weight stays FP8-resident (per-forward dequant) when the flag is off,
+    under the W8A8 GEMM path, or when free device memory is low; the decision
+    is remembered per module. Runs on host weights leave the decision open so
+    CPU-offloaded modules decide once they land on the device.
+    """
+    global _dequant_cache_logged, _dequant_low_memory_logged
+    weight = module.weight
+    if weight.dtype != FP8_WEIGHT_DTYPE:
+        module._fp8_dequant_decided = True
+        return
+    if weight.device.type != "cuda":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        # Never allocate inside a CUDA graph capture; retry on an eager call.
+        return
+    module._fp8_dequant_decided = True
+    if not envs.SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE:
+        return
+    if module.enable_fused_w8a8:
+        # The W8A8 GEMM path consumes the FP8 weight directly.
+        return
+    dtype = module.compute_dtype or x_dtype
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return
+    needed_bytes = weight.numel() * dtype.itemsize
+    free_bytes, _ = torch.cuda.mem_get_info(weight.device)
+    if free_bytes < needed_bytes + _DEQUANT_CACHE_RESERVE_BYTES:
+        if not _dequant_low_memory_logged:
+            logger.warning(
+                "Keeping weight-only FP8 linear weights FP8-resident (low "
+                "free device memory); they dequantize on every forward."
+            )
+            _dequant_low_memory_logged = True
+        return
+    # Server warmup commonly runs under inference_mode. A cached inference
+    # tensor has no version counter, so Dynamo cannot later guard it.
+    with torch.inference_mode(False), torch.no_grad():
+        dequant = dequantize_rowwise_fp8_weight(weight, module.weight_scale, dtype)
+    module.weight = nn.Parameter(dequant, requires_grad=False)
+    if not _dequant_cache_logged:
+        logger.info(
+            "Dequantizing weight-only FP8 linear weights once at first use "
+            "(bit-identical outputs; set "
+            "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE=0 to keep weights "
+            "FP8-resident)."
+        )
+        _dequant_cache_logged = True
 
 
 def swap_linears_to_weight_only_fp8(module: nn.Module) -> None:

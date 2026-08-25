@@ -73,9 +73,7 @@ def _fused_qknorm_rope_enabled() -> bool:
 
 
 def _can_use_fused_qknorm_rope(head_dim: int, dtype: torch.dtype) -> bool:
-    from sglang.kernels.ops.diffusion.qknorm_rope import (
-        can_use_fused_inplace_qknorm_rope,
-    )
+    from sglang.kernels.ops.diffusion import can_use_fused_inplace_qknorm_rope
 
     return can_use_fused_inplace_qknorm_rope(head_dim, head_dim, False, dtype)
 
@@ -119,9 +117,7 @@ def norm_scale_shift(
     pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
     """
     if x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -358,9 +354,7 @@ class Attention(nn.Module):
             and _fused_qknorm_rope_enabled()
             and _can_use_fused_qknorm_rope(hd, q.dtype)
         ):
-            from sglang.kernels.ops.diffusion.qknorm_rope import (
-                fused_inplace_qknorm_rope,
-            )
+            from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
 
             b, s = qkv.shape[0], qkv.shape[1]
             q = q.view(b, s, self.local_heads, hd)
