@@ -611,3 +611,6 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         return self.full_attn_backend.draft_extend_metadata_captured_in_graph()
+
+    def draft_extend_rereads_shared_state_in_graph(self) -> bool:
+        return self.full_attn_backend.draft_extend_rereads_shared_state_in_graph()

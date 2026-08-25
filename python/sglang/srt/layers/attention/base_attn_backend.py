@@ -123,6 +123,21 @@ class AttentionBackend(ABC):
         against the static buffers from :py:meth:`init_cuda_graph_state`."""
         return False
 
+    def draft_extend_rereads_shared_state_in_graph(self) -> bool:
+        """True when this backend's captured DRAFT_EXTEND_V2 graph re-reads
+        scheduler-shared state (req_to_token) while replaying, so the
+        draft-extend graph runner must record its WAR read-done event after
+        the replay launch instead of before it.
+
+        An in-graph metadata rebuild re-reads req_to_token by construction,
+        hence the default mirrors
+        :py:meth:`draft_extend_metadata_captured_in_graph`. Backends whose
+        recorded capture re-reads shared state without satisfying that
+        method's full-rebuild contract (its consumers skip the eager
+        :py:meth:`init_forward_metadata_out_graph` call and gate multi-layer
+        single-graph draft modes on it) must override this method alone."""
+        return self.draft_extend_metadata_captured_in_graph()
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 

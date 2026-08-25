@@ -32,6 +32,7 @@ class TestDraftExtendGraphCapability(CustomTestCase):
 
     def test_support_implies_in_graph_metadata_rebuild(self):
         # The draft-extend graph runner keys its WAR read-done publication on
+        # draft_extend_rereads_shared_state_in_graph(), whose default mirrors
         # draft_extend_metadata_captured_in_graph(): FA rebuilds metadata inside
         # the captured graph (re-reading req_to_token at replay time), so
         # whenever it declares graph support it must also declare the in-graph
