@@ -209,27 +209,35 @@ class TestRegisterToBootstrap(CustomTestCase):
         success_resp.status_code = 200
         mock_put.return_value = success_resp
 
-        gathered = [
-            ("10.0.0.1", 8765),
-            None,
-            ("10.0.0.2", 8765),
-            None,
-        ]
-        mock_world_group.return_value.all_gather_object.return_value = gathered
+        schedulers = (
+            (0, 0, "10.0.0.1", 8765),
+            (0, 1, "10.0.0.1", None),
+            (1, 0, "10.0.0.2", 8765),
+            (1, 1, "10.0.0.2", None),
+        )
+
+        def gather_topology(payload):
+            return [
+                {
+                    **payload,
+                    "attn_dp_rank": dp_rank,
+                    "attn_tp_rank": tp_rank,
+                    "rank_ip": host,
+                }
+                for dp_rank, tp_rank, host, _ in schedulers
+            ]
+
+        mock_world_group.return_value.all_gather_object.side_effect = gather_topology
 
         with envs.SGLANG_RUST_SERVER.override(True):
-            for dp_rank, tp_rank, local_ip, rust_http_port in (
-                (0, 0, "10.0.0.1", 8765),
-                (0, 1, "10.0.0.1", None),
-                (1, 0, "10.0.0.2", 8765),
-                (1, 1, "10.0.0.2", None),
-            ):
+            for dp_rank, tp_rank, local_ip, rust_http_port in schedulers:
                 manager = self._make_manager()
                 manager.attn_dp_size = 2
                 manager.attn_dp_rank = dp_rank
                 manager.attn_tp_size = 2
                 manager.attn_tp_rank = tp_rank
                 manager.local_ip = local_ip
+                manager.bootstrap_host = local_ip
                 manager.kv_args.rust_http_port = rust_http_port
                 manager.register_to_bootstrap()
 
@@ -239,7 +247,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             topology_by_registry.setdefault(put_call.args[0], set()).add(
                 (payload["attn_dp_rank"], payload["attn_tp_rank"])
             )
-        complete_topology = {(0, 0), (0, 1), (1, 0), (1, 1)}
+        complete_topology = {(dp, tp) for dp, tp, _, _ in schedulers}
         self.assertEqual(
             topology_by_registry,
             {
@@ -248,13 +256,14 @@ class TestRegisterToBootstrap(CustomTestCase):
             },
         )
         self.assertEqual(
-            mock_world_group.return_value.all_gather_object.call_args_list,
             [
-                call(("10.0.0.1", 8765)),
-                call(None),
-                call(("10.0.0.2", 8765)),
-                call(None),
+                (
+                    gather_call.args[0]["attn_dp_rank"],
+                    gather_call.args[0]["attn_tp_rank"],
+                )
+                for gather_call in mock_world_group.return_value.all_gather_object.call_args_list
             ],
+            [(dp, tp) for dp, tp, _, _ in schedulers],
         )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
@@ -312,12 +321,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         from sglang.srt.disaggregation.common.conn import CommonKVManager
 
         mgr = MagicMock(spec=CommonKVManager)
-        # Bind the real methods to the mock
+        # Bind the real method to the mock
         mgr.register_to_bootstrap = CommonKVManager.register_to_bootstrap.__get__(
             mgr, CommonKVManager
-        )
-        mgr._bootstrap_registry_endpoints = (
-            CommonKVManager._bootstrap_registry_endpoints.__get__(mgr, CommonKVManager)
         )
 
         # Set attributes that register_to_bootstrap reads

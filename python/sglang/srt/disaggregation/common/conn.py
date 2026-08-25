@@ -769,45 +769,8 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
-    def _bootstrap_registry_endpoints(self) -> List[NetworkAddress]:
-        if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
-            local_endpoint = (
-                (self.local_ip, self.kv_args.rust_http_port)
-                if self.kv_args.rust_http_port is not None
-                else None
-            )
-            gathered = get_world_group().all_gather_object(local_endpoint)
-            endpoints = [
-                NetworkAddress(str(host), int(port))
-                for endpoint in gathered
-                if endpoint is not None
-                for host, port in [endpoint]
-            ]
-            if len(endpoints) != self.attn_dp_size:
-                raise RuntimeError(
-                    "Embedded Rust bootstrap registry discovery expected "
-                    f"{self.attn_dp_size} attention DP listeners, found "
-                    f"{len(endpoints)}."
-                )
-            return endpoints
-
-        if self.dist_init_addr:
-            # Multi-node case: bootstrap server's host is dist_init_addr
-            host = NetworkAddress.parse(self.dist_init_addr).resolved().host
-        else:
-            # Single-node case: bootstrap server's host is the same as http server's host
-            host = self.bootstrap_host
-            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
-            # and can't be connected to; rewrite it to the same-family loopback,
-            # which the wildcard listener also binds.  (self.local_ip is wrong
-            # here — it can resolve to a different family than the listener,
-            # e.g. IPv6 while the server is bound to 0.0.0.0.)
-            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
-
-        return [NetworkAddress(host, self.bootstrap_port)]
-
     def register_to_bootstrap(self):
-        """Register prefill server info with every serving bootstrap registry."""
+        """Register prefill server info to bootstrap server via HTTP PUT."""
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -831,13 +794,37 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        payloads = [payload]
+        if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
+            payloads = get_world_group().all_gather_object(payload)
+            if self.kv_args.rust_http_port is None:
+                return
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+                self.bootstrap_host, self.bootstrap_host
+            )
+            bootstrap_na = NetworkAddress(host, self.kv_args.rust_http_port)
+        else:
+            if self.dist_init_addr:
+                # Multi-node case: bootstrap server's host is dist_init_addr
+                host = NetworkAddress.parse(self.dist_init_addr).resolved().host
+            else:
+                # Single-node case: bootstrap server's host is the same as http server's host
+                host = self.bootstrap_host
+                # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+                # and can't be connected to; rewrite it to the same-family loopback,
+                # which the wildcard listener also binds.  (self.local_ip is wrong
+                # here — it can resolve to a different family than the listener,
+                # e.g. IPv6 while the server is bound to 0.0.0.0.)
+                host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+            bootstrap_na = NetworkAddress(host, self.bootstrap_port)
+
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
-        for endpoint in self._bootstrap_registry_endpoints():
-            url = f"{endpoint.to_url()}/route"
+        url = f"{bootstrap_na.to_url()}/route"
+        for topology_payload in payloads:
             registered = False
             for attempt in range(max_retries):
                 try:
-                    response = requests.put(url, json=payload, timeout=5)
+                    response = requests.put(url, json=topology_payload, timeout=5)
                     if response.status_code == 200:
                         logger.debug(
                             "Prefill successfully registered to bootstrap server."
