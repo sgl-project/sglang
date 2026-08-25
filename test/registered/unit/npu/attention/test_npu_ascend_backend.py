@@ -283,9 +283,7 @@ class TestFiaMixedSplitGate(unittest.TestCase):
         )
 
     def test_causal_gqa_mixed_batch_is_enabled(self):
-        self.assertTrue(
-            self.backend._should_split_fia_mixed(_make_mixed_layer(), None)
-        )
+        self.assertTrue(self.backend._should_split_fia_mixed(_make_mixed_layer(), None))
 
     def test_causal_mha_mixed_batch_is_enabled(self):
         self.assertTrue(

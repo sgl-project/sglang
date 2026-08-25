@@ -2957,10 +2957,7 @@ class AscendAttnBackend(AttentionBackend):
             and topk_indices is None
             and layer.attn_type == AttentionType.DECODER
             and not layer.is_cross_attention
-            and (
-                layer.sliding_window_size is None
-                or layer.sliding_window_size <= -1
-            )
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
             and layer.tp_k_head_num > 0
             and layer.tp_q_head_num % layer.tp_k_head_num == 0
             and metadata.mixed_num_prefill_reqs is not None
@@ -3011,9 +3008,7 @@ class AscendAttnBackend(AttentionBackend):
         assert num_prefill_tokens is not None
         num_tokens = query.shape[0]
 
-        output = query.new_empty(
-            (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
-        )
+        output = query.new_empty((num_tokens, layer.tp_q_head_num, layer.v_head_dim))
 
         with profile_range("ascend.fia_mixed.prefill"):
             prefill_output = self._run_fia_mixed(
@@ -3023,12 +3018,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer=layer,
                 block_size=block_size,
                 block_table=metadata.block_tables[:num_prefill_reqs],
-                actual_seq_lengths=metadata.seq_lens_list_cumsum[
-                    :num_prefill_reqs
-                ],
-                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[
-                    :num_prefill_reqs
-                ],
+                actual_seq_lengths=metadata.seq_lens_list_cumsum[:num_prefill_reqs],
+                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[:num_prefill_reqs],
             )
         output[:num_prefill_tokens].copy_(
             prefill_output.view(
@@ -3050,14 +3041,10 @@ class AscendAttnBackend(AttentionBackend):
                 block_size=block_size,
                 block_table=metadata.block_tables[num_prefill_reqs:],
                 actual_seq_lengths=decode_seq_lens,
-                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[
-                    num_prefill_reqs:
-                ],
+                actual_seq_lengths_kv=metadata.seq_lens_cpu_int[num_prefill_reqs:],
             )
         output[num_prefill_tokens:].copy_(
-            decode_output.view(
-                num_decode_tokens, layer.tp_q_head_num, layer.v_head_dim
-            )
+            decode_output.view(num_decode_tokens, layer.tp_q_head_num, layer.v_head_dim)
         )
         return output
 

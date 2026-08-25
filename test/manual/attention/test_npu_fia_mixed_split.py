@@ -9,6 +9,7 @@ import math
 
 import pytest
 import torch
+
 from sglang.srt.hardware_backend.npu.device_op import get_npu_device_op
 
 torch_npu = pytest.importorskip("torch_npu")
@@ -46,9 +47,7 @@ def _run_fia(
 
 
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(8, 8), (8, 2)])
-def test_single_and_prefill_first_split_are_byte_identical(
-    num_heads, num_kv_heads
-):
+def test_single_and_prefill_first_split_are_byte_identical(num_heads, num_kv_heads):
     if not get_npu_device_op().fia_splits_mixed_batch:
         pytest.skip("FIA mixed split is only validated on Ascend 950 / A5")
 
@@ -61,9 +60,7 @@ def test_single_and_prefill_first_split_are_byte_identical(
     num_prefill_tokens = 33
     num_tokens = 35
 
-    query = torch.randn(
-        (num_tokens, num_heads, head_dim), dtype=dtype, device=device
-    )
+    query = torch.randn((num_tokens, num_heads, head_dim), dtype=dtype, device=device)
     key = torch.randn(
         (4, block_size, num_kv_heads * head_dim), dtype=dtype, device=device
     )
