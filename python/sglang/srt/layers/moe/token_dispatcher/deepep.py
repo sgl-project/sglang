@@ -282,6 +282,16 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             allow_mnnvl=use_mnnvl_fabric,
         )
+        if _is_npu and getattr(
+            Buffer, "supports_normal_dispatch_token_capacity", False
+        ):
+            from sglang.srt.runtime_context import max_prefill_buffer_tokens
+
+            normal_token_capacity = max_prefill_buffer_tokens()
+            if normal_token_capacity > 0:
+                buffer_kwargs["normal_num_max_dispatch_tokens_per_rank"] = (
+                    normal_token_capacity
+                )
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
