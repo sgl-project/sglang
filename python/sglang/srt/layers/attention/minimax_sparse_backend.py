@@ -21,6 +21,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -292,6 +296,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
     @staticmethod
+    def _target_verify_q_cap(forward_batch: ForwardBatch) -> int:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if spec_info is None:
+            raise RuntimeError(
+                "MiniMax sparse TARGET_VERIFY CUDA Graph requires spec_info."
+            )
+
+        q_cap = getattr(spec_info, "draft_token_num", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(spec_info, "num_tokens_for_logprob_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            q_cap = getattr(spec_info, "num_tokens_per_req", None)
+        if q_cap is None or int(q_cap) <= 0:
+            raise RuntimeError(
+                "MiniMax sparse TARGET_VERIFY CUDA Graph requires a positive, "
+                "fixed per-request verify-token cap."
+            )
+        return int(q_cap)
+
+    @staticmethod
     def _choose_decode_score_max_chunks(batch_size: int) -> int:
         """Score chunk count per graph bucket.
 
@@ -332,11 +356,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._prefill_meta = None
             self._extend_meta = None
             self._extend_meta_key = None
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
-            self._max_seqlen_q = int(max(extend_lens))
+
+        if in_capture and forward_batch.forward_mode.is_target_verify():
+            # q/k bounds are Python integers and become CUDA Graph launch
+            # constants. They must cover every layout admitted by this graph,
+            # not merely the synthetic layout used while capturing it.
+            self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
         else:
-            self._max_seqlen_q = 1
+            ragged_layout = (
+                resolve_ragged_verify_layout(forward_batch)
+                if forward_batch.forward_mode.is_target_verify()
+                else None
+            )
+            if ragged_layout is not None:
+                if ragged_layout.verify_lens_cpu is not None:
+                    self._max_seqlen_q = int(max(ragged_layout.verify_lens_cpu))
+                else:
+                    # Replay-side views intentionally have no fresh CPU mirror.
+                    # The fixed cap is safe and avoids a device-to-host sync.
+                    self._max_seqlen_q = self._target_verify_q_cap(forward_batch)
+            else:
+                extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+                self._max_seqlen_q = int(max(extend_lens)) if extend_lens else 1
+
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_npu and forward_batch.forward_mode.is_target_verify())
@@ -345,7 +387,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
-            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
+                raise RuntimeError(
+                    "MiniMax sparse attention metadata requires seq_lens_cpu "
+                    "outside TARGET_VERIFY CUDA Graph capture."
+                )
+            self._max_seqlen_k = int(seq_lens_cpu.max().item())
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -1346,11 +1394,61 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        ragged_layout = (
+            resolve_ragged_verify_layout(forward_batch)
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
 
-        # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        if ragged_layout is not None:
+            ragged_geometry = build_ragged_target_verify_geometry(
+                seq_lens=forward_batch.seq_lens,
+                layout=ragged_layout,
+            )
+            cu_seqlens = ragged_geometry.cu_seqlens_q
+            seq_lens = ragged_geometry.cache_seqlens_int32
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = ragged_layout.verify_lens_cpu
+        elif extend_seq_lens is not None:
+            cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
+                forward_batch, q
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = int(forward_batch.seq_lens.shape[0])
+            verify_len = self._target_verify_q_cap(forward_batch)
+            expected_num_tokens = bs * verify_len
+            if bs <= 0 or q.shape[0] != expected_num_tokens:
+                raise RuntimeError(
+                    "MiniMax sparse non-ragged TARGET_VERIFY requires the fixed "
+                    "verify width from spec_info; refusing to infer a layout from "
+                    f"q.shape. Got q.shape[0]={q.shape[0]}, bs={bs}, "
+                    f"verify_cap={verify_len}, expected={expected_num_tokens}."
+                )
+            uniform_verify_lens = torch.full(
+                (bs,),
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cu_seqlens = torch.arange(
+                0,
+                expected_num_tokens + 1,
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            seq_lens = (forward_batch.seq_lens + uniform_verify_lens).to(torch.int32)
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = [verify_len] * bs
+        else:
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
+
+        # DP attention pads q beyond the real token count for collective alignment;
+        # trim to actual tokens so the sparse kernel sees consistent shapes.
+        if extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
@@ -1421,7 +1519,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 score_type=self.score_type,
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
-                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                seqlens_cpu=extend_seq_lens_cpu,
                 q_scale=layer.q_scale_float,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
@@ -1616,9 +1714,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
-        self.extend_dummy_seqs_capped_by_req_pool = getattr(
-            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
-        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.
