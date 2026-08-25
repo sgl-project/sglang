@@ -1322,33 +1322,55 @@ class PrefillAdder:
     ) -> int:
         if self.memory_budget.prices_by_demand:
             return self._get_dllm_remain_tokens_by_demand(req, reuses_kv=reuses_kv)
+        separate_ctx = self.dllm_config.requires_separate_context_encoding
         _rem_tokens = min(self.rem_dllm_tokens, int(self.rem_total_tokens))
-        if not (
-            self.dllm_config.requires_separate_context_encoding
-            and req is not None
-            and req.is_dllm_prefill()
-        ):
+        if not (separate_ctx and req is not None and req.is_dllm_prefill()):
             _rem_tokens = min(_rem_tokens, self.dllm_block_size)
         if _rem_tokens <= 0:
-            # rem_total_tokens charges max_new_tokens upfront per staging row,
-            # so it goes negative long before the KV pool is full. Grant one
-            # whole block or nothing: the denoise algorithms reshape with
-            # view(B, block_size), which admits neither a larger nor a ragged row.
-            _rem_tokens = (
-                self.dllm_block_size
-                if self.rem_dllm_tokens >= self.dllm_block_size
-                else 0
-            )
-        else:
+            if separate_ctx:
+                # Separate-context-encoding prefill rows may extend past one
+                # block and the cur_rem_tokens cap below already protects the
+                # pool, so keep the plain fallback on that path.
+                _rem_tokens = self.rem_dllm_tokens
+            else:
+                # rem_total_tokens charges max_new_tokens upfront per staging
+                # row, so it goes negative long before the KV pool is full.
+                # Grant one whole block or nothing: the denoise algorithms
+                # reshape with view(B, block_size), which admits neither a
+                # larger nor a ragged row.
+                #
+                # But only override rem_total_tokens, not real pool exhaustion:
+                # a row that needs fresh KV must fit the full admission charge
+                # (`_update_prefill_budget` debits ceil_paged(extend) + one
+                # per_req_token_overhead of allocation rounding) in
+                # cur_rem_tokens, or `alloc_for_extend` fails loudly
+                # downstream. Rows reusing retained FDFO KV (reuses_kv)
+                # allocate zero fresh tokens, so gating them would strand
+                # their retained blocks.
+                block_charge = (
+                    self.ceil_paged_tokens(self.dllm_block_size)
+                    + self.per_req_token_overhead
+                )
+                pool_fits = reuses_kv or int(self.cur_rem_tokens) >= block_charge
+                _rem_tokens = (
+                    self.dllm_block_size
+                    if pool_fits and self.rem_dllm_tokens >= self.dllm_block_size
+                    else 0
+                )
+        elif not separate_ctx:
             # A positive sub-block budget rounds down to 0, it does NOT take
             # the whole-block fallback: the fallback only overrides a
             # rem_total_tokens driven negative by the upfront max_new_tokens
             # charge, while a small positive budget is genuine and a full
             # block would overshoot it. The min above caps at block_size, so
-            # this yields exactly one block or nothing.
+            # this yields exactly one block or nothing. No cur_rem_tokens gate
+            # here: the memory_budget's total_offset accrues everything its
+            # current_offset does plus max_new_tokens and the running-batch
+            # reservation (both >= 0), so cur_rem_tokens >= rem_total_tokens > 0
+            # on this path.
             _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
-        if self.dllm_config.requires_separate_context_encoding:
+        if separate_ctx:
             _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
             if self.is_hybrid_swa:
                 _rem_tokens = min(
@@ -1465,13 +1487,11 @@ class PrefillAdder:
     @capacity_decision
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        # A retained incomplete block runs on the rows it holds (the extend
-        # allocation reuses them), so it is priced and charged no new rows.
-        reuses_kv = (
-            bool(req.dllm_incomplete_ids)
-            and req.kv.holds_kv
-            and self.memory_budget.prices_by_demand
-        )
+        # A retained incomplete block runs on the rows it holds: the extend
+        # allocation reuses them (mem_cache/allocation.py `reuse_kv`, whose
+        # predicate this mirrors), so its grant needs no fresh rows. Only a
+        # budget pricing demands also charges it none.
+        reuses_kv = req.kv.holds_kv and bool(req.dllm_incomplete_ids)
         if (
             self.memory_budget.prices_by_demand
             and self.tree_cache.supports_swa()
@@ -1535,7 +1555,7 @@ class PrefillAdder:
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
-            reuses_kv=reuses_kv,
+            reuses_kv=reuses_kv and self.memory_budget.prices_by_demand,
         )
 
         if self.memory_budget.prices_by_demand:
