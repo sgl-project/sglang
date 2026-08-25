@@ -62,6 +62,7 @@ class TestVerifySharedKV(CustomTestCase):
         head_dim,
         v_head_dim,
         h_q=4,
+        h_kv=1,
         cache_dtype=torch.bfloat16,
         k_scale=1.0,
         v_scale=1.0,
@@ -77,6 +78,10 @@ class TestVerifySharedKV(CustomTestCase):
             v_head_dim=v_head_dim,
             cache_dtype=cache_dtype,
         )
+        if h_kv > 1:
+            inputs = list(inputs)
+            for index in (1, 2, 3, 4):
+                inputs[index] = inputs[index].expand(-1, h_kv, -1).contiguous()
         q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
         output_shape = (q.shape[0], q.shape[1], v_head_dim)
         reference = torch.empty(output_shape, dtype=q.dtype, device=q.device)
@@ -152,12 +157,15 @@ class TestVerifySharedKV(CustomTestCase):
     def test_kimi_k3_absorbed_mla_shape(self):
         self._run_parity(head_dim=576, v_head_dim=512)
 
-    def test_rejects_multiple_local_kv_heads(self):
+    def test_kimi_k3_dspark_gqa_shape(self):
+        self._run_parity(head_dim=64, v_head_dim=64, h_q=4, h_kv=2)
+
+    def test_rejects_non_power_of_two_kv_group(self):
         inputs = list(
             _build_inputs(
                 prefix_lens=[512],
                 l_ext=4,
-                h_q=4,
+                h_q=6,
                 head_dim=256,
                 v_head_dim=256,
             )
