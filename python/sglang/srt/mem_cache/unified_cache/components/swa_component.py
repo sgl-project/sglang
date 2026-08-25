@@ -1126,7 +1126,12 @@ class SWAComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, FreeComponentDeviceSlot):
-            for indices in action.indices:
+            # Node page sets are disjoint: one batched free is identical to
+            # per-node frees, at one sync chain instead of N.
+            indices_list = action.indices
+            if len(indices_list) > 1:
+                indices_list = [torch.cat(indices_list)]
+            for indices in indices_list:
                 alloc.free_swa(indices)
             return
         if isinstance(action, FreeComponentHostSlot):

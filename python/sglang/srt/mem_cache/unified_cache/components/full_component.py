@@ -433,7 +433,13 @@ class FullComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
-            for indices in action.indices:
+            # One free for the whole batch: the freed-page set is identical to
+            # per-tensor frees (pages are disjoint across nodes), and each free
+            # pays a unique/index/sync chain on the scheduler CPU.
+            indices_list = action.indices
+            if len(indices_list) > 1:
+                indices_list = [torch.cat(indices_list)]
+            for indices in indices_list:
                 if self.cache.is_swa_enabled:
                     alloc.full_attn_allocator.free(indices)
                 else:
