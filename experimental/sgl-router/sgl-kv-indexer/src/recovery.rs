@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 use crate::bridge::{build_apply_request, decode_event_batch, BridgeConfig, BridgeError};
@@ -200,17 +200,47 @@ where
         let expected = config.workers.clone();
         tasks.spawn(async move { supervise_worker(indexer, worker, expected).await });
     }
+    supervise_fleet(tasks, shutdown).await
+}
+
+/// Wait out the fleet, retiring streams one at a time.
+///
+/// One stream retiring must not unroute the others. A permanent failure means
+/// the Bridge and the Indexer disagree about that stream -- an RPC the Indexer
+/// does not implement after a partial rollout, a credential it rejects, a batch
+/// no retry can make appliable -- which says nothing about its peers. The
+/// retiring stream is left invalidated so the Router stops trusting its
+/// placement, and the fleet gives up only once every stream is gone, which is
+/// the case that says the disagreement is systemic.
+async fn supervise_fleet<F>(
+    mut tasks: tokio::task::JoinSet<Result<(), BridgeError>>,
+    shutdown: F,
+) -> Result<(), BridgeError>
+where
+    F: std::future::Future<Output = ()>,
+{
     tokio::pin!(shutdown);
-    tokio::select! {
-        _ = &mut shutdown => {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            Ok(())
-        }
-        result = tasks.join_next() => match result {
-            Some(Ok(result)) => result,
-            Some(Err(error)) => Err(BridgeError::Config(format!("worker recovery task failed: {error}"))),
-            None => Err(BridgeError::Config("worker recovery fleet exited".into())),
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Ok(());
+            }
+            joined = tasks.join_next() => match joined {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(error))) => {
+                    error!(%error, "worker stream retired; remaining streams keep serving");
+                }
+                Some(Err(error)) => {
+                    error!(%error, "worker recovery task failed; remaining streams keep serving");
+                }
+                None => {
+                    return Err(BridgeError::Config(
+                        "every worker stream retired; no placement is being tracked".into(),
+                    ))
+                }
+            },
         }
     }
 }
@@ -226,11 +256,26 @@ async fn supervise_worker(
     worker: BridgeWorkerConfig,
     expected_workers: Vec<BridgeWorkerConfig>,
 ) -> Result<(), BridgeError> {
+    let result = stream_worker(&indexer_endpoint, &worker, &expected_workers).await;
+    if result.is_err() {
+        // Nothing will refresh this stream again, and it still holds whatever
+        // placement it installed before failing.
+        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
+            warn!(worker_id = %worker.worker_id, %error, "failed to invalidate a retired Worker");
+        }
+    }
+    result
+}
+
+async fn stream_worker(
+    indexer_endpoint: &str,
+    worker: &BridgeWorkerConfig,
+    expected_workers: &[BridgeWorkerConfig],
+) -> Result<(), BridgeError> {
     let mut delay = RECONNECT_BASE;
     loop {
         // Re-establish the complete desired Worker set after an Indexer restart.
-        let indexer_epoch = match configure_worker_list(&indexer_endpoint, &expected_workers).await
-        {
+        let indexer_epoch = match configure_worker_list(indexer_endpoint, expected_workers).await {
             Ok(epoch) => epoch,
             Err(error) => {
                 if error.is_permanent() {
@@ -242,7 +287,7 @@ async fn supervise_worker(
                 continue;
             }
         };
-        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
+        if let Err(error) = invalidate_worker(indexer_endpoint, worker).await {
             if error.is_permanent() {
                 return Err(error);
             }
@@ -251,14 +296,7 @@ async fn supervise_worker(
             delay = (delay * 2).min(RECONNECT_CAP);
             continue;
         }
-        match recover_and_stream(
-            &indexer_endpoint,
-            &worker,
-            &expected_workers,
-            &indexer_epoch,
-        )
-        .await
-        {
+        match recover_and_stream(indexer_endpoint, worker, expected_workers, &indexer_epoch).await {
             Ok(()) => return Ok(()),
             Err(error) if error.is_permanent() => return Err(error),
             Err(error) => {
@@ -268,6 +306,21 @@ async fn supervise_worker(
             }
         }
     }
+}
+
+/// Recovery-path RPC classification.
+///
+/// The Indexer answers `FAILED_PRECONDITION` for a stream it has not been
+/// configured with, a stream holding no READY snapshot for the current epoch
+/// and generation, and a sequence gap. All three describe a Bridge that has
+/// fallen out of step with the Indexer, and all three are repaired by
+/// rebuilding from a fresh snapshot. The shared classifier calls the code
+/// permanent, which ends the worker task instead of letting it resynchronise.
+fn classify_recovery_rpc(status: tonic::Status) -> BridgeError {
+    if status.code() == tonic::Code::FailedPrecondition {
+        return BridgeError::Rpc(status);
+    }
+    super::bridge::classify_rpc(status)
 }
 
 async fn invalidate_worker(
@@ -281,7 +334,7 @@ async fn invalidate_worker(
             stream_id: Some(stream_id(worker)),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -308,7 +361,7 @@ async fn configure_worker_list(
                 .collect(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(response.into_inner().indexer_epoch)
 }
 
@@ -377,7 +430,7 @@ async fn install_snapshot(
                 expected_placements: snapshot.placements.len() as u64,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?
+            .map_err(classify_recovery_rpc)?
             .into_inner();
         for chunk in snapshot.placements.chunks(SNAPSHOT_APPEND_PLACEMENTS) {
             let append = client
@@ -401,7 +454,7 @@ async fn install_snapshot(
                         transaction_id: begin.transaction_id,
                     })
                     .await;
-                return Err(super::bridge::classify_rpc(error));
+                return Err(classify_recovery_rpc(error));
             }
         }
         client
@@ -409,7 +462,7 @@ async fn install_snapshot(
                 transaction_id: begin.transaction_id,
             })
             .await
-            .map_err(super::bridge::classify_rpc)?;
+            .map_err(classify_recovery_rpc)?;
         return Ok((worker_generation, Some(wire_cache_spec(metadata))));
     }
 
@@ -438,7 +491,7 @@ async fn install_snapshot(
             worker_generation: String::new(),
         })
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok((worker_generation, cache_spec))
 }
 
@@ -470,7 +523,7 @@ async fn apply_live_payload(
     client
         .apply_external_kv_batch(request)
         .await
-        .map_err(super::bridge::classify_rpc)?;
+        .map_err(classify_recovery_rpc)?;
     Ok(())
 }
 
@@ -691,6 +744,65 @@ mod tests {
     use crate::pb::kv_indexer_client::KvIndexerClient;
     use crate::pb::MatchExternalKvPrefixRequest;
     use crate::{server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
+
+    /// A permanent failure is scoped to the stream that hit it: the supervisor
+    /// used to return as soon as any task finished, so one stream the Indexer
+    /// rejected unrouted every healthy worker beside it.
+    #[tokio::test]
+    async fn a_retired_stream_leaves_the_rest_of_the_fleet_running() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { Err(BridgeError::Config("Indexer rejected the stream".into())) });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tasks.spawn(async move {
+            let _ = release_rx.await;
+            Ok(())
+        });
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let fleet = tokio::spawn(supervise_fleet(tasks, async {
+            let _ = stop_rx.await;
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !fleet.is_finished(),
+            "one retired stream took the whole fleet down"
+        );
+        let _ = stop_tx.send(());
+        assert!(fleet.await.unwrap().is_ok());
+        drop(release_tx);
+    }
+
+    /// Every stream retiring is a different signal: the disagreement is
+    /// systemic, nothing is tracking placement any more, and idling would hide
+    /// that behind a healthy-looking process.
+    #[tokio::test]
+    async fn a_fleet_with_no_surviving_stream_stops() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            tasks.spawn(async { Err(BridgeError::Config("Indexer rejected the stream".into())) });
+        }
+
+        let result = supervise_fleet(tasks, std::future::pending()).await;
+
+        assert!(result.is_err());
+    }
+
+    /// A stream that has fallen out of step must be able to rebuild. Treating
+    /// the Indexer's resync signal as permanent ends the worker task instead,
+    /// so the stream never recovers from a gap the replay path could repair.
+    #[test]
+    fn an_indexer_resync_signal_is_not_a_permanent_failure() {
+        let gap = classify_recovery_rpc(tonic::Status::failed_precondition(
+            "event sequence gap: expected 5, got 9",
+        ));
+        let contract =
+            classify_recovery_rpc(tonic::Status::invalid_argument("unsupported action type"));
+
+        assert!(!gap.is_permanent());
+        // A contract violation is not repaired by retrying, so it must still stop.
+        assert!(contract.is_permanent());
+    }
 
     #[test]
     fn parses_snapshot_topic_metadata() {
