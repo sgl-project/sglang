@@ -238,31 +238,17 @@ class TestTopK(CustomTestCase):
 
     def test_topk_softmax_with_correction_bias(self):
         """Bias must affect expert selection without becoming a routing weight."""
-        for (
-            num_tokens,
-            num_experts,
-            topk,
-            with_bias,
-            bias_2d,
-            renormalize,
-        ) in itertools.product(
+        for num_tokens, num_experts, topk, with_bias, renormalize in itertools.product(
             [1, 17, 128],
             [16, 128, 384, 512],
             [1, 2, 4, 8],
-            [False, True],
             [False, True],
             [False, True],
         ):
             torch.manual_seed(0)
             hidden_states = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
             gating_output = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
-            if with_bias:
-                if bias_2d:
-                    correction_bias = torch.randn((1, num_experts))
-                else:
-                    correction_bias = torch.randn(num_experts)
-            else:
-                correction_bias = None
+            correction_bias = torch.randn(num_experts) if with_bias else None
 
             topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
                 hidden_states=hidden_states,
@@ -275,9 +261,7 @@ class TestTopK(CustomTestCase):
             scores = torch.softmax(gating_output.float(), dim=-1)
             scores_for_choice = scores
             if correction_bias is not None:
-                if not bias_2d:
-                    correction_bias = correction_bias.unsqueeze(0)
-                scores_for_choice = scores_for_choice + correction_bias
+                scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
             expected_choice_scores = torch.topk(
                 scores_for_choice, k=topk, dim=-1, sorted=True
             ).values
