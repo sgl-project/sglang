@@ -62,7 +62,6 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
-    # Emissions deferred by SGLANG_OPT_STREAM_FINISH_BUDGET; drained FIFO.
     _deferred_finished: deque = field(default_factory=deque)
     _deferred_rids: set = field(default_factory=set)
 

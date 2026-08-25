@@ -101,7 +101,6 @@ class TestStreamFinishBudget(CustomTestCase):
         self.assertEqual(len(finished_emitted), len(set(finished_emitted)))
         for p in passes:
             self.assertLessEqual(sum(rid.startswith("f") for rid in p), 4)
-        # 10 finished at budget 4 -> 3 passes carry finished outputs.
         self.assertEqual(len(passes), 3)
         self.assertEqual(len(streamer._deferred_finished), 0)
         self.assertEqual(len(streamer._deferred_rids), 0)
@@ -124,7 +123,6 @@ class TestStreamFinishBudget(CustomTestCase):
         ):
             _StubAccumulator.instances = []
             streamer._stream_output_generation(finished, False)
-            # Overlap can re-present the same finished reqs on the next pass.
             streamer._stream_output_generation(finished, False)
             while streamer._deferred_finished:
                 streamer._stream_output_generation([], False)
