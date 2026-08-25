@@ -167,7 +167,6 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
-        self.enable_dcp_pack = envs.SGLANG_DISAGG_DCP_PACK.get()
         self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
@@ -356,7 +355,7 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _init_dcp_pack_buffers_once(self) -> None:
-        if self._dcp_pack_buffers is not None or not self.enable_dcp_pack:
+        if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
             return
