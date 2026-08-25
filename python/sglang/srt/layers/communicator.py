@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.afd.afd_type import AFDRole, get_afd_role
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -388,6 +389,7 @@ class LayerScatterModes:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
+                or get_afd_role()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or enable_dwdp()
             ):
@@ -468,6 +470,7 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.afd_role = get_afd_role()
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -567,6 +570,9 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -763,6 +769,9 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         if cache is not None:
             self._context.cache = cache
 
@@ -780,6 +789,9 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -789,6 +801,9 @@ class LayerCommunicator:
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if self.afd_role is not None:
+            return False
+
         if not self.allow_reduce_scatter:
             return False
         if (
@@ -809,6 +824,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if self.afd_role is not None:
+            return False
+
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at

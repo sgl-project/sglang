@@ -33,6 +33,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -3238,6 +3239,29 @@ class ServerArgs:
     ] = 0
 
     # -------------------------------------------------------------------------
+    # Attention-FFN disaggregation (AFD)
+    # -------------------------------------------------------------------------
+    afd_role: A[
+        Optional[AFDRole],
+        Arg(
+            help="AFD role, i.e., `attn` or `ffn`.",
+            choices=list(AFDRole),
+            type_parser=AFDRole,
+        ),
+        NS("disagg"),
+    ] = None
+    afd_transfer_backend: A[
+        Literal["stepmesh"],
+        Arg(help="Backend for AFD."),
+        NS("disagg"),
+    ] = "stepmesh"
+    afd_ffn_addr: A[
+        Optional[str],
+        "The host address (ip:port) for FFN (e.g., `192.168.0.2:25000`).",
+        NS("disagg"),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Encode prefill disaggregation
     # -------------------------------------------------------------------------
     encoder_only: A[
@@ -3827,6 +3851,9 @@ class ServerArgs:
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
 
+        # Validate Attention-FFN disaggregation (AFD) flags.
+        self._handle_afd_validation()
+
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
@@ -4190,6 +4217,31 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _handle_afd_validation(self):
+        if self.afd_role is None:
+            return
+
+        # Either not compatible or temporarily unsupported.
+        assert self.disable_cuda_graph, "Cuda graph is not supported for AFD."
+        assert (
+            self.disable_overlap_schedule
+        ), "Overlap schedule is not supported for AFD."
+
+        assert self.nnodes == 1, "Multi-node distribution is not supported for AFD."
+        assert (
+            self.disaggregation_mode == "null"
+        ), "Disaggregation mode is not supported for AFD."
+        assert self.pp_size == 1, "PP is not supported for AFD."
+        if self.tp_size > 1:
+            assert (
+                self.enable_dp_attention
+            ), "DP attention must be enabled if tp_size > 1 for AFD"
+
+        assert self.moe_a2a_backend == "none", "MoE A2A is not compatible with AFD."
+        assert (
+            not self.enable_two_batch_overlap
+        ), "Two batch overlap is not compatible with AFD."
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:
@@ -10576,6 +10628,9 @@ class PortArgs:
     # empty when IPC mode derives the address from instance_id).
     load_collector_ipc_name: str = ""
 
+    # The ipc endpoint for Attn-to-FFN scheduler sync (AFD only)
+    afd_ipc_name: Optional[str] = None
+
     # Stable token shared by all processes in one server instance, used to
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
@@ -10599,6 +10654,20 @@ class PortArgs:
             )
 
         instance_id = uuid.uuid4().hex[:12]
+
+        # always use TCP for AFD
+        afd_ipc_name = None
+        if server_args.afd_role is not None:
+            assert (
+                server_args.afd_ffn_addr is not None
+            ), "Please provide --afd-ffn-addr for AFD"
+            try:
+                afd_ffn_addr = NetworkAddress.parse(server_args.afd_ffn_addr)
+            except ValueError:
+                raise ValueError(
+                    "Please provide --afd-ffn-addr as host:port of FFN node"
+                )
+            afd_ipc_name = afd_ffn_addr.to_tcp()
 
         decoupled_spec_ipc_config = None
         if server_args.decoupled_spec_role != "null":
@@ -10629,6 +10698,7 @@ class PortArgs:
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 decoupled_spec_ipc_config=decoupled_spec_ipc_config,
+                afd_ipc_name=afd_ipc_name,
                 instance_id=instance_id,
             )
         else:
@@ -10720,5 +10790,6 @@ class PortArgs:
                 load_collector_ipc_name=NetworkAddress(
                     dist_init_host, load_collector_port
                 ).to_tcp(),
+                afd_ipc_name=afd_ipc_name,
                 instance_id=instance_id,
             )

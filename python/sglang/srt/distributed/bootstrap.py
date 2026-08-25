@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
     init_distributed_environment,
+    initialize_local_group,
     initialize_model_parallel,
     set_custom_all_reduce,
     set_flashinfer_allreduce_only,
@@ -28,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
 )
@@ -269,6 +271,12 @@ def _init_parallel_groups(
         max_world_size=server_args.max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
+    if get_disagg().afd_role is not None:
+        initialize_local_group(
+            nnodes=server_args.nnodes,
+            pp_size=pp_size,
+            tp_size=tp_size,
+        )
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,

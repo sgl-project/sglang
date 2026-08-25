@@ -2305,6 +2305,13 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
     error: str = ""
 
 
+class AFSyncReq(BaseReq, kw_only=True):
+    """Sync request from the AFD ATTN scheduler to the FFN scheduler:
+    notifies the FFN side to run one model forward pass."""
+
+    pass
+
+
 # The following request types are either defined in other files,
 # or not subclasses of BaseReq/BaseBatchReq, so we skip the check for them.
 _IGNORE_REQ_TYPES_CHECK = (

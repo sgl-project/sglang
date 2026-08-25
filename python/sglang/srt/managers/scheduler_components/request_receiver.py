@@ -66,6 +66,10 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # AFD (Attention-FFN disaggregation) control channel, only active at
+    # tp_rank 0: ATTN forwards control requests to FFN, FFN receives them.
+    afd_send_to_ffn: Optional[zmq.Socket] = None
+    afd_recv_from_attn: Optional[zmq.Socket] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -132,6 +136,31 @@ class SchedulerRequestReceiver:
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                if self.ps.tp_rank == 0:
+                    if self.afd_send_to_ffn is not None:
+                        # AFD ATTN: forward control reqs to the FFN scheduler.
+                        for req in recv_reqs:
+                            if not isinstance(
+                                req,
+                                (
+                                    TokenizedGenerateReqInput,
+                                    TokenizedEmbeddingReqInput,
+                                    BatchTokenizedGenerateReqInput,
+                                    BatchTokenizedEmbeddingReqInput,
+                                ),
+                            ):
+                                self.afd_send_to_ffn.send_pyobj(req)
+                    elif self.afd_recv_from_attn is not None:
+                        # AFD FFN: drain the control reqs forwarded by ATTN.
+                        while True:
+                            try:
+                                recv_afd = self.afd_recv_from_attn.recv_pyobj(
+                                    zmq.NOBLOCK
+                                )
+                            except zmq.ZMQError:
+                                break
+                            recv_reqs.append(recv_afd)
             else:
                 recv_reqs = None
         else:
