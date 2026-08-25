@@ -317,19 +317,19 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         vae_config_dict: dict[str, Any],
     ) -> torch.nn.Module:
         """Load the repo's AutoencoderKLConv3D and fill it with the "vae.*" weights."""
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-        vae_cls = get_class_from_dynamic_module(
-            "autoencoder_kl_3d.AutoencoderKLConv3D",
-            model_path,
-            revision=server_args.revision,
+        # AutoencoderKLConv3D is copied from the official HunyuanImage-3 model
+        # repository (autoencoder_kl_3d.py) and vendored into sglang so that
+        # trust_remote_code / dynamic-module loading is no longer required.
+        from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_conv3d_hunyuan_image3 import (
+            AutoencoderKLConv3D,
         )
+
         # the vae section of config.json omits a few constructor args
         vae_params = dict(vae_config_dict)
         vae_params.setdefault("in_channels", 3)
         vae_params.setdefault("out_channels", 3)
         vae_params.setdefault("ffactor_temporal", 4)
-        vae = vae_cls(**vae_params)
+        vae = AutoencoderKLConv3D(**vae_params)
 
         dtype = PRECISION_TO_TYPE.get(pipeline_config.vae_precision, torch.float32)
         vae.to(dtype=dtype)
