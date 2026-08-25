@@ -771,6 +771,21 @@ class CommonKVManager(BaseKVManager):
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
+        if self.dist_init_addr:
+            # Multi-node case: bootstrap server's host is dist_init_addr
+            host = NetworkAddress.parse(self.dist_init_addr).resolved().host
+        else:
+            # Single-node case: bootstrap server's host is the same as http server's host
+            host = self.bootstrap_host
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+
+        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
+        url = f"{bootstrap_na.to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -794,64 +809,55 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
-        payloads = [payload]
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
-            payloads = get_world_group().all_gather_object(payload)
+            topology_rows = get_world_group().all_gather_object(payload)
+            # Every scheduler contributes a topology row. Only the scheduler
+            # ranks that own a Rust listener populate their local registry.
             if self.kv_args.rust_http_port is None:
                 return
-            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+            registry_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
                 self.bootstrap_host, self.bootstrap_host
             )
-            bootstrap_na = NetworkAddress(host, self.kv_args.rust_http_port)
-        else:
-            if self.dist_init_addr:
-                # Multi-node case: bootstrap server's host is dist_init_addr
-                host = NetworkAddress.parse(self.dist_init_addr).resolved().host
-            else:
-                # Single-node case: bootstrap server's host is the same as http server's host
-                host = self.bootstrap_host
-                # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
-                # and can't be connected to; rewrite it to the same-family loopback,
-                # which the wildcard listener also binds.  (self.local_ip is wrong
-                # here — it can resolve to a different family than the listener,
-                # e.g. IPv6 while the server is bound to 0.0.0.0.)
-                host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
-            bootstrap_na = NetworkAddress(host, self.bootstrap_port)
+            registry = NetworkAddress(registry_host, self.kv_args.rust_http_port)
+            url = f"{registry.to_url()}/route"
+            for topology_row in topology_rows:
+                registry_row = {
+                    **topology_row,
+                    "prefill_http_port": self.kv_args.rust_http_port,
+                }
+                self._register_topology_row(url, registry_row)
+            return
 
+        self._register_topology_row(url, payload)
+
+    def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
-        url = f"{bootstrap_na.to_url()}/route"
-        for topology_payload in payloads:
-            registered = False
-            for attempt in range(max_retries):
-                try:
-                    response = requests.put(url, json=topology_payload, timeout=5)
-                    if response.status_code == 200:
-                        logger.debug(
-                            "Prefill successfully registered to bootstrap server."
-                        )
-                        registered = True
-                        break
-                    logger.warning(
-                        f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
-                    )
-                except Exception as e:
-                    # Walk to root cause to skip misleading urllib3 wrapper messages
-                    cause = e
-                    while cause.__cause__ is not None:
-                        cause = cause.__cause__
-                    logger.warning(
-                        f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
-                    )
-                if attempt != max_retries - 1:
-                    delay = min(initial_delay * (2**attempt), max_delay) * (
-                        0.75 + 0.25 * (time.monotonic() % 1)
-                    )
-                    time.sleep(delay)
-            if not registered:
-                logger.error(
-                    f"Prefill instance failed to register to bootstrap server "
-                    f"{url} after {max_retries} retries"
+        for attempt in range(max_retries):
+            try:
+                response = requests.put(url, json=payload, timeout=5)
+                if response.status_code == 200:
+                    logger.debug("Prefill successfully registered to bootstrap server.")
+                    return
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
+            except Exception as e:
+                # Walk to root cause to skip misleading urllib3 wrapper messages
+                cause = e
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
+                )
+            if attempt == max_retries - 1:
+                break
+            delay = min(initial_delay * (2**attempt), max_delay) * (
+                0.75 + 0.25 * (time.monotonic() % 1)
+            )
+            time.sleep(delay)
+        logger.error(
+            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:

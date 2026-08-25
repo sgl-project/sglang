@@ -210,10 +210,10 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = success_resp
 
         schedulers = (
-            (0, 0, "10.0.0.1", 8765),
-            (0, 1, "10.0.0.1", None),
-            (1, 0, "10.0.0.2", 8765),
-            (1, 1, "10.0.0.2", None),
+            (0, 0, "10.0.0.1", 17000, 8765),
+            (0, 1, "10.0.0.1", 17001, None),
+            (1, 0, "10.0.0.2", 17002, 8766),
+            (1, 1, "10.0.0.2", 17003, None),
         )
 
         def gather_topology(payload):
@@ -223,14 +223,15 @@ class TestRegisterToBootstrap(CustomTestCase):
                     "attn_dp_rank": dp_rank,
                     "attn_tp_rank": tp_rank,
                     "rank_ip": host,
+                    "rank_port": rank_port,
                 }
-                for dp_rank, tp_rank, host, _ in schedulers
+                for dp_rank, tp_rank, host, rank_port, _ in schedulers
             ]
 
         mock_world_group.return_value.all_gather_object.side_effect = gather_topology
 
         with envs.SGLANG_RUST_SERVER.override(True):
-            for dp_rank, tp_rank, local_ip, rust_http_port in schedulers:
+            for dp_rank, tp_rank, local_ip, _, rust_http_port in schedulers:
                 manager = self._make_manager()
                 manager.attn_dp_size = 2
                 manager.attn_dp_rank = dp_rank
@@ -244,15 +245,29 @@ class TestRegisterToBootstrap(CustomTestCase):
         topology_by_registry = {}
         for put_call in mock_put.call_args_list:
             payload = put_call.kwargs["json"]
-            topology_by_registry.setdefault(put_call.args[0], set()).add(
+            topology_by_registry.setdefault(put_call.args[0], {})[
                 (payload["attn_dp_rank"], payload["attn_tp_rank"])
-            )
-        complete_topology = {(dp, tp) for dp, tp, _, _ in schedulers}
+            ] = (payload["rank_ip"], payload["rank_port"])
+        complete_topology = {
+            (dp, tp): (host, rank_port)
+            for dp, tp, host, rank_port, _ in schedulers
+        }
         self.assertEqual(
             topology_by_registry,
             {
                 "http://10.0.0.1:8765/route": complete_topology,
-                "http://10.0.0.2:8765/route": complete_topology,
+                "http://10.0.0.2:8766/route": complete_topology,
+            },
+        )
+        self.assertEqual(mock_put.call_count, 8)
+        self.assertEqual(
+            {
+                (put_call.args[0], put_call.kwargs["json"]["prefill_http_port"])
+                for put_call in mock_put.call_args_list
+            },
+            {
+                ("http://10.0.0.1:8765/route", 8765),
+                ("http://10.0.0.2:8766/route", 8766),
             },
         )
         self.assertEqual(
@@ -263,7 +278,7 @@ class TestRegisterToBootstrap(CustomTestCase):
                 )
                 for gather_call in mock_world_group.return_value.all_gather_object.call_args_list
             ],
-            [(dp, tp) for dp, tp, _, _ in schedulers],
+            [(dp, tp) for dp, tp, _, _, _ in schedulers],
         )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
@@ -323,6 +338,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr = MagicMock(spec=CommonKVManager)
         # Bind the real method to the mock
         mgr.register_to_bootstrap = CommonKVManager.register_to_bootstrap.__get__(
+            mgr, CommonKVManager
+        )
+        mgr._register_topology_row = CommonKVManager._register_topology_row.__get__(
             mgr, CommonKVManager
         )
 

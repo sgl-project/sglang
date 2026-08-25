@@ -71,7 +71,7 @@ class KVArgs:
     page_size: int
     # for system dp
     system_dp_rank: int
-    # HTTP port bound by this scheduler's embedded Rust server, if it hosts one.
+    # Local Rust /route registry port; None on scheduler ranks without a listener.
     rust_http_port: Optional[int]
     # for pp prefill
     pp_rank: int
