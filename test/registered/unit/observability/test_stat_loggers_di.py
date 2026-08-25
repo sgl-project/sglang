@@ -221,5 +221,7 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
         )
         self.assertEqual(self._value("attempts"), 4)
         self.assertEqual(self._value("issued"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
