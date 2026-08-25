@@ -220,8 +220,8 @@ STDOUT_IDLE_TIMEOUT = 600  # > BENCHMARK_STDOUT_IDLE_TIMEOUT (300)
 STDOUT_WATCHDOG_POLL_INTERVAL = 30
 
 _last_stdout_activity = time.time()
-_current_server_proc = None       # server Popen of the current test class
-_stdout_watchdog_active = False   # only allow triggering while tests run
+_current_server_proc = None  # server Popen of the current test class
+_stdout_watchdog_active = False  # only allow triggering while tests run
 _stdout_watchdog_started = False  # started once per process
 
 
@@ -328,6 +328,7 @@ def _ensure_stdout_watchdog():
         name="stdout-idle-watchdog",
         daemon=True,
     ).start()
+
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
