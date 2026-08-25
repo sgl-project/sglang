@@ -1,6 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from AITER's Triton unified-attention implementation.
+"""Qwen3.5 MTP-verify specialization of AITER's Triton unified attention.
+
+Forked from ROCm/aiter @ d9e5ef7, kernel_unified_attention_3d in
+aiter/ops/triton/_triton_kernels/attention/unified_attention.py. The kernel body
+is essentially unchanged; what diverges is the launch configuration, because
+upstream's heuristics are tuned for prefill/decode and mis-fit MTP verify.
+
+Divergences from upstream (upstream refs are in aiter/ops/triton/attention/
+unified_attention.py):
+
+  block_m = 32 -> BLOCK_Q = 2    upstream: BLOCK_M = 16 if nqpkv <= 16, BLOCK_Q = 1
+  tile_size = 32, fixed          upstream: select_2d_config / select_3d_config
+  always 3D split-K              upstream: use_2d_kernel() picks 2D or 3D
+  num_segments computed here     upstream: config table
+  num_warps / waves_per_eu       upstream: config table
+
+The core win is block_m. MTP verify has q_len 2-4, so upstream packs one query
+token x 16 heads per tile and fills only half the MFMA M dimension; block_m=32
+stacks two draft tokens into one tile. Forcing 3D then recovers the CU occupancy
+that a low batch would otherwise leave idle. Both are tied to the 16:1 GQA
+ratio, not to head_dim.
+
+Real constraints, mirrored by the gate in srt/layers/attention/aiter_backend.py:
+
+  - head_dim must be a power of 2: HEAD_SIZE_PADDED is passed through unpadded,
+    so 192 and 80 do not compile. 256 is the only measured size; 128 should be
+    correct but is not tuned (num_warps=2 balances VGPR pressure at 256).
+  - Causal only. seq_mask carries no tree mask, so spec decoding needs topk==1.
+"""
 
 import math
 

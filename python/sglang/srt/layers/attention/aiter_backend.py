@@ -2294,12 +2294,18 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
+                    # Shape gate, not a model gate: the kernel is tuned for 16:1 GQA
+                    # (block_m=32 -> block_q=2 packs two draft tokens per tile), and
+                    # head_dim 256 is the only validated size.
+                    # TODO(yichiche): relax the head_dim gate once other sizes are
+                    # measured -- the wrapper passes HEAD_SIZE_PADDED unpadded, so
+                    # only powers of 2 work (128/256 OK, 192 is not).
+                    num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
                     use_qwen35_mtp_kernel = (
                         is_gfx95_supported()
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
-                        and layer.tp_q_head_num == 16
-                        and layer.tp_k_head_num == 1
+                        and num_queries_per_kv == 16
                         and layer.tp_v_head_num == 1
                         and layer.qk_head_dim == 256
                         and layer.v_head_dim == 256
