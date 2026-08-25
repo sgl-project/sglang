@@ -37,15 +37,21 @@ on:
           - mi300
           - mi325
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (ROCm 7.2.4 by default)'
         required: false
         type: choice
-        default: rocm720
+        default: rocm724
         options:
+          - rocm724
           - rocm720
           - rocm700
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image:
+        description: 'Override AMD CI Docker image (optional, e.g. rocm/sgl-dev:tag)'
         required: false
         type: string
         default: ''
@@ -67,12 +73,17 @@ on:
         type: string
         default: mi300
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (ROCm 7.2.4 by default)'
         required: false
         type: string
-        default: rocm720
+        default: rocm724
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image:
+        description: 'Override AMD CI Docker image (optional, e.g. rocm/sgl-dev:tag)'
         required: false
         type: string
         default: ''
@@ -84,6 +95,7 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -130,7 +142,7 @@ jobs:
   # setup across scarce AMD GPUs to shave only a couple minutes of test time,
   # so one GPU running the whole suite sequentially is the better trade.
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -145,8 +157,8 @@ jobs:
 
       - name: Start CI container
         # `inputs` is empty on pull_request events, so fall back explicitly to
-        # the ROCm 7.2 PR default. Reusable callers can still request ROCm 7.0.
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
+        # the ROCm 7.2 PR default. Reusable callers can request another variant.
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm724' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -163,7 +175,7 @@ jobs:
   # pool as small (AMD GPUs carry enough VRAM that "large" here is a CUDA
   # memory-tier label, not a separate AMD runner pool).
   extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -177,7 +189,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm724' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -193,7 +205,7 @@ jobs:
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
   # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && inputs.rocm_version != 'rocm720' && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -207,7 +219,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm724' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
