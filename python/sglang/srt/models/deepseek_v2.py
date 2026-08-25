@@ -1018,7 +1018,7 @@ class DeepseekV2MoE(nn.Module):
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
+            _, shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
@@ -1194,6 +1194,9 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
         # Fused shared-add + reduce-scatter path (falls through if not applicable).
+        # When humming runner is active, pass topk info for the mul-sum overlap
+        # kernel which fuses topk weighted sum + add shared + RS in one kernel.
+        is_humming = get_moe_runner_backend().is_humming()
         fused_out = maybe_fused_shared_add_rs(
             final_hidden_states,
             shared_output,
@@ -1202,6 +1205,9 @@ class DeepseekV2MoE(nn.Module):
             # if fuse shared experts, topk for moe equals to num_experts_per_tok + num_fused_shared_experts
             self.top_k + self.num_fused_shared_experts,
             self.routed_scaling_factor,
+            is_humming=is_humming,
+            topk_weights=topk_output.topk_weights if is_humming else None,
+            topk_ids=topk_output.topk_ids if is_humming else None,
         )
         if fused_out is not None:
             return fused_out
@@ -1524,13 +1530,35 @@ class DeepseekV2MoE(nn.Module):
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
 
-            shared = getattr(self, "shared_experts", None)
-            ag_out, gate_up_local = maybe_fused_ag_shared_experts(
-                hidden_states,
-                getattr(self, "shared_experts_is_fp8", False),
-                shared.gate_up_proj.weight if shared is not None else None,
-                shared.gate_up_proj.weight_scale_inv if shared is not None else None,
-            )
+            if shared is None:
+                return None, None
+
+            shared_experts_is_fp8 = self.shared_experts_is_fp8
+            gate_up = shared.gate_up_proj
+
+            from sglang.srt.layers.quantization.humming import HummingLinearMethod
+            is_humming = isinstance(gate_up.quant_method, HummingLinearMethod)
+
+            if is_humming:
+                ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+                    hidden_states,
+                    shared_experts_is_fp8=False,
+                    w_fp8=None,
+                    w_scale=None,
+                    is_humming=True,
+                    humming_weight=gate_up.pre_repacked_weight,
+                    humming_scale=gate_up.pre_repacked_scale,
+                    humming_group_size=(
+                        gate_up.quant_method.weight_schema.weight_scale_group_size
+                    ),
+                )
+            else:
+                ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+                    hidden_states,
+                    shared_experts_is_fp8,
+                    gate_up.weight if not shared_experts_is_fp8 else None,
+                    gate_up.weight_scale_inv if shared_experts_is_fp8 else None,
+                )
             if gate_up_local is not None and ag_out is not None:
                 return ag_out, self.shared_experts(
                     hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator,
@@ -2859,15 +2887,15 @@ class DeepseekV2Model(nn.Module):
         )
 
         # CP-v2 shards/gathers at the eager-runner boundary instead.
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
         use_cp_v1 = (
-            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            use_prefill_cp or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
         ) and not is_cp_v2_active(forward_batch)
-
-        if use_cp_v1:
+        if use_prefill_cp:
             _comm = get_tp_group().torch_symm_mem_comm
             if _comm is not None:
                 _comm.set_use_cp(True)
+        if use_cp_v1:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)

@@ -447,11 +447,20 @@ def maybe_fused_ag_shared_experts(
     shared_experts_is_fp8: bool,
     w_fp8: Optional[torch.Tensor],
     w_scale: Optional[torch.Tensor],
+    is_humming: bool = True,
+    humming_weight: Optional[torch.Tensor] = None,
+    humming_scale: Optional[torch.Tensor] = None,
+    humming_group_size: int = 128,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Fused AG + fp8-quant + gate_up gemm. Returns (None, None) to fall back.
+    """Fused AG + GEMM for shared experts. Returns (None, None) to fall back.
 
-    Standalone wrapper around allgather_gemm_op_symm_mem that handles
-    communicator lookup, context creation, and output allocation.
+    Supports two quantization paths:
+    - fp8 block-wise (W8A8): uses allgather_gemm_op_symm_mem (existing)
+    - humming fp8 (W8A8): uses allgather_humming_fp8_gemm_op_symm_mem
+
+    The path is selected at the Python level (not via kernel constexpr)
+    because the two weight formats have different dtype, shape, and dequant
+    logic — a single kernel with constexpr branches would waste registers.
     """
     from sglang.srt.distributed.device_communicators.torch_symm_mem import (
         TorchSymmMemCommunicator,
@@ -460,6 +469,41 @@ def maybe_fused_ag_shared_experts(
     comm = TorchSymmMemCommunicator.get_active_comm()
     if comm is None:
         return None, None
+    
+
+    _, K = hidden_states.shape
+    if is_humming:
+        if humming_weight is None or humming_scale is None:
+            return None, None
+        ctx = comm.get_or_create_ag_gemm_ctx(K=K)
+        if ctx is None:
+            return None, None
+        try:
+            # BLOCK_SIZE_K must divide group_size (128); 128 keeps one scale
+            # per K-tile for the W8A8 block-fp8 consumer kernel.
+            block_size = [64, 128, 128]
+            allgather_output, gate_up_full = allgather_humming_fp8_gemm_op_symm_mem(
+                ctx=ctx,
+                a_bf16=hidden_states,
+                w_humming=humming_weight,
+                w_scale=humming_scale,
+                group_size=humming_group_size,
+                block_size=block_size,
+            )
+        except Exception:
+            # Layout/comm failure: fall back to the non-fused path, but log so
+            # a regression in the fused kernel is visible instead of silent.
+            logger.exception(
+                "humming fused AG+GEMM failed (K=%d, w=%s %s, scale=%s %s, "
+                "group=%d); falling back to non-fused shared experts",
+                K,
+                tuple(humming_weight.shape), humming_weight.dtype,
+                tuple(humming_scale.shape), humming_scale.dtype,
+                humming_group_size,
+            )
+            return None, None
+        return allgather_output, gate_up_full
+
     if not shared_experts_is_fp8:
         return None, None
     if w_fp8 is None or w_scale is None:
@@ -563,7 +607,7 @@ def consumer_bf16_matmul(
     c_mask = (offs_cm[:, None] < rank_row_end) & (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 # ============================================================================
-# AllGather -> BF16 GEMM Operation (AG first, BF16 GEMM follows with tile-level signaling)
+# AllGather -> Humming 4-bit GEMM Operation
 # ============================================================================
 def allgather_bf16_gemm_op_symm_mem(
     ctx: AllGatherGemmContextSymmMem,
@@ -655,6 +699,123 @@ def allgather_bf16_gemm_op_symm_mem(
     current_stream.wait_stream(ag_stream)
     return symm_ag_a[:M, :], c
 
+# ============================================================================
+# AllGather -> Humming FP8 (W8A8) GEMM Operation
+# Reuses consumer_bf16_a_block_fp8_matmul (on-the-fly A→fp8 quant + fp8 GEMM)
+# with group_n=1 for humming's per-channel-N / group-K weight scale.
+# ============================================================================
+def allgather_humming_fp8_gemm_op_symm_mem(
+    ctx: AllGatherGemmContextSymmMem,
+    a_bf16: torch.Tensor,
+    w_humming: torch.Tensor,
+    w_scale: torch.Tensor,
+    group_size: int,
+    block_size: list,
+    output_dtype: torch.dtype = torch.bfloat16,
+    GROUP_SIZE_M: int = 32,
+):
+    """AG → humming FP8 (W8A8) GEMM overlap for shared experts.
+
+    Humming FP8 is W8A8: the activation is dynamically quantized to fp8 e4m3
+    (per-row absmax) inside the consumer kernel, then an fp8 GEMM is run against
+    the fp8 weight; the result is scaled by the per-row A scale and the
+    weight's per-channel-N / group-K scale.
+
+    Weight is humming's int32 [N, K//4] packed fp8 e4m3 (4 bytes per int32,
+    pre-interleave layout) → view as fp8 [N, K]. Scale is bf16 [N, K//group_size]
+    (per-channel N, group in K → group_n=1, group_k=group_size). Reuses the
+    proven W8A8 block-fp8 consumer kernel with on-the-fly A quantization.
+
+    Returns (gathered_A [M*world_size, K], C [M*world_size, N]).
+    """
+    assert len(block_size) == 3
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
+    M_local, K = a_bf16.shape
+    N = w_humming.shape[0]
+    M = M_local * ctx.num_ranks
+
+    assert a_bf16.dtype == torch.bfloat16, f"Expected bf16 A, got {a_bf16.dtype}"
+    # Weight is int32 [N, K//4] (4 fp8 e4m3 bytes per int32) -> view as fp8 [N, K].
+    assert w_humming.dtype == torch.int32, (
+        f"Expected int32 packed fp8 weight, got {w_humming.dtype}")
+    assert w_humming.is_contiguous(), "humming weight must be contiguous for fp8 view"
+    w_fp8 = w_humming.view(torch.float8_e4m3fn)
+    assert w_fp8.shape == (N, K), (
+        f"fp8 view {tuple(w_fp8.shape)} != ({N}, {K}); "
+        f"weight {tuple(w_humming.shape)} (expected int32 [N, K//4])")
+    assert w_scale.dtype == torch.bfloat16, f"Expected bf16 scale, got {w_scale.dtype}"
+    assert w_scale.shape == (N, K // group_size), (
+        f"scale {tuple(w_scale.shape)} != ({N}, {K // group_size})")
+    # The block kernel holds one weight scale per K-tile, so BLOCK_SIZE_K must
+    # divide the K group size (use block_size = [64, 128, 128]).
+    assert group_size % BLOCK_SIZE_K == 0, (
+        f"group_size {group_size} must be divisible by BLOCK_SIZE_K {BLOCK_SIZE_K}")
+    assert a_bf16.is_contiguous()
+
+    symm_input = ctx.get_input_buf(M_local, K)
+    symm_input.copy_(a_bf16)
+    symm_ag_a = ctx.symm_ag_a_buf
+    ag_signal = ctx.ag_signal_buf
+    assert ag_signal.numel() >= ctx.num_ranks
+
+    c = torch.empty((M, N), dtype=output_dtype, device=a_bf16.device)
+    current_stream = torch.cuda.current_stream()
+    ag_stream = ctx.ag_stream
+
+    ctx.input_hdl.barrier()
+    ag_signal.fill_(0)
+    ctx.input_hdl.barrier()
+    ag_stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(ag_stream):
+        cp_engine_full_mesh_pull_ag(
+            rank=ctx.rank,
+            world_size=ctx.num_ranks,
+            M_local=M_local,
+            K=K,
+            symm_input=symm_input,
+            symm_ag_a=symm_ag_a,
+            peer_symm_input_bufs=ctx.peer_symm_input_bufs,
+            ag_signal=ag_signal,
+        )
+
+    needs_masking = bool(K % BLOCK_SIZE_K != 0)
+    M_local_tiles = triton.cdiv(M_local, BLOCK_SIZE_M)
+    num_pid_n = triton.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = M_local_tiles * ctx.num_ranks * num_pid_n
+
+    consumer_bf16_a_block_fp8_matmul[(num_tiles,)](
+        symm_ag_a,
+        w_fp8,
+        c,
+        w_scale,
+        ag_signal,
+        M, N, K,
+        M_local,
+        M_local_tiles,
+        1,              # group_n: per-channel-N scale [N, K//group_size]
+        group_size,     # group_k
+        symm_ag_a.stride(0),
+        symm_ag_a.stride(1),
+        w_fp8.stride(1),   # stride_bk (K is dim 1 in [N, K] row-major)
+        w_fp8.stride(0),   # stride_bn (N is dim 0 in [N, K] row-major)
+        c.stride(0),
+        c.stride(1),
+        w_scale.stride(1), # stride_Bs_k
+        w_scale.stride(0), # stride_Bs_n
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        needs_masking=needs_masking,
+        rank=ctx.rank,
+        world_size=ctx.num_ranks,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    current_stream.wait_stream(ag_stream)
+    return symm_ag_a[: M_local * ctx.num_ranks, :], c
 
 def maybe_fused_ag_gate_mm(
     hidden_states: torch.Tensor,

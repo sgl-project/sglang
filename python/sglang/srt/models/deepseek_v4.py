@@ -3048,12 +3048,12 @@ class DeepseekV4Model(nn.Module):
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if use_prefill_cp and not run_tbo:
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None and _cp_fused_symm_mem_enabled():
+                _comm.set_use_cp(True)
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
             else:
-                _comm = get_tp_group().torch_symm_mem_comm
-                if _comm is not None and _cp_fused_symm_mem_enabled():
-                    _comm.set_use_cp(True)
                 if self.pp_group.is_first_rank:
                     hidden_states = cp_split_and_rebuild_data(
                         forward_batch, hidden_states

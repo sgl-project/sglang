@@ -522,6 +522,13 @@ class HummingRunnerCore(MoeRunnerCore):
         routed_scaling_factor = (
             self.config.routed_scaling_factor if apply_routed_scaling_factor else None
         )
+        # if enable fused topk reduce rs, skip moe_fused_mul_sum
+        from sglang.srt.distributed import get_tp_group
+        comm = get_tp_group().torch_symm_mem_comm
+        fused_topk_reduce_rs = comm is not None and comm.use_cp
+        if fused_topk_reduce_rs:
+            return buffers["down_output"].view(*topk_ids.shape, -1)
+        
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,

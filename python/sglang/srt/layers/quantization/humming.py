@@ -628,6 +628,19 @@ class HummingLinearMethod(LinearMethodBase):
             torch_dtype=layer.param_dtype,
         )
 
+        # The fused AG+GEMM triton kernel needs the plain packed layout, i.e.
+        # the tensors as they are before Humming's C++-specific interleaved
+        # repack. Only the shared-experts gate_up projection feeds that kernel;
+        # keeping the pre-repack pair on every Humming linear pins a second
+        # weight copy per layer (measured +13.6 GB/GPU on GLM-5.2 TP8).
+        prefix = getattr(layer, "prefix", "")
+        keep_pre_repacked = (
+            envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get()
+            and "shared_experts" in prefix
+            and prefix.endswith("gate_up_proj")
+        )
+        layer.pre_repacked_weight = layer.weight if keep_pre_repacked else None
+        layer.pre_repacked_scale = layer.weight_scale if keep_pre_repacked else None
         # preprocess weight for inference
         HummingMethod.transform_humming_layer(layer)
 
