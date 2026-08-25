@@ -1140,6 +1140,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
+            # Gap probe 1 (layers/cp/layer_trap.py): the layer trap ends at
+            # the last decoder layer; this drain covers the target post-loop
+            # path (CP all-gather / norms / lm_head / logits capture) of the
+            # JUST-finished forward.
+            try:
+                from sglang.srt.layers.cp.layer_trap import gap_probe_post_target
+
+                gap_probe_post_target(self)
+            except Exception:
+                pass
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1165,6 +1175,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                # Gap probe 2: drain the post-target snapshot (verdict for the
+                # target post-loop window), leave a post-draft snapshot for
+                # the next iteration's layer_trap_start (verdict for the
+                # draft prefill forward -- a separate ForwardMode the layer
+                # trap's extend-only gate never covered).
+                try:
+                    from sglang.srt.layers.cp.layer_trap import (
+                        gap_probe_post_draft,
+                    )
+
+                    gap_probe_post_draft(self)
+                except Exception:
+                    pass
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])

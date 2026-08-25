@@ -232,6 +232,12 @@ def layer_trap_start(forward_batch) -> None:
             "[mf-trap] armed rows=allocated window=active-batch-max "
             "(silent-clean mode; catches print [mf-trap] caught)"
         )
+    # Drain a pending gap-probe snapshot (post-target/post-draft of the
+    # previous iteration) BEFORE re-baselining, or its window is lost. If
+    # it caught, keep the evidence buffer and stop (first-hit discipline).
+    _drain()
+    if _pend.get("fired"):
+        return
     _pend.clear()
     _snapshot(forward_batch, "start")
 
@@ -257,3 +263,101 @@ def layer_trap_end(forward_batch) -> None:
     if not _enabled():
         return
     _drain()
+
+
+# ---- gap probes (§24.23: writer outside the layer windows) ---------------
+# The layer trap + send-probe split proved the r2t row is clean through the
+# layer loop but ALREADY dirty at send-loop entry. The untrapped windows on
+# the forward thread are exactly: (1) the target model's post-loop path
+# (after layer_trap_end: CP all-gather, norms, lm_head, logits capture) and
+# (2) the draft prefill forward (a separate ForwardMode the extend-only
+# `_active` gate never traps). These probes bracket them: snapshot at the
+# boundary, drain at the next checkpoint (the next iteration's
+# layer_trap_start drains a still-pending gap snapshot first).
+
+
+def _snapshot_pool(pool, label: str) -> None:
+    """Snapshot every allocated row of `pool` (full width, batch-free)."""
+    if not _enabled() or _pend.get("fired"):
+        return
+    r2t = getattr(pool, "req_to_token", None)
+    if not torch.is_tensor(r2t):
+        return
+    free = getattr(pool, "free_slots", None)
+    hi = int(r2t.shape[0])
+    if free is not None:
+        try:
+            free_set = {int(s) for s in free if 0 < int(s) < hi}
+            rows = [s for s in range(1, hi) if s not in free_set]
+        except Exception:
+            rows = None
+        if not rows:
+            return
+        idx = torch.tensor(rows, dtype=torch.int64)
+    else:
+        idx = torch.arange(1, hi, dtype=torch.int64)
+    try:
+        buf = torch.empty(
+            (idx.numel(), r2t.shape[1]), dtype=torch.int32, pin_memory=True
+        )
+    except Exception:
+        buf = torch.empty((idx.numel(), r2t.shape[1]), dtype=torch.int32)
+    try:
+        buf.copy_(r2t[idx], non_blocking=True)
+    except Exception:
+        return
+    try:
+        ev = (
+            torch.get_device_module(r2t.device).current_stream().record_event()
+        )
+    except Exception:
+        ev = None
+    _pend.clear()
+    _pend.update(
+        buf=buf, ev=ev, label=label, rows=idx.tolist(), fired=False
+    )
+
+
+def gap_probe_post_target(worker) -> None:
+    """Call on the forward thread right after the TARGET forward returns
+    (eagle_worker_v2.forward_batch_generation, extend branch). Drains any
+    prior state, then snapshots: a dirty hit at the next drain convicts the
+    target post-loop path (CP all-gather / norm / lm_head / logits capture).
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    pool = getattr(
+        getattr(worker, "_target_worker", None), "model_runner", None
+    )
+    pool = getattr(pool, "req_to_token_pool", None)
+    if pool is None:
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, "gap:post-target")
+
+
+def gap_probe_post_draft(worker) -> None:
+    """Call right after the DRAFT prefill forward returns. Drains the
+    post-target snapshot (naming the target post-loop window) and leaves a
+    post-draft snapshot for the next iteration's layer_trap_start: a hit
+    there convicts the draft prefill forward family.
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    pool = getattr(
+        getattr(worker, "_draft_worker", None), "draft_runner", None
+    )
+    pool = getattr(pool, "req_to_token_pool", None) or getattr(
+        getattr(worker, "_target_worker", None),
+        "model_runner",
+        None,
+    )
+    pool = getattr(pool, "req_to_token_pool", None)
+    if pool is None:
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, "gap:post-draft")
