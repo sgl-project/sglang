@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_library")
 load("@srt_empty_bootstrap//:requirements.bzl", "requirement")
 
@@ -18,6 +19,30 @@ py_library(
         "//python/sglang:__subpackages__",
     ],
     deps = [requirement("msgspec")],
+)
+
+# Host-only core of the speculative n-gram corpus. The TVM-FFI adapter remains
+# a separate future target, so this compiles without torch, CUDA, or DLPack.
+cc_library(
+    name = "ngram_corpus_core",
+    srcs = [
+        "jit/csrc/ngram_corpus/ngram.cpp",
+        "jit/csrc/ngram_corpus/result.cpp",
+        "jit/csrc/ngram_corpus/suffix_automaton.cpp",
+        "jit/csrc/ngram_corpus/trie.cpp",
+    ],
+    hdrs = [
+        "jit/csrc/ngram_corpus/ngram.h",
+        "jit/csrc/ngram_corpus/param.h",
+        "jit/csrc/ngram_corpus/queue.h",
+        "jit/csrc/ngram_corpus/result.h",
+        "jit/csrc/ngram_corpus/suffix_automaton.h",
+        "jit/csrc/ngram_corpus/trie.h",
+    ],
+    copts = ["-std=c++20"],
+    linkopts = ["-pthread"],
+    target_compatible_with = ["//bazel/platforms:cpu"],
+    visibility = ["//visibility:public"],
 )
 
 filegroup(

@@ -1,6 +1,41 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+load(
+    "@sglang_crates//:defs.bzl",
+    "aliases",
+    "all_crate_deps",
+    "crate_edition",
+)
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "Cargo.toml",
     "pyproject.toml",
 ])
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    aliases = aliases(build = True),
+    build_script_env = {
+        "PROTOC": "$(execpath @bazel_tools//tools/proto:protoc)",
+    },
+    crate_root = "build.rs",
+    data = ["//proto/sglang/runtime/v1:sglang.proto"],
+    edition = crate_edition(),
+    tools = ["@bazel_tools//tools/proto:protoc"],
+    deps = all_crate_deps(build = True),
+)
+
+rust_shared_library(
+    name = "sglang_grpc_core",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "sglang_grpc_core",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    deps = [
+        ":build_script",
+    ] + all_crate_deps(normal = True),
+)
