@@ -222,7 +222,7 @@ def gdn_prefill_qkv_prepare_fwd(
     v: torch.Tensor,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Materialize strided Q/K/V together, then reuse the existing L2Norm."""
+    """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
     if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
         raise ValueError(
             "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
@@ -243,6 +243,9 @@ def gdn_prefill_qkv_prepare_fwd(
     H_V = v.shape[1]
     if D > 512:
         raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
+
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)

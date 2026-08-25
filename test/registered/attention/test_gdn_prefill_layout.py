@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention.fla.l2norm import (
 )
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -90,6 +91,24 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     k_out, l2norm_fwd(k.contiguous()), rtol=0, atol=0
                 )
                 torch.testing.assert_close(v_out, v.contiguous(), rtol=0, atol=0)
+
+    def test_fused_split_flashinfer_prepare_reuses_contiguous_value(self):
+        _, (mixed_qkv, _, _, _) = self._projection_views(torch.bfloat16)
+        q, k, v = fused_qkv_split_gdn_prefill(
+            mixed_qkv,
+            self.NUM_QK_HEADS,
+            self.NUM_QK_HEADS,
+            self.NUM_V_HEADS,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+            self.HEAD_DIM,
+        )
+
+        q_out, k_out, v_out = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+
+        self.assertEqual(v_out.data_ptr(), v.data_ptr())
+        torch.testing.assert_close(q_out, l2norm_fwd(q[0]), rtol=0, atol=0)
+        torch.testing.assert_close(k_out, l2norm_fwd(k[0]), rtol=0, atol=0)
 
     def test_strided_gate_matches_contiguous_gate(self):
         for dtype in (torch.bfloat16, torch.float16):
