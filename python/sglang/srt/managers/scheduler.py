@@ -1323,6 +1323,15 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+        self.init_gc_policy()
+
+    def init_gc_policy(self):
+        from sglang.srt.managers.scheduler_components.gc_policy import (
+            SchedulerGcPolicy,
+        )
+
+        self.gc_policy = SchedulerGcPolicy()
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1793,6 +1802,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self.gc_policy.maybe_run()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1867,6 +1877,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            self.gc_policy.maybe_run()
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
