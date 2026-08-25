@@ -29,7 +29,12 @@ def resolve_precision(
     return precision_to_dtype(precision, field_name or precision_attr)
 
 
-def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.dtype:
+def resolve_decode_precision(
+    server_args,
+    component_name: str = "vae",
+    *,
+    quality: str | None = None,
+) -> torch.dtype:
     pipeline_config = server_args.pipeline_config
     if component_name in ("audio_vae", "vocoder"):
         return resolve_precision(
@@ -37,6 +42,11 @@ def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.
             component_name,
             precision_attr="audio_vae_precision",
         )
+
+    if quality == "high":
+        high_precision = getattr(pipeline_config, "vae_decode_precision_high", None)
+        if high_precision is not None:
+            return precision_to_dtype(high_precision, "vae_decode_precision_high")
 
     decode_precision = getattr(pipeline_config, "vae_decode_precision", None)
     if decode_precision is not None:

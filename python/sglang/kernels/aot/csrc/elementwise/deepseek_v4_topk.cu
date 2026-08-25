@@ -28,7 +28,16 @@ limitations under the License.
 namespace {
 
 constexpr uint32_t kMaxTopK = 1024;
+#ifdef USE_ROCM
+// CDNA3/CDNA4: this kernel is one block per row and is latency-bound on its
+// O(c4_len) histogram and emit passes. A full 1024-thread block (16 wavefronts
+// of 64 lanes) instead of 512 doubles the per-block scan parallelism, which is
+// ~1.6x faster at 128k context (c4_len = 32768) and never slower at short
+// context. The selected index set is unchanged. CUDA keeps 512.
+constexpr uint32_t kBlockSize = 1024;
+#else
 constexpr uint32_t kBlockSize = 512;
+#endif
 
 #ifdef SGL_TOPK_DYNAMIC_SMEM_BYTES
 constexpr size_t kSMEM = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
