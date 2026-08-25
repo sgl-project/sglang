@@ -67,8 +67,8 @@ PullPlaneObj::PullPlaneObj(
       num_bytes(),
       semaphores{},
       workspaces{},
-      mc_workspace(),
-      mc_semaphore() {
+      mc_semaphore(),
+      mc_workspace() {
   CHECK_HOST(workspaces.size() == world_size) << "Bad pull workspace count";
   CHECK_HOST(semaphores.size() == world_size) << "Bad pull semaphore count";
   // Either half may be empty (a 0-element tensor); the halves a caller does
@@ -96,8 +96,8 @@ PullPlaneObj::PullPlaneObj(
     this->semaphores[i] = static_cast<Semaphore*>(semaphores[i].data_ptr());
     this->workspaces[i] = static_cast<uint8_t*>(workspaces[i].data_ptr());
   }
+  this->mc_semaphore = reinterpret_cast<Semaphore*>(mc_semaphore_ptr);
   this->mc_workspace = reinterpret_cast<uint8_t*>(mc_workspace_ptr);
-  this->mc_semaphore = reinterpret_cast<uint8_t*>(mc_semaphore_ptr);
 }
 
 CommunicatorObj::CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull)

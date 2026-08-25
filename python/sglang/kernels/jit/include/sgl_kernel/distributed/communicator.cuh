@@ -55,26 +55,45 @@ struct alignas(128) Semaphore {
   SGL_DEVICE void put_relaxed() {
     ptx::red_add_relaxed_sys(&m_flag, 1);
   }
+  SGL_DEVICE void put_relaxed_multicast() {
+    ptx::multimem_red_add_relaxed(&m_flag, 1);
+  }
   SGL_DEVICE uint32_t get_acquire() const {
     return ptx::load_acquire_sys(&m_flag);
   }
   SGL_DEVICE void put_release() {
     ptx::red_add_release_sys(&m_flag, 1);
   }
-
-  /// Multicast alias of block `block`'s flag, given the multicast VA of a
-  /// semaphore array. Signalling every peer through it costs one instruction
-  /// instead of a world_size-wide unicast fan-out. Relies on `m_flag` being
-  /// the first member.
-  SGL_DEVICE static uint32_t* mc_flag(uint8_t* mc_base, uint32_t block) {
-    return reinterpret_cast<uint32_t*>(mc_base + block * sizeof(Semaphore));
+  SGL_DEVICE void put_release_multicast() {
+    ptx::multimem_red_add_release(&m_flag, 1);
   }
 
  private:
   uint32_t m_flag;
   Counter m_counter;
 };
-static_assert(sizeof(Semaphore) == 128, "Semaphore::mc_flag strides by sizeof(Semaphore)");
+static_assert(sizeof(Semaphore) == 128, "must match _SEMAPHORE_BYTES in custom_all_reduce_v2.py");
+
+/// Kernel-facing slice of a push plane: `[offset, offset + size)` within every
+/// slot, with `slot_bytes` as the stride from one slot to the next. Trivially
+/// copyable, so it drops straight into a `__grid_constant__` params struct.
+template <uint32_t kWorldSize>
+struct PushWorkSpace {
+  std::array<uint8_t*, kWorldSize> workspaces;
+  Counter* counter;  // NOTE: this is a local tensor, so no mc
+  uint8_t* mc_workspace;
+  uint32_t slot_bytes;
+};
+
+/// Kernel-facing slice of a pull plane. The semaphores are indexed by block,
+/// not by byte, so they pass through the slice unchanged.
+template <uint32_t kWorldSize>
+struct PullWorkSpace {
+  std::array<Semaphore*, kWorldSize> semaphores;
+  std::array<uint8_t*, kWorldSize> workspaces;
+  Semaphore* mc_semaphore;
+  uint8_t* mc_workspace;
+};
 
 /// Bit patterns of the lamport "slot empty" marker. A producer rewrites any
 /// +0.0 in its payload to -0.0 (numerically identical for the reduction) so a
@@ -182,30 +201,48 @@ struct Barrier {
   Semaphore* const* m_semaphores;
 };
 
+/// Picks which half of a push plane's `2 * kWorldSize` slots this round owns.
+/// The halves alternate because a round leaves its pos-zero markers behind: a
+/// peer still draining the previous round must not see them refilled.
 template <uint32_t kWorldSize>
-struct Lamport {
+struct PushEpoch {
  public:
-  SGL_DEVICE Lamport(Counter* counter, uint8_t* const* workspaces, uint32_t slot_bytes)
-      : m_counter(counter), m_workspaces(workspaces), m_slot_bytes(slot_bytes), m_phase(m_counter[blockIdx.x].get()) {}
+  SGL_DEVICE PushEpoch(Counter* counter, uint8_t* const* workspaces, uint32_t slot_bytes)
+      : m_counter(counter), m_workspaces(workspaces), m_slot_bytes(slot_bytes), m_epoch(m_counter[blockIdx.x].get()) {}
 
-  SGL_DEVICE uint32_t get_phase() const {
-    return m_phase & 1;
+  SGL_DEVICE PushEpoch(const PushWorkSpace<kWorldSize>& ws)
+      : PushEpoch(ws.counter, ws.workspaces.data(), ws.slot_bytes) {}
+
+  /// Rank `src`'s slot inside rank `dst`'s workspace, for the current epoch.
+  SGL_DEVICE void* slot_ptr(uint32_t dst, uint32_t src = 0) const {
+    const auto epoch_stride_bytes = (m_epoch & 1) * m_slot_bytes * kWorldSize;
+    return m_workspaces[dst] + src * m_slot_bytes + epoch_stride_bytes;
   }
 
-  SGL_DEVICE void* get_phase_ptr(uint32_t dst, uint32_t src = 0) const {
-    const auto phase_stride_bytes = (m_phase & 1) * m_slot_bytes * kWorldSize;
-    return m_workspaces[dst] + src * m_slot_bytes + phase_stride_bytes;
+  SGL_DEVICE uint32_t slot_offset(uint32_t src = 0) const {
+    const auto epoch_stride_bytes = (m_epoch & 1) * m_slot_bytes * kWorldSize;
+    return src * m_slot_bytes + epoch_stride_bytes;
   }
 
-  SGL_DEVICE void exit() const {
-    if (threadIdx.x == 0) m_counter[blockIdx.x].set(m_phase ^ 1);
+  SGL_DEVICE void flip() const {
+    if (threadIdx.x == 0) m_counter[blockIdx.x].set(m_epoch ^ 1);
+  }
+
+  SGL_DEVICE void unsafe_flip_at(uint32_t bx) const {
+    m_counter[bx].set(m_epoch ^ 1);
+  }
+
+  SGL_DEVICE void unsafe_flip_range(uint32_t start, uint32_t finish) const {
+    for (uint32_t idx = start + threadIdx.x; idx < finish; idx += blockDim.x) {
+      m_counter[idx].set(m_epoch ^ 1);
+    }
   }
 
  private:
   Counter* m_counter;
   uint8_t* const* m_workspaces;
   uint32_t m_slot_bytes;
-  uint32_t m_phase;
+  uint32_t m_epoch;
 };
 
 /// Same window protocol as `Barrier`, but a single `multimem.red` reaches every
@@ -219,7 +256,7 @@ struct Lamport {
 /// the signal must stay after it, since it asserts the producer grid flushed.
 struct McBarrier {
  public:
-  SGL_DEVICE McBarrier(Semaphore* local, uint8_t* mc, uint32_t world_size, uint32_t num_arrives)
+  SGL_DEVICE McBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t num_arrives)
       : m_counter(0), m_world_size(world_size), m_local(local), m_mc(mc) {
     if (threadIdx.x == 0) {
       m_counter = local[blockIdx.x].counter_ptr()->inc(num_arrives * world_size);
@@ -249,16 +286,17 @@ struct McBarrier {
   /// `arrive` against a window reserved earlier, without holding the object.
   /// `window` already includes the `n * world_size` offset.
   template <bool kNeedFence>
-  SGL_DEVICE static void arrive_at(Semaphore* local, uint8_t* mc, uint32_t world_size, uint32_t window) {
+  SGL_DEVICE static void arrive_at(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t window) {
     if (threadIdx.x != 0) return;
-    const auto semaphore = &local[blockIdx.x];
-    const auto flag = Semaphore::mc_flag(mc, blockIdx.x);
+    const auto bx = blockIdx.x;
+    const auto semaphore = &local[bx];
+    const auto mc_semaphore = &mc[bx];
     if constexpr (kNeedFence) {
-      ptx::multimem_red_add_release(flag, 1);
+      mc_semaphore->put_release_multicast();
       while (semaphore->get_acquire() - window < world_size)
         ;
     } else {
-      ptx::multimem_red_add_relaxed(flag, 1);
+      mc_semaphore->put_relaxed_multicast();
       while (semaphore->get_relaxed() - window < world_size)
         ;
     }
@@ -268,33 +306,7 @@ struct McBarrier {
   uint32_t m_counter;  // window base; meaningful in thread 0, the sole poller
   uint32_t m_world_size;
   Semaphore* m_local;
-  uint8_t* m_mc;
-};
-
-/// Kernel-facing slice of a push plane: `[offset, offset + size)` within every
-/// slot, with `slot_bytes` as the stride from one slot to the next. Trivially
-/// copyable, so it drops straight into a `__grid_constant__` params struct.
-template <uint32_t kWorldSize>
-struct PushWorkSpace {
-  static constexpr uint32_t size() {
-    return kWorldSize;
-  }
-  std::array<uint8_t*, kWorldSize> workspaces;
-  uint8_t* mc_workspace;
-  uint32_t slot_bytes;
-};
-
-/// Kernel-facing slice of a pull plane. The semaphores are indexed by block,
-/// not by byte, so they pass through the slice unchanged.
-template <uint32_t kWorldSize>
-struct PullWorkSpace {
-  static constexpr uint32_t size() {
-    return kWorldSize;
-  }
-  std::array<Semaphore*, kWorldSize> semaphores;
-  std::array<uint8_t*, kWorldSize> workspaces;
-  uint8_t* mc_workspace;
-  uint8_t* mc_semaphore;
+  Semaphore* m_mc;
 };
 
 }  // namespace device::distributed
@@ -362,7 +374,7 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
     // is `(2 * N - 1) * slot_bytes`, so the whole double-buffered plane must fit.
     CHECK_HOST(2 * N * slot_bytes <= std::numeric_limits<uint32_t>::max())
         << 2 * N * slot_bytes << " bytes of push plane exceeds the 32-bit offset range";
-    PushWorkSpace<N> ws{{}, offset_mc(mc_workspace, offset), static_cast<uint32_t>(slot_bytes)};
+    PushWorkSpace<N> ws{{}, counter, offset_mc(mc_workspace, offset), static_cast<uint32_t>(slot_bytes)};
     for (uint32_t i = 0; i < N; ++i) {
       ws.workspaces[i] = workspaces[i] + offset;
     }
@@ -404,15 +416,15 @@ struct PullPlaneObj : public tvm::ffi::Object, BasePlane {
   int64_t num_bytes;                                 // per-rank workspace bytes
   std::array<Semaphore*, kMaxWorldSize> semaphores;  // symmetric memory
   std::array<uint8_t*, kMaxWorldSize> workspaces;    // symmetric memory
+  Semaphore* mc_semaphore;                           // multicast VA of the local semaphores (may be null)
   uint8_t* mc_workspace;                             // multicast VA of the local workspace (may be null)
-  uint8_t* mc_semaphore;                             // multicast VA of the local semaphores (may be null)
 
   template <uint32_t N>
   PullWorkSpace<N> get_workspace(int64_t size, int64_t offset = 0) const {
     CHECK_HOST(N == world_size) << "Plane holds " << world_size << " ranks, asked for " << N;
     CHECK_HOST(size >= 0 && offset >= 0 && offset + size <= num_bytes)
         << "slice [" << offset << ", " << offset + size << ") escapes the " << num_bytes << "-byte pull workspace";
-    PullWorkSpace<N> ws{{}, {}, offset_mc(mc_workspace, offset), mc_semaphore};
+    PullWorkSpace<N> ws{{}, {}, mc_semaphore, offset_mc(mc_workspace, offset)};
     for (uint32_t i = 0; i < N; ++i) {
       ws.semaphores[i] = semaphores[i];
       ws.workspaces[i] = workspaces[i] + offset;

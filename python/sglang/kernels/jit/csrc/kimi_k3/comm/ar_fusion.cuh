@@ -386,7 +386,7 @@ struct PullParams {
   uint8_t* input_mc;        // multicast VA of the symmetric input
   const uint8_t* residual;  // may be null (compile-time kHasResidual selects)
   Semaphore* sem_local;     // this rank's v2 pull semaphores (poll side)
-  uint8_t* sem_mc;          // multicast VA of the pull-semaphore region
+  Semaphore* sem_mc;        // multicast VA of the pull-semaphore region
   uint32_t rank;
   uint32_t world_size;
   uint32_t num_vecs;  // 16B vectors

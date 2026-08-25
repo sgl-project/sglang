@@ -38,7 +38,6 @@
 
 namespace sglang {
 
-using device::distributed::Counter;
 using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
 using host::distributed::CommunicatorRef;
 
@@ -50,7 +49,6 @@ struct AllReducePushParams {
   void* __restrict__ output;
   uint32_t num_vecs;
   uint32_t rank;
-  Counter* counter;  // rank-local
   PushWorkSpace<kWorldSize> ws;
 };
 
@@ -146,17 +144,13 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   const auto num_threads = blockDim.x * gridDim.x;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   PDLWaitPrimary<kUsePDL>();
-  const auto lamport = distributed::Lamport<kWorldSize>{
-      params.counter,
-      params.ws.workspaces.data(),
-      params.ws.slot_bytes,
-  };
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 
   // push to peer
   void* push_ptrs[kWorldSize];
 #pragma unroll
   for (uint32_t i = 0; i < kWorldSize; ++i) {
-    push_ptrs[i] = lamport.get_phase_ptr(/*dst=*/i, /*src=*/r);
+    push_ptrs[i] = epoch.slot_ptr(/*dst=*/i, /*src=*/r);
   }
 
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
@@ -173,7 +167,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   void* poll_ptrs[kWorldSize];
 #pragma unroll
   for (uint32_t i = 0; i < kWorldSize; ++i) {
-    poll_ptrs[i] = lamport.get_phase_ptr(/*dst=*/r, /*src=*/i);
+    poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
   }
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
@@ -202,7 +196,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  lamport.exit();
+  epoch.flip();
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -332,7 +326,6 @@ struct AllReduceKernel {
           .output = out.data_ptr(),
           .num_vecs = num_vecs,
           .rank = push.rank,
-          .counter = push.counter,
           .ws = push.get_workspace<kWorldSize>(nbytes),
       };
       using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;

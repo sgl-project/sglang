@@ -40,7 +40,7 @@ struct Params {
   uint8_t* push_ws_mc;
   Counter* counter;
   Semaphore* sem_local;
-  uint8_t* sem_mc;
+  Semaphore* sem_mc;
   uint8_t* input_mc;
   uint8_t* output_mc;
   int64_t stride_bytes;

@@ -182,7 +182,7 @@ struct AttnResTMAParams {
   const bf16_t* residual;
   bf16_t* prefix_out;
   device::distributed::Semaphore* sem_local;
-  uint8_t* sem_mc;
+  device::distributed::Semaphore* sem_mc;
   uint8_t* output_mc;
   uint32_t world_size;
   uint32_t rank;
