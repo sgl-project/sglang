@@ -7,10 +7,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import (
-    draft_topk1,
-    draft_topk1_postprocess,
-)
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -117,7 +114,7 @@ class TestSpecTopk1Triton(CustomTestCase):
                     )
                     expected_index = torch.argmax(expected_logits, dim=-1, keepdim=True)
 
-                    topk_p, topk_index = draft_topk1(logits)
+                    topk_p, topk_index = draft_topk1_postprocess(logits, positions=None)
 
                     torch.testing.assert_close(
                         topk_index, expected_index, rtol=0, atol=0
@@ -193,7 +190,9 @@ class TestSpecTopk1Triton(CustomTestCase):
         positions = torch.empty((0,), dtype=torch.long, device=self.device)
         draft_tokens = torch.empty((0, 3), dtype=torch.long, device=self.device)
 
-        select_topk_p, select_topk_index = draft_topk1(logits)
+        select_topk_p, select_topk_index = draft_topk1_postprocess(
+            logits, positions=None
+        )
         topk_p, topk_index = draft_topk1_postprocess(
             logits, positions, draft_tokens, draft_token_column=1
         )
@@ -209,7 +208,7 @@ class TestSpecTopk1Triton(CustomTestCase):
         positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
 
         with self.assertRaises(AssertionError):
-            draft_topk1(logits)
+            draft_topk1_postprocess(logits, positions=None)
         with self.assertRaises(AssertionError):
             draft_topk1_postprocess(
                 logits, torch.empty(4, dtype=torch.long, device=self.device)

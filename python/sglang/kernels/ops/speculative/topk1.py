@@ -73,12 +73,17 @@ def _draft_topk1_finalize_kernel(
         tl.store(positions + row, position + 1)
 
 
-def _draft_topk1_impl(
+def draft_topk1_postprocess(
     next_token_logits: torch.Tensor,
     positions: torch.Tensor | None,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
 ):
+    """Select top-k=1 and optionally update positions and the draft chain.
+
+    The split reduction masks vocabulary-tail lanes and treats NaNs as
+    ``-1e30``, so every returned index is within the real vocabulary.
+    """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
     advance_positions = positions is not None
@@ -143,33 +148,3 @@ def _draft_topk1_impl(
         num_warps=1,
     )
     return topk_p, topk_index
-
-
-def draft_topk1(next_token_logits: torch.Tensor):
-    """Select top-k=1 directly from raw draft logits.
-
-    The split reduction masks vocabulary-tail lanes and treats NaNs as
-    ``-1e30``, so every returned index is within the real vocabulary.
-    ``topk_p`` is constant 1.0 because top-k=1 drafting is greedy.
-    """
-    return _draft_topk1_impl(next_token_logits, positions=None)
-
-
-def draft_topk1_postprocess(
-    next_token_logits: torch.Tensor,
-    positions: torch.Tensor,
-    draft_tokens: torch.Tensor | None = None,
-    draft_token_column: int = 0,
-):
-    """Select top-k=1, advance positions, and optionally write the draft chain.
-
-    PyTorch eager argmax reduces each row with too little parallelism for large
-    vocabularies. This split reduction exposes the vocabulary dimension across
-    CTAs, then finalizes one token per row.
-    """
-    return _draft_topk1_impl(
-        next_token_logits,
-        positions,
-        draft_tokens,
-        draft_token_column,
-    )

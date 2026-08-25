@@ -6,10 +6,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import (
-    draft_topk1,
-    draft_topk1_postprocess,
-)
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -167,7 +164,7 @@ def _try_greedy_draft_extend_topk1(
             if next_token_logits.stride(1) == 1
             else next_token_logits.contiguous()
         )
-        return draft_topk1(logits)
+        return draft_topk1_postprocess(logits, positions=None)
     if topk == 1 and not _is_hip and not use_rejection_sampling:
         topk_index = torch.argmax(next_token_logits, dim=-1, keepdim=True)
         topk_p = torch.ones_like(topk_index, dtype=torch.float32)

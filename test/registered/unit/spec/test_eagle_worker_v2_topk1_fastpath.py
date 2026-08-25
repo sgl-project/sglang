@@ -195,7 +195,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with patch("sglang.srt.speculative.eagle_worker_v2._is_hip", True), patch(
             "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
         ), patch(
-            "sglang.srt.speculative.eagle_worker_v2.draft_topk1",
+            "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess",
             return_value=expected,
         ) as triton_topk1:
             result = _try_greedy_draft_extend_topk1(
@@ -210,7 +210,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
         self.assertIsNotNone(result)
         topk_p, topk_index = result
-        triton_topk1.assert_called_once_with(logits)
+        triton_topk1.assert_called_once_with(logits, positions=None)
         torch.testing.assert_close(
             topk_index,
             torch.tensor([[1], [2]], dtype=torch.long, device=DEVICE),
