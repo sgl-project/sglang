@@ -34,11 +34,8 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
     def test_pipeline_placeholders_preserve_global_layer_ids(self):
         local_attention = SimpleNamespace()
         layer_model = SimpleNamespace(
-            layers=[
-                SimpleNamespace(),
-                SimpleNamespace(),
-                SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention)),
-            ]
+            layers=[SimpleNamespace(), SimpleNamespace()]
+            + [SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention))]
         )
 
         attention_layers, _, _, _, mha_companion_layers = (

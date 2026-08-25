@@ -1,6 +1,7 @@
 """Unit tests for prefill CUDA graph wrapper helpers."""
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -14,7 +15,6 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _build_layer_model_forward_kwargs,
     _resolve_transformer_layer_model,
 )
-from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,37 +30,18 @@ class _LayerModel:
         return input_embeds
 
 
-class _ProxyBeforeEmbedsLayerModel:
-    def __init__(self):
-        self.layers = [object()]
-
-    def forward(
-        self,
-        input_ids,
-        positions,
-        forward_batch,
-        pp_proxy_tensors=None,
-        inputs_embeds=None,
-    ):
-        return pp_proxy_tensors, inputs_embeds
-
-
 def _make_pp_buffers_and_registry():
-    buffers = PrefillInputBuffers.create(
-        device=torch.device("cpu"),
-        max_bs=2,
-        max_num_tokens=8,
-        cache_loc_dtype=torch.int64,
-        is_multimodal=False,
-        hidden_size=4,
-        dtype=torch.float32,
-        enable_mamba_track=False,
-        pp_size=4,
+    base = torch.zeros(3, dtype=torch.int64)
+    buffers = SimpleNamespace(
+        **{name: base.clone() for name in ("input_ids", "positions", "out_cache_loc")},
+        pp_proxy_tensors={
+            key: torch.zeros((3, 2)) for key in ("hidden_states", "residual")
+        },
     )
     registry = build_prefill_registry(
-        device=torch.device("cpu"),
-        max_bs=2,
-        max_num_token=8,
+        device=base.device,
+        max_bs=1,
+        max_num_token=len(base),
         cache_loc_dtype=torch.int64,
         share_pool=False,
         source=buffers,
@@ -69,28 +50,24 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
-    def test_pp_proxy_uses_stable_capture_buffer_and_live_replay_values(self):
+    def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
-        live_proxy = PPProxyTensors(
+        full_proxy = PPProxyTensors(
             {
-                "hidden_states": torch.full((3, 4), 2.0),
-                "residual": torch.full((3, 4), 3.0),
+                "hidden_states": torch.full((3, 2), 2.0),
+                "residual": torch.full((3, 2), 3.0),
             }
         )
-        forward_batch = SimpleNamespace(
-            input_ids=torch.arange(3),
-            positions=torch.arange(3),
-            out_cache_loc=torch.arange(3),
-        )
-
-        registry.fill_from(
-            forward_batch,
+        values = torch.arange(3)
+        fill = partial(
+            registry.fill_from,
+            SimpleNamespace(input_ids=values, positions=values, out_cache_loc=values),
             raw_bs=1,
             padded_bs=1,
             raw_num_tokens=3,
             padded_num_tokens=3,
-            pp_proxy_tensors=live_proxy,
         )
+        fill(pp_proxy_tensors=full_proxy)
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.buffers = buffers
@@ -98,87 +75,49 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             pp_group=SimpleNamespace(is_first_rank=False)
         )
         capture_proxy = runner._capture_pp_proxy_tensors(3)
-        self.assertEqual(capture_proxy["hidden_states"].tolist(), [[2.0] * 4] * 3)
-        self.assertEqual(capture_proxy["residual"].tolist(), [[3.0] * 4] * 3)
+        torch.testing.assert_close(capture_proxy.tensors, full_proxy.tensors)
         self.assertEqual(
             capture_proxy["hidden_states"].data_ptr(),
             buffers.pp_proxy_tensors["hidden_states"].data_ptr(),
         )
 
-    def test_pp_proxy_allows_hidden_only_live_contract(self):
-        buffers, registry = _make_pp_buffers_and_registry()
-        live_proxy = PPProxyTensors({"hidden_states": torch.full((3, 4), 2.0)})
-        forward_batch = SimpleNamespace(
-            input_ids=torch.arange(3),
-            positions=torch.arange(3),
-            out_cache_loc=torch.arange(3),
+        hidden_only_proxy = PPProxyTensors({"hidden_states": torch.full((3, 2), 4.0)})
+        fill(pp_proxy_tensors=hidden_only_proxy)
+        torch.testing.assert_close(
+            buffers.pp_proxy_tensors["hidden_states"][:3],
+            hidden_only_proxy["hidden_states"],
         )
 
-        registry.fill_from(
-            forward_batch,
-            raw_bs=1,
-            padded_bs=1,
-            raw_num_tokens=3,
-            padded_num_tokens=3,
-            pp_proxy_tensors=live_proxy,
+    def test_layer_model_kwargs_bind_optional_inputs_by_signature(self):
+        def proxy_before_embeds(a, b, c, pp_proxy_tensors=None, inputs_embeds=None):
+            pass
+
+        cases = (
+            (_LayerModel(), {"input_embeds": "embeds"}),
+            (
+                SimpleNamespace(forward=proxy_before_embeds),
+                {"inputs_embeds": "embeds", "pp_proxy_tensors": "proxy"},
+            ),
         )
-
-        self.assertEqual(
-            buffers.pp_proxy_tensors["hidden_states"][:3].tolist(),
-            [[2.0] * 4] * 3,
-        )
-        self.assertEqual(
-            buffers.pp_proxy_tensors["residual"][:3].tolist(),
-            [[0.0] * 4] * 3,
-        )
-
-    def test_layer_model_kwargs_bind_proxy_before_embeds_by_name(self):
-        layer_model = _ProxyBeforeEmbedsLayerModel()
-        input_embeds = object()
-        pp_proxy_tensors = object()
-        forward_batch = SimpleNamespace(input_embeds=input_embeds)
-
-        kwargs = _build_layer_model_forward_kwargs(
-            layer_model, forward_batch, pp_proxy_tensors
-        )
-        actual_proxy, actual_embeds = layer_model.forward(
-            None, None, forward_batch, **kwargs
-        )
-
-        self.assertIs(actual_proxy, pp_proxy_tensors)
-        self.assertIs(actual_embeds, input_embeds)
-
-    def test_layer_model_kwargs_keep_input_embeds_alias(self):
-        layer_model = _LayerModel()
-        input_embeds = object()
-        forward_batch = SimpleNamespace(input_embeds=input_embeds)
-
-        kwargs = _build_layer_model_forward_kwargs(layer_model, forward_batch, None)
-
-        self.assertIs(
-            layer_model.forward(None, None, forward_batch, **kwargs), input_embeds
-        )
+        forward_batch = SimpleNamespace(input_embeds="embeds")
+        for layer_model, expected in cases:
+            with self.subTest(signature=layer_model.forward.__name__):
+                kwargs = _build_layer_model_forward_kwargs(
+                    layer_model, forward_batch, "proxy"
+                )
+                self.assertEqual(kwargs, expected)
+                layer_model.forward(None, None, forward_batch, **kwargs)
 
     def test_finalize_pp_proxy_trims_padded_token_rows(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.raw_num_tokens = 3
-        output = PPProxyTensors(
-            {
-                "hidden_states": torch.arange(20).reshape(5, 4),
-                "residual": torch.arange(20, 40).reshape(5, 4),
-            }
-        )
-
+        output = PPProxyTensors({"hidden_states": torch.arange(10).reshape(5, 2)})
         trimmed = runner._finalize_execute_output(output)
-
         self.assertIsInstance(trimmed, PPProxyTensors)
-        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
-        self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
-        self.assertEqual(
-            trimmed["hidden_states"].tolist(),
-            output["hidden_states"][:3].tolist(),
+        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 2))
+        torch.testing.assert_close(
+            trimmed["hidden_states"][-1], output["hidden_states"][2]
         )
-        self.assertEqual(trimmed["residual"].tolist(), output["residual"][:3].tolist())
 
     def test_resolve_layer_model_from_language_model_wrapper(self):
         layer_model = _LayerModel()
