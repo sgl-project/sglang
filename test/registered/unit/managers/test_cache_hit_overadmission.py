@@ -2,7 +2,9 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.scheduler_components.cache_hit_overadmission import (
+    disable_radix_cache_insert_for_overadmission_batch,
     evaluate_cache_hit_overadmission,
+    has_pending_mamba_cache_writeback,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -108,6 +110,69 @@ class TestCacheHitOveradmissionEligibility(unittest.TestCase):
         input_embeds = evaluate(make_req(input_embeds=[[0.0]]))
         self.assertFalse(input_embeds.allowed)
         self.assertEqual(input_embeds.reason, "unsupported_input")
+
+
+class TestCacheHitOveradmissionOverlapSafety(unittest.TestCase):
+    @staticmethod
+    def make_pending_req(**overrides):
+        values = dict(
+            skip_radix_cache_insert=False,
+            is_retracted=False,
+            finished=lambda: False,
+            inflight_middle_chunks=0,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def make_batch(reqs, *, is_extend=True, decoding_reqs=None):
+        return SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
+            is_dllm=lambda: False,
+            reqs=reqs,
+            decoding_reqs=decoding_reqs,
+        )
+
+    def test_detects_pending_unfinished_prefill_writeback(self):
+        req = self.make_pending_req()
+        queue = [(self.make_batch([req]), object())]
+
+        self.assertTrue(has_pending_mamba_cache_writeback(queue))
+
+    def test_ignores_prefills_that_cannot_write_back(self):
+        cases = [
+            self.make_pending_req(skip_radix_cache_insert=True),
+            self.make_pending_req(is_retracted=True),
+            self.make_pending_req(finished=lambda: True),
+            self.make_pending_req(inflight_middle_chunks=1),
+        ]
+        for req in cases:
+            with self.subTest(req=req):
+                queue = [(self.make_batch([req]), object())]
+                self.assertFalse(has_pending_mamba_cache_writeback(queue))
+
+        decoding_req = self.make_pending_req()
+        queue = [
+            (
+                self.make_batch([decoding_req], decoding_reqs=[decoding_req]),
+                object(),
+            )
+        ]
+        self.assertFalse(has_pending_mamba_cache_writeback(queue))
+
+        decode_batch = self.make_batch([self.make_pending_req()], is_extend=False)
+        self.assertFalse(has_pending_mamba_cache_writeback([(decode_batch, object())]))
+
+    def test_marks_entire_new_prefill_batch_reuse_only(self):
+        reqs = [
+            SimpleNamespace(skip_radix_cache_insert=False),
+            SimpleNamespace(skip_radix_cache_insert=True),
+            SimpleNamespace(skip_radix_cache_insert=False),
+        ]
+
+        disable_radix_cache_insert_for_overadmission_batch(reqs)
+
+        self.assertTrue(all(req.skip_radix_cache_insert for req in reqs))
 
 
 if __name__ == "__main__":

@@ -220,8 +220,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.cache_hit_overadmission import (
     CacheHitOveradmissionDecision,
+    disable_radix_cache_insert_for_overadmission_batch,
     evaluate_cache_hit_overadmission,
     evaluate_cache_hit_overadmission_shape,
+    has_pending_mamba_cache_writeback,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
@@ -3445,6 +3447,11 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        pending_mamba_cache_writeback = (
+            get_schedule().enable_cache_hit_overadmission
+            and mamba_allocator is not None
+            and has_pending_mamba_cache_writeback(getattr(self, "result_queue", ()))
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3480,6 +3487,16 @@ class Scheduler(
                 >= self.normal_max_running_requests
             )
             if is_overadmission:
+                if pending_mamba_cache_writeback:
+                    self._record_cache_hit_overadmission(
+                        CacheHitOveradmissionDecision(
+                            False, "pending_mamba_cache_writeback"
+                        )
+                    )
+                    # The previous prefill's result is processed after this
+                    # scheduling pass.  Do not let new extra-lane live state
+                    # consume the slot its radix checkpoint donation needs.
+                    break
                 shape_rejection = evaluate_cache_hit_overadmission_shape(
                     req,
                     max_new_tokens=get_schedule().cache_hit_overadmission_max_new_tokens,
@@ -3574,6 +3591,15 @@ class Scheduler(
 
             if is_overadmission and overadmission_decision is not None:
                 if added:
+                    # The lazy capacity formula budgets two live slots per
+                    # request.  Growing a unique radix suffix would need a
+                    # third donation/replacement slot during prefill result
+                    # processing.  Once this batch crosses the normal limit,
+                    # make every request in it reuse-only, including a chunked
+                    # request already carried into the adder.
+                    disable_radix_cache_insert_for_overadmission_batch(
+                        adder.can_run_list
+                    )
                     self._record_cache_hit_overadmission(overadmission_decision)
                 else:
                     self._record_cache_hit_overadmission(

@@ -1,0 +1,106 @@
+---
+title: "Cache-hit over-admission"
+metatags:
+    description: "Increase concurrency for bounded hybrid Mamba/GDN requests with high device prefix-cache hit rates."
+---
+
+Cache-hit over-admission lets a bounded number of inexpensive requests run above the normal request limit. It targets workloads where requests reuse a long device-resident prefix, have a small uncached prefill tail, and declare a small output-token budget.
+
+The feature is experimental and disabled by default. It does not raise the normal limit for other traffic or bypass full-KV, Mamba-state, scheduler-budget, or request-pool checks.
+
+<Warning>
+Over-admission reserves additional request-indexed capacity. This can leave less memory for the full-KV cache, so measure cache capacity and end-to-end performance with your model and workload before using it in production.
+</Warning>
+
+## Requirements
+
+Use this feature only when all of the following conditions apply:
+
+- The server runs on NVIDIA CUDA.
+- The model is a hybrid Mamba/GDN model with the Mamba radix cache enabled.
+- `--mamba-radix-cache-strategy` is `extra_buffer_lazy`.
+- You set an explicit `--max-running-requests` value.
+- PD disaggregation and hierarchical cache are disabled.
+- If priority scheduling is enabled, priority preemption is disabled with `--disable-priority-preemption`.
+
+## Enable over-admission
+
+Replace `MODEL_PATH` with a supported hybrid Mamba/GDN model:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --tp 1 \
+  --dp 1 \
+  --enable-metrics \
+  --max-running-requests 64 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --enable-cache-hit-overadmission \
+  --cache-hit-overadmission-max-extra-reqs 27 \
+  --cache-hit-overadmission-min-hit-ratio 0.95 \
+  --cache-hit-overadmission-max-uncached-prefill-tokens 128 \
+  --cache-hit-overadmission-max-new-tokens 64
+```
+
+Start with a small extra-request limit and increase it only after measuring the full-KV capacity and request latency. Warm the shared prefix before testing because only device-resident prefix-cache hits qualify.
+
+## Configure eligibility
+
+| Argument | Default | Description |
+| --- | ---: | --- |
+| `--enable-cache-hit-overadmission` | `false` | Enables the experimental extra admission lane. |
+| `--cache-hit-overadmission-max-extra-reqs` | `0` | Sets the maximum extra requests across attention data-parallel workers. The value must be positive when the feature is enabled. |
+| `--cache-hit-overadmission-min-hit-ratio` | `0.95` | Sets the minimum device prefix-cache hit ratio. Valid values are from `0` through `1`, inclusive. |
+| `--cache-hit-overadmission-max-uncached-prefill-tokens` | `128` | Sets the maximum uncached input tokens. The value must be non-negative. |
+| `--cache-hit-overadmission-max-new-tokens` | `64` | Sets the maximum declared output-token budget. The value must be positive. |
+
+For attention data parallelism, SGLang divides `--cache-hit-overadmission-max-extra-reqs` evenly with integer division. For example, a value of `32` with `--dp 4` allows at most eight extra requests per worker.
+
+## Understand request eligibility
+
+A request can enter the extra lane only when it:
+
+- is a fresh request rather than a continuation or retracted request;
+- sets `ignore_eos` to `false`;
+- does not use a session;
+- explicitly declares `max_new_tokens` at or below the configured limit;
+- has a non-empty device prefix-cache hit at or above the configured ratio;
+- has no more than the configured number of uncached input tokens; and
+- does not use multimodal input, input embeddings, positional embedding overrides, host-cache hits, or storage-cache hits.
+
+Eligibility alone does not guarantee admission. SGLang also checks the available request rows, Mamba slots, full-KV capacity, and scheduler budget at admission time.
+
+When the request at the head of the waiting queue is ineligible, SGLang stops filling the extra lane instead of skipping that request. The lane then drains below the normal limit, preserving queue order and preventing regular traffic from starving.
+
+An extra-lane prefill reuses its matched shared prefix but does not insert its request-specific suffix into the radix cache. This keeps Mamba-state allocation within the `extra_buffer_lazy` capacity model, but the unique suffix will not become a reusable prefix for a later request.
+
+## Understand capacity
+
+The server reports two per-worker limits:
+
+- The **normal request limit** is the existing worst-case admission limit used by regular traffic.
+- The **physical request capacity** provisions request-indexed pools for both normal traffic and the bounded extra lane.
+
+Physical capacity cannot exceed the explicit `--max-running-requests` value, the normal limit plus the configured extra requests, or the available Mamba-state capacity. At startup, look for a log entry like:
+
+```text
+Cache-hit over-admission: normal request limit=37, physical request capacity=64 per DP worker (requested extra=27).
+```
+
+If physical capacity equals the normal limit, the server could not provision an extra lane with the current request, full-KV, and Mamba-state memory limits.
+
+You can also query `/get_server_info` and compare `normal_max_running_requests_per_dp` with `effective_max_running_requests_per_dp`.
+
+## Monitor admission
+
+Enable Prometheus metrics with `--enable-metrics`. See [Observability](/docs/advanced_features/observability) for metrics endpoint configuration.
+
+| Metric | Meaning |
+| --- | --- |
+| `sglang:cache_hit_overadmitted_reqs` | Current running requests above the normal limit. |
+| `sglang:cache_hit_overadmission_admitted_requests_total` | Requests admitted through the extra lane. |
+| `sglang:cache_hit_overadmission_rejected_requests_total{reason=...}` | Extra-lane candidates rejected, grouped by reason. |
+| `sglang:cache_hit_overadmission_hit_ratio{result=...}` | Device prefix-cache hit ratio for admitted and rejected candidates. |
+| `sglang:cache_hit_overadmission_uncached_prefill_tokens{result=...}` | Uncached prefill tokens for admitted and rejected candidates. |
+
+Common rejection reasons include an ineligible request shape, insufficient hit ratio, too many uncached or output tokens, unavailable Mamba slots, insufficient full-KV capacity, and scheduler-budget exhaustion. A rejection is expected fallback behavior: the request remains eligible for normal admission when capacity becomes available.

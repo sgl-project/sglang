@@ -113,8 +113,10 @@ def resolve_cache_hit_overadmission_capacity(
 
     ``extra_buffer_lazy`` needs one active and one resident ping-pong slot per
     live request. Keep one additional Mamba slot for the cached checkpoint that
-    made a cache-hit admission possible. Runtime admission performs the tighter
-    allocator check, which also covers multiple distinct cached prefixes.
+    made a cache-hit admission possible. Extra-lane batches do not insert their
+    unique suffixes into the radix cache, so they cannot create a third
+    donation/replacement slot per request. Runtime admission performs the
+    tighter allocator check, which also covers multiple cached prefixes.
     """
     if not enabled or max_extra_reqs_per_worker <= 0:
         return normal_capacity

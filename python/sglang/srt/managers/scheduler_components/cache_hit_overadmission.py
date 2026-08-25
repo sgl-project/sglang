@@ -1,22 +1,9 @@
-"""
-Copyright 2026 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+"""Cache-hit-aware over-admission eligibility and safety helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -34,6 +21,61 @@ class CacheHitOveradmissionDecision:
     @property
     def hit_ratio(self) -> float:
         return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else 0.0
+
+
+def has_pending_mamba_cache_writeback(
+    result_queue: Iterable[tuple[Any, Any]],
+) -> bool:
+    """Whether overlap has an unfinished prefill that may donate a Mamba slot.
+
+    The overlap scheduler builds and allocates the next batch before processing
+    the previous batch's result.  ``cache_unfinished_req`` may need one
+    transient slot to donate the tracked state to the radix cache.  Entering
+    the extra lane while such a writeback is pending can consume that last slot
+    and make result processing fail even though admission itself succeeded.
+
+    This intentionally over-approximates requests that finish on their first
+    sampled token; their finish state is unknown until the queued result is
+    processed.
+    """
+
+    for batch, _ in result_queue:
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is None or not forward_mode.is_extend():
+            continue
+        if getattr(batch, "is_dllm", lambda: False)():
+            continue
+
+        decoding_reqs = getattr(batch, "decoding_reqs", None)
+        for req in batch.reqs:
+            if (
+                getattr(req, "skip_radix_cache_insert", False)
+                or req.is_retracted
+                or req.finished()
+                or req.inflight_middle_chunks > 0
+                or (decoding_reqs is not None and req in decoding_reqs)
+            ):
+                continue
+            return True
+    return False
+
+
+def disable_radix_cache_insert_for_overadmission_batch(
+    reqs: Iterable[Req],
+) -> None:
+    """Keep an over-admitting prefill batch inside the lazy two-slot model.
+
+    An unfinished radix-cache insert donates a request's tracked Mamba state
+    and allocates a replacement, temporarily adding a third request-specific
+    slot.  The extra lane is provisioned for one active plus one lazy
+    ping-pong slot, so requests in a batch that crosses the normal limit must
+    reuse the already matched prefix without growing a unique suffix node.
+    ``release_kv_cache`` still frees their suffix KV and live Mamba state and
+    releases the matched-prefix lock normally.
+    """
+
+    for req in reqs:
+        req.skip_radix_cache_insert = True
 
 
 def evaluate_cache_hit_overadmission(
