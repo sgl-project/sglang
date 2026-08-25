@@ -206,8 +206,6 @@ def prepare_raw_kimi_server_args(
         model_path,
         tokenizer_dir=tokenizer_path,
     )
-    server_args.model_path = str(assets["model_dir"])
-    server_args.tokenizer_path = str(assets["model_dir"])
     server_args._declare(
         "prepare_raw_kimi_server_args",
         model_path=str(assets["model_dir"]),
@@ -527,8 +525,6 @@ def prepare_raw_deepseek_server_args(
     config_sha256 = _deepseek_digest(
         model_value.get("config_sha256"), "model.config_sha256"
     )
-    server_args.model_path = str(model_config.parent)
-    server_args.tokenizer_path = str(model_config.parent)
     server_args._declare(
         "prepare_raw_deepseek_server_args",
         model_path=str(model_config.parent),

@@ -41,7 +41,7 @@ from sglang.srt.model_loader.loader import (
     device_loading_context,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -172,17 +172,18 @@ class ExpertPackModelLoader(BaseModelLoader):
             details = "\n".join(f"- {error}" for error in model_errors)
             raise ValueError(f"Invalid expert_pack model configuration:\n{details}")
         is_kimi = model_kind == KIMI_K3_MODEL_TYPE
-        server_args = get_server_args()
         if is_kimi:
             if self.manifest_path is None or not self.manifest_path.is_file():
                 raise FileNotFoundError("Kimi-K3 expert_pack requires manifest_path")
 
+        parallel = get_parallel()
+        exec_config = get_exec()
         if (
-            server_args.tp_size != 1
-            or server_args.dp_size != 1
-            or server_args.ep_size != 1
-            or not server_args.disable_cuda_graph
-            or not server_args.disable_shared_experts_fusion
+            parallel.tp_size != 1
+            or parallel.moe_dp_size != 1
+            or parallel.moe_ep_size != 1
+            or not exec_config.graph.disable_cuda_graph
+            or not exec_config.moe.disable_shared_experts_fusion
         ):
             raise RuntimeError(
                 "expert_pack ServerArgs invariants were not applied before model load"

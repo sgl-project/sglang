@@ -622,7 +622,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         # Thor (SM110) and other architectures keep the existing auto behavior.
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
             non_sm10x = self._construct(
                 "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
             )

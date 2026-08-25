@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from sglang.srt.environ import envs
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -100,8 +101,8 @@ def handle_expert_pack(server_args: Any) -> None:
                 expert_pack_runtime.prepare_raw_expert_pack_server_args(
                     server_args, loader_config
                 )
-            server_args.model_loader_extra_config = loader_config
-            server_args._declare(
+            declare_resolution(
+                server_args,
                 "handle_expert_pack",
                 model_loader_extra_config=loader_config,
             )
@@ -183,9 +184,8 @@ def handle_expert_pack(server_args: Any) -> None:
         details = "\n".join(f"- {error}" for error in errors)
         raise ValueError(f"Invalid expert_pack configuration:\n{details}")
 
-    server_args.disable_cuda_graph = True
-    server_args.disable_shared_experts_fusion = True
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "handle_expert_pack",
         disable_cuda_graph=True,
         disable_shared_experts_fusion=True,
