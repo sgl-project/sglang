@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import prometheus_client
 
@@ -35,6 +36,7 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
+    StorageMetrics,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
     resolve_collector_class,
@@ -140,5 +142,85 @@ class TestDefaultBackend(unittest.TestCase):
         )
 
 
+
+class _FakeMetricChild:
+    def __init__(self, metric, label_values):
+        self.metric = metric
+        self.label_values = label_values
+
+    def inc(self, value=1):
+        self.metric.values[self.label_values] = (
+            self.metric.values.get(self.label_values, 0) + value
+        )
+
+    def observe(self, value):
+        self.inc(value)
+
+    def set(self, value):
+        self.metric.values[self.label_values] = value
+
+
+class _FakeMetric:
+    instances = []
+
+    def __init__(self, name, documentation, labelnames=(), **kwargs):
+        self.name = name
+        self.documentation = documentation
+        self.labelnames = tuple(labelnames)
+        self.values = {}
+        self.__class__.instances.append(self)
+
+    def labels(self, **labels):
+        return _FakeMetricChild(self, tuple(sorted(labels.items())))
+
+
+class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
+    def setUp(self):
+        _FakeMetric.instances = []
+        self.patches = [
+            mock.patch.object(StorageMetricsCollector, "_counter_cls", _FakeMetric),
+            mock.patch.object(StorageMetricsCollector, "_gauge_cls", _FakeMetric),
+            mock.patch.object(StorageMetricsCollector, "_histogram_cls", _FakeMetric),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+        self.addCleanup(mock.patch.stopall)
+        self.collector = StorageMetricsCollector(labels={"model": "test"})
+        self.counter = next(
+            metric
+            for metric in _FakeMetric.instances
+            if metric.name == "sglang:hicache_prefetch_outcomes_total"
+        )
+
+    def _value(self, outcome):
+        return self.counter.values.get((("model", "test"), ("outcome", outcome)), 0)
+
+    def test_exports_deltas_without_duplicate_flushes_or_counter_regression(self):
+        first = {"attempts": 2, "issued": 1, "revoked_full_miss": 1}
+        self.collector.log_storage_metrics(StorageMetrics(prefetch_stats=first))
+        self.collector.log_storage_metrics(StorageMetrics(prefetch_stats=first))
+        self.assertEqual(self._value("attempts"), 2)
+        self.assertEqual(self._value("issued"), 1)
+        self.assertEqual(self._value("revoked_full_miss"), 1)
+
+        self.collector.log_storage_metrics(
+            StorageMetrics(
+                prefetch_stats={
+                    "attempts": 3,
+                    "issued": 2,
+                    "declined_rate_limited": 1,
+                    "revoked_full_miss": 1,
+                }
+            )
+        )
+        self.assertEqual(self._value("attempts"), 3)
+        self.assertEqual(self._value("issued"), 2)
+        self.assertEqual(self._value("declined_rate_limited"), 1)
+
+        self.collector.log_storage_metrics(
+            StorageMetrics(prefetch_stats={"attempts": 1, "issued": 1})
+        )
+        self.assertEqual(self._value("attempts"), 4)
+        self.assertEqual(self._value("issued"), 3)
 if __name__ == "__main__":
     unittest.main()
