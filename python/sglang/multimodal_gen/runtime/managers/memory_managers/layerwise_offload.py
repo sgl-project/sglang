@@ -1,6 +1,10 @@
 import bisect
+import ctypes
+import ctypes.util
+import os
 import queue
 import re
+import sys
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
@@ -191,6 +195,51 @@ def _install_host_gather_hooks(
 
     module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
     module.register_forward_hook(_output_to_device)
+
+
+_MADV_WILLNEED = 3
+_libc = None
+if sys.platform == "linux":
+    try:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except OSError:
+        _libc = None
+_PAGE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+
+
+def advise_willneed(tensors) -> int:
+    """Ask the kernel to read these mapped tensors' pages ahead, in bulk.
+
+    The default readahead pipeline feeds the drive in read_ahead_kb-sized
+    beats (128 KB), which holds a fast NVMe to a quarter of its sequential
+    throughput on a host too small to cache the checkpoint. MADV_WILLNEED
+    schedules the whole range at once, so the disk read for the next layer
+    runs at drive speed while the current layer computes. Best-effort and
+    Linux-only: on any failure the normal fault path still works.
+    """
+    if _libc is None:
+        return 0
+    advised = 0
+    for tensor in tensors:
+        try:
+            storage = tensor.untyped_storage()
+            ptr = storage.data_ptr()
+            nbytes = storage.nbytes()
+        except Exception:
+            continue
+        if ptr == 0 or nbytes == 0:
+            continue
+        start = ptr & ~(_PAGE - 1)
+        length = (ptr + nbytes) - start
+        length = (length + _PAGE - 1) & ~(_PAGE - 1)
+        if (
+            _libc.madvise(
+                ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_WILLNEED
+            )
+            == 0
+        ):
+            advised += 1
+    return advised
 
 
 class MappedLayerCourier:
@@ -988,6 +1037,11 @@ class LayerwiseOffloadManager:
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
+                if not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED:
+                    # Schedule the disk read for this layer's pages now, in
+                    # one bulk request, so it overlaps the previous layer's
+                    # compute instead of trickling in at fault-time beats.
+                    advise_willneed(self._mapped_cpu_weights[layer_idx].values())
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
