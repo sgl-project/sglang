@@ -3726,9 +3726,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                             param = params_dict[resolved_name]
                             if (
                                 _is_npu
+                                and getattr(self.quant_config, "is_fp4_experts", False)
+                                and param_name
+                                in {"w13_weight_scale_inv", "w2_weight_scale_inv"}
                                 and param.data.dtype == torch.uint8
-                                and loaded_weight.dtype != torch.uint8
-                                and loaded_weight.element_size() == 1
+                                and loaded_weight.dtype == torch.float8_e8m0fnu
                             ):
                                 # FP4 expert scales ship as E8M0 (float8_e8m0fnu)
                                 # but the param is uint8 and the GMM consumes the

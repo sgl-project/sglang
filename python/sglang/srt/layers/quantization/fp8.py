@@ -56,7 +56,9 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
+    ceil_to_ue8m0,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
@@ -118,6 +120,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_A5_MXFP8_BLOCK_SIZE = 32
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -739,23 +742,44 @@ class Fp8LinearMethod(LinearMethodBase):
                 del t
 
     def _process_npu_a5_mxfp8_linear_weights(self, layer: Module) -> None:
-        """Reinterpret DeepSeek [128, 128] block-FP8 scales as A5 MXFP8 scales.
+        """Convert DeepSeek [128, 128] block-FP8 weights to A5 MXFP8 layout.
 
-        The checkpoint stores one fp32 scale per 128x128 block. The A5 GEMM
-        (``npu_w8a8_block_fp8_linear``) wants one E8M0 exponent byte per group
-        of ``MXFP8_BLOCK_SIZE`` elements, packed in pairs, with both weight and
-        scale K-major. So: pull the exponent field out of the fp32 bits, expand
-        it back over the block it covered, pair it up, and transpose.
+        The checkpoint stores arbitrary FP32 scale factors per 128x128 block,
+        while the A5 GEMM consumes one UE8M0 scale per 32 K elements. Extracting
+        the FP32 exponent alone would change the represented value whenever a
+        checkpoint scale has a non-zero mantissa. Requantize the dequantized
+        weights instead so the FP8 values and UE8M0 scales remain consistent.
         """
-        scale_u8 = (layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF).to(
-            torch.uint8
+        if self.weight_block_size != [128, 128]:
+            raise ValueError(
+                "A5 MXFP8 linear only supports [128, 128] block-FP8 weights, "
+                f"got {self.weight_block_size}."
+            )
+        weight = block_quant_dequant(
+            layer.weight.data,
+            layer.weight_scale_inv.data,
+            self.weight_block_size,
+            torch.bfloat16,
         )
-        scale_u8 = scale_u8.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
-        n_dim, k_dim = scale_u8.shape
-        layer.weight_scale_inv.data = scale_u8.reshape(n_dim, k_dim // 2, 2).transpose(
-            0, 1
+        n_dim, k_dim = weight.shape
+        if k_dim % (2 * _A5_MXFP8_BLOCK_SIZE) != 0:
+            raise ValueError(
+                "A5 MXFP8 linear requires K to be divisible by "
+                f"{2 * _A5_MXFP8_BLOCK_SIZE}, got {k_dim}."
+            )
+
+        weight_groups = weight.float().reshape(
+            n_dim, k_dim // _A5_MXFP8_BLOCK_SIZE, _A5_MXFP8_BLOCK_SIZE
         )
-        layer.weight.data = layer.weight.data.transpose(0, 1)
+        scale = ceil_to_ue8m0(weight_groups.abs().amax(dim=-1, keepdim=True) / 448.0)
+        qweight = (weight_groups / scale).to(torch.float8_e4m3fn).reshape(n_dim, k_dim)
+        scale_u8 = (scale.squeeze(-1).view(torch.int32) >> 23).to(torch.uint8)
+
+        layer.weight.data = qweight.transpose(0, 1)
+        layer.weight_scale_inv.data = scale_u8.reshape(
+            n_dim, k_dim // (2 * _A5_MXFP8_BLOCK_SIZE), 2
+        ).transpose(0, 1)
+        layer.weight_scale_inv.format_ue8m0 = True
 
         if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
             self._batch_npu_a5_wo_a_weights(layer)

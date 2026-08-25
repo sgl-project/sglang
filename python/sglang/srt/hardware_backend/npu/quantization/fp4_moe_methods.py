@@ -22,22 +22,9 @@ if TYPE_CHECKING:
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
 
-# Routed-expert activation quant scheme. The DSV4 checkpoint declares W4A8_MXFP
-# (FP4 weights, FP8-e4m3 activations) The
-# W4A4_MXFP4 path below (FP4 activations) is kept because it parameterizes the
-# same GMM differently and is the fallback used while bringing up new weight
-# packings. Flipping the flag switches both the NZ weight pack and the GMM
-# parameterization; it is a module constant rather than an env var because it is
-# a bring-up knob, not a supported configuration.
-ROUTED_EXPERTS_FP8_ACTIVATION = True
-
-# The router emits weights normalized for a topk sum the FP4 experts do not
-# reproduce; vllm-ascend applies the same constant before combine.
-_ROUTED_SCALING = 1.5
-
 
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
-    """DeepSeek-V4 routed experts on Ascend A5: MXFP4 weights + MX activations.
+    """DeepSeek-V4 routed experts on Ascend A5: W4A8 MXFP weights.
 
     Delegates nothing to ``fp8_method`` except the shared runner config; it is
     held so the FP8 method sees the same ``moe_runner_config`` the layer built.
@@ -131,14 +118,10 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
                 "not match w2_weight_scale_inv."
             )
 
-        nz_kwargs = (
-            dict(
-                customize_dtype=torch.float8_e4m3fn,
-                input_dtype=_get_float4_e2m1fn_x2_dtype(),
-            )
-            if ROUTED_EXPERTS_FP8_ACTIVATION
-            else {}
-        )
+        nz_kwargs = {
+            "customize_dtype": torch.float8_e4m3fn,
+            "input_dtype": _get_float4_e2m1fn_x2_dtype(),
+        }
         nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
         layer.w13_weight.data = npu_format_cast(
             layer.w13_weight.data.view(torch.uint8), nz_format, **nz_kwargs
@@ -180,7 +163,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights = (topk_weights * _ROUTED_SCALING).to(hidden_states.dtype)
+        topk_weights = topk_weights.to(hidden_states.dtype)
         moe_runner_config = layer.moe_runner_config
 
         output = npu_fused_experts_w4a4_mxfp(
@@ -503,9 +486,8 @@ def w4a4_mxfp_gmm_npu(
     output_dtype=torch.bfloat16,
     scale_alg=None,
 ) -> torch.Tensor:
-    """MXFP4-weight grouped matmul; activation dtype per the module flag."""
-    gmm = _w4a8_mxfp_gmm if ROUTED_EXPERTS_FP8_ACTIVATION else _w4a4_mxfp_gmm
-    return gmm(
+    """W4A8 MXFP grouped matmul used by the DeepSeek-V4 checkpoint."""
+    return _w4a8_mxfp_gmm(
         input=input,
         input_scale=input_scale,
         weight=weight,
@@ -515,49 +497,6 @@ def w4a4_mxfp_gmm_npu(
         output_dtype=output_dtype,
         scale_alg=scale_alg,
     )
-
-
-def _w4a4_mxfp_gmm(
-    *,
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype: torch.dtype,
-    scale_alg=None,
-) -> torch.Tensor:
-    """FP4 weight x FP4 activation (W4A4_MXFP4 parameterization)."""
-    fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-    if input_scale is None:
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            input,
-            axis=1,
-            round_mode="rint",
-            dst_type=fp4_dtype,
-            block_size=MXFP4_BLOCK_SIZE,
-            scale_alg=scale_alg,
-        )
-    else:
-        x, x_scale = input, input_scale
-
-    e8m0_dtype = _get_float8_e8m0fnu_dtype()
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=[weight_scale],
-        scale_dtype=e8m0_dtype,
-        per_token_scale=[x_scale],
-        split_item=2,
-        group_type=0,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        output_dtype=output_dtype,
-        x_dtype=fp4_dtype,
-        weight_dtype=fp4_dtype,
-        per_token_scale_dtype=e8m0_dtype,
-    )[0]
 
 
 def _w4a8_mxfp_gmm(
