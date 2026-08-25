@@ -2858,7 +2858,7 @@ class UnifiedRadixCacheSuite:
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
         mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        prod_leaf = prod.resolve_node_handle(mp.last_device_node)
+        prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
         self._flush_l3_backups(prod)
@@ -2882,7 +2882,7 @@ class UnifiedRadixCacheSuite:
         ).available_size()
         occupied_before = cons.cache_controller.prefetch_tokens_occupied
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self.assertEqual(
             cons.cache_controller.prefetch_tokens_occupied,
@@ -3013,7 +3013,7 @@ class UnifiedRadixCacheSuite:
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
         mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        prod_leaf = prod.resolve_node_handle(mp.last_device_node)
+        prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
         self._flush_l3_backups(prod)
@@ -3037,7 +3037,7 @@ class UnifiedRadixCacheSuite:
         ).available_size()
         occupied_before = cc.prefetch_tokens_occupied
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self.assertEqual(
             cons.cache_controller.prefetch_tokens_occupied,
