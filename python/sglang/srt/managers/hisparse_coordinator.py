@@ -9,20 +9,17 @@ from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 if is_xpu():
     from sgl_kernel import (
+        copy_cache_planned_mla,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
     )
 else:
     from sglang.kernels.ops.kvcache.hisparse import (
+        copy_cache_planned_mla,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
     )
 
-from sglang.kernels.ops.kvcache.hisparse import (
-    copy_cache_planned_mla,
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-)
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
