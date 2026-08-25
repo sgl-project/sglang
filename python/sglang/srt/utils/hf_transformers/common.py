@@ -74,15 +74,15 @@ from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import normalize_rope_scaling_compat
+from .hub import _cached_file_exists as _cached_file_exists
+from .hub import _remote_file_exists as _remote_file_exists
+from .hub import _resolve_local_or_cached_file as _resolve_local_or_cached_file
 from .hub import (
-    _cached_file_exists,  # noqa: F401 - compatibility re-export
-    _remote_file_exists,  # noqa: F401 - compatibility re-export
-    _resolve_local_or_cached_file,  # noqa: F401 - compatibility re-export
     check_gguf_file,
     download_from_hf,
     gguf_sidecar_dir,
-    resolve_hf_gguf_reference,  # noqa: F401 - compatibility re-export
 )
+from .hub import resolve_hf_gguf_reference as resolve_hf_gguf_reference
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig
