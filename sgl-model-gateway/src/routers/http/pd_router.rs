@@ -209,7 +209,6 @@ impl PDRouter {
     fn inject_request_id_into_value(
         mut original: Value,
         request_id: &str,
-        batch_size: Option<usize>,
     ) -> Result<Value, String> {
         if original.get("rid").is_some_and(|value| !value.is_null()) {
             return Ok(original);
@@ -219,15 +218,10 @@ impl PDRouter {
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
 
-        let rid = match batch_size {
-            Some(size) => Value::Array(
-                (0..size)
-                    .map(|index| Value::from(format!("{request_id}_{index}")))
-                    .collect(),
-            ),
-            None => Value::from(request_id),
-        };
-        obj.insert("rid".to_string(), rid);
+        // Keep one logical request ID here. The engine expands scalar IDs when
+        // handling true batches or parallel sampling, so the gateway must not
+        // interpret chat `n` as the batch size.
+        obj.insert("rid".to_string(), Value::from(request_id));
         Ok(original)
     }
 
@@ -435,7 +429,7 @@ impl PDRouter {
         // then adds a fresh bootstrap_room for the new transfer attempt.
         let shared_request = match serde_json::to_value(original_request) {
             Ok(request) => {
-                match Self::inject_request_id_into_value(request, &request_id, context.batch_size) {
+                match Self::inject_request_id_into_value(request, &request_id) {
                     Ok(request) => Arc::new(request),
                     Err(error) => return Self::handle_serialization_error(error),
                 }
@@ -2007,22 +2001,20 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_request_id_preserves_existing_and_expands_batch() {
+    fn test_inject_request_id_preserves_existing_and_injects_scalar() {
         let existing = PDRouter::inject_request_id_into_value(
             json!({"rid": "client-rid"}),
             "router-rid",
-            None,
         )
         .unwrap();
         assert_eq!(existing["rid"], "client-rid");
 
-        let batch = PDRouter::inject_request_id_into_value(
+        let request = PDRouter::inject_request_id_into_value(
             json!({"prompt": ["a", "b"]}),
             "router-rid",
-            Some(2),
         )
         .unwrap();
-        assert_eq!(batch["rid"], json!(["router-rid_0", "router-rid_1"]));
+        assert_eq!(request["rid"], "router-rid");
     }
 
     #[test]
