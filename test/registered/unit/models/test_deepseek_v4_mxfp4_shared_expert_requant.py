@@ -50,6 +50,7 @@ class TestQuantizeBlockFp8WeightToMxfp4(CustomTestCase):
         w[0, 0] = 0.5  # code 1
         w[0, 1] = -3.0  # magnitude idx 5, sign bit -> code 13
         w[0, 2] = 6.0  # code 7
+        w[0, 3] = 1.5  # code 3
         packed, scales = self._requant(w)
 
         self.assertEqual(packed.dtype, torch.int8)
@@ -61,8 +62,13 @@ class TestQuantizeBlockFp8WeightToMxfp4(CustomTestCase):
         as_u8 = packed.view(torch.uint8)
         # byte 0 = code(0.5) | code(-3.0) << 4 ; low nibble is the even column
         self.assertEqual(as_u8[0, 0].item(), 0x01 | (0x0D << 4))
-        # byte 1 = code(6.0) | code(0.0) << 4
-        self.assertEqual(as_u8[0, 1].item(), 0x07)
+        # byte 1 = code(6.0) | code(1.5) << 4
+        self.assertEqual(as_u8[0, 1].item(), 0x07 | (0x03 << 4))
+        # Zero padding is not asserted byte-exactly: the quantizer encodes 0.0
+        # as -0.0 (code 8), which the kernel decodes back to zero. Check the
+        # padding dequantizes to zero without pinning its sign bit.
+        deq = _dequant_mxfp4(packed, scales)
+        self.assertTrue((deq[0, 4:] == 0).all())
 
     def test_roundtrip_error_is_mxfp4_sized(self):
         torch.manual_seed(0)
