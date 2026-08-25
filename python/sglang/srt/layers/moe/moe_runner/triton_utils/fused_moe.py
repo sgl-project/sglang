@@ -788,34 +788,37 @@ def _fused_moe_kernel_sequence(
 
     del intermediate_cache1
 
-    intermediate_cache3 = torch.empty(
-        (num_tokens, topk, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-
     # LoRA hooks force the second kernel to write to intermediate_cache3 so
     # hooks.after_down can inspect/modify it before reduction.
     _use_intermediate = not no_combine and (topk != 1 or hooks)
+    assert not (
+        no_combine and hooks and hooks.after_down
+    ), "after_down hook needs a route-major intermediate, which no_combine skips"
 
-    out_slice = None
+    # intermediate_cache3 is allocated only when it is the down kernel's
+    # destination. The other paths have the kernel write (or accumulate) the
+    # finished rows straight into out_hidden_states, and leaving the buffer
+    # unallocated is what keeps a combine from reducing memory nobody wrote.
+    intermediate_cache3 = None
     if use_fused_moe_sum_all_reduce:
-        out_slice = out_hidden_states
-        out_slice.zero_()
+        # The kernel accumulates every route into the output in place.
+        out_hidden_states.zero_()
+        down_out = out_hidden_states
+    elif _use_intermediate:
+        intermediate_cache3 = torch.empty(
+            (num_tokens, topk, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        down_out = intermediate_cache3
+    else:
+        down_out = out_hidden_states.unsqueeze(0)
 
     invoke_fused_moe_kernel(
         intermediate_cache2,
         w2,
         b2,
-        (
-            out_slice
-            if use_fused_moe_sum_all_reduce
-            else (
-                intermediate_cache3
-                if _use_intermediate
-                else out_hidden_states.unsqueeze(0)
-            )
-        ),
+        down_out,
         a2_scale,
         w2_scale,
         w2_zp,
@@ -853,14 +856,13 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
+    elif intermediate_cache3 is None:
+        # The kernel already put the finished rows in out_hidden_states, so the
+        # routed scaling the reduce would have folded in is all that is left.
+        if routed_scaling_factor != 1.0:
+            out_hidden_states.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if use_fused_moe_sum_all_reduce:
-            if routed_scaling_factor != 1.0:
-                assert out_slice is not None
-                out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
-        elif topk == 2 and routed_scaling_factor == 1.0:
+        if topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
                 intermediate_cache3[:, 0],
                 intermediate_cache3[:, 1],
@@ -901,14 +903,11 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
-        else:
-            moe_sum_reduce(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-                routed_scaling_factor,
-            )
+        moe_sum_reduce(
+            intermediate_cache3.view(*intermediate_cache3.shape),
+            out_hidden_states,
+            routed_scaling_factor,
+        )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(
