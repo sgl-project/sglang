@@ -23,6 +23,14 @@ from sglang.srt.utils.common import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
+def _encode_metrics(registry, accept_header):
+    """Encode metrics using the same content negotiation as HTTP mode."""
+    from prometheus_client.exposition import choose_encoder
+
+    encoder, content_type = choose_encoder(accept_header)
+    return encoder(registry), content_type
+
+
 async def _start_sidecar_server(host: str, port: int, app):
     """Start the aiohttp sidecar and return the runner for cleanup."""
     runner = web.AppRunner(app)
@@ -43,19 +51,17 @@ def _add_metrics_routes(app):
         CollectorRegistry,
         multiprocess,
     )
-    from prometheus_client.openmetrics.exposition import (
-        CONTENT_TYPE_LATEST,
-        generate_latest,
-    )
 
     async def metrics_handler(request):
         try:
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
-            data = generate_latest(registry)
+            data, content_type = _encode_metrics(
+                registry, request.headers.get("Accept")
+            )
             return web.Response(
                 body=data,
-                headers={"Content-Type": CONTENT_TYPE_LATEST},
+                headers={"Content-Type": content_type},
             )
         except Exception:
             logger.exception("Failed to generate Prometheus metrics")
