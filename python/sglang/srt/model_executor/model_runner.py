@@ -833,6 +833,10 @@ class ModelRunner:
         )
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
+        self.normal_max_running_requests = (
+            result.memory_pool_config.normal_max_running_requests
+            or self.max_running_requests
+        )
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
@@ -916,9 +920,16 @@ class ModelRunner:
             )
         if resize.capped_max_running_requests is not None:
             self.max_running_requests = resize.capped_max_running_requests
+            self.normal_max_running_requests = min(
+                self.normal_max_running_requests,
+                resize.capped_max_running_requests,
+            )
             if self.memory_pool_config is not None:
                 self.memory_pool_config.max_running_requests = (
                     resize.capped_max_running_requests
+                )
+                self.memory_pool_config.normal_max_running_requests = (
+                    self.normal_max_running_requests
                 )
 
     def post_capture_elastic_ep_recover(self):

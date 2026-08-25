@@ -810,6 +810,31 @@ class ServerArgs:
     max_running_requests: A[
         Optional[int], "The maximum number of running requests.", NS("schedule")
     ] = None
+    enable_cache_hit_overadmission: A[
+        bool,
+        "Allow a bounded number of short, high-prefix-cache-hit requests to run above the normal request admission limit. This is an experimental, opt-in feature for hybrid Mamba/GDN models using extra_buffer_lazy.",
+        NS("schedule"),
+    ] = False
+    cache_hit_overadmission_max_extra_reqs: A[
+        int,
+        "The maximum number of requests, across data-parallel workers, that cache-hit over-admission may add above the normal request admission limit.",
+        NS("schedule"),
+    ] = 0
+    cache_hit_overadmission_min_hit_ratio: A[
+        float,
+        "The minimum device prefix-cache hit ratio required for cache-hit over-admission.",
+        NS("schedule"),
+    ] = 0.95
+    cache_hit_overadmission_max_uncached_prefill_tokens: A[
+        int,
+        "The maximum number of uncached input tokens allowed for cache-hit over-admission.",
+        NS("schedule"),
+    ] = 128
+    cache_hit_overadmission_max_new_tokens: A[
+        int,
+        "The maximum declared output-token budget allowed for cache-hit over-admission.",
+        NS("schedule"),
+    ] = 64
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -3811,6 +3836,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_cache_hit_overadmission_options()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -6204,7 +6230,47 @@ class ServerArgs:
         run_post_process_pass(self, _mamba_radix_cache_resolution)
         view = resolved_view(self)
         if not view.uses_mamba_radix_cache:
+            if view.enable_cache_hit_overadmission:
+                raise ValueError(
+                    "--enable-cache-hit-overadmission currently requires a hybrid "
+                    "Mamba/GDN model with the Mamba radix cache enabled."
+                )
             return
+
+        if view.enable_cache_hit_overadmission:
+            if not is_cuda():
+                raise ValueError(
+                    "--enable-cache-hit-overadmission is currently supported on "
+                    "CUDA only."
+                )
+            if view.disable_radix_cache:
+                raise ValueError(
+                    "--enable-cache-hit-overadmission requires the radix cache; "
+                    "remove --disable-radix-cache."
+                )
+            if view.mamba_radix_cache_strategy != "extra_buffer_lazy":
+                raise ValueError(
+                    "--enable-cache-hit-overadmission currently requires "
+                    "--mamba-radix-cache-strategy extra_buffer_lazy; got "
+                    f"{view.mamba_radix_cache_strategy!r}."
+                )
+            if view.max_running_requests is None:
+                raise ValueError(
+                    "--enable-cache-hit-overadmission requires an explicit "
+                    "--max-running-requests so startup can provision a bounded "
+                    "physical request capacity."
+                )
+            if view.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-cache-hit-overadmission is not supported with PD "
+                    "disaggregation yet."
+                )
+            if view.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-cache-hit-overadmission currently supports device "
+                    "prefix-cache hits only and is not compatible with the "
+                    "hierarchical cache yet."
+                )
 
         if mamba_extra_buffer_of(view):
             self._validate_mamba_extra_buffer(view, model_arch)
@@ -9162,6 +9228,35 @@ class ServerArgs:
     def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
+
+    def _validate_cache_hit_overadmission_options(self):
+        if not self.enable_cache_hit_overadmission:
+            return
+        if self.cache_hit_overadmission_max_extra_reqs <= 0:
+            raise ValueError(
+                "--cache-hit-overadmission-max-extra-reqs must be positive "
+                "when --enable-cache-hit-overadmission is set."
+            )
+        if not 0.0 <= self.cache_hit_overadmission_min_hit_ratio <= 1.0:
+            raise ValueError(
+                "--cache-hit-overadmission-min-hit-ratio must be in [0, 1]."
+            )
+        if self.cache_hit_overadmission_max_uncached_prefill_tokens < 0:
+            raise ValueError(
+                "--cache-hit-overadmission-max-uncached-prefill-tokens must "
+                "be non-negative."
+            )
+        if self.cache_hit_overadmission_max_new_tokens <= 0:
+            raise ValueError(
+                "--cache-hit-overadmission-max-new-tokens must be positive."
+            )
+        if self.enable_priority_scheduling and not self.disable_priority_preemption:
+            raise ValueError(
+                "--enable-cache-hit-overadmission currently requires "
+                "--disable-priority-preemption when priority scheduling is "
+                "enabled, so an ineligible request cannot replace an eligible "
+                "request while the batch is above the normal limit."
+            )
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(

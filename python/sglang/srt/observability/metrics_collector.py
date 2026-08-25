@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.cache_hit_overadmission import (
+        CacheHitOveradmissionDecision,
+    )
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -75,6 +78,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
+    cache_hit_overadmitted_reqs: int = 0
 
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
@@ -306,6 +310,41 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cache_hit_overadmitted_reqs = Gauge(
+            name="sglang:cache_hit_overadmitted_reqs",
+            documentation=(
+                "The number of running requests above the normal admission "
+                "limit in the cache-hit extra lane."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_hit_overadmission_admitted_requests_total = Counter(
+            name="sglang:cache_hit_overadmission_admitted_requests_total",
+            documentation=("Total requests admitted through the cache-hit extra lane."),
+            labelnames=labels.keys(),
+        )
+        self.cache_hit_overadmission_rejected_requests_total = Counter(
+            name="sglang:cache_hit_overadmission_rejected_requests_total",
+            documentation=(
+                "Total cache-hit extra-lane candidates rejected, by reason."
+            ),
+            labelnames=[*labels.keys(), "reason"],
+        )
+        self.cache_hit_overadmission_hit_ratio = Histogram(
+            name="sglang:cache_hit_overadmission_hit_ratio",
+            documentation="Device prefix-cache hit ratio of extra-lane candidates.",
+            labelnames=[*labels.keys(), "result"],
+            buckets=(0.5, 0.75, 0.9, 0.95, 0.99, 1.0),
+        )
+        self.cache_hit_overadmission_uncached_prefill_tokens = Histogram(
+            name="sglang:cache_hit_overadmission_uncached_prefill_tokens",
+            documentation=(
+                "Uncached prefill tokens of cache-hit extra-lane candidates."
+            ),
+            labelnames=[*labels.keys(), "result"],
+            buckets=(0, 1, 16, 32, 64, 128, 256, 512),
         )
 
         # =================================================================
@@ -1155,6 +1194,26 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
 
+    def record_cache_hit_overadmission(
+        self, decision: CacheHitOveradmissionDecision
+    ) -> None:
+        result = "admitted" if decision.allowed else "rejected"
+        if decision.allowed:
+            self.cache_hit_overadmission_admitted_requests_total.labels(
+                **self.labels
+            ).inc()
+        else:
+            self.cache_hit_overadmission_rejected_requests_total.labels(
+                **self.labels, reason=decision.reason
+            ).inc()
+        if decision.input_tokens > 0:
+            self.cache_hit_overadmission_hit_ratio.labels(
+                **self.labels, result=result
+            ).observe(decision.hit_ratio)
+            self.cache_hit_overadmission_uncached_prefill_tokens.labels(
+                **self.labels, result=result
+            ).observe(decision.uncached_tokens)
+
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
@@ -1330,6 +1389,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
+        self._log_gauge(
+            self.cache_hit_overadmitted_reqs,
+            stats.cache_hit_overadmitted_reqs,
+        )
 
         # Memory pool usage ratios
         self._log_gauge(self.token_usage, stats.token_usage)

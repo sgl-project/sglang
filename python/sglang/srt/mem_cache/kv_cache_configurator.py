@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.common import MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -90,6 +91,46 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RequestCapacity:
+    """Per-worker scheduler gate and provisioned physical request capacity."""
+
+    normal: int
+    physical: int
+
+
+def resolve_cache_hit_overadmission_capacity(
+    *,
+    normal_capacity: int,
+    hard_capacity: int,
+    mamba_cache_size: int,
+    max_extra_reqs_per_worker: int,
+    enabled: bool,
+) -> int:
+    """Resolve the request-indexed capacity for the opt-in extra lane.
+
+    ``extra_buffer_lazy`` needs one active and one resident ping-pong slot per
+    live request. Keep one additional Mamba slot for the cached checkpoint that
+    made a cache-hit admission possible. Runtime admission performs the tighter
+    allocator check, which also covers multiple distinct cached prefixes.
+    """
+    if not enabled or max_extra_reqs_per_worker <= 0:
+        return normal_capacity
+
+    mamba_live_capacity = max(
+        (mamba_cache_size - 1) // MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+        0,
+    )
+    return max(
+        normal_capacity,
+        min(
+            hard_capacity,
+            normal_capacity + max_extra_reqs_per_worker,
+            mamba_live_capacity,
+        ),
+    )
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
@@ -1933,9 +1974,13 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def resolve_max_num_reqs(self, token_capacity: int) -> int:
-        """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
+    def resolve_request_capacity(self, token_capacity: int) -> RequestCapacity:
+        """Compute normal and physical request capacities per DP worker.
+
+        The normal capacity preserves the existing worst-case Mamba admission
+        limit. The physical capacity is larger only for the opt-in cache-hit
+        extra lane and sizes every request-indexed allocation.
+        """
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -1948,6 +1993,7 @@ class KVCacheConfigurator:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
+        hard_capacity = max_num_reqs
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
@@ -1986,7 +2032,48 @@ class KVCacheConfigurator:
                 requested_per_worker,
                 max_num_reqs,
             )
-        return max_num_reqs
+
+        physical_capacity = max_num_reqs
+        if (
+            self.mambaish_config is not None
+            and get_schedule().enable_cache_hit_overadmission
+        ):
+            max_extra_per_worker = (
+                get_schedule().cache_hit_overadmission_max_extra_reqs
+                // self.ps.attn_dp_size
+            )
+            physical_capacity = resolve_cache_hit_overadmission_capacity(
+                normal_capacity=max_num_reqs,
+                hard_capacity=hard_capacity,
+                mamba_cache_size=get_schedule().max_mamba_cache_size,
+                max_extra_reqs_per_worker=max_extra_per_worker,
+                enabled=True,
+            )
+            if physical_capacity > max_num_reqs:
+                logger.info(
+                    "Cache-hit over-admission: normal request limit=%d, "
+                    "physical request capacity=%d per DP worker "
+                    "(requested extra=%d).",
+                    max_num_reqs,
+                    physical_capacity,
+                    max_extra_per_worker,
+                )
+            else:
+                logger.warning(
+                    "Cache-hit over-admission is enabled but no additional "
+                    "request capacity can be provisioned (normal=%d, hard=%d, "
+                    "max_mamba_cache_size=%d, requested extra per worker=%d).",
+                    max_num_reqs,
+                    hard_capacity,
+                    get_schedule().max_mamba_cache_size,
+                    max_extra_per_worker,
+                )
+
+        return RequestCapacity(normal=max_num_reqs, physical=physical_capacity)
+
+    def resolve_max_num_reqs(self, token_capacity: int) -> int:
+        """Backward-compatible resolver for the normal admission limit."""
+        return self.resolve_request_capacity(token_capacity).normal
 
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
@@ -1998,9 +2085,9 @@ class KVCacheConfigurator:
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
-        config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
+        request_capacity = self.resolve_request_capacity(config.max_total_num_tokens)
+        config.normal_max_running_requests = request_capacity.normal
+        config.max_running_requests = request_capacity.physical
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
@@ -2029,6 +2116,34 @@ class KVCacheConfigurator:
                 max_tokens, get_schedule().page_size
             )
         return config
+
+    def _mamba_intermediate_request_capacity(self) -> int:
+        """Request rows that speculative Mamba scratch must physically cover.
+
+        This runs before the full-KV token capacity is known, so it uses the
+        explicit per-worker request limit. Any later KV-derived clamp only
+        over-reserves scratch; it can never make the allocation unsafe.
+        """
+        assert get_schedule().max_running_requests is not None
+        requested_per_worker = (
+            get_schedule().max_running_requests // self.ps.attn_dp_size
+        )
+        ratio = self._calculate_mamba_ratio()
+        normal_capacity = min(
+            requested_per_worker,
+            get_schedule().max_mamba_cache_size // ratio,
+        )
+        max_extra_per_worker = (
+            get_schedule().cache_hit_overadmission_max_extra_reqs
+            // self.ps.attn_dp_size
+        )
+        return resolve_cache_hit_overadmission_capacity(
+            normal_capacity=normal_capacity,
+            hard_capacity=requested_per_worker,
+            mamba_cache_size=get_schedule().max_mamba_cache_size,
+            max_extra_reqs_per_worker=max_extra_per_worker,
+            enabled=get_schedule().enable_cache_hit_overadmission,
+        )
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
@@ -2099,11 +2214,7 @@ class KVCacheConfigurator:
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
             if has_spec_dec and not replayssm_active:
-                ratio = self._calculate_mamba_ratio()
-                capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
-                    get_schedule().max_mamba_cache_size // ratio,
-                )
+                capped_reqs = self._mamba_intermediate_request_capacity()
                 intermediate_size = (
                     stage_per_req
                     * (capped_reqs + 1)
@@ -2157,10 +2268,7 @@ class KVCacheConfigurator:
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
-                capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
-                    get_schedule().max_mamba_cache_size // ratio,
-                )
+                capped_reqs = self._mamba_intermediate_request_capacity()
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:

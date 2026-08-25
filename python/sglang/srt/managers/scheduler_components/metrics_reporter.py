@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
@@ -747,6 +748,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._update_cache_hit_overadmission_metrics()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -994,6 +996,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._update_cache_hit_overadmission_metrics()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1156,6 +1159,21 @@ class SchedulerMetricsReporter:
                     self.stats.token_usage / 0.9,
                 )
 
+    def _update_cache_hit_overadmission_metrics(self) -> None:
+        if not get_schedule().enable_cache_hit_overadmission:
+            self.stats.cache_hit_overadmitted_reqs = 0
+            return
+        physical_limit = getattr(self.scheduler, "max_running_requests", 0)
+        normal_limit = getattr(
+            self.scheduler,
+            "normal_max_running_requests",
+            physical_limit,
+        )
+        self.stats.cache_hit_overadmitted_reqs = max(
+            self.stats.num_running_reqs.total - normal_limit,
+            0,
+        )
+
     def update_device_timer(self):
         if not ENABLE_METRICS_DEVICE_TIMER:
             return
@@ -1242,4 +1260,5 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
+        self._update_cache_hit_overadmission_metrics()
         self.metrics_collector.log_stats(self.stats)

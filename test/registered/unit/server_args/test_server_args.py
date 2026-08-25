@@ -90,6 +90,70 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_cache_hit_overadmission_cli(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        defaults = parser.parse_args(["--model-path", "dummy-model"])
+        self.assertFalse(defaults.enable_cache_hit_overadmission)
+        self.assertEqual(defaults.cache_hit_overadmission_max_extra_reqs, 0)
+        self.assertEqual(defaults.cache_hit_overadmission_min_hit_ratio, 0.95)
+        self.assertEqual(
+            defaults.cache_hit_overadmission_max_uncached_prefill_tokens, 128
+        )
+        self.assertEqual(defaults.cache_hit_overadmission_max_new_tokens, 64)
+
+        enabled = parser.parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--enable-cache-hit-overadmission",
+                "--cache-hit-overadmission-max-extra-reqs",
+                "27",
+                "--cache-hit-overadmission-min-hit-ratio",
+                "0.99",
+                "--cache-hit-overadmission-max-uncached-prefill-tokens",
+                "47",
+                "--cache-hit-overadmission-max-new-tokens",
+                "32",
+            ]
+        )
+        self.assertTrue(enabled.enable_cache_hit_overadmission)
+        self.assertEqual(enabled.cache_hit_overadmission_max_extra_reqs, 27)
+        self.assertEqual(enabled.cache_hit_overadmission_min_hit_ratio, 0.99)
+        self.assertEqual(
+            enabled.cache_hit_overadmission_max_uncached_prefill_tokens, 47
+        )
+        self.assertEqual(enabled.cache_hit_overadmission_max_new_tokens, 32)
+
+    def test_cache_hit_overadmission_option_validation(self):
+        valid = dict(
+            model_path="dummy",
+            enable_cache_hit_overadmission=True,
+            cache_hit_overadmission_max_extra_reqs=1,
+        )
+        ServerArgs(**valid).resolve_once()
+
+        invalid_cases = (
+            ({"cache_hit_overadmission_max_extra_reqs": 0}, "max-extra-reqs"),
+            ({"cache_hit_overadmission_min_hit_ratio": 1.01}, "min-hit-ratio"),
+            (
+                {"cache_hit_overadmission_max_uncached_prefill_tokens": -1},
+                "max-uncached-prefill-tokens",
+            ),
+            ({"cache_hit_overadmission_max_new_tokens": 0}, "max-new-tokens"),
+            (
+                {"enable_priority_scheduling": True},
+                "disable-priority-preemption",
+            ),
+        )
+        for changes, message in invalid_cases:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                ServerArgs(**(valid | changes)).resolve_once()
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

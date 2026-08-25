@@ -218,6 +218,11 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.cache_hit_overadmission import (
+    CacheHitOveradmissionDecision,
+    evaluate_cache_hit_overadmission,
+    evaluate_cache_hit_overadmission_shape,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
@@ -1057,6 +1062,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.normal_max_running_requests = getattr(
+            self.tp_worker.model_runner,
+            "normal_max_running_requests",
+            self.max_running_requests,
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1110,6 +1120,7 @@ class Scheduler(
                 f"chunked_prefill_size={get_schedule().chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
+                f"normal_max_running_requests={self.normal_max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
@@ -3239,6 +3250,62 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _record_cache_hit_overadmission(
+        self,
+        decision: CacheHitOveradmissionDecision,
+    ) -> None:
+        if self.metrics_collector is not None:
+            self.metrics_collector.record_cache_hit_overadmission(decision)
+
+    def _cleanup_failed_mamba_match(
+        self,
+        req: Req,
+        *,
+        had_mamba_pool_idx: bool,
+    ) -> None:
+        """Rollback the deferred COW state staged by prefix matching."""
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        if (
+            not had_mamba_pool_idx
+            and req.mamba_pool_idx is not None
+            and req.session is None
+        ):
+            self.req_to_token_pool.mamba_allocator.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+
+    def _mamba_slots_needed_after_match(self, req: Req) -> int:
+        """Slots still needed when the admitted prefill batch allocates rows."""
+        needed = int(req.mamba_pool_idx is None)
+        if (
+            getattr(self.req_to_token_pool, "enable_mamba_extra_buffer", False)
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            if getattr(self.req_to_token_pool, "enable_mamba_extra_buffer_lazy", False):
+                needed += 1
+            else:
+                needed += self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+        return needed
+
+    def _has_overadmission_mamba_headroom(
+        self,
+        req: Req,
+        pending_reqs: List[Req],
+    ) -> bool:
+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if allocator is None:
+            return False
+        needed = self._mamba_slots_needed_after_match(req) + sum(
+            self._mamba_slots_needed_after_match(pending_req)
+            for pending_req in pending_reqs
+        )
+        # Do not rely on evictable cached states: each matched state may become
+        # protected when PrefillAdder commits the candidate. The static free
+        # count (including unused group-preallocated slots) is race-free here.
+        return allocator.schedulable_available_size() >= needed
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3397,6 +3464,45 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    if (
+                        get_schedule().enable_cache_hit_overadmission
+                        and running_bs + len(adder.can_run_list)
+                        >= self.normal_max_running_requests
+                    ):
+                        self._record_cache_hit_overadmission(
+                            CacheHitOveradmissionDecision(False, "extra_cap")
+                        )
+                    break
+
+            is_overadmission = (
+                get_schedule().enable_cache_hit_overadmission
+                and running_bs + len(adder.can_run_list)
+                >= self.normal_max_running_requests
+            )
+            if is_overadmission:
+                shape_rejection = evaluate_cache_hit_overadmission_shape(
+                    req,
+                    max_new_tokens=get_schedule().cache_hit_overadmission_max_new_tokens,
+                )
+                if shape_rejection is not None:
+                    self._record_cache_hit_overadmission(shape_rejection)
+                    # Do not skip an ineligible head candidate to keep filling
+                    # the extra lane behind it. Let the lane drain below the
+                    # normal limit so regular traffic cannot starve.
+                    break
+            if is_overadmission and mamba_allocator is not None:
+                pending_mamba_slots = sum(
+                    self._mamba_slots_needed_after_match(pending_req)
+                    for pending_req in adder.can_run_list
+                )
+                # A fresh high-hit request needs a COW destination before its
+                # request row is allocated. If every currently schedulable slot
+                # is already reserved for admitted candidates, prefix matching
+                # cannot proceed without risking an allocator assertion.
+                if mamba_allocator.schedulable_available_size() <= pending_mamba_slots:
+                    self._record_cache_hit_overadmission(
+                        CacheHitOveradmissionDecision(False, "mamba_slots")
+                    )
                     break
 
             if self.enable_hicache_storage:
@@ -3409,6 +3515,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            had_mamba_pool_idx = req.mamba_pool_idx is not None
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
@@ -3427,11 +3534,59 @@ class Scheduler(
                     req.swa_host_hit_length = (
                         self.tree_cache.staged_prefetch_swa_tokens(req.rid)
                     )
+
+            overadmission_decision = None
+            if is_overadmission:
+                overadmission_decision = evaluate_cache_hit_overadmission(
+                    req,
+                    min_hit_ratio=get_schedule().cache_hit_overadmission_min_hit_ratio,
+                    max_uncached_prefill_tokens=get_schedule().cache_hit_overadmission_max_uncached_prefill_tokens,
+                    max_new_tokens=get_schedule().cache_hit_overadmission_max_new_tokens,
+                )
+                if not overadmission_decision.allowed:
+                    self._cleanup_failed_mamba_match(
+                        req, had_mamba_pool_idx=had_mamba_pool_idx
+                    )
+                    self._record_cache_hit_overadmission(overadmission_decision)
+                    # Preserve queue order at the normal/extra boundary. Once
+                    # an ineligible candidate reaches the front, stop refilling
+                    # the extra lane and let regular capacity become available.
+                    break
+                if not self._has_overadmission_mamba_headroom(req, adder.can_run_list):
+                    self._cleanup_failed_mamba_match(
+                        req, had_mamba_pool_idx=had_mamba_pool_idx
+                    )
+                    self._record_cache_hit_overadmission(
+                        dataclasses.replace(
+                            overadmission_decision,
+                            allowed=False,
+                            reason="mamba_slots",
+                        )
+                    )
+                    break
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+
+            if is_overadmission and overadmission_decision is not None:
+                if added:
+                    self._record_cache_hit_overadmission(overadmission_decision)
+                else:
+                    self._record_cache_hit_overadmission(
+                        dataclasses.replace(
+                            overadmission_decision,
+                            allowed=False,
+                            reason=(
+                                "full_kv"
+                                if res == AddReqResult.NO_TOKEN
+                                else "scheduler_budget"
+                            ),
+                        )
+                    )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3449,19 +3604,10 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.mamba_cow_src_index = None
-                    req.mamba_needs_clear = False
-                    if req.mamba_pool_idx is not None and not getattr(
-                        req, "session", None
-                    ):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.mamba_pool_idx = None
+                    self._cleanup_failed_mamba_match(
+                        req, had_mamba_pool_idx=had_mamba_pool_idx
+                    )
                 break
 
         if mamba_allocator is not None:
@@ -4438,6 +4584,7 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret["normal_max_running_requests_per_dp"] = self.normal_max_running_requests
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
