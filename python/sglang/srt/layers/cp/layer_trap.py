@@ -94,6 +94,17 @@ def layer_trap_register_tensors(tensors: dict) -> None:
                     v.data_ptr(),
                     v.data_ptr() + v.numel() * v.element_size(),
                 )
+        # §24.41 (Run 25): one-shot sorted layout dump. The catch-time addr
+        # line only fires on a catch; this maps r2t's neighborhood in EVERY
+        # run (catchless included), so "which pool is physically adjacent to
+        # r2t" is answered without waiting for a reproduction.
+        if _addrs and not _on.get("layout_logged"):
+            _on["layout_logged"] = True
+            for k in sorted(_addrs, key=lambda n: _addrs[n][0]):
+                lo, hi = _addrs[k]
+                logger.error(
+                    "[mf-trap] layout name=%s lo=%#x hi=%#x", k, lo, hi
+                )
     except Exception:
         pass
 
