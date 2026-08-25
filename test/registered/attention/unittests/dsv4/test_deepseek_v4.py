@@ -345,6 +345,54 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             swa_offsets=torch.zeros(3, **int32),
         )
 
+    def test_interleave_cp_sparse_prefill_swa_ranges(self):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            compute_interleave_cp_swa_ranges,
+        )
+
+        common = dict(
+            seq_lens=[10, 20],
+            extend_seq_lens=[3, 4],
+            cp_size=2,
+            swa_window=4,
+        )
+        self.assertEqual(
+            compute_interleave_cp_swa_ranges(
+                local_query_lens=[2, 2],
+                local_request_indices=[0, 1],
+                cp_rank=0,
+                **common,
+            ),
+            ([4, 14], [6, 6]),
+        )
+        self.assertEqual(
+            compute_interleave_cp_swa_ranges(
+                local_query_lens=[1, 2],
+                local_request_indices=[0, 1],
+                cp_rank=1,
+                **common,
+            ),
+            ([5, 13], [4, 6]),
+        )
+
+    def test_interleave_cp_sparse_prefill_skips_empty_local_request(self):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            compute_interleave_cp_swa_ranges,
+        )
+
+        self.assertEqual(
+            compute_interleave_cp_swa_ranges(
+                seq_lens=[7, 12],
+                extend_seq_lens=[1, 3],
+                local_query_lens=[2],
+                local_request_indices=[1],
+                cp_rank=1,
+                cp_size=2,
+                swa_window=4,
+            ),
+            ([6], [6]),
+        )
+
     def _make_core_metadata(self, base: int):
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
