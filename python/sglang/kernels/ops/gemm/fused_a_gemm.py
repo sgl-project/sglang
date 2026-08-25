@@ -34,7 +34,8 @@ _DEVICE_SM = get_device_sm()
 
 def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
     return (
-        layer.weight.dtype == torch.bfloat16
+        hasattr(layer, "weight")
+        and layer.weight.dtype == torch.bfloat16
         and layer.weight.shape[0] % 16 == 0
         and layer.weight.shape[1] % 256 == 0
         and _IS_CUDA
