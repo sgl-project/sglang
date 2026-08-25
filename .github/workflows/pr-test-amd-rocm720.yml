@@ -643,6 +643,46 @@ jobs:
           docker stop ci_sglang 2>/dev/null || true
           docker rm -f ci_sglang 2>/dev/null || true
 
+  # Control group for the probe above: same 24-way fan-out, same no-max-parallel
+  # matrix, but with the tarball cache switched off so every job pulls from
+  # Docker Hub. Without this the cache is only ever compared against pulls
+  # measured at low concurrency, which is not the same regime.
+  #
+  # The in-network registry is deliberately not measured: #36171 removed that
+  # path from main precisely because concurrent CI pulls saturate it, so there
+  # is no code left to exercise and pointing 24 simultaneous 64 GB pulls at a
+  # host that is already known to be overloaded would disrupt other jobs.
+  amd-image-cache-probe-nocache-rocm720:
+    name: ${{ format('amd-image-cache-probe-nocache ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300', matrix.idx) }}
+    needs: [check-changes]
+    if: always() && contains(format(',{0},', inputs.target_stage), ',amd-image-cache-probe-nocache-rocm720,')
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container without the tarball cache
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          AMD_CI_IMAGE_TARBALL_CACHE: "0"
+
+      - name: Release the container
+        if: always()
+        run: |
+          docker stop ci_sglang 2>/dev/null || true
+          docker rm -f ci_sglang 2>/dev/null || true
+
   stage-b-test-1-gpu-small-amd-nondeterministic-rocm720:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm724', inputs.runner_arch || 'mi300') }}
     needs: [check-changes, wait-for-stage-a-amd-rocm720]
