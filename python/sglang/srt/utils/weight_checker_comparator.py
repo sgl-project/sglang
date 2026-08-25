@@ -161,7 +161,13 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+    if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
+            return None
+        raise NotImplementedError(
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
+        )
+    if isinstance(quant_method, ModelOptFp4LinearMethod):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )

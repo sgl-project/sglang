@@ -251,6 +251,14 @@ class DeviceMixin:
             return CpuArchEnum.ARM
         return CpuArchEnum.UNSPECIFIED
 
+    def get_torch_profiler_activity_str(self) -> str:
+        """[Planned] Return the torch profiler activity string."""
+        raise NotImplementedError
+
+    def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
+        """[Planned] Return the torch profiler activity."""
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Dunder helpers
     # ------------------------------------------------------------------

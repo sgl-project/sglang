@@ -102,8 +102,12 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             }
         )
+        # The mask keeps at most top_k tokens, plus possibly the actually
+        # sampled token when the sampling kernel picks one just outside the
+        # mask's topk reconstruction (fp cumsum divergence); see
+        # Sampler._attach_sampling_mask_to_output.
         for sampling_mask in top_p_sampling_masks:
-            self.assertLessEqual(len(sampling_mask), _TOP_K)
+            self.assertLessEqual(len(sampling_mask), _TOP_K + 1)
 
         top_k_sampling_masks = self._generate_sampling_masks(
             {
@@ -114,7 +118,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_sampling_masks:
-            self.assertEqual(len(sampling_mask), _TOP_K)
+            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
 
         top_k_top_p_one_sampling_masks = self._generate_sampling_masks(
             {
@@ -126,7 +130,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
-            self.assertEqual(len(sampling_mask), _TOP_K)
+            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
 
     def test_sampling_mask_matches_topk_logprobs(self):
         """Check the returned mask and its renormalized logprobs.
@@ -186,6 +190,37 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             support_mass = sum(probs[tid] for tid in mask)
             expected_logprob = math.log(probs[output_id] / support_mass)
             self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
+
+    def test_chat_completions_returns_sampling_mask(self):
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Name a capital city."}],
+                "temperature": 1.0,
+                "top_k": _TOP_K,
+                "top_p": _TOP_P,
+                "max_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+                "return_sampling_mask": True,
+                "return_meta_info": True,
+                "return_token_ids": True,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        choice = response.json()["choices"][0]
+        output_ids = choice["response_token_ids"]
+        meta_info = choice["meta_info"]
+        sampling_masks = meta_info["output_token_sampling_mask"]
+        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
+
+        self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
+        self.assertEqual(len(sampling_masks), len(output_ids))
+        self.assertEqual(len(sampling_logprobs), len(output_ids))
+        for output_id, sampling_mask in zip(output_ids, sampling_masks):
+            self.assertIn(output_id, sampling_mask)
 
     def test_generate_rejects_unbounded_sampling_mask(self):
         self._assert_rejects_unbounded_sampling_mask(

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
@@ -52,11 +52,15 @@ class SessionSlot:
     last_node: Any = None
     cache_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
+    # components the first req skipped locking on last_node, so release dec
+    # releases only what it took (may share the node with another req).
+    skip_lock_node_ids: dict = field(default_factory=dict)
 
     # Mamba states
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
     mamba_next_track_idx: Any = None
+    mamba_last_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
@@ -75,10 +79,12 @@ class SessionSlot:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
+            self.skip_lock_node_ids = req.skip_lock_node_ids
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
         self.mamba_next_track_idx = req.mamba_next_track_idx
+        self.mamba_last_track_idx = req.mamba_last_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
@@ -95,6 +101,7 @@ class SessionSlot:
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
+        req.mamba_last_track_idx = None
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
 
@@ -104,10 +111,12 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
+        req.skip_lock_node_ids = self.skip_lock_node_ids
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
         req.mamba_next_track_idx = self.mamba_next_track_idx
+        req.mamba_last_track_idx = self.mamba_last_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
 
@@ -239,6 +248,21 @@ class StreamingSession(BasePrefixCache):
             return None
 
         req = params.req
+
+        # [NPU] When aligned context < page_size, release the slot's KV and
+        # fall back to radix cache (full prefill). Once context >= page_size,
+        # streaming session kicks in with page-aligned KV reuse.
+        if is_npu() and self.page_size > 1:
+            expected_prefix_len = min(slot.kv_committed_len, len(params.key))
+            aligned_prefix_len = (
+                expected_prefix_len // self.page_size
+            ) * self.page_size
+            if aligned_prefix_len < slot.cache_protected_len or aligned_prefix_len == 0:
+                # Release KV to avoid leak and fallback to full prefill.
+                # req remains unassigned, so alloc_for_extend treats it as new.
+                self.release_session(req.session.session_id)
+                return None
+
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -252,6 +276,12 @@ class StreamingSession(BasePrefixCache):
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.cache_protected_len=}"
         )
+
+        # Floor-align prefix_len to page boundary (NPU workaround).
+        if is_npu() and self.page_size > 1:
+            prefix_len = (prefix_len // self.page_size) * self.page_size
+            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range
@@ -306,6 +336,7 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -418,13 +449,13 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            self.inner.dec_lock_ref(
+                lock_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
+                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                ),
+            )
 
         if slot.is_holding_kv:
             start = protected_len
@@ -434,7 +465,7 @@ class StreamingSession(BasePrefixCache):
                     slot.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+            self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
 
@@ -595,9 +626,6 @@ class StreamingSession(BasePrefixCache):
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
-
-    def flush_write_through_acks(self) -> None:
-        return self.inner.flush_write_through_acks()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()

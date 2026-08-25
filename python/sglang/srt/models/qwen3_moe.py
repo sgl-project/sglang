@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -72,12 +73,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -91,7 +87,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_qknorm_rope import (
+    from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
@@ -261,7 +257,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -271,19 +267,29 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
+        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
+        # offline ModelSlim path (which carries a per-layer quant_model_description)
+        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # and dequantised correctly instead of cast to bf16 without its block scale.
+        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
+        gate_quant_config = (
+            quant_config
+            if (quant_config is not None and quant_config.get_name() == "modelslim")
+            else None
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=gate_quant_config,
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if is_deepep_class_backend():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -294,7 +300,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
 
         if (
-            not get_moe_a2a_backend().is_deepep()
+            not is_deepep_class_backend()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(hidden_states)
@@ -514,7 +520,7 @@ class Qwen3MoeAttention(nn.Module):
         ) and self.head_dim in (64, 128, 256)
         _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
@@ -955,10 +961,18 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        # IPC loading bypasses load_weights(), so initialize the EPLB descriptor here.
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
+        )
 
         self.attn_cp_size = get_parallel().attn_cp_size
         self.attn_cp_rank = get_parallel().attn_cp_rank
