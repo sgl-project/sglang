@@ -1,5 +1,5 @@
 {
-  "checksum": "2759963786ee5ad274ef5977448404ce4fe8c2633a5e886ceea2ebeecd97b563",
+  "checksum": "b4dc94cb2a00bf5307c873dc3fa3d18904c4285036285fa2a82a64b2d7324eb7",
   "crates": {
     "addr2line 0.25.1": {
       "name": "addr2line",
@@ -39004,7 +39004,7 @@
         ],
         "data": {
           "common": [
-            "@protobuf//:well_known_protos"
+            "@@protobuf+//:well_known_protos"
           ],
           "selects": {}
         },
@@ -39329,7 +39329,7 @@
         ],
         "data": {
           "common": [
-            "@protobuf//:well_known_protos"
+            "@@protobuf+//:well_known_protos"
           ],
           "selects": {}
         },
