@@ -34,6 +34,7 @@ with patch.dict(
     from sglang.srt.layers.attention.minicpm.sparse_utils import (
         CompressionLevelMetadata,
     )
+    from sglang.srt.runtime_context import get_context, get_schedule
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -73,7 +74,6 @@ def _construct_sparse_backend(
         token_to_kv_pool_allocator=SimpleNamespace(),
         server_args=SimpleNamespace(
             enable_memory_saver=False,
-            chunked_prefill_size=chunked_prefill_size,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -94,6 +94,7 @@ def _construct_sparse_backend(
         ),
     )
     with (
+        get_schedule().override(chunked_prefill_size=chunked_prefill_size),
         patch.object(backend_module, "MiniCPMHybridConfig", SimpleNamespace),
         patch.object(backend_module, "is_blackwell_supported", return_value=blackwell),
         patch.object(
@@ -151,6 +152,15 @@ class _SingleTensorConversion:
 
 
 class TestMiniCPMSparseMetadata(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The backend reads chunked_prefill_size off the schedule bag, so the
+        # context has to be published before any construction; the helper
+        # scopes a different value on top of this one where a case needs it.
+        override = get_context().override_server_args(chunked_prefill_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_sparse_backend_rejects_context_too_short_for_layout(self):
         with self.assertRaisesRegex(
             ValueError,
@@ -369,7 +379,6 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 attention_backend="minicpm_flashattn",
                 disable_cuda_graph=False,
                 enable_memory_saver=False,
-                chunked_prefill_size=64,
             ),
             model_config=SimpleNamespace(
                 hf_config=hf_config,
