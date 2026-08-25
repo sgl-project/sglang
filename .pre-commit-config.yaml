@@ -8,6 +8,8 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # Unified-diff blank context lines consist of one required space.
+        exclude: ^bazel/rust/openssl-src-hermetic-path\.patch$
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
