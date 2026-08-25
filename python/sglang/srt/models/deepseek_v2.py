@@ -1872,7 +1872,10 @@ class DeepseekV2AttentionMLA(
                     config=config,
                 )
 
-            if self.skip_topk:
+            # A skip-topk layer only owns an indexer when it is also nextn; the
+            # others reuse the previous layer's topk and build none, so there are
+            # no weights to exempt.
+            if self.skip_topk and self.indexer is not None:
                 for p in self.indexer.parameters():
                     p._skip_weight_check = True
 
