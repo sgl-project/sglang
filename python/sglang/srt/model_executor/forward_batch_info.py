@@ -483,6 +483,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_split_seq_index: Optional[int] = None
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
+    # CPU mirror of req_pool_indices. NPU metadata construction uses this to
+    # avoid synchronizing the device stream through Tensor.tolist().
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -813,6 +816,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
@@ -922,11 +926,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
+                prefill_pin = _pin or (
+                        _is_npu and str(device).split(":", 1)[0] == "npu"
+                )
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32, pin_memory=_pin
+                    extend_seq_lens, dtype=torch.int32, pin_memory=prefill_pin
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32, pin_memory=_pin
+                    extend_prefix_lens, dtype=torch.int32, pin_memory=prefill_pin
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens

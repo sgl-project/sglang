@@ -717,7 +717,8 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max = forward_batch.seq_lens.max()
             seq_lens_max += self.speculative_step_id + 1
         else:
-            seq_lens_max = forward_batch.seq_lens.max()
+            seq_lens_max = forward_batch.seq_lens_cpu.max()
+
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
@@ -739,9 +740,14 @@ class AscendAttnBackend(AttentionBackend):
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
-            self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
-            )
+            if forward_batch.extend_seq_lens_cpu is not None:
+                self.forward_metadata.extend_seq_lens_cpu_int = torch.from_numpy(
+                    np.asarray(forward_batch.extend_seq_lens_cpu, dtype=np.int32)
+                )
+            else:
+                self.forward_metadata.extend_seq_lens_cpu_int = (
+                    forward_batch.extend_seq_lens.cpu().int()
+                )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
         else:
@@ -799,32 +805,29 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
-            self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
-                "cpu"
+            seq_prefix_lens = forward_batch.extend_prefix_lens_cpu
+            self.forward_metadata.prefix_lens = torch.from_numpy(
+                np.asarray(seq_prefix_lens, dtype=np.int32)
             )
-            seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
             prefix_block_tables = []
-            prefix_seq_starts = []
-            prefix_token_offset = 0
-            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
-                0, dtype=torch.int32
-            ).to(self.device)
-            for req_idx, seq_len in zip(
-                forward_batch.req_pool_indices.tolist(), seq_prefix_lens
-            ):
+            req_pool_indices_cpu = getattr(
+                forward_batch, "req_pool_indices_cpu", None
+            )
+            if req_pool_indices_cpu is not None:
+                req_pool_indices_list = req_pool_indices_cpu.tolist()
+            else:
+                # Compatibility fallback for manually constructed ForwardBatch.
+                req_pool_indices_list = forward_batch.req_pool_indices.tolist()
+            for req_idx, seq_len in zip(req_pool_indices_list, seq_prefix_lens):
                 req_indices = self.req_to_token_pool.req_to_token[req_idx]
                 req_prefix_block_tables = (
-                    req_indices[:seq_len][:: self.page_size] // self.page_size
+                        req_indices[:seq_len][:: self.page_size] // self.page_size
                 )
-                prefix_block_tables.append(req_prefix_block_tables.to(torch.int32))
-                prefix_seq_starts.append(prefix_token_offset)
-                prefix_token_offset += seq_len
-                self.forward_metadata.flatten_prefix_block_tables = torch.cat(
-                    (
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        torch.flatten(req_prefix_block_tables),
-                    )
-                )
+                prefix_block_tables.append(req_prefix_block_tables)
+
+            self.forward_metadata.flatten_prefix_block_tables = torch.cat(
+                prefix_block_tables
+            )
 
             max_prefix_pages = max(
                 (table.numel() for table in prefix_block_tables),
@@ -838,15 +841,20 @@ class AscendAttnBackend(AttentionBackend):
             for row, table in enumerate(prefix_block_tables):
                 if table.numel() > 0:
                     self.forward_metadata.prefix_block_tables[row, : table.numel()] = (
-                        table.to(device=self.device, dtype=torch.int32)
+                        table
                     )
             self.forward_metadata.prefix_seq_lens_npu = (
-                self.forward_metadata.prefix_lens.to(device=self.device).int()
+                forward_batch.extend_prefix_lens
             )
-            self.forward_metadata.prefix_seq_starts = torch.tensor(
-                prefix_seq_starts,
-                dtype=torch.int64,
-                device=self.device,
+            self.forward_metadata.prefix_seq_starts = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int64, device=self.device),
+                    torch.cumsum(
+                        forward_batch.extend_prefix_lens[:-1],
+                        dim=0,
+                        dtype=torch.int64,
+                    ),
+                )
             )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
