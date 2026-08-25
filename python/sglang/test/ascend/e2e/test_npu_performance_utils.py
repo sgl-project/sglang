@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -209,6 +210,124 @@ SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
 BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
 BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
+
+# --- Per-test stdout idle watchdog (single-node perf only) ---
+# Runner-level hang watchdog, covering scenarios the benchmark's own watchdog
+# cannot see (server startup hang, data loading hang, framework hang). If stdout
+# stays silent past the threshold, SIGKILL the whole group so ci_utils can move
+# on to the next case. Prerequisite: one test class per file.
+STDOUT_IDLE_TIMEOUT = 600  # > BENCHMARK_STDOUT_IDLE_TIMEOUT (300)
+STDOUT_WATCHDOG_POLL_INTERVAL = 30
+
+_last_stdout_activity = time.time()
+_current_server_proc = None       # server Popen of the current test class
+_stdout_watchdog_active = False   # only allow triggering while tests run
+_stdout_watchdog_started = False  # started once per process
+
+
+class _ActivityStdout:
+    """Write-through proxy that refreshes _last_stdout_activity on each write.
+
+    Wraps sys.stdout so direct print() calls (benchmark forwarding, health
+    check) are timestamped too.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, s):
+        global _last_stdout_activity
+        _last_stdout_activity = time.time()
+        return self._real.write(s)
+
+    def flush(self):
+        return self._real.flush()
+
+    def isatty(self):
+        return self._real.isatty()
+
+    def fileno(self):
+        return self._real.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _ActivityLogHandler(logging.Handler):
+    """Logger output bypasses the sys.stdout proxy (StreamHandler holds the old
+    stream reference), so add a handler that only timestamps, never outputs."""
+
+    def emit(self, record):
+        global _last_stdout_activity
+        _last_stdout_activity = time.time()
+
+
+def _install_stdout_activity_tracking():
+    if not isinstance(sys.stdout, _ActivityStdout):
+        sys.stdout = _ActivityStdout(sys.stdout)
+    if not any(isinstance(h, _ActivityLogHandler) for h in logger.handlers):
+        logger.addHandler(_ActivityLogHandler())
+
+
+def _set_current_server_proc(proc):
+    global _current_server_proc
+    _current_server_proc = proc
+
+
+def _kill_current_test_group():
+    """SIGKILL every process of this test: descendants (server subtree, running
+    benchmark) + leftover reparented forkserver in the same group + self.
+
+    Under option C the server shares the test's group, so killpg(self-group) also
+    kills self; it must only be used for "already failed / already stuck" cases.
+    setUpClass's setpgid(0,0) ensures this group excludes run_suite.py / ci_utils.
+    """
+    try:
+        kill_process_tree(os.getpid(), include_parent=False)
+    except Exception as e:
+        logger.warning("kill_process_tree failed: %s", e)
+    pgid = os.getpgrp()
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        logger.error("Killed test process group pgid=%d", pgid)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        logger.warning("No permission to kill pgid=%d", pgid)
+
+
+def _stdout_idle_watchdog_loop():
+    """Daemon thread: kill the group once stdout goes silent past the timeout."""
+    while True:
+        time.sleep(STDOUT_WATCHDOG_POLL_INTERVAL)
+        if not _stdout_watchdog_active:
+            return
+        idle = time.time() - _last_stdout_activity
+        if idle > STDOUT_IDLE_TIMEOUT:
+            logger.error(
+                "Test produced no stdout for %.0fs (> %ds), killing test group",
+                idle,
+                STDOUT_IDLE_TIMEOUT,
+            )
+            _kill_current_test_group()
+            return
+
+
+def _ensure_stdout_watchdog():
+    """Install stdout timestamping and start the idle watchdog (once per process,
+    idempotent)."""
+    global _stdout_watchdog_started
+    global _last_stdout_activity
+    if _stdout_watchdog_started:
+        return
+    _stdout_watchdog_started = True
+    _last_stdout_activity = time.time()
+    _install_stdout_activity_tracking()
+    threading.Thread(
+        target=_stdout_idle_watchdog_loop,
+        name="stdout-idle-watchdog",
+        daemon=True,
+    ).start()
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -1111,23 +1230,68 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
 
         other_args = list(cls.other_args)
 
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=cls.timeout,
-            other_args=other_args,
-            env=env,
-        )
+        # Self-isolate into an independent process group so a later killpg does
+        # not affect run_suite/ci_utils. Depends on "one test class per file"
+        # (all currently registered cases satisfy this).
+        try:
+            os.setpgid(0, 0)
+        except OSError as e:
+            logger.warning("skip self-isolation setpgid: %s", e)
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=cls.timeout,
+                other_args=other_args,
+                env=env,
+            )
+        except Exception:
+            # Server startup failed: tearDownClass won't run after setUpClass
+            # raises, but the leftover reparented forkserver still holds the CI
+            # stdout pipe write-end and would hang the job, so kill the group to
+            # close the pipe before re-raising.
+            _kill_current_test_group()
+            raise
+
+        _set_current_server_proc(cls.process)
+
+        # Enable the idle watchdog only after the server is ready to avoid false
+        # kills during loading: loading produces no Python-level output and server
+        # logs write straight to fd 1, bypassing timestamping.
+        global _stdout_watchdog_active
+        _stdout_watchdog_active = True
+        _ensure_stdout_watchdog()
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
+        # Stop the idle watchdog first to avoid a false self-kill during teardown.
+        global _stdout_watchdog_active
+        _stdout_watchdog_active = False
+        _set_current_server_proc(None)
+
+        # Persist results before any kill-group action (under option C the
+        # kill-group also kills this process).
         cls._save_metrics_json()
         cls._backup_plog()
+
+        proc = getattr(cls, "process", None)
+        if proc is None:
+            return  # server never started, nothing to clean up
+        if proc.poll() is None:
+            # Server alive: kill the whole descendant tree (server + leftover
+            # benchmark + still-attached forkserver) without killing self, so the
+            # passing case keeps a clean exit code.
+            try:
+                kill_process_tree(os.getpid(), include_parent=False)
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+        else:
+            # Server dead (self-died): its reparented forkserver still holds this
+            # group + the CI stdout pipe write-end. Killing the group closes the
+            # pipe so ci_utils stops hanging, at the cost of also SIGKILL-ing this
+            # process (acceptable, the case already failed).
+            _kill_current_test_group()
 
     @retry()
     def run_throughput(self):

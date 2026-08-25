@@ -63,6 +63,16 @@ on:
         type: string
         default: '300'
         description: 'timeout-minutes for the Run test step'
+      loop_count:
+        required: false
+        type: string
+        default: '1'
+        description: 'Number of times to run the test suite or single test file (for repeat/stress testing)'
+      test_case:
+        required: false
+        type: string
+        default: ''
+        description: 'Optional single test file path (relative to test/). When set, this file is run directly (looped loop_count times) instead of run_suite.py --suite.'
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -392,10 +402,27 @@ jobs:
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
           fi
 
-          # Run NPU test suite with run_suite.py.
+          # Run NPU test suite with run_suite.py, or a single test file directly when
+          # inputs.test_case is set (for repeat/stress testing of one case).
           # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
           # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          # loop_count repeats the target (suite or single file) the requested times (default 1).
+          LOOP_COUNT="${{ inputs.loop_count }}"
+          if [ -n "${{ inputs.test_case }}" ]; then
+            TEST_CMD="${PYTHON_FOR_SGLANG} -u ${{ inputs.test_case }} -f"
+            echo "Test target: single file (${{ inputs.test_case }})"
+          else
+            TEST_CMD="${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200"
+            echo "Test target: suite (${test_suite})"
+          fi
+          for iter in $(seq 1 "${LOOP_COUNT}"); do
+            echo "===== Loop iteration ${iter}/${LOOP_COUNT} ====="
+            iter_exit_code=0
+            ${TEST_CMD} 2>&1 | tee -a "${LOG_TEE_TARGETS[@]}" || iter_exit_code=$?
+            if [ "${iter_exit_code}" != "0" ]; then
+              test_exit_code=${iter_exit_code}
+            fi
+          done
 
           echo "Finished test: ${tc_name}"
 
