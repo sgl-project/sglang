@@ -18,5 +18,5 @@ build:rocm --platforms=//bazel/platforms:linux_x86_64_rocm
 # Integration targets intentionally consume the already-provisioned SGLang
 # runtime used by hardware CI. They are transitional until every native wheel
 # is represented as a Bazel dependency.
-test:cuda --test_tag_filters=-manual,-requires-rocm
-test:rocm --test_tag_filters=-manual,-requires-cuda
+test:cuda --test_tag_filters=-requires-rocm
+test:rocm --test_tag_filters=-requires-cuda
