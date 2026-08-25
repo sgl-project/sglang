@@ -2033,8 +2033,7 @@ def _floor_pow2(value: int) -> int:
 @lru_cache(maxsize=None)
 def requant_warp_size(device: torch.device) -> int:
     """Lanes per warp, which sets the tile width the requant launches."""
-    props = torch.cuda.get_device_properties(device)
-    return getattr(props, "warp_size", _REQUANT_DEFAULT_WARP_SIZE)
+    return torch.cuda.get_device_properties(device).warp_size
 
 
 def requant_launch_geometry(
@@ -2048,6 +2047,14 @@ def requant_launch_geometry(
 
     Only a launch hint: the m-grid decides how many programs share an expert's
     rows, so any value is correct and skew just means more rows per program.
+    It costs something, though: ``expected_rows`` is a dispatch-wide average and
+    cannot see which expert is holding the rows, so an expert with s times its
+    share serializes s times deeper.  Measured against the previous fixed 32-grid
+    the crossover is around s = 16 (worst ~7 us per layer at s = 32); at
+    ``expected_rows >= 64`` this returns 32 anyway, so a saturated batch is
+    exposed to none of it.  Bounding s is EPLB's job -- a kernel-side fix would
+    have to flatten (row, expert) onto one index over a ``masked_m`` prefix sum
+    so a hot expert can borrow the programs idle experts are not using.
     One program per expected row, never above the historical 32 and additionally
     capped by the expert count while rows are scarce, was the measured optimum
     across hidden sizes and expert counts -- so this only ever shrinks the grid.
@@ -2067,7 +2074,12 @@ def requant_launch_geometry(
         else _REQUANT_BYTES_PER_LANE_FEW_EXPERTS
     )
     tile_elems = bytes_per_lane * _REQUANT_NUM_WARPS * warp_size
-    # Round down, so the tile never covers groups the payload does not have.
+    # Round down, so the tile never covers groups the payload does not have.  A
+    # group count that is not a power of two still pays a partial last tile: 40
+    # and 48 groups fill only 62% and 75% of a 32-group tile, which measured up
+    # to 8% behind the narrower tile on MI350X (never behind the previous
+    # kernel).  Sizing per hidden width needed a third tuned constant that only
+    # moved the loss to another width, so the widths in between are left as-is.
     g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
     if expected_rows is None:
         return g_block, _REQUANT_M_GRID_MAX
@@ -2087,13 +2099,22 @@ def fp8_per_token_to_per_tensor_quant_triton(
     output: torch.Tensor,
     expected_rows: Optional[int] = None,
 ):
+    # The [groups, group] tile indexes within a group with tl.arange, so the group
+    # width has to be a power of two; a flat tile would only need it to divide k.
     K_SCALE_BLOCK_SIZE = 128
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
-    # The [groups, group] tile indexes within a group with tl.arange, so the group
-    # width must be a power of two; a flat tile would only need it to divide k.
-    assert K_SCALE_BLOCK_SIZE & (K_SCALE_BLOCK_SIZE - 1) == 0
     assert x.is_contiguous()
+    assert output.shape == x.shape and output.is_contiguous()
+    # Every tensor is addressed with flat `pid_e * m * k` arithmetic and raw
+    # strides, so a shape that disagrees reads out of bounds rather than failing.
+    assert masked_m.shape[0] == x.size(0)
+    assert x_scale.size(0) == x.size(0) and x_scale.size(1) == x.size(1)
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    # DeepEP hands back int32-packed UE8M0 scales when the dispatcher asks for
+    # them (`use_ue8m0`, FP8-DeepGEMM on Blackwell).  Reinterpreting those as
+    # floats would quantize silently against garbage, so refuse them here -- W4A8
+    # CUTLASS is Hopper-only today, which is the only reason this cannot fire.
+    assert x_scale.dtype == torch.float32
     assert output_scale.numel() == 1
 
     num_groups = x.size(2) // K_SCALE_BLOCK_SIZE

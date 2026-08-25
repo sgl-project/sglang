@@ -11,13 +11,15 @@ combination has to produce the same bytes.
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
+    _fp8_per_token_quant_to_per_tensor_quant_kernel,
     fp8_per_token_to_per_tensor_quant_triton,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 dev = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -48,6 +50,20 @@ def _ref(x, x_scale):
     return (dequant * (1.0 / OUTPUT_SCALE)).to(FP8)
 
 
+def _assert_output(output, x, x_scale, masked):
+    ref = _ref(x, x_scale)
+    for e, valid in enumerate(masked):
+        torch.testing.assert_close(
+            output[e, :valid].float(), ref[e, :valid].float(), rtol=0, atol=0
+        )
+        # Padding rows are not part of any expert's GEMM problem size and must
+        # stay as the caller left them.
+        padding = output[e, valid:].float()
+        torch.testing.assert_close(
+            padding, torch.full_like(padding, SENTINEL), rtol=0, atol=0
+        )
+
+
 def _run_and_check(num_experts, m, k, masked, expected_rows, column_major_scales):
     x, x_scale = _build(
         num_experts, m, k, seed=k + num_experts, column_major_scales=column_major_scales
@@ -65,17 +81,7 @@ def _run_and_check(num_experts, m, k, masked, expected_rows, column_major_scales
         expected_rows=expected_rows,
     )
 
-    ref = _ref(x, x_scale)
-    for e, valid in enumerate(masked):
-        torch.testing.assert_close(
-            output[e, :valid].float(), ref[e, :valid].float(), rtol=0, atol=0
-        )
-        # Padding rows are not part of any expert's GEMM problem size and must
-        # stay as the caller left them.
-        padding = output[e, valid:].float()
-        torch.testing.assert_close(
-            padding, torch.full_like(padding, SENTINEL), rtol=0, atol=0
-        )
+    _assert_output(output, x, x_scale, masked)
 
 
 # 7168: fills every tile of scale groups (the DeepSeek-V3 hidden size).
@@ -112,6 +118,44 @@ def test_many_experts(num_experts, expected_rows):
         expected_rows=expected_rows,
         column_major_scales=True,
     )
+
+
+# The wrapper sizes the tile from the running part's warp width, so a CI machine
+# only ever exercises its own vendor's choice: an NVIDIA runner never launches the
+# 32-group tile a wave64 part picks, and an AMD one never launches the 16-group
+# tile.  Drive the kernel directly instead, across every width either vendor can
+# choose plus the degenerate single-group one, so the docstring's claim -- that
+# the geometry only decides how the work is split -- is checked on whatever GPU
+# CI happens to have.
+@pytest.mark.parametrize("g_block", [1, 8, 16, 32])
+@pytest.mark.parametrize("k", [7168, 3584])
+@pytest.mark.parametrize("m_grid", [4, 32])
+def test_every_launch_geometry_agrees(g_block, k, m_grid):
+    num_experts, m = 4, 48
+    masked = [0, 1, 17, 48]
+    x, x_scale = _build(num_experts, m, k, seed=k + g_block, column_major_scales=True)
+    masked_m = torch.tensor(masked, dtype=torch.int32, device=dev)
+    output_scale = torch.tensor([OUTPUT_SCALE], dtype=torch.float32, device=dev)
+    output = torch.full((num_experts, m, k), SENTINEL, device=dev).to(FP8)
+
+    num_groups = k // K_SCALE_BLOCK_SIZE
+    grid = (triton.cdiv(num_groups, g_block), m_grid, num_experts)
+    _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
+        x,
+        x_scale,
+        *x_scale.stride(),
+        masked_m,
+        output_scale,
+        output,
+        m,
+        k,
+        K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
+        G_BLOCK_SIZE=g_block,
+        HAS_G_TAIL=(num_groups % g_block != 0),
+        num_warps=4,
+    )
+
+    _assert_output(output, x, x_scale, masked)
 
 
 if __name__ == "__main__":
