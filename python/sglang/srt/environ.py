@@ -1446,6 +1446,11 @@ class Envs:
     # sparse main attention through the native AscendC sparse-attention op with the
     # cached block_table override.
     SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
+    # Log sparse/hybrid EAGLE TARGET_VERIFY kernel routing once per layer (debug).
+    SGLANG_MINIMAX_LOG_EAGLE_VERIFY = EnvBool(False)
+    # Force gpu_sparse_prefill_verify (minimax_sparse_prefill) on gfx950 TARGET_VERIFY
+    # instead of gfx950_sparse_decode_verify; for A/B testing decode vs prefill verify.
+    SGLANG_MINIMAX_FORCE_SPARSE_PREFILL_VERIFY = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
     # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
     # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
