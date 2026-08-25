@@ -8,15 +8,15 @@ from sglang.srt.arg_groups import speculative_hook
 from sglang.srt.managers import overlap_utils
 from sglang.srt.models.dspark import DSparkConfidenceHead
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_confidence import (
     plan_verify_prefixes,
     select_sps_verify_token_budget,
-    selector_confidence_from_scores,
+    selector_selected_path_confidence,
 )
 from sglang.srt.speculative.dflash_confidence_observability import (
     DFlashConfidenceObserver,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_sps import SpsCostTable
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
@@ -71,7 +71,7 @@ class TestDFlashConfidence(unittest.TestCase):
         ):
             self.assertFalse(overlap_utils.decide_needs_confidence_relay(server_args))
 
-    def test_selector_confidence_is_bounded_and_uses_anchor_row(self):
+    def test_selector_confidence_uses_the_selected_path(self):
         scores = torch.tensor(
             [
                 [
@@ -80,12 +80,26 @@ class TestDFlashConfidence(unittest.TestCase):
                 ]
             ]
         )
-        confidence = selector_confidence_from_scores(scores)
+        # Select candidate 1 first, then candidate 0. Position one must score
+        # row 1 -> candidate 0, not the best transition anywhere in the lattice.
+        path_indices = torch.tensor([[1, 0]])
+        confidence = selector_selected_path_confidence(scores, path_indices)
         self.assertEqual(confidence.shape, (1, 2))
         self.assertTrue(bool(((confidence >= 0.0) & (confidence <= 1.0)).all()))
-        torch.testing.assert_close(
-            confidence[0, 0], torch.softmax(scores[0, 0, 0], 0).max()
+        expected = torch.tensor(
+            [
+                [
+                    torch.softmax(scores[0, 0, 0], 0)[1],
+                    torch.softmax(scores[0, 1, 1], 0)[0],
+                ]
+            ]
         )
+        torch.testing.assert_close(confidence, expected)
+
+    def test_selector_confidence_rejects_invalid_path_indices(self):
+        scores = torch.zeros((1, 2, 2, 2))
+        with self.assertRaisesRegex(ValueError, "outside the selector top-k"):
+            selector_selected_path_confidence(scores, torch.tensor([[0, 2]]))
 
     def test_planner_preserves_prefixes_and_minimum_progress(self):
         confidence = torch.tensor(
@@ -201,7 +215,9 @@ class TestDFlashConfidence(unittest.TestCase):
                     )
                     candidates = []
                     for request_index in range(batch_size):
-                        for position_index in range(min_verify_len - 1, confidence.shape[1]):
+                        for position_index in range(
+                            min_verify_len - 1, confidence.shape[1]
+                        ):
                             candidates.append(
                                 (
                                     float(priority[request_index, position_index]),
@@ -405,7 +421,9 @@ class TestDFlashConfidence(unittest.TestCase):
         )
         self.assertEqual(decision.verify_lens.device.type, "cpu")
         self.assertEqual(int(decision.verify_lens.sum()), 6)
-        self.assertTrue(bool(((decision.verify_lens >= 2) & (decision.verify_lens <= 4)).all()))
+        self.assertTrue(
+            bool(((decision.verify_lens >= 2) & (decision.verify_lens <= 4)).all())
+        )
 
     def test_server_args_accepts_anchor_only_floor_and_rejects_zero(self):
         def make_args(min_verify_len):

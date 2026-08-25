@@ -52,7 +52,7 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
     temperatures = torch.tensor([1.0, 0.7])
     greedy_mask = torch.tensor([True, False])
 
-    mixed_tokens, mixed_q = selector.sample_path(
+    mixed_tokens, mixed_path_indices, mixed_q = selector.sample_path(
         candidate_ids=candidate_ids,
         scores=scores,
         uniforms=uniforms,
@@ -61,7 +61,7 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
     )
     assert torch.all((mixed_q[0] == 0) | (mixed_q[0] == 1))
     for row in range(2):
-        tokens, q_rows = selector.sample_path(
+        tokens, path_indices, q_rows = selector.sample_path(
             candidate_ids=candidate_ids[row : row + 1],
             scores=scores[row : row + 1],
             uniforms=uniforms[row : row + 1],
@@ -69,6 +69,7 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
             greedy_mask=greedy_mask[row : row + 1],
         )
         torch.testing.assert_close(mixed_tokens[row], tokens[0])
+        torch.testing.assert_close(mixed_path_indices[row], path_indices[0])
         torch.testing.assert_close(mixed_q[row], q_rows[0])
 
 
@@ -212,12 +213,10 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
-def test_selector_sampler_folds_proxy_confidence(monkeypatch):
+def test_selector_sampler_preserves_selected_path_metadata(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
-    scores = torch.tensor(
-        [[[[0.0, 2.0]], [[1.0, 0.0]]]], dtype=torch.float32
-    )
+    scores = torch.tensor([[[[0.0, 2.0]], [[1.0, 0.0]]]], dtype=torch.float32)
     candidate_ids = torch.tensor([[[4], [5]]], dtype=torch.int64)
 
     class Selector:
@@ -226,11 +225,13 @@ def test_selector_sampler_folds_proxy_confidence(monkeypatch):
         @staticmethod
         def sample_path(**kwargs):
             del kwargs
-            return torch.tensor([[4, 5]]), torch.ones((1, 2, 1))
+            return (
+                torch.tensor([[4, 5]]),
+                torch.zeros((1, 2), dtype=torch.int64),
+                torch.ones((1, 2, 1)),
+            )
 
-    draft_model = SimpleNamespace(
-        candidate_selector=Selector(), confidence_head=None
-    )
+    draft_model = SimpleNamespace(candidate_selector=Selector(), confidence_head=None)
     monkeypatch.setattr(
         worker_mod,
         "_selector_lattice",
@@ -245,14 +246,8 @@ def test_selector_sampler_folds_proxy_confidence(monkeypatch):
     )
     sampler(torch.zeros((3, 2)), torch.tensor([9, 0, 0]))
 
-    expected = torch.cat(
-        [
-            torch.softmax(scores[:, 0, 0], dim=-1).amax(dim=-1, keepdim=True),
-            torch.softmax(scores[:, 1:], dim=-1).amax(dim=-1).amax(dim=-1),
-        ],
-        dim=1,
-    )
-    torch.testing.assert_close(sampler.confidence_out[:1], expected)
+    torch.testing.assert_close(sampler.path_indices_out[:1], torch.zeros((1, 2)))
+    torch.testing.assert_close(sampler.scores_out[:1], scores)
     assert sampler.out[:2].tolist() == [4, 5]
 
 

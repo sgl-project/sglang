@@ -55,7 +55,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_confidence import (
     plan_verify_prefixes,
     select_sps_verify_token_budget,
-    selector_confidence_from_scores,
+    selector_selected_path_confidence,
 )
 from sglang.srt.speculative.dflash_confidence_observability import (
     DFlashConfidenceObserver,
@@ -250,28 +250,29 @@ class _SelectorDraftSampler:
         block_size,
         max_bs,
         device,
-        sampling_enabled: bool,
+        sampling_enabled: bool = True,
         enable_confidence: bool = False,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
+        # Fixed at construction, so the captured graph replays the same branch:
+        # plain DFLASH never pays for confidence-side static buffers.
+        self.enable_confidence = bool(enable_confidence)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
-        self.confidence_out = (
-            torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
-            if enable_confidence
+        self.path_indices_out = (
+            torch.empty((max_bs, gamma), dtype=torch.int64, device=device)
+            if self.enable_confidence
             else None
         )
-        # Select the graph tail once, before capture. Replay itself has no
-        # confidence-head availability branch: it invokes this fixed callable.
-        self._confidence_writer = (
-            self._write_head_confidence
-            if enable_confidence and draft_model.confidence_head is not None
-            else self._write_proxy_confidence
-            if enable_confidence
-            else self._skip_confidence
+        self.scores_out = (
+            torch.empty(
+                (max_bs, gamma, top_k, top_k), dtype=torch.float32, device=device
+            )
+            if self.enable_confidence
+            else None
         )
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -309,7 +310,7 @@ class _SelectorDraftSampler:
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
-        tokens, q_rows = self.selector.sample_path(
+        tokens, path_indices, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=self.uniforms[:bs].uniform_(),
@@ -319,28 +320,10 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
-        self._confidence_writer(hs, block_ids[:, 0], tokens.view(bs, -1), scores, bs)
-
-    def _skip_confidence(self, hs, anchor_tokens, sampled_tokens, scores, bs) -> None:
-        del hs, anchor_tokens, sampled_tokens, scores, bs
-
-    def _write_head_confidence(
-        self, hs, anchor_tokens, sampled_tokens, scores, bs
-    ) -> None:
-        del scores
-        confidence = self.draft_model.compute_confidence(
-            draft_hidden=hs,
-            anchor_tokens=anchor_tokens,
-            sampled_tokens=sampled_tokens,
-        )
-        assert confidence is not None
-        self.confidence_out[:bs].copy_(confidence)
-
-    def _write_proxy_confidence(
-        self, hs, anchor_tokens, sampled_tokens, scores, bs
-    ) -> None:
-        del hs, anchor_tokens, sampled_tokens
-        self.confidence_out[:bs].copy_(selector_confidence_from_scores(scores))
+        if self.enable_confidence:
+            assert self.path_indices_out is not None and self.scores_out is not None
+            self.path_indices_out[:bs].copy_(path_indices)
+            self.scores_out[:bs].copy_(scores)
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -418,6 +401,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._confidence_observer.configure_sps(verify_num_draft_tokens=self.block_size)
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
         self._load_confidence_sts_calibration()
 
@@ -1191,7 +1175,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
-        tokens, q_rows = self.selector.sample_path(
+        tokens, path_indices, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
@@ -1200,15 +1184,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         tokens = tokens.view(bs, num_pred)
         if self._uses_confidence_scheduling():
-            confidence = draft_model.compute_confidence(
-                draft_hidden=pred_hidden,
-                anchor_tokens=anchor_token_ids,
-                sampled_tokens=tokens,
-            )
-            self._selector_confidence = (
-                confidence
-                if confidence is not None
-                else selector_confidence_from_scores(scores)
+            self._selector_confidence = selector_selected_path_confidence(
+                scores, path_indices
             )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
@@ -1336,7 +1313,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Keep the relay plan useful for stable rows in a continuously batched
         # request set. A stale row gets survival=1 and therefore only its floor.
         confidence = torch.where(
-            fresh.unsqueeze(1), resolved.confidence, torch.ones_like(resolved.confidence)
+            fresh.unsqueeze(1),
+            resolved.confidence,
+            torch.ones_like(resolved.confidence),
         )
         verify_lens, deferred_tokens, low_confidence_tokens = (
             self._plan_confidence_verify_prefixes(confidence)
@@ -2225,6 +2204,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        if self._uses_confidence_scheduling():
+            self._confidence_observer.begin_step()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -2390,11 +2371,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
-            if (
-                self._uses_confidence_scheduling()
-                and self._draft_sampler.confidence_out is not None
-            ):
-                self._selector_confidence = self._draft_sampler.confidence_out[:bs]
+            if self._uses_confidence_scheduling():
+                assert (
+                    self._draft_sampler.scores_out is not None
+                    and self._draft_sampler.path_indices_out is not None
+                )
+                self._selector_confidence = selector_selected_path_confidence(
+                    self._draft_sampler.scores_out[:bs],
+                    self._draft_sampler.path_indices_out[:bs],
+                )
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
@@ -2484,7 +2469,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 confidence_reason = "confidence_ragged"
             graph_buckets = self._ragged_verify_graph_buckets()
             runner = self.model_runner.decode_cuda_graph_runner
-            exceeds_graph_grid = graph_buckets and sum(verify_lens_cpu) > graph_buckets[-1]
+            exceeds_graph_grid = (
+                graph_buckets and sum(verify_lens_cpu) > graph_buckets[-1]
+            )
             exceeds_graph_slots = (
                 graph_buckets
                 and runner is not None
@@ -2799,10 +2786,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
-        if (
-            self._uses_confidence_scheduling()
-            and self._confidence_observer.sps_recording_enabled
-        ):
+        if self._uses_confidence_scheduling():
             self._confidence_observer.finish_step(
                 batch_size=bs,
                 verify_tokens=(
