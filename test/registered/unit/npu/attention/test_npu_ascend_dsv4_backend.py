@@ -348,20 +348,25 @@ class TestCompressorStateTableABI(unittest.TestCase):
         rope = MagicMock()
         rope.get_cos_sin.return_value = (torch.empty(0), torch.empty(0))
 
-        with patch(
-            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
-            "Dsv4NpuRoPE.for_freqs",
-            return_value=rope,
-        ), patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops:
-            npu_ops.compressor.return_value = torch.empty((0, 1))
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "Dsv4NpuRoPE.for_freqs",
+                return_value=rope,
+            ),
+            patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
+            patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
+        ):
+            custom_ops.compressor.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
 
+        self.assertEqual(npu_ops.compressor.call_count, 0)
         self.assertIs(
-            npu_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
         )
         self.assertIs(
-            npu_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
         )
 
 
@@ -409,9 +414,11 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             (False, "npu_sparse_attn_sharedkv_metadata"),
             (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
         ):
-            with self.subTest(is_a5=is_a5), patch(
-                self._A5_PATCH_TARGET, return_value=is_a5
-            ), patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            with (
+                self.subTest(is_a5=is_a5),
+                patch(self._A5_PATCH_TARGET, return_value=is_a5),
+                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
+            ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
                 )

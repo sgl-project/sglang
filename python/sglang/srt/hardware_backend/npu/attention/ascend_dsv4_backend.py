@@ -459,7 +459,11 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = torch.ops.npu.compressor(
+        # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
+        compressor_op = (
+            torch.ops.custom.compressor if _is_atlas_a5() else torch.ops.npu.compressor
+        )
+        cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
