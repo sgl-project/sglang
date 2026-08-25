@@ -147,6 +147,7 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # explicitly so that adding a processor forces a decision instead of silently
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
+    "dots_note_omni.py",
     "inkling.py",
     "lightonocr.py",
     "llava.py",
@@ -155,7 +156,6 @@ _NO_WORKER_POOL_ROUTE = {
     "minicpmv4_6.py",
     "moss_vl.py",
     "nano_nemotron_vl.py",
-    "transformers_auto.py",
     "voxtral.py",
     "whisper.py",
 }
