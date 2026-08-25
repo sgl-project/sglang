@@ -1,3 +1,4 @@
+import functools
 import json
 import unittest
 import warnings
@@ -33,8 +34,15 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=61, suite="base-c-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=70, suite="base-c-test-cpu")
+
+
+@functools.lru_cache(maxsize=None)
+def _shared_tokenizer(path: str):
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+    return get_tokenizer(path)
 
 
 class TestInklingDetector(unittest.TestCase):
@@ -768,6 +776,27 @@ class TestPythonicDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["location"], "Mars")
         self.assertEqual(params["unit"], "celsius")
+
+    def test_non_finite_argument_never_emits_invalid_json(self):
+        """A 1e999 literal overflows to inf and json.dumps rendered it as
+        Infinity — parameters no JSON parser accepts, delivered as a
+        successful call. The call is skipped instead."""
+        text = "[get_weather(location='Tokyo', unit=1e999)]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
+    def test_unconvertible_argument_skips_only_that_call(self):
+        """A bytes argument is an ast.Constant, so it passed value
+        extraction and only failed later inside json.dumps, escaping to the
+        block-level handler and dropping every parseable sibling call."""
+        text = "[get_weather(location='Tokyo'), search(query=b'raw')]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
 
 
 class TestMistralDetector(unittest.TestCase):
@@ -1578,9 +1607,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
@@ -2028,9 +2055,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
@@ -4051,6 +4076,245 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
+
+    # ==================== recovery tests (dropped-call regressions) ====================
+
+    def test_multiline_string_argument_recovered(self):
+        """A raw newline inside a string argument (multi-line shell command)
+        is invalid Python, so ast.parse failed and the whole call was
+        dropped. The value must round-trip with the newline intact."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
+    def test_nul_byte_in_string_argument_recovered(self):
+        """A NUL byte anywhere makes ast.parse raise ValueError (not
+        SyntaxError), so the call was dropped with no recovery path."""
+        text = "<|tool_call_start|>[search(query='printf a\x00b')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "printf a\x00b")
+
+    def test_nested_quotes_recovered(self):
+        """Unescaped same-style quotes nested in a shell command
+        (sed -n '360,450p') read as string/number juxtaposition, a
+        SyntaxError, so the call was dropped even though only one closing
+        quote yields parseable text."""
+        text = (
+            "<|tool_call_start|>[search(query='sed -n '360,450p' f.py')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "sed -n '360,450p' f.py")
+
+    def test_ambiguous_nested_quotes_not_guessed(self):
+        """When a later string argument's closing quote is also a plausible
+        closer, the nesting is genuinely ambiguous; recovery must NOT guess
+        a reading (guards the recovery predicate degrading to greedy)."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='echo 'hi', unit='celsius')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
+    def test_reserved_keyword_parameter_recovered(self):
+        """A parameter named after a Python keyword (from=1) is a
+        SyntaxError; the call was dropped. The original parameter name must
+        be restored in the decoded arguments."""
+        text = "<|tool_call_start|>[search(query='M.md', from=1)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "M.md", "from": 1})
+
+    def test_zero_padded_int_recovered(self):
+        """Zero-padded ints (day=07) are a SyntaxError ("leading zeros in
+        decimal integer literals"); the call was dropped."""
+        text = "<|tool_call_start|>[get_weather(city='NYC', day=07)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["day"], 7)
+
+    def test_explicit_positive_number(self):
+        """An explicitly signed positive number (+7) is UnaryOp(UAdd), which
+        only had a USub branch, so the call was dropped."""
+        text = "<|tool_call_start|>[search(query='x', limit=+7)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["limit"], 7)
+
+    def test_set_argument_decoded_as_list(self):
+        """A set argument ({'a', 'b'}) raised in _get_parameter_value and
+        dropped the call; JSON has no set type so it decodes as a list."""
+        text = "<|tool_call_start|>[search(query={'a', 'b'})]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], ["a", "b"])
+
+    def test_constant_fstring_argument(self):
+        """A placeholder-free f-string (f'hello') parses as JoinedStr, not
+        Constant, and dropped the call although it is a plain string."""
+        text = "<|tool_call_start|>[search(query=f'hello')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "hello")
+
+    def test_bytes_argument_skips_only_that_call(self):
+        """A bytes argument passed _get_parameter_value (it is an
+        ast.Constant) and only failed later as TypeError inside json.dumps,
+        which escaped the per-call handler and dropped every sibling call in
+        the block."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='SF'), search(query=b'z')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_non_finite_number_never_emits_invalid_json(self):
+        """The literal 1e999 overflows to float inf, and json.dumps rendered
+        it as Infinity — parameters that no JSON parser accepts. The call
+        must be skipped instead; every emitted parameters string must be
+        valid JSON."""
+        text = "<|tool_call_start|>[search(query='x', limit=1e999)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
+    def test_kwargs_unpack_merges_dict(self):
+        """**-unpacked kwargs were skipped silently, emitting the call with
+        arguments missing; a dict literal merges with later-binding-wins
+        semantics instead, and non-dict operands reject the call."""
+        text = "<|tool_call_start|>[search(**{'query': 'x'}, limit=2)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "limit": 2})
+
+        bad = "<|tool_call_start|>[search(**[1, 2])]<|tool_call_end|>"
+        self.assertEqual(self.detector.detect_and_parse(bad, self.tools).calls, [])
+
+    def test_positional_argument_call_not_silently_corrupted(self):
+        """get_weather('Paris', unit='celsius') used to silently drop
+        'Paris' and emit a successful call with only {"unit": "celsius"} —
+        a wrong execution instead of a visible failure. The call is
+        rejected; a keyword-only sibling still comes through."""
+        text = (
+            "<|tool_call_start|>[search(query='x'), "
+            "get_weather('Paris', unit='celsius')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+    def test_good_call_survives_unparsable_block(self):
+        """A genuinely ambiguous nested quote makes the whole block a
+        SyntaxError, so no call list exists and the parseable sibling died
+        with the block, leaving the agent loop with no tool result."""
+        text = (
+            "<|tool_call_start|>[search(query='ok'), "
+            "get_weather(city='x 'y', unit='c')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "ok"})
+
+    def test_swallowing_reading_rejected(self):
+        """Closing the broken string late makes the text parse by absorbing
+        the sibling call into the argument value, so the tool would run with
+        corrupted arguments. Rejecting readings that lose calls leaves the
+        correct early close and recovers both calls."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y'), "
+            "get_weather(city='p 'q')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["search", "get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "x 'y"})
+        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "p 'q"})
+
+    def test_unrecoverable_block_reports_no_calls(self):
+        """Splitting must not fabricate calls: when no segment parses, the
+        block yields no tool calls at all."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y' 'z), "
+            "get_weather(city='p 'q' 'r)]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_recovers_multiline(self):
+        """Streaming buffers the block and delegates to detect_and_parse;
+        an incremental rewrite of the streaming path would bypass the
+        recovery rewrites and re-drop multi-line commands."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        detector = Lfm2Detector()
+        calls = []
+        for i in range(0, len(text), 7):
+            result = detector.parse_streaming_increment(text[i : i + 7], self.tools)
+            calls.extend(result.calls)
+
+        self.assertEqual(len(calls), 1)
+        params = json.loads(calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
+    def test_reserved_kwarg_suffix_parameter_not_rewritten(self):
+        """A parameter literally named in_pyreservedkw_ must survive the
+        normal parse path; only recovery-renamed kwargs get restored."""
+        text = (
+            "<|tool_call_start|>[search(query='x', in_pyreservedkw_=5)]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "in_pyreservedkw_": 5})
+
+    def test_reserved_kwarg_with_nested_quote_recovered(self):
+        """A keyword-named parameter holding a nested-quote command needs
+        the rename and requote rewrites to compose."""
+        text = (
+            "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]" "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"from": "sed -n '1,5p' f.py"})
 
     # ==================== structure_info tests ====================
 

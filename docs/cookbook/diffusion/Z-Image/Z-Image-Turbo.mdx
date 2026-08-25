@@ -7,23 +7,13 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "turbo", "8-step"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "6B S3-DiT", "8-step", "bilingual text"]} />
 
 ## 1. Model Introduction
 
-[Z-Image](https://github.com/Tongyi-MAI/Z-Image) is a powerful and highly efficient image generation model family with 6B parameters, developed by Tongyi-MAI. It adopts a Scalable Single-Stream DiT (S3-DiT) architecture, where text, visual semantic tokens, and image VAE tokens are concatenated at the sequence level to serve as a unified input stream, maximizing parameter efficiency compared to dual-stream approaches.
+[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a distilled 6B single-stream DiT for fast text-to-image generation. It reaches its intended operating point in 8 function evaluations and is particularly strong at photorealistic scenes, prompt adherence, and English/Chinese text rendering.
 
-[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a distilled version of Z-Image that matches or exceeds leading competitors with only 8 NFEs (Number of Function Evaluations). It is powered by two core techniques: **Decoupled-DMD** (few-step distillation) and **DMDR** (fusing DMD with Reinforcement Learning).
-
-**Key Features:**
-
-- **Sub-second Inference Latency**: Achieves sub-second inference on enterprise-grade H800 GPUs and fits comfortably within 16GB VRAM consumer devices
-- **Photorealistic Image Generation**: Excels in high-quality photorealistic image generation with rich aesthetics
-- **Bilingual Text Rendering**: Supports accurate bilingual text rendering in both English and Chinese
-- **Robust Instruction Adherence**: Strong prompt following and instruction adherence capabilities
-- **#1 Open-Source Model**: Ranked 8th overall and #1 among open-source models on the [Artificial Analysis Text-to-Image Leaderboard](https://artificialanalysis.ai/image/leaderboard/text-to-image)
-
-For more details, please refer to the [Z-Image-Turbo HuggingFace page](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo), the [GitHub repository](https://github.com/Tongyi-MAI/Z-Image), and the [technical report (arXiv)](https://arxiv.org/abs/2511.22699).
+Choose it when latency and a relatively small deployment footprint matter more than the editability or maximum capacity of larger image models. It is a generation-only checkpoint; use Qwen-Image-Edit or FLUX.2 when the request includes source images or identity-preserving edits.
 
 ## 2. SGLang-diffusion Installation
 
@@ -225,7 +215,7 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+        --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -305,7 +295,7 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+        --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:

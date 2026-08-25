@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -14,8 +15,22 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading the shared data"""
+
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
+
+    @staticmethod
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Ordered by lateness: the latest end covers every child.
+        return max(items, key=lambda x: x.value)
 
 
 class AttentionBackend(ABC):
@@ -101,12 +116,24 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True for backends that preallocate per-seq extend metadata at req-pool
+    # size (e.g. triton's kv_indptr): dummy extend batches must then keep
+    # batch_size <= req_to_token_pool.size.
+    extend_dummy_seqs_capped_by_req_pool: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        """Declare where this backend's scheduler-shared reads end per mode.
+        Override only for audited deviations from this conservative default."""
+        if fm.is_decode() or fm.is_target_verify():
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not

@@ -13,6 +13,7 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
 
 
 class ImagePromptTokensDetails(BaseModel):

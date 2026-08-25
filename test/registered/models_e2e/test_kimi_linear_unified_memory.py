@@ -32,7 +32,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=570, stage="nightly", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 

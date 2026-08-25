@@ -147,18 +147,17 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
+        if batch.num_inference_steps < 2:
+            raise ValueError(
+                "MiniMax H3 requires num_inference_steps >= 2 because its "
+                "video/audio sigma schedules include both interval endpoints"
+            )
         quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality not in QUALITY_LEVELS:
             raise ValueError(
                 f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"
             )
         high_quality = quality == "high"
-        attention_backend = str(server_args.attention_backend or "").strip().lower()
-        if attention_backend == "sage_attn" and not batch.is_warmup:
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
         if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
             plan = minimax_h3_plan_from_batch(batch)

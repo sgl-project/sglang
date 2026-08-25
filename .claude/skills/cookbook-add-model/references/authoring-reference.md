@@ -34,7 +34,7 @@ the full contract):
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
-| `cells` | `{match, verified?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
+| `cells` | `{match, verified?, verificationStatus?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |
 | `placeholders` | `{[key]: {target, label, default?}}` | `{{KEY}}` interpolation map for command + curl. `target` is `'command'` or `'curl'`. Editable through the Env modal. |
 | `curl` | string | cURL template. Uses `{{MODEL_NAME}}` + placeholder keys. |
@@ -114,6 +114,17 @@ Each cell describes one verified (or auto-estimated) launch recipe.
 
 - `match` MUST contain exactly the 5 keys: `hw`, `variant`, `quant`,
   `strategy`, `nodes`. The engine looks up cells by tuple equality.
+- `verified` is the badge baseline (`true` → green **Verified**, absent →
+  yellow **Not Verified**). `verificationStatus` overrides it with a third
+  state — `"verified" | "in-progress" | "unverified"` — for a recipe whose
+  verification round is OPEN rather than absent. It may also be a FUNCTION of
+  the selection, which is how a cell reports a per-pick state: e.g.
+  `verificationStatus: (sel) => sel.spec === "dflash" ? "in-progress" :
+  "verified"` marks one speculative option as still being validated while the
+  cell's other picks stay Verified. An unrecognized string falls back to
+  `unverified`, so a typo can never render as a green badge — and
+  `check_cookbook_configs.mjs` probes the function over every reachable
+  selection, so a typo or a crash fails the check instead of reaching the page.
 - `env` and `flags` are FLAT literals. The engine does NOT expand
   fragments, aliases, or templates — it consumes them verbatim
   (only `{{PLACEHOLDER}}` substitutions happen at render time).
@@ -164,7 +175,7 @@ schemas (full reference in the `_playground.jsx` header):
 | `moe` | Backend select (incl. MegaMoE) + EP knob; picking the MegaMoE backend reveals a Quantization sub-select (W4A8/W4A4) | Model is MoE and supports multiple `--moe-*-backend` choices. For Blackwell MoE kernel-fusion, give the `megamoe` backend option a `requiresHw` (and optional `excludesStrategy`) gate, then add a sibling `megamoeQuant` block (`{stripEnv, options}`): W4A8 = `NUM_MAX` only, W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select chip group | Model has spec-decoding presets you want to expose. |
-| `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a separate companion block and retargets the cURL modal to `router.port` (clients hit the router, not the role servers). |
+| `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. A `modes[]` entry may carry `flags` / `env` that only that role needs (`prefill`'s `--load-balance-method`, `decode`'s `--disaggregation-decode-polling-interval`, ...); they are emitted only while that role is selected, and a flag whose head the base cell already sets is replaced rather than duplicated. Put role-specific settings here, NOT in the cells — a cell carries one recipe, and the role is a Playground overlay. In `router.command` the ports MUST be `{{PREFILL_PORT}}` / `{{DECODE_PORT}}` / `{{ROUTER_PORT}}`: the engine substitutes them from its own `PD_PORTS` (prefill 30000, decode **30100**), so a literal port silently points the router at something the generated decode command never binds. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a companion block and retargets the cURL modal to `router.port`. |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
 | `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
 | `flagSelects` | A config-declared **list** of single-selects, each `{ id, title, stripPrefixes, options }` (option = `{ id, label, flags?, hide?, disable?, disableReason? }`); a flagless option is the "none"/accuracy-safe choice | A titled single-select that picks one value of a flag family the other axes don't model — e.g. KV-cache dtype (`--kv-cache-dtype`), mamba scheduler strategy (`--mamba-scheduler-strategy`). Generic: no engine change to add another. |

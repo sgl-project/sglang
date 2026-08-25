@@ -20,7 +20,9 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -59,7 +61,7 @@ def maybe_build_flashinfer_checkpoint_plan(
     ):
         return
 
-    checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    checkpoint_every_n_tokens = mamba_cache_chunk_size()
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(
@@ -170,6 +172,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
+        # The SM120 chunked-prefill kernel only accepts float32 initial
+        # states; SM100 accepts the state-pool dtype directly.
+        self._prefill_needs_fp32_state = sm_major >= 12
         self.supports_target_verify = sm_major in (9, 10)
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -289,7 +294,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self.use_state_pool:
             # Negative indices are padding markers; slot 0 is reserved for them.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            cu_seqlens = query_start_loc
+            cu_seqlens = query_start_loc.to(torch.int64)
         else:
             # SM90 uses the last pool slot as its padding sentinel and requires
             # int64 sequence offsets.
@@ -345,7 +350,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_cache_indices = prep.ssm_cache_indices
 
         if self.use_state_pool:
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            initial_state_fi = (
+                ssm_states[ssm_cache_indices].to(torch.float32)
+                if self._prefill_needs_fp32_state
+                else ssm_states[ssm_cache_indices].contiguous()
+            )
         else:
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)

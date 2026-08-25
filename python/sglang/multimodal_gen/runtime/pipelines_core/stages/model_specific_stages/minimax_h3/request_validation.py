@@ -16,7 +16,9 @@ from typing import Any
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
+    MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
     MINIMAX_H3_SUPPORTED_FPS,
+    warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
@@ -83,10 +85,13 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     # compatibility keys are ignored; only these three declared values are
     # validated and emitted below.
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
-    if short_edge != 768:
-        raise ValueError(
-            f"{path}.short_edge must be 768 for minimax_h3, got {short_edge}"
-        )
+    if short_edge <= 0:
+        raise ValueError(f"{path}.short_edge must be positive, got {short_edge}")
+    if short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE:
+        # Same guard the resolver applies. Without it the recommended value warns
+        # that it is "outside the verified configuration", naming itself as the
+        # verified one.
+        warn_unverified_short_edge(short_edge)
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
     if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
         raise ValueError(
@@ -243,15 +248,30 @@ def _validate_conditions(
     return normalized
 
 
-def _validate_fl2va_conditions(conditions: Sequence[Mapping[str, Any]]) -> None:
-    """Enforce the public FL contract after per-entry schema validation."""
+def _validate_keyframe_conditions(
+    conditions: Sequence[Mapping[str, Any]], *, task: str
+) -> None:
+    """Enforce the shared first/last-frame contract after schema validation."""
 
-    frame_indices = tuple(condition.get("frame_index") for condition in conditions)
+    keyframes = [
+        condition
+        for condition in conditions
+        if condition["role"] == MINIMAX_H3_CONDITION_ROLE_KEYFRAME
+    ]
+    frame_indices = tuple(condition.get("frame_index") for condition in keyframes)
     if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
         raise ValueError(
-            "conditions for task 'fl2va' must be one or two ordered "
+            f"conditions for task {task!r} must include one or two ordered "
             "image/keyframe entries with frame_index [0], [-1], or [0, -1], "
             f"got {list(frame_indices)!r}"
+        )
+    if task == MINIMAX_H3_TASK_REF2VA and not any(
+        condition["role"] == MINIMAX_H3_CONDITION_ROLE_REFERENCE
+        for condition in conditions
+    ):
+        raise ValueError(
+            "ref2va keyframes require at least one reference condition; "
+            "use task 'fl2va' for keyframe-only generation"
         )
 
 
@@ -295,11 +315,16 @@ def minimax_h3_validate_canonical_request(
         frame_count=requested_frame_count,
     )
     if profile.task == MINIMAX_H3_TASK_FL2VA:
-        _validate_fl2va_conditions(normalized_conditions)
-    # ref2va accepts ordered material streams containing any mix of
-    # image/audio/video/video_audio references. Type admission is handled by
-    # the task profile; temporal ambiguity is validated later when target
-    # duration is omitted.
+        _validate_keyframe_conditions(normalized_conditions, task=profile.task)
+    elif profile.task == MINIMAX_H3_TASK_REF2VA and any(
+        condition["role"] == MINIMAX_H3_CONDITION_ROLE_KEYFRAME
+        for condition in normalized_conditions
+    ):
+        _validate_keyframe_conditions(normalized_conditions, task=profile.task)
+    # ref2va accepts ordered reference streams and, for hybrid checkpoints,
+    # one first/last keyframe signature. Type admission is handled by the task
+    # profile; temporal ambiguity is validated later when target duration is
+    # omitted.
     if not profile.video_reference_supported:
         for index, cond in enumerate(normalized_conditions):
             if cond["type"] in ("video", "video_audio"):

@@ -240,7 +240,7 @@ class Mamba2Metadata(ForwardMetadata):
         batch_size = getattr(forward_batch, "_original_batch_size", None)
         if batch_size is None:
             batch_size = len(forward_batch.seq_lens)
-        num_decodes = batch_size - num_prefills
+        num_decodes = max(0, batch_size - num_prefills)
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0

@@ -1,8 +1,6 @@
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -10,16 +8,11 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
 )
-from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
@@ -38,6 +31,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=35, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=35, stage="base-b", runner_config="1-gpu-large")
@@ -57,10 +51,6 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
     # FlashInfer SM90 prefill kernels require value head dim in {64, 128, 256}.
     HEAD_K_DIM = 64
     HEAD_V_DIM = 64
-    PREFILL_BACKEND_GETTER = (
-        "sglang.srt.layers.attention.linear.gdn_backend."
-        "get_linear_attn_prefill_backend"
-    )
     GDN_POOL_CLASS = (
         "sglang.test.kits.attention_unittest.attention_methods.gdn_attention."
         "HybridReqToTokenPool"
@@ -74,6 +64,7 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
         page_size=16,
         prefix_lens=(0, 8),
         extend_lens=(17, 9),
+        linear_attn_prefill_backend="flashinfer",
     )
 
     CASES = make_gdn_cases("flashinfer")
@@ -256,10 +247,7 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
             kwargs["mamba_layer_ids"] = layer_ids
             return HybridReqToTokenPool(*args, **kwargs)
 
-        with patch(
-            self.PREFILL_BACKEND_GETTER,
-            return_value=LinearAttnKernelBackend.FLASHINFER,
-        ), patch(self.GDN_POOL_CLASS, side_effect=build_two_layer_pool):
+        with patch(self.GDN_POOL_CLASS, side_effect=build_two_layer_pool):
             return build_gdn_attention_fixture(
                 self,
                 self.PREFILL_CASE,
@@ -278,16 +266,12 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                 )
 
     def test_flashinfer_prefill_attention_block(self):
-        with patch(
-            self.PREFILL_BACKEND_GETTER,
-            return_value=LinearAttnKernelBackend.FLASHINFER,
-        ):
-            run_gdn_attention_case(
-                self,
-                self.PREFILL_CASE,
-                head_k_dim=128,
-                head_v_dim=128,
-            )
+        run_gdn_attention_case(
+            self,
+            self.PREFILL_CASE,
+            head_k_dim=128,
+            head_v_dim=128,
+        )
 
     def test_extend_prep_is_built_once_per_forward(self):
         fixture = self._build_two_layer_flashinfer_prefill_fixture()
@@ -356,7 +340,7 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
         query_start_loc = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
 
         for use_state_pool, expected_indices, offsets_dtype in (
-            (True, [3, 0], torch.int32),
+            (True, [3, 0], torch.int64),
             (False, [3, 7], torch.int64),
         ):
             with self.subTest(use_state_pool=use_state_pool), patch.object(
@@ -375,8 +359,6 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                 torch.testing.assert_close(
                     prep.cu_seqlens, query_start_loc.to(offsets_dtype)
                 )
-                if use_state_pool:
-                    self.assertIs(prep.cu_seqlens, query_start_loc)
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     LAYOUT_ROBUSTNESS_CASES = (

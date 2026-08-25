@@ -11,7 +11,7 @@
 
 #include <numeric>
 
-namespace {
+namespace sglang {
 
 struct FusedRopeParams {
   void* __restrict__ q_ptr;
@@ -466,4 +466,4 @@ struct FusedRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
