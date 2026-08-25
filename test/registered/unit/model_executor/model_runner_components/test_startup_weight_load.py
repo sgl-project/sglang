@@ -1180,6 +1180,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             options.disable_shared_experts_fusion,
             server_args.disable_shared_experts_fusion,
         )
+        self.assertEqual(options.ep_join_mode, server_args.ep_join_mode)
         self.assertIsNone(options.cuda_device_capability)
 
         with (

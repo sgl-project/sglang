@@ -206,7 +206,7 @@ class StartupWeightLoadOptions:
             enable_elastic_expert_backup=(
                 get_exec().moe.enable_elastic_expert_backup
             ),
-            ep_join_mode=get_parallel().ep_join_mode,
+            ep_join_mode=get_exec().moe.ep_join_mode,
             max_ep_size=get_parallel().max_ep_size,
             linear_attn_backend=get_exec().mamba.linear_attn_backend,
             linear_attn_decode_backend=get_exec().mamba.linear_attn_decode_backend,
