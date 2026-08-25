@@ -43,11 +43,6 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_xpu():
-    from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
-
-    causal_conv1d_fn = causal_conv1d_fn_xpu
-    causal_conv1d_update = causal_conv1d_update_xpu
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -142,6 +137,13 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # The fused SYCL kernel is dispatched via XpuGDNAttnBackend.forward_fused_gdn,
+            # outside this dispatcher; Triton is the dispatcher-level kernel for requests
+            # that hook doesn't handle (e.g. verify).
+            self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -168,6 +170,12 @@ class GDNKernelDispatcher:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
         if prefill_backend.is_triton():
+            self.extend_kernel = triton_kernel
+        elif prefill_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # See the decode branch above: intel_xpu uses Triton as its
+            # dispatcher-level fallback kernel.
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
@@ -384,6 +392,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         backends = model_runner.linear_attn_backends
+        self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )

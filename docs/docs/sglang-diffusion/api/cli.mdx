@@ -131,6 +131,8 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
+| Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
 For example, pair a replacement text-encoder configuration with a separate
 single-file checkpoint as follows:
@@ -152,6 +154,7 @@ unquantized during online quantization.
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- `--component-quantizations.text_encoder {METHOD}` applies supported online quantization to an unquantized native encoder; pair it with `--component-quantization-ignored-layers.text_encoder {PATTERN...}` when selected layers must remain unquantized
 - Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
@@ -211,6 +214,15 @@ vae_tiling: true
 vae_sp: true
 enable_torch_compile: false
 ```
+
+HunyuanVideo and FastHunyuan use tiled VAE decode by default so multi-GPU runs
+distribute VAE tiles instead of selecting spatial-shard decode. At
+HunyuanVideo's supported 960×544×77 shape, spatial-shard decode can consume
+99.8 GiB per rank before requesting another 49.61 GiB causal mask. At
+FastHunyuan's default 1280×720×125 shape, the mask alone would require
+197.75 GiB. You can still override the policy with
+`--vae-config.parallel-decode-mode`, but `spatial` and `spatial_shard` should
+only be used for smaller validated shapes.
 
 ## Generate
 
