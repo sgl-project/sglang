@@ -1298,9 +1298,12 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            capacity = self.max_total_num_tokens
+        if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
+            return req_to_token_pool.schedulable_token_capacity(capacity)
+        return capacity
 
     @property
     def max_token_pool_size(self):
@@ -1415,8 +1418,14 @@ class ModelRunner:
         )
 
     def init_threads_binding(self):
+        # With --enable-dp-attention, dp partitions the existing TP group
+        # rather than spawning additional processes, so dp_size must not be
+        # multiplied into the process count here (unlike regular DP, where
+        # dp_size * tp_size * pp_size is the true worker count).
+        dp_size = 1 if get_parallel().enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
-            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
+            numa_index=self.gpu_id,
+            world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
         )
 
     def apply_torch_tp(self):
