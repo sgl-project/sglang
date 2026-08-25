@@ -15,15 +15,16 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.attention.ragged_verify_utils import (
-    get_npu_bucketed_ragged_verify_layout,
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+    ForwardMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.spec_info import SpecInputType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -103,18 +104,35 @@ def _build_explicit_state_block_table(
 
 class CompressorAscendBackendMixin:
 
-    @staticmethod
-    def _ragged_verify_layout(forward_batch: ForwardBatch):
+    def _dspark_ragged_verify_layout(self, forward_batch: ForwardBatch):
+        if not self._is_dspark_algorithm:
+            return None
+
         layout = resolve_ragged_verify_layout(forward_batch)
-        if layout is not None and (
-            layout.bs != forward_batch.batch_size or layout.cap is None
-        ):
-            layout = get_npu_bucketed_ragged_verify_layout(
-                spec_info=forward_batch.spec_info,
-                layout=layout,
-                padded_bs=forward_batch.batch_size,
-            )
-        return layout
+        if layout is None:
+            return None
+
+        padded_bs = forward_batch.batch_size
+        if layout.bs == padded_bs and layout.cap is not None:
+            return layout
+
+        spec_info = forward_batch.spec_info
+        cached = getattr(spec_info, "_npu_ragged_verify_bucket_cache", None)
+        if cached is not None and cached[0] is layout and cached[1] == padded_bs:
+            return cached[2]
+
+        padded = layout.padded_to_bucket(
+            padded_bs=padded_bs,
+            cap=spec_info.draft_token_num,
+        )
+        # Retain the source object so a recycled Python id cannot collide with
+        # a later layout. A new source or padded geometry replaces the cache.
+        setattr(
+            spec_info,
+            "_npu_ragged_verify_bucket_cache",
+            (layout, padded_bs, padded),
+        )
+        return padded
 
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
@@ -152,7 +170,7 @@ class CompressorAscendBackendMixin:
         fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         if _verify_compress:
             n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + (
@@ -985,26 +1003,202 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # Parent refreshes shared (block_tables / seq_lens) metadata; we layer DSV4
-        # fields on top: capture allocates+zeros, replay refreshes them in place.
-        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         bs = forward_batch.batch_size
-        metadata_key = self._cuda_graph_metadata_key(forward_batch)
+        metadata_key = self._dsv4_graph_metadata_key(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         if in_capture:
+            self._init_dsv4_shared_graph_metadata(
+                metadata_key=metadata_key,
+                bs=bs,
+                forward_mode=forward_batch.forward_mode,
+                seq_lens=forward_batch.seq_lens,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
             self._init_dsv4_graph_metadata(
                 metadata_key,
                 bs,
                 forward_batch.forward_mode,
-                self._ragged_verify_layout(forward_batch),
+                ragged_layout,
             )
-        else:
+        self._apply_dsv4_shared_graph_metadata(
+            metadata_key=metadata_key,
+            forward_batch=forward_batch,
+            ragged_layout=ragged_layout,
+            in_capture=in_capture,
+        )
+        if not in_capture:
             self._apply_dsv4_graph_metadata(forward_batch)
 
-    def _cuda_graph_metadata_key(self, forward_batch: ForwardBatch):
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+    def _dsv4_graph_metadata_key(self, forward_batch: ForwardBatch):
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         if ragged_layout is not None:
             return ("ragged_verify", int(ragged_layout.graph_num_tokens))
-        return super()._cuda_graph_metadata_key(forward_batch)
+        return forward_batch.batch_size
+
+    def _init_dsv4_shared_graph_metadata(
+        self,
+        *,
+        metadata_key,
+        bs: int,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> ForwardMetadata:
+        """Allocate the graph metadata shared by DSV4 attention paths.
+
+        Unlike ``AscendAttnBackend``, DSV4 keeps the final Attention/KV lengths
+        in dedicated storage.  ``forward_batch.seq_lens`` remains the committed
+        prefix throughout capture and replay, which is also the CUDA DSpark
+        verify-epilogue contract.
+        """
+        metadata = ForwardMetadata()
+        metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+            metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
+                : out_cache_loc.shape[0]
+            ]
+
+        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        metadata.seq_lens = torch.empty_like(seq_lens)
+        metadata.seq_lens.copy_(seq_lens)
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + bs * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        else:
+            metadata.actual_seq_lengths_q = torch.arange(
+                1,
+                bs + 1,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+
+        if forward_mode.is_dllm_extend():
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.dllm_block_size,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            metadata.seq_lens_list_cumsum = (
+                torch.cumsum(extend_seq_lens, dim=0).int().tolist()
+            )
+
+        if (
+            self.q_head_num_padding is not None
+            and self.q_head_num_padding > self.tp_q_head_num
+        ):
+            dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
+            metadata.nope_padding = torch.empty(
+                (
+                    bs,
+                    1,
+                    self.q_head_num_padding - self.tp_q_head_num,
+                    self.kv_lora_rank,
+                ),
+                dtype=dtype,
+                device=seq_lens.device,
+            )
+            metadata.rope_padding = torch.empty(
+                (
+                    bs,
+                    1,
+                    self.q_head_num_padding - self.tp_q_head_num,
+                    self.qk_rope_head_dim,
+                ),
+                dtype=dtype,
+                device=seq_lens.device,
+            )
+
+        self.graph_metadata[metadata_key] = metadata
+        return metadata
+
+    def _apply_dsv4_shared_graph_metadata(
+        self,
+        *,
+        metadata_key,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        in_capture: bool,
+    ) -> None:
+        """Refresh common graph metadata without mutating the live prefixes."""
+        metadata = self.graph_metadata[metadata_key]
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        live_seq_lens = forward_batch.seq_lens
+        seq_lens_cpu = live_seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            num_tokens = out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[num_tokens:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:num_tokens].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            )
+
+        max_len = seq_lens_cpu[:bs].max().item()
+        is_dflash_verify = (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+        )
+        if forward_mode.is_target_verify() and not is_dflash_verify:
+            max_len += self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            max_len += self.speculative_step_id + 1
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        if self.is_hybrid_swa:
+            full_page_locs = self.req_to_token[
+                req_pool_indices[:bs],
+                0 : max_len : self.page_size,
+            ]
+            swa_page_table = (
+                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+            )
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
+
+            seq_lens_int = live_seq_lens[:bs].int()
+            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+            indices = self.graph_metadata["swa_indices"]
+            mask = (indices.unsqueeze(0) < starts.unsqueeze(1)) | (
+                indices.unsqueeze(0) >= seq_lens_int.unsqueeze(1)
+            )
+            metadata.swa_mask[:bs, 0, :].copy_(mask)
+            metadata.swa_mask[bs:, :, :].fill_(True)
+
+        metadata.block_tables[:bs, :max_seq_pages].copy_(
+            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+            // self.page_size
+        )
+        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        metadata.block_tables[bs:, :].fill_(0)
+
+        final_seq_lens = live_seq_lens
+        if forward_mode.is_target_verify():
+            if ragged_layout is None:
+                final_seq_lens = live_seq_lens + self.speculative_num_draft_tokens
+            else:
+                final_seq_lens = live_seq_lens + ragged_layout.verify_lens.to(
+                    live_seq_lens.dtype
+                )
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            final_seq_lens = live_seq_lens + self.speculative_step_offset_npu
+        metadata.seq_lens[:bs].copy_(final_seq_lens[:bs])
+
+        self.forward_metadata = metadata
+        self.graph_mode = True
 
     def _init_dsv4_graph_metadata(
         self,
@@ -1136,7 +1330,7 @@ class DeepseekV4AscendAttnBackend(
             if graph_mode.is_target_verify() or graph_mode.is_draft_extend_v2()
             else 1
         )
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         verify_lens = None
         verify_lens_cpu = None
         if ragged_layout is not None:
@@ -1158,43 +1352,57 @@ class DeepseekV4AscendAttnBackend(
             if is_idle_replay:
                 live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
                 final_seq_lens_cpu = live_seq_lens_cpu
-            elif ragged_layout is not None:
-                live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
-                    dtype=raw_seq_lens_cpu.dtype,
-                    device=raw_seq_lens_cpu.device,
-                ).flatten()[:raw_bs]
-                live_seq_lens_cpu = F.pad(
-                    live_seq_lens_cpu,
-                    (0, bs - live_seq_lens_cpu.numel()),
-                )
-                # Query rows beyond raw_bs are graph-tier ghosts. Keep their
-                # Q indptr geometry intact, but do not allocate/write target
-                # compressor state for them.
-                effective_verify_lens_cpu = verify_lens_cpu.clone()
-                effective_verify_lens_cpu[raw_bs:].zero_()
-                final_seq_lens_cpu = live_seq_lens_cpu + effective_verify_lens_cpu
-            elif self._is_dspark_algorithm or explicit_live_cpu is not None:
-                # DSpark/DFLASH temporarily expand seq_lens_cpu to the final
-                # target-verify length and carry the committed/live prefix
-                # separately. Graph replay batches are lightweight namespace
-                # views and do not necessarily retain spec_algorithm.
-                final_seq_lens_cpu = raw_seq_lens_cpu
-                if explicit_live_cpu is None:
-                    live_seq_lens_cpu = torch.clamp(
-                        final_seq_lens_cpu - int(tokens_per_bs), min=0
+            elif self._is_dspark_algorithm:
+                if ragged_layout is not None:
+                    live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
+                        dtype=raw_seq_lens_cpu.dtype,
+                        device=raw_seq_lens_cpu.device,
+                    ).flatten()[:raw_bs]
+                    live_seq_lens_cpu = F.pad(
+                        live_seq_lens_cpu,
+                        (0, bs - live_seq_lens_cpu.numel()),
                     )
+                    # Query rows beyond raw_bs are graph-tier ghosts. Keep their
+                    # Q indptr geometry intact, but do not allocate/write target
+                    # compressor state for them.
+                    effective_verify_lens_cpu = verify_lens_cpu.clone()
+                    effective_verify_lens_cpu[raw_bs:].zero_()
+                    final_seq_lens_cpu = live_seq_lens_cpu + effective_verify_lens_cpu
                 else:
-                    explicit_live_cpu = torch.as_tensor(
-                        explicit_live_cpu,
-                        dtype=final_seq_lens_cpu.dtype,
-                        device=final_seq_lens_cpu.device,
-                    ).flatten()
-                    live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                    num_live_rows = min(bs, explicit_live_cpu.numel())
-                    if num_live_rows > 0:
-                        live_seq_lens_cpu[:num_live_rows].copy_(
-                            explicit_live_cpu[:num_live_rows]
+                    # Static DSpark temporarily expands seq_lens_cpu to the final
+                    # target-verify length and carries the live prefix separately.
+                    final_seq_lens_cpu = raw_seq_lens_cpu
+                    if explicit_live_cpu is None:
+                        live_seq_lens_cpu = torch.clamp(
+                            final_seq_lens_cpu - int(tokens_per_bs), min=0
                         )
+                    else:
+                        explicit_live_cpu = torch.as_tensor(
+                            explicit_live_cpu,
+                            dtype=final_seq_lens_cpu.dtype,
+                            device=final_seq_lens_cpu.device,
+                        ).flatten()
+                        live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+                        num_live_rows = min(bs, explicit_live_cpu.numel())
+                        if num_live_rows > 0:
+                            live_seq_lens_cpu[:num_live_rows].copy_(
+                                explicit_live_cpu[:num_live_rows]
+                            )
+            elif explicit_live_cpu is not None:
+                # DFlash also carries its committed/live prefix separately from
+                # the temporarily expanded target-verify seq_lens_cpu.
+                final_seq_lens_cpu = raw_seq_lens_cpu
+                explicit_live_cpu = torch.as_tensor(
+                    explicit_live_cpu,
+                    dtype=final_seq_lens_cpu.dtype,
+                    device=final_seq_lens_cpu.device,
+                ).flatten()
+                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+                num_live_rows = min(bs, explicit_live_cpu.numel())
+                if num_live_rows > 0:
+                    live_seq_lens_cpu[:num_live_rows].copy_(
+                        explicit_live_cpu[:num_live_rows]
+                    )
             else:
                 # EAGLE and the other uniform verify callers keep
                 # seq_lens_cpu at the committed/live prefix length.
@@ -1535,7 +1743,7 @@ class DeepseekV4AscendAttnBackend(
             return
 
         device = forward_batch.seq_lens.device
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         # cu_seqlens_q must hold per-request QUERY token counts, not KV lengths.
         if (
             forward_batch.forward_mode.is_extend()
@@ -1636,7 +1844,7 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         if ragged_layout is not None:
             # The metadata operator accepts an upper bound. Keep this host-free
             # when verify_lens is device-only by using the configured cap.
@@ -1929,7 +2137,7 @@ class DeepseekV4AscendAttnBackend(
         positions = forward_batch.positions
         t = positions.shape[0]
         bs = forward_batch.batch_size
-        ragged_layout = self._ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         n_draft = int(forward_batch.spec_info.draft_token_num)
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
