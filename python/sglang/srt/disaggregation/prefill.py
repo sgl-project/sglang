@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -322,11 +322,18 @@ class PrefillBootstrapQueue:
         # Propagate trace context to KV sender so Mooncake transfer spans
         # link to the parent request's trace (W3C traceparent).
         import inspect as _inspect
-        if "external_trace_header" in _inspect.signature(kv_sender_class.__init__).parameters:
+
+        if (
+            "external_trace_header"
+            in _inspect.signature(kv_sender_class.__init__).parameters
+        ):
             _trace_carrier: Dict[str, str] = {}
-            _trace_ctx = getattr(getattr(req.time_stats, "trace_ctx", None), "root_span_context", None)
+            _trace_ctx = getattr(
+                getattr(req.time_stats, "trace_ctx", None), "root_span_context", None
+            )
             if _trace_ctx is not None:
                 from opentelemetry import propagate
+
                 propagate.inject(_trace_carrier, _trace_ctx)
             if _trace_carrier:
                 _sender_kwargs["external_trace_header"] = _trace_carrier
