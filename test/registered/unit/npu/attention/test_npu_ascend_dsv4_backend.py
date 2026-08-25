@@ -396,6 +396,53 @@ class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
         self.assertEqual(kwargs, {})
 
 
+class TestSparseAttentionMetadata(unittest.TestCase):
+    _A5_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5"
+    )
+
+    def test_device_metadata_receives_sequence_lengths(self):
+        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
+        seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
+
+        for is_a5, metadata_op_name in (
+            (False, "npu_sparse_attn_sharedkv_metadata"),
+            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
+        ):
+            with self.subTest(is_a5=is_a5), patch(
+                self._A5_PATCH_TARGET, return_value=is_a5
+            ), patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+                backend = DeepseekV4AscendAttnBackend.__new__(
+                    DeepseekV4AscendAttnBackend
+                )
+                backend.forward_metadata = SimpleNamespace()
+                backend._is_dspark_draft_worker = False
+                backend._dsv4_sliding_window_size = 128
+                backend._dsv4_q_head_num = 64
+                backend._dsv4_kv_head_num = 1
+                backend._dsv4_head_dim = 512
+                backend._dsv4_has_c4 = True
+                backend._dsv4_has_c128 = True
+                backend._dsv4_index_topk = 512
+                backend._dsv4_index_n_heads = 16
+                backend._dsv4_index_head_dim = 128
+
+                backend._kernel_metadata_from_parts(
+                    bs=2,
+                    actual_seq_lengths_q_pa=cu_seqlens_q,
+                    actual_seq_lengths_kv=seqused_kv,
+                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                    max_seqlen_q=2,
+                    is_nextn=False,
+                )
+
+                metadata_op = getattr(custom_ops, metadata_op_name)
+                self.assertEqual(metadata_op.call_count, 3)
+                for call in metadata_op.call_args_list:
+                    self.assertIs(call.kwargs["cu_seqlens_q"], cu_seqlens_q)
+                    self.assertIs(call.kwargs["seqused_kv"], seqused_kv)
+
+
 class TestGetKvIndices(unittest.TestCase):
     _PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.get_attn_backend"

@@ -2027,6 +2027,10 @@ class DeepseekV4AscendAttnBackend(
                 device=str(actual_seq_lengths_kv.device), **c1a_kwargs
             )
         else:
+            c1a_kwargs = c1a_kwargs | {
+                "cu_seqlens_q": actual_seq_lengths_q_pa,
+                "seqused_kv": actual_seq_lengths_kv,
+            }
             metadata_op, _ = _sparse_attn_ops()
             c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
