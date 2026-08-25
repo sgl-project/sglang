@@ -1365,7 +1365,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.is_npu or forward_batch.forward_mode.is_target_verify()
         ):
             _bs = forward_batch.seq_lens.shape[0]
-            if self.is_npu and forward_batch.forward_mode.is_target_verify():
+            if forward_batch.forward_mode.is_target_verify() and (
+                self.is_npu or is_gfx95_supported()
+            ):
                 _ndt = self._target_verify_q_cap(forward_batch)
             else:
                 _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
@@ -1449,11 +1451,47 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
 
-        # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        if extend_seq_lens is not None:
+            cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
+                forward_batch, q
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = int(forward_batch.seq_lens.shape[0])
+            verify_len = self._target_verify_q_cap(forward_batch)
+            expected_num_tokens = bs * verify_len
+            if bs <= 0 or q.shape[0] < expected_num_tokens:
+                raise RuntimeError(
+                    "MiniMax sparse non-ragged TARGET_VERIFY requires the fixed "
+                    "verify width from spec_info; refusing to infer a layout from "
+                    f"q.shape. Got q.shape[0]={q.shape[0]}, bs={bs}, "
+                    f"verify_cap={verify_len}, expected>={expected_num_tokens}."
+                )
+            uniform_verify_lens = torch.full(
+                (bs,),
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cu_seqlens = torch.arange(
+                0,
+                expected_num_tokens + 1,
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            seq_lens = (forward_batch.seq_lens + uniform_verify_lens).to(torch.int32)
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = [verify_len] * bs
+        else:
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
+
+        # DP attention pads q beyond the real token count for collective alignment;
+        # trim to actual tokens so the sparse kernel sees consistent shapes.
+        if extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
@@ -1538,7 +1576,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     score_type=self.score_type,
                     disable_index_value=disable_value,
                     use_msa=self.use_msa,
-                    seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                    seqlens_cpu=extend_seq_lens_cpu,
                     q_scale=layer.q_scale_float,
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
