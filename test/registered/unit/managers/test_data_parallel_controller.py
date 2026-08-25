@@ -50,6 +50,7 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.status = [True] * dp_size
     ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
+    ctl._dp_prefill_load_aware_routing = False
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl
 
@@ -260,6 +261,20 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+class TestDPPrefillLoadAwareRouting(CustomTestCase):
+    def test_treats_external_rank_as_hint_and_uses_token_load(self):
+        ctl = _make_controller(dp_size=4)
+        ctl._dp_prefill_load_aware_routing = True
+        ctl.dp_budget.total_tokens = [100, 50, 200, 150]
+        ctl.dp_budget.total_requests = [0, 0, 0, 0]
+
+        ctl.total_tokens_scheduler(_req(routed_dp_rank=2, input_ids=[1] * 8192))
+
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[2].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_tokens, [100, 8242, 200, 150])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
