@@ -18,6 +18,7 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 from safetensors.torch import safe_open
+from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
@@ -1653,7 +1654,10 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _aliases = ["MiniMaxH3Transformer3DModel"]
+    _aliases = [
+        "MiniMaxH3Transformer3DModel",
+        "MiniMaxH3PrunedTransformer3DModel",
+    ]
     _fsdp_shard_conditions = [is_block]
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
@@ -1665,6 +1669,65 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        full_width = self.arch.adaln_affine_input_dim
+        if full_width is None:
+            return adapter
+
+        suffix = ".adaln_proj.linear.lora_A"
+        a_keys = sorted(key for key in adapter if key.endswith(suffix))
+        if not a_keys:
+            return adapter
+        widths = {int(adapter[key].shape[-1]) for key in a_keys}
+        if widths == {self.arch.time_embed_dim}:
+            return adapter
+        if widths != {full_width}:
+            raise ValueError(
+                "MiniMax H3 pruned AdaLN LoRA inputs must be uniformly "
+                f"{self.arch.time_embed_dim} or {full_width} wide, got "
+                f"{sorted(widths)}."
+            )
+
+        basis = self.adaln_basis
+        mean = self.adaln_mean
+        assert basis is not None and mean is not None
+        if isinstance(basis, DTensor):
+            basis = basis.full_tensor()
+            mean = mean.full_tensor()
+        if torch.count_nonzero(basis).item() == 0:
+            raise ValueError(
+                "MiniMax H3 pruned LoRA projection requires adaln_basis and "
+                "adaln_mean from the component checkpoint."
+            )
+
+        projected = dict(adapter)
+        work_device = adapter[a_keys[0]].device
+        work_basis = basis.to(device=work_device, dtype=torch.float64)
+        work_mean = mean.to(device=work_device, dtype=torch.float64)
+        for a_key in a_keys:
+            b_key = a_key[: -len("lora_A")] + "lora_B"
+            if b_key not in adapter:
+                raise ValueError(f"MiniMax H3 AdaLN LoRA is missing {b_key!r}.")
+            a = adapter[a_key]
+            b = adapter[b_key]
+            a64 = a.to(torch.float64)
+            b64 = b.to(device=work_device, dtype=torch.float64)
+            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
+                b64 @ (a64 @ work_mean)
+            ).to(torch.float32)
+
+        logger.info(
+            "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
+            len(a_keys),
+            full_width,
+            self.arch.time_embed_dim,
+        )
+        return projected
 
     def prepare_adaln_plans(self, step_timesteps: list[torch.Tensor]) -> None:
         """Fill the AdaLN cache for this request before denoising starts.
@@ -1845,6 +1908,28 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 ),
                 requires_grad=False,
             )
+        if arch.adaln_affine_input_dim is None:
+            self.register_parameter("adaln_basis", None)
+            self.register_parameter("adaln_mean", None)
+        else:
+            self.register_parameter(
+                "adaln_basis",
+                nn.Parameter(
+                    torch.empty(
+                        arch.time_embed_dim,
+                        arch.adaln_affine_input_dim,
+                        dtype=_FP32_DTYPE,
+                    ),
+                    requires_grad=False,
+                ),
+            )
+            self.register_parameter(
+                "adaln_mean",
+                nn.Parameter(
+                    torch.empty(arch.adaln_affine_input_dim, dtype=_FP32_DTYPE),
+                    requires_grad=False,
+                ),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1929,6 +2014,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 if not name.startswith("time_embedder.")
             ]
             fp32_param_names.append("adaln_t_table")
+            if self.adaln_basis is not None:
+                fp32_param_names.extend(("adaln_basis", "adaln_mean"))
         for name in fp32_param_names:
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:

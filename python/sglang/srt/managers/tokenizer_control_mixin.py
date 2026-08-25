@@ -72,6 +72,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
@@ -106,6 +108,7 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -928,6 +931,13 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def update_weight_version(
+        self: TokenizerManager, obj: UpdateWeightVersionReqInput
+    ) -> None:
+        self.auto_create_handle_loop()
+        await self.update_weight_version_communicator(obj)
+        self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

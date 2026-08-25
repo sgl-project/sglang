@@ -1303,6 +1303,12 @@
                     ]
                   },
                   {
+                    "group": "IBM",
+                    "pages": [
+                      "cookbook/autoregressive/IBM/Granite-4.2"
+                    ]
+                  },
+                  {
                     "group": "LiquidAI",
                     "pages": [
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
