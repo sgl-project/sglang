@@ -7,7 +7,6 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.reject_sampling import (
-    chain_speculative_sampling_torch,
     chain_speculative_sampling_triton,
 )
 from sglang.kernels.ops.speculative.triton_compat import cdiv, jit, tl
@@ -119,42 +118,22 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    if inputs_on_cuda(candidates):
-        chain_speculative_sampling_triton(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            uniform_samples=uniform_samples,
-            uniform_samples_for_final_sampling=uniform_samples_final,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=1.0,
-            threshold_acc=1.0,
-            deterministic=True,
-        )
-    else:
-        # Ascend NPU / CPU: no Triton; the torch reference writes the same
-        # buffers with the same acceptance and final-sampling semantics.
-        chain_speculative_sampling_torch(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            uniform_samples=uniform_samples,
-            uniform_samples_for_final_sampling=uniform_samples_final,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=1.0,
-            threshold_acc=1.0,
-            deterministic=True,
-        )
+    chain_speculative_sampling_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_final,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
         correct_len, cap_trim_lens = CapCorrectLen.execute(

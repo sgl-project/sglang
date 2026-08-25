@@ -263,6 +263,97 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
+def test_worker_warns_once_when_npu_selector_sampling_falls_back(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    warnings = []
+    monkeypatch.setattr(worker_mod, "_is_npu", True)
+    monkeypatch.setattr(
+        worker_mod.logger, "warning", lambda *args: warnings.append(args)
+    )
+    worker = SimpleNamespace(
+        selector=object(),
+        _warned_sampling_fallback=False,
+        ps=SimpleNamespace(tp_rank=0),
+    )
+    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
+
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+
+    assert worker._warned_sampling_fallback
+    assert len(warnings) == 1
+    assert "sampling distribution will not be preserved" in warnings[0][0]
+
+    monkeypatch.setattr(worker_mod, "_is_npu", False)
+    worker._warned_sampling_fallback = False
+    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
+    assert len(warnings) == 1
+
+
+def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_is_npu", True)
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.7]]),
+        top_ks=torch.tensor([[8]]),
+        is_all_greedy=False,
+    )
+
+    sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
+    sampler.temperatures = torch.zeros(1)
+    sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
+    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
+    torch.testing.assert_close(sampler.temperatures, torch.ones(1))
+    assert sampler.greedy_mask.tolist() == [True]
+
+    monkeypatch.setattr(worker_mod, "_is_npu", False)
+    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
+    torch.testing.assert_close(sampler.temperatures, torch.tensor([0.7]))
+    assert sampler.greedy_mask.tolist() == [False]
+    monkeypatch.setattr(worker_mod, "_is_npu", True)
+
+    observed = {}
+
+    def sample_path(**kwargs):
+        observed.update(kwargs)
+        return torch.zeros((1, 1), dtype=torch.int64), torch.zeros((1, 1, 2))
+
+    selector = SimpleNamespace(
+        build_lattice=lambda **kwargs: torch.zeros((1, 1, 2, 2)),
+        sample_path=sample_path,
+    )
+    draft_model = SimpleNamespace(
+        lm_head=None,
+        candidate_selector=selector,
+        compute_candidates=lambda hidden: (
+            torch.zeros((1, 2), dtype=torch.int64),
+            torch.zeros((1, 2)),
+        ),
+    )
+    worker = SimpleNamespace(
+        draft_model=draft_model,
+        selector=selector,
+        block_size=2,
+        _selector_sample=None,
+    )
+    draft_logits_output = SimpleNamespace(hidden_states=torch.zeros((2, 4)))
+
+    worker_mod.DFlashWorkerV2._propose_selector_block(
+        worker,
+        draft_logits_output=draft_logits_output,
+        bs=1,
+        lm_head=object(),
+        anchor_token_ids=torch.zeros(1, dtype=torch.int64),
+        sampling_info=sampling_info,
+    )
+
+    torch.testing.assert_close(observed["temperatures"], torch.ones(1))
+    assert observed["greedy_mask"].tolist() == [True]
+    assert worker._selector_sample is None
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

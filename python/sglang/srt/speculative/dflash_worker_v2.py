@@ -198,7 +198,7 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
 
 
 class _SelectorDraftSampler:
-    """Selector decode folded into the draft cuda graph, greedy and T>0 alike.
+    """Selector decode folded into the draft device graph, greedy and T>0 alike.
 
     One captured graph serves both: it always walks the sampling path, and a static
     greedy_mask selects the argmax per row.
@@ -225,7 +225,7 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        if sampling_info is None:
+        if sampling_info is None or _is_npu:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
@@ -458,7 +458,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
-                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                    "Disable DFLASH draft device graph because only %.2f GB GPU "
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
@@ -502,7 +502,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode (greedy + sampling) folded into the "
-                    "draft cuda graph."
+                    "draft device graph."
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
@@ -530,7 +530,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start = int(shard.org_vocab_start_index)
         if self.ps.tp_rank == 0:
             logger.info(
-                "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
+                "DFLASH draft greedy head folded into the draft device graph (tp=%d).",
                 tp_group.world_size,
             )
         return _DflashDraftSampler(
@@ -968,17 +968,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)
-            if sampling_info is None
+            if sampling_info is None or _is_npu
             else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
+        )
+        greedy_mask = (
+            torch.ones(bs, dtype=torch.bool, device=device)
+            if _is_npu
+            else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
             temperatures=temperatures,
-            greedy_mask=resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=device
-            ),
+            greedy_mask=greedy_mask,
         )
         if not _is_all_greedy(sampling_info) and not _is_npu:
             self._selector_sample = (candidate_ids, q_rows)
@@ -1610,23 +1613,24 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
-        # A selector draft carries its own q and verifies through accept_sampling, so
-        # it never falls back to greedy argmax however this build was compiled.
-        if (
-            sampling_info is None
-            or sampling_info.is_all_greedy
-            or self.selector is not None
-        ):
+        if sampling_info is None or sampling_info.is_all_greedy:
             return
 
+        sampling_verify_available = (
+            not _is_npu
+            if self.selector is not None
+            else is_dflash_sampling_verify_available()
+        )
         if (
-            not is_dflash_sampling_verify_available()
+            not sampling_verify_available
             and not self._warned_sampling_fallback
             and self.ps.tp_rank == 0
         ):
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "
-                "falling back to greedy argmax verification."
+                "falling back to greedy argmax verification. The requested sampling "
+                "distribution will not be preserved; use temperature=0 and top_k=1 "
+                "for lossless greedy decoding."
             )
             self._warned_sampling_fallback = True
 
@@ -1986,14 +1990,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        # CUDA prepare_for_verify pre-plans attention metadata; NPU leaves
+        # planning to the forward path.
+        if not _is_npu:
+            verify_forward_batch.mark_forward_metadata_ready()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            # Only the CUDA prepare_for_verify pre-plans (load_batch /
-            # init_forward_metadata); the NPU branch leaves planning to the
-            # forward path, so it must not mark metadata ready here.
-            skip_attn_backend_init=None if _is_npu else True,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph

@@ -1,9 +1,7 @@
-"""Triton imports that tolerate a missing triton install.
+"""Import helpers for speculative kernel modules that may not launch Triton.
 
-Kernel modules under this package import triton at module scope. Builds
-without triton (e.g. some Ascend NPU images) must still be able to import
-them so device-dispatched torch fallbacks can load; only *launching* a
-Triton kernel is an error there, and those code paths never run.
+This keeps these modules importable without Triton, but does not make every
+higher-level speculative-decoding dependency Triton-free.
 """
 
 from __future__ import annotations
