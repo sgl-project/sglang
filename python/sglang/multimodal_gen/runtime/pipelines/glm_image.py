@@ -3,18 +3,16 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DecodingStage,
-    DenoisingStage,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
     GlmImageAR,
     GlmImageBeforeDenoisingStage,
+    GlmImageDecodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-class GlmImageDenoiserDecodingStage(DecodingStage):
+class GlmImageDenoiserDecodingStage(GlmImageDecodingStage):
     """Run VAE decoding on the denoiser because this topology has no decoder worker."""
 
     @property
@@ -87,7 +85,14 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 "decoding_stage",
             )
         else:
-            self.add_standard_decoding_stage()
+            self.add_stage_factory(
+                RoleType.DECODER,
+                lambda: GlmImageDecodingStage(
+                    vae=self.get_module("vae"),
+                    pipeline=self,
+                ),
+                "decoding_stage",
+            )
 
 
 EntryClass = [GlmImagePipeline]

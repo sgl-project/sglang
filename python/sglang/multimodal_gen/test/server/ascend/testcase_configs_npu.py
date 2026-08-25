@@ -27,6 +27,7 @@ JOYAI_IMAGE_EDIT_WEIGHTS_PATH = use_modelscope(
 )
 LTX_2_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
+MINIMAX_H3_WEIGHTS_PATH = use_modelscope("MiniMax/MiniMax-H3")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
 WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH = use_modelscope(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -145,7 +146,69 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    # === Text+Image to Video+Audio (TI2V)
+    # === Text to Video+Audio (T2VA)
+    DiffusionTestCase(
+        "minimax_h3_t2va_2npu",
+        DiffusionServerArgs(
+            model_path=MINIMAX_H3_WEIGHTS_PATH,
+            modality="video",
+            num_gpus=2,
+            tp_size=2,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--dit-cpu-offload",
+                "false",
+                "--sp-degree",
+                "1",
+                "--attention-backend",
+                "laser_attn",
+                "--component-residency",
+                "text_encoder=layerwise-offload",
+            ],
+            env_vars={
+                "SGLANG_CACHE_DIT_ENABLED": "true",
+                "SGLANG_CACHE_DIT_FN": "2",
+                "SGLANG_CACHE_DIT_BN": "1",
+                "SGLANG_CACHE_DIT_WARMUP": "4",
+                "SGLANG_CACHE_DIT_RDT": "0.4",
+                "SGLANG_CACHE_DIT_MC": "4",
+                "SGLANG_CACHE_DIT_TAYLORSEER": "true",
+                "SGLANG_CACHE_DIT_TS_ORDER": "2",
+                "HCCL_BUFFSIZE": "256",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "At night, while their owner sleeps in a bedroom, three cats "
+                "march in loudly playing tiny brass instruments, then abruptly "
+                "file out."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 50,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 1101,
+            },
+        ),
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    # === Text+Image to Video+Audio (TI2VA)
     DiffusionTestCase(
         "ltx_2_ti2va_2npu",
         DiffusionServerArgs(
