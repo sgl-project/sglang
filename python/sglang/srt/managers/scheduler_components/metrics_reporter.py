@@ -324,6 +324,7 @@ class SchedulerMetricsReporter:
                 for seq_len in batch.seq_lens_cpu:
                     decode_kv.add(int(seq_len))
             else:
+                # Requests hold post-step lengths here; the mirror may hold pre-step lengths.
                 for req in batch.reqs:
                     decode_kv.add(req.seqlen)
 
