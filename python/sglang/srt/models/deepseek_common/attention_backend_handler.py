@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -190,6 +190,20 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        # DCP takes the same MHA route, in its ONE_SHOT form:
+        # forward_normal_rocm_prepare runs all_gather_kv_cache_for_mha_extend --
+        # which assembles the round-robin prefix and hands it to kv_b_proj for
+        # per-head materialization -- only when forward_batch.mha_one_shot is
+        # set, and only the one-shot prepare sets it. Under plain MHA the prefix
+        # is silently never assembled, so k/v hold the extend tokens alone while
+        # cu_seqlens_k still spans prefix + extend.
+        #
+        # The concat this adds has no head-count constraint on ROCm: both
+        # power-of-2 fast paths in forward_mha are _is_cuda-gated, so K3's 12
+        # heads take the generic elementwise branch -- the same one the non-DCP
+        # return below has always used.
+        if get_parallel().dcp_enabled:
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA

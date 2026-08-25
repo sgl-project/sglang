@@ -4235,6 +4235,66 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
+        # Resolve the decode backend the way the model overrides do: gating on
+        # self.attention_backend alone misses --decode-attention-backend aiter.
+        if self.dcp_size > 1 and is_hip():
+            from sglang.srt.arg_groups.overrides import attention_backends_of
+
+            _, decode_backend = attention_backends_of(self)
+            if decode_backend == "aiter":
+                self._validate_aiter_mla_dcp()
+
+    def _validate_aiter_mla_dcp(self):
+        """Validate aiter MLA decode-context-parallel (--dcp-size > 1)."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA:
+            return
+
+        # fp8 kv-cache needs no opt-in here. It serves on both DCP MLA paths:
+        # Triton at any batch, and Gluon from ROCm/aiter#4480 onwards (before
+        # it, mla_gluon's bh16bn128 regime asserts batch_size == 1 inside the
+        # kernel, on the first batched decode rather than at startup).
+        if envs.SGLANG_USE_AITER_GLUON_MLA_DCP.get():
+            self._validate_gluon_mla_dcp_buildable()
+
+    def _validate_gluon_mla_dcp_buildable(self):
+        """Reject SGLANG_USE_AITER_GLUON_MLA_DCP when triton is too old.
+
+        ``aiter.ops.triton.gluon.mla_gluon`` builds its shared-memory layout
+        with ``gl.PaddedSharedLayout(..., cga_layout=...)``, a kwarg that only
+        exists from triton 3.7. On 3.6 nothing complains until the kernel is
+        compiled -- i.e. during cuda-graph capture, minutes into startup, as a
+        CompilationError naming neither triton nor this flag (and with
+        --disable-cuda-graph it moves to the first decode request instead).
+        aiter's own guard misses it too: ``aiter/ops/triton/gluon/__init__.py``
+        only rejects below 3.6.0, so a ``3.6.0+git...`` build sails past.
+        """
+        try:
+            from triton.experimental.gluon import language as gl
+        except ImportError as e:
+            reason = f"triton's gluon language is not importable ({e})"
+        else:
+            import inspect
+
+            params = inspect.signature(gl.PaddedSharedLayout.__init__).parameters
+            if "cga_layout" in params:
+                return
+            import triton
+
+            reason = (
+                f"the installed triton ({triton.__version__}) does not accept "
+                "gl.PaddedSharedLayout(cga_layout=...), which the kernel requires"
+            )
+
+        raise ValueError(
+            "SGLANG_USE_AITER_GLUON_MLA_DCP=1 selects aiter's Gluon MLA kernel "
+            f"for the DCP decode path, but {reason}. That kernel needs "
+            "triton >= 3.7. Either unset SGLANG_USE_AITER_GLUON_MLA_DCP to use "
+            "the Triton DCP path, or upgrade triton."
+        )
+
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
             raise ValueError(
