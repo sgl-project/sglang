@@ -369,7 +369,8 @@ python -m sglang.bench_serving \
     --max-concurrency 40 \
     --num-prompts 40 \
     --request-rate inf \
-    --seed 1
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B W4A8 8P IN16K OUT1K 20ms
@@ -1189,5 +1190,6 @@ python -m sglang.bench_serving \
     --max-concurrency 96 \
     --num-prompts 96 \
     --request-rate inf \
-    --seed 1
+    --temperature 0.6 \
+    --top-p 0.95
 ```
