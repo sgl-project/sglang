@@ -1614,13 +1614,27 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             elif do_cfg and effective_scale != 1.0:
                 cond_text_seq_len = batch.extra["cond_text_seq_len"]
                 uncond_text_seq_len = batch.extra["uncond_text_seq_len"]
+                text_seq_lens_differ = cond_text_seq_len != uncond_text_seq_len
+                if (
+                    text_seq_lens_differ
+                    and not self._logged_cfg_split
+                    and not self._current_batch_is_warmup
+                ):
+                    self._logged_cfg_split = True
+                    self.log_info(
+                        "Prompt and negative prompt tokenize to different lengths "
+                        f"({cond_text_seq_len} vs {uncond_text_seq_len}); running "
+                        "the CFG branches in separate forwards to keep padding "
+                        "out of the cross-attention"
+                    )
+                single_cfg_rank_control_free = (
+                    cfg_world_size == 1 and control_latents is None
+                )
                 can_batch_text_cfg = (
-                    cfg_world_size == 1
-                    and control_latents is None
-                    and cond_text_seq_len == uncond_text_seq_len
+                    single_cfg_rank_control_free and not text_seq_lens_differ
                 )
                 if can_batch_text_cfg:
-                    # Single-GPU, control-free text CFG: one batch_size=2 forward
+                    # Single-CFG-rank, control-free text CFG: one batched forward
                     # (lower launch overhead, no control tokens to duplicate).
                     noise_pred = self._predict_noise_cfg_batched(
                         latents=latents,
@@ -1642,22 +1656,36 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
                     )
+                elif single_cfg_rank_control_free:
+                    # Keep each branch at its native text length, but preserve the
+                    # canonical CFG operation order used by the batched path. The
+                    # algebraically equivalent coefficient sum rounds differently
+                    # in BF16 and changes deterministic generation results.
+                    noise_pred = self._predict_noise_text_cfg_serial(
+                        latents=latents,
+                        timestep=timestep,
+                        cond_text_ids=cond_text_ids,
+                        cond_text_mask=cond_text_mask,
+                        uncond_text_ids=uncond_text_ids,
+                        uncond_text_mask=uncond_text_mask,
+                        video_shape=video_shape,
+                        fps=fps,
+                        guidance_scale=effective_scale,
+                        noisy_frame_mask=velocity_mask,
+                        cond_text_seq_len=cond_text_seq_len,
+                        uncond_text_seq_len=uncond_text_seq_len,
+                        current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
+                    )
                 else:
-                    if (
-                        cond_text_seq_len != uncond_text_seq_len
-                        and not self._logged_cfg_split
-                        and not self._current_batch_is_warmup
-                    ):
-                        self._logged_cfg_split = True
-                        self.log_info(
-                            "Prompt and negative prompt tokenize to different lengths "
-                            f"({cond_text_seq_len} vs {uncond_text_seq_len}); running "
-                            "the CFG branches in separate forwards to keep padding "
-                            "out of the cross-attention"
-                        )
-                    # CFG parallel, control passthrough, or unequal text lengths:
-                    # distribute unbatched branches across ranks. Separate
-                    # forwards preserve each branch's native text length.
+                    # CFG parallel or control passthrough: distribute unbatched
+                    # branches across ranks. Separate forwards preserve each
+                    # branch's native text length.
                     branches = self._text_cfg_branches(
                         cond_text_ids,
                         cond_text_mask,
@@ -1902,6 +1930,77 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             return cfg_model_parallel_all_reduce(acc)
         return acc
+
+    def _predict_noise_text_cfg_serial(
+        self,
+        *,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        cond_text_ids: torch.Tensor,
+        cond_text_mask: torch.Tensor,
+        uncond_text_ids: torch.Tensor,
+        uncond_text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float,
+        guidance_scale: float,
+        noisy_frame_mask: torch.Tensor | None = None,
+        cond_text_seq_len: int | None = None,
+        uncond_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run control-free text CFG as separate native-length forwards.
+
+        Keep the canonical uncond + g * (cond - uncond) operation order.
+        Although a coefficient-weighted sum is algebraically equivalent, it is
+        not numerically equivalent in BF16 and would make results depend on
+        whether the two prompts happen to tokenize to the same length.
+        """
+        common_kwargs = {
+            "latents": latents,
+            "timestep": timestep,
+            "video_shape": video_shape,
+            "fps": fps,
+            "noisy_frame_mask": noisy_frame_mask,
+            "current_timestep": current_timestep,
+            "sound_latents": sound_latents,
+            "action_latents": action_latents,
+            "action_domain_ids": action_domain_ids,
+            "action_noisy_mask": action_noisy_mask,
+            "action_fps": action_fps,
+            "action_start_frame_offset": action_start_frame_offset,
+            "control_latents": None,
+        }
+        cond = self._run_transformer(
+            text_ids=cond_text_ids,
+            text_mask=cond_text_mask,
+            cache_key="cond",
+            max_text_seq_len=cond_text_seq_len,
+            **common_kwargs,
+        )
+        uncond = self._run_transformer(
+            text_ids=uncond_text_ids,
+            text_mask=uncond_text_mask,
+            cache_key="uncond",
+            max_text_seq_len=uncond_text_seq_len,
+            **common_kwargs,
+        )
+
+        def _combine(
+            cond_pred: torch.Tensor, uncond_pred: torch.Tensor
+        ) -> torch.Tensor:
+            return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
+
+        if isinstance(cond, tuple):
+            return tuple(
+                _combine(c, u) for c, u in zip(cond, uncond, strict=True)
+            )
+        return _combine(cond, uncond)
 
     def _predict_noise_cfg_batched(
         self,
