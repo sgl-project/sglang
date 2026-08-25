@@ -278,6 +278,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "b12x",
     "cutlass",
     "aiter",
     "marlin",
