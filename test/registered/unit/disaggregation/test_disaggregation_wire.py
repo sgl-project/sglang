@@ -28,8 +28,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
+    should_send_replicated_state,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -186,6 +188,48 @@ class TestQwen4StateWire(unittest.TestCase):
             ),
             [(0, 2), (1, 3)],
         )
+
+    def test_replicated_state_tp_policy(self):
+        for src_tp, dst_tp, rank, expected in (
+            (4, 1, 0, True),
+            (4, 1, 1, False),
+            (1, 4, 0, True),
+            (4, 4, 3, True),
+        ):
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, rank=rank):
+                self.assertEqual(
+                    should_send_replicated_state(
+                        src_attn_tp_size=src_tp,
+                        dst_attn_tp_size=dst_tp,
+                        local_tp_rank_in_group=rank,
+                    ),
+                    expected,
+                )
+
+        common = dict(
+            src_item_len=96,
+            dst_item_len=96,
+            src_dim=0,
+            dst_dim=0,
+            outer_count=1,
+            src_attn_tp_size=4,
+            dst_attn_tp_size=1,
+            dst_tp_rank_in_group=0,
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=0),
+            [(0, 0, 96)],
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=1),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            should_send_replicated_state(
+                src_attn_tp_size=3,
+                dst_attn_tp_size=2,
+                local_tp_rank_in_group=0,
+            )
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
