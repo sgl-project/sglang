@@ -24,7 +24,6 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -51,6 +50,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
@@ -1561,7 +1561,9 @@ class SchedulerDisaggMixin:
                 output_batches = list(
                     self.worker.execute_forward_sequentially(output_reqs)
                 )
-                output_batch = self.worker._merge_expanded_output_batches(output_batches)
+                output_batch = self.worker._merge_expanded_output_batches(
+                    output_batches
+                )
             else:
                 output_batch = self.worker.execute_forward([req])
 
