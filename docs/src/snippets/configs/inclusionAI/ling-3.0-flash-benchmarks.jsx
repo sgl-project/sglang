@@ -177,8 +177,8 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 71292.20, tpot_ms: 38.09, tokens_per_sec_per_gpu: 1157 },
     ],
-    accuracy: { gsm8k_pct: null },
-    notes: "Full GSM8K run in progress on GB10; single-chip memory ceiling makes c=16 prefill the bottleneck.",
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.55%; single-chip memory ceiling makes c=16 prefill the bottleneck.",
   },
   {
     match: { hw: "gb10", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
