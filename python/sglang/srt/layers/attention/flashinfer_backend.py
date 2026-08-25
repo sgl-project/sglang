@@ -1491,6 +1491,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
