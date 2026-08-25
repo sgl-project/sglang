@@ -1678,6 +1678,10 @@ class DeepseekV4AscendAttnBackend(
             c1a_kwargs = c1a_kwargs | host_inputs
             metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
         else:
+            c1a_kwargs = c1a_kwargs | {
+                "cu_seqlens_q": actual_seq_lengths_q_pa,
+                "seqused_kv": actual_seq_lengths_kv,
+            }
             metadata_op, _ = _sparse_attn_ops()
         kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
 

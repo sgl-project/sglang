@@ -258,6 +258,10 @@ def _use_npu_a5_mxfp8_wo_a(quant_config) -> bool:
     return tuple(weight_block_size or ()) == (128, 128)
 
 
+def _should_dequant_fp8_wo_a(quant_config) -> bool:
+    return not (_FP8_WO_A_GEMM or _use_npu_a5_mxfp8_wo_a(quant_config))
+
+
 def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
     if _is_xpu:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
@@ -3625,11 +3629,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-            or _use_npu_a5_mxfp8_wo_a(self.quant_config)
-            or not _FP8_WO_A_GEMM
-        ):
+        if _should_dequant_fp8_wo_a(self.quant_config):
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
