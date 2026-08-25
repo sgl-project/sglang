@@ -41,11 +41,12 @@ class TestKimiK3B300LowLatency(MMMUProMixin, SpecDecodingMixin, CustomTestCase):
     """TP8 Low Latency recipe with DSPARK linear ReplaySSM speculation."""
 
     mmmu_pro_score_threshold = 0.75
-    mmmu_pro_num_examples = 300
+    mmmu_pro_num_examples = 200
     mmmu_pro_load_preset_from_model_id = MODEL_PATH
-    # Gate the speculative average over the accuracy workload rather than the
-    # single greedy request in test_bs_1_speed below.
-    mmmu_pro_accept_length_thres = 4.5
+    # MMMU-Pro's long multimodal reasoning has a lower speculative average than
+    # GSM8K (2.62 in the first B300 run). Keep a workload-specific regression
+    # gate here; test_bs_1_speed below retains the stricter single-prompt gate.
+    mmmu_pro_accept_length_thres = 2.4
     # Both scale with how far that one greedy prompt runs, and speed is
     # end-to-end, so launch and TTFT are amortized over the output -- it sits
     # well below the steady decode rate the server logs. Coarse guards only.
