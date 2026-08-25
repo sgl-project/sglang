@@ -9,7 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +77,9 @@ def init_dcp_pack_buffers(
         _get_custom_mem_pool,
     )
 
-    chunk = get_schedule().chunked_prefill_size
-    max_tokens = int(chunk) if chunk is not None and chunk > 0 else 32768
+    max_tokens = max_prefill_buffer_tokens()
+    if max_tokens <= 0:
+        max_tokens = get_schedule().max_prefill_tokens
     # NOTE(kpham-sgl): pack_buffer_bytes = max_tokens x sum(per-layer token bytes).
     # At 32,768 tokens and 61 MLA layers x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
     size_bytes = dcp_pack_buffer_bytes(
