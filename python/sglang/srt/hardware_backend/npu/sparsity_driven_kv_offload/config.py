@@ -9,19 +9,12 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
-
-_ENABLE_ENV_VAR = "SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD"
-
-
-def is_sparsity_driven_kv_offload_requested() -> bool:
-    return get_bool_env_var(_ENABLE_ENV_VAR)
-
 
 def is_sparsity_driven_kv_offload_enabled(
     *,
@@ -29,7 +22,7 @@ def is_sparsity_driven_kv_offload_enabled(
     server_args: ServerArgs,
     use_mla_backend: bool,
 ) -> bool:
-    if not is_sparsity_driven_kv_offload_requested():
+    if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         return False
 
     if not (
@@ -39,13 +32,14 @@ def is_sparsity_driven_kv_offload_enabled(
         and is_deepseek_dsa(model_config.hf_config)
     ):
         raise ValueError(
-            f"{_ENABLE_ENV_VAR} requires an NPU DSA-family MLA model "
+            "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires an NPU "
+            "DSA-family MLA model "
             "(for example DeepSeek V3.2 or GLM-5.x) using the Ascend MLA "
             "attention backend."
         )
     if server_args.max_running_requests is None:
         raise ValueError(
-            f"{_ENABLE_ENV_VAR} requires an explicit "
+            "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires an explicit "
             "--max-running-requests to bound the per-process host KV allocation."
         )
     return True

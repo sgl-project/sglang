@@ -4,9 +4,6 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    is_sparsity_driven_kv_offload_requested,
-)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -424,7 +421,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
-            is_sparsity_driven_kv_offload_requested()
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")

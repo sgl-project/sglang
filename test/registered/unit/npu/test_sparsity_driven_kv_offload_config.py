@@ -36,7 +36,7 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
         with (
             patch.dict(
                 os.environ,
-                {"SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD": "1"},
+                {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"},
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
