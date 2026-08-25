@@ -866,10 +866,7 @@ PERF_BASELINE_PLATFORM_ALIASES = {
     "rtx5090": "5090",
     "5090": "5090",
     "xpu": "xpu_b60",
-    "xpub60": "xpu_b60",
-    "arcprob60": "xpu_b60",
     "bmg": "xpu_b60",
-    "battlemage": "xpu_b60",
 }
 
 
