@@ -258,10 +258,11 @@ class DSparkAttention(MqaAttentionBase):
             q_out = q_padded[:, : self.n_local_heads, :]
 
         if enable_multi_stream:
-            current_stream = torch.cuda.current_stream()
+            device_module = torch.get_device_module()
+            current_stream = device_module.current_stream()
             stream_kv = self.alt_streams[0]
             stream_kv.wait_stream(current_stream)
-            with torch.cuda.stream(stream_kv):
+            with device_module.stream(stream_kv):
                 kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
@@ -712,10 +713,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         use_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
-            and torch.cuda.is_available()
+            and (_is_npu or torch.cuda.is_available())
         )
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
-            [torch.cuda.Stream()] if use_multi_stream else None
+            [torch.get_device_module().Stream()] if use_multi_stream else None
         )
         self.stages = nn.ModuleList(
             [
