@@ -1039,6 +1039,37 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
             self.live_page_count -= int(freed_p_pages.shape[0])
 
+    def free_v_pages_lazy(self, free_v_pages: torch.Tensor) -> None:
+        """Fixed-shape twin of `_free_lazy` for callers that already hold the
+        freed range's distinct virtual PAGE ids (sorted ascending for bitwise
+        parity with `_free_lazy`'s `torch.unique`; ps==1 callers pass the raw
+        token order `_free_lazy` would use). Skips the data-dependent dedup,
+        so it never forces a stream sync under an in-flight forward. LAZY
+        mode only — eager compaction walks freed ids on the CPU and cannot be
+        made sync-free without redesign."""
+        assert self.lazy_compaction
+        if free_v_pages.numel() == 0:
+            return
+        self._stats_n_free_lazy += 1
+        with record_function("MultiEndedAlloc.free_v_pages_lazy"):
+            freed_p_pages = self.virtual_to_physical[free_v_pages]
+            # Device-resident -1, not the python scalar: index_put_ with a
+            # python scalar copies it host->device with a blocking memcpy — a
+            # stream sync, the very thing this method exists to avoid.
+            neg_one = torch.full(
+                (), -1, dtype=self.virtual_to_physical.dtype, device=self.device
+            )
+            self.virtual_to_physical[free_v_pages] = neg_one
+            self.physical_to_virtual[freed_p_pages] = neg_one
+            if self.is_id_owner:
+                self.free_virtual_ids = torch.cat(
+                    [self.free_virtual_ids, free_v_pages]
+                )
+            self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
+            if _SORT_FREE_LIST_AFTER_MERGE:
+                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
+            self.live_page_count -= int(free_v_pages.shape[0])
+
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
         """Cat `pages` onto `_free_phys_pages` (+ optional sort). Called by `_flush`
         at END to merge event-fired compaction-srcs (`released_fired`) AFTER the
@@ -2136,6 +2167,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
+        # Parent's tail-only-swa alloc path (which installs unmapped slots) is
+        # unsupported here; stays False. Read by free_swa_segment_inplace.
+        self._swa_mapping_may_be_partial = False
 
         logger.info(
             "[unified-memory-pool] UnifiedSWATokenToKVPoolAllocator ready: "
@@ -2478,6 +2512,33 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape free_swa for a page-aligned out-of-window range: page
+        reps via a stride slice, liveness filter skipped (first-time-freed
+        below the frontier means every virtual page is bound). Eager
+        compaction and unaligned inputs fall back to the legacy path.
+        """
+        n = free_index.numel()
+        if n == 0:
+            return
+        ps = self.page_size
+        sa = self.swa_attn_allocator
+        if (
+            not sa.lazy_compaction
+            or self._swa_mapping_may_be_partial
+            or start_pos % ps != 0
+            or n % ps != 0
+        ):
+            self.free_swa(free_index)
+            return
+        v = free_index.detach().to(torch.int64)
+        if ps == 1:
+            free_v_pages = v  # raw order: _free_lazy skips unique at ps==1
+        else:
+            free_v_pages = torch.sort(v[::ps] // ps).values
+        sa.free_v_pages_lazy(free_v_pages)
+        sa.clear_inverse_history()
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -2509,6 +2570,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self._swa_mapping_may_be_partial = False
 
     # -- Lazy compaction hooks --
 

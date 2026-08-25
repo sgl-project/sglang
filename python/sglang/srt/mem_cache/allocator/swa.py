@@ -96,6 +96,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        # True once a tail-only swa allocation installed zero mappings;
+        # fixed-shape frees then fall back to the filtering path.
+        self._swa_mapping_may_be_partial = False
 
         self._kvcache = kvcache
         self.clear()
@@ -281,6 +284,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if swa_tail_len < extend_num_tokens:
             self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
+            # Allocated-but-unmapped slots now exist; the in-place segment
+            # free must keep filtering (see free_swa_segment_inplace).
+            self._swa_mapping_may_be_partial = True
         return alloc_full_indices
 
     def alloc_decode(
@@ -368,6 +374,50 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.clear_full_to_swa_mapping(mapping_indices)
 
+    def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
+        """free_swa for a page-aligned out-of-window range with fixed-shape
+        ops only (no unique/nonzero -> no stream sync under the in-flight
+        forward): page reps are the stride slice ``free_index[::page_size]``,
+        and a first-time-freed range below the frontier has every mapping
+        live, so the ``> 0`` filter is skippable. Same call site and timing;
+        bitwise-identical end state. Partial mappings, unaligned inputs, and
+        in-group calls fall back to free_swa.
+        """
+        n = free_index.numel()
+        if n == 0:
+            return
+        ps = self.page_size
+        if (
+            not self.is_not_in_free_group
+            or self._swa_mapping_may_be_partial
+            or start_pos % ps != 0
+            or n % ps != 0
+        ):
+            self.free_swa(free_index)
+            return
+
+        if ps == 1:
+            swa_slots = self.full_to_swa_index_mapping[free_index]
+            self.swa_attn_allocator.free(swa_slots)
+            self.clear_full_to_swa_mapping(free_index)
+            return
+
+        page_reps = free_index[::ps]
+        swa_reps = self.full_to_swa_index_mapping[page_reps]
+        if self.swa_attn_allocator.debug_mode:
+            # Reference check of the fixed-shape contract (CPU; debug only).
+            ref_pages = torch.unique(free_index.cpu() // ps)
+            got_pages = torch.sort(page_reps.cpu() // ps)[0]
+            assert torch.equal(ref_pages, got_pages), "range is not whole pages"
+            assert bool(
+                (swa_reps.cpu() > 0).all()
+            ), "out-of-window range has unmapped slots"
+        # Requests own disjoint pages, so the representatives are distinct; a
+        # fixed-shape sort reproduces free()'s unique ordering.
+        swa_page_ids = torch.sort(swa_reps // ps).values
+        self.swa_attn_allocator.free_page_ids(swa_page_ids)
+        self.clear_full_to_swa_mapping(free_index)
+
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
@@ -408,6 +458,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self._swa_mapping_may_be_partial = False
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -515,6 +566,19 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
+
+    def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
+        # Identity mapping (never zeroed) and page_size == 1: the only
+        # data-dependent op in free_swa is its `> 0` filter, and an
+        # out-of-window range holds real slot values, so drop the filter.
+        # In-group behavior is exactly free_swa's.
+        if free_index.numel() == 0:
+            return
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free(free_index)
+        else:
+            self.free_group.append(self._copy_for_free_group(free_index))
+
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
