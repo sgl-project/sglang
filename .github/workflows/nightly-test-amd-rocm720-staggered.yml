@@ -1,0 +1,14 @@
+name: Nightly Test (AMD ROCm 7.2.0)
+
+on:
+  schedule:
+    # Offset from the primary ROCm 7.2.4 run by 12 hours so the two
+    # image flavors do not double the instantaneous runner demand.
+    - cron: '30 5 * * *'
+
+jobs:
+  run-rocm720:
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
+    with:
+      rocm_version: rocm720
+    secrets: inherit

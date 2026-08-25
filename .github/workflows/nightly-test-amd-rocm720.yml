@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version (the nightly schedule runs rocm724 only; "all" also runs rocm720, at double the GPU cost)'
+        description: 'ROCm image version (scheduled flavors run separately; "all" runs both together)'
         required: false
         type: choice
         default: rocm724
@@ -115,8 +115,7 @@ on:
         description: 'ROCm image version ("all" runs every flavor)'
         required: false
         type: string
-        # Same single flavor the schedule uses: a caller that says nothing
-        # should not silently get double the GPU cost.
+        # Callers default to the primary flavor; use rocm720 or all explicitly.
         default: rocm724
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
@@ -148,8 +147,9 @@ concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
-  # Manual dispatch runs also get unique groups so they never cancel each other.
-  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  # Manual dispatch runs also get unique groups so they never cancel each other. Include the
+  # flavor so the staggered rocm724 and rocm720 schedules cannot cancel each other.
+  group: nightly-test-amd-rocm720-${{ inputs.rocm_version || 'rocm724' }}-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:

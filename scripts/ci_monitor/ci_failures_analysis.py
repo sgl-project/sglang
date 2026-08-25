@@ -2529,7 +2529,10 @@ def main():
         )
         nightly_amd_scheduled_runs = analyzer.get_recent_runs(
             limit=nightly_scheduled_limit,
-            workflow_filter=["nightly-test-amd-rocm720.yml"],
+            workflow_filter=[
+                "nightly-test-amd-rocm720.yml",
+                "nightly-test-amd-rocm720-staggered.yml",
+            ],
             filters={"event": "schedule"},
         )
         nightly_intel_scheduled_runs = analyzer.get_recent_runs(
@@ -2573,7 +2576,10 @@ def main():
         )
         nightly_amd_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
-            workflow_filter=["nightly-test-amd-rocm720.yml"],
+            workflow_filter=[
+                "nightly-test-amd-rocm720.yml",
+                "nightly-test-amd-rocm720-staggered.yml",
+            ],
         )
         nightly_intel_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
