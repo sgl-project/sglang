@@ -7,9 +7,7 @@ from pathlib import Path
 
 def install_namespace_packages() -> None:
     workspace = (
-        Path(os.environ["TEST_SRCDIR"])
-        / os.environ["TEST_WORKSPACE"]
-        / "python/sglang"
+        Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / "python/sglang"
     )
     sglang = types.ModuleType("sglang")
     sglang.__path__ = [str(workspace)]
@@ -40,9 +38,7 @@ class KernelMetadataTest(unittest.TestCase):
             op="bazel.identity",
             backend=KernelBackend.TORCH,
             target="builtins:id",
-            capabilities=frozenset(
-                [CapabilityRequirement(device=DeviceType.CPU)]
-            ),
+            capabilities=frozenset([CapabilityRequirement(device=DeviceType.CPU)]),
         )
         register_kernel(spec)
 

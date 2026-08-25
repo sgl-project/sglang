@@ -2,17 +2,14 @@ import ast
 import json
 import os
 import re
+import tomllib
 import unittest
 from pathlib import Path
-
-import tomllib
 
 
 def workspace_file(relative_path: str) -> Path:
     return (
-        Path(os.environ["TEST_SRCDIR"])
-        / os.environ["TEST_WORKSPACE"]
-        / relative_path
+        Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / relative_path
     )
 
 
@@ -21,9 +18,7 @@ def requirement_name(requirement: str) -> str:
 
 
 def torch_pulling_packages() -> frozenset[str]:
-    source = workspace_file(
-        "test/registered/core/test_srt_empty_deps.py"
-    ).read_text()
+    source = workspace_file("test/registered/core/test_srt_empty_deps.py").read_text()
     tree = ast.parse(source)
     for node in tree.body:
         if not isinstance(node, ast.Assign):
