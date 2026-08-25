@@ -297,9 +297,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = 0
+            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
         return alloc_full_indices
 
     def alloc_decode(
@@ -362,6 +360,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        if full_indices.numel() == 0:
+            return
+        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
+        # host-resident scalar and blocks until the stream drains.
+        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
+
     def free_swa(self, free_index: torch.Tensor):
         """Release only the SWA peers of these FULL slot ids, keeping the full
         side live. The mapping is the source of truth, so callers pass full ids
@@ -369,39 +374,37 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if not self.is_not_in_free_group:
-            self.swa_free_group.append(self._copy_for_free_group(free_index))
-            return
-
         if self.page_size == 1:
             # Per-token mapping, so no page to expand and every entry is mapped:
             # the caller's host-side liveness proof (`free_full` covers the rest)
             # is enough, and filtering here would need a device-side count.
-            swa_indices = self.full_to_swa_index_mapping[free_index]
+            mapping_indices = free_index
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
             if resolve_level() >= InvariantCheckLevel.WARN:
                 expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
-            self.swa_attn_allocator.free(swa_indices)
-            self._clear_mapping(free_index)
+        else:
+            # Paged: two things break a page-representative read, so keep the
+            # legacy expand-and-filter until both are closed.
+            #   1. A partially filled page owns full slots that never got an SWA
+            #      peer, so the gather sees the padding slot.
+            #   2. HiCache LOAD_BACK re-pairs a page-aligned full chunk with an
+            #      arbitrarily offset SWA chunk
+            #      (`swa_component.commit_hicache_transfer` advances by raw token
+            #      count), so one full page can span three SWA pages and share one
+            #      with its neighbour.
+            mapping_indices = self._expand_to_full_pages(free_index)
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            swa_indices = swa_indices[swa_indices > 0]
+
+        self.clear_full_to_swa_mapping(mapping_indices)
+
+        if not self.is_not_in_free_group:
+            # Resolve ownership now. A cache action later in this group may
+            # install a new mapping for the same full index.
+            self.swa_free_group.append(swa_indices)
             return
 
-        # Paged: two things break a page-representative read, so keep the legacy
-        # expand-and-filter until both are closed.
-        #   1. A partially filled page owns full slots that never got an SWA peer,
-        #      so the gather sees the padding slot.
-        #   2. HiCache LOAD_BACK re-pairs a page-aligned full chunk with an
-        #      arbitrarily offset SWA chunk (`swa_component.commit_hicache_transfer`
-        #      advances by raw token count), so one full page can span three SWA
-        #      pages and share one with its neighbour.
-        mapping_indices = self._expand_to_full_pages(free_index)
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self._clear_mapping(mapping_indices)
-
-    def _clear_mapping(self, full_indices: torch.Tensor) -> None:
-        # index_fill_ passes the 0 as a kernel argument; `mapping[...] = 0` would
-        # copy a host-resident scalar and stall the stream until it drains.
-        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
 
     def free_full(self, free_index: torch.Tensor):
         """Free the full-attention slots of a range whose SWA peers are already
@@ -425,22 +428,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_free_group = []
 
     def free_group_end(self):
-        # Not super(): the base concatenates free_group, which puts a later
-        # range's page boundary at an arbitrary stride offset for free_swa.
-        self.is_not_in_free_group = True
-        free_group, self.free_group = self.free_group, []
-        if free_group:
-            # Full side takes one call so torch.unique dedups across entries.
-            self.full_attn_allocator.free(torch.cat(free_group))
-            for indices in free_group:
-                self.free_swa(indices)
+        super().free_group_end()
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            # Replay each range on its own: concatenating them would put a
-            # later range's page boundary at an arbitrary stride offset.
-            for indices in swa_free_group:
-                self.free_swa(indices)
+            self.swa_attn_allocator.free(torch.cat(swa_free_group))
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []

@@ -5,7 +5,7 @@ CUDA-only: gpt-oss-20b is not part of the AMD streaming-session coverage.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
 from sglang.test.server_fixtures.streaming_session_fixture import (
     SWA_COMMON_ARGS,
@@ -14,6 +14,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 )
 
 register_cuda_ci(est_time=130, stage="extra-a", runner_config="1-gpu-large")
+register_cpu_ci(est_time=449, suite="base-c-test-cpu")
 
 
 class TestStreamingSessionSWARetractMixedChunk(

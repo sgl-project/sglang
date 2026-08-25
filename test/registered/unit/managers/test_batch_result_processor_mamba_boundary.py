@@ -17,6 +17,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+# The decode checkpoint grid is lcm(mamba_cache_chunk_size, tree page,
+# interval); keeping all three equal leaves it at the interval under test.
+TRACK_INTERVAL = 4
+
+
 def _make_batch() -> tuple[Req, ScheduleBatch]:
     sampling_params = SamplingParams(max_new_tokens=32)
     sampling_params.normalize(None)
@@ -31,6 +36,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
+    batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
     batch.device = "cpu"
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
     batch.enable_overlap = True
@@ -57,7 +63,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=None,
+        tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
@@ -74,6 +80,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
 def _make_result():
     return SimpleNamespace(
         copy_done=None,
+        auxiliary_host_output=None,
         routed_experts_output=None,
         indexer_topk_output=None,
         logits_output=SimpleNamespace(hidden_states=None, customized_info=None),
@@ -154,7 +161,8 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     # defaults.
                     get_context().override_server_args(
                         mamba_radix_cache_strategy="extra_buffer",
-                        mamba_track_interval=4,
+                        mamba_track_interval=TRACK_INTERVAL,
+                        _mamba_cache_chunk_size=TRACK_INTERVAL,
                     ),
                     patch(
                         "sglang.srt.managers.schedule_batch.alloc_for_decode",

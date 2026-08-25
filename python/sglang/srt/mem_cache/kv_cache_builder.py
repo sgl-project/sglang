@@ -32,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -120,7 +121,7 @@ def _register_legacy_hicache_draft(
         host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )
@@ -145,6 +146,18 @@ def _register_legacy_hicache_draft(
 BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 
+def uses_ssm_state(model_config) -> bool:
+    """Whether the model keeps recurrent/conv state alongside its attention KV."""
+    spec = linear_attn_model_spec(model_config)
+    return (
+        hybrid_gdn_config(model_config) is not None
+        or mamba2_config(model_config) is not None
+        or (spec.uses_mamba_radix_cache if spec is not None else False)
+        or kimi_linear_config(model_config) is not None
+        or hybrid_lightning_config(model_config) is not None
+    )
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -164,8 +177,13 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        # Host-pool retraction transfers full and sliding-window components
+        # only, so a model with recurrent state stays on cpu_tensor.
+        supports_host_pool = not uses_ssm_state(
+            tp_worker.model_runner.model_config
+        ) and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -227,15 +245,7 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
-    _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
-    is_hybrid_ssm = (
-        hybrid_gdn_config(tp_worker.model_runner.model_config) is not None
-        or mamba2_config(tp_worker.model_runner.model_config) is not None
-        or _registry_needs_mamba
-        or kimi_linear_config(tp_worker.model_runner.model_config) is not None
-        or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
-    )
+    is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
@@ -259,18 +269,38 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode-side radix cache supports SWA only through the unified tree, whose
+    # component pools preserve the full-attention prefix while transferring the
+    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
+    # incompatible with the prefix-match-and-lock allocation path.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models requires the unified radix "
+                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
+            if enable_hierarchical_cache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models currently supports only "
+                    "device-resident cache and is incompatible with "
+                    "--enable-hierarchical-cache."
+                )
+            if getattr(model_config, "is_deepseek_v4_arch", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+                )
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
