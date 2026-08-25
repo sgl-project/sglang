@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -203,12 +203,28 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Full queried page-hash chain, set by _storage_hit_query before
+        # hash_value is truncated to the hit boundary; the tail is the
+        # absence signal that invalidates buffer-mode existence beliefs.
+        self.all_hash_values: Optional[List[str]] = None
+        # Prefetch-outcome accounting, set at enqueue by the tree cache.
+        self.stats_requested_tokens = 0
+        self.stats_total_tokens = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
 
     def __lt__(self, other: StorageOperation):
         return self.id < other.id
+
+
+# Buffer-mode staging budgets. Prefetch staging is latency-critical
+# (wait_complete gates TTFT), so loads may fill the pool up to this fraction
+# before new prefetches are declined.
+HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
+# Write-staging floor: writes are deferrable, so the flush gate grows the
+# write window dynamically into whatever load staging is not using.
+HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 
 
 class PrefetchOperation(StorageOperation):
@@ -262,8 +278,10 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
     ):
         self.tp_group = tp_group
+        self.host_memory_mode = host_memory_mode
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -283,6 +301,9 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Buffer mode: wired by the tree cache after attach; the load rate
+        # limiter subtracts write staging from actual pool usage.
+        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -299,6 +320,11 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+
+        # Storage control queues, (re)created whenever the storage threads start.
+        self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
+        self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
+        self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -396,9 +422,9 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
-        self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.ack_backup_queue: Queue[StorageOperation] = Queue()
-        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+        self.prefetch_hit_queue = Queue()
+        self.ack_backup_queue = Queue()
+        self.host_mem_release_queue = Queue()
 
         self.prefetch_thread.start()
         self.backup_thread.start()
@@ -501,8 +527,16 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            if self.host_memory_mode == "buffer_only":
+                # The whole pool is transient staging; loads may fill it up
+                # to this fraction, and the tree's write flush gate yields
+                # to live fetch demand (the write fraction is a floor).
+                self.prefetch_capacity_limit = int(
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                )
+            else:
+                # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -1050,6 +1084,16 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
+        if self.host_memory_mode == "buffer_only":
+            # Gate on real pool usage: buffer mode allocates hit-sized, so
+            # prefetch_tokens_occupied's requested spans overstate it. Pool
+            # state mutates only at scheduler-thread lockstep points, so this
+            # stays TP-deterministic. Write staging is the write budget's
+            # usage; charging it here would park hits behind its storage drain.
+            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            if self.host_write_staged_tokens_fn is not None:
+                used -= self.host_write_staged_tokens_fn()
+            return max(0, used) >= self.prefetch_capacity_limit
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
             return True
@@ -1066,6 +1110,7 @@ class HiCacheController:
         page_hashes = self.get_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
+        operation.all_hash_values = page_hashes
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
