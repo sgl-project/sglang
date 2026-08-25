@@ -1175,10 +1175,19 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
     "Gemma4ForConditionalGeneration",
     "Gemma4ForCausalLM",
     "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
 )
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
+    is_diffusion = (
+        hf_config is not None
+        and hf_config.architectures[0] == "DiffusionGemmaForBlockDiffusion"
+    )
+    default_attention_backend = (
+        "triton"
+        if is_diffusion
+        else ("trtllm_mha" if is_sm100_supported() else "triton")
+    )
     if server_args.is_attention_backend_not_set():
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"
@@ -2811,6 +2820,25 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend",
+                view.dllm_algorithm,
+                backend,
+            )
+        return overrides
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(

@@ -1426,6 +1426,11 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if (
+            self.dllm_config is not None
+            and self.dllm_config.requires_separate_context_encoding
+        ):
+            max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)

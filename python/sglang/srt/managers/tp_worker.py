@@ -535,6 +535,9 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
             - 1,
         )
+        max_req_input_len = max_req_len - 5
+        if self.dllm_algorithm is not None:
+            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.req_to_token_pool.schedulable_token_capacity(
                 self.model_runner.max_total_num_tokens
@@ -543,7 +546,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,
