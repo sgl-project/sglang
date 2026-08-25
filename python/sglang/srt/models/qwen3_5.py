@@ -960,6 +960,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                enable_cuda_shared_expert_fusion=True,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1212,6 +1213,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                enable_cuda_shared_expert_fusion=True,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -2357,10 +2359,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
-        self.num_fused_shared_experts = 0
-        if _use_aiter and not _disable_shared_experts_fusion():
-            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
-
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3.5 shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
