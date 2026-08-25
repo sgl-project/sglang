@@ -957,8 +957,14 @@ class MqaAttentionBase(nn.Module):
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
 
-    def _kernel_num_heads(self, num_tokens: int) -> int:
+    def _kernel_num_heads(self, num_tokens: int, attn_backend=None) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        if not getattr(attn_backend, "pads_tp_q_heads", True):
+            # The trtllm-gen sparse kernel takes per-rank head counts natively
+            # (verified bit-identical h=16 vs padded h=64), so it opts out of
+            # the FlashMLA {64, 128} head padding entirely.
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -2222,7 +2228,7 @@ class MQALayer(MqaAttentionBase):
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
             kernel_num_heads = self.n_local_heads
         else:
-            kernel_num_heads = self._kernel_num_heads(x.shape[0])
+            kernel_num_heads = self._kernel_num_heads(x.shape[0], attn_backend)
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
