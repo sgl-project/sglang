@@ -98,23 +98,6 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
-    def test_invalidate_without_initialized_entries_is_noop(self):
-        # A receiver can hit a failure path before __init__ populated
-        # _connection_pool_entries; invalidation must not raise AttributeError
-        # and mask the original failure.
-        receiver = object.__new__(CommonKVReceiver)
-        receiver.kv_mgr = SimpleNamespace(
-            connection_pool={"key": [{"rank_ip": "10.0.0.1", "rank_port": 1001}]},
-            connection_lock=threading.Lock(),
-        )
-
-        receiver.invalidate_cached_bootstrap_infos()
-
-        self.assertEqual(
-            receiver.kv_mgr.connection_pool,
-            {"key": [{"rank_ip": "10.0.0.1", "rank_port": 1001}]},
-        )
-
     def test_next_receiver_refetches_after_invalidation(self):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         connection_pool = {"prefill:8998_0_0_0": stale}

@@ -1473,18 +1473,11 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_infos = all_bootstrap_infos
 
     def invalidate_cached_bootstrap_infos(self) -> None:
-        # A receiver can reach a failure path before __init__ finished (or without
-        # it, e.g. constructed via object.__new__), so tolerate the attribute
-        # being absent rather than masking the original failure with an
-        # AttributeError. Matches the defensive hasattr() checks below.
-        entries = getattr(self, "_connection_pool_entries", None)
-        if not entries:
-            return
         with self.kv_mgr.connection_lock:
-            for bootstrap_key, bootstrap_infos in entries.items():
+            for bootstrap_key, bootstrap_infos in self._connection_pool_entries.items():
                 if self.kv_mgr.connection_pool.get(bootstrap_key) is bootstrap_infos:
                     del self.kv_mgr.connection_pool[bootstrap_key]
-            entries.clear()
+            self._connection_pool_entries.clear()
 
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
