@@ -183,6 +183,14 @@ class RequestStage:
         level=1,
         metrics_is_observed=True,
     )
+    DECODE_BOOTSTRAP_HANDSHAKE = RequestStageConfig(
+        "decode_bootstrap_handshake",
+        level=1,
+    )
+    DECODE_KV_ALLOCATION_WAIT = RequestStageConfig(
+        "decode_kv_allocation_wait",
+        level=1,
+    )
     DECODE_WAITING = RequestStageConfig(
         "decode_waiting",
         level=1,
@@ -1020,6 +1028,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             stage, ts - self.decode_prealloc_queue_entry_time
         )
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
+
+        if self.bootstrap_done_time > 0:
+            self.trace_slice(
+                RequestStage.DECODE_BOOTSTRAP_HANDSHAKE,
+                self.decode_prealloc_queue_entry_time,
+                self.bootstrap_done_time,
+            )
+            self.trace_slice(
+                RequestStage.DECODE_KV_ALLOCATION_WAIT,
+                self.bootstrap_done_time,
+                ts,
+            )
 
         if self.enable_metrics and self.bootstrap_done_time > 0:
             bootstrap_ms = (
