@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    triton_one_pass_rms_norm,
 )
-from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -37,6 +37,7 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
+_has_attentions = False
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
@@ -46,6 +47,20 @@ if _is_npu:
     from sgl_kernel_npu.norm.rmsnorm_without_weight import (
         fused_rmsnorm_without_weight,
     )
+
+    try:
+        import attentions  # noqa: F401
+
+        _has_attentions = True
+    except ImportError:
+        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+        logger = init_logger(__name__)  # pylint: disable=invalid-name
+        logger.warning_once(
+            "The 'attentions' library is not installed. Falling back to native layernorm. "
+            "Installing this library may improve performance on NPU. "
+            "See: sgl-project/sgl-kernel-npu"
+        )
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
@@ -58,7 +73,7 @@ if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
 if not _is_cpu:
-    from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -452,21 +467,8 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         self._forward_method = self.dispatch_forward()
 
-        if _is_npu:
-            try:
-                import attentions  # noqa: F401
-            except ImportError:
-                from sglang.multimodal_gen.runtime.utils.logging_utils import (
-                    init_logger,
-                )
-
-                logger = init_logger(__name__)  # pylint: disable=invalid-name
-                logger.warning(
-                    "The 'attentions' library is not installed. Falling back to native layernorm. "
-                    "Installing this library may improve performance on NPU."
-                    "See: sgl-project/sgl-kernel-npu"
-                )
-                self._forward_method = self.forward_native
+        if _is_npu and not _has_attentions:
+            self._forward_method = self.forward_native
 
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
@@ -614,9 +616,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_scale_residual_norm_scale_shift
 
         if isinstance(gate, int) and gate != 1:
             raise ValueError(
@@ -647,7 +647,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
@@ -792,9 +792,7 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -816,7 +814,7 @@ class _NormScaleShift(CustomOp):
             return self.forward_native(x, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )
