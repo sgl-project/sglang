@@ -205,14 +205,17 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
 
   const auto index = *index_ptr;
   // A stale/OOB slot id would cause an illegal memory access in the store below;
-  // fail fast at the culprit instead. always-on (kvcache JIT compiles without NDEBUG).
+  // fail fast at the culprit on CUDA. HIP device assertions require a hostcall,
+  // which hipGraph capture rejects, so ROCm instead suppresses the invalid write.
+#ifndef USE_ROCM
   assert(index >= 0 && index < size_limit);
-  const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kKSplitSize);
-  const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kVSplitSize);
-  const auto k_dst = pointer::offset(k_cache, index * stride_k_cache, split_id * kKSplitSize);
-  const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitSize);
+#endif
 
-  if (index != reserved_skip_index) {
+  if (index >= 0 && index < size_limit && index != reserved_skip_index) {
+    const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kKSplitSize);
+    const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kVSplitSize);
+    const auto k_dst = pointer::offset(k_cache, index * stride_k_cache, split_id * kKSplitSize);
+    const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitSize);
     copy_kv_rows_warp<kKSplitSize, kVSplitSize>(k_src, v_src, k_dst, v_dst);
   }
   PDLTriggerSecondary<kUsePDL>();
