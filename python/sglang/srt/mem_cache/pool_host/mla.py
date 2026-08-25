@@ -56,7 +56,7 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-_ASCENDC_LAYER_GROUP_DEFAULT = 8
+_ASCENDC_LAYER_GROUP_DEFAULT = 2
 
 
 def _ascendc_layer_group_size() -> int:
