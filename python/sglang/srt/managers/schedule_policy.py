@@ -560,9 +560,7 @@ class PrefillAdder:
         self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
-            # Remaining-token-space estimate; tight-loop form because it runs
-            # over the whole running batch each pass (ratio factored out of
-            # the sum — this is a heuristic, float order is immaterial).
+            # Estimate the offset in the remaining token space
             clip = CLIP_MAX_NEW_TOKENS
             self.rem_total_token_offset += (
                 sum(
