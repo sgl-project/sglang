@@ -183,22 +183,38 @@ class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
     mhc_fused_post_pre: Optional[Callable[..., Any]]
     npu_hc_pre: Optional[Callable[..., Any]]
+    mhc_pre: Optional[Callable[..., Any]]
+    mhc_post: Optional[Callable[..., Any]]
+    fused_hc_head: Optional[Callable[..., Any]]
 
 
 @functools.cache
 def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
 
-    Model modules are imported eagerly by the registry.  Importing
+    Model modules are imported eagerly by the registry. Importing
     ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
     Import it only when a DeepSeek-V4 layer executes so registry discovery
     cannot initialize an optional CUDA runtime before unrelated models set up
-    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    their communication workspaces. DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn
+        from sgl_kernel import (
+            fused_hc_head,
+            hc_post,
+            hc_split_sinkhorn,
+            mhc_fused_post_pre,
+            mhc_pre,
+        )
 
-        return MhcOps(hc_split_sinkhorn, None, None)
+        return MhcOps(
+            hc_split_sinkhorn=hc_split_sinkhorn,
+            mhc_fused_post_pre=mhc_fused_post_pre,
+            npu_hc_pre=None,
+            mhc_pre=mhc_pre,
+            mhc_post=hc_post,
+            fused_hc_head=fused_hc_head,
+        )
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -206,7 +222,14 @@ def _get_mhc_ops() -> MhcOps:
         npu_hc_pre,
     )
 
-    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+    return MhcOps(
+        hc_split_sinkhorn=hc_split_sinkhorn,
+        mhc_fused_post_pre=mhc_fused_post_pre,
+        npu_hc_pre=npu_hc_pre,
+        mhc_pre=None,
+        mhc_post=None,
+        fused_hc_head=None,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -233,6 +256,13 @@ def _use_npu_a5_mxfp8_wo_a(quant_config) -> bool:
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     return tuple(weight_block_size or ()) == (128, 128)
+
+
+def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
+    if _is_xpu:
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+
+    return False
 
 
 # FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
@@ -1822,7 +1852,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
+        self.use_fused_mhc_post_pre = (
+            is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
+        )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -1897,6 +1929,26 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, self.hc_mult), dtype=torch.float32, device=x.device
             )
             return y, post, comb, False
+
+        if _is_xpu:
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
+
+            post, comb, y = _get_mhc_ops().mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            return y, post, comb, norm is not None
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             y, post, comb = _flashinfer_hc_pre(
@@ -2011,6 +2063,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 post.unsqueeze(0),
                 comb.unsqueeze(0),
             ).squeeze(0)
+
+        if _is_xpu:
+            return _get_mhc_ops().mhc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post
@@ -2790,6 +2845,15 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_xpu:
+                return _get_mhc_ops().fused_hc_head(
+                    x.contiguous(),
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_eps=self.norm_eps,
+                    hc_eps=self.hc_eps,
+                )
             from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
@@ -3484,7 +3548,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
@@ -3564,6 +3628,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not (
             envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
             or _use_npu_a5_mxfp8_wo_a(self.quant_config)
+            or not _FP8_WO_A_GEMM
         ):
             weights = _dequant_fp8_wo_a_streaming(weights)
 
