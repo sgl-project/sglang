@@ -1453,33 +1453,37 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return 80
 
     @staticmethod
-    def common_group_size(cfg: dict) -> int:
-        """Return the unique group_size across the config; raise if missing/mismatched."""
+    def common_group_size(
+        cfg: dict, *, allow_missing: bool = False, strict: bool = False
+    ) -> Optional[int]:
+        """Return the unique group_size, optionally validating explicit values."""
         sizes = set()
 
+        def add_size(value: Any) -> None:
+            if value is None:
+                return
+            if strict and type(value) is not int:
+                raise ValueError(f"group_size must be an integer, got {value!r}.")
+            if isinstance(value, int):
+                sizes.add(value)
+
         # Top-level and 'quantization' block
-        v = cfg.get("group_size")
-        if isinstance(v, int):
-            sizes.add(v)
+        add_size(cfg.get("group_size"))
         q = cfg.get("quantization")
         if isinstance(q, dict):
-            v = q.get("group_size")
-            if isinstance(v, int):
-                sizes.add(v)
+            add_size(q.get("group_size"))
 
         # config_groups: accept group-level or nested dicts (e.g., weights/input_activations)
         for g in (cfg.get("config_groups") or {}).values():
             if isinstance(g, dict):
-                v = g.get("group_size")
-                if isinstance(v, int):
-                    sizes.add(v)
+                add_size(g.get("group_size"))
                 for sub in g.values():
                     if isinstance(sub, dict):
-                        v = sub.get("group_size")
-                        if isinstance(v, int):
-                            sizes.add(v)
+                        add_size(sub.get("group_size"))
 
         if not sizes:
+            if allow_missing:
+                return None
             raise ValueError("No group_size found in config.")
         if len(sizes) > 1:
             raise ValueError(f"Inconsistent group_size values: {sorted(sizes)}")
@@ -1531,15 +1535,19 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             else:
                 kv_cache_quant_algo = config.get("kv_cache_quant_algo") or "auto"
 
-            group_size = config.get("group_size")
-            # If group_size is not at top level, try to extract from config_groups
-            if group_size is None:
-                config_groups = config.get("config_groups", {})
-                if config_groups:
-                    # Get group_size from the first group's weights config
-                    first_group = next(iter(config_groups.values()), {})
-                    weights_config = first_group.get("weights", {})
-                    group_size = weights_config.get("group_size")
+            if quant_method == "NVFP4":
+                group_size = cls.common_group_size(
+                    config, allow_missing=True, strict=True
+                )
+            else:
+                group_size = config.get("group_size")
+                # Preserve the existing FP8/NVFP4_AWQ parsing behavior.
+                if group_size is None:
+                    config_groups = config.get("config_groups", {})
+                    if config_groups:
+                        first_group = next(iter(config_groups.values()), {})
+                        weights_config = first_group.get("weights", {})
+                        group_size = weights_config.get("group_size")
             # NVFP4 (incl. NVFP4_AWQ) always uses group_size 16
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
@@ -1553,7 +1561,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
                     kv_cache_quant_algo = "auto"
-                group_size = ModelOptFp4Config.common_group_size(config)
+                group_size = ModelOptFp4Config.common_group_size(
+                    config, strict=quant_method == "NVFP4"
+                )
                 exclude_modules = quant_config.get("exclude_modules", [])
             except (ValueError, KeyError):
                 raise ValueError(
@@ -1579,6 +1589,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "NVFP4 quantization requires group_size and exclude_modules "
                 "specified in the quantization config"
             )
+        if quant_method == "NVFP4" and group_size != 16:
+            raise ValueError(
+                f"ModelOpt NVFP4 requires group_size=16, got {group_size}."
+            )
+
         return cls(
             is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo,
