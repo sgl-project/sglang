@@ -112,13 +112,18 @@ class TestFusedMOE(CustomTestCase):
     def _test_case(
         self, m, n, k, e, topk, dtype, use_fp8_w8a8=False, routed_scaling_factor=None
     ):
+        """Compare the fused kernel against the naive reference.
+
+        Returns the ``(fused, reference)`` pair so a caller can add its own
+        assertions, or ``None`` when the case was skipped.
+        """
         rtol, atol = self.get_tolerance(dtype)
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
             capability = get_device_capability()
             if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
-                return
+                return None
 
             a = self.create_random_gpu_tensor((m, k), dtype)
             w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
@@ -178,6 +183,7 @@ class TestFusedMOE(CustomTestCase):
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
+            return sglang_output, torch_output
         else:
             a = self.create_random_gpu_tensor((m, k), dtype)
             w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
@@ -202,6 +208,23 @@ class TestFusedMOE(CustomTestCase):
             torch.testing.assert_close(
                 triton_output, torch_output, rtol=rtol, atol=atol
             )
+            return triton_output, torch_output
+
+    def _assert_output_magnitude_matches(self, fused_output, reference_output):
+        """Assert the two outputs agree in magnitude, not just within ``atol``.
+
+        The std=0.01 inputs put the reference around 1e-8 while the bfloat16
+        ``atol`` is 1e-2, so the element-wise comparison above accepts any
+        output whose error stays under 1e-2 -- an all-zero one included. Norms
+        have no cancellation, so comparing them catches an output that was
+        dropped or replaced wholesale while staying well clear of the
+        element-wise noise floor.
+        """
+        reference_norm = reference_output.float().norm()
+        self.assertGreater(reference_norm.item(), 0.0)
+        torch.testing.assert_close(
+            fused_output.float().norm(), reference_norm, rtol=5e-2, atol=0.0
+        )
 
     def test_various_configurations(self):
         m_values = [1, 33, 64, 222]
@@ -255,13 +278,14 @@ class TestFusedMOE(CustomTestCase):
 
     def test_single_expert_routing(self):
         # Cover the topk == 1 fast path (e.g. Llama-4-Scout num_experts_per_tok=1),
-        # where the second kernel writes directly into the output when
-        # routed_scaling_factor == 1.0 and the reduction is otherwise applied.
+        # where the second kernel writes the combined rows straight into the
+        # output and the route-major intermediate is never filled, so a combine
+        # that reduces it anyway silently replaces the result.
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         for routed_scaling_factor in [1.0, 1.5]:
             for m in [1, 33]:
                 with self.subTest(m=m, routed_scaling_factor=routed_scaling_factor):
-                    self._test_case(
+                    fused_output, reference_output = self._test_case(
                         m,
                         n=128,
                         k=128,
@@ -269,6 +293,9 @@ class TestFusedMOE(CustomTestCase):
                         topk=1,
                         dtype=torch.bfloat16,
                         routed_scaling_factor=routed_scaling_factor,
+                    )
+                    self._assert_output_magnitude_matches(
+                        fused_output, reference_output
                     )
                     empty_gpu_cache()
 
