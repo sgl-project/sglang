@@ -166,10 +166,12 @@ class TestDcpGpunetioPeerRows(CustomTestCase):
                 pack_buffer=mgr._dcp_pack_buffer_for_worker(0),
                 ready_slot=1,
                 ready_epoch=7,
+                ready_src_ptr=0x3000,
             )
 
         self.assertEqual(result, "transfer")
         pack.assert_not_called()
+        mgr._publish_ready_epoch.assert_not_called()
         args = mgr._send_kvcache_generic.call_args.kwargs
         np.testing.assert_array_equal(
             args["prefill_data_indices"], np.arange(0, 256, 4, dtype=np.int32)

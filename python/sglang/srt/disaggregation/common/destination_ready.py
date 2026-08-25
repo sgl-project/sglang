@@ -46,12 +46,12 @@ def _ld_acquire_sys_u64(ptr):
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["expected_epoch"])
 def _wait_ready_epoch_kernel(
     ready_epoch,
     result,
+    expected_epoch,
     max_spins,
-    EXPECTED_EPOCH: tl.constexpr,
 ):
     observed = tl.full((), 0, tl.uint64)
     largest_observed = tl.full((), 0, tl.uint64)
@@ -61,10 +61,10 @@ def _wait_ready_epoch_kernel(
 
     while (spin < max_spins) & (done == 0):
         observed = _ld_acquire_sys_u64(ready_epoch)
-        if observed == EXPECTED_EPOCH:
+        if observed == expected_epoch:
             status = tl.full((), 0, tl.uint64)
             done = tl.full((), 1, tl.int1)
-        elif observed > EXPECTED_EPOCH:
+        elif observed > expected_epoch:
             status = tl.full((), 4, tl.uint64)
             done = tl.full((), 1, tl.int1)
         elif observed < largest_observed:
@@ -127,8 +127,8 @@ def wait_for_destination_ready_epoch(
     _wait_ready_epoch_kernel[(1,)](
         ready_epoch,
         result,
+        expected_epoch,
         max_spins,
-        EXPECTED_EPOCH=expected_epoch,
         num_warps=1,
     )
     stream.synchronize()

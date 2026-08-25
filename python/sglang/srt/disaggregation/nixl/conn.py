@@ -1356,6 +1356,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # per-req loop and `continue` the worker main loop without
                 # touching room status -- the next pop will retry.
                 staging_deferred = False
+                published_ready: Dict[Tuple[int, int], int] = {}
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
@@ -1447,7 +1448,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 )
                                 if self.enable_dcp_peer_rows:
                                     assert req.ready_slot is not None
+                                    assert req.ready_epoch is not None
                                     ready_slots.add(req.ready_slot)
+                                    ready_key = (req.ready_slot, req.ready_epoch)
+                                    if ready_key not in published_ready:
+                                        published_ready[ready_key] = (
+                                            self._publish_ready_epoch(*ready_key)
+                                        )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1460,6 +1467,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     pack_buffer=pack_buffer,
                                     ready_slot=req.ready_slot,
                                     ready_epoch=req.ready_epoch,
+                                    ready_src_ptr=(
+                                        published_ready[ready_key]
+                                        if self.enable_dcp_peer_rows
+                                        else None
+                                    ),
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1927,6 +1939,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         pack_buffer=None,
         ready_slot: Optional[int] = None,
         ready_epoch: Optional[int] = None,
+        ready_src_ptr: Optional[int] = None,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -2011,7 +2024,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ready_tail = None
         if self.enable_dcp_peer_rows:
             ready_tail = (
-                self._publish_ready_epoch(ready_slot, ready_epoch),
+                (
+                    ready_src_ptr
+                    if ready_src_ptr is not None
+                    else self._publish_ready_epoch(ready_slot, ready_epoch)
+                ),
                 dst_info.ready_base_ptr + ready_slot * _READY_ITEM_SIZE,
             )
         return self._send_kvcache_generic(
