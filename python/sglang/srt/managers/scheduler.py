@@ -56,6 +56,7 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+import zmq
 from torch.distributed import barrier
 
 if TYPE_CHECKING:
@@ -67,6 +68,7 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+from sglang.srt.afd.afd_type import AFDRole, get_afd_role
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -119,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AFSyncReq,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -326,6 +329,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -498,6 +502,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self.init_afd(port_args)
         self.init_idle_sleeper()
 
         # Init ZBAL, switch allocator should before any torch alloc action
@@ -782,6 +787,33 @@ class Scheduler(
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
 
+    def init_afd(self, port_args: PortArgs):
+        # Init afd config
+        self.afd_role = get_afd_role()
+        self.afd_send_to_ffn = None
+        self.afd_recv_from_attn = None
+        self.afd_ffn_running = False
+        if self.afd_role is None:
+            return
+
+        if self.model_config.hf_config.architectures[0] not in ["Qwen3MoeForCausalLM"]:
+            logging.warning("AFD is not supported for the target model, disabled.")
+            self.afd_role = None
+            return
+
+        # Init the Attn-to-FFN control socket. It is only active at tp_rank 0,
+        # and other ranks get the requests by broadcasting.
+        if self.ps.tp_rank == 0:
+            context = zmq.Context(1)
+            if self.afd_role == AFDRole.AFD_ROLE_ATTN:
+                self.afd_send_to_ffn = get_zmq_socket(
+                    context, zmq.PUSH, port_args.afd_ipc_name, False
+                )
+            elif self.afd_role == AFDRole.AFD_ROLE_FFN:
+                self.afd_recv_from_attn = get_zmq_socket(
+                    context, zmq.PULL, port_args.afd_ipc_name, True
+                )
+
     def init_idle_sleeper(self) -> None:
         if (
             self.ps.pp_rank == 0
@@ -789,11 +821,14 @@ class Scheduler(
             and self.ps.attn_cp_rank == 0
             and get_device().sleep_on_idle
         ):
+            sockets = [
+                self.ipc_channels.recv_from_tokenizer,
+                self.ipc_channels.recv_from_rpc,
+            ]
+            if self.afd_recv_from_attn is not None:
+                sockets.append(self.afd_recv_from_attn)
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=sockets,
             )
         else:
             self.idle_sleeper = None
@@ -1654,6 +1689,7 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (AFSyncReq, self.handle_afd_sync),
             ]
         )
 
@@ -1772,6 +1808,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                self._afd_send_req_to_ffn(AFSyncReq())
+
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -1783,6 +1821,30 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _afd_send_req_to_ffn(self, req):
+        if (
+            self.afd_role == AFDRole.AFD_ROLE_ATTN
+            and self.ps.pp_rank == 0
+            and self.ps.tp_rank == 0
+        ):
+            self.afd_send_to_ffn.send_pyobj(req)
+
+    @DynamicGradMode()
+    def event_loop_afd_ffn_normal(self):
+        """A normal scheduler loop for afd ffn."""
+        while True:
+            if self.gracefully_exit:
+                break
+
+            self.afd_ffn_running = False
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            if self.afd_ffn_running:
+                self.tp_worker.model_runner.afd_forward_ffn()
+            else:
+                self.maybe_sleep_on_idle()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2064,6 +2126,8 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            afd_send_to_ffn=self.afd_send_to_ffn,
+            afd_recv_from_attn=self.afd_recv_from_attn,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -5008,6 +5072,10 @@ class Scheduler(
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def handle_afd_sync(self, recv_req: AFSyncReq):
+        self.afd_ffn_running = True
+        return None
+
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.
         self.gracefully_exit = True
@@ -5048,6 +5116,13 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if scheduler.afd_role is not None:
+        if scheduler.afd_role == AFDRole.AFD_ROLE_FFN:
+            scheduler.event_loop_afd_ffn_normal()
+        else:
+            scheduler.event_loop_normal()
+        return
+
     # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:

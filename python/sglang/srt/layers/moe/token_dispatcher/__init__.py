@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.stepmesh import StepMeshATTN, StepMeshFFN
 
 __all__ = [
     "BaseDispatcher",
@@ -90,4 +91,6 @@ __all__ = [
     "AscendTPDispatcher",
     "AscendTPDispatchOutput",
     "AscendTPCombineInput",
+    "StepMeshATTN",
+    "StepMeshFFN",
 ]

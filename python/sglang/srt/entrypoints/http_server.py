@@ -63,6 +63,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -2391,7 +2392,17 @@ def _wait_and_warmup(
             get_exec().moe.ep_join_mode,
         )
 
-    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+    # No work request arrives at the FFN side, so warmup is unnecessary (and
+    # would fail there): skip it for the AFD FFN role.
+    skip_afd_ffn_warmup = get_disagg().afd_role == AFDRole.AFD_ROLE_FFN
+    if skip_afd_ffn_warmup:
+        logger.debug("[AFD] Skipping server warmup for the FFN role.")
+
+    if (
+        not get_serving().skip_server_warmup
+        and not skip_elastic_joiner_warmup
+        and not skip_afd_ffn_warmup
+    ):
         if not execute_warmup_func(server_args):
             return
     else:
