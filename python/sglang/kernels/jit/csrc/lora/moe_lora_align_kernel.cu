@@ -6,10 +6,15 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#ifndef USE_ROCM
 #include <cub/cub.cuh>
+#else
+#include <hipcub/hipcub.hpp>
+#endif
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
+#include <bit>
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -20,6 +25,11 @@
 namespace sglang {
 
 namespace moe {
+
+#ifdef USE_ROCM
+// The JIT build does not run hipify, so map this file's cub:: uses explicitly.
+namespace cub = hipcub;
+#endif
 
 template <typename scalar_t>
 SGL_DEVICE void _moe_align_block_size(
@@ -529,7 +539,8 @@ struct MoeLoraAlignBlockSizeKernel {
 
       dim3 blockDim(num_thread + fill_threads);
       auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
-      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+      const auto fptr = std::bit_cast<const void*>(kernel);
+      RuntimeDeviceCheck(cudaFuncSetAttribute(fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
 
       LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
           kernel,
