@@ -435,7 +435,7 @@ def maybe_load_fsdp_model(
     # 3. postprocessing
     if weight_postprocess_device is not None:
         # move to device to perform postprocessing
-        model.to(weight_postprocess_device)
+        model._apply(lambda t: t if t.is_meta else t.to(weight_postprocess_device))
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
