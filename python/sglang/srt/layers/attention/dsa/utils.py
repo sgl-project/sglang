@@ -269,10 +269,21 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
             seq_len % cp_size == 0
         ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
     else:
-        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
-        # the seq data needs to be divided and recombined at twice the size of cp_size.
+        # zigzag (in-seq-split) mode: each sequence is independently split into
+        # 2*cp_size blocks. For bs > 1, every sequence must be long enough
+        # (extend_len >= 2*cp_size); otherwise prepare_context_parallel_metadata
+        # would produce zero-size blocks for short sequences, breaking the
+        # attention/indexer kernels. Fall back the whole batch to non-CP if any
+        # sequence is too short.
         cur_cp_seq_len = seq_len // (cp_size * 2)
+        if cur_cp_seq_len == 0:
+            return False
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is not None:
+            cp_min = cp_size * 2
+            for L in extend_lens:
+                if L < cp_min:
+                    return False
     return cur_cp_seq_len != 0
 
 

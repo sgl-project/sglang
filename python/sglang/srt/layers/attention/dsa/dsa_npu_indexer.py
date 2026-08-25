@@ -514,6 +514,7 @@ class DSANPUIndexerMixin:
                 block_table,
                 use_quant_lightning_indexer,
                 layer_id,
+                forward_batch,
             )
             return topk_indices
         else:
@@ -580,18 +581,30 @@ class DSANPUIndexerMixin:
         block_table,
         use_quant_lightning_indexer,
         layer_id,
+        forward_batch,
     ):
-        q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
+        # CP zigzag layout for bs>1 is [all_prev_tokens, all_next_tokens];
+        # split at total_q_prev_tokens (sum of per-seq prev blocks), NOT the
+        # midpoint. Using (q.size(0)+1)//2 is only correct when bs==1 and
+        # prev/next happen to be equal.
+        split_len = forward_batch.attn_cp_metadata.total_q_prev_tokens
+        q_prev, q_next = torch.split(q, split_len, dim=0)
         weights_prev, weights_next = None, None
         if indexer_weights is not None:
             weights_prev, weights_next = torch.split(
-                indexer_weights, (indexer_weights.size(0) + 1) // 2, dim=0
+                indexer_weights, split_len, dim=0
             )
             weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
             weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
 
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        # NPU indexer kernels with TND layout expect cumulative
+        # actual_seq_lengths_query (last element = total query tokens).
+        # CP metadata stores per-sequence lengths, so convert to cumsum.
+        actual_seq_lengths_q_prev = torch.cumsum(actual_seq_lengths_q_prev, dim=0)
+        actual_seq_lengths_q_next = torch.cumsum(actual_seq_lengths_q_next, dim=0)
 
         if use_quant_lightning_indexer:
             q_prev, q_prev_scale = _quantize_npu_indexer_activation(

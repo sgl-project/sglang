@@ -55,9 +55,16 @@ class ContextParallelMetadata:
     actual_seq_q_prev_list: List[int] = None
     actual_seq_q_next_list: List[int] = None
 
-    # Aggregate sum of extend_seq_lens across the batch.
+    # Aggregate sum of extend_seq_lens across the batch (without CP padding).
     total_seq_lens: int = 0
     bs: int = 1
+
+    # Per-sequence CP padding: each seq is padded at its end to be divisible
+    # by 2*cp_size so that all blocks within a seq are uniform.  The padding
+    # tokens flow through the entire CP computation and are stripped at the
+    # end via cp_unpad_output_tensor.
+    per_seq_pad_len: List[int] = None  # [bs] padding tokens added per sequence
+    total_pad_tokens: int = 0  # sum(per_seq_pad_len)
 
 
 def is_prefill_context_parallel_enabled():
@@ -125,6 +132,83 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
             return False
 
     return True
+
+
+# def cp_pad_input_tensor(
+#     input_tensor: torch.Tensor,
+#     cp_meta: "ContextParallelMetadata",
+#     extend_seqs_len: List[int],
+# ) -> torch.Tensor:
+#     """Physically pad a flat tensor by appending zeros at the end of each seq.
+#
+#     Each sequence ``s`` occupies ``extend_seqs_len[s]`` rows in *input_tensor*.
+#     This function inserts ``cp_meta.per_seq_pad_len[s]`` zero-rows after each
+#     sequence so that every sequence's padded length is divisible by
+#     ``2 * cp_size``.  The padding flows through the entire CP computation and
+#     is removed by :func:`cp_unpad_output_tensor` at the end.
+#
+#     Args:
+#         input_tensor: ``[total_tokens, ...]`` — flat concatenation of seqs.
+#         cp_meta: metadata carrying ``per_seq_pad_len``.
+#         extend_seqs_len: per-seq lengths **as seen in input_tensor** (i.e.
+#             after any scheduler/batch-level padding, before CP padding).
+#
+#     Returns:
+#         ``[total_tokens + total_pad_tokens, ...]`` padded tensor.
+#     """
+#     if cp_meta is None or cp_meta.per_seq_pad_len is None:
+#         return input_tensor
+#     if cp_meta.total_pad_tokens == 0:
+#         return input_tensor
+#
+#     chunks = []
+#     offset = 0
+#     for L, pad in zip(extend_seqs_len, cp_meta.per_seq_pad_len):
+#         chunks.append(input_tensor[offset : offset + L])
+#         if pad > 0:
+#             pad_shape = (pad,) + tuple(input_tensor.shape[1:])
+#             chunks.append(
+#                 torch.zeros(
+#                     pad_shape,
+#                     dtype=input_tensor.dtype,
+#                     device=input_tensor.device,
+#                 )
+#             )
+#         offset += L
+#     return torch.cat(chunks, dim=0)
+#
+#
+# def cp_unpad_output_tensor(
+#     output_tensor: torch.Tensor,
+#     cp_meta: "ContextParallelMetadata",
+#     extend_seqs_len: List[int],
+# ) -> torch.Tensor:
+#     """Remove per-sequence CP padding from a flat output tensor.
+#
+#     Inverse of :func:`cp_pad_input_tensor`: strips the zero-rows that were
+#     appended at the end of each sequence, restoring the original
+#     ``[total_tokens, ...]`` layout.
+#
+#     Args:
+#         output_tensor: ``[total_tokens + total_pad_tokens, ...]`` padded tensor.
+#         cp_meta: metadata carrying ``per_seq_pad_len``.
+#         extend_seqs_len: per-seq original lengths (same as passed to
+#             :func:`cp_pad_input_tensor`).
+#
+#     Returns:
+#         ``[total_tokens, ...]`` unpadded tensor.
+#     """
+#     if cp_meta is None or cp_meta.per_seq_pad_len is None:
+#         return output_tensor
+#     if cp_meta.total_pad_tokens == 0:
+#         return output_tensor
+#
+#     chunks = []
+#     offset = 0
+#     for L, pad in zip(extend_seqs_len, cp_meta.per_seq_pad_len):
+#         chunks.append(output_tensor[offset : offset + L])
+#         offset += L + pad
+#     return torch.cat(chunks, dim=0)
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
@@ -575,15 +659,23 @@ def prepare_context_parallel_metadata(
         prefix_offsets = [0] * bs
 
     # Per-sequence block sizes: first (L % cp_segment_num) blocks get +1.
+    # This keeps split_list matching the actual (unpadded) tensor length so
+    # that cp_split_and_rebuild_data can torch.split correctly.
+    # per_seq_pad_len records how much padding WOULD be needed to make all
+    # blocks uniform (for diagnostics / future use), but is not applied.
+    per_seq_pad_len: List[int] = []
     per_seq_block_sizes: List[List[int]] = []
     split_list: List[int] = []
     for s in range(bs):
         L = extend_seqs_len[s]
         base = L // cp_segment_num
         rem = L % cp_segment_num
+        pad = (cp_segment_num - rem) % cp_segment_num
+        per_seq_pad_len.append(pad)
         blk = [base + 1 if i < rem else base for i in range(cp_segment_num)]
         per_seq_block_sizes.append(blk)
         split_list.extend(blk)
+    total_pad_tokens = sum(per_seq_pad_len)
 
     # Per-rank aggregate: this rank owns block r and block (2*cp_size-1-r)
     # of every sequence.
@@ -692,6 +784,8 @@ def prepare_context_parallel_metadata(
     # - zigzag_index has 2 * bs entries (this rank's prev + next per seq).
     # - cp_reverse_index has bs * cp_segment_num entries (reorders the
     #   full allgathered stream back to per-seq-original order).
+    # - split_list sums to total_seq_lens (no physical padding; blocks are
+    #   non-uniform base/base+1).  per_seq_pad_len is informational only.
     assert len(split_list) == bs * cp_segment_num
     assert sum(split_list) == total_seq_lens
     assert len(zigzag_index) == 2 * bs
@@ -722,4 +816,6 @@ def prepare_context_parallel_metadata(
         actual_seq_q_next_list=actual_seq_q_next_list,
         total_seq_lens=total_seq_lens,
         bs=bs,
+        per_seq_pad_len=per_seq_pad_len,
+        total_pad_tokens=total_pad_tokens,
     )

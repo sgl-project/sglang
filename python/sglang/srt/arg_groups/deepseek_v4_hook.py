@@ -160,21 +160,31 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     if not server_args.enable_prefill_cp:
         return
 
-    if server_args.cp_strategy != "interleave":
+    # DeepSeekV4 supports both CP strategies:
+    #   - "interleave" (round-robin-split): token-interleaved sharding across CP ranks.
+    #   - "zigzag" (in-seq-split): per-sequence zigzag split into 2*cp_size blocks;
+    #     supports bs > 1 on NPU (each sequence is split independently).
+    if server_args.cp_strategy not in ("interleave", "zigzag"):
         raise ValueError(
-            "DeepSeekV4 only supports interleave CP strategy, "
+            "DeepSeekV4 only supports interleave or zigzag CP strategy, "
             f"got {server_args.cp_strategy}"
         )
 
     server_args.enable_dsa_prefill_context_parallel = True
     server_args.enable_prefill_context_parallel = False
-    server_args.dsa_prefill_cp_mode = "round-robin-split"
+    # Respect the user's chosen strategy instead of hardcoding round-robin-split.
+    strategy_to_legacy_mode = {
+        "interleave": "round-robin-split",
+        "zigzag": "in-seq-split",
+    }
+    server_args.dsa_prefill_cp_mode = strategy_to_legacy_mode[server_args.cp_strategy]
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
     server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
-    assert (
-        server_args.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
+    if server_args.dsa_prefill_cp_mode == "round-robin-split":
+        assert (
+            server_args.dp_size == 1
+        ), "For round-robin split mode, dp attention is not supported."
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."

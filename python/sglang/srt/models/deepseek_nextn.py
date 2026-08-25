@@ -377,7 +377,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        # NextN (MTP) typically runs with a single draft sequence; the underlying
+        # can_dsa_cp_split / prepare_context_parallel_metadata support bs > 1.
         if not is_cp_v2_active(forward_batch):
             if self.dsa_enable_prefill_cp:
                 if can_dsa_cp_split(
