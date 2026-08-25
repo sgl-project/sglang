@@ -784,10 +784,10 @@ fn check_embedding_tokens(
     let input_len = ids.len() as u64 + limits.num_reserved_tokens;
     if input_len >= limits.context_len {
         if limits.allow_auto_truncate {
-            let keep = limits
-                .context_len
-                .saturating_sub(limits.num_reserved_tokens + 1) as usize;
-            ids.truncate(keep);
+            // Match Python's `_validate_one_request`: reserved tokens decide
+            // whether truncation runs, but the input itself is sliced only at
+            // `context_len` (`del input_ids[context_len:]`).
+            ids.truncate(limits.context_len as usize);
             if ids.is_empty() {
                 return Err(Error::Validation(
                     "input cannot fit the model context".into(),
@@ -1045,6 +1045,41 @@ mod tests {
             unreachable!()
         };
         assert!(check_embedding_tokens(request, &embedding_limits).is_err());
+    }
+
+    /// Embeddings request zero generated tokens, so auto-truncation must not
+    /// reserve an extra generation slot. This matches Python's
+    /// `TokenizerManager._validate_one_request`, which keeps an input already at
+    /// the context boundary when `allow_auto_truncate` is enabled.
+    #[test]
+    fn embedding_auto_truncate_keeps_the_full_context_window() {
+        for (input_len, reserved_tokens, expected_len) in [
+            (8, 0, 8), // exact context boundary remains intact
+            (9, 0, 8), // only tokens beyond context_len are removed
+            (7, 2, 7), // reserved tokens trigger the branch but do not shrink input
+            (9, 2, 8), // reserved tokens do not move the truncation boundary
+        ] {
+            let limits = Limits {
+                context_len: 8,
+                num_reserved_tokens: reserved_tokens,
+                allow_auto_truncate: true,
+                is_generation: false,
+                ..test_limits()
+            };
+            let mut request = embedding_req(Some((1..=input_len).collect()), None);
+            validate(&mut request, &limits).unwrap();
+            let RequestKind::Embedding(embedding) = &mut request.kind else {
+                unreachable!()
+            };
+
+            check_embedding_tokens(embedding, &limits).unwrap();
+
+            assert_eq!(
+                embedding.input_ids.as_ref().map(Vec::len),
+                Some(expected_len),
+                "input_len={input_len}, reserved_tokens={reserved_tokens}"
+            );
+        }
     }
 
     /// `input + max_new_tokens` past the context window is an actionable 400, not a
