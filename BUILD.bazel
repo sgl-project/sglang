@@ -12,7 +12,7 @@ test_suite(
 filegroup(
     name = "bazel_components",
     srcs = [
-        "//python/sglang/kernels:ngram_corpus_core",
+        "//python/sglang/kernels:ngram_corpus_ffi.so",
         "//python/sglang/kernels/aot:cpu_sources",
         "//python/sglang/srt/rust_extensions:_multimodal",
         "//python/sglang/srt/rust_extensions:_server",

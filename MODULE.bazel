@@ -11,6 +11,30 @@ bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_pyo3", version = "0.73.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
+tvm_ffi_wheel = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive",
+)
+
+tvm_ffi_wheel(
+    name = "tvm_ffi_linux_x86_64",
+    build_file_content = """
+load("@rules_cc//cc:cc_import.bzl", "cc_import")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_import(
+    name = "tvm_ffi",
+    hdrs = glob(["tvm_ffi/include/**/*.h"]),
+    includes = ["tvm_ffi/include"],
+    shared_library = "tvm_ffi/lib/libtvm_ffi.so",
+)
+""",
+    sha256 = "78aa1857b04a2ea718317041ab3f01288b3d496e6036eb1b99ebdc9da0fdaef5",
+    type = "zip",
+    urls = ["https://files.pythonhosted.org/packages/36/99/2848df4e8ed5bf51df1d286d1718510584fa61e88adbc9c5b23d71b38f7c/apache_tvm_ffi-0.1.11-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"],
+)
+
 rules_rust_pyo3_crates = use_extension(
     "@rules_rust_pyo3//private:internal_extensions.bzl",
     "rust_ext",

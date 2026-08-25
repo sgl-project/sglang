@@ -1,4 +1,35 @@
+load(":kernel_wheel.bzl", "kernel_wheel")
+
 package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "wheel_sources",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "build/**",
+            "dist/**",
+        ],
+    ),
+)
+
+kernel_wheel(
+    name = "cpu_wheel",
+    srcs = [":wheel_sources"],
+    backend = "cpu",
+    source_root = "python/sglang/kernels/aot",
+    tags = ["manual"],
+    target_compatible_with = ["//bazel/platforms:cpu"],
+)
+
+kernel_wheel(
+    name = "cuda_wheel",
+    srcs = [":wheel_sources"],
+    backend = "cuda",
+    source_root = "python/sglang/kernels/aot",
+    tags = ["manual"],
+    target_compatible_with = ["//bazel/platforms:cuda"],
+)
 
 filegroup(
     name = "public_headers",
