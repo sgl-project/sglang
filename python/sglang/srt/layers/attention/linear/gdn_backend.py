@@ -73,15 +73,20 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     ):
         return None
 
-    # SM100 runs the CUDA>=13 CuTe-DSL chunk kernel on a bf16 state pool;
-    # SM90/SM120 run the C++ path on an fp32 state pool and tolerate larger
-    # chunks. Everything outside these validated domains keeps Triton.
+    # SM100 and SM120 share the state-pool prefill path (see gdn_flashinfer's
+    # use_state_pool) and are both validated only on CUDA>=13 with chunks up to
+    # 8192; they differ in the state dtype the kernel entry accepts. SM90 runs
+    # the fused Hopper kernel on an fp32 state pool and tolerates larger chunks.
+    # Everything outside these validated domains keeps Triton.
     cuda_version = torch.version.cuda
-    if sm_major == 10:
+    if sm_major in (10, 12):
         if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
             return None
         max_chunk = 8192
-        expected_state_dtype = torch.bfloat16
+        # SM100 feeds the pool dtype straight to the kernel, while the SM120
+        # chunked-prefill entry only accepts fp32 initial states (see
+        # gdn_flashinfer's _prefill_needs_fp32_state).
+        expected_state_dtype = torch.bfloat16 if sm_major == 10 else torch.float32
     else:
         max_chunk = 32768
         expected_state_dtype = torch.float32
