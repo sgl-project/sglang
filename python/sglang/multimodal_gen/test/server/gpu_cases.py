@@ -1088,6 +1088,18 @@ if not current_platform.is_hip():
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
+# MiniMax-H3's full-loop denoise stage accepts CUDA, MPS, and Ascend NPU only and
+# raises RuntimeError on every other platform, so every H3 case fails within
+# seconds of the first request on ROCm. Keying off the model path rather than the
+# case ids covers H3 cases added later. Remove this block once the stage grows a
+# HIP path.
+if current_platform.is_hip():
+    TWO_GPU_CASES = [
+        case
+        for case in TWO_GPU_CASES
+        if case.server_args.model_path != "MiniMaxAI/MiniMax-H3"
+    ]
+
 
 ONE_GPU_5090_PERF_CASE_IDS = frozenset(
     {

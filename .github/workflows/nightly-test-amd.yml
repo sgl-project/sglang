@@ -89,6 +89,7 @@ on:
           - nightly-8-gpu-minimax-m27
           # Diffusion (MI30x)
           - nightly-1-gpu-zimage-turbo
+          - nightly-8-gpu-wan22-fp8-mla
       job_filter:
         description: 'Or type comma-separated job names (overrides dropdown if non-empty)'
         required: false
@@ -1913,6 +1914,50 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  nightly-8-gpu-wan22-fp8-mla:
+    name: nightly-8-gpu-wan22-fp8-mla (rocm700, linux-mi300-8gpu-sglang)
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-wan22-fp8-mla,'))
+    runs-on: linux-mi300-8gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
+
+      - name: Wan2.2 FP8 MLA Diffusion Test (1-GPU + 8-GPU)
+        timeout-minutes: 150
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e SGLANG_DIFFUSION_ARTIFACT_DIR="/sglang-checkout/diffusion-failures" \
+            python3 run_suite.py --hw amd --suite nightly-amd-fp8-mla-diffusion --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wan22-fp8-mla-failures
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
+
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
@@ -1975,6 +2020,7 @@ jobs:
       - nightly-8-gpu-minimax-m27
       # Diffusion (MI30x)
       - nightly-1-gpu-zimage-turbo
+      # - nightly-8-gpu-wan22-fp8-mla  # excluded: newly enabled suite with no green history yet
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
