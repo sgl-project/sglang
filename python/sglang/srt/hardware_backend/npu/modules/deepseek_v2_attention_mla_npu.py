@@ -303,27 +303,15 @@ def forward_mla_core_npu(
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_output = attn_output.contiguous()
-    if (
-        attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
-        or m.w_vc.shape[-1] >= 65536
-    ):
-        # npu_transpose_batchmatmul does not support dimensions >= 65536.
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    else:
-        # Use the numerically validated torch_npu implementation when supported.
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+    # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
+    # Kimi-K3, so use the numerically validated torch_npu implementation.
+    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+        attn_output,
+        m.w_vc,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
