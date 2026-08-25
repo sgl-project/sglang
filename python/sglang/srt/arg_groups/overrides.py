@@ -888,6 +888,17 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_hip():
         if server_args.is_attention_backend_not_set():
             overrides["attention_backend"] = "triton"
+        if (
+            server_args.page_size is None
+            and overrides.get("attention_backend", server_args.attention_backend)
+            == "triton"
+        ):
+            overrides["page_size"] = 128
+            logger.info(
+                "MiniMax-M3 on ROCm: page_size=128 to match the sparse block "
+                "size, so the Triton sparse kernels resolve a selected block "
+                "with one req_to_token lookup per page."
+            )
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"
         if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():
@@ -932,8 +943,16 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         page_resolved = server_args.page_size
         # fa4 (fmha_sm100) and trtllm_mha both allow the page_size == 128
         # sparse block MSA needs (trtllm_mha via trtllm-gen's dynamic
-        # tokens-per-page kernels).
-        if page_resolved is None and backend_resolved in ("fa4", "trtllm_mha"):
+        # tokens-per-page kernels), and triton serves any page size. Matching
+        # the page to the sparse block also lets the Triton step-3 kernels
+        # resolve a selected block with one req_to_token lookup per page
+        # instead of a per-token gather, which is what runs whenever MSA is
+        # unavailable.
+        if page_resolved is None and backend_resolved in (
+            "fa4",
+            "trtllm_mha",
+            "triton",
+        ):
             overrides["page_size"] = 128
             page_resolved = 128
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
@@ -952,11 +971,12 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         if server_args.is_attention_backend_not_set():
             overrides["attention_backend"] = "fa3"
         page_resolved = server_args.page_size
-        if (
-            page_resolved is None
-            and overrides.get("attention_backend", server_args.attention_backend)
-            == "fa3"
-        ):
+        # fa3 allows the 128-token page, and triton serves any page size; both
+        # want it matched to the sparse block size so the Triton step-3 kernels
+        # resolve a selected block with one req_to_token lookup per page.
+        if page_resolved is None and overrides.get(
+            "attention_backend", server_args.attention_backend
+        ) in ("fa3", "triton"):
             overrides["page_size"] = 128
             page_resolved = 128
         logger.info(
@@ -964,6 +984,15 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved} "
             "(MSA is SM100-only; sparse attention runs on the Triton path)."
         )
+    elif (
+        server_args.page_size is None
+        and overrides.get("attention_backend", server_args.attention_backend)
+        == "triton"
+    ):
+        # Pre-Hopper CUDA has no arch default for the dense backend, but an
+        # explicit --attention-backend triton runs the same Triton sparse path,
+        # which wants the KV page matched to the sparse block size.
+        overrides["page_size"] = 128
 
     # fp8 attention GEMMs have no opt-in flag: m3_fp8_attn_gemm_enabled
     # (server_args.py) derives the mode from kv_cache_dtype (fp8_e4m3) +

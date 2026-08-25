@@ -158,7 +158,12 @@ def _decode_score_kernel(
                 mask=prefetch_mask,
                 other=0,
             ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots
+        # Same wrap as `(slots + max_slots) % max_slots` over
+        # [-max_slots, 2 * max_slots), without a runtime integer modulo: GPUs
+        # have no integer div/mod, so the modulo expands into a reciprocal
+        # sequence on every lane of this vector.
+        slots = tl.where(slots < 0, slots + max_slots, slots)
+        slots = tl.where(slots >= max_slots, slots - max_slots, slots)
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -373,7 +378,12 @@ def _decode_score_attn_kernel(
             mask=pos_mask,
             other=0,
         ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        # Same wrap as `(slots + max_slots) % max_slots` over
+        # [-max_slots, 2 * max_slots), without a runtime integer modulo: GPUs
+        # have no integer div/mod, so the modulo expands into a reciprocal
+        # sequence on every lane of this vector.
+        slots = tl.where(slots < 0, slots + max_slots, slots)
+        slots = tl.where(slots >= max_slots, slots - max_slots, slots)
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s

@@ -13,6 +13,10 @@ from ..common.utils import (
     unit_scale,
 )
 
+# Shortest per-page run worth taking the paged slot resolution for. Below this
+# the [PAGE_RUNS, PAGE_SPAN] reshape costs more than the gather it replaces.
+MIN_PAGE_SPAN = 16
+
 
 @triton.heuristics(
     {
@@ -89,6 +93,9 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGED_KV: tl.constexpr,
+    PAGE_SPAN: tl.constexpr,  # consecutive slots per run
+    PAGE_RUNS: tl.constexpr,  # runs per block (PAGE_SPAN * PAGE_RUNS == BLOCK_SIZE_N)
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -168,12 +175,46 @@ def _gqa_share_sparse_decode_kernel(
         # resolve slots for this block via req_to_token
         pos = c + off_n
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        if PAGED_KV:
+            # A block starts at a multiple of block_size, so whenever page and
+            # block sizes divide one another the block covers PAGE_RUNS whole,
+            # page-aligned runs of PAGE_SPAN consecutive slots. One lookup per
+            # run then replaces the BLOCK_SIZE_N-entry index gather.
+            if PAGE_RUNS == 1:
+                # page_size >= block size: the whole block is one page.
+                base_slot = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + c,
+                    mask=c < seq_len,
+                    other=0,
+                ).to(tl.int64)
+                base_slot = tl.where(base_slot < 0, base_slot + max_slots, base_slot)
+                slots = base_slot + off_n.to(tl.int64)
+            else:
+                # page_size < block size: one lookup per page.
+                off_p = tl.arange(0, PAGE_RUNS)
+                run_pos = c + off_p * PAGE_SPAN
+                bases = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + run_pos,
+                    mask=run_pos < seq_len,
+                    other=0,
+                ).to(tl.int64)
+                bases = tl.where(bases < 0, bases + max_slots, bases)
+                slots = tl.reshape(
+                    bases[:, None] + tl.arange(0, PAGE_SPAN).to(tl.int64)[None, :],
+                    BLOCK_SIZE_N,
+                )
+        else:
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
+            # Same wrap as `(slots + max_slots) % max_slots` over
+            # [-max_slots, 2 * max_slots), without a runtime integer modulo:
+            # GPUs have no integer div/mod, so the modulo expands into a
+            # reciprocal sequence on every lane of this vector.
+            slots = tl.where(slots < 0, slots + max_slots, slots)
+            slots = tl.where(slots >= max_slots, slots - max_slots, slots)
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -321,7 +362,19 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
+    """Sparse GQA decode over the selected blocks of the paged main KV cache.
+
+    ``page_size`` is the KV pool's allocation granularity -- the pool hands out
+    ``page_size`` *contiguous* slots per page, which is what makes this work
+    (the MSA path relies on the same contract). When it and
+    ``block_size`` divide one another a selected block covers whole,
+    page-aligned runs of consecutive slots, so the inner loop resolves it with
+    one ``req_to_token`` lookup per run instead of a ``block_size``-entry
+    gather. Any other page size (and the default 1) keeps the gather, so the
+    argument is always safe to pass; the two paths are bit-identical.
+    """
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
@@ -334,6 +387,18 @@ def flash_decode_with_gqa_share_sparse(
     assert (
         triton.next_power_of_2(block_size) == block_size
     ), f"block_size must be a power of 2, but got {block_size}"
+    # A block starts at a multiple of block_size, so its slots are consecutive
+    # within page-aligned runs exactly when page and block sizes divide one
+    # another -- either direction:
+    #     page >= block  ->  1 run of block_size      (one scalar lookup)
+    #     page <  block  ->  block/page runs of page  (one lookup per page)
+    page_span = min(page_size, block_size)
+    paged_kv = (
+        (page_size % block_size == 0 or block_size % page_size == 0)
+        and max_slots % page_size == 0
+        and page_span >= MIN_PAGE_SPAN
+    )
+    page_runs = block_size // page_span if paged_kv else 1
     # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
     max_kv_len = req_to_token.shape[1]
     # gqa
@@ -420,6 +485,9 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        PAGED_KV=paged_kv,
+        PAGE_SPAN=page_span,
+        PAGE_RUNS=page_runs,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
