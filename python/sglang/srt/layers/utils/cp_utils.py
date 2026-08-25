@@ -20,7 +20,8 @@ from sglang.srt.runtime_context import (
     uses_mla_backend,
 )
 
-
+MAX_LEN = None
+PER_RANK_ACTUAL_TOKEN = None
 @dataclass
 class ContextParallelMetadata:
     # Layout lists have length bs * cp_segment_num (= bs * 2 * cp_size).
@@ -792,6 +793,11 @@ def prepare_context_parallel_metadata(
     assert len(cp_reverse_index) == bs * cp_segment_num
     assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
     assert sum(per_rank_actual_token) == total_seq_lens
+
+    global MAX_LEN
+    MAX_LEN = max_rank_len[0]
+    global PER_RANK_ACTUAL_TOKEN
+    PER_RANK_ACTUAL_TOKEN = per_rank_actual_token
 
     return ContextParallelMetadata(
         split_list=split_list,
