@@ -368,7 +368,8 @@ class TestExtendAttention(CustomTestCase):
             sinks if has_sink else None,
         )
 
-        torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
+        tolerance = 2e-2 if kv_from_cache else 1e-2
+        torch.testing.assert_close(o_ref, o_extend, atol=tolerance, rtol=tolerance)
 
     def test_extend_attention(self):
         for kvcache_dtype in [

@@ -34,14 +34,12 @@ inline void mm512_load_vec(
     int64_t index,
     int n,
     __m512i& dst) {
-  const __m512 s = _mm512_mul_ps(_mm512_set1_ps(scale[index]), vexp);
+  const __m512 s = _mm512_set1_ps(scale[index]);
   const auto* p = src + index * ld;
   __m256i s8 =
       n >= 32 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)) : _mm256_maskz_loadu_epi8(elem_mask(n), p);
-  const __mmask32 nz = _mm256_cmpneq_epi8_mask(s8, _mm256_setzero_si256());
-  s8 = _mm256_maskz_mov_epi8(nz, s8);
   // TODO: optimize the process of converting fp8 to bf16: fp8 -> bf16 -> fp32 -> bf16
-  __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
+  __m512bh bf16 = cvt_e4m3_bf16_intrinsic_with_denorm(s8);
   __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
   __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
   dst = (__m512i)_mm512_cvtne2ps_pbh(_mm512_mul_ps(f_hi, s), _mm512_mul_ps(f_lo, s));
