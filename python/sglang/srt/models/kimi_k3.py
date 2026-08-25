@@ -311,6 +311,9 @@ class KimiK3MLP(nn.Module):
         if self._dense_attn_tp:
             tp_rank = get_parallel().attn_tp_rank
             tp_size = get_parallel().attn_tp_size
+        elif tp_rank is None and tp_size is None:
+            if get_parallel().moe_dense_tp_size == 1:
+                tp_rank, tp_size = 0, 1
         _tp_kwargs = (
             dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
         )
