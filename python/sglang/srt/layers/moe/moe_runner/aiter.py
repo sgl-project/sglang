@@ -123,53 +123,43 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
-_RECV_BOUND_LOGGED = False
+def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
+    """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
 
+    Worst case fan-in is every rank routing all of its tokens here, so
+    sum(per-rank tokens) * topk, where topk already includes the fused shared
+    expert. Summing the actual per-rank counts rather than assuming they are
+    equal keeps this a bound even when the ranks are not carrying the same batch.
 
-def _mori_decode_recv_bound(recv_rows: int) -> int:
-    """Upper bound on live rows in mori's receive buffer, or 0 for "do not bound".
+    Two cases must stay unbounded, because a bound below the real fan-in silently
+    drops rows from the all-to-all -- wrong output, not an error:
 
-    Only valid in decode, where every DP rank replays the same cuda-graph tier and
-    so sends the same number of tokens: this rank can receive at most every rank
-    sending all of its tokens to it, i.e. send_tokens * world_size * topk. topk
-    already includes the fused shared expert (deepseek_v2.py adds
-    num_fused_shared_experts into top_k), so this is the true worst case and not an
-    estimate. Prefill token counts are uneven across ranks and cannot be bounded on
-    the host, so it is left alone -- truncating prefill corrupts mori's combine.
+    * Prefill. Per-rank counts are uneven and not knowable here.
+    * DP without max-length padding. This runs while a cuda graph is *captured*,
+      so the value is frozen into the graph and has to hold for every later
+      replay. Only max-length padding makes the ranks share one padded length,
+      and therefore one graph tier; without it a peer can replay a wider tier
+      than the one seen at capture and overrun the bound recorded here.
     """
     if not get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
         return 0
 
-    from sglang.srt.layers.moe.token_dispatcher import moriep
+    from sglang.srt.layers.dp_attention import (
+        get_dp_global_num_tokens,
+        get_is_extend_in_batch,
+        is_dp_max_padding,
+    )
 
-    sent = moriep.LAST_DISPATCH_SEND_TOKENS
-    if not sent:
+    if get_is_extend_in_batch() or not is_dp_max_padding():
         return 0
 
-    from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-
-    if get_is_extend_in_batch():
+    global_num_tokens = get_dp_global_num_tokens()
+    if not global_num_tokens:
         return 0
 
-    num_token, world_size, topk = sent
-    margin_pct = get_int_env_var("SGLANG_MORI_RECV_BOUND_MARGIN_PCT", 100)
-    bound = num_token * world_size * topk * margin_pct // 100
-    # Never grow the tensor, and never bother when there is nothing to trim.
-    if not 0 < bound < recv_rows:
-        return 0
-
-    global _RECV_BOUND_LOGGED
-    if not _RECV_BOUND_LOGGED:
-        _RECV_BOUND_LOGGED = True
-        # Announce once: a bound that silently never engages is indistinguishable
-        # from an unpatched run in the results.
-        print(
-            f"[recv-bound] decode bound ACTIVE: {recv_rows} rows -> {bound} "
-            f"(sent={num_token} world={world_size} topk={topk} "
-            f"margin={margin_pct}%)",
-            flush=True,
-        )
-    return bound
+    bound = sum(global_num_tokens) * topk
+    # Never grow the tensor, and nothing to do when there is nothing to trim.
+    return bound if 0 < bound < recv_rows else 0
 
 
 class AiterRunnerCore(MoeRunnerCore):
@@ -372,7 +362,9 @@ def _pre_permute_deepep_to_aiter(
         # padding back.
         mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
         if mori_max <= 0:
-            mori_max = _mori_decode_recv_bound(hidden_states.shape[0])
+            mori_max = _mori_decode_recv_bound(
+                hidden_states.shape[0], topk_ids.shape[-1]
+            )
         if mori_max > 0:
             hidden_states = hidden_states[:mori_max]
             if a1_scale is not None:
