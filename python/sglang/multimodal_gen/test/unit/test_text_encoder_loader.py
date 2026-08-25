@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
     KitchenW4A8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -27,15 +28,22 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
+    _get_encoder_quant_config,
     _process_quantized_encoder_weights,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+    TextEncoder,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -124,6 +132,13 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
 
+    def test_tensor_parallel_encoder_keeps_checkpoint_weights_by_default(self):
+        self.assertTrue(
+            EncoderTensorParallelMixin.should_materialize_checkpoint_weight(
+                "model.layers.0.self_attn.q_proj.weight"
+            )
+        )
+
     def test_bitsandbytes_native_load_requires_resident_encoder(self):
         loaded_encoder = nn.Linear(1, 1)
         transformers_model_class = SimpleNamespace(
@@ -174,7 +189,9 @@ class TestTextEncoderClassResolution(unittest.TestCase):
 
 class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
     def test_only_known_unconsumed_weights_are_filtered(self):
-        should_load = MiniMaxH3Qwen3VLEncoder.should_materialize_checkpoint_weight
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        encoder.selected_lm_layer = 50
+        should_load = encoder.should_materialize_checkpoint_weight
         expected = {
             "model.language_model.layers.49.self_attn.q_proj.weight": True,
             "model.language_model.layers.50.self_attn.q_proj.weight": False,
@@ -186,17 +203,25 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             "model.layers.49.self_attn.q_proj.weight": True,
             "model.layers.50.self_attn.q_proj.weight": False,
             "visual.blocks.0.attn.qkv.weight": True,
-            "language_model.layers.63.mlp.down_proj.weight": True,
+            "language_model.layers.63.mlp.down_proj.weight": False,
             "module.model.language_model.layers.63.mlp.down_proj.weight": True,
         }
         self.assertEqual(
             {name: should_load(name) for name in expected},
             expected,
         )
+        encoder.selected_lm_layer = 24
+        self.assertTrue(
+            should_load("model.language_model.layers.23.mlp.down_proj.weight")
+        )
+        self.assertFalse(
+            should_load("model.language_model.layers.24.mlp.down_proj.weight")
+        )
 
     def test_vision_qkv_checkpoint_name_maps_to_native_projection(self):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
+        encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.visual = torch.nn.Module()
         block = torch.nn.Module()
@@ -217,6 +242,7 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
     def test_comfy_language_checkpoint_name_maps_to_native_namespace(self):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
+        encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.language_model = torch.nn.Module()
         layer = torch.nn.Module()
@@ -232,6 +258,69 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
         target_name = "model.language_model.layers.0.self_attn.q_proj.weight"
         self.assertEqual(loaded, {target_name})
         torch.testing.assert_close(layer.self_attn.q_proj.weight, source)
+
+
+class TestMiniMaxH3ConditioningProjection(unittest.TestCase):
+    @staticmethod
+    def _save_projection(path, tensors):
+        save_file(tensors, path, metadata={"tap": "2"})
+
+    def test_linear_projection_and_attention_sink(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            tensors = {
+                "W": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "mean_in": torch.tensor([1.0, -1.0]),
+                "std_in": torch.tensor([2.0, 4.0]),
+                "mean_out": torch.tensor([0.5, -0.5]),
+                "std_out": torch.tensor([2.0, 3.0]),
+                "sink_out": torch.tensor([9.0, 8.0]),
+            }
+            self._save_projection(checkpoint.name, tensors)
+            projection = MiniMaxH3ConditioningProjection(checkpoint.name)
+            hidden = torch.tensor([[5.0, 3.0], [3.0, -1.0]])
+            expected = (hidden - tensors["mean_in"]) / tensors["std_in"]
+            expected = expected @ tensors["W"]
+            expected = expected * tensors["std_out"] + tensors["mean_out"]
+            expected[0] = tensors["sink_out"]
+
+            torch.testing.assert_close(projection(hidden), expected)
+            self.assertEqual(projection.tap, 2)
+
+    def test_mlp_only_projection(self):
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            tensors = {
+                "mean_in": torch.zeros(2),
+                "std_in": torch.ones(2),
+                "mean_out": torch.tensor([0.5]),
+                "std_out": torch.tensor([2.0]),
+                "mlp.0.weight": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                "mlp.0.bias": torch.tensor([0.25, -0.25]),
+                "mlp.2.weight": torch.tensor([[2.0, -1.0]]),
+                "mlp.2.bias": torch.tensor([0.75]),
+            }
+            self._save_projection(checkpoint.name, tensors)
+            projection = MiniMaxH3ConditioningProjection(checkpoint.name)
+            hidden = torch.tensor([[1.0, 2.0]])
+            residual = torch.nn.functional.linear(
+                hidden, tensors["mlp.0.weight"], tensors["mlp.0.bias"]
+            )
+            residual = torch.nn.functional.gelu(residual)
+            residual = torch.nn.functional.linear(
+                residual, tensors["mlp.2.weight"], tensors["mlp.2.bias"]
+            )
+            expected = residual * tensors["std_out"] + tensors["mean_out"]
+
+            torch.testing.assert_close(projection(hidden), expected)
+
+    def test_small_encoder_requires_matching_projection(self):
+        config = SimpleNamespace(
+            arch_config=SimpleNamespace(
+                hidden_size=2560,
+                checkpoint_num_hidden_layers=36,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "conditioning_projection"):
+            MiniMaxH3Qwen3VLEncoder.configure_component_paths(config, {})
 
 
 class TestTextEncoderQuantization(unittest.TestCase):
@@ -261,6 +350,25 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "text_encoder",
         )
         self.assertIs(model_config.quant_config, self.serialized)
+
+    def test_explicit_online_quantization_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="kitchen_int8",
+            ignored_layers=["lm_head"],
+        )
+
+        self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
+        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
+        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
@@ -294,11 +402,11 @@ class TestTextEncoderQuantization(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
             save_file(
                 {
-                    "model.layers.0.self_attn.q_proj.weight": torch.ones(
+                    "visual.blocks.0.attn.qkv.weight": torch.ones(
                         (2, 256), dtype=torch.int8
                     ),
-                    "model.layers.0.self_attn.q_proj.weight_scale": torch.ones((2, 1)),
-                    "model.layers.0.self_attn.q_proj.comfy_quant": torch.tensor(
+                    "visual.blocks.0.attn.qkv.weight_scale": torch.ones((2, 1)),
+                    "visual.blocks.0.attn.qkv.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
                 },
@@ -322,7 +430,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIsInstance(model_config.quant_config, KitchenInt8Config)
         self.assertEqual(
             set(model_config.quant_config.layer_markers),
-            {"model.language_model.layers.0.self_attn.q_proj"},
+            {"model.visual.blocks.0.attn.qkv_proj"},
         )
 
     def test_comfy_w4a4_weight_file_configures_native_encoder(self):
@@ -416,6 +524,57 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIn(
             "model.language_model.layers.0.mlp.down_proj",
             model_config.quant_config.layer_markers,
+        )
+
+    def test_gguf_maps_h3_names_and_drops_unused_language_layers(self):
+        self.get_quant_config.return_value = None
+
+        def meta(name: str) -> GGUFTensorMeta:
+            return GGUFTensorMeta(
+                ggml_type=12,
+                logical_shape=(2, 256),
+                stored_shape=(2, 144),
+                stored_dtype=torch.uint8,
+                param_name=f"{name.removesuffix('.weight')}.qweight",
+            )
+
+        checkpoint_meta = {
+            name: meta(name)
+            for name in (
+                "model.layers.49.self_attn.q_proj.weight",
+                "model.layers.50.self_attn.q_proj.weight",
+                "visual.blocks.0.attn.qkv.weight",
+            )
+        }
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.read_gguf_tensor_meta",
+            return_value=checkpoint_meta,
+        ):
+            config = _get_encoder_quant_config(
+                {},
+                "/model/text_encoder",
+                "/weights/encoder.gguf",
+                MiniMaxH3Qwen3VLEncoder,
+            )
+
+        self.assertIsInstance(config, GGUFConfig)
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        encoder.selected_lm_layer = 50
+        config.retain_tensor_meta(encoder.should_materialize_checkpoint_weight)
+        self.assertEqual(
+            config.quantized_prefixes,
+            {"model.language_model.layers.49.self_attn.q_proj"},
+        )
+        vision_meta = config.tensor_meta["model.visual.blocks.0.attn.qkv_proj.weight"]
+        self.assertTrue(vision_meta.dequantize_on_load)
+        self.assertEqual(
+            vision_meta.param_name,
+            "model.visual.blocks.0.attn.qkv_proj.weight",
+        )
+        self.assertNotIn(
+            "model.language_model.layers.50.self_attn.q_proj.weight",
+            config.tensor_meta,
         )
 
     def test_encoder_must_use_native_loader(self):
@@ -548,7 +707,27 @@ class _QuantizedEncoder(nn.Module):
         self.unquantized = nn.Linear(2, 2, bias=False)
 
 
+class _SRTQuantizedLinear(SrtLinearBase):
+    def __init__(self, quant_method):
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.empty(2, 2), requires_grad=False)
+        self.quant_method = quant_method
+
+
 class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
+    def test_processes_srt_quantized_linear(self):
+        quant_method = _RecordingQuantMethod()
+        model = _SRTQuantizedLinear(quant_method)
+
+        processed = _process_quantized_encoder_weights(
+            model,
+            torch.device("cpu"),
+            "image_encoder",
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(quant_method.devices, [torch.device("cpu")])
+
     def test_rejects_native_encoder_without_quantized_layers(self):
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError,

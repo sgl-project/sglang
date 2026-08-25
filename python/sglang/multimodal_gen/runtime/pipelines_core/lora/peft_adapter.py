@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import torch
+from safetensors import safe_open
 
 _ADAPTER_SLOT = re.compile(r"(\.lora_[AB])\.([^.]+)\.weight$")
 _WRAPPER_PREFIXES = ("peft_model.base_model.model.", "base_model.model.")
@@ -21,16 +22,78 @@ _UNSUPPORTED_CONFIG_FIELDS = (
     "use_bdlora",
     "use_qalora",
 )
+_SAFETENSORS_ALPHA_KEYS = ("lora_alpha", "network_alpha", "alpha")
+_NATIVE_LORA_A_SUFFIXES = (
+    ".lora_A.weight",
+    ".lora_down.weight",
+    ".lora.down.weight",
+)
+
+
+def _has_unambiguous_global_alpha(file: Any) -> bool:
+    """Reject bare mixed-rank files whose global alpha semantics are ambiguous."""
+    keys = list(file.keys())
+    if any(_ADAPTER_SLOT.search(name) is not None for name in keys):
+        return True
+
+    ranks = set()
+    for name in keys:
+        if not name.endswith(_NATIVE_LORA_A_SUFFIXES):
+            continue
+        shape = file.get_slice(name).get_shape()
+        if len(shape) >= 2:
+            ranks.add(shape[-2])
+    return len(ranks) == 1
+
+
+def _load_safetensors_lora_alpha(weight_path: str) -> int | None:
+    if Path(weight_path).suffix.lower() != ".safetensors":
+        return None
+    with safe_open(weight_path, framework="pt", device="cpu") as file:
+        metadata = file.metadata() or {}
+        if not _has_unambiguous_global_alpha(file):
+            return None
+    declared = []
+    for key in _SAFETENSORS_ALPHA_KEYS:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"safetensors metadata {key!r} must be a positive integer"
+            ) from error
+        if not math.isfinite(numeric) or numeric <= 0 or not numeric.is_integer():
+            raise ValueError(f"safetensors metadata {key!r} must be a positive integer")
+        declared.append((key, int(numeric)))
+    values = {value for _, value in declared}
+    if len(values) > 1:
+        raise ValueError(f"conflicting safetensors LoRA alpha metadata: {declared}")
+    return declared[0][1] if declared else None
 
 
 def load_peft_config(weight_path: str) -> dict[str, Any]:
     path = Path(weight_path).with_name("adapter_config.json")
-    if not path.is_file():
-        return {}
-    with path.open(encoding="utf-8") as file:
-        config = json.load(file)
+    config = {}
+    if path.is_file():
+        with path.open(encoding="utf-8") as file:
+            config = json.load(file)
     if not isinstance(config, dict):
         raise ValueError("PEFT adapter_config.json must contain a JSON object")
+    metadata_alpha = _load_safetensors_lora_alpha(weight_path)
+    config_alpha = get_peft_lora_alpha(config)
+    if (
+        metadata_alpha is not None
+        and config_alpha is not None
+        and metadata_alpha != config_alpha
+    ):
+        raise ValueError(
+            "adapter_config.json lora_alpha conflicts with safetensors metadata: "
+            f"{config_alpha} != {metadata_alpha}"
+        )
+    if metadata_alpha is not None:
+        config.setdefault("lora_alpha", metadata_alpha)
     return config
 
 

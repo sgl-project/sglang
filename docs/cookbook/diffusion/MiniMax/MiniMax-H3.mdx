@@ -291,6 +291,13 @@ the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
 layerwise offload are supported; TP8 violates the checkpoint's 256-element
 ConvRot group boundary, and FSDP is rejected.
 
+Self-describing community MXFP8 files use the same
+`--transformer-weights-path <repo/file.safetensors>` form and need no
+quantization flag. SGLang reads their global format metadata, keeps unmarked H3
+layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
+selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
+this mixed per-layer layout.
+
 W4A8 ConvRot DiT files use the same flagless flow. With
 `comfy-kitchen>=0.2.27`, pass a file such as
 `starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
@@ -988,6 +995,34 @@ W4A4 Qwen3-VL files use the same overlay, for example:
 
 This checkpoint keeps its unmarked embedding and vision tower in their source
 precision; no explicit component quantization option is needed.
+
+The same component option accepts a self-describing Quanto qint8 file without
+an additional quantization flag:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors
+```
+
+This variant keeps the declared language and vision linear weights in qint8
+storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
+it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
+is the selector; adding `--quantization` would describe a different operation.
+
+Qwen3-VL GGUF files use the same component option:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf
+```
+
+The file selects its own Q4/Q6 layout; do not add `--quantization`. SGLang keeps
+the aligned vocabulary table and language linears in packed GGML storage. The
+smaller Comfy vision tower, whose flattened blocks can cross row and TP shard
+boundaries, is restored one matrix at a time to BF16 during loading.
+This CUDA-only memory option supports encoder TP and layerwise placement, but
+not encoder FSDP. Like the Quanto variant, it is approximate and is not a
+throughput claim.
 
 </Tab>
 
