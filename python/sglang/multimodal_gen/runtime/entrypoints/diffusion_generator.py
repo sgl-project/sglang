@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
-    should_run_explicit_client_warmup,
+    should_run_client_warmup,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
@@ -156,10 +156,16 @@ class DiffGenerator:
         return processes
 
     def _run_client_warmup_if_needed(self) -> None:
-        if not should_run_explicit_client_warmup(self.server_args):
+        if not should_run_client_warmup(self.server_args):
             return
 
-        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
+        # An auto-selected warmup must not break the run it was meant to
+        # speed up; an explicitly requested one is part of the contract.
+        run_sync_client_warmup(
+            self.server_args,
+            sync_scheduler_client.forward,
+            fail_open=self.server_args.warmup_resolutions is None,
+        )
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""

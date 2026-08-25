@@ -101,6 +101,17 @@ def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
     )
 
 
+def should_run_client_warmup(server_args: ServerArgs) -> bool:
+    """Whether the calling entrypoint runs the synthetic warmup itself.
+
+    Offline runs launch no HTTP server, so the startup task in ``http_server``
+    never fires and nothing else honors ``server`` mode for them.
+    """
+    if should_run_synthetic_server_warmup(server_args):
+        return True
+    return should_run_explicit_client_warmup(server_args)
+
+
 def format_warmup_req(req_or_group: Any) -> str:
     req = get_first_generation_req(req_or_group)
     prefix = (
@@ -175,17 +186,27 @@ async def run_async_client_warmup(
 def run_sync_client_warmup(
     server_args: ServerArgs,
     forward: Callable[[Req], OutputBatch],
+    *,
+    fail_open: bool = False,
 ) -> None:
-    warmup_input_path = None
-    if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = prepare_warmup_image_path(server_args)
+    try:
+        warmup_input_path = None
+        if should_include_warmup_image(server_args, server_based_warmup=True):
+            warmup_input_path = prepare_warmup_image_path(server_args)
 
-    for req in build_client_warmup_reqs(
-        server_args, warmup_input_path=warmup_input_path
-    ):
-        response = forward(req)
-        if response.error is not None:
-            raise RuntimeError(response.error)
+        for req in build_client_warmup_reqs(
+            server_args, warmup_input_path=warmup_input_path
+        ):
+            response = forward(req)
+            if response.error is not None:
+                raise RuntimeError(response.error)
+    except Exception:
+        if fail_open:
+            logger.warning(
+                "Synthetic warmup failed; continuing without it", exc_info=True
+            )
+            return
+        raise
 
 
 def prepare_warmup_image_path(server_args: ServerArgs) -> str:
