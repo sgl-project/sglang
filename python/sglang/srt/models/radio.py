@@ -623,8 +623,10 @@ class RadioModel(nn.Module):
             weights_list = list(weights)
 
         for name, weight in weights_list:
+            source_name = name
+            is_hf_export = name.startswith("radio_model.hf_model.")
             loaded_shard_id = None
-            if name.startswith("radio_model.hf_model."):
+            if is_hf_export:
                 mapped_weight = _map_hf_radio_weight_name(name)
                 if mapped_weight is None:
                     continue
@@ -645,6 +647,10 @@ class RadioModel(nn.Module):
                 loaded_params.add(name)
                 if "video_embedder" in name:
                     self.model.patch_generator._video_embedder_loaded = True
+            elif is_hf_export:
+                raise ValueError(
+                    f"Unexpected HF RADIO weight: {source_name} (mapped to {name})"
+                )
 
         return loaded_params
 

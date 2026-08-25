@@ -438,12 +438,14 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     def _load_extra_weight(self, name: str, weight: torch.Tensor) -> None:
         prefix = "vision_projector.vision_final_layernorm."
         if not name.startswith(prefix):
-            return
+            raise ValueError(f"Unexpected Nemotron-H Omni weight: {name}")
         if self.vision_final_layernorm is None:
             raise ValueError(f"Unexpected vision projector weight: {name}")
-        parameter = dict(self.vision_final_layernorm.named_parameters())[
-            name.removeprefix(prefix)
-        ]
+        parameter_name = name.removeprefix(prefix)
+        parameters = dict(self.vision_final_layernorm.named_parameters())
+        if parameter_name not in parameters:
+            raise ValueError(f"Unexpected vision projector weight: {name}")
+        parameter = parameters[parameter_name]
         default_weight_loader(parameter, weight)
 
     @classmethod
