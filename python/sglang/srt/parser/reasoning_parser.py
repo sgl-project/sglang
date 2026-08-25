@@ -105,6 +105,16 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
+        # Whether a think_end_token has already closed reasoning (in the
+        # previous content or during this stream). Guards the dangling-closer
+        # handling below: a closer that arrives after reasoning ended is
+        # payload the model wrote, not a reasoning boundary.
+        self._saw_think_end = self.think_end_token in self.previous_content
+        # Rolling tail of text already streamed out as normal, long enough to
+        # recognise a think_start_token split across chunk boundaries. Once an
+        # opener has passed through as content, a later bare closer pairs with
+        # it (quoted markup), so dangling-closer handling turns itself off.
+        self._normal_tail = ""
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -124,6 +134,22 @@ class BaseReasoningFormatDetector:
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
+
+        if (
+            not in_reasoning
+            and self.thinks_internally
+            and not self._saw_think_end
+            and self.think_end_token in text
+        ):
+            # Dangling closer from a hybrid model: these models keep the
+            # opening tag in the chat template, so one that entered thinking
+            # on its own emits only reasoning followed by the closing tag —
+            # the same shape DeepSeek-R1 always produces. Without this the
+            # whole thought lands in normal_text with the tag embedded.
+            reasoning_text, normal_text = text.split(self.think_end_token, maxsplit=1)
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -218,6 +244,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
+            self._saw_think_end = True
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -259,10 +286,64 @@ class BaseReasoningFormatDetector:
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
+            if self._dangling_end_possible(current_text):
+                # Hybrid models keep the opening tag in the chat template, so
+                # one that entered thinking on its own emits only a closing
+                # tag. Reclassify what is still buffered as reasoning (chunks
+                # already streamed out are gone) and strip the tag itself.
+                end_idx = current_text.find(self.think_end_token)
+                if end_idx != -1:
+                    self._buffer = ""
+                    self._saw_think_end = True
+                    return StreamingParseResult(
+                        normal_text=current_text[end_idx + len(self.think_end_token) :],
+                        reasoning_text=current_text[:end_idx],
+                    )
+                # Hold back a tail that could be the closing tag split across
+                # chunks; finish() flushes it as content if it never is.
+                holdback = self._ends_with_partial_token(
+                    current_text, self.think_end_token
+                )
+                if holdback:
+                    emitted = current_text[: len(current_text) - holdback]
+                    self._buffer = current_text[len(current_text) - holdback :]
+                    self._track_normal_tail(emitted)
+                    return StreamingParseResult(normal_text=emitted)
             self._buffer = ""
+            self._track_normal_tail(current_text)
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
+
+    def _dangling_end_possible(self, current_text: str) -> bool:
+        """Whether a bare think_end_token in `current_text` should still be
+        read as the close of template-opened reasoning. Only for hybrid
+        models (thinks_internally), and only while nothing has contradicted
+        that reading: reasoning was never explicitly entered or closed, and
+        no opening tag has passed through as content (which would make a
+        later bare closer quoted markup, not a boundary)."""
+        if not self.thinks_internally:
+            return False
+        if self.force_reasoning or self.stripped_think_start or self._saw_think_end:
+            return False
+        think_start_text = self.think_start_token + self.think_start_self_label
+        return think_start_text not in self._normal_tail + current_text
+
+    def _track_normal_tail(self, emitted: str) -> None:
+        """Remember enough streamed-out content to recognise an opening tag
+        that straddled chunk boundaries (see _dangling_end_possible)."""
+        if not self.thinks_internally:
+            return
+        think_start_text = self.think_start_token + self.think_start_self_label
+        combined = self._normal_tail + emitted
+        if think_start_text in combined:
+            # Latch: an opener went out as content, so dangling handling is
+            # off for the rest of the stream however far the tail rolls.
+            self._normal_tail = think_start_text
+        else:
+            self._normal_tail = combined[
+                max(0, len(combined) - len(think_start_text) + 1) :
+            ]
 
     def _strip_leading_think_start(self, text: str) -> str:
         think_start_text = self.think_start_token + self.think_start_self_label
