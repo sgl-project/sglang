@@ -6,11 +6,16 @@ from unittest.mock import MagicMock
 import torch
 from PIL import Image
 
+from sglang.srt.managers.mm_schedule import _get_precomputed_embedding
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
+    MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -111,6 +116,36 @@ class TestPixtralProcessor(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "patch rows"):
             processor._finalize_mm_items([item], images=images)
+
+    def test_precomputed_embedding_reaches_pixtral_scheduler(self) -> None:
+        processor = self._make_processor()
+        processor._processor = MagicMock()
+        processor._tokenizer = MagicMock()
+        embedding = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+        items, _, _ = processor.process_and_combine_mm_data(
+            base_output=BaseMultiModalProcessorOutput(
+                input_text="",
+                input_ids=[7, 7],
+                images=[
+                    {
+                        "feature": embedding,
+                        "format": "precomputed_embedding",
+                    }
+                ],
+            ),
+            mm_tokens=MultimodalSpecialTokens(image_token_id=7),
+        )
+        result = _get_precomputed_embedding(
+            items=items,
+            items_size=[0, 1],
+            prefix_length=[0],
+            extend_length=[2],
+            items_offset_list=[[(0, 1)]],
+        )
+
+        self.assertIsNotNone(result)
+        torch.testing.assert_close(result, embedding, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
