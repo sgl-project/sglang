@@ -5,12 +5,12 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
 import logging
 
@@ -183,6 +183,211 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
+
+
+# ---------------------------------------------------------------------------
+#  NPUW4A8MXFP4MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
+    """W4A8 MoE with packed MXFP4 weights and MXFP8 activations.
+
+    Serves the offline ModelSlim ``W4A8_MXFP`` checkpoints and the online
+    ``--quantization mxfp_w4a8`` entry point; ``process_weights_after_loading``
+    tells them apart by expert-weight dtype.
+    """
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+
+    @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor, weight_prefix: str, fp4_dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize BF16/FP16 experts [E, N, K] to packed MXFP4 [E, N, K//2].
+
+        The returned e8m0 block scale is already pair-split as [E, N, K//64, 2];
+        an offline checkpoint instead stores it flat as [E, N, K//32].
+        """
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "NPUW4A8MXFP4MoEMethod: %s_weight dtype %s is not float16/bfloat16; "
+                "casting to bfloat16 before MXFP4 quantization.",
+                weight_prefix,
+                weight.dtype,
+            )
+            weight = weight.to(torch.bfloat16)
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        return torch.ops.npu.npu_dynamic_mx_quant(
+            weight, dst_type=fp4_dtype, round_mode="round"
+        )
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+
+        weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.data.dtype in (torch.float16, torch.bfloat16):
+            # Online entry: UnquantizedFusedMoEMethod created BF16 experts and no
+            # scale parameter, so make both here and share the re-layout below.
+            packed, block_scale = self._quantize_weight_online(
+                weight.data, weight_prefix, fp4_dtype
+            )
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
+        weight.data = npu_format_cast(
+            weight.data,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        ).transpose(-1, -2)
+
+        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
+        scale = weight_scale.data
+        if scale.dim() == 3:
+            scale = scale.reshape(
+                scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+            )
+        weight_scale.data = scale.transpose(1, 2)
+
+        # The refactored Ascend dispatchers currently support BF16 and INT8.
+        # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type: int,
+    ) -> torch.Tensor:
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        e8m0_dtype = _require_e8m0_dtype()
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
+
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            scale=None,
+            scale_dtype=None,
+            per_token_scale=[pertoken_scale],
+            antiquant_scale=[
+                getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+            ],
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=fp4_dtype,
+            per_token_scale_dtype=e8m0_dtype,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  NPUW4A4MXFP4MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
+    """ModelSlim W4A4 MXFP4 MoE with single-level FP4 weights and activations."""
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A4 MXFP4 MoE requires float4 support.")
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=fp4_dtype,
+            use_mx_quant=True,
+        )
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight = getattr(layer, f"{weight_prefix}_weight")
+        weight.data = npu_format_cast(weight.data).transpose(-1, -2)
+
+        weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
+        scale = weight_scale.data.reshape(
+            weight_scale.shape[0],
+            weight_scale.shape[1],
+            weight_scale.shape[2] // 2,
+            2,
+        ).transpose(1, 2)
+        weight_scale.data = scale
+
+        # The refactored Ascend dispatchers currently support BF16 and INT8.
+        # Keep dispatch in BF16 and quantize immediately before each GMM.
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type: int,
+    ) -> torch.Tensor:
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
+        e8m0_dtype = _require_e8m0_dtype()
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 32, 2
+            )
+
+        scale_args: Dict[str, Any] = {
+            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "scale_dtype": e8m0_dtype,
+            "per_token_scale": [pertoken_scale],
+            "per_token_scale_dtype": e8m0_dtype,
+            "x_dtype": fp4_dtype,
+            "weight_dtype": fp4_dtype,
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **scale_args,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -940,156 +1145,6 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             "per_token_scale_dtype": e8m0_dtype,
             "x_dtype": None,
             "weight_dtype": None,
-        }
-        return self.matmul.forward(
-            quant_info,
-            weight_prefix,
-            hidden_states,
-            expert_tokens,
-            output_dtype,
-            group_list_type=group_list_type,
-            transposed=True,
-            **scale_args,
-        )
-
-
-# ---------------------------------------------------------------------------
-#  NPUMXFP4W4A8MoEMethod
-# ---------------------------------------------------------------------------
-class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
-    """MXFP4 W4A8 MoE on Ascend A5 – packed-fp4 weights with e8m0 block scales.
-
-    Serves both the online config path (``--quantization mxfp_w4a8``, weights
-    quantised at load time from BF16 to MXFP4) and the offline ModelSlim
-    ``W4A8_MXFP`` scheme (weights already packed as uint8 fp4); the two are told
-    apart by weight dtype in ``process_weights_after_loading``.
-
-    Unlike MXFP8, gmm1 is **not** fused with swiglu via
-    ``npu_grouped_matmul_swiglu_quant_v2``: the fp4-gmm1 kernel produces bf16
-    output, which the runner then feeds through a separate swiglu + FP8
-    requantisation step (``NPUSwigluMXFP8Quant``). Both gmm1 and gmm2 use plain
-    ``npu_grouped_matmul`` with ``weight_dtype=fp4`` and ``antiquant_scale``,
-    mirroring vllm-ascend ``AscendW4A8MXFPDynamicFusedMoEMethod`` exactly.
-
-    TP only: MoE EP / DeepEP is not supported on this path (activation
-    quantisation comes from ``npu_moe_init_routing_v2(quant_mode=3)``, which the
-    DeepEP dispatch path does not go through).
-    """
-
-    def __init__(self):
-        super().__init__(quant_config=None)
-        self.matmul = GroupedMatmul()
-
-    @staticmethod
-    def _quantize_weight_online(
-        weight: torch.Tensor, weight_prefix: str
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantise BF16/FP16 expert weights ``[E, N, K]`` to packed MXFP4.
-
-        Returns the packed-fp4 payload ``[E, N, K//2]`` (uint8 container) and
-        its e8m0 block scale ``[E, N, K//64, 2]`` (block_size=32, pair-split by
-        the op).
-        """
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        if weight.dtype not in (torch.float16, torch.bfloat16):
-            logger.warning(
-                "NPUMXFP4W4A8MoEMethod: %s_weight dtype %s is not float16/bfloat16; "
-                "casting to bfloat16 before MXFP4 quantisation.",
-                weight_prefix,
-                weight.dtype,
-            )
-            weight = weight.to(torch.bfloat16)
-        if not weight.is_npu:
-            weight = weight.to(f"npu:{torch.npu.current_device()}")
-        return torch.ops.npu.npu_dynamic_mx_quant(
-            weight, dst_type=fp4_dtype, round_mode="round"
-        )
-
-    @staticmethod
-    def _process_weight_fp4(weight: torch.Tensor) -> torch.Tensor:
-        """Cast packed-fp4 weight to FRACTAL_NZ, then transpose [E,K,N]."""
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        # npu_format_cast needs an int-dtype tensor; packed-fp4 stored as uint8.
-        # view as uint8 is a no-op for a uint8 tensor.
-        weight_nz = npu_format_cast(
-            weight.view(torch.uint8),
-            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=fp4_dtype,
-        )
-        return weight_nz.transpose(1, 2)  # [E,N,K] → [E,K,N]
-
-    @staticmethod
-    def _process_scale_fp4(scale: torch.Tensor) -> torch.Tensor:
-        """Reshape scale to [E, K//64, N, 2] for grouped matmul.
-
-        The online path from ``npu_dynamic_mx_quant(dst_type=fp4)`` already
-        returns a 4D pair-split scale ``[E, N, K//64, 2]``; the offline
-        checkpoint gives a 3D flat scale ``[E, N, K//32]`` uint8 that still
-        needs the split.
-        """
-        if scale.ndim == 3:
-            # Offline: [E, N, K//32] → [E, N, K//64, 2]
-            n, k = scale.shape[1], scale.shape[2]
-            scale = scale.reshape(scale.shape[0], n, k // 2, 2)
-        # else: online — already 4D [E, N, K//64, 2]
-        return scale.transpose(-3, -2)  # [E, K//64, N, 2]
-
-    def process_weights_after_loading(
-        self, layer: torch.nn.Module, weight_prefix: str
-    ) -> None:
-        self._validate_weight_prefix(layer, weight_prefix)
-
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight").data
-        if weight.dtype == torch.uint8:
-            # Offline (ModelSlim) path: checkpoint already holds packed-fp4 uint8
-            # weights and uint8 e8m0 block scales.
-            scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale").data
-        else:
-            weight, scale = self._quantize_weight_online(weight, weight_prefix)
-
-        setattr(
-            layer,
-            f"{weight_prefix}_weight",
-            Parameter(self._process_weight_fp4(weight), requires_grad=False),
-        )
-        setattr(
-            layer,
-            f"{weight_prefix}_weight_scale",
-            Parameter(self._process_scale_fp4(scale), requires_grad=False),
-        )
-
-        if weight_prefix == "w13":
-            # Reuse the MXFP8 quant_mode=3 path: init_routing emits e4m3 + e8m0
-            # activation scale, which is exactly what we need for gmm2.
-            self._set_dispatcher_output_dtype(layer, "mxfp8")
-
-    def apply(
-        self,
-        quant_info: "AscendQuantInfo",
-        hidden_states: torch.Tensor,
-        expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
-        output_dtype: torch.dtype,
-        weight_prefix: str,
-        group_list_type,
-    ) -> torch.Tensor:
-        """Grouped matmul with fp4 weights (serves both w13 and w2).
-
-        Mirrors vllm-ascend ``W4A8MXFP``: weight_scale via ``antiquant_scale``,
-        ``weight_dtype=fp4``, ``x_dtype=fp8_e4m3``, no ``scale`` kwarg.
-        """
-        e8m0_dtype = _require_e8m0_dtype()
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
-        scale_args: Dict[str, Any] = {
-            "antiquant_scale": [
-                getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-            ],
-            "per_token_scale": [pertoken_scale],
-            "per_token_scale_dtype": e8m0_dtype,
-            "x_dtype": torch.float8_e4m3fn,
-            "weight_dtype": fp4_dtype,
         }
         return self.matmul.forward(
             quant_info,

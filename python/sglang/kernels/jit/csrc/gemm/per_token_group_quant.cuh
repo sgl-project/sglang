@@ -16,9 +16,9 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
-namespace {
+namespace sglang {
 
-namespace details {
+namespace detail {
 
 SGL_DEVICE float silu(const float val) {
   // silu(x) = x * sigmoid(x)
@@ -190,12 +190,12 @@ struct TensorArgs {
   }
 };
 
-}  // namespace details
+}  // namespace detail
 
 struct QuantKernelParams {
-  details::TensorArgs input;
-  details::TensorArgs output;
-  details::ScaleStoreArgs scale;
+  detail::TensorArgs input;
+  detail::TensorArgs output;
+  detail::ScaleStoreArgs scale;
   uint32_t num_tokens;   // tokens_pad for the masked kernel
   uint32_t hidden_size;  // = num_groups * kGroupSize
 };
@@ -229,9 +229,10 @@ struct QuantTrait {
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
   static constexpr uint32_t kBlockSize = 256;
-  static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
+  static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
-  static_assert(sizeof(InputType) == 2, "only 16-bit inputs (bf16/fp16) are supported");
+  static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
+  static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
@@ -242,15 +243,28 @@ struct QuantTrait {
       const uint32_t token_idx,
       const uint32_t group_idx,
       const uint32_t lane_id) {
+    if constexpr (sizeof(InputType) == 4) {
+      run_fp32(params, expert_idx, token_idx, group_idx, lane_id);
+    } else {
+      run_packed16(params, expert_idx, token_idx, group_idx, lane_id);
+    }
+  }
+
+  SGL_DEVICE static void run_packed16(
+      const QuantKernelParams& params,
+      const uint32_t expert_idx,
+      const uint32_t token_idx,
+      const uint32_t group_idx,
+      const uint32_t lane_id) {
     using deepseek_v4::fp8::cast_to_ue8m0;
     using deepseek_v4::fp8::inv_scale_ue8m0;
     using namespace device;
     using T = InputType;
     using T2 = packed_t<T>;
     using Q = QuantType;
-    using WTrait = details::WeightTrait<Q>;
+    using WTrait = detail::WeightTrait<Q>;
     using Q2 = typename WTrait::packed2_t;
-    using in_vec_t = details::Vec32B<T2>;
+    using in_vec_t = detail::Vec32B<T2>;
     using out_vec_t = AlignedVector<Q2, kVecSize / 2>;
     constexpr float kMaxValue = WTrait::kMaxValue;
     constexpr float kMaxValueInv = 1.f / kMaxValue;
@@ -268,7 +282,7 @@ struct QuantTrait {
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         const auto gate = cast<float2>(in[i]);
-        const auto act = cast<T2>(float2{details::silu(gate.x), details::silu(gate.y)});
+        const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
         in[i] = __hmul2(act, up[i]);
       }
     }
@@ -284,7 +298,7 @@ struct QuantTrait {
     const float raw_scale = amax * kMaxValueInv;  // the dequant scale the GEMM consumes
 
     out_vec_t out;
-    details::scale_t<kUe8m0> scale_inv;
+    detail::scale_t<kUe8m0> scale_inv;
     if constexpr (kUe8m0) {
       // ue8m0 scale: pow-2 quant multiplier is exact in float16/bfloat16 type
       static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
@@ -305,12 +319,71 @@ struct QuantTrait {
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue * __frcp_rn(amax);
+      const float quant_scale = kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = WTrait::quant(details::mul2(cast<float2>(in[i]), quant_scale2));
+        out[i] = WTrait::quant(detail::mul2(cast<float2>(in[i]), quant_scale2));
       }
+    }
+
+    out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
+    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+  }
+
+  SGL_DEVICE static void run_fp32(
+      const QuantKernelParams& params,
+      const uint32_t expert_idx,
+      const uint32_t token_idx,
+      const uint32_t group_idx,
+      const uint32_t lane_id) {
+    using deepseek_v4::fp8::cast_to_ue8m0;
+    using deepseek_v4::fp8::inv_scale_ue8m0;
+    using namespace device;
+    using Q = QuantType;
+    using WTrait = detail::WeightTrait<Q>;
+    using Q2 = typename WTrait::packed2_t;
+    constexpr uint32_t kSubVec = kMaxVecBytes / sizeof(fp32_t);
+    constexpr uint32_t kNumSubVecs = kVecSize / kSubVec;
+    using in_vec_t = AlignedVector<fp32_t, kSubVec>;
+    using out_vec_t = AlignedVector<Q2, kVecSize / 2>;
+    constexpr float kMaxValue = WTrait::kMaxValue;
+    constexpr float kMaxValueInv = 1.f / kMaxValue;
+
+    const fp32_t* token_in = params.input.get<const fp32_t>(expert_idx, token_idx);
+    const uint32_t group_offset = group_idx * kGroupSize;
+
+    in_vec_t in_vecs[kNumSubVecs];
+#pragma unroll
+    for (uint32_t v = 0; v < kNumSubVecs; ++v) {
+      in_vecs[v].load(token_in + group_offset, lane_id * kNumSubVecs + v);
+    }
+    const auto in = [&](const uint32_t i) { return in_vecs[i / kSubVec][i % kSubVec]; };
+
+    float local_amax = fabsf(in(0));
+#pragma unroll
+    for (uint32_t i = 1; i < kVecSize; ++i) {
+      local_amax = math::max(local_amax, fabsf(in(i)));
+    }
+    const auto amax = math::max(warp::reduce_max<kNumLanes>(local_amax), 1e-10f);
+    const float raw_scale = amax * kMaxValueInv;
+
+    out_vec_t out;
+    detail::scale_t<kUe8m0> scale_inv;
+    float quant_scale;
+    if constexpr (kUe8m0) {
+      static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
+      const auto exp = cast_to_ue8m0(raw_scale);
+      scale_inv = static_cast<uint8_t>(exp);
+      quant_scale = inv_scale_ue8m0(exp);
+    } else {
+      scale_inv = raw_scale;
+      quant_scale = kMaxValue / amax;
+    }
+    const float2 quant_scale2 = {quant_scale, quant_scale};
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      out[i] = WTrait::quant(detail::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
@@ -408,11 +481,22 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
+    CHECK_HOST((input.stride(0) * sizeof(T)) % 32 == 0)
+        << "input expert stride must keep rows 32B-aligned for the vectorized loads";
   } else {
     TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
   }
+  // The 32B/lane vectorized loads need every input row to start 32B-aligned
+  // (kMaxVecBytes on Blackwell; over-strict but harmless on Hopper, whose
+  // 16B vectors only need 16). Contiguous allocations always satisfy this; it
+  // only bites hand-made row-strided views, which must keep rows aligned --
+  // rejected loudly here rather than densified silently at the call site.
+  CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % 32 == 0)
+      << "input base pointer must be 32B-aligned for the vectorized loads";
+  CHECK_HOST((input.stride(-2) * sizeof(T)) % 32 == 0)
+      << "input token stride must keep rows 32B-aligned for the vectorized loads";
 
   const uint32_t num_tokens = N.unwrap();
   const uint32_t hidden_size = H.unwrap();
@@ -429,7 +513,7 @@ QuantHostContext<Trait> build_quant_context( //
   if constexpr (Trait::kUe8m0) {
     CHECK_HOST(Trait::kAligned == (num_groups % 4 == 0));
   }
-  auto scale_args = details::ScaleStoreArgs{
+  auto scale_args = detail::ScaleStoreArgs{
       .base = output_s.data_ptr(),
       .expert_stride = static_cast<uint32_t>(kMasked ? output_s.stride(0) : 0),
       .token_stride = static_cast<uint32_t>(output_s.stride(-2)),
@@ -454,12 +538,12 @@ QuantHostContext<Trait> build_quant_context( //
   }
   // The scale store indexes with uint32 strides; guard against overflow.
   scale_args.check_overflow(num_experts, num_tokens);
-  const auto input_args = details::TensorArgs{
+  const auto input_args = detail::TensorArgs{
       .ptr = input.data_ptr(),
       .expert_stride = kMasked ? input.stride(0) : 0,
       .token_stride = input.stride(-2),
   };
-  const auto output_args = details::TensorArgs{
+  const auto output_args = detail::TensorArgs{
       .ptr = output_q.data_ptr(),
       .expert_stride = kMasked ? output_q.stride(0) : 0,
       .token_stride = output_q.stride(-2),
@@ -555,4 +639,4 @@ struct PerTokenGroupQuantMaskedKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

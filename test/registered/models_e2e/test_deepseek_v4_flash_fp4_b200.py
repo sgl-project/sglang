@@ -1,10 +1,11 @@
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
 
-Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
+Launches TP=4 with the auto-selected flashinfer_mxfp4 MoE runner and EAGLE
+speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-deepep-4-gpu-b200 (per-commit, 4x B200)
+Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=465, stage="base-c", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -56,8 +57,6 @@ class TestDSV4FlashFP4B200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

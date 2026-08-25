@@ -18,7 +18,7 @@ class TestQwen3VLVisionQuantConfig(CustomTestCase):
             rope_scaling={},
             vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
         )
-        server_args = SimpleNamespace(mm_enable_dp_encoder=False)
+        mm_config = SimpleNamespace(mm_enable_dp_encoder=False)
 
         with (
             patch(
@@ -26,8 +26,8 @@ class TestQwen3VLVisionQuantConfig(CustomTestCase):
                 return_value=MagicMock(),
             ),
             patch(
-                "sglang.srt.models.qwen3_vl.get_server_args",
-                return_value=server_args,
+                "sglang.srt.models.qwen3_vl.get_mm",
+                return_value=mm_config,
             ),
             patch(
                 "sglang.srt.models.qwen3_vl.Qwen3VLMoeVisionModel"

@@ -10,6 +10,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
 from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -84,6 +85,11 @@ class ForwardBatchDeepSeekMHAMixin:
                 chunk_kv_indices,
                 req_to_token.shape[1],
             )
+            chunk_kv_indices = filter_dcp_local_chunk_kv_indices(
+                chunk_kv_indices,
+                self.prefix_chunk_starts_cpu[idx],
+                self.prefix_chunk_seq_lens_cpu[idx],
+            )
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     # Here we suppose the length of each chunk is equal
@@ -122,11 +128,19 @@ class ForwardBatchDeepSeekMHAMixin:
             HybridLinearKVPool,
             MLATokenToKVPool,
         )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         token_to_kv_pool = get_token_to_kv_pool()
-        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
-            isinstance(token_to_kv_pool, HybridLinearKVPool)
-            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+        assert (
+            isinstance(token_to_kv_pool, MLATokenToKVPool)
+            or (
+                isinstance(token_to_kv_pool, HybridLinearKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
+            or (
+                isinstance(token_to_kv_pool, SWAKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):
