@@ -923,6 +923,28 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return self.quantized_layers[candidate]["quant_algo"].upper()
 
         proj_name = prefix.rsplit(".", 1)[-1]
+        # DeepSeek MLPs fuse checkpoint ``gate_proj`` and ``up_proj`` into
+        # one runtime ``gate_up_proj``.  ModelOpt exports the two source
+        # names even when it does not include a packed_modules_mapping, so
+        # infer the fused method when (and only when) both agree.
+        if proj_name == "gate_up_proj":
+            algos = set()
+            base = prefix.rsplit(".", 1)[0]
+            for base_candidate in self._quantized_layer_prefix_candidates(base):
+                for shard_name in ("gate_proj", "up_proj"):
+                    shard_prefix = f"{base_candidate}.{shard_name}"
+                    if shard_prefix in self.quantized_layers:
+                        algos.add(
+                            self.quantized_layers[shard_prefix]["quant_algo"].upper()
+                        )
+            if len(algos) == 1:
+                return algos.pop()
+            if len(algos) > 1:
+                raise ValueError(
+                    f"Mixed quant_algo within fused layer {prefix}: {algos}. "
+                    "gate_proj and up_proj must use the same quantization."
+                )
+
         if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
             algos = set()
             base = prefix.rsplit(".", 1)[0]

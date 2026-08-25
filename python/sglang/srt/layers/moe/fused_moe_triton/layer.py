@@ -627,6 +627,38 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
         is_bias: bool = False,
     ):
+        quant_method = self.quant_method
+        if isinstance(quant_method, KTEPWrapperMethod):
+            quant_method = quant_method.gpu_method
+        if isinstance(
+            quant_method, ModelOptNvFp4FusedMoEMethod
+        ) and loaded_weight.dtype in (
+            torch.uint8,
+            torch.int8,
+        ):
+            # ModelOpt serializes NVFP4 expert tensors in the exact physical
+            # [output, packed-input] layout of w13_weight.  Do not route
+            # through the generic padded helper: that helper is for logical
+            # BF16 layouts and can transpose/reinterpret the packed axis.
+            assert shard_id in {"w1", "w3"}
+            target_shard_size = expert_data.shape[shard_dim] // 2
+            # Converted FP8 shared experts can have a smaller intermediate
+            # size than routed experts.  Their int8 MXFP4 payload therefore
+            # needs its source-derived TP slice copied into the leading,
+            # zero-padded part of the routed-expert slot.
+            shard_size = (
+                target_shard_size
+                if loaded_weight.dtype == torch.uint8
+                else loaded_weight.shape[shard_dim] // self.moe_tp_size
+            )
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+            start = 0 if shard_id == "w1" else target_shard_size
+            expert_data.narrow(shard_dim, start, shard_size).copy_(loaded_weight)
+            return
+
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         assert shard_id in {"w1", "w3", "w13"}
@@ -720,6 +752,30 @@ class FusedMoE(torch.nn.Module):
             loaded_weight: The weight tensor to load from
             tp_rank: The tensor parallel rank
         """
+        quant_method = self.quant_method
+        if isinstance(quant_method, KTEPWrapperMethod):
+            quant_method = quant_method.gpu_method
+        if isinstance(
+            quant_method, ModelOptNvFp4FusedMoEMethod
+        ) and loaded_weight.dtype in (
+            torch.uint8,
+            torch.int8,
+        ):
+            if not self.use_presharded_weights:
+                # The physical NVFP4 buffer can be more finely partitioned
+                # than the logical MoE TP group (packed inputs halve the
+                # stored width).  Its target dimension is authoritative.
+                loaded_size = (
+                    expert_data.shape[shard_dim]
+                    if loaded_weight.dtype == torch.uint8
+                    else loaded_weight.shape[shard_dim] // self.moe_tp_size
+                )
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, loaded_size * tp_rank, loaded_size
+                )
+            expert_data.copy_(loaded_weight)
+            return
+
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
         ):
@@ -798,11 +854,18 @@ class FusedMoE(torch.nn.Module):
         shard_dim: int,
         tp_rank: int,
     ) -> bool:
+        quant_method = self.quant_method
+        if isinstance(quant_method, KTEPWrapperMethod):
+            quant_method = quant_method.gpu_method
         if (
             not self._has_fused_shared
             or expert_id < self._num_local_routed
             or self.quant_config is None
-            or not getattr(self.quant_config, "is_fp4_experts", False)
+            # ModelConfig's architecture-specific FP4-expert flag is not set
+            # for every mixed ModelOpt checkpoint.  The installed fused MoE
+            # method is the authoritative signal that the destination is
+            # NVFP4.
+            or not isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
             or shard_id not in ("w1", "w2", "w3")
         ):
             return False
@@ -812,16 +875,20 @@ class FusedMoE(torch.nn.Module):
             and "scale" not in weight_name
             and loaded_weight.dtype == torch.float8_e4m3fn
         )
-        is_scale = "weight_scale_inv" in weight_name and loaded_weight.dtype in (
-            torch.float8_e8m0fnu,
-            torch.float32,
-        )
+        # ModelOpt checkpoints use ``weight_scale`` for the FP8 shared
+        # experts, while the MXFP4 destination stores
+        # ``weight_scale_inv``.  Accept both source spellings so the pair is
+        # converted together instead of trying to copy the original 7168-wide
+        # FP8 tensor into the packed FP4 buffer.
+        is_scale = (
+            "weight_scale_inv" in weight_name or "weight_scale" in weight_name
+        ) and loaded_weight.dtype in (torch.float8_e8m0fnu, torch.float32)
         if not is_weight and not is_scale:
             return False
 
         weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
         scale_param = (
-            self.w2_weight_scale_inv if shard_id == "w2" else self.w13_weight_scale_inv
+            self.w2_weight_scale if shard_id == "w2" else self.w13_weight_scale
         )
         if param is not weight_param and param is not scale_param:
             return False
@@ -849,13 +916,39 @@ class FusedMoE(torch.nn.Module):
 
         weight_block_size = getattr(self.quant_config, "weight_block_size", None)
         if weight_block_size is None:
-            raise ValueError(
-                "Loading FP8 shared expert weights into FP4 fused MoE weights "
-                "requires block-FP8 weight_block_size."
+            # Some mixed checkpoints store FP8 shared experts with one scalar
+            # scale per projection rather than block-FP8 scales. Dequantize
+            # that source before generating the destination's grouped MXFP4
+            # payload.
+            from sglang.srt.layers.quantization.mxfp4_tensor import (
+                MXFP4QuantizeUtil,
             )
-        fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
-            fp8_weight, fp8_scale, weight_block_size
-        )
+
+            fp8_dequant = (
+                fp8_weight.to(torch.float32) * fp8_scale.to(torch.float32)
+            ).to(torch.bfloat16)
+            fp4_quant, fp4_scale_raw = MXFP4QuantizeUtil.quantize(
+                fp8_dequant, block_size=self.quant_config.group_size
+            )
+            fp4_weight = fp4_quant.contiguous().view(torch.int8)
+            fp4_scale = (
+                fp4_scale_raw.view(
+                    *fp8_dequant.shape[:-1],
+                    fp8_dequant.shape[-1] // self.quant_config.group_size,
+                )
+                .contiguous()
+                .view(torch.float8_e8m0fnu)
+            )
+        else:
+            fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
+                fp8_weight,
+                fp8_scale,
+                weight_block_size,
+                # Match the serialized NVFP4 destination's group scale layout
+                # (16 for this checkpoint), rather than the helper's generic
+                # MXFP4 default of 32.
+                mxfp4_block_size=self.quant_config.group_size,
+            )
 
         weight_data = weight_param.data[expert_id]
         scale_data = scale_param.data[expert_id]
@@ -1149,7 +1242,17 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
+        # Serialized ModelOpt NVFP4 tensors are already stored in the
+        # physical [output, packed-input] layout used by their runtime
+        # buffers.  Unlike BF16/Triton MoE weights they must not have the
+        # shard dimension flipped here: w1/w3 slice dim 0 and w2 slices dim
+        # 1.  Flipping it makes the native 2048x3584 gate/up tensor copy as
+        # a 7168-wide source into the 3584-wide packed target.
+        # ``method`` is the unwrapped GPU method (``self.quant_method`` can
+        # be a KTEP wrapper), so use it for the serialized-NVFP4 check.
+        if self.use_triton_kernels and not isinstance(
+            method, ModelOptNvFp4FusedMoEMethod
+        ):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
@@ -1215,7 +1318,12 @@ class FusedMoE(torch.nn.Module):
                 else "weight_scale" in weight_name
             ) or "input_scale" in weight_name
 
-            if per_tensor_conditions:
+            # ModelOpt NVFP4 exports ``weight_scale_2`` as a scalar.  Treat
+            # any scalar here as a per-expert tensor scale as well: the
+            # checkpoint's projection-name mapping may have converted it to
+            # ``w13_weight_scale_2`` before this branch.  Sending a scalar to
+            # the sharded group-scale loader would index a nonexistent dim.
+            if per_tensor_conditions or loaded_weight.ndim == 0:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
                     param=param,
