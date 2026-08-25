@@ -311,22 +311,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
-        # Hidden-state capture mode cases:
-        # - Breakable EAGLE draft: LAST.
-        # - EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
-        # - Otherwise: NULL.
+        # EAGLE prefill asks for FULL on the target (it feeds the draft) and
+        # LAST on the draft, regardless of the prefill backend: a graph captured
+        # below the requested mode is rejected on every replay.
         is_eagle = model_runner.spec_algorithm.is_eagle()
-        is_breakable_eagle_draft = (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and is_eagle
-            and model_runner.is_draft_worker
-        )
-        if is_breakable_eagle_draft:
+        if is_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif (is_eagle and not model_runner.is_draft_worker) or (
-            model_runner.spec_algorithm.is_dflash_family()
-        ):
+        elif is_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = self.return_hidden_states_mode
