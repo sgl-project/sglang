@@ -155,6 +155,26 @@ class TestRaggedCaptureTokenBuckets(CustomTestCase):
             [4, 8, 12, 16, 32, 64, 128],
         )
 
+    def test_fixed_verify_width_replaces_default_width(self):
+        from sglang.srt.speculative.ragged_verify import (
+            build_ragged_capture_token_buckets,
+        )
+
+        self.assertEqual(
+            build_ragged_capture_token_buckets(
+                capture_bs=[1, 2, 4],
+                num_draft_tokens=16,
+                fixed_verify_len=10,
+            ),
+            [10, 20, 40],
+        )
+        with self.assertRaisesRegex(ValueError, "fixed_verify_len"):
+            build_ragged_capture_token_buckets(
+                capture_bs=[1],
+                num_draft_tokens=16,
+                fixed_verify_len=17,
+            )
+
     def test_extra_token_bucket_range_is_validated(self):
         from sglang.srt.speculative.ragged_verify import (
             build_ragged_capture_token_buckets,

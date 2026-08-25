@@ -221,9 +221,18 @@ def build_ragged_capture_token_buckets(
     capture_bs: Sequence[int],
     num_draft_tokens: int,
     extra_token_buckets: Sequence[str] = (),
+    fixed_verify_len: int = 0,
 ) -> list[int]:
-    """Build a compact-verify token grid while preserving all default tiers."""
-    buckets = {int(bs) * int(num_draft_tokens) for bs in capture_bs}
+    """Build compact-verify tiers, using the fixed width when configured."""
+    fixed_verify_len = int(fixed_verify_len)
+    num_draft_tokens = int(num_draft_tokens)
+    if not 0 <= fixed_verify_len <= num_draft_tokens:
+        raise ValueError(
+            "fixed_verify_len must be in "
+            f"[0, {num_draft_tokens}], got {fixed_verify_len}"
+        )
+    capture_width = fixed_verify_len or num_draft_tokens
+    buckets = {int(bs) * capture_width for bs in capture_bs}
     if not buckets or min(buckets) <= 0:
         raise ValueError(
             "ragged capture requires positive capture_bs and num_draft_tokens, "

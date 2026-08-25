@@ -517,6 +517,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_bs=self.capture_bs,
             num_draft_tokens=self.captured_req_width,
             extra_token_buckets=envs.SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS.get(),
+            fixed_verify_len=envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get(),
         )
 
     def _autotune_buffers(self):
