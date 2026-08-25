@@ -533,6 +533,53 @@ sglang serve \
 
 ## 5. Benchmark
 
+### 5.1 Accuracy Benchmark
+
+**Test Environment:**
+
+- Hardware: 4× AMD MI355X
+- Model: `amd/Kimi-K2.7-Code-MXFP4` (MXFP4)
+- Tensor Parallelism: 4
+- Docker Image: `rocm/sgl-dev:v0.5.17-rocm720-mi35x-20260812` (ROCm 7.2)
+
+GSM8K accuracy of the MXFP4 checkpoint, measured on the deployed server across several client parallelism levels (2,000 questions each):
+
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py \
+  --num-questions 2000 \
+  --parallel <PARALLEL> \
+  --port 30000
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>Parallel</th>
+      <th>GSM8K Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>100</td>
+      <td>0.951</td>
+    </tr>
+    <tr>
+      <td>300</td>
+      <td>0.953</td>
+    </tr>
+    <tr>
+      <td>600</td>
+      <td>0.942</td>
+    </tr>
+    <tr>
+      <td>1200</td>
+      <td>0.950</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Model Card Reference (Official)
+
 The following results are from the official Kimi-K2.7-Code model card. They were evaluated with thinking mode enabled through Kimi Code CLI at `temperature=1.0`, `top_p=0.95`, and a 262,144-token context length unless otherwise stated.
 
 <table>
@@ -580,6 +627,94 @@ The following results are from the official Kimi-K2.7-Code model card. They were
       <td>MCP Mark Verified</td>
       <td>72.8</td>
       <td>81.1</td>
+    </tr>
+  </tbody>
+</table>
+
+### 5.2 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: 4× AMD MI355X
+- Model: `amd/Kimi-K2.7-Code-MXFP4` (MXFP4)
+- Tensor Parallelism: 4
+- Docker Image: `rocm/sgl-dev:v0.5.17-rocm720-mi35x-20260812` (ROCm 7.2)
+
+We use SGLang's built-in `bench_serving` tool with the `random` dataset (input 8192, output 1024, range ratio 0.8). For each concurrency `C`, `--num-prompts` is set to `C × 5`.
+
+#### 5.2.1 Latency Benchmark
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model amd/Kimi-K2.7-Code-MXFP4 \
+  --dataset-name random \
+  --random-input-len 8192 \
+  --random-output-len 1024 \
+  --random-range-ratio 0.8 \
+  --max-concurrency <C> \
+  --num-prompts <C x 5> \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>Concurrency</th>
+      <th>Output Throughput (tok/s)</th>
+      <th>Total Throughput (tok/s)</th>
+      <th>Mean TTFT (ms)</th>
+      <th>Median TTFT (ms)</th>
+      <th>Mean TPOT (ms)</th>
+      <th>Mean E2E Latency (ms)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>4</td>
+      <td>416.22</td>
+      <td>3747.97</td>
+      <td>260.35</td>
+      <td>194.14</td>
+      <td>9.03</td>
+      <td>8720.79</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>670.88</td>
+      <td>6086.74</td>
+      <td>364.15</td>
+      <td>199.00</td>
+      <td>11.19</td>
+      <td>10687.52</td>
+    </tr>
+    <tr>
+      <td>16</td>
+      <td>963.47</td>
+      <td>8766.11</td>
+      <td>490.72</td>
+      <td>203.12</td>
+      <td>15.49</td>
+      <td>14680.68</td>
+    </tr>
+    <tr>
+      <td>32</td>
+      <td>1329.55</td>
+      <td>11857.47</td>
+      <td>775.37</td>
+      <td>215.45</td>
+      <td>22.61</td>
+      <td>21831.61</td>
+    </tr>
+    <tr>
+      <td>64</td>
+      <td>1740.46</td>
+      <td>15759.18</td>
+      <td>1343.98</td>
+      <td>300.81</td>
+      <td>34.41</td>
+      <td>33068.86</td>
     </tr>
   </tbody>
 </table>
