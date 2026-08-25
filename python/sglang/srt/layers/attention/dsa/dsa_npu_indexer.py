@@ -606,6 +606,8 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q_prev = torch.cumsum(actual_seq_lengths_q_prev, dim=0)
         actual_seq_lengths_q_next = torch.cumsum(actual_seq_lengths_q_next, dim=0)
 
+        actual_seq_lengths_kv_next[-1] = actual_seq_lengths_kv_next[0]
+
         if use_quant_lightning_indexer:
             q_prev, q_prev_scale = _quantize_npu_indexer_activation(
                 q_prev,
