@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -103,13 +104,9 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
-    assert (
-        get_platform().is_cuda
-        or get_platform().is_musa
-        or get_platform().is_npu
-        or get_platform().is_hip
-        or get_platform().is_xpu
-    ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
+    assert current_platform.support_mamba_cache_extra_buffer(), (
+        "extra_buffer requires platform support for Mamba cache state snapshots."
+    )
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.
         assert view.disaggregation_mode == "null", (
