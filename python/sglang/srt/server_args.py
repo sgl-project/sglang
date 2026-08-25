@@ -9738,22 +9738,26 @@ class ServerArgs:
 
         memo = getattr(self, "model_config", None)
         if memo is not None:
-            # A configuration built before resolution describes the path the
-            # caller typed; the GGUF and ModelScope handlers declare a
-            # different `model_path`, and every later decision keyed on the
-            # architecture would read the wrong contents. Only a real
-            # `ModelConfig` is checked -- a fixture's stand-in stays untouched.
-            if not (
-                isinstance(memo, ModelConfig) and memo.model_path != self.model_path
-            ):
+            # The key is the path this record carried when the cache was
+            # filled. The GGUF and ModelScope handlers declare a different
+            # `model_path`, and a configuration built before them describes
+            # another checkpoint. `ModelConfig` re-points its own `model_path`
+            # at the local pull directory when the weights sit behind an
+            # object-store URI, so its field is not the key. A configuration a
+            # fixture supplied carries no key and is handed back as it is.
+            built_from = getattr(self, "_model_config_built_from", None)
+            if built_from is None or built_from == self.model_path:
                 return memo
-        self.model_config = ModelConfig.from_server_args(self)
-        if self.model_config.is_hybrid_swa:
+
+        model_config = ModelConfig.from_server_args(self)
+        self.model_config = model_config
+        self._model_config_built_from = self.model_path
+        if model_config.is_hybrid_swa:
             logger.info(
                 "Hybrid SWA model detected. architectures=%s",
-                self.model_config.hf_config.architectures,
+                model_config.hf_config.architectures,
             )
-        return self.model_config
+        return model_config
 
     def _resolved(self):
         """Read-only view of the resolving configuration: declared fields
@@ -9781,6 +9785,7 @@ class ServerArgs:
         if (
             getattr(self, "_declarations_materialized", False)
             and not getattr(self, "_internal_write", False)
+            and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
@@ -10576,6 +10581,14 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
+# Caches, which the read-only guard lets through: a value the record derived
+# from itself is not resolved configuration, and a key that can invalidate on a
+# resolved record needs the refill to be storable there. Only the public-named
+# ones are listed -- a cache key spelled with a leading underscore is already
+# exempt.
+_CACHE_SLOTS = frozenset({"model_config"})
+
+
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
@@ -10587,8 +10600,8 @@ def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.
 
     The read-only guard exempts underscore names because they are the record's
-    own bookkeeping (the stash, the flags, the memoized model config). A *field*
-    that happens to start with an underscore is still resolved configuration --
+    own bookkeeping (the stash, the flags, the cache keys). A *field* that
+    happens to start with an underscore is still resolved configuration --
     `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
     by spelling would leave exactly one leaf writable on a read-only record.
     """
