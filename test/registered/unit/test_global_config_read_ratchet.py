@@ -498,8 +498,11 @@ def _field_reads():
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         if rel.startswith(_SLOT_OWNERS):
             continue
+        source = path.read_text()
+        if "get_server_args" not in source:
+            continue
         try:
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(source)
         except SyntaxError:
             continue
         module_direct, module_alias = _collect(rel, tree)
@@ -551,8 +554,11 @@ class TestConfiguredSizeCallSites(CustomTestCase):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
             if rel.startswith(_SLOT_OWNERS):
                 continue
+            source = path.read_text()
+            if "configured_" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text())
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
@@ -588,8 +594,11 @@ class TestNoRenamedAccessorImports(CustomTestCase):
         offenders = []
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            source = path.read_text()
+            if "get_server_args" not in source and "configured_" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text())
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
