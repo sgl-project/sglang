@@ -24,6 +24,9 @@ ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
+# Repository searched by the versioned image lookup. Test workflows can point
+# ROCm 7.14 at the scratch registry while all released flavors keep the default.
+SGL_DEV_REPO="${AMD_CI_IMAGE_REPO:-rocm/sgl-dev}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -150,10 +153,10 @@ find_latest_image() {
   # First, check local cache on the runner.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
+    image_id=$(docker images -q "${SGL_DEV_REPO}:${image_tag}")
     if [[ -n "$image_id" ]]; then
-      echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
-      echo "rocm/sgl-dev:${image_tag}"
+      echo "Found cached image locally: ${SGL_DEV_REPO}:${image_tag}" >&2
+      echo "${SGL_DEV_REPO}:${image_tag}"
       return 0
     fi
   done
@@ -161,10 +164,10 @@ find_latest_image() {
   # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
-    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-      echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
-      echo "rocm/sgl-dev:${image_tag}"
+    echo "Checking for image: ${SGL_DEV_REPO}:${image_tag}" >&2
+    if docker manifest inspect "${SGL_DEV_REPO}:${image_tag}" >/dev/null 2>&1; then
+      echo "Found available image: ${SGL_DEV_REPO}:${image_tag}" >&2
+      echo "${SGL_DEV_REPO}:${image_tag}"
       return 0
     fi
   done
@@ -174,23 +177,23 @@ find_latest_image() {
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
     local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/${SGL_DEV_REPO}/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
       if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
         echo "${tag}"
         break
       fi
     done || true)
     if [[ -n "$remote_tags" ]]; then
-      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
-      echo "rocm/sgl-dev:${remote_tags}"
+      echo "Found available image: ${SGL_DEV_REPO}:${remote_tags}" >&2
+      echo "${SGL_DEV_REPO}:${remote_tags}"
       return 0
     fi
   done
 
   echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
-    local tag="${image#rocm/sgl-dev:}"
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=${SGL_DEV_REPO}:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#${SGL_DEV_REPO}:}"
     if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
       echo "${image}"
     fi
