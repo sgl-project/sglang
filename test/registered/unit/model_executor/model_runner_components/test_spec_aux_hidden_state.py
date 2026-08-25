@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from sglang.srt.model_executor.model_runner_components import spec_aux_hidden_state
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
@@ -13,6 +14,15 @@ register_cpu_ci(
     nightly=False,
     disabled=None,
 )
+
+
+@pytest.fixture(autouse=True)
+def _published_config():
+    with get_context().override_server_args(
+        speculative_draft_model_path=None,
+        speculative_draft_model_revision=None,
+    ):
+        yield
 
 
 def _resolve_kwargs():
@@ -29,6 +39,9 @@ def _resolve_kwargs():
         model_config=SimpleNamespace(
             num_nextn_predict_layers=1,
             hf_config=SimpleNamespace(eagle_config=None),
+            is_hybrid_swa=False,
+            is_deepseek_v4_arch=False,
+            swa_attention_layer_ids=[],
         ),
         spec_algorithm=spec_algorithm,
     )

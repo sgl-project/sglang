@@ -176,9 +176,10 @@ struct TopKProblem {
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
+  int32_t bias = 0;  // needed by ragged mode
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
-    out[pos] = static_cast<int32_t>(raw_idx);
+    out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
     out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);

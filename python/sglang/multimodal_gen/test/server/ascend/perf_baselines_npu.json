@@ -73,7 +73,7 @@
         "flux_2_image_t2i_2npu": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 192.4,
+                "TextEncodingStage": 363.09,
                 "ImageVAEEncodingStage": 0.01,
                 "LatentPreparationStage": 0.97,
                 "TimestepPreparationStage": 34.65,
@@ -134,7 +134,8 @@
             },
             "expected_e2e_ms": 46557.7,
             "expected_avg_denoise_ms": 872.7,
-            "expected_median_denoise_ms": 905.81
+            "expected_median_denoise_ms": 905.81,
+            "estimated_full_test_time_s": 488.4
         },
         "wan2_1_t2v_1.3b_1_npu": {
             "stages_ms": {
@@ -257,7 +258,8 @@
             },
             "expected_e2e_ms": 193947.19,
             "expected_avg_denoise_ms": 4691.07,
-            "expected_median_denoise_ms": 4773.22
+            "expected_median_denoise_ms": 4773.22,
+            "estimated_full_test_time_s": 987.8
         },
         "qwen_image_t2i_2npu": {
             "stages_ms": {
@@ -322,14 +324,15 @@
             },
             "expected_e2e_ms": 34362.34,
             "expected_avg_denoise_ms": 610.41,
-            "expected_median_denoise_ms": 615.39
+            "expected_median_denoise_ms": 615.39,
+            "estimated_full_test_time_s": 275.2
         },
         "ernie_image_t2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "PromptEnhancementStage": 8787.2,
                 "TextEncodingStage": 35.87,
-                "TimestepPreparationStage": 32.74,
+                "TimestepPreparationStage": 246.30,
                 "LatentPreparationStage": 0.2,
                 "DenoisingStage": 47471.93,
                 "DecodingStage": 42.24
@@ -572,7 +575,8 @@
             },
             "expected_e2e_ms": 109909.47,
             "expected_avg_denoise_ms": 2636.6,
-            "expected_median_denoise_ms": 2705.05
+            "expected_median_denoise_ms": 2705.05,
+            "estimated_full_test_time_s": 239.7
          },
        "mova_360p_ti2va_2npu": {
            "stages_ms": {
@@ -645,13 +649,13 @@
             "stages_ms": {
                 "InputValidationStage": 3.8,
                 "TextEncodingStage": 1029.19,
-                "LTX2TextConnectorStage": 56.3,
+                "LTX2TextConnectorStage":  654.62,
                 "LTX2SigmaPreparationStage": 0.19,
                 "TimestepPreparationStage": 33.52,
                 "LTX2AVLatentPreparationStage": 0.45,
                 "LTX2ImageEncodingStage": 93.32,
                 "LTX2AVDenoisingStage": 29672.06,
-                "LTX2AVDecodingStage": 560.9
+                "LTX2AVDecodingStage": 1240.88
             },
             "denoise_step_ms": {
                 "0": 544.81,
@@ -697,7 +701,8 @@
             },
             "expected_e2e_ms": 31484.37,
             "expected_avg_denoise_ms": 741.58,
-            "expected_median_denoise_ms": 746.28
+            "expected_median_denoise_ms": 746.28,
+            "estimated_full_test_time_s": 255.2
         }
     }
 }

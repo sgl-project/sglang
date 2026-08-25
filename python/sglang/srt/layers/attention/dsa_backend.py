@@ -90,7 +90,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
+from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -457,7 +457,7 @@ class DeepseekSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
@@ -534,10 +534,9 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.dsa_prefill_impl: _DSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
-        )
-        self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.supports_mha_one_shot: bool = True
+        self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
+        self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -607,7 +606,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
@@ -4576,7 +4575,8 @@ class DeepseekSparseAttnBackend(
 
             # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
+                self.supports_mha_one_shot
+                and (
                     device_sm == 90
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95

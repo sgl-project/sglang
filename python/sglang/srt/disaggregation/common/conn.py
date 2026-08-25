@@ -36,7 +36,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_disagg,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -164,9 +169,9 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         # for p/d multi node infer
-        self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
-        self.dist_init_addr = server_args.dist_init_addr
+        self.bootstrap_host = get_serving().host
+        self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
         self.attn_tp_rank = parallel.attn_tp_rank
@@ -182,7 +187,7 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
@@ -287,6 +292,20 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _should_skip_cp_replicated_state_transfer(self) -> bool:
+        """Whether this prefill rank should omit CP-replicated state.
+
+        Prefill CP materializes global token order before writing state pools, so
+        every CP rank holds the same state. When all CP ranks transfer their KV
+        shards, only rank 0 needs to send that state. Cache layer split is the
+        exception because each CP rank owns different state layers.
+        """
+        return (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not get_parallel().enable_dsa_cache_layer_split
+        )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
@@ -1298,12 +1317,6 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def poll(self) -> KVPoll:
-        pass
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
-
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
@@ -1561,9 +1574,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)

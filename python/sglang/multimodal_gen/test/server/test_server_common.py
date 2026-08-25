@@ -467,8 +467,13 @@ class DiffusionServerBase:
                         expected_load_peak_vram_mb,
                         expected_runtime_peak_vram_mb,
                     )
+                    validator.validate_peak_host_anon(
+                        summary,
+                        scenario.load_peak_host_anon_mb,
+                        scenario.runtime_peak_host_anon_mb,
+                    )
                 except AssertionError as e:
-                    logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                    logger.error(f"Peak memory validation failed for {case.id}:\n{e}")
                     self._dump_baseline_for_testcase(case, summary, missing_scenario)
                     raise
 
@@ -664,6 +669,10 @@ class DiffusionServerBase:
                 {
                     "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
                     "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                    "load_peak_host_anon_mb": round(summary.load_peak_host_anon_mb, 2),
+                    "runtime_peak_host_anon_mb": round(
+                        summary.runtime_peak_host_anon_mb, 2
+                    ),
                 }
             )
 
@@ -1546,14 +1555,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             sampling_params=case.sampling_params,
         )
 
-        # Single generation - output is reused for both validations
+        # Generation - output of the last request is used for both validations.
+        # perf_repeat_requests > 1 asserts a warm second request meets the same
+        # baselines as the first: residency or courier state leaking between
+        # requests shows up here as degradation or an OOM.
         is_realtime_case = case.sampling_params.realtime_num_chunks is not None
-        perf_record, content = self.run_and_collect(
-            diffusion_server,
-            case.id,
-            generate_fn,
-            collect_perf=not is_gt_gen_mode and not is_realtime_case,
-        )
+        for _ in range(max(1, case.perf_repeat_requests)):
+            perf_record, content = self.run_and_collect(
+                diffusion_server,
+                case.id,
+                generate_fn,
+                collect_perf=not is_gt_gen_mode and not is_realtime_case,
+            )
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
