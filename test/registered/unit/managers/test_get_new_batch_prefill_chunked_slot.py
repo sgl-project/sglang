@@ -7,12 +7,12 @@ slot is deducted from ``available_size()``) AND is re-appended to the adder's
 
     num_allocatable = min(
         pp_max_micro_batch_size - running_bs,
-        available_size() + int(chunked_req_holds_slot),
+        available_size() + int(chunked_req_in_batch),
     )
     if len(can_run_list) >= num_allocatable:
         batch_is_full = True
 
-must add that already-held slot back (the ``+ int(chunked_req_holds_slot)``
+must add that already-held slot back (the ``+ int(chunked_req_in_batch)``
 term). Without it the batch is declared full one request early, and because
 ``batch_is_full`` is sticky (reset only when a request finishes) the rank parks
 at ``max_running_requests - 1`` with requests still queued -- the DP-attention
@@ -35,6 +35,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
@@ -57,21 +58,34 @@ class _FakeAdder:
     slot/ceiling gate can limit admission.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *, schedule_chunk=True, chunk_continues=True):
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.schedule_chunk = schedule_chunk
+        self.chunk_continues = chunk_continues
 
     def add_chunked_req(self, req):
-        self.can_run_list.append(req)
-        return req  # truncated=True: still chunking, not the final chunk
+        if self.schedule_chunk:
+            self.can_run_list.append(req)
+        return req if self.chunk_continues else None
 
     def add_one_req(self, req, has_chunked_req=False, truncation_align_size=None):
         self.can_run_list.append(req)
         return AddReqResult.CONTINUE
 
 
-def _make_scheduler(*, ceiling, running_bs, pool_avail, chunked_req, waiting_queue):
+def _make_scheduler(
+    *,
+    ceiling,
+    running_bs,
+    pool_avail,
+    chunked_req,
+    waiting_queue,
+    disaggregation_mode=None,
+    schedule_chunk=True,
+    chunk_continues=True,
+):
     """A ``Scheduler`` skeleton carrying only the attributes
     ``_get_new_batch_prefill_raw`` reads on the path exercised here."""
     s = Scheduler.__new__(Scheduler)
@@ -102,7 +116,7 @@ def _make_scheduler(*, ceiling, running_bs, pool_avail, chunked_req, waiting_que
     s.prefill_delayer = None
     s.dllm_config = None
     s.enable_lora = False
-    s.disaggregation_mode = None  # != DisaggregationMode.PREFILL
+    s.disaggregation_mode = disaggregation_mode
     s.truncation_align_size = None
     s.enable_hicache_storage = False
     s.enable_priority_scheduling = False
@@ -126,6 +140,8 @@ def _make_scheduler(*, ceiling, running_bs, pool_avail, chunked_req, waiting_que
     )
     s.chunked_req = chunked_req
     s.waiting_queue = list(waiting_queue)
+    s._test_schedule_chunk = schedule_chunk
+    s._test_chunk_continues = chunk_continues
     return s
 
 
@@ -136,7 +152,10 @@ def _run_prefill(s):
     created = []
 
     def _factory(*args, **kwargs):
-        adder = _FakeAdder()
+        adder = _FakeAdder(
+            schedule_chunk=s._test_schedule_chunk,
+            chunk_continues=s._test_chunk_continues,
+        )
         created.append(adder)
         return adder
 
@@ -212,6 +231,60 @@ class TestGetNewBatchPrefillChunkedSlot(CustomTestCase):
             pool_avail=1,
             chunked_req=None,
             waiting_queue=[q1, q2],
+        )
+
+        _, adder = _run_prefill(s)
+
+        self.assertEqual(adder.can_run_list, [q1])
+        self.assertEqual(s.waiting_queue, [q2])
+        self.assertTrue(s.running_batch.batch_is_full)
+
+    def test_pd_prefill_pool_gate_also_adds_back_chunked_slot(self):
+        q = MagicMock(name="queued")
+        chunk = MagicMock(name="chunked")
+        s = _make_scheduler(
+            ceiling=16,
+            running_bs=14,
+            pool_avail=1,
+            chunked_req=chunk,
+            waiting_queue=[q],
+            disaggregation_mode=DisaggregationMode.PREFILL,
+        )
+
+        _, adder = _run_prefill(s)
+
+        self.assertEqual(adder.can_run_list, [chunk, q])
+        self.assertEqual(s.waiting_queue, [])
+        self.assertFalse(s.running_batch.batch_is_full)
+
+    def test_final_chunk_still_receives_held_slot_credit(self):
+        q = MagicMock(name="queued")
+        chunk = MagicMock(name="final_chunk")
+        s = _make_scheduler(
+            ceiling=16,
+            running_bs=14,
+            pool_avail=1,
+            chunked_req=chunk,
+            waiting_queue=[q],
+            chunk_continues=False,
+        )
+
+        _, adder = _run_prefill(s)
+
+        self.assertEqual(adder.can_run_list, [chunk, q])
+        self.assertIsNone(s.chunked_req)
+
+    def test_parked_chunk_does_not_receive_slot_credit(self):
+        q1 = MagicMock(name="q1")
+        q2 = MagicMock(name="q2")
+        chunk = MagicMock(name="parked_hybrid_swa_chunk")
+        s = _make_scheduler(
+            ceiling=16,
+            running_bs=14,
+            pool_avail=1,
+            chunked_req=chunk,
+            waiting_queue=[q1, q2],
+            schedule_chunk=False,
         )
 
         _, adder = _run_prefill(s)
