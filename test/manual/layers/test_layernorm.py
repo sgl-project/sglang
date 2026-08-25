@@ -124,6 +124,33 @@ class TestGemma3RMSNorm(CustomTestCase):
     ADD_RESIDUAL = [False, True]
     SEEDS = [0]
 
+    # (batch_size, hidden_size, dtype) combos for the 2D case.
+    SHAPE_DTYPE_2D = [
+        (batch_size, hidden_size, torch.float16)
+        for batch_size in [1, 19, 99, 989]
+        for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
+    ] + [
+        (19, 1024, torch.bfloat16),
+        (19, 1024, torch.float32),
+        (2, 32768, torch.float16),
+    ]
+
+    BATCH_SIZES_3D = [1, 4, 19]
+    SEQ_LENS_3D = [1, 7, 32]
+    # hidden_size=1 exercises the "other dim == 1" shape (excluding the leading
+    # batch dim) that bypasses the flattenable fast-path check but still
+    # yields a correct result.
+    HIDDEN_SIZES_3D = [1, 111, 1024, 4096]
+    DTYPES_3D = [torch.float16]
+
+    NUM_TOKENS_4D = [1, 7]
+    # num_heads=1 and head_dim=1 exercise the "other dim == 1" shapes
+    # (excluding the leading batch/token dims) that bypass the flattenable
+    # fast-path check but still yield a correct result.
+    NUM_HEADS_4D = [1, 4, 8]
+    HEAD_DIMS_4D = [1, 64, 128]
+    DTYPES_4D = [torch.float16]
+
     @classmethod
     def setUpClass(cls):
         if not (torch.cuda.is_available() or torch.xpu.is_available()):
@@ -161,36 +188,71 @@ class TestGemma3RMSNorm(CustomTestCase):
             self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
 
     def test_gemma3_rms_norm_2d(self):
-        for hidden_size, add_residual, dtype, seed in itertools.product(
-            [768, 5120, 8199], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        for (batch_size, hidden_size, dtype), add_residual, seed in itertools.product(
+            self.SHAPE_DTYPE_2D, self.ADD_RESIDUAL, self.SEEDS
         ):
             with self.subTest(
-                hidden_size=hidden_size, add_residual=add_residual, dtype=dtype
+                batch_size=batch_size,
+                hidden_size=hidden_size,
+                add_residual=add_residual,
+                dtype=dtype,
             ):
                 self._run_gemma3_rms_norm_test(
-                    (83, hidden_size), add_residual, dtype, seed
+                    (batch_size, hidden_size), add_residual, dtype, seed
                 )
 
     def test_gemma3_rms_norm_3d(self):
-        for hidden_size, add_residual, dtype, seed in itertools.product(
-            [768, 5120], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        for (
+            batch_size,
+            seq_len,
+            hidden_size,
+            dtype,
+            add_residual,
+            seed,
+        ) in itertools.product(
+            self.BATCH_SIZES_3D,
+            self.SEQ_LENS_3D,
+            self.HIDDEN_SIZES_3D,
+            self.DTYPES_3D,
+            self.ADD_RESIDUAL,
+            self.SEEDS,
         ):
             with self.subTest(
-                hidden_size=hidden_size, add_residual=add_residual, dtype=dtype
+                batch_size=batch_size,
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                add_residual=add_residual,
+                dtype=dtype,
             ):
                 self._run_gemma3_rms_norm_test(
-                    (4, 19, hidden_size), add_residual, dtype, seed
+                    (batch_size, seq_len, hidden_size), add_residual, dtype, seed
                 )
 
     def test_gemma3_rms_norm_4d(self):
-        for head_dim, add_residual, dtype, seed in itertools.product(
-            [128, 256], self.ADD_RESIDUAL, self.DTYPES, self.SEEDS
+        for (
+            num_tokens,
+            num_heads,
+            head_dim,
+            dtype,
+            add_residual,
+            seed,
+        ) in itertools.product(
+            self.NUM_TOKENS_4D,
+            self.NUM_HEADS_4D,
+            self.HEAD_DIMS_4D,
+            self.DTYPES_4D,
+            self.ADD_RESIDUAL,
+            self.SEEDS,
         ):
             with self.subTest(
-                head_dim=head_dim, add_residual=add_residual, dtype=dtype
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                add_residual=add_residual,
+                dtype=dtype,
             ):
                 self._run_gemma3_rms_norm_test(
-                    (1, 19, 8, head_dim), add_residual, dtype, seed
+                    (1, num_tokens, num_heads, head_dim), add_residual, dtype, seed
                 )
 
     def test_gemma3_rms_norm_3d_unflatten(self):
