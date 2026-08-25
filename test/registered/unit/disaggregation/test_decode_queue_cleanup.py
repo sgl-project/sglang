@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -14,6 +16,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -346,6 +349,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.enable_staging = False
         queue.enable_deferred_kv_release = False
+        queue.token_to_kv_pool = object()
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
@@ -404,6 +408,44 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
+
+    def test_qsa_successes_share_one_gpudirect_visibility_flush(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [
+            SimpleNamespace(
+                req=SimpleNamespace(rid=f"req-{i}", finished_reason=None),
+                hicache_restore_status=None,
+                metadata_buffer_index=i,
+            )
+            for i in range(2)
+        ]
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+        )
+        queue.token_to_kv_pool = object.__new__(QSATokenToKVPool)
+        queue.enable_staging = False
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[1, 2])
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(free=MagicMock())
+
+        with (
+            patch.object(
+                DecodeTransferQueue,
+                "_poll_with_metadata_gate",
+                return_value=[KVPoll.Success, KVPoll.Success],
+            ),
+            patch.object(DecodeTransferQueue, "_commit_transfer_to_req"),
+            patch(
+                "sglang.srt.disaggregation.decode._flush_gpudirect_writes_to_cuda_owner"
+            ) as flush,
+            patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            transferred = queue.pop_transferred()
+
+        self.assertEqual([req.rid for req in transferred], ["req-0", "req-1"])
+        flush.assert_called_once_with()
+        synchronize.assert_not_called()
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

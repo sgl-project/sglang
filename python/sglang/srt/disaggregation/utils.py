@@ -1302,6 +1302,7 @@ def setup_state_kv_args(
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
@@ -1443,6 +1444,29 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+            if isinstance(token_to_kv_pool, QSATokenToKVPool):
+                qsa_ptrs, qsa_lens, qsa_item_lens = (
+                    token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_PENDING,
+                    qsa_ptrs,
+                    qsa_lens,
+                    qsa_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                )
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.QSA_COMPRESSED,
+                    compressed_ptrs,
+                    compressed_lens,
+                    compressed_item_lens,
+                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):
