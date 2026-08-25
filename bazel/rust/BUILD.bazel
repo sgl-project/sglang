@@ -1,3 +1,19 @@
+load("@rules_rust_pyo3//:defs.bzl", "rust_pyo3_toolchain")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["sglang-crates.lock.json"])
+
+# Keep the pyo3 crate seen by extension sources identical to the one used by
+# crate-universe dependencies such as numpy.
+rust_pyo3_toolchain(
+    name = "sglang_rust_pyo3_toolchain_impl",
+    pyo3 = "@sglang_crates//:pyo3",
+    pyo3_introspection = "@rpyo3c//:pyo3-introspection",
+)
+
+toolchain(
+    name = "sglang_rust_pyo3_toolchain",
+    toolchain = ":sglang_rust_pyo3_toolchain_impl",
+    toolchain_type = "@rules_rust_pyo3//:rust_toolchain_type",
+)

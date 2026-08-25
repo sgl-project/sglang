@@ -13,8 +13,11 @@ filegroup(
     srcs = [
         "//python/sglang/kernels:ngram_corpus_core",
         "//python/sglang/kernels/aot:cpu_sources",
+        "//python/sglang/srt/rust_extensions:_multimodal",
+        "//python/sglang/srt/rust_extensions:_server",
         "//rust/sglang-grpc:sglang_grpc_core",
         "//rust/sglang-mm:sglang_mm_core",
+        "//rust/sglang-server:sglang_server_core",
     ],
 )
 

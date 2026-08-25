@@ -8,7 +8,20 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_cc", version = "0.2.22")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.73.0")
+bazel_dep(name = "rules_rust_pyo3", version = "0.73.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
+
+rules_rust_pyo3_crates = use_extension(
+    "@rules_rust_pyo3//private:internal_extensions.bzl",
+    "rust_ext",
+)
+use_repo(
+    rules_rust_pyo3_crates,
+    "rpyo3c",
+    "rpyo3c__pyo3-0.29.0",
+    "rpyo3c__pyo3-ffi-0.29.0",
+    "rpyo3c__pyo3-introspection-0.29.0",
+)
 
 register_execution_platforms(
     "//bazel/platforms:linux_x86_64_cpu",
@@ -82,9 +95,24 @@ use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
 
+register_toolchains(
+    "@rules_rust_pyo3//toolchains:toolchain",
+    "//bazel/rust:sglang_rust_pyo3_toolchain",
+)
+
 crate = use_extension(
     "@rules_rust//crate_universe:extensions.bzl",
     "crate",
+)
+crate.annotation(
+    build_script_use_cc_toolchain = "on",
+    crate = "esaxx-rs",
+    repositories = ["sglang_crates"],
+)
+crate.annotation(
+    build_script_use_cc_toolchain = "on",
+    crate = "onig_sys",
+    repositories = ["sglang_crates"],
 )
 crate.from_cargo(
     name = "sglang_crates",
@@ -99,4 +127,8 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
-use_repo(crate, "sglang_crates")
+use_repo(
+    crate,
+    "sglang_crates",
+    "sglang_crates__rayon-1.12.0",
+)

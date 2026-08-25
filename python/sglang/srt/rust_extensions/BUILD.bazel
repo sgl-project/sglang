@@ -1,0 +1,78 @@
+load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
+load(
+    "@sglang_crates//:defs.bzl",
+    "all_crate_deps",
+    "crate_deps",
+    "crate_edition",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+pyo3_extension(
+    name = "_multimodal",
+    srcs = ["//rust/sglang-mm:sglang_mm_srcs"],
+    crate_features = [
+        "parallel",
+        "python",
+    ],
+    crate_name = "sglang_mm_core",
+    crate_root = "//rust/sglang-mm:src/lib.rs",
+    edition = crate_edition(package_name = "rust/sglang-mm"),
+    imports = ["../../.."],
+    stubs = False,
+    deps = [
+        "@sglang_crates//:numpy",
+        "@sglang_crates__rayon-1.12.0//:rayon",
+    ] + all_crate_deps(
+        package_name = "rust/sglang-mm",
+        normal = True,
+    ),
+)
+
+pyo3_extension(
+    name = "_server",
+    srcs = ["//rust/sglang-server:sglang_server_srcs"],
+    aliases = {
+        "//rust/sglang-mm:sglang_mm_core": "sglang_mm",
+    },
+    crate_name = "sglang_server",
+    crate_root = "//rust/sglang-server:src/lib.rs",
+    edition = crate_edition(package_name = "rust/sglang-server"),
+    imports = ["../../.."],
+    stubs = False,
+    deps = [
+        "//rust/sglang-mm:sglang_mm_core",
+    ] + crate_deps(
+        [
+            "arc-swap",
+            "async-stream",
+            "axum",
+            "bytemuck",
+            "bytes",
+            "core_affinity",
+            "dynamo-parsers",
+            "dynamo-protocols",
+            "dynamo-renderer",
+            "dynamo-tokenizers",
+            "flume",
+            "futures",
+            "hf-hub",
+            "itertools",
+            "libc",
+            "numpy",
+            "regex-syntax",
+            "rmp-serde",
+            "rmpv",
+            "serde",
+            "serde_json",
+            "socket2",
+            "thiserror",
+            "tokio",
+            "tracing",
+            "tracing-appender",
+            "tracing-subscriber",
+            "uuid",
+        ],
+        package_name = "rust/sglang-server",
+    ),
+)

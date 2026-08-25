@@ -1,5 +1,5 @@
 {
-  "checksum": "585abf1b75495532253abfa6adb632adc8f5182339bb8cd240da4b32f2f6750d",
+  "checksum": "d65f6600b12cb564b78c84014686ca9165a220bc5b4400a52a198710518aeaaa",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -6683,7 +6683,8 @@
             }
           ],
           "selects": {}
-        }
+        },
+        "use_cc_toolchain": 1
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -14827,7 +14828,8 @@
           ],
           "selects": {}
         },
-        "links": "onig"
+        "links": "onig",
+        "use_cc_toolchain": 1
       },
       "license": "MIT",
       "license_ids": [

@@ -11,14 +11,20 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "Cargo.toml",
     "pyproject.toml",
+    "src/lib.rs",
 ])
+
+filegroup(
+    name = "sglang_mm_srcs",
+    srcs = glob(["src/**/*.rs"]),
+)
 
 # This target intentionally leaves both `python` and `parallel` disabled. It is
 # the dependency shape linked by sglang-server and the smallest native target
 # that can be built independently of Python, protobuf, CUDA, and ROCm.
 rust_library(
     name = "sglang_mm_core",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = [":sglang_mm_srcs"],
     aliases = aliases(),
     crate_name = "sglang_mm_core",
     crate_root = "src/lib.rs",

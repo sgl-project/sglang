@@ -1,6 +1,33 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load(
+    "@sglang_crates//:defs.bzl",
+    "all_crate_deps",
+    "crate_edition",
+)
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "Cargo.toml",
     "pyproject.toml",
+    "src/lib.rs",
 ])
+
+filegroup(
+    name = "sglang_server_srcs",
+    srcs = glob(["src/**/*.rs"]),
+)
+
+rust_library(
+    name = "sglang_server_core",
+    srcs = [":sglang_server_srcs"],
+    aliases = {
+        "//rust/sglang-mm:sglang_mm_core": "sglang_mm",
+    },
+    crate_name = "sglang_server",
+    crate_root = "src/lib.rs",
+    edition = crate_edition(),
+    deps = [
+        "//rust/sglang-mm:sglang_mm_core",
+    ] + all_crate_deps(normal = True),
+)
