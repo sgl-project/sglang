@@ -679,10 +679,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         host_index_k_scale=self.index_k_scale_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
-                        layer_start=layer_start,
-                        layer_num=layer_num,
-                        index_k_layer_start=ik_start,
-                        index_k_layer_num=ik_num,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
