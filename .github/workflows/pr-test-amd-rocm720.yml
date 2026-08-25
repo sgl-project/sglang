@@ -593,6 +593,31 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
+      # Splits a cache hit into the part that streams bytes off the volume and
+      # the part `docker load` spends importing them, which is what decides
+      # whether a no-tar scheme (loose layer files, or a persistent data-root)
+      # could be meaningfully faster. O_DIRECT so the page cache cannot flatter
+      # the read, and only a slice is read so the probe stays cheap.
+      - name: Measure raw volume read and local write throughput
+        if: always()
+        run: |
+          set -u
+          cache=/home/runner/sglang-data/docker-images
+          tarball=$(ls -S "${cache}"/*.tar 2>/dev/null | head -n 1 || true)
+          if [[ -n "${tarball}" ]]; then
+            bytes=$(stat -c %s "${tarball}")
+            echo "[probe-io] tarball=${tarball} size=$(( bytes / 1024 / 1024 / 1024 ))G"
+            for flag in direct ""; do
+              out=$(dd if="${tarball}" of=/dev/null bs=16M count=512 ${flag:+iflag=$flag} 2>&1 | tail -n 1) || true
+              echo "[probe-io] volume-read${flag:+ ($flag)}: ${out}"
+            done
+          else
+            echo "[probe-io] no tarball in ${cache}"
+          fi
+          out=$(dd if=/dev/zero of=/tmp/probe-io.bin bs=16M count=256 oflag=direct conv=fsync 2>&1 | tail -n 1) || true
+          echo "[probe-io] local-write (direct): ${out}"
+          rm -f /tmp/probe-io.bin
+
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
@@ -603,6 +628,14 @@ jobs:
         run: |
           echo "probe idx=${{ matrix.idx }} runner=${RUNNER_NAME:-unknown}"
           df -h /home/runner/sglang-data 2>/dev/null | tail -n 1 || true
+          # How many inodes the image occupies once unpacked. A scheme that
+          # copied loose layer files instead of one tar would pay per-file
+          # metadata cost on the shared volume for every one of these.
+          root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+          echo "[probe-io] data-root=${root}"
+          timeout 300 find "${root}/overlay2" -xdev -printf '.' 2>/dev/null | wc -c \
+            | sed 's/^/[probe-io] overlay2 inodes: /' || echo "[probe-io] inode count timed out"
+          du -sh "${root}/overlay2" 2>/dev/null | sed 's/^/[probe-io] overlay2 size: /' || true
 
       - name: Release the container
         if: always()
