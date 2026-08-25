@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 
+from sglang.kernels.ops.diffusion import _attn_fwd, get_block_map
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -34,9 +35,168 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-
 # ==================================SLA Functions===================================
-from sglang.kernels.ops.diffusion import _attn_fwd, get_block_map
+
+_DEFAULT_SLA_TOPK_RATIO = 0.1
+_DEFAULT_SLA_BLKQ = 128
+_DEFAULT_SLA_BLKK = 64
+_DEFAULT_SLA_LINEAR_MIX = True
+
+
+@dataclass(frozen=True)
+class _SLAImplConfig:
+    topk_ratio: float
+    BLKQ: int
+    BLKK: int
+    linear_mix: bool
+
+
+def _resolve_sla_impl_config(
+    *,
+    topk_ratio: float = _DEFAULT_SLA_TOPK_RATIO,
+    BLKQ: int = _DEFAULT_SLA_BLKQ,
+    BLKK: int = _DEFAULT_SLA_BLKK,
+    linear_mix: bool | None = None,
+) -> _SLAImplConfig:
+    """Merge ctor args with ``attention_backend_config`` for unset/default fields only."""
+    resolved_linear_mix = (
+        _DEFAULT_SLA_LINEAR_MIX if linear_mix is None else bool(linear_mix)
+    )
+    cfg: dict[str, Any] = {}
+    try:
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        raw = getattr(get_global_server_args(), "attention_backend_config", None)
+        if isinstance(raw, dict):
+            cfg = raw
+    except ValueError:
+        pass
+
+    if topk_ratio == _DEFAULT_SLA_TOPK_RATIO:
+        if "topk_ratio" in cfg:
+            topk_ratio = float(cfg["topk_ratio"])
+        elif "sparsity_ratio" in cfg:
+            topk_ratio = 1.0 - float(cfg["sparsity_ratio"])
+
+    if BLKQ == _DEFAULT_SLA_BLKQ and BLKK == _DEFAULT_SLA_BLKK:
+        if "blkq" in cfg or "block_size" in cfg:
+            blkq = int(cfg.get("blkq", cfg.get("block_size", BLKQ)))
+            BLKQ = blkq
+            BLKK = int(cfg.get("blkk", 64 if blkq == 128 else blkq))
+
+    if linear_mix is None and "linear_mix" in cfg:
+        value = cfg["linear_mix"]
+        if isinstance(value, str):
+            resolved_linear_mix = value.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        else:
+            resolved_linear_mix = bool(value)
+
+    if not 0.0 < topk_ratio <= 1.0:
+        raise ValueError(f"SLA topk_ratio must be in (0, 1], got {topk_ratio}")
+
+    return _SLAImplConfig(
+        topk_ratio=topk_ratio,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        linear_mix=resolved_linear_mix,
+    )
+
+
+def _clamp_protect_upto(n: int, seq_len: int) -> int:
+    if n <= 0:
+        return 0
+    return min(n, seq_len)
+
+
+def _localize_protect_upto(
+    protect_upto: int,
+    *,
+    segment_start: int,
+    segment_len: int,
+) -> int:
+    """Map a packed-layout token bound to a segment-local prefix length."""
+    if protect_upto <= segment_start or segment_len <= 0:
+        return 0
+    return min(protect_upto - segment_start, segment_len)
+
+
+def _trailing_padding_used_len(
+    *,
+    total_tokens: int,
+    max_seqlen: int,
+    bounds: tuple[int, ...],
+) -> int | None:
+    if len(bounds) != 3:
+        return None
+    start, used, total = bounds
+    if start != 0 or used >= total or total != total_tokens or used != max_seqlen:
+        return None
+    return used
+
+
+def _packed_sla_forward(
+    impl: AttentionImpl,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    bounds: tuple[int, ...],
+    max_seqlen: int,
+    protect_upto: int = 0,
+) -> torch.Tensor:
+    used = _trailing_padding_used_len(
+        total_tokens=query.shape[0],
+        max_seqlen=max_seqlen,
+        bounds=bounds,
+    )
+    if used is not None:
+        metadata = SparseLinearAttentionMetadata(
+            current_timestep=0,
+            topk_ratio=impl.topk_ratio,
+            protect_upto=_localize_protect_upto(
+                protect_upto,
+                segment_start=0,
+                segment_len=used,
+            ),
+        )
+        live_out = impl.forward(
+            query[:used].unsqueeze(0),
+            key[:used].unsqueeze(0),
+            value[:used].unsqueeze(0),
+            metadata,
+        )[0]
+        if used == query.shape[0]:
+            return live_out
+        output = torch.zeros_like(query)
+        output[:used] = live_out
+        return output
+
+    output = torch.empty_like(query)
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        if start == stop:
+            continue
+        segment_len = stop - start
+        metadata = SparseLinearAttentionMetadata(
+            current_timestep=0,
+            topk_ratio=impl.topk_ratio,
+            protect_upto=_localize_protect_upto(
+                protect_upto,
+                segment_start=start,
+                segment_len=segment_len,
+            ),
+        )
+        output[start:stop] = impl.forward(
+            query[start:stop].unsqueeze(0),
+            key[start:stop].unsqueeze(0),
+            value[start:stop].unsqueeze(0),
+            metadata,
+        )[0]
+    return output
 
 
 def _get_cuda_arch(device_index: int) -> str:
@@ -80,7 +240,8 @@ class SparseLinearAttentionMetadata(AttentionMetadata):
     current_timestep: int
 
     # Sparse attention configuration
-    topk_ratio: float = 0.1
+    topk_ratio: float = _DEFAULT_SLA_TOPK_RATIO
+    protect_upto: int = 0
 
 
 class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -95,12 +256,13 @@ class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
     def build(
         self,
         current_timestep: int,
-        topk_ratio: float = 0.1,
+        topk_ratio: float = _DEFAULT_SLA_TOPK_RATIO,
         **kwargs: dict[str, Any],
     ) -> SparseLinearAttentionMetadata:
         return SparseLinearAttentionMetadata(
             current_timestep=current_timestep,
             topk_ratio=topk_ratio,
+            protect_upto=int(kwargs.get("protect_upto", 0) or 0),
         )
 
 
@@ -116,44 +278,57 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
         num_kv_heads: int | None = None,
         prefix: str = "",
         # SLA-specific parameters - matched to TurboDiffusion defaults
-        topk_ratio: float = 0.1,  # TurboDiffusion uses topk=0.1
+        topk_ratio: float = _DEFAULT_SLA_TOPK_RATIO,  # TurboDiffusion uses topk=0.1
         feature_map: str = "softmax",
-        BLKQ: int = 128,  # TurboDiffusion uses BLKQ=128
-        BLKK: int = 64,  # TurboDiffusion uses BLKK=64
+        BLKQ: int = _DEFAULT_SLA_BLKQ,  # TurboDiffusion uses BLKQ=128
+        BLKK: int = _DEFAULT_SLA_BLKK,  # TurboDiffusion uses BLKK=64
         use_bf16: bool = True,
+        linear_mix: bool | None = None,
         **extra_impl_args,
     ) -> None:
         nn.Module.__init__(self)
 
+        sla = _resolve_sla_impl_config(
+            topk_ratio=topk_ratio,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            linear_mix=linear_mix,
+        )
         # SLA-specific config
-        self.topk_ratio = topk_ratio
-        self.BLKQ = BLKQ
-        self.BLKK = BLKK
+        self.topk_ratio = sla.topk_ratio
+        self.BLKQ = sla.BLKQ
+        self.BLKK = sla.BLKK
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
+        self.linear_mix = sla.linear_mix
+        self.head_size = head_size
 
         # Learnable linear projection for combining sparse + linear attention
-        self.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
-
+        self.proj_l: nn.Linear | None
         # Feature map for linear attention
         # Type annotation for callables
-        self.feature_map_q: Callable[[torch.Tensor], torch.Tensor]
-        self.feature_map_k: Callable[[torch.Tensor], torch.Tensor]
-        if feature_map == "elu":
-            self.feature_map_q = lambda x: F.elu(x) + 1
-            self.feature_map_k = lambda x: F.elu(x) + 1
-        elif feature_map == "relu":
-            self.feature_map_q = F.relu
-            self.feature_map_k = F.relu
-        elif feature_map == "softmax":
-            self.feature_map_q = lambda x: F.softmax(x, dim=-1)
-            self.feature_map_k = lambda x: F.softmax(x, dim=-1)
+        self.feature_map_q: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self.feature_map_k: Callable[[torch.Tensor], torch.Tensor] | None = None
+        if self.linear_mix:
+            self.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
+            if feature_map == "elu":
+                self.feature_map_q = lambda x: F.elu(x) + 1
+                self.feature_map_k = lambda x: F.elu(x) + 1
+            elif feature_map == "relu":
+                self.feature_map_q = F.relu
+                self.feature_map_k = F.relu
+            elif feature_map == "softmax":
+                self.feature_map_q = lambda x: F.softmax(x, dim=-1)
+                self.feature_map_k = lambda x: F.softmax(x, dim=-1)
+            else:
+                raise ValueError(f"Unknown feature map: {feature_map}")
+            self._init_weights()
         else:
-            raise ValueError(f"Unknown feature map: {feature_map}")
-
-        self._init_weights()
+            self.proj_l = None
 
     def _init_weights(self) -> None:
         """Initialize projection weights to zero for residual-like behavior."""
+        if self.proj_l is None:
+            return
         with torch.no_grad():
             nn.init.zeros_(self.proj_l.weight)
             nn.init.zeros_(self.proj_l.bias)  # type: ignore[arg-type]
@@ -181,15 +356,26 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
             output tensor of shape (B, H, L, D)
         """
         dtype = query.dtype
+        if self.proj_l is not None and self.proj_l.weight.device != query.device:
+            self.proj_l = self.proj_l.to(device=query.device)
 
         # Transpose for computation
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
 
+        requested = 0
+        if attn_metadata is not None:
+            requested = int(getattr(attn_metadata, "protect_upto", 0) or 0)
+        protect_upto = _clamp_protect_upto(requested, int(query.shape[2]))
         # Get sparse attention map
         sparse_map, lut, real_topk = get_block_map(
-            query, key, topk_ratio=self.topk_ratio, BLKQ=self.BLKQ, BLKK=self.BLKK
+            query,
+            key,
+            topk_ratio=self.topk_ratio,
+            BLKQ=self.BLKQ,
+            BLKK=self.BLKK,
+            protect_upto=protect_upto,
         )
 
         # Convert to computation dtype
@@ -201,21 +387,47 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
         o_s = _attention.apply(
             query, key, value, sparse_map, lut, real_topk, self.BLKQ, self.BLKK
         )
-
-        # Apply feature maps
-        query = self.feature_map_q(query).to(self.dtype)  # c_q
-        key = self.feature_map_k(key).to(self.dtype)  # c_k
-        # Linear attention computation
-        o_l = self._calc_linear_attention_with_torch(query, key, value)
-
-        # Apply projection and combine results
-        with torch.amp.autocast("cuda", dtype=self.dtype):
-            o_l = self.proj_l(o_l)
-
-        # Combine sparse and linear attention
-        output = (o_s + o_l).to(dtype).transpose(1, 2)
-
+        if self.linear_mix:
+            assert self.feature_map_q is not None and self.feature_map_k is not None
+            assert self.proj_l is not None
+            # Apply feature maps
+            q_lin = self.feature_map_q(query).to(self.dtype)  # c_q
+            k_lin = self.feature_map_k(key).to(self.dtype)  # c_k
+            # Linear attention computation
+            o_l = self._calc_linear_attention_with_torch(q_lin, k_lin, value)
+            # Apply projection and combine results
+            with torch.amp.autocast("cuda", dtype=self.dtype):
+                o_l = self.proj_l(o_l)
+            # Combine sparse and linear attention
+            o_s = o_s + o_l
+        output = o_s.to(dtype).transpose(1, 2)
         return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+        protect_upto: int = 0,
+    ) -> torch.Tensor:
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(x) for x in cu_seqlens.tolist())
+        )
+        return _packed_sla_forward(
+            self,
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            bounds=bounds,
+            max_seqlen=max_seqlen,
+            protect_upto=protect_upto,
+        )
 
 
 class _attention(torch.autograd.Function):
