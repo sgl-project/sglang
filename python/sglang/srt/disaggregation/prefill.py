@@ -684,6 +684,16 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
+        # Glue bisect mark 0 (§24.34): batch-scope pool snapshot at entry; a
+        # catch on the drained gap:post-draft snapshot convicts the
+        # eagle-worker return tail, and this snapshot splits the prologue
+        # below (finalize scatters / move_logprobs D2H) into its own window.
+        try:
+            from sglang.srt.layers.cp.layer_trap import glue_probe_pool
+
+            glue_probe_pool(self.req_to_token_pool, "glue:entry")
+        except Exception:
+            pass
         if copy_done is not None:
             copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -766,6 +776,20 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     req.hidden_states_tensor = None
                     req.output_dsa_topk_indices = None
+                # Glue bisect mark 2b (§24.34): splits the eagle extraction
+                # (topk views + hidden_states[i].cpu().clone() D2H) from the
+                # logprob/sampling-mask glue below.
+                try:
+                    from sglang.srt.layers.cp.layer_trap import glue_probe
+
+                    glue_probe(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        len(req.origin_input_ids),
+                        "glue:post-extract",
+                    )
+                except Exception:
+                    pass
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -862,6 +886,18 @@ class SchedulerDisaggregationPrefillMixin:
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
+                    # Glue bisect (§24.34): middle-chunk send entry.
+                    try:
+                        from sglang.srt.layers.cp.layer_trap import glue_probe
+
+                        glue_probe(
+                            self.req_to_token_pool,
+                            req.req_pool_idx,
+                            len(req.origin_input_ids),
+                            "glue:mid-pre-send",
+                        )
+                    except Exception:
+                        pass
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -1108,7 +1144,29 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
+            # Glue bisect (§24.34): the middle-chunk radix cache path
+            # (chunked=True variant; same insert + FreeDeviceKV family).
+            try:
+                from sglang.srt.layers.cp.layer_trap import glue_probe
+
+                glue_probe(
+                    self.req_to_token_pool,
+                    req.req_pool_idx,
+                    len(req.origin_input_ids),
+                    "glue:chunk-pre-cache",
+                )
+            except Exception:
+                pass
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            try:
+                glue_probe(
+                    self.req_to_token_pool,
+                    req.req_pool_idx,
+                    len(req.origin_input_ids),
+                    "glue:chunk-post-cache",
+                )
+            except Exception:
+                pass
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):

@@ -431,3 +431,20 @@ def glue_probe(pool, row: int, width: int, label: str) -> None:
     if _pend.get("fired"):
         return
     _snapshot_row(pool, row, width, label)
+
+
+def glue_probe_pool(pool, label: str) -> None:
+    """Drain the pending snapshot, then a full-pool snapshot (batch scope).
+
+    glue:entry (process_batch_result_disagg_prefill head): a catch on the
+    drained gap:post-draft snapshot convicts the eagle-worker return tail;
+    the entry snapshot itself is compared at the next mark, splitting the
+    batch-result prologue (copy_done.synchronize / TopkCaptureOutput
+    finalize scatters / move_logprobs_to_cpu D2H) into its own window.
+    """
+    if not _enabled() or _pend.get("fired"):
+        return
+    _drain()
+    if _pend.get("fired"):
+        return
+    _snapshot_pool(pool, label)
