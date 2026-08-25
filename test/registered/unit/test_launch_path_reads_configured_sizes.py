@@ -8,6 +8,7 @@ reaches, because nothing short of booting a server runs the launcher.
 """
 
 import ast
+import functools
 import pathlib
 import unittest
 
@@ -82,6 +83,7 @@ def _multiprocessing_names(tree):
     return modules, constructors
 
 
+@functools.lru_cache(maxsize=None)
 def _configured_accessors() -> frozenset:
     """The `configured_*_size()` names `runtime_context` exports.
 
@@ -217,10 +219,13 @@ def _launch_paths():
     nothing, which no derivation can reach.
     """
     seen = {}
+    sizes = frozenset(_LIVE_SHADOWED) | _configured_accessors()
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         source = path.read_text()
         # Every spawn shape below names Process, ProcessPoolExecutor or Popen.
         if not any(name in source for name in ("Process", "Popen", "spawn")):
+            continue
+        if not any(name in source for name in sizes):
             continue
         try:
             tree = ast.parse(source)
