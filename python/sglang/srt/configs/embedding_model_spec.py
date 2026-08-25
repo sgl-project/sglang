@@ -146,6 +146,7 @@ _CLASSIFICATION_ARCHITECTURES = {
     "LlamaForSequenceClassificationWithNormal_Weights",
     "Qwen2ForSequenceClassification",
     "Qwen3ForSequenceClassification",
+    "Qwen3_5ForSequenceClassification",
     "XLMRobertaForSequenceClassification",
 }
 
@@ -291,7 +292,9 @@ def resolve_embedding_model_spec(
             tokenizer_special_tokens="model_default",
             supports_dimensions=False,
             supports_token_embeddings=False,
-            supports_multimodal=False,
+            supports_multimodal=(
+                "Qwen3_5ForSequenceClassification" in architecture_set
+            ),
             requires_embedding_flag=False,
             auto_enable_embedding=False,
             bidirectional_attention=False,

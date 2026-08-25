@@ -66,6 +66,7 @@ from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.pooler import Pooler, PoolingType, score_and_pool
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -2099,8 +2100,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         language_model_cls=Qwen3_5ForCausalLM,
+        create_lm_head: bool = True,
     ):
-        super().__init__(config, quant_config, prefix, language_model_cls)
+        super().__init__(
+            config,
+            quant_config,
+            prefix,
+            language_model_cls,
+            create_lm_head=create_lm_head,
+        )
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2246,6 +2254,65 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+
+class Qwen3_5ForSequenceClassification(Qwen3_5ForConditionalGeneration):
+    """Multimodal Qwen3.5 with a sequence-classification score head.
+
+    The head is applied to the raw last-token hidden state. In particular, it
+    must not reuse the L2-normalized embedding returned by the base Qwen3-VL
+    pooler.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3_5Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        num_labels = config.num_labels
+        problem_type = getattr(config, "problem_type", None)
+        super().__init__(config, quant_config, prefix, create_lm_head=False)
+
+        self.num_labels = num_labels
+        self.problem_type = problem_type
+        self.score = nn.Linear(
+            config.text_config.hidden_size,
+            num_labels,
+            bias=False,
+        )
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
+
+    def _pool_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        return score_and_pool(
+            self.score,
+            self.pooler,
+            hidden_states,
+            forward_batch,
+            input_ids,
+        )
+
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        return embed, None
+
+    def set_embed_and_head(self, embed, head):
+        # The score head is independent from token embeddings and must never be
+        # replaced by the generation lm_head sharing path.
+        super().set_embed_and_head(embed, None)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        filtered_weights = (
+            (name, weight)
+            for name, weight in weights
+            if not name.startswith("lm_head.")
+        )
+        return super().load_weights(filtered_weights)
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -2676,6 +2743,7 @@ for _entry_class in (
     Qwen3_5ForCausalLM,
     Qwen3_5MoeForCausalLM,
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5ForSequenceClassification,
     Qwen3_5MoeForConditionalGeneration,
 ):
     _entry_class.shared_experts_fusion_disable_reason = staticmethod(
@@ -2683,4 +2751,8 @@ for _entry_class in (
     )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5ForSequenceClassification,
+]

@@ -107,6 +107,18 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertFalse(spec.safe_disable_kv_cache)
         self.assertEqual(spec.bcg_prefill_policy, BCGPrefillPolicy.DEFAULT)
 
+    def test_qwen3_5_classification_preserves_multimodal_capability(self):
+        spec = resolve_embedding_model_spec(
+            ["Qwen3_5ForSequenceClassification"],
+            is_embedding_requested=True,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.task, EmbeddingTask.CLASSIFY)
+        self.assertEqual(spec.execution, EmbeddingExecution.CLASSIFICATION)
+        self.assertFalse(spec.normalize)
+        self.assertTrue(spec.supports_multimodal)
+
     def test_unknown_generation_model_has_no_embedding_contract_without_intent(self):
         spec = resolve_embedding_model_spec(
             ["Qwen3ForCausalLM"],

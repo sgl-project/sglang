@@ -246,6 +246,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForSequenceClassification",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",

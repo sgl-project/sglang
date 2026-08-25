@@ -357,6 +357,7 @@ class TestQwen3_5Gate(_FusionGateCase):
             qwen3_5.Qwen3_5ForCausalLM,
             qwen3_5.Qwen3_5MoeForCausalLM,
             qwen3_5.Qwen3_5ForConditionalGeneration,
+            qwen3_5.Qwen3_5ForSequenceClassification,
             qwen3_5.Qwen3_5MoeForConditionalGeneration,
         ):
             self.assertTrue(
