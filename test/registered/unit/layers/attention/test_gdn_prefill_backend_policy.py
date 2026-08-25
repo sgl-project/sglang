@@ -78,6 +78,28 @@ def make_runner(
     )
 
 
+class TestGdnTrackedConvStateDtype(CustomTestCase):
+    def test_casts_snapshot_to_conv_cache_dtype(self):
+        conv_states = torch.zeros((2, 3, 4), dtype=torch.bfloat16)
+        tracked = torch.full((1, 3, 4), 1.5, dtype=torch.float16)
+
+        gdn_backend._store_tracked_conv_states(
+            conv_states, torch.tensor([1]), tracked
+        )
+
+        self.assertEqual(conv_states.dtype, torch.bfloat16)
+        torch.testing.assert_close(conv_states[1], tracked[0].to(torch.bfloat16))
+
+    def test_same_dtype_write_remains_exact(self):
+        conv_states = torch.zeros((1, 2, 3), dtype=torch.float16)
+        tracked = torch.arange(6, dtype=torch.float16).reshape(1, 2, 3)
+
+        gdn_backend._store_tracked_conv_states(
+            conv_states, torch.tensor([0]), tracked
+        )
+
+        torch.testing.assert_close(conv_states[0], tracked[0], rtol=0, atol=0)
+
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def apply_policy(
         self,
