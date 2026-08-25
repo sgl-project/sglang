@@ -1179,7 +1179,7 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
                 "--layerwise-offload-components",
                 "dit,text_encoder,vae",
                 "--layerwise-resident-layers",
-                "video_vae=24",
+                "video_vae=36",
             ],
             env_vars={
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
@@ -1212,6 +1212,7 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
             },
         ),
         run_perf_check=True,
+        perf_repeat_requests=2,
         run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
