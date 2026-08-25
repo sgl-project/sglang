@@ -150,10 +150,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromDistributedReqInput,
-    LoadLoRAAdapterFromDistributedReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -161,6 +157,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1634,14 +1631,6 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
-                (
-                    LoadLoRAAdapterFromTensorsReqInput,
-                    self.load_lora_adapter_from_tensors,
-                ),
-                (
-                    LoadLoRAAdapterFromDistributedReqInput,
-                    self.load_lora_adapter_from_distributed,
-                ),
                 (RegisterLoRAAdapterReqInput, self.register_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -4865,34 +4854,20 @@ class Scheduler(
         result = self.tp_worker.load_lora_adapter(recv_req)
         return result
 
-    def load_lora_adapter_from_tensors(
-        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
-    ) -> LoadLoRAAdapterFromTensorsReqOutput:
-        """In-place loading a new lora adapter from serialized tensors."""
-
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        return result
-
-    def load_lora_adapter_from_distributed(
-        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
-    ) -> LoadLoRAAdapterFromDistributedReqOutput:
-        """In-place loading a new lora adapter broadcast over a process group."""
-
-        result = self.tp_worker.load_lora_adapter_from_distributed(recv_req)
-        return result
-
-    def register_lora_adapter(self, recv_req: RegisterLoRAAdapterReqInput):
-        """Create-or-refresh an adapter's identity and config (weights zeroed)."""
-
-        result = self.tp_worker.register_lora_adapter(recv_req)
-        return result
-
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def register_lora_adapter(
+        self, recv_req: RegisterLoRAAdapterReqInput
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh a LoRA adapter's identity and config (weights zeroed)."""
+
+        result = self.tp_worker.register_lora_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(
