@@ -448,6 +448,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    enable_ar_dit_overlap: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -2540,6 +2541,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--enable-ar-dit-overlap",
+            action=StoreBoolean,
+            default=ServerArgs.enable_ar_dit_overlap,
+            help=(
+                "Enable AR/DiT overlap for separated GLM-Image deployments "
+                "whenever the single-rank DiT pipeline supports async AR prefetch."
+            ),
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -3461,6 +3471,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if not isinstance(self.enable_ar_dit_overlap, bool):
+            raise ValueError("enable_ar_dit_overlap must be a boolean")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
