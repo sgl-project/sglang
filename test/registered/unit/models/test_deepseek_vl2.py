@@ -1,4 +1,5 @@
 import unittest
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import torch
@@ -15,6 +16,11 @@ class _VisionStub(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.dtype_anchor = nn.Parameter(torch.zeros(()), requires_grad=False)
+        self.parameter_lookups = 0
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
+        self.parameter_lookups += 1
+        return super().parameters(recurse=recurse)
 
     def forward_features(self, features: torch.Tensor) -> torch.Tensor:
         return features.flatten(start_dim=2) + 1
@@ -51,6 +57,24 @@ class TestDeepseekVL2ImageFeatures(CustomTestCase):
                     image_features,
                     torch.tensor(expected, dtype=torch.float32).unsqueeze(1),
                 )
+
+    def test_vision_dtype_is_read_once_per_batch(self) -> None:
+        item = SimpleNamespace(
+            feature=torch.arange(2, dtype=torch.float32).reshape(2, 1, 1, 1),
+            images_spatial_crop=torch.tensor([[[1, 1]]]),
+        )
+        vision = _VisionStub()
+
+        DeepseekVL2ForCausalLM.build_image_features(
+            items=[item, item],
+            vision=vision,
+            projector=_ProjectorStub(),
+            image_newline=torch.tensor([-1.0]),
+            view_seperator=torch.tensor([-2.0]),
+            global_view_pos="head",
+        )
+
+        self.assertEqual(vision.parameter_lookups, 1)
 
 
 if __name__ == "__main__":
