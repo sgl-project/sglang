@@ -1148,6 +1148,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 from sglang.srt.layers.cp.layer_trap import layer_trap_mark
 
                 layer_trap_mark(batch, "GL:D0-eagle")
+                # Discriminator 6 (§24.33): back-to-back snapshots. Runs
+                # 15-18 convicted the write to (copy_C0, gather_D0] -- a
+                # window holding NO same-stream kernels. Two more snapshots
+                # with ~zero host-side gap slice that window's tail into
+                # us-scale segments. Same-stream FIFO cannot interleave a
+                # task between two consecutively enqueued copy kernels, so
+                # a catch on D0b/D0c convicts an OFF-STREAM writer with a
+                # precise device-time anchor; all silent while the row still
+                # turns dirty at send time => the writer lands after the
+                # last snapshot (same-stream post-snapshot task family:
+                # draft prefill forward kernels / later overlap windows).
+                layer_trap_mark(batch, "GL:D0b-b2b")
+                layer_trap_mark(batch, "GL:D0c-b2b")
             except Exception:
                 pass
             # Gap probe 1 (layers/cp/layer_trap.py): the layer trap ends at
