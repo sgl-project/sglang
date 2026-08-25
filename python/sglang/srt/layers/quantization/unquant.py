@@ -933,12 +933,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def forward_xpu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            StandardCombineInput,
+        )
 
         moe_runner_config = self.moe_runner_config
         assert moe_runner_config.activation in [
@@ -946,6 +946,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             "gelu",
             "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
+
+        if not DispatchOutputChecker.format_is_standard(dispatch_output):
+            # A2A recv layouts (DeepEP normal) carry local expert ids; only the
+            # runner's permutes handle them, fused_experts below cannot.
+            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         backend = self.runner.runner_backend
         if use_intel_xpu_backend():

@@ -13,9 +13,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -235,7 +236,7 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     3. Parse a mode-specific dtype from quant_config.
     4. Parse a generic dtype from quant_config.
     5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
-    6. Otherwise default for NPU → BF16 (the default for NPU).
+    6. Otherwise default for NPU / XPU → BF16.
     7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
@@ -283,8 +284,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     ):
         return DispatcherOutputDtype.BF16
 
-    # 6. Default on NPU → BF16
-    if _is_npu:
+    # 6. Default on NPU / XPU → BF16 (no fp8 expert path)
+    if _is_npu or _is_xpu:
         return DispatcherOutputDtype.BF16
 
     # 7. Default → FP8
