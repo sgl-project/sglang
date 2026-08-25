@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     offloader,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
@@ -1858,7 +1860,9 @@ def apply_fp8_linear(
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
-        if channelwise_cutlass:
+        if channelwise_cutlass or (_is_xpu and weight_scale.numel() == weight.shape[1]):
+            # On XPU, sgl-kernel-xpu's native quant kernels require output_q
+            # to exactly match input's shape; padded output isn't supported.
             num_token_padding = None
         # For static per-tensor activation scales when using inductor compiler,
         # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.

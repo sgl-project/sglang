@@ -24,6 +24,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
+    LongLive2T2VConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -491,6 +494,12 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "--component-weights-paths.text_encoder",
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
+                "--component-quantizations.text_encoder",
+                "kitchen_int8",
+                "--component-quantization-ignored-layers.text_encoder",
+                "model.layers.0",
+                "lm_head",
+                "--transformer-quantization=fp8",
                 "--component-attention-backends.transformer",
                 "fa3",
             ]
@@ -532,6 +541,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             {"transformer": "fa"},
             server_args.component_attention_backends,
+        )
+        self.assertEqual(
+            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            server_args.component_quantizations,
+        )
+        self.assertEqual(
+            {"text_encoder": ["model.layers.0", "lm_head"]},
+            server_args.component_quantization_ignored_layers,
         )
 
     def test_serve_cli_defaults_warmup_on(self):
@@ -1417,6 +1434,7 @@ class TestOffloadDefaults(unittest.TestCase):
         lingbot_deployment = LingBotWorldCausalDMDConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
         ltx23_config = LTX23PipelineConfig()
+        longlive_deployment = LongLive2T2VConfig().get_model_deployment_config()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
@@ -1454,6 +1472,11 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
+        self.assertEqual(longlive_deployment.keep_resident_min_available_gb, 60)
+        self.assertEqual(
+            longlive_deployment.keep_resident_components,
+            ("dit", "text_encoder", "vae"),
+        )
         self.assertFalse(
             LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
         )
@@ -1485,6 +1508,25 @@ class TestOffloadDefaults(unittest.TestCase):
         # default keeps only vae resident (encoders are large, dit owned by FSDP)
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
         self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
+
+    def test_longlive_residency_scales_with_available_memory(self):
+        high_memory_args = self._from_dict_with_pipeline_config(
+            LongLive2T2VConfig(),
+            memory_gb=80,
+            kwargs={"performance_mode": "auto"},
+        )
+        high_memory_offload = high_memory_args.layerwise_offload_components or []
+        self.assertNotIn("text_encoder", high_memory_offload)
+        self.assertNotIn("vae", high_memory_offload)
+
+        constrained_args = self._from_dict_with_pipeline_config(
+            LongLive2T2VConfig(),
+            memory_gb=50,
+            kwargs={"performance_mode": "auto"},
+        )
+        constrained_offload = constrained_args.layerwise_offload_components or []
+        self.assertIn("text_encoder", constrained_offload)
+        self.assertIn("vae", constrained_offload)
 
     def test_qwen_ar_generation_residency_scales_with_available_memory(self):
         pipeline_configs = (
