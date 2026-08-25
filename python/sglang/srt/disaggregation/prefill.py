@@ -697,6 +697,34 @@ class SchedulerDisaggregationPrefillMixin:
         # catch on the drained gap:post-draft snapshot convicts the
         # eagle-worker return tail, and this snapshot splits the prologue
         # below (finalize scatters / move_logprobs D2H) into its own window.
+        # §24.40 (Run 24): register the address map for the alias-vs-OOB
+        # discriminator once per process (idempotent, cheap).
+        try:
+            from sglang.srt.layers.cp.layer_trap import (
+                layer_trap_register_tensors,
+            )
+
+            cand = {
+                "r2t": self.req_to_token_pool.req_to_token,
+                "topk_p": self.disagg_metadata_buffers.output_topk_p,
+                "hidden": self.disagg_metadata_buffers.output_hidden_states,
+            }
+            # k_buffer/v_buffer are per-layer LISTS on the pool; register the
+            # first layer of each (allocator/pool attribute varies by class).
+            for pool_obj in (
+                getattr(self, "token_to_kv_pool_allocator", None),
+                getattr(self, "token_to_kv_pool", None),
+            ):
+                kb = getattr(pool_obj, "k_buffer", None)
+                if isinstance(kb, list) and kb and torch.is_tensor(kb[0]):
+                    cand["kv_k0"] = kb[0]
+                    vb = getattr(pool_obj, "v_buffer", None)
+                    if isinstance(vb, list) and vb and torch.is_tensor(vb[0]):
+                        cand["kv_v0"] = vb[0]
+                    break
+            layer_trap_register_tensors(cand)
+        except Exception:
+            pass
         try:
             from sglang.srt.layers.cp.layer_trap import glue_probe_pool
 

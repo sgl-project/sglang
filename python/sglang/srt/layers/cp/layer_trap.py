@@ -30,6 +30,7 @@ copied (a few MB worst case, still cheap next to a layer's kernels).
 
 import logging
 import os
+import struct
 
 import torch
 
@@ -37,6 +38,26 @@ logger = logging.getLogger(__name__)
 
 _on: dict = {}
 _pend: dict = {}
+# §24.40 (Run 24): address-space map for alias-vs-OOB discrimination.
+# Registered once per process from the scheduler side (see
+# layer_trap_register_tensors); a catch prints the dirty byte address
+# against every registered range.
+_addrs: dict = {}
+
+
+def layer_trap_register_tensors(tensors: dict) -> None:
+    """Record {name: tensor} base addresses for the Run 24 discriminator."""
+    if not _enabled():
+        return
+    try:
+        for k, v in tensors.items():
+            if torch.is_tensor(v):
+                _addrs[k] = (
+                    v.data_ptr(),
+                    v.data_ptr() + v.numel() * v.element_size(),
+                )
+    except Exception:
+        pass
 
 
 def _enabled() -> bool:
@@ -140,7 +161,8 @@ def _snapshot(forward_batch, label):
     # tests): the copy was synchronous, treat as already complete.
     _pend.clear()
     _pend.update(
-        buf=buf, ev=ev, label=label, rows=idx.tolist(), fired=False
+        buf=buf, ev=ev, label=label, rows=idx.tolist(), fired=False,
+        r2t=r2t,
     )
 
 
@@ -175,6 +197,40 @@ def _drain():
             vals.shape[0],
             vals.shape[1],
         )
+        # §24.40 (Run 24): alias-vs-OOB discriminator. The dirty element's
+        # byte address inside r2t vs every registered candidate range.
+        # NOTE: the row stride is r2t.shape[1] (full tensor width), NOT the
+        # snapshot width -- row-scoped snapshots copy r2t[row, :w] with
+        # w < shape[1], and only the tensor's own layout gives the address.
+        try:
+            r2t = _pend.get("r2t")
+            if r2t is not None:
+                stride = int(r2t.shape[1])
+                dirty = (
+                    r2t.data_ptr()
+                    + (_pend["rows"][b] * stride + c) * r2t.element_size()
+                )
+                parts = []
+                for k, (lo, hi) in _addrs.items():
+                    hit = "HIT" if lo <= dirty < hi else "miss"
+                    parts.append(f"{k}=[{lo:#x},{hi:#x}){hit}")
+                # fp32 bit-reinterpretation of the dirty int32 (payload
+                # family identification) + offset within r2t.
+                raw = int(vals[b, c]) & 0xFFFFFFFF
+                fp = struct.unpack("<f", struct.pack("<I", raw))[0]
+                r2t_lo = r2t.data_ptr()
+                logger.error(
+                    "[mf-trap] addr dirty=%#x r2t=[%#x,%#x) off_in_r2t=%#x "
+                    "fp32=%g %s",
+                    dirty,
+                    r2t_lo,
+                    r2t_lo + r2t.numel() * r2t.element_size(),
+                    dirty - r2t_lo,
+                    fp,
+                    " ".join(parts),
+                )
+        except Exception:
+            pass
         _pend["fired"] = True
         # Keep the evidence buffer; no further snapshots this forward.
 
@@ -324,7 +380,8 @@ def _snapshot_pool(pool, label: str) -> None:
         ev = None
     _pend.clear()
     _pend.update(
-        buf=buf, ev=ev, label=label, rows=idx.tolist(), fired=False
+        buf=buf, ev=ev, label=label, rows=idx.tolist(), fired=False,
+        r2t=r2t,
     )
 
 
@@ -465,7 +522,10 @@ def _snapshot_row(pool, row: int, width: int, label: str) -> None:
     except Exception:
         ev = None
     _pend.clear()
-    _pend.update(buf=buf, ev=ev, label=label, rows=[int(row)], fired=False)
+    _pend.update(
+        buf=buf, ev=ev, label=label, rows=[int(row)], fired=False,
+        r2t=r2t,
+    )
 
 
 def glue_probe(pool, row: int, width: int, label: str) -> None:
