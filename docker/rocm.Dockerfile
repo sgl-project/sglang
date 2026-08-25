@@ -441,12 +441,7 @@ RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt \
- && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
-    # Hot patch: these commits breaks gpt-oss accuracy
-    git revert 1ecb760a5482a9e26744c3077a82814c04bd55c8; \
-    git revert e708f6c15215c187d8854208c49610fcda6305ff; \
- fi
+ && pip install -r requirements.txt
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
