@@ -631,12 +631,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
-    ) -> Optional[NodeId]:
+    ) -> tuple[Optional[NodeId], bool]:
         """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
         self._free_values(result.device_frees, result.host_frees)
         self._accumulate_tracker(tracker, result.tracker)
-        return result.node_id
+        return result.node_id, result.made_progress
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -693,8 +693,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while not target_reached(ct):
-                    node_id = self._evict_device_next_node(ct, tracker)
+                    node_id, made_progress = self._evict_device_next_node(ct, tracker)
                     if node_id is None:
+                        if made_progress:
+                            # Internal tombstone frees are now allocator-visible;
+                            # recheck the allocation target before walking again.
+                            continue
                         break
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:

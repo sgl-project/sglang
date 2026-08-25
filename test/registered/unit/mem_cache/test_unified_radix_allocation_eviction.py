@@ -34,8 +34,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         def next_node(component_type, tracker):
             if tracker[component_type] >= 70:
-                return None
-            return leaf_count["value"] + 1
+                return None, False
+            return leaf_count["value"] + 1, True
 
         def evict_leaf(_node_id, tracker):
             leaf_count["value"] += 1
@@ -73,7 +73,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache, _, _ = self._build_cache(collateral_capacity_gain=70)
         cache.tree_components = (ComponentType.FULL, ComponentType.C128)
         cache._evict_device_next_node.side_effect = None
-        cache._evict_device_next_node.return_value = None
+        cache._evict_device_next_node.return_value = (None, False)
 
         result = cache.evict(EvictParams(num_tokens=1))
 
@@ -100,7 +100,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_allocator)
 
         def next_node(component_type, tracker):
-            return None if tracker[component_type] >= 3 else 1
+            return (None, False) if tracker[component_type] >= 3 else (1, True)
 
         def evict_leaf(_node_id, tracker):
             tracker[ComponentType.FULL] += 20
