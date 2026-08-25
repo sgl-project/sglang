@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
@@ -250,6 +253,25 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
         self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
+        self._comfy_int8_config: KitchenInt8Config | None = None
+
+    def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
+        unsupported = {
+            str(marker.get("format")) for marker in layer_markers.values()
+        } - {"nvfp4", "int8_tensorwise"}
+        if unsupported:
+            raise ValueError(
+                "NVFP4 checkpoints cannot dispatch companion Comfy formats: "
+                + ", ".join(sorted(unsupported))
+            )
+        int8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "int8_tensorwise"
+        }
+        self._comfy_int8_config = (
+            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -356,6 +378,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if (
+            self._comfy_int8_config is not None
+            and prefix in self._comfy_int8_config.layer_markers
+        ):
+            return self._comfy_int8_config.get_quant_method(layer, prefix)
         return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
 
 
