@@ -1526,7 +1526,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_target_verify()
-                and not envs.SGLANG_MINIMAX_FORCE_SPARSE_PREFILL_VERIFY.get()
             ):
                 # gfx950 EAGLE verify: per-draft decode rows (not extend prefill).
                 idx_o, o = self._forward_gfx950_triton_verify(
