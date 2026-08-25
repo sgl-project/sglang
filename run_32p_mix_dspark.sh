@@ -88,16 +88,16 @@ do
             --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 64 \
-	          --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
+		    --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
             --mem-fraction-static 0.75 \
-            --max-mamba-cache-size 180 \
+            --max-mamba-cache-size 240 \
             --chunked-prefill-size 16384 \
-            --cuda-graph-bs $CUDA_GRAPH_BS \
+            --cuda-graph-bs 11 16 \
             --reasoning-parser kimi_k3 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 30000 \
-	          --moe-a2a-backend deepep \
+		    --moe-a2a-backend deepep \
             --deepep-mode auto \
             --speculative-algorithm DSPARK \
             --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
