@@ -644,6 +644,15 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
+                # Glue bisect mark C1 (spec prefill takes this early-return
+                # path): last on-stream point of the target forward thread
+                # before eagle_worker's post-target snapshot.
+                try:
+                    from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                    layer_trap_mark(forward_batch, "GL:C1-delayed")
+                except Exception:
+                    pass
                 return batch_result
 
             if not forward_batch.is_prefill_only:
@@ -667,6 +676,16 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, forward_batch
                     )
+
+            # Glue bisect mark C0: after sample / logprob post-processing --
+            # the final statement of the target forward thread before the
+            # eagle_worker post-target gap snapshot drains.
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                layer_trap_mark(forward_batch, "GL:C0-sample")
+            except Exception:
+                pass
 
             return batch_result
         else:

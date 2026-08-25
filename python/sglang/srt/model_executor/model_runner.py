@@ -1730,11 +1730,33 @@ class ModelRunner:
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
 
+            # Glue bisect mark A0 (layers/cp/layer_trap.py): after the model
+            # dispatch tail (eager/graph/split), before the DP MLP sync --
+            # brackets the (PL:C-logits, post-target] glue window left by the
+            # silent PL marks (Run 13).
+            try:
+                from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                layer_trap_mark(forward_batch, "GL:A0-fwd")
+            except Exception:
+                pass
+
             if (
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+
+                # Glue bisect mark A1: after the DP MLP sync collective. A hit
+                # here with A0 clean means the write landed while the forward
+                # stream was stalled in the sync -- cross-stream writer or the
+                # collective family; A0 dirty instead convicts the eager tail.
+                try:
+                    from sglang.srt.layers.cp.layer_trap import layer_trap_mark
+
+                    layer_trap_mark(forward_batch, "GL:A1-mlpsync")
+                except Exception:
+                    pass
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
