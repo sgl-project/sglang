@@ -1,5 +1,5 @@
 {
-  "checksum": "f5875ebd9a94775bb0c056f172274a980963f50e9d1155e2be312f904ad6be4f",
+  "checksum": "f96c17f8ae8f0db55f524733fea49db7513c02ff21ae6cb10899384784e40d09",
   "crates": {
     "addr2line 0.25.1": {
       "name": "addr2line",
@@ -39333,6 +39333,18 @@
               "id": "tonic-prost-build 0.14.6",
               "target": "tonic_prost_build"
             }
+          ],
+          "selects": {}
+        },
+        "build_script_env": {
+          "common": {
+            "PROTOC": "$(execpath @bazel_tools//tools/proto:protoc)"
+          },
+          "selects": {}
+        },
+        "tools": {
+          "common": [
+            "@bazel_tools//tools/proto:protoc"
           ],
           "selects": {}
         }
