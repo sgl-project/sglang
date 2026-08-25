@@ -91,6 +91,11 @@ class AscendKVManager(MooncakeKVManager):
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
+        if state_type is not None:
+            # State components, including dSparK draft KV, have their own flat
+            # layout and must not inherit the target NPU MLA buffer grouping.
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
+
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
         # state_type is accepted for parity with the common disaggregation path;

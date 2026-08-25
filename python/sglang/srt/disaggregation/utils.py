@@ -745,9 +745,22 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
 
-    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+    if isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool)):
+        return True
+
+    # Kimi-K3 exposes its MLA cache through the hybrid KDA/MLA wrapper. The
+    # latent KV has one shared head and must use the flat MLA transfer path,
+    # rather than the MHA head-sliced path.
+    return (
+        isinstance(target_kv_pool, HybridLinearKVPool)
+        and bool(target_kv_pool.use_mla)
+        and isinstance(target_kv_pool.full_kv_pool, MLATokenToKVPool)
+    )
 
 
 def compute_mamba_state_slice_blocks(
@@ -969,6 +982,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    draft_kv_as_state: bool = False,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1099,9 +1113,31 @@ def setup_state_kv_args(
                 slice_outer_counts,
                 layer_ids,
             )
+            full_kv_pool = token_to_kv_pool.full_kv_pool
+            if isinstance(full_kv_pool, NPUMLATokenToKVPool):
+                if full_kv_pool.layer_num <= 0:
+                    raise ValueError(
+                        "NPU MLA KV pool must contain at least one full-attention "
+                        "layer for PD transfer."
+                    )
+                if len(kv_args.kv_data_ptrs) % full_kv_pool.layer_num != 0:
+                    raise ValueError(
+                        "NPU MLA KV buffer count must be divisible by its layer "
+                        f"count, got buffers={len(kv_args.kv_data_ptrs)}, "
+                        f"layers={full_kv_pool.layer_num}."
+                    )
+                # NPU MLA stores latent K and K-RoPE in separate unequal-width
+                # buffer groups. Keep that grouping independent of Mamba and
+                # speculative draft state components.
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // full_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
-            if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, DSATokenToKVPool
+            if (
+                not draft_kv_as_state
+                and draft_token_to_kv_pool is not None
+                and isinstance(draft_token_to_kv_pool, DSATokenToKVPool)
             ):
                 (
                     draft_data_ptrs,
@@ -1133,6 +1169,40 @@ def setup_state_kv_args(
                 c128_lens,
                 c128_item_lens,
             )
+
+    if draft_kv_as_state:
+        if draft_token_to_kv_pool is None:
+            raise ValueError(
+                "Draft KV state transfer requires a draft token-to-KV pool."
+            )
+        target_page_size = getattr(token_to_kv_pool, "page_size", None)
+        draft_page_size = getattr(draft_token_to_kv_pool, "page_size", None)
+        if (
+            target_page_size is not None
+            and draft_page_size is not None
+            and target_page_size != draft_page_size
+        ):
+            raise ValueError(
+                "Target and draft KV pools must use the same page size for "
+                "PD dSparK transfer, got target="
+                f"{target_page_size}, draft={draft_page_size}."
+            )
+        draft_ptrs, draft_lens, draft_item_lens = (
+            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        )
+        draft_layer_ids = (
+            draft_token_to_kv_pool.get_kv_layer_ids()
+            if hasattr(draft_token_to_kv_pool, "get_kv_layer_ids")
+            else None
+        )
+        append_state_component(
+            kv_args,
+            StateType.DRAFT_KV,
+            draft_ptrs,
+            draft_lens,
+            draft_item_lens,
+            layer_ids=draft_layer_ids,
+        )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

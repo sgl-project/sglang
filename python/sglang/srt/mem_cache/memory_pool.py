@@ -3800,7 +3800,18 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
-        return layer_ids if self.use_mla else layer_ids * 2
+        if not layer_ids:
+            return []
+        num_entries = len(self.full_kv_pool.get_contiguous_buf_infos()[0])
+        if num_entries % len(layer_ids) != 0:
+            raise RuntimeError(
+                "Hybrid KV buffer count must be divisible by its full-attention "
+                f"layer count, got buffers={num_entries}, layers={len(layer_ids)}."
+            )
+        # Most MLA pools have one entry per layer and MHA pools have K/V
+        # entries. NPU MLA keeps latent K and K-RoPE as two separate groups,
+        # so derive the multiplicity from the concrete backing pool.
+        return layer_ids * (num_entries // len(layer_ids))
 
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (

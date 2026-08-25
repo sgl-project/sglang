@@ -1215,13 +1215,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DSA,
             StateType.SWA_RING,
             StateType.C128_STATE,
+            StateType.DRAFT_KV,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         """State types whose page lists are positional and must not be truncated."""
-        return st in (StateType.SWA_RING, StateType.C128_STATE)
+        return st in (StateType.SWA_RING, StateType.C128_STATE, StateType.DRAFT_KV)
 
     def maybe_send_extra(
         self,
@@ -1350,6 +1351,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DRAFT_KV:
+                    if not (
+                        len(src_data_ptrs)
+                        == len(src_item_lens)
+                        == len(dst_data_ptrs)
+                        == len(dst_item_lens)
+                    ):
+                        raise RuntimeError(
+                            "DRAFT_KV buffer metadata mismatch: "
+                            f"src_ptrs={len(src_data_ptrs)}, "
+                            f"src_item_lens={len(src_item_lens)}, "
+                            f"dst_ptrs={len(dst_data_ptrs)}, "
+                            f"dst_item_lens={len(dst_item_lens)}"
+                        )
+                    if list(src_item_lens) != list(dst_item_lens):
+                        raise RuntimeError(
+                            "DRAFT_KV cache layout mismatch between Prefill and "
+                            "Decode; use the same draft checkpoint, attention TP "
+                            "size, page size, dtype, and quantization on both sides."
+                        )
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0

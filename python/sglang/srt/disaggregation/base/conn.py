@@ -24,6 +24,10 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # Speculative draft KV uses the target token-pool indices, but it is not
+    # part of the target model's KV/MLA buffer grouping. Keep it separate so
+    # target and draft models can have different layer and buffer counts.
+    DRAFT_KV = "draft_kv"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
