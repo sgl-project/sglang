@@ -14,9 +14,14 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
+)
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    use_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -25,19 +30,20 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def get_folding_tp_group(config: EncoderConfig):
-    """group an encoder tensor-parallels over; the default TP group unless a
-    fold mode is set"""
+    """Return the TP group selected for an encoder."""
     mode = config.parallel_folding_mode
     if mode == "sp":
         return get_sp_group()
-    elif mode == "ulysses":
-        return get_sp_group().ulysses_group
-    elif mode == "ring":
-        return get_sp_group().ring_group
-    elif mode == "world":
+    if mode == "world":
         # the whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
         return get_world_group()
-    return get_tp_group()
+    if mode == "replica":
+        # the ranks serving this rank's pipeline replica (== world when
+        # dp_size is 1); the shape-independent choice for explicit folding
+        return get_replica_group()
+    if mode is None:
+        return get_tp_group()
+    raise ValueError(f"Unsupported encoder folding mode: {mode!r}")
 
 
 # measured on 2/4xH100: folding wins only for wide encoders (T5-XXL 4096: -20%
@@ -148,13 +154,51 @@ def finalize_encoder_folding(
         config.parallel_folding_mode = None
 
 
-class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+class EncoderTensorParallelMixin:
+    """Keep an encoder on the TP group that was used to build its shards."""
+
+    _encoder_tp_group: GroupCoordinator | None = None
+    checkpoint_quantization_backend = "diffusion"
+    packed_modules_mapping: dict[str, list[str]] = {}
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
+
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
+
+    @classmethod
+    def configure_component_paths(
+        cls,
+        config: EncoderConfig,
+        component_paths: dict[str, str],
+    ) -> None:
+        """Apply optional runtime components before parallel layout is resolved."""
+
+    def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
+        self._encoder_tp_group = tp_group
+
+    def __call__(self, *args, **kwargs):
+        tp_group = self._encoder_tp_group
+        if tp_group is None:
+            return super().__call__(*args, **kwargs)
+        with use_tensor_parallel_group(tp_group):
+            return super().__call__(*args, **kwargs)
+
+
+class TextEncoder(
+    EncoderTensorParallelMixin, nn.Module, ABC, LayerwiseOffloadableModuleMixin
+):
     # Opt in per encoder to data-parallel batched encoding: the gather rebuilds a
     # BaseEncoderOutput, and subclasses are free to return their own output type
     # instead (Qwen2_5_VLForConditionalGeneration returns
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",
@@ -163,6 +207,11 @@ class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
         "model.language_model.layers",
     ]
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
+    # Methods that drive a forward pass without going through __call__. FSDP2
+    # only unshards around the wrapped module's own forward, so anything the
+    # shard conditions left in the root group stays sharded unless the entry
+    # point is registered; loaders read this and register each name.
+    _fsdp_forward_methods: tuple[str, ...] = ()
     _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends
@@ -195,7 +244,9 @@ class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
         return self._supported_attention_backends
 
 
-class ImageEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+class ImageEncoder(
+    EncoderTensorParallelMixin, nn.Module, ABC, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",

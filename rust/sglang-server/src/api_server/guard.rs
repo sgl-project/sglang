@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 
-use crate::ids::Rid;
-use crate::tokenizer_manager::{AbortSource, Senders};
+use crate::message::ids::Rid;
+use crate::tokenizer_manager::wiring::{AbortSource, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
@@ -64,7 +64,7 @@ impl Drop for AbortGuard {
         // The lane is unbounded, so this send only fails at shutdown, when the loop
         // is gone and nothing is generating anyway.
         for rid in self.rids.drain() {
-            let _ = self.senders.abort.send(AbortSource::Guard(rid));
+            let _ = self.senders.abort_tx.send(AbortSource::Guard(rid));
         }
     }
 }
@@ -75,10 +75,10 @@ mod tests {
 
     fn senders_with_abort(abort: flume::Sender<AbortSource>) -> Senders {
         Senders {
-            tm: flume::unbounded().0,
-            abort,
-            tok: flume::unbounded().0,
-            detok: vec![],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: abort,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![],
         }
     }
 
@@ -105,7 +105,7 @@ mod tests {
     /// An armed guard aborts its rid on drop — exactly the cleanup a busy-skipped
     /// `/health_generate` probe relies on. It never sees a terminal frame here, so
     /// dropping the guard is the only path that deregisters its detok sink (via the
-    /// ingress `on_abort`). Regression for the detok-entry leak per health probe.
+    /// request `on_abort`). Regression for the detok-entry leak per health probe.
     #[test]
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();
