@@ -441,7 +441,13 @@ RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt \
+ && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+    git revert --no-edit --no-commit 8d581370b; \
+    git revert --no-edit --no-commit 79c11b677; \
+    git revert --no-edit --no-commit 1ecb760a5; \
+    git revert --no-edit --no-commit e708f6c15; \
+ fi
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
