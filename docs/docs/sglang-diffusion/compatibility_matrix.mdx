@@ -135,7 +135,7 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td>MiniMax-H3</td>
             <td><div className="sgd-id-list"><code>MiniMaxAI/MiniMax-H3</code></div></td>
             <td>T2VA / FL2VA / Ref2VA, 768p at 24 fps with synchronized audio</td>
-            <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Sage</span><span className="sgd-chip">Online FP8</span></td>
+            <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Sage</span><span className="sgd-chip">Online FP8</span><span className="sgd-chip">GGUF</span></td>
           </tr>
           <tr>
             <td>Wan2.1 Fun</td>
@@ -716,6 +716,13 @@ component directory.
 The same overrides can also be provided in config files through
 `component_paths.<component>`.
 
+Component path overrides are generic, but quantized checkpoint support is
+loader-specific. Native SGLang loaders that only materialize plain state dicts
+reject detected quantization metadata before weight loading instead of silently
+casting the checkpoint into an unquantized module. Library-managed components
+inherit the corresponding Transformers or Diffusers support. See
+[Quantized Component Repositories](./quantization#quantized-component-repositories).
+
 ### Common Syntax
 
 CLI:
@@ -818,7 +825,7 @@ The table below lists concrete Hugging Face component repos that are already use
 ### Transformer / DiT
 
 - `--transformer-path` is the standard override for the main denoising transformer.
-- For quantized transformers, prefer `--transformer-path` or `--transformer-weights-path`; see `quantization.md`.
+- For a pre-quantized main transformer, prefer `--transformer-path` or `--transformer-weights-path`; see [Quantization](./quantization).
 - `--video-dit-path` and `--audio-dit-path` are only for pipelines that split denoisers by modality.
 
 ### Text Encoders and Preprocessors
@@ -838,6 +845,10 @@ The table below lists concrete Hugging Face component repos that are already use
    that component.
 2. The override key should match the component name in the pipeline's
    `model_index.json` or the native pipeline's registered module name.
+3. An override path does not enable quantization by itself. A pre-quantized
+   component must include metadata for a format supported by its selected
+   loader. `--quantization` overrides the transformer loader; other component
+   checkpoints select their serialized format through their own metadata.
 
 ## Verified LoRA Examples
 
