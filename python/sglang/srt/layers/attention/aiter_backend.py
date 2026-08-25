@@ -80,7 +80,6 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
