@@ -13,7 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _partial_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_end_token = "</｜DSML｜invoke>"
+        self.parameter_end_token = "</｜DSML｜parameter>"
         self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         self.partial_parameter_regex = (
             r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
@@ -112,6 +113,54 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
 
+    @staticmethod
+    def _strip_partial_tag_suffix(text: str, tag: str) -> str:
+        """Drop a trailing fragment of `text` that is the start of `tag`.
+
+        `str.rstrip` cannot do this: it takes a character SET, so the previous
+        `rstrip("oke")` also ate a value ending in "note", leaving "not".
+        """
+        for n in range(min(len(tag), len(text)), 0, -1):
+            if text.endswith(tag[:n]):
+                return text[:-n]
+        return text
+
+    def _direct_json_body(self, invoke_content: str, allow_partial: bool):
+        """Format 2: the invoke body IS the arguments object, verbatim.
+        Returns None when the body is not in that format.
+
+        The partial closing tag is trimmed BEFORE whitespace is stripped. The
+        other order is off by a byte: the tag's leading "<" shields the
+        whitespace in front of it from strip(), so that whitespace is streamed
+        and then vanishes once the tag completes.
+        """
+        text = invoke_content
+        if allow_partial:
+            text = self._strip_partial_tag_suffix(text, self.invoke_end_token)
+        text = text.strip()
+        if text.startswith("{") and (allow_partial or text.endswith("}")):
+            return text
+        return None
+
+    def _complete_parameters(self, invoke_content: str) -> tuple[dict, int]:
+        """Parameters whose closing tag has arrived, and the offset past the
+        last one. These are settled: their serialised form cannot change."""
+        parameters = {}
+        last_match_end = 0
+        for match in re.finditer(self.parameter_regex, invoke_content, re.DOTALL):
+            name, param_type, value = match.group(1), match.group(2), match.group(3)
+            value = value.strip()
+            if param_type == "true":  # string type
+                parameters[name] = value
+            else:
+                # Try to parse as JSON for other types
+                try:
+                    parameters[name] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    parameters[name] = value
+            last_match_end = match.end()
+        return parameters, last_match_end
+
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
@@ -121,49 +170,26 @@ class DeepSeekV32Detector(BaseFormatDetector):
         Supports two formats:
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
         2. Direct JSON: { "key": "value" }
+
+        NOTE: the `allow_partial=True` result must not be streamed. A parameter
+        still arriving can serialise as a structure on one chunk and as a
+        quote-escaped string on the next, so consecutive results are not
+        prefixes of each other. Use `_streamable_prefix` for that.
         """
         # First, try to parse as direct JSON (new format)
-        invoke_content_stripped = invoke_content.strip()
-        if invoke_content_stripped.startswith("{"):
-            if allow_partial:
-                # Remove incomplete invoke end call prefix in case they are captured by param
-                for token in reversed(self.prefix_invoke_end_call):
-                    invoke_content_stripped = invoke_content_stripped.rstrip(token)
-                return invoke_content_stripped
-            elif invoke_content_stripped.endswith("}"):
-                return invoke_content_stripped
+        body = self._direct_json_body(invoke_content, allow_partial)
+        if body is not None:
+            return body
 
         # Fall back to XML parameter tag parsing (original format)
-        parameters = {}
-        # Find all complete parameter matches
-        param_matches = list(
-            re.finditer(self.parameter_regex, invoke_content, re.DOTALL)
-        )
-
-        last_match_end = 0
-        for match in param_matches:
-            param_name = match.group(1)
-            param_type = match.group(2)
-            param_value = match.group(3)
-            last_match_end = match.end()
-
-            # Convert value based on type
-            if param_type == "true":  # string type
-                parameters[param_name] = param_value.strip()
-            else:
-                # Try to parse as JSON for other types
-                try:
-                    parameters[param_name] = json.loads(param_value.strip())
-                except (json.JSONDecodeError, ValueError):
-                    parameters[param_name] = param_value.strip()
+        parameters, last_match_end = self._complete_parameters(invoke_content)
 
         # If allowed, try to parse a partial parameter at the end
         if allow_partial:
-            remaining_content = invoke_content[last_match_end:]
-
-            # Remove incomplete parameter_end_call prefix in case they are captured by param
-            for token in reversed(self.prefix_parameter_end_call):
-                remaining_content = remaining_content.rstrip(token)
+            # Remove an incomplete closing tag in case it was captured by param
+            remaining_content = self._strip_partial_tag_suffix(
+                invoke_content[last_match_end:], self.parameter_end_token
+            )
 
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
@@ -184,6 +210,48 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
+
+    def _streamable_prefix(self, invoke_content: str) -> str:
+        """The longest prefix of the final arguments JSON that cannot change.
+
+        Every byte returned here is handed to the client and can never be
+        recalled, so this is deliberately conservative:
+
+        * a parameter whose closing tag has arrived is settled — include it;
+        * a non-string parameter still arriving is not settled: whether its
+          value ends up structural (`_partial_json_loads` succeeded) or a
+          quote-escaped string (the fallback) is only decided once the whole
+          value is in hand, and the two differ from the value's first byte.
+          Stop before it;
+        * a string parameter is safe — `json.dumps` escapes character by
+          character, so its serialisation only grows by appending. Stream its
+          content, minus the closing quote.
+        """
+        body = self._direct_json_body(invoke_content, allow_partial=True)
+        if body is not None:
+            return body
+
+        parameters, last_match_end = self._complete_parameters(invoke_content)
+        # Drop the closing brace: more parameters may still follow.
+        prefix = json.dumps(parameters, ensure_ascii=False)[:-1]
+
+        remaining_content = self._strip_partial_tag_suffix(
+            invoke_content[last_match_end:], self.parameter_end_token
+        )
+        partial_match = re.search(
+            self.partial_parameter_regex, remaining_content, re.DOTALL
+        )
+        if (
+            partial_match
+            and partial_match.group(2) == "true"
+            and (param_value := partial_match.group(3))
+        ):
+            key = json.dumps(partial_match.group(1), ensure_ascii=False)
+            value = json.dumps(param_value.strip(), ensure_ascii=False)
+            # ", " and ": " are json.dumps' default separators; value[:-1] drops
+            # the closing quote, because the content can still grow.
+            prefix += f"{', ' if parameters else ''}{key}: {value[:-1]}"
+        return prefix
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
@@ -307,28 +375,33 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                     self.current_tool_name_sent = True
 
-                # 2. Parse current parameters (partial or complete)
-                current_params = self._parse_parameters_from_xml(
-                    invoke_content, allow_partial=not is_tool_end
-                )
+                # 2. Parse current parameters. While the invoke is still open,
+                #    take only the part that is provably final. Diffing two
+                #    partial serialisations is not sound: a parameter flips
+                #    between structural and quote-escaped-string form as it
+                #    arrives, so their common prefix need not be a prefix of the
+                #    finished arguments.
+                if is_tool_end:
+                    current_params = self._parse_parameters_from_xml(invoke_content)
+                else:
+                    current_params = self._streamable_prefix(invoke_content)
 
                 # 3. Calculate and send incremental arguments
-                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
-                prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
-                    "arguments"
-                )
+                sent = self.streamed_args_for_tool[self.current_tool_id]
 
                 argument_diff = None
-
-                if is_tool_end:
-                    # If complete, send everything remaining
-                    argument_diff = current_params[sent_len:]
-                elif prev_params is not None:
-                    # If partial, send stable prefix diff
-                    if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
+                if current_params.startswith(sent):
+                    argument_diff = current_params[len(sent) :] or None
+                else:
+                    # Bytes already streamed cannot be recalled; all that is
+                    # left is to stop making it worse and be loud about it.
+                    logger.warning(
+                        "deepseekv32: streamed tool arguments diverged from the "
+                        "parsed value (%d chars streamed, %d parsed); dropping "
+                        "this delta rather than emitting invalid JSON",
+                        len(sent),
+                        len(current_params),
+                    )
 
                 if argument_diff:
                     all_calls.append(
