@@ -303,7 +303,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
-      partitions: '{"size":3,"arr":[0,1,2]}'
+      partitions: '{"size":2,"arr":[0,1]}'
 
   base-c-test-acc-4-npu-a3:
     name: base-c-test-acc-4-npu-a3
