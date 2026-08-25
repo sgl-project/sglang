@@ -44,7 +44,7 @@ def _run_accuracy_eval(
     eval_name: str,
     score_threshold: float,
     num_examples: Optional[int],
-    num_threads: int,
+    num_threads: Optional[int],
     accept_length_thres: Optional[float] = None,
     summary_label: Optional[str] = None,
     **eval_overrides,
@@ -64,9 +64,10 @@ def _run_accuracy_eval(
         score_threshold == score_threshold
     ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
 
+    model = eval_overrides.pop("model", getattr(test_case, "model", None))
     kwargs = dict(
         base_url=test_case.base_url,
-        model=getattr(test_case, "model", None),
+        model=model,
         eval_name=eval_name,
         num_examples=num_examples,
         num_threads=num_threads,
@@ -270,6 +271,41 @@ class MMLUMixin:
                 num_threads=self.mmlu_num_threads,
                 accept_length_thres=self.mmlu_accept_length_thres,
             )
+
+
+class MMMUProMixin:
+    """Mixin for the standard 10-option MMMU-Pro evaluation via sgl-eval.
+
+    The model preset supplies the endpoint model and all generation settings.
+    Leaving those values to sgl-eval is important for reasoning models whose
+    recommended token budget and sampling settings differ from run_eval defaults.
+
+    Required attributes on the test class:
+        base_url: str
+        mmmu_pro_score_threshold: float
+        mmmu_pro_load_preset_from_model_id: str
+    """
+
+    mmmu_pro_score_threshold: float = _THRESHOLD_NOT_SET
+    mmmu_pro_accept_length_thres: Optional[float] = None
+    mmmu_pro_num_examples: Optional[int] = 300
+    mmmu_pro_num_threads: Optional[int] = None
+    mmmu_pro_load_preset_from_model_id: Optional[str] = None
+
+    def test_mmmu_pro(self):
+        assert self.mmmu_pro_load_preset_from_model_id, (
+            f"{type(self).__name__} must set " "mmmu_pro_load_preset_from_model_id"
+        )
+        _run_accuracy_eval(
+            self,
+            eval_name="mmmu_pro",
+            score_threshold=self.mmmu_pro_score_threshold,
+            num_examples=self.mmmu_pro_num_examples,
+            num_threads=self.mmmu_pro_num_threads,
+            accept_length_thres=self.mmmu_pro_accept_length_thres,
+            model=None,
+            load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
+        )
 
 
 class GPQAMixin:
