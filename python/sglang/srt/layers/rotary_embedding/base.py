@@ -452,8 +452,6 @@ class RotaryEmbedding(BaseFusedOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        self._match_cos_sin_cache_dtype(query)
-
         # Fused_qk_rope only supports aligned head_size
         if self.head_size in [128, 256, 512]:
             num_tokens = positions.size(0)

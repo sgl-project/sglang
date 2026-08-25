@@ -43,10 +43,11 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_xpu, make_layers
 from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
+_is_xpu = is_xpu()
 
 
 class Ernie4_5_VLMoeAttention(nn.Module):
@@ -282,7 +283,11 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = (
+            torch.xpu.is_current_stream_capturing()
+            if _is_xpu
+            else torch.cuda.is_current_stream_capturing()
+        )
 
         if visual_token_mask is not None and not capturing:
             all_visual = visual_token_mask.all()
