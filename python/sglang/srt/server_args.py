@@ -1888,7 +1888,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
@@ -2252,6 +2252,14 @@ class ServerArgs:
         "Attention backend for speculative decoding drafting.",
         NS("spec"),
     ] = None
+    speculative_dsa_topk_backend: A[
+        str,
+        Arg(
+            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=DSA_TOPK_BACKEND_CHOICES,
+        ),
+        NS("spec"),
+    ] = "sgl-kernel"
     speculative_draft_kv_cache_dtype: A[
         Optional[str],
         Arg(
