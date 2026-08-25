@@ -1,6 +1,6 @@
 ---
 title: Granite 4.2
-description: "Deploy Granite 4.2 3B, 8B, and 30B dense models with SGLang on NVIDIA H200, including thinking modes and structured tool calling."
+description: "Deploy Granite 4.2 3B, 8B, and 30B dense models with SGLang on NVIDIA H200 and B200, including thinking modes and structured tool calling."
 tag: NEW
 ---
 
@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+uv pip install --prerelease=allow sglang
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -32,7 +32,7 @@ Then run the **Python** output of the command panel below in that environment.
 docker pull lmsysorg/sglang:dev
 ```
 
-For how to launch the image, see [Install -> Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
 
 </Tab>
 
