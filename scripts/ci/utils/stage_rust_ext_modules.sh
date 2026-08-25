@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copy the built PyO3 extension modules into rust-ext-staging/<pkg>/ for
+# Copy the built PyO3 extension modules into rust-ext-staging/rust_extensions/ for
 # upload-artifact. Shared by both jobs of _pr-test-rust-ext-build.yml, so the
 # archive layout and the module-count check cannot drift between them.
 #
@@ -12,15 +12,25 @@ shopt -s nullglob
 # module would silently shift the archive layout.
 rm -rf rust-ext-staging
 built=()
-for pkg in server grpc multimodal; do
-    found=(python/sglang/srt/"${pkg}"/_core*.so)
-    if [ ${#found[@]} -ne 1 ]; then
-        echo "::error::expected exactly one extension module for ${pkg}, found ${#found[@]}"
+# Same suffix set across modules, or one ABI's Rust-server tests silently skip.
+expected_suffixes=""
+mkdir -p rust-ext-staging/rust_extensions
+for module in server grpc multimodal; do
+    found=(python/sglang/srt/rust_extensions/_"${module}"*.so)
+    if [ ${#found[@]} -eq 0 ]; then
+        echo "::error::no extension module found for ${module}"
         exit 1
     fi
-    mkdir -p "rust-ext-staging/${pkg}"
-    cp "${found[0]}" "rust-ext-staging/${pkg}/"
-    built+=("${found[0]}")
+    suffixes=$(printf '%s\n' "${found[@]##*/_${module}}" | sort)
+    if [ -z "${expected_suffixes}" ]; then
+        expected_suffixes="${suffixes}"
+    elif [ "${suffixes}" != "${expected_suffixes}" ]; then
+        echo "::error::extension modules for ${module} do not match server's interpreter set"
+        printf 'have:\n%s\nwant:\n%s\n' "${suffixes}" "${expected_suffixes}"
+        exit 1
+    fi
+    cp "${found[@]}" rust-ext-staging/rust_extensions/
+    built+=("${found[@]}")
 done
 max_allowed="${MAX_GLIBC:-}"
 [ -n "${max_allowed}" ] || exit 0

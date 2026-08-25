@@ -16,7 +16,7 @@ You can install SGLang using any of the methods below. Please go through `System
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Way</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Method</th>
     </tr>
   </thead>
   <tbody>
@@ -119,7 +119,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
+Prior to starting work with SGLang on Ascend, you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
 
 #### MemFabric-Hybrid
 
@@ -140,7 +140,7 @@ installed in addition to MemFabric-Hybrid.
 pip install memfabric-zbal==1.1.1
 ```
 
-#### PyTorch and PyTorch Framework Adaptor on Ascend
+#### PyTorch and PyTorch Framework Adapter on Ascend
 
 ```bash Command
 PYTORCH_VERSION=2.10.0
@@ -216,7 +216,7 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `cann9.0.0-a3-v0.5.16`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
 <Tabs>
@@ -224,7 +224,7 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
@@ -235,7 +235,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
@@ -280,7 +280,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by SGLang.
+# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -301,7 +301,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for download model by SGLang.
+# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -549,7 +549,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
   }'
 ```
 
-Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
+Some models return responses accompanied by thinking process content. To disable this output, configure parameters as follows:
 
 ```bash Command
 curl http://127.0.0.1:30000/v1/chat/completions \

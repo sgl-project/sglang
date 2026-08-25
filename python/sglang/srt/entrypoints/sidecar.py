@@ -18,6 +18,9 @@ import logging
 import multiprocessing as mp
 import os
 
+from sglang.srt.runtime_context import (
+    get_serving,
+)
 from sglang.srt.utils.common import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -36,10 +39,10 @@ def _loopback_host(host: str) -> str:
     return host
 
 
-def build_sidecar_endpoint(server_args) -> str:
-    return NetworkAddress(
-        _loopback_host(server_args.host), server_args.grpc_port
-    ).to_url()
+def build_sidecar_endpoint(host: str, grpc_port: int) -> str:
+    """Both halves are passed in: this is a string helper, and the caller is
+    the one that knows where the effective values live."""
+    return NetworkAddress(_loopback_host(host), grpc_port).to_url()
 
 
 def _parse_sidecar_args(args: list[str] | None) -> tuple[list[str], float]:
@@ -115,7 +118,7 @@ def start_sidecar(server_args) -> Sidecar:
     module_name = server_args.sidecar
     assert module_name is not None
     sidecar_args, shutdown_timeout = _parse_sidecar_args(server_args.sidecar_args)
-    endpoint = build_sidecar_endpoint(server_args)
+    endpoint = build_sidecar_endpoint(server_args.host, get_serving().grpc_port)
     proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,

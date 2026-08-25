@@ -68,7 +68,7 @@ jobs:
 
           # Determine extra build args
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           else
             echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           fi
@@ -176,9 +176,8 @@ jobs:
             --load \
             -t "$IMAGE" \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             ${{ needs.prepare.outputs.extra_build_args }} \
             --no-cache \

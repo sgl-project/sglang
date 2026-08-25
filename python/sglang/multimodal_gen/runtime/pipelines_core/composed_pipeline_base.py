@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -17,9 +17,6 @@ from tqdm import tqdm
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
-)
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    component_attn_backend_context_manager,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -56,6 +53,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
+    prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -181,7 +179,9 @@ class ComposedPipelineBase(ABC):
 
         if model_subfolder is None:
             model_path = maybe_download_model(
-                self.model_path, force_diffusers_model=True
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
@@ -196,6 +196,7 @@ class ComposedPipelineBase(ABC):
             model_root = maybe_download_model(
                 self.model_path,
                 allow_patterns=[f"{model_subfolder}/**"],
+                revision=self.server_args.revision,
             )
             model_path = os.path.join(model_root, model_subfolder)
 
@@ -349,8 +350,9 @@ class ComposedPipelineBase(ABC):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            # overridden with args like --vae-path
-            component_model_path = maybe_download_model(override_path)
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                override_path
+            )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
@@ -554,16 +556,15 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=matched_backend_key or module_name
-            ):
-                module, memory_usage = PipelineComponentLoader.load_component(
-                    component_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                    component_architecture=architecture,
-                )
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+                component_architecture=architecture,
+                component_attn_backend=attn_backend,
+                component_attn_name=matched_backend_key or module_name,
+            )
 
             self.memory_usages[load_module_name] = memory_usage
 
@@ -1064,4 +1065,28 @@ class ComposedPipelineBase(ABC):
 
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
+        )
+
+    @torch.no_grad()
+    def forward_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped outputs as each terminal-stage invocation completes."""
+        if len(batches) == 1 and (
+            not server_args.pipeline_config.supports_sequential_multi_output_inference()
+            or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
+        ):
+            yield self.forward(batches[0], server_args)
+            return
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        yield from self.executor.execute_group_sequentially_with_profiling(
+            self.stages,
+            batches,
+            server_args,
         )
