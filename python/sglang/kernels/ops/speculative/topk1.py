@@ -49,6 +49,7 @@ def _draft_topk1_finalize_kernel(
     draft_token_column,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    ADVANCE_POSITIONS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -67,33 +68,25 @@ def _draft_topk1_finalize_kernel(
     if WRITE_DRAFT_TOKEN:
         tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
 
-    position = tl.load(positions + row)
-    tl.store(positions + row, position + 1)
+    if ADVANCE_POSITIONS:
+        position = tl.load(positions + row)
+        tl.store(positions + row, position + 1)
 
 
-def draft_topk1_postprocess(
+def _draft_topk1_impl(
     next_token_logits: torch.Tensor,
-    positions: torch.Tensor,
+    positions: torch.Tensor | None,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
 ):
-    """Argmax draft logits for topk=1 and advance positions.
-
-    PyTorch eager argmax reduces each row with too little parallelism for the
-    GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
-    the vocab dimension across CTAs, then finalizes one token per row.
-
-    If ``draft_tokens`` is given, the finalize kernel also stores the argmax
-    into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
-    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
-    is greedy and the chain probabilities are unused downstream.
-    """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
-    assert positions.ndim == 1
-    assert positions.is_contiguous()
-    assert positions.shape[0] == next_token_logits.shape[0]
-    assert positions.device == next_token_logits.device
+    advance_positions = positions is not None
+    if advance_positions:
+        assert positions.ndim == 1
+        assert positions.is_contiguous()
+        assert positions.shape[0] == next_token_logits.shape[0]
+        assert positions.device == next_token_logits.device
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
@@ -104,6 +97,7 @@ def draft_topk1_postprocess(
         assert 0 <= draft_token_column < draft_tokens.shape[1]
 
     bs, vocab_size = next_token_logits.shape
+    assert vocab_size > 0
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
     topk_index = torch.empty(
         (bs, 1), dtype=torch.int64, device=next_token_logits.device
@@ -138,13 +132,44 @@ def draft_topk1_postprocess(
         partial_indices,
         topk_p,
         topk_index,
-        positions,
+        positions if advance_positions else topk_index,
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        ADVANCE_POSITIONS=advance_positions,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )
     return topk_p, topk_index
+
+
+def draft_topk1(next_token_logits: torch.Tensor):
+    """Select top-k=1 directly from raw draft logits.
+
+    The split reduction masks vocabulary-tail lanes and treats NaNs as
+    ``-1e30``, so every returned index is within the real vocabulary.
+    ``topk_p`` is constant 1.0 because top-k=1 drafting is greedy.
+    """
+    return _draft_topk1_impl(next_token_logits, positions=None)
+
+
+def draft_topk1_postprocess(
+    next_token_logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0,
+):
+    """Select top-k=1, advance positions, and optionally write the draft chain.
+
+    PyTorch eager argmax reduces each row with too little parallelism for large
+    vocabularies. This split reduction exposes the vocabulary dimension across
+    CTAs, then finalizes one token per row.
+    """
+    return _draft_topk1_impl(
+        next_token_logits,
+        positions,
+        draft_tokens,
+        draft_token_column,
+    )

@@ -14,7 +14,6 @@ from sglang.kernels.jit.benchmark.utils import (
     run_benchmark,
 )
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
-from sglang.srt.speculative.eagle_worker_v2 import _aiter_draft_topk1_postprocess
 from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -57,7 +56,7 @@ class BenchmarkEnvironment:
 def detect_benchmark_environment(provider: str | None = None) -> BenchmarkEnvironment:
     """Resolve benchmark dispatch and descriptive hardware metadata."""
     backend = "rocm" if is_hip() else "cuda"
-    resolved_provider = provider or ("aiter" if backend == "rocm" else "triton")
+    resolved_provider = provider or "triton"
     if resolved_provider not in {"aiter", "triton"}:
         raise ValueError(f"Unsupported accelerated provider: {resolved_provider}")
     if backend != "rocm" and resolved_provider == "aiter":
@@ -113,6 +112,26 @@ def eager_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor)
     return topk_p, topk_index
 
 
+def aiter_draft_topk1_postprocess(
+    logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0,
+):
+    """Old production path retained only for local AITER/Triton comparisons."""
+    from aiter import greedy_sample
+
+    batch_size = logits.shape[0]
+    topk_index_i32 = torch.empty(batch_size, dtype=torch.int32, device=logits.device)
+    greedy_sample(topk_index_i32, logits)
+    topk_index = topk_index_i32.to(dtype=torch.long).view(batch_size, 1)
+    topk_p = torch.ones((batch_size, 1), dtype=torch.float32, device=logits.device)
+    positions.add_(1)
+    if draft_tokens is not None:
+        draft_tokens[:, draft_token_column].copy_(topk_index[:, 0])
+    return topk_p, topk_index
+
+
 def accelerated_draft_topk1_postprocess(
     logits: torch.Tensor,
     positions: torch.Tensor,
@@ -122,7 +141,7 @@ def accelerated_draft_topk1_postprocess(
 ):
     resolved_provider = provider or detect_benchmark_environment().provider
     if resolved_provider == "aiter":
-        return _aiter_draft_topk1_postprocess(
+        return aiter_draft_topk1_postprocess(
             logits, positions, draft_tokens, draft_token_column
         )
     if resolved_provider == "triton":
@@ -179,7 +198,7 @@ def accelerated_chain_materialize(
         x_vals=[(bs, vocab) for bs in BATCH_SIZE_RANGE for vocab in VOCAB_SIZE_RANGE],
         line_arg="provider",
         line_vals=["accelerated", "eager"],
-        line_names=["AITER / Triton", "Eager torch"],
+        line_names=["Triton", "Eager torch"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="spec-topk1-draft-postprocess",
@@ -245,7 +264,7 @@ def benchmark_chain_materialize(
         ],
         line_arg="provider",
         line_vals=["raw_argmax", "softmax_max"],
-        line_names=["Raw-logits AITER / Triton", "Softmax + torch.max"],
+        line_names=["Raw-logits Triton", "Softmax + torch.max"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="large-vocab-draft-topk1",
