@@ -612,9 +612,6 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
-        # Set by CommonKVReceiver.__init__, which object.__new__ skips; the
-        # failure paths (e.g. _check_waiting_timeout) invalidate cached
-        # bootstrap metadata through it.
         receiver._connection_pool_entries = {}
         return receiver, mgr
 

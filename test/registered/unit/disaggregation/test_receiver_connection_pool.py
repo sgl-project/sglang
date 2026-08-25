@@ -15,8 +15,16 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.test.test_utils import CustomTestCase
 
 
+class _ConcreteReceiver(CommonKVReceiver):
+    def poll(self) -> KVPoll:
+        raise NotImplementedError
+
+    def failure_exception(self):
+        raise NotImplementedError
+
+
 def _receiver(connection_pool, entries):
-    receiver = object.__new__(CommonKVReceiver)
+    receiver = object.__new__(_ConcreteReceiver)
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
         connection_lock=threading.Lock(),
@@ -25,7 +33,7 @@ def _receiver(connection_pool, entries):
     return receiver
 
 
-class _FetchingReceiver(CommonKVReceiver):
+class _FetchingReceiver(_ConcreteReceiver):
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
@@ -56,8 +64,6 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
-    """Identity-scoped invalidation of cached prefill bootstrap metadata."""
-
     def test_invalidate_removes_matching_generation(self):
         stale = [
             {"rank_ip": "10.0.0.1", "rank_port": 1001},
