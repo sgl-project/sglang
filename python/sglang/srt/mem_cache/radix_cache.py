@@ -182,6 +182,21 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        # Keep the shared-prefix compare on the C-level array('q') memcmp path:
+        # a list slice compare boxes every PyLong and is up to ~11x slower on
+        # long shared prefixes. We deliberately do *not* eagerly convert lists
+        # here -- array("q", list) costs O(n) per call and is more expensive
+        # than the list compare it would replace -- so the convert only runs
+        # when the two sides disagree in type, which previously tripped the
+        # `type is type` assert below (mixing a list query key with an array
+        # tree node). Prefer array('q') storage at the source
+        # (Req.origin_input_ids / Req.output_ids); see
+        # benchmark/scheduler/bench_radix_key_match.py.
+        if type(t0) is not type(t1):
+            if type(t0) is list:
+                t0 = array("q", t0)
+            if type(t1) is list:
+                t1 = array("q", t1)
         assert type(t0) is type(t1), (type(t0), type(t1))
         n = min(len(t0), len(t1))
 
