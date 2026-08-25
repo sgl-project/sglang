@@ -369,7 +369,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -822,7 +822,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
             int(ndt)
         )
-        max_seqlen = int(per_query_seq_lens.max().item()) if ndt else 0
+        # ``max_seqlen`` from capture-safe ``_max_seqlen_k`` (host-derived in
+        # init_forward_metadata_out_graph); no device->host sync during graph capture.
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else (int(per_query_seq_lens.max().item()) if ndt else 0)
+        )
         from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
             minimax_sparse_decode,
         )
