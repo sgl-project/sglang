@@ -76,6 +76,16 @@ def copy_metadata(
         if src_val is None and dst_val is None:
             continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
+        # Fields backed by persistent backend-owned storage (e.g. the trtllm
+        # TrtllmSparseTablePool) alias the same memory in src and dst; the
+        # content is already in place, so skip the self-copy.
+        if (
+            isinstance(dst_val, torch.Tensor)
+            and isinstance(src_val, torch.Tensor)
+            and dst_val.data_ptr() == src_val.data_ptr()
+            and dst_val.shape == src_val.shape
+        ):
+            continue
         if hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
         else:

@@ -102,6 +102,89 @@ def _install_persistent_trtllm_semaphores() -> None:
     )
 
 
+class TrtllmSparseTablePool:
+    """Persistent backing storage for the trtllm combined sparse tables.
+
+    The trtllm-gen kernel consumes exact-address int32 tables; building them
+    as fresh allocations every step made their addresses (and the garbage
+    beyond them) a function of allocator state -- the source of a family of
+    layout-dependent faults and silent accuracy drift. This pool allocates
+    each table role ONCE (constant column width, 64-row-aligned capacity,
+    filled with its inert value) and hands out ``[:rows]`` views that are
+    re-inerted and rewritten in place every step:
+
+    - addresses are stable, so CUDA graphs capture permanent pointers and
+      there is nothing for the capture pool to recycle;
+    - every byte is either the inert fill or a value a previous step
+      legitimately wrote, so tile-boundary row over-reads and DP-padding
+      row overhang are memory-safe by construction;
+    - views keep row stride == column width, so downstream ``.contiguous()``
+      calls never copy.
+
+    Roles used from CUDA-graph capture must be preallocated via
+    ``preallocate`` before the first capture; ``view`` asserts it never
+    (re)allocates while a stream is capturing.
+    """
+
+    def __init__(self, int32_kwargs: dict):
+        self._kwargs = int32_kwargs
+        self._bufs: dict = {}
+        self._fills: dict = {}
+
+    @staticmethod
+    def _pad_rows(rows: int) -> int:
+        # trtllm-gen VarSeq tile size: per-token rows are read to the 64-row
+        # tile boundary, so capacity is always 64-row aligned.
+        return (rows + 63) // 64 * 64
+
+    def preallocate(self, role: str, rows: int, fill: int, width: int = 0) -> None:
+        self._ensure(role, self._pad_rows(rows), fill, width)
+
+    def _ensure(self, role: str, rows_pad: int, fill: int, width: int) -> torch.Tensor:
+        buf = self._bufs.get(role)
+        if buf is not None:
+            # width == 0 with an existing 2-D buffer means "use the
+            # preallocated width" (the caller writes a column subrange).
+            if width:
+                assert (
+                    buf.dim() == 2 and buf.shape[1] == width
+                ), f"table role {role!r} width changed: {buf.shape} vs {width=}"
+            assert self._fills[role] == fill, f"table role {role!r} fill changed"
+        if buf is None or buf.shape[0] < rows_pad:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"trtllm table pool role {role!r} would (re)allocate during "
+                "CUDA graph capture; preallocate it with enough rows first."
+            )
+            new_rows = max(rows_pad, 0 if buf is None else buf.shape[0])
+            if buf is not None and buf.dim() == 2:
+                width = buf.shape[1]
+            shape = (new_rows,) if not width else (new_rows, width)
+            buf = torch.full(shape, fill, **self._kwargs)
+            self._bufs[role] = buf
+        self._fills[role] = fill
+        return self._bufs[role]
+
+    def view(
+        self,
+        role: str,
+        rows: int,
+        fill: int,
+        src: Optional[torch.Tensor] = None,
+        width: int = 0,
+    ) -> torch.Tensor:
+        """A ``[:rows]`` view of the role's parent, re-inerted then filled
+        with ``src`` (if given) up to ``rows``. The 64-row-aligned tail is
+        re-inerted too, matching the previous per-step allocation semantics.
+        """
+        rows_pad = self._pad_rows(rows)
+        buf = self._ensure(role, rows_pad, fill, width)
+        padded = buf[:rows_pad]
+        padded.fill_(fill)
+        if src is not None:
+            padded[:rows].copy_(src)
+        return padded[:rows]
+
+
 class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     """DSV4 attention through the trtllm-gen sparse MLA kernel."""
 
@@ -137,6 +220,46 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
+
+        # Persistent combined-table storage (see TrtllmSparseTablePool). The
+        # decode-side roles are consumed inside CUDA-graph capture, so they
+        # are preallocated here at their maxima: rows = one row per query
+        # token of the largest verify batch; c128 columns = the whole
+        # context in 128-token pages (per-row lens bound what the kernel
+        # actually reads, so unused columns are dead weight, not reads).
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            PAGE_INDEX_ALIGNED_SIZE,
+            SWA_WINDOW,
+        )
+
+        def _align(x: int) -> int:
+            a = PAGE_INDEX_ALIGNED_SIZE
+            return (x + a - 1) // a * a
+
+        self.trtllm_table_pool = TrtllmSparseTablePool(self.cuda_int32_kwargs)
+        max_decode_rows = self.req_to_token.shape[0] * max(
+            1, self.speculative_num_draft_tokens or 1
+        )
+        w4 = _align(self.c4_topk)
+        # c128 pages for the longest representable sequence: bound by the
+        # req_to_token row length (context + scheduler margin), which is what
+        # graph capture uses as its max seq len, plus one alignment block for
+        # the producer's own padding.
+        w128 = (
+            _align((self.MAX_SEQ_LEN_FOR_CAPTURE + 127) // 128)
+            + PAGE_INDEX_ALIGNED_SIZE
+        )
+        pool = self.trtllm_table_pool
+        pool.preallocate("d_swa_lens", max_decode_rows, fill=SWA_WINDOW)
+        pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
+        pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
+        pool.preallocate("d_c128", max_decode_rows, fill=-1, width=SWA_WINDOW + w128)
+        pool.preallocate("d_c128_lens", max_decode_rows, fill=SWA_WINDOW)
+        # Prefill c128 also uses a full-context-width parent (its per-chunk
+        # width varies, and constant width keeps row stride == width so
+        # nothing downstream re-copies). Rows grow on demand (prefill is
+        # eager); other prefill roles carry their width at the call site.
+        pool.preallocate("p_c128", 64, fill=-1, width=SWA_WINDOW + w128)
 
     def _compute_prep_in_cuda_graph(self, model_runner: ModelRunner) -> bool:
         # trtllm + speculative + DP attention prepares metadata on the host:
@@ -421,40 +544,42 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # Layer-invariant parts are cached per chunk on the metadata: the c0
         # lens, the c4 table's SWA half (per-layer: the indexer top-k tail +
         # lens), and the whole c128 table + lens (its page list is
-        # metadata-level).
-        # TILE OVERRUN GUARD (see init_trtllm_sparse_buffers): the VarSeq
-        # kernel reads per-token table rows up to the 64-token tile boundary,
-        # so allocate every per-token tensor as a 64-row-aligned inert parent
-        # and hand the kernel [:sum_q] views.
-        sum_q_pad = (sum_q + 63) // 64 * 64
+        # metadata-level). All tensors are [:sum_q] views of the backend's
+        # persistent table pool (64-row-aligned, inert-filled; see
+        # TrtllmSparseTablePool) so kernel-visible addresses never depend on
+        # allocator state. Prefill runs eagerly, so pool rows grow on demand.
+        pool = self.trtllm_table_pool
 
-        def _tile_padded_pf(fill, src=None, width=None):
-            shape = (sum_q_pad,) if width is None else (sum_q_pad, width)
-            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-            if src is not None:
-                buf[:sum_q].copy_(src)
-            return buf[:sum_q]
-
-        swa_indices = _tile_padded_pf(-1, swa_page_indices[:sum_q], width=SWA_WINDOW)
+        swa_indices = pool.view(
+            "p_swa", sum_q, fill=-1, src=swa_page_indices[:sum_q], width=SWA_WINDOW
+        )
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
         if extra_indices is None:
             # SWA-only (compress_ratio == 0) layer. SWA_WINDOW satisfies the
             # kernel's capacity constraints (>= 128, % 4 == 0).
             sparse_indices = swa_indices
             if core.trtllm_prefill_swa_lens is None:
-                core.trtllm_prefill_swa_lens = _tile_padded_pf(SWA_WINDOW)
+                core.trtllm_prefill_swa_lens = pool.view(
+                    "p_swa_lens", sum_q, fill=SWA_WINDOW
+                )
             sparse_topk_lens = core.trtllm_prefill_swa_lens
         elif compress_ratio == 128:
             if core.trtllm_prefill_c128 is None:
                 width = extra_indices.shape[-1]
                 assert width % 4 == 0, f"{width=}"
-                table = _tile_padded_pf(-1, width=SWA_WINDOW + width)
+                # Full-context-width parent (preallocated in __init__); this
+                # chunk writes the first `width` compressed columns and the
+                # per-row lens bound what the kernel reads beyond them.
+                table = pool.view("p_c128", sum_q, fill=-1)
+                assert table.shape[1] >= SWA_WINDOW + width, f"{table.shape=}"
                 table[:, :SWA_WINDOW].copy_(swa_indices)
-                table[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
+                table[:, SWA_WINDOW : SWA_WINDOW + width].copy_(extra_indices[:sum_q])
                 assert extra_topk_lengths is not None
-                lens = _tile_padded_pf(
-                    SWA_WINDOW,
-                    extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+                lens = pool.view(
+                    "p_c128_lens",
+                    sum_q,
+                    fill=SWA_WINDOW,
+                    src=extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
                 )
                 core.trtllm_prefill_c128 = (table, lens)
             sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
@@ -465,8 +590,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             # (_pad_last_dim), so the combined capacity satisfies % 4 == 0.
             assert width % 4 == 0, f"{width=}"
             if core.trtllm_prefill_c4_indices is None:
-                core.trtllm_prefill_c4_indices = _tile_padded_pf(
-                    -1, width=SWA_WINDOW + width
+                core.trtllm_prefill_c4_indices = pool.view(
+                    "p_c4", sum_q, fill=-1, width=SWA_WINDOW + width
                 )
                 core.trtllm_prefill_c4_indices[:, :SWA_WINDOW].copy_(swa_indices)
             sparse_indices = core.trtllm_prefill_c4_indices
@@ -477,9 +602,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
             # Total lens include the fixed 128 SWA slots; SWA validity itself
             # is derived from seq_lens/cum_seq_lens_q inside the kernel.
-            sparse_topk_lens = _tile_padded_pf(
-                SWA_WINDOW,
-                extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
+            sparse_topk_lens = pool.view(
+                "p_c4_lens",
+                sum_q,
+                fill=SWA_WINDOW,
+                src=extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
             )
 
         # FP8 query: RoPE already applied upstream; per-tensor scale 1.0 makes
