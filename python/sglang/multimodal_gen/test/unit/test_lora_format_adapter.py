@@ -16,7 +16,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
