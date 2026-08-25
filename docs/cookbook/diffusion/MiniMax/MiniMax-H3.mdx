@@ -314,6 +314,15 @@ honors each layer's activation mode; omit `--quantization`.
 Mixed exports use the same command: SGLang dispatches each marked layer to its
 serialized W4A4 or INT8 ConvRot kernel instead of applying one global method.
 
+Comfy NVFP4 DiTs reuse SGLang's ModelOpt NVFP4 backend, which requires CUDA
+compute capability 10.0 or newer. Pass a pruned FL2VA / Ref2VA file such as
+`Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/MiniMax_H3_FL2VA_pruned_nvfp4.safetensors`
+to `--transformer-weights-path` and omit `--quantization`. SGLang infers the
+packed group size and Comfy scale layout from the checkpoint; FSDP is rejected.
+Mixed files may mark selected linears as `int8_tensorwise` or dynamic/static
+FP8; SGLang dispatches those layers to their serialized Kitchen INT8 or native
+FP8 path automatically.
+
 ### Advanced: precomputed AdaLN cache
 
 The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
@@ -999,6 +1008,21 @@ This variant keeps the declared language and vision linear weights in qint8
 storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
 it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
 is the selector; adding `--quantization` would describe a different operation.
+
+Qwen3-VL GGUF files use the same component option:
+
+```bash Overlay
+--component-paths.text_encoder \
+  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf
+```
+
+The file selects its own Q4/Q6 layout; do not add `--quantization`. SGLang keeps
+the aligned vocabulary table and language linears in packed GGML storage. The
+smaller Comfy vision tower, whose flattened blocks can cross row and TP shard
+boundaries, is restored one matrix at a time to BF16 during loading.
+This CUDA-only memory option supports encoder TP and layerwise placement, but
+not encoder FSDP. Like the Quanto variant, it is approximate and is not a
+throughput claim.
 
 </Tab>
 
