@@ -53,12 +53,12 @@ repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
 MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
-including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
-exports are also auto-detected: the presence of an input scale selects static
-activation scaling, while its absence selects dynamic scaling. Pass one selected
-FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
-direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
-usage is documented in
+including `pruned_fp8_scaled`, serialized ConvRot formats, and the official
+NVFP4-AWQ Qwen3-VL encoder. Other Comfy FP8 exports are also auto-detected: the
+presence of an input scale selects static activation scaling, while its absence
+selects dynamic scaling. Pass one selected DiT or component file by local path,
+`owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do not
+combine it with an explicit quantization option. Its GGUF usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quantized Component Repositories
@@ -162,7 +162,7 @@ backend.
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
       <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511, MiniMax-H3</td>
       <td>None</td>
-      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select their checkpoint layout automatically; omit <code>--quantization</code>.</td>
+      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select NVFP4 plus INT8 or FP8 companion linears automatically; omit <code>--quantization</code>.</td>
     </tr>
     <tr>
       <td><code>gguf</code></td>
@@ -211,6 +211,14 @@ backend.
       <td>Native DiTs and encoders with matching parameter mappings; MiniMax-H3 FL2VA / Ref2VA DiTs and Qwen3-VL encoder layouts are recognized</td>
       <td><code>comfy-kitchen</code></td>
       <td>Auto-detected; omit <code>--quantization</code>. Each layer dispatches to its serialized W4A4 or INT8 ConvRot kernel. CUDA requires SM75+; TP must preserve each format's quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-nvfp4-full-precision</code></td>
+      <td>Safetensors with serialized <code>nvfp4</code> and optional row-wise <code>int8_tensorwise</code> layer metadata</td>
+      <td><code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 native Qwen3-VL encoder</td>
+      <td>None</td>
+      <td>Auto-detected; omit explicit quantization. Preserves packed storage, high-nibble-first weights, swizzled block scales, and AWQ input pre-scales. Each active NVFP4 matrix is dequantized for BF16/FP16 compute, so this is a memory path rather than a native FP4 speed path.</td>
     </tr>
     <tr>
       <td><code>quanto-int8</code></td>
