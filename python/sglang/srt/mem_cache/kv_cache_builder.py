@@ -32,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -117,10 +118,10 @@ def _register_legacy_hicache_draft(
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
     host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.size / pool.size,
+        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )
@@ -137,6 +138,24 @@ def _register_legacy_hicache_draft(
         return
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+
+# Host slots a backup-only retraction pool gets, as a fraction of the device
+# pool. Sized well under 1.0 because a retraction burst touches a fraction of
+# the device tokens; overflow aborts the request rather than pre-reserving.
+BACKUP_ONLY_HICACHE_RATIO = 0.2
+
+
+def uses_ssm_state(model_config) -> bool:
+    """Whether the model keeps recurrent/conv state alongside its attention KV."""
+    spec = linear_attn_model_spec(model_config)
+    return (
+        hybrid_gdn_config(model_config) is not None
+        or mamba2_config(model_config) is not None
+        or (spec.uses_mamba_radix_cache if spec is not None else False)
+        or kimi_linear_config(model_config) is not None
+        or hybrid_lightning_config(model_config) is not None
+    )
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -158,8 +177,13 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        # Host-pool retraction transfers full and sliding-window components
+        # only, so a model with recurrent state stays on cpu_tensor.
+        supports_host_pool = not uses_ssm_state(
+            tp_worker.model_runner.model_config
+        ) and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -180,10 +204,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
-        # Only a decode server reaches resolution with the ratio unset; host-pool
-        # retraction sizes the host pool 1:1 with the device pool, everything
-        # else keeps the standard default.
-        fields["hicache_ratio"] = 1.0 if backend == "host_pool" else 2.0
+        # Only a decode server reaches resolution with the ratio unset. A
+        # backup-only pool can be small: retractions that overflow it abort their
+        # request instead of crashing the scheduler. Sharing the pool with
+        # HiCache keeps the standard default.
+        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
+        else:
+            fields["hicache_ratio"] = 2.0
 
     source = "kv_cache_builder.decode_retraction"
     get_context().override(source, **fields)
@@ -217,15 +245,7 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
-    _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
-    is_hybrid_ssm = (
-        hybrid_gdn_config(tp_worker.model_runner.model_config) is not None
-        or mamba2_config(tp_worker.model_runner.model_config) is not None
-        or _registry_needs_mamba
-        or kimi_linear_config(tp_worker.model_runner.model_config) is not None
-        or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
-    )
+    is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
@@ -240,27 +260,47 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    disable_radix_cache = server_args.disable_radix_cache or (
+    disable_radix_cache = get_memory().disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
-    if disable_radix_cache and not server_args.disable_radix_cache:
+    if disable_radix_cache and not get_memory().disable_radix_cache:
         logger.warning(
             "Radix cache is disabled for multimodal models with the "
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode-side radix cache supports SWA only through the unified tree, whose
+    # component pools preserve the full-attention prefix while transferring the
+    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
+    # incompatible with the prefix-match-and-lock allocation path.
     if (
-        server_args.disaggregation_decode_enable_radix_cache
-        and server_args.disaggregation_mode == "decode"
+        get_disagg().disaggregation_decode_enable_radix_cache
+        and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models requires the unified radix "
+                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
+            if enable_hierarchical_cache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models currently supports only "
+                    "device-resident cache and is incompatible with "
+                    "--enable-hierarchical-cache."
+                )
+            if getattr(model_config, "is_deepseek_v4_arch", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+                )
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -285,15 +325,15 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
-        eviction_policy=server_args.radix_eviction_policy,
+        eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
-        enable_session_radix_cache=server_args.enable_session_radix_cache,
+        enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,

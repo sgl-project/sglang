@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -6,6 +7,29 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+logger = logging.getLogger(__name__)
+
+
+def warn_if_adapter_targets_embeddings(
+    lora_name: str,
+    embedding_layer_names: Iterable[str],
+    speculative_algorithm: Optional[str],
+) -> None:
+    """Warn once when an adapter carries embedding weights under EAGLE spec."""
+    if speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        return
+    modules = sorted(embedding_layer_names)
+    if not modules:
+        return
+    logger.warning(
+        "LoRA adapter '%s' targets embedding modules (%s) while EAGLE-family "
+        "speculative decoding is enabled. The shared draft consumes their "
+        "base weights, so those deltas do not influence drafting and may "
+        "reduce the accept rate. Outputs are unaffected.",
+        lora_name,
+        ", ".join(modules),
+    )
 
 
 @dataclass
@@ -463,6 +487,19 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
     if shard_indices is not None:
         return shard_indices.num_org_elements
     return output_dim
+
+
+def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
+    """(total tokens, max tokens per request) for LoRA segment math."""
+    mode = forward_batch.forward_mode
+    if mode.is_decode():
+        return forward_batch.batch_size, 1
+    if mode.is_target_verify():
+        num_tokens_per_req = forward_batch.spec_info.draft_token_num
+        return forward_batch.batch_size * num_tokens_per_req, num_tokens_per_req
+    if mode.is_extend():
+        return forward_batch.extend_num_tokens, max(forward_batch.extend_seq_lens_cpu)
+    raise ValueError(f"Unsupported forward mode: {mode}")
 
 
 def generate_sequence_lengths(

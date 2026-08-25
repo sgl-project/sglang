@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     register_model_override,
     validate_declarations,
 )
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
@@ -69,6 +70,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
@@ -76,6 +78,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
+                    "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
@@ -252,17 +255,21 @@ class TestPublishInstallsSlot(_IsolatedPublish):
     """Publish wiring: set_server_args installs the already-resolved object
     into the context-owned slot (no transformation at publish time)."""
 
-    def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
+    def test_dummy_fixture_publishes_the_object_it_resolved(self):
         from sglang.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
 
-        sa = ServerArgs(model_path="dummy")  # __post_init__ early-returns
-        # The stash is created before the dummy short-circuit and stays empty.
-        self.assertEqual(sa._resolved_overrides, [])
+        sa = ServerArgs(model_path="dummy")  # construction resolves nothing
+        self.assertFalse(hasattr(sa, "_resolved_overrides"))
         set_global_server_args_for_scheduler(sa)
         self.assertIs(get_server_args(), sa)
+        # Publishing is what resolved it; the handlers ahead of the dummy
+        # short-circuit still declare.
+        for source, declared in sa._resolved_overrides:
+            for field, value in declared.items():
+                self.assertEqual(getattr(sa, field), value, f"{source}: {field}")
 
 
 class TestGoldenModelOverrides(_IsolatedPublish):
@@ -289,6 +296,235 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         "v_head_dim": 16,
     }
 
+    @staticmethod
+    def _minicpm_overrides(
+        architecture,
+        *,
+        sparse_attention=False,
+        lightning_attention=False,
+        attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
+        disaggregation_mode="null",
+        enable_dp_attention=False,
+        enable_hierarchical_cache=False,
+    ):
+        args = SimpleNamespace(
+            attention_backend=attention_backend,
+            prefill_attention_backend=prefill_attention_backend,
+            decode_attention_backend=decode_attention_backend,
+            disaggregation_mode=disaggregation_mode,
+            enable_dp_attention=enable_dp_attention,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+        )
+        args.is_attention_backend_not_set = lambda: all(
+            backend is None
+            for backend in (
+                args.attention_backend,
+                args.prefill_attention_backend,
+                args.decode_attention_backend,
+            )
+        )
+        mixer_types = []
+        if sparse_attention:
+            mixer_types.append("minicpm4")
+        if lightning_attention:
+            mixer_types.append("lightning-attn")
+        if not mixer_types:
+            mixer_types.append("minicpm4")
+        declarations = collect_model_override_declarations(
+            architecture,
+            args,
+            hf_config=MiniCPMHybridConfig(
+                num_hidden_layers=len(mixer_types),
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                mixer_types=mixer_types,
+                sparse_config={} if sparse_attention else None,
+            ),
+        )
+        return {
+            field: value
+            for _, declaration in declarations
+            for field, value in declaration.items()
+        }
+
+    def test_minicpm_disables_radix_cache_only_for_hybrid_layers(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                self.assertNotIn(
+                    "disable_radix_cache",
+                    self._minicpm_overrides(architecture),
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, sparse_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, lightning_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+
+    def test_minicpm_rejects_dp_attention(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM does not support DP attention",
+                ):
+                    self._minicpm_overrides(
+                        architecture,
+                        enable_dp_attention=True,
+                    )
+
+    def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
+        for capability in ("sparse_attention", "lightning_attention"):
+            with self.subTest(capability=capability):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM SALA does not support hierarchical cache",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        enable_hierarchical_cache=True,
+                        **{capability: True},
+                    )
+
+    def test_sparse_minicpm_defaults_to_sparse_attention_backend(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=False,
+        ):
+            for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+                with self.subTest(architecture=architecture):
+                    self.assertEqual(
+                        self._minicpm_overrides(
+                            architecture,
+                            sparse_attention=True,
+                        )["attention_backend"],
+                        "minicpm_flashattn",
+                    )
+
+    def test_minicpm_overrides_use_config_capabilities(self):
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            disaggregation_mode="null",
+            enable_dp_attention=False,
+            enable_hierarchical_cache=False,
+            is_attention_backend_not_set=lambda: True,
+        )
+        config = SimpleNamespace(
+            has_minicpm_sparse_attention=True,
+            has_lightning_layers=False,
+        )
+
+        with patch.object(
+            overrides_module, "is_blackwell_supported", return_value=False
+        ):
+            overrides = overrides_module._minicpm_sala_overrides(args, config)
+
+        self.assertTrue(overrides["disable_radix_cache"])
+        self.assertEqual(overrides["attention_backend"], "minicpm_flashattn")
+
+    def test_sparse_minicpm_defaults_to_flashinfer_on_blackwell(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=True,
+        ):
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                )["attention_backend"],
+                "minicpm_flashinfer",
+            )
+
+    def test_minicpm_preserves_explicit_attention_backend(self):
+        overrides = self._minicpm_overrides(
+            "MiniCPMSALAForCausalLM",
+            sparse_attention=True,
+            attention_backend="fa3",
+        )
+        self.assertNotIn("attention_backend", overrides)
+
+    def test_sparse_minicpm_rejects_pd_disaggregation(self):
+        for disaggregation_mode in ("prefill", "decode"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode=disaggregation_mode,
+                    )
+        for backend_field in (
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            with self.subTest(backend_field=backend_field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode="decode",
+                        **{backend_field: "minicpm_flashattn"},
+                    )
+
+    def test_minicpm_force_dense_uses_stock_attention_backend(self):
+        with envs.SGLANG_MINICPM_FORCE_DENSE.override(True):
+            self.assertNotIn(
+                "attention_backend",
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                ),
+            )
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    attention_backend="minicpm_flashinfer",
+                )["attention_backend"],
+                "flashinfer",
+            )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        attention_backend="minicpm_flashattn",
+                    )["attention_backend"],
+                    "fa4",
+                )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=False,
+            ):
+                split_overrides = self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    prefill_attention_backend="minicpm_flashattn",
+                    decode_attention_backend="minicpm_flashattn",
+                )
+                self.assertEqual(split_overrides["prefill_attention_backend"], "fa3")
+                self.assertEqual(split_overrides["decode_attention_backend"], "fa3")
+
     def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs
 
@@ -301,7 +537,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
             json.dump(config, f)
-        return ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args = ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args.resolve_once()
+        return server_args
 
     def _publish(self, server_args):
         from sglang.srt.server_args import (
@@ -970,20 +1208,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 device="cuda",
                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                moe_a2a_backend="none",
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+                get_model_config=lambda: SimpleNamespace(
+                    is_fp4_experts=True, nvfp4_moe_meta=None
+                ),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        self.assertEqual(
-            _deepseek_v4_overrides(_args(), hf),
-            {
-                "attention_backend": "dsv4",
-                "page_size": 256,
-                "swa_full_tokens_ratio": 0.1,
-            },
-        )
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _deepseek_v4_overrides(_args(), hf),
+                {
+                    "attention_backend": "dsv4",
+                    "moe_runner_backend": "flashinfer_mxfp4",
+                    "page_size": 256,
+                    "swa_full_tokens_ratio": 0.1,
+                },
+            )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
@@ -993,44 +1239,81 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # An explicit user choice takes precedence over the model default.
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(moe_runner_backend="triton"), hf),
+        )
+        # FlashInfer MXFP4 only supports the standard (non-A2A) dispatcher.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(moe_a2a_backend="deepep"), hf),
+            )
+        # Runtime FP4-to-FP8 dequantization must retain the generic FP8 runner.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # FP8 checkpoints and non-CUDA platforms keep their platform-specific
+        # auto-resolution paths.
+        fp8_model_config = lambda: SimpleNamespace(
+            is_fp4_experts=False, nvfp4_moe_meta=None
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(get_model_config=fp8_model_config), hf),
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(device="npu"), hf),
+        )
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # Unsupported NVIDIA architectures keep the generic auto-resolution
+        # path instead of selecting a FlashInfer kernel that cannot launch.
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # SM120 uses the same model hook; no later pass is needed.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _deepseek_v4_overrides(_args(), hf)["moe_runner_backend"],
+                "flashinfer_mxfp4",
+            )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(
             _deepseek_v4_overrides(
                 _args(
-                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                    get_model_config=lambda: SimpleNamespace(
+                        is_fp4_experts=False, nvfp4_moe_meta=object()
+                    )
                 ),
                 hf,
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
-
-    def test_deepseek_v4_sm120_moe_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_v4_sm120_moe,
-        )
-
-        def _view(arch="DeepseekV4ForCausalLM", **kw):
-            hf = SimpleNamespace(architectures=[arch])
-            defaults = dict(moe_runner_backend="auto")
-            defaults.update(kw)
-            return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
-            )
-
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
-            self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()),
-                {"moe_runner_backend": "flashinfer_mxfp4"},
-            )
-            self.assertEqual(
-                _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
-            )
-            self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
-        with patch.object(overrides_module, "is_sm120_supported", return_value=False):
-            self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
@@ -2123,7 +2406,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_data_parallelism_and_a2a_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
-            _a2a_backend_overrides,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
@@ -2140,27 +2422,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
-
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
-            e.get.return_value = False
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "deepep"},
-            )
-            e.get.return_value = True
-            # megamoe env wins over the waterfill override (chained, last write)
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "megamoe"},
-            )
 
         self.assertEqual(
             _a2a_ep_size(
