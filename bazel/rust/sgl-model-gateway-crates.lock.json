@@ -1,5 +1,5 @@
 {
-  "checksum": "2ce2f1c600dc6c5f9267974c641be19900491b4b938aec5c69e21d17fcefbb63",
+  "checksum": "d51204c19b869403f3fba2c097cd3dbdf2b05b81e6aca3727d4821c1dcf9f94c",
   "crates": {
     "addr2line 0.25.1": {
       "name": "addr2line",
@@ -25832,6 +25832,12 @@
         "compile_data_glob": [
           "**"
         ],
+        "crate_features": {
+          "common": [
+            "vendored"
+          ],
+          "selects": {}
+        },
         "deps": {
           "common": [
             {
@@ -25857,6 +25863,12 @@
         "compile_data_glob_excludes": [
           "**/*.rs"
         ],
+        "data": {
+          "common": [
+            "@gateway_openssl_src__openssl-src-300.6.1-3.6.3//:all_files"
+          ],
+          "selects": {}
+        },
         "data_glob": [
           "**"
         ],
@@ -25874,6 +25886,12 @@
               "id": "vcpkg 0.2.15",
               "target": "vcpkg"
             }
+          ],
+          "selects": {}
+        },
+        "extra_deps": {
+          "common": [
+            "@gateway_openssl_src//:openssl-src"
           ],
           "selects": {}
         },

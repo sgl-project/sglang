@@ -1,0 +1,55 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,5 +7,11 @@
+ use std::process::Command;
+ 
+ pub fn source_dir() -> PathBuf {
++    if let Some(manifest) = option_env!("OPENSSL_SRC_MANIFEST") {
++        return Path::new(manifest)
++            .parent()
++            .expect("OPENSSL_SRC_MANIFEST must name a file")
++            .join("openssl");
++    }
+     Path::new(env!("CARGO_MANIFEST_DIR")).join("openssl")
+ }
+@@ -478,9 +484,10 @@
+             // Make sure we pass extra flags like `-ffunction-sections` and
+             // other things like ARM codegen flags.
+             let mut skip_next = false;
+             let mut is_isysroot = false;
+-            for arg in compiler.args() {
++            let mut compiler_args = compiler.args().iter().peekable();
++            while let Some(arg) = compiler_args.next() {
+                 // For whatever reason `-static` on MUSL seems to cause
+                 // issues...
+                 if target.contains("musl") && arg == "-static" {
+@@ -513,7 +520,29 @@
+                 if skip_next {
+                     skip_next = false;
+                     continue;
+                 }
+ 
++                // Configure parses this Clang flag as an OpenSSL `no-*` feature.
++                if arg == "-no-canonical-prefixes" {
++                    continue;
++                }
++
++                // OpenSSL Configure treats every bare argument as a target name.
++                // Keep Clang options with separate path operands together so
++                // Configure stores them as compiler flags instead.
++                if matches!(
++                    arg.to_str(),
++                    Some("-B" | "-resource-dir" | "-imacros" | "-idirafter")
++                ) {
++                    let value = compiler_args
++                        .next()
++                        .ok_or_else(|| format!("missing value for compiler argument {arg:?}"))?;
++                    let mut combined = arg.to_os_string();
++                    combined.push(" ");
++                    combined.push(value);
++                    configure.arg(combined);
++                    continue;
++                }
++
+                 configure.arg(arg);
+             }

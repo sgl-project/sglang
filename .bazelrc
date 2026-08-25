@@ -15,6 +15,10 @@ build:cpu --platforms=//bazel/platforms:linux_x86_64_cpu
 build:cuda --platforms=//bazel/platforms:linux_x86_64_cuda
 build:rocm --platforms=//bazel/platforms:linux_x86_64_rocm
 
+build:manylinux --platforms=//bazel/platforms:linux_x86_64_manylinux_cpu
+build:manylinux --extra_toolchains=@manylinux_llvm//:cc-toolchain-x86_64-linux
+build:manylinux --@rules_rust//rust/settings:toolchain_linker_preference=cc
+
 # Integration targets intentionally consume the already-provisioned SGLang
 # runtime used by hardware CI. They are transitional until every native wheel
 # is represented as a Bazel dependency.

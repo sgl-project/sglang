@@ -11,6 +11,7 @@ bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.73.0")
 bazel_dep(name = "rules_rust_pyo3", version = "0.73.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "toolchains_llvm", version = "1.8.0")
 
 tvm_ffi_wheel = use_repo_rule(
     "@bazel_tools//tools/build_defs/repo:http.bzl",
@@ -127,6 +128,42 @@ register_execution_platforms(
     "//bazel/platforms:linux_x86_64_rocm",
 )
 
+# Use a content-addressed Debian Stretch sysroot as the oldest supported Linux
+# ABI boundary. Its glibc 2.24 floor is below SGLang's MAX_GLIBC=2.35 policy.
+manylinux_sysroot = use_repo_rule(
+    "@toolchains_llvm//toolchain:sysroot.bzl",
+    "sysroot",
+)
+
+manylinux_sysroot(
+    name = "manylinux_sysroot_x86_64",
+    sha256 = "84656a6df544ecef62169cfe3ab6e41bb4346a62d3ba2a045dc5a0a2ecea94a3",
+    urls = ["https://commondatastorage.googleapis.com/chrome-linux-sysroot/toolchain/2202c161310ffde63729f29d27fe7bb24a0bc540/debian_stretch_amd64_sysroot.tar.xz"],
+)
+
+llvm = use_extension(
+    "@toolchains_llvm//toolchain/extensions:llvm.bzl",
+    "llvm",
+)
+llvm.toolchain(
+    name = "manylinux_llvm",
+    cxx_include_layout = {"linux-x86_64": "debian"},
+    llvm_version = "19.1.0",
+)
+llvm.sysroot(
+    name = "manylinux_llvm",
+    label = "@manylinux_sysroot_x86_64//sysroot",
+    targets = ["linux-x86_64"],
+)
+llvm.extra_target_compatible_with(
+    name = "manylinux_llvm",
+    constraints = ["//bazel/platforms:glibc_2_24"],
+    targets = ["linux-x86_64"],
+)
+use_repo(llvm, "manylinux_llvm")
+
+register_toolchains("@manylinux_llvm//:all")
+
 # Python 3.12 matches the hosted CPU/lint jobs. Accelerator-specific Python
 # hubs will be added separately because CUDA, ROCm, XPU, and NPU can share an
 # OS/CPU tuple while requiring mutually incompatible wheels.
@@ -219,6 +256,44 @@ crate.annotation(
     repositories = ["sglang_crates"],
 )
 crate.annotation(
+    build_script_data = ["@gateway_openssl_src__openssl-src-300.6.1-3.6.3//:all_files"],
+    build_script_deps = ["@gateway_openssl_src//:openssl-src"],
+    crate = "openssl-sys",
+    crate_features = ["vendored"],
+    repositories = ["sgl_model_gateway_crates"],
+)
+crate.annotation(
+    additive_build_file_content = """
+filegroup(
+    name = "all_files",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "manifest",
+    srcs = ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+)
+""",
+    compile_data = ["@gateway_openssl_src__openssl-src-300.6.1-3.6.3//:manifest"],
+    crate = "openssl-src",
+    patch_args = ["-p1"],
+    patches = ["//bazel/rust:openssl-src-hermetic-path.patch"],
+    repositories = ["gateway_openssl_src"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "$(rootpath :manifest)/..",
+        "OPENSSL_SRC_MANIFEST": "$(rootpath :manifest)",
+    },
+)
+crate.annotation(
+    build_script_env = {
+        "PCRE2_SYS_STATIC": "1",
+    },
+    crate = "pcre2-sys",
+    repositories = ["sglang_crates"],
+)
+crate.annotation(
     build_script_env = {
         "PROTOC": "$(execpath @@//bazel/rust:gateway_protoc)",
     },
@@ -262,8 +337,16 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
+crate.from_specs(name = "gateway_openssl_src")
+crate.spec(
+    package = "openssl-src",
+    repositories = ["gateway_openssl_src"],
+    version = "=300.6.1+3.6.3",
+)
 use_repo(
     crate,
+    "gateway_openssl_src",
+    "gateway_openssl_src__openssl-src-300.6.1-3.6.3",
     "sgl_model_gateway_crates",
     "sglang_crates",
     "sglang_crates__rayon-1.12.0",

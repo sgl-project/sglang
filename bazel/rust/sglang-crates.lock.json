@@ -1,5 +1,5 @@
 {
-  "checksum": "d65f6600b12cb564b78c84014686ca9165a220bc5b4400a52a198710518aeaaa",
+  "checksum": "9671aece316f243e83de6257f97aa0ef7b1a93a7e2aa048d783d011966bfec4a",
   "crates": {
     "adler2 2.0.1": {
       "name": "adler2",
@@ -15476,6 +15476,12 @@
               "target": "pkg_config"
             }
           ],
+          "selects": {}
+        },
+        "build_script_env": {
+          "common": {
+            "PCRE2_SYS_STATIC": "1"
+          },
           "selects": {}
         }
       },
