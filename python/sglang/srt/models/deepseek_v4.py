@@ -3792,8 +3792,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if (
                                 _is_npu
                                 and getattr(self.quant_config, "is_fp4_experts", False)
-                                and param_name
-                                in {"w13_weight_scale_inv", "w2_weight_scale_inv"}
+                                and resolved_name.endswith(
+                                    (".w13_weight_scale_inv", ".w2_weight_scale_inv")
+                                )
                                 and param.data.dtype == torch.uint8
                                 and loaded_weight.dtype == torch.float8_e8m0fnu
                             ):
