@@ -153,8 +153,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
-        # Non-None only while a batched eviction walk accumulates device
-        # frees; see _evict_components / _free_values.
         self._pending_frees: Optional[dict[ComponentType, list[torch.Tensor]]] = None
 
         if params.enable_metrics:
@@ -634,9 +632,6 @@ class UnifiedRadixCache(BasePrefixCache):
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
     ) -> None:
-        # One drain per component instead of a sync chain per node. Deferral
-        # is safe: a deferred page cannot be reallocated before it is freed,
-        # and the stop condition reads `tracker`, not allocator availability.
         batch_frees = self._pending_frees is None
         if batch_frees:
             self._pending_frees = defaultdict(list)

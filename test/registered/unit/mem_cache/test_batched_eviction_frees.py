@@ -57,7 +57,7 @@ def _segments(seed: int, n_segments: int) -> list[torch.Tensor]:
 
 
 def _install_mapping(alloc: SWATokenToKVPoolAllocator, segs: list[torch.Tensor]):
-    swa_slot = PAGE  # skip the reserved page-0 slots
+    swa_slot = PAGE
     for seg in segs:
         n = seg.numel()
         swa_idx = torch.arange(swa_slot, swa_slot + n, dtype=torch.int64)
