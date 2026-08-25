@@ -86,6 +86,15 @@ crate = use_extension(
     "@rules_rust//crate_universe:extensions.bzl",
     "crate",
 )
+crate.annotation(
+    build_script_env = {
+        "PROTOC": "$(execpath @bazel_tools//tools/proto:protoc)",
+    },
+    build_script_tools = ["@bazel_tools//tools/proto:protoc"],
+    crate = "smg-grpc-client",
+    repositories = ["sgl_model_gateway_crates"],
+    version = "1.0.0",
+)
 crate.from_cargo(
     name = "sglang_crates",
     cargo_lockfile = "//rust:Cargo.lock",
