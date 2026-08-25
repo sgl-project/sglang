@@ -1,11 +1,13 @@
 import unittest
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
 from sglang.srt.disaggregation.common.dcp_pack import (
+    _copy_mla_rows_into_pack,
     dcp_pack_buffer_bytes,
-    gather_mla_owned_tokens,
     plan_packed_dcp_blocks,
     try_pack_dcp_src,
 )
@@ -81,7 +83,7 @@ class TestDcpPackBufferBytes(CustomTestCase):
                 dcp_pack_buffer_bytes([100], page_size=64)
 
 
-class TestGatherMlaOwnedTokens(CustomTestCase):
+class TestDcpPackCopy(CustomTestCase):
     def test_gathers_strided_rows_layer_major(self):
         dim = 8
         kv0 = torch.arange(32 * dim, dtype=torch.float32).view(32, 1, dim)
@@ -89,7 +91,12 @@ class TestGatherMlaOwnedTokens(CustomTestCase):
         src = np.array([0, 4, 8, 12], dtype=np.int64)
         item_len = int(kv0[0].nbytes)
         pack = torch.zeros(2 * src.size * item_len, dtype=torch.uint8)
-        gather_mla_owned_tokens([kv0, kv1], src, pack, [item_len, item_len], gpu_id=0)
+        _copy_mla_rows_into_pack(
+            [kv0, kv1],
+            torch.from_numpy(src),
+            pack,
+            [item_len, item_len],
+        )
 
         packed0 = pack[: src.size * item_len].view(torch.float32).view(4, 1, dim)
         packed1 = pack[src.size * item_len :].view(torch.float32).view(4, 1, dim)
@@ -101,6 +108,7 @@ class TestGatherMlaOwnedTokens(CustomTestCase):
         kv = torch.arange(16 * dim, dtype=torch.float32).view(16, 1, dim)
         item_len = int(kv[0].nbytes)
         pack = torch.zeros(8 * item_len, dtype=torch.uint8)
+        gather_stream = Mock()
         buf = type(
             "Buf",
             (),
@@ -109,16 +117,26 @@ class TestGatherMlaOwnedTokens(CustomTestCase):
                 "fits": lambda self, n: n <= pack.numel(),
                 "get_ptr": lambda self: 0x1000,
                 "get_size": lambda self: pack.numel(),
+                "get_gather_stream": lambda self: gather_stream,
             },
         )()
         src = np.array([1, 5, 9, 13], dtype=np.int64)
-        packed = try_pack_dcp_src(
-            pack_buffer=buf,
-            kv_buffers=[kv],
-            src_token_indices=src,
-            token_item_lens=[item_len],
-            gpu_id=0,
-        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.stream",
+                return_value=nullcontext(),
+            ),
+        ):
+            packed = try_pack_dcp_src(
+                pack_buffer=buf,
+                kv_buffers=[kv],
+                src_token_indices=src,
+                token_item_lens=[item_len],
+            )
+        gather_stream.synchronize.assert_called_once_with()
         self.assertIsNotNone(packed)
         ptrs, indices = packed
         self.assertEqual(ptrs, [0x1000])

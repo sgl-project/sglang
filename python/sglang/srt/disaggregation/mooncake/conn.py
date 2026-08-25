@@ -929,7 +929,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_buffers=src_tensors,
                     src_token_indices=src_token_indices,
                     token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
-                    gpu_id=self.kv_args.gpu_id,
                 )
                 if src_tensors is not None
                 else None

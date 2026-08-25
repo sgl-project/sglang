@@ -52,26 +52,19 @@ def plan_packed_dcp_blocks(
     ]
 
 
-def gather_mla_owned_tokens(
+def _copy_mla_rows_into_pack(
     kv_buffers: Sequence[torch.Tensor],
-    src_token_indices: npt.NDArray[np.integer],
+    row_indices: torch.Tensor,
     pack: torch.Tensor,
     token_item_lens: Sequence[int],
-    *,
-    gpu_id: int,
 ) -> None:
-    n = int(src_token_indices.size)
-    if n == 0:
-        return
     if len(kv_buffers) != len(token_item_lens):
         raise ValueError(
             "kv_buffers and token_item_lens length mismatch: "
             f"{len(kv_buffers)} vs {len(token_item_lens)}"
         )
 
-    if pack.device.type == "cuda":
-        torch.cuda.set_device(gpu_id)
-    idx = torch.as_tensor(src_token_indices, device=pack.device, dtype=torch.int64)
+    n = int(row_indices.numel())
     offset = 0
     for buf, item_len in zip(kv_buffers, token_item_lens):
         row_nbytes = int(buf[0].nbytes)
@@ -80,12 +73,12 @@ def gather_mla_owned_tokens(
                 "MLA token geometry mismatch during DCP pack: "
                 f"buffer row={row_nbytes} bytes, item_len={item_len}"
             )
-        gathered = buf.index_select(0, idx).contiguous()
+        selected_rows = buf.index_select(0, row_indices).contiguous()
         nbytes = n * item_len
-        pack[offset : offset + nbytes].view(gathered.dtype).copy_(gathered.view(-1))
+        pack[offset : offset + nbytes].view(selected_rows.dtype).copy_(
+            selected_rows.view(-1)
+        )
         offset += nbytes
-    if pack.device.type == "cuda":
-        torch.cuda.current_stream(pack.device).synchronize()
 
 
 def try_pack_dcp_src(
@@ -94,7 +87,6 @@ def try_pack_dcp_src(
     kv_buffers: Sequence[torch.Tensor],
     src_token_indices: npt.NDArray[np.integer],
     token_item_lens: Sequence[int],
-    gpu_id: int,
 ) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
     n = int(src_token_indices.size)
     if n == 0:
@@ -110,13 +102,16 @@ def try_pack_dcp_src(
         )
         return None
 
-    gather_mla_owned_tokens(
-        kv_buffers,
-        src_token_indices,
-        pack_buffer.buffer,
-        token_item_lens,
-        gpu_id=gpu_id,
+    pack = pack_buffer.buffer
+    row_indices = torch.as_tensor(
+        src_token_indices, device=pack.device, dtype=torch.int64
     )
+    gather_stream = pack_buffer.get_gather_stream()
+    gather_stream.wait_stream(torch.cuda.default_stream(pack.device))
+    with torch.cuda.stream(gather_stream):
+        _copy_mla_rows_into_pack(kv_buffers, row_indices, pack, token_item_lens)
+    gather_stream.synchronize()
+
     packed_ptrs: List[int] = []
     offset = 0
     base = pack_buffer.get_ptr()
