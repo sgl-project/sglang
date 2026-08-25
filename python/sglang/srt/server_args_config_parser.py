@@ -26,6 +26,17 @@ class ConfigArgumentMerger:
         # NOTE: The current code does not support actions other than "store_true" and "store".
         if parser is not None:
             self.parser = parser
+            # A deprecated alias can share its destination with a canonical action.
+            # Treat the destination as supported if any action for it is supported.
+            supported_action_types = (
+                argparse._StoreAction,
+                argparse._StoreTrueAction,
+            )
+            supported_action_dests = {
+                action.dest
+                for action in parser._actions
+                if isinstance(action, supported_action_types)
+            }
             self.store_true_actions = [
                 action.dest
                 for action in parser._actions
@@ -35,8 +46,7 @@ class ConfigArgumentMerger:
                 a.dest: a
                 for a in parser._actions
                 if a.option_strings
-                and not isinstance(a, argparse._StoreTrueAction)
-                and not isinstance(a, argparse._StoreAction)
+                and a.dest not in supported_action_dests
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
