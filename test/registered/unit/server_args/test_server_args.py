@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1099,6 +1100,34 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
             cuda_graph_max_bs=64,
         )
         self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
+
+
+class TestTorchNativeAttentionBackendSpeculativeRejected(CustomTestCase):
+    """torch_native's SDPA extend path doesn't populate/consult spec_info for
+    TARGET_VERIFY batches, so speculative decoding must be rejected up front
+    (mirrors the existing flex_attention + speculative_algorithm check)."""
+
+    def _args(self, *, speculative_algorithm):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "torch_native"
+        server_args.speculative_algorithm = speculative_algorithm
+        server_args.get_model_config = lambda: SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            is_encoder_decoder=False,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        server_args.cuda_graph_config = CudaGraphConfig()
+        return server_args
+
+    def test_torch_native_rejects_speculative_decoding(self):
+        server_args = self._args(speculative_algorithm="NGRAM")
+        with self.assertRaisesRegex(AssertionError, "torch_native attention backend"):
+            server_args._handle_attention_backend_compatibility()
+
+    def test_torch_native_allows_non_speculative(self):
+        server_args = self._args(speculative_algorithm=None)
+        server_args._handle_attention_backend_compatibility()
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
 
 
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):

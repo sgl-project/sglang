@@ -2969,6 +2969,10 @@ class ServerArgs:
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            assert self.speculative_algorithm is None, (
+                "Speculative decoding is currently not supported with the "
+                "torch_native attention backend"
+            )
 
         if self.attention_backend == "flex_attention":
             logger.warning(
