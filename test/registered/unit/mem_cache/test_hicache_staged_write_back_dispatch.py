@@ -21,12 +21,12 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
-    DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
-    MambaPoolHost,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,6 +35,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
+DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"
 MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
 MLA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mla"
 
@@ -845,7 +846,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.can_use_write_back_jit = True
         src_registry = {_ptr_key_from_layers(device_layers): device_layers}
 
-        staged_patch, fallback_patch, load_patch = self._patched_transfers(src_registry)
+        staged_patch, fallback_patch, load_patch = self._patched_transfers(
+            src_registry, module=DSA_POOL_HOST_MODULE
+        )
         with staged_patch as staged, fallback_patch as fallback, load_patch as load:
             host.backup_from_device_all_layer(
                 device_pool=device_pool,

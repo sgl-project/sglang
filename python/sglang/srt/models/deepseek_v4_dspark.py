@@ -47,6 +47,7 @@ from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
     gather_and_crop_vocab,
+    project_through_lm_head,
     run_markov_block,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -868,10 +869,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
-        if self._use_fp32_lm_head:
+        if self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = F.linear(x.float(), weight.float())
         else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+            local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)

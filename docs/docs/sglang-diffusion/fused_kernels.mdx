@@ -1,0 +1,209 @@
+---
+title: "Fused Kernels"
+description: "The fused CUDA/Triton kernels SGLang Diffusion ships, what each one replaces, and which are on by default."
+tag: "preserve"
+---
+
+Diffusion transformers and VAEs spend a large share of their non-GEMM time on short elementwise chains — adaLN modulate, residual gating, QK-norm, RoPE, norm epilogues — each of which is a separate kernel launch and a separate HBM round trip in eager PyTorch. SGLang Diffusion replaces these chains with fused kernels under [`sglang/kernels/ops/diffusion`](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/ops/diffusion).
+
+This page is an inventory: what each kernel fuses, what its numerical contract is, and which models use it. It is not a lever you tune — most of these kernels are on by default and require no flag. The one switch is `--quality`, described below.
+
+## Two numerical contracts
+
+Multi-step denoising amplifies a per-step rounding difference into visible quality loss, so "close enough" and "bit-exact" are different products here. Every kernel in the package falls into one of two classes.
+
+**Bit-exact — mounted unconditionally.** The kernel reproduces every rounding boundary of the eager chain, so `torch.equal` holds against the reference. Some go quite far to get there: the fused LayerNorm+modulate kernel replicates PyTorch's `vectorized_layer_norm_kernel` down to its Welford update order, guarded reciprocal, and warp-fold tree; the fused RMSNorm+scale/shift kernel replicates FlashInfer's CuTe-DSL `RMSNormKernel` fragment order and `shfl.bfly` fold. Because the dispatch they replicate can change underneath them, each one still verifies itself against the live eager chain on first sight and falls back permanently on any mismatch.
+
+**Not bit-exact — request-gated.** These differ from eager only at half-precision rounding-order level, but that is enough to matter, so they are mounted only for `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. The default `quality="lossless"` runs the unmodified reference chain.
+
+<Note>
+A plain fp32 single-pass norm fusion looks harmless and is not. On ERNIE-Image it moved the 50-step trajectory to 18.83 dB PSNR at `quality=high`, which is what motivated the bit-exact rewrite of that path.
+</Note>
+
+## Enabling the request-gated set
+
+```bash
+sglang generate --model-path MODEL_PATH --prompt "..." --quality high
+```
+
+The server default stays `lossless`; the OpenAI-compatible endpoints carry it per request. Images:
+
+```bash
+curl -X POST http://${HOST}:${PORT}/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "high"}'
+```
+
+Video, same field:
+
+```bash
+curl -X POST http://${HOST}:${PORT}/v1/videos \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "high"}'
+```
+
+<Warning>
+The `quality` field in a **video response** body is unrelated. It is Sora-compatible response metadata and is always reported as `"standard"`; it does not reflect the sampling quality the request ran with.
+</Warning>
+
+`quality` participates in the dynamic-batch signature, so mixed-quality traffic is batched separately and the transition happens safely at a batch boundary. Mounting is all-or-nothing: if any marked site on a transformer fails its static guards, no site on that transformer is fused.
+
+<Warning>
+Do not combine request-gated DiT fusions with `--enable-breakable-cuda-graph`.
+BCG warmup captures the lossless module branches before a high-quality request
+mounts its DiT fusions, so replay would bypass the requested kernels. SGLang
+rejects this combination for models with eligible DiT quality sites. Models
+whose high-quality path changes only VAE decode remain allowed because BCG
+captures the DiT only.
+</Warning>
+
+These fusion families mount under `quality="high"`:
+
+| Fusion | What it folds |
+| --- | --- |
+| Linear + tanh-GELU | Bias-add and GELU into the GEMM epilogue (cublasLt), removing the `[tokens, 4*dim]` intermediate round trip |
+| LayerNorm + modulate | `layer_norm(x, weight=(1 + scale), bias=shift)` in place of affine-free LN plus a separate modulate |
+| LTX-2 RMSNorm + modulate | `rms_norm(x) * (1 + scale) + shift` in one launch |
+| Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
+| HunyuanVideo strided QK RMSNorm | Per-head QK RMSNorm over the packed QKV layout |
+| LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
+| SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
+
+## Kernel inventory
+
+34 operators are registered in the kernel registry across 38 implementations (some operators carry several backends). Backends are named by provenance, not device: `JIT` compiles under nvcc *and* hipcc, `TRITON` runs on CUDA and ROCm, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, `AOT` comes from the `sgl_kernel` wheel.
+
+### Normalization
+
+| Operator | Backend | Contract | Replaces |
+| --- | --- | --- | --- |
+| `rmsnorm_scale_shift` | Triton | bit-exact | RMSNorm + `* (1 + scale) + shift` (4 kernels) |
+| `scale_residual_norm_scale_shift` | Triton / CuTe-DSL / FlyDSL | bit-exact (Triton) | the above plus the preceding `residual + gate * update` |
+| `layernorm_modulate` | Triton | bit-exact | affine-free LayerNorm + adaLN modulate |
+| `qk_head_layernorm` | Triton | bit-exact | per-head LayerNorm on q/k |
+| `qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
+| `norm_scale_shift` | CuTe-DSL / FlyDSL | fp32 statistics | LN-or-RMS + scale/shift, many broadcast modes |
+| `rmsnorm_scale`, `rmsnorm_tanh_residual` | Triton | bf16-native statistics | `RMSNorm(x) * scale`, `x + tanh(gate) * RMSNorm(y)` |
+| `apply_group_norm_silu` | Triton | close | `GroupNorm + SiLU`, NCHW-contiguous |
+| `group_norm_silu_4d`, `group_norm_silu_rows` | Triton | close | channels-last GroupNorm(+SiLU); what lets a VAE decoder run channels_last end to end with no `nchwToNhwc` transposes |
+| `wan_rmsnorm_silu` | Triton | close | Wan VAE `channels_last_3d` RMSNorm + SiLU |
+
+### adaLN modulation and gating
+
+| Operator | Backend | Contract | Replaces |
+| --- | --- | --- | --- |
+| `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
+| `residual_gate_add` | JIT CUDA | bit-exact | `residual + gate * update` |
+| `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
+| `temb_table_slices` | Triton | bit-exact | see note below |
+| `ltx2_ada_values` | Triton | bit-exact | LTX-2 nine-way adaLN value split, slices come out contiguous |
+
+<Tip>
+`temb_table_slices` is worth knowing about. The eager `(scale_shift_table + temb.float()).chunk(6, dim=2)` materializes roughly 8 GB of fp32 at 704p/121f *and* hands six **strided** slices downstream, whose `.contiguous()` calls then copy each one again. The fused kernel produces the six slices in one pass, each naturally contiguous, so the downstream copies become no-ops.
+</Tip>
+
+### RoPE and QK-norm
+
+| Operator | Backend | Contract | Replaces |
+| --- | --- | --- | --- |
+| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs the split baseline; exact with `round_norm_before_rope=True` | separate QK-norm kernel + RoPE |
+| `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
+| `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
+| `ltx2_qknorm_split_rope` | JIT CUDA | close (validated on B200) | LTX-2 QK-norm + split RoPE |
+| `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
+| `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
+
+### Activation
+
+| Operator | Backend | Contract | Replaces |
+| --- | --- | --- | --- |
+| `silu_mul` | Triton | bit-exact | `F.silu(a) * b` for split-projection SwiGLU, where the concatenated `silu_and_mul` kernels do not apply without an extra full-width `cat` |
+| `bias_silu`, `bias_glu` | Triton | bit-exact | Sana GLUMB conv bias + SiLU / GLU post-processing |
+| `linear_gelu_tanh` | AOT (cublasLt) | not bit-exact, request-gated | bias-add and tanh-GELU folded into the GEMM epilogue |
+
+### Attention
+
+| Operator | Backend | Notes |
+| --- | --- | --- |
+| `sparse_linear_attn_fwd` | Triton | block-map, compression, and forward for sparse linear attention |
+| `bigdn` | Triton | Sana-WM bidirectional gated delta-net; the chunkwise form splits phase A along the KV and Z streams so two blocks stay resident per SM, and stores `(I - P)` so phase B's MMA folds the identity-add in |
+
+### Data movement
+
+Every kernel here only moves values (plus zero fill, plus at most one same-order add), so each is bitwise identical to the aten chain it replaces.
+
+| Operator | Backend | Replaces |
+| --- | --- | --- |
+| `usp_merge_heads` | JIT CUDA | USP all-to-all output head merge (`permute` + `contiguous`) |
+| `pack_qkv_destination_major` | Triton | Ulysses destination-major QKV pack |
+| `varlen_pack_qkv`, `varlen_scatter_to_padded` | Triton | varlen gather/scatter around the masked attention path |
+| `causal_conv3d_cat_pad` | JIT CUDA / Triton | causal Conv3d `cat` + `pad` |
+| `cat_pad_channels_last_3d` | Triton | Wan causal VAE `cat + F.pad + contiguous` (three passes plus cache bookkeeping) in one pass |
+| `dup_up3d_add` | Triton | `repeat_interleave + permute().contiguous() + add` |
+
+## Coverage by model
+
+Kernels are written against a specific eager chain in a specific model, so coverage is per-model rather than universal.
+
+| Model | Fused paths |
+| --- | --- |
+| FLUX.1 | LN+modulate, modulate, residual-gate add, linear+GELU |
+| FLUX.2 | LN+modulate, packed SwiGLU, residual-gate add |
+| Qwen-Image | linear+GELU, select-0/1 LN modulation |
+| GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
+| ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
+| Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
+| Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
+| LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
+| LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
+| HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
+| LingBot Video MoE | Fused RMSNorm at `quality=high` |
+| Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=high` |
+| Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
+| Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
+| Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
+| FLUX.2 VAE / HunyuanVAE / latent upsampler | GroupNorm + SiLU (channels-last two-pass for FLUX.2) |
+
+## Inspecting what is registered
+
+Every kernel is described by a `KernelSpec` in the process-wide registry, so the inventory is queryable without importing any backend:
+
+```python
+from sglang.kernels.registry import registry
+
+diffusion_ops = [op for op in registry.ops() if op.startswith("diffusion.")]
+for spec in registry.get("diffusion.scale_residual_norm_scale_shift"):
+    print(spec.backend, spec.target, spec.capabilities)
+```
+
+Registration is metadata only — it imports neither torch nor a backend and triggers no JIT build. To pick a specific implementation of an operator that has several:
+
+```python
+from sglang.kernels import select_kernel, KernelBackend
+
+fn = select_kernel(
+    "diffusion.scale_residual_norm_scale_shift", backend=KernelBackend.CUTE_DSL
+).load()
+```
+
+## Importing the kernels
+
+Runtime code imports from the package, never from a submodule:
+
+```python
+from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
+```
+
+Resolution is lazy: the backends have disjoint, heavy dependencies (Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager re-export would make every one of them an import-time requirement on every platform. Each public kernel is a predicate-plus-kernel pair — call `can_use_<op>(...)` first and fall back to the reference chain when it returns `False`; the kernel raises on an unsupported input rather than silently returning `None`.
+
+The package `README.md` carries a selection matrix for the cases where several kernels look interchangeable and are not. The normalization domain alone holds more than a dozen implementations that differ by numerical contract, activation layout, and backend rather than by speed.
+
+## References
+
+- [Performance Optimization](./performance-optimization)
+- [Attention Backends](./attention_backends)
+- [Quantization](./quantization)
+- [Profiling](./profiling)
+- [`sglang/kernels/ops/diffusion`](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/ops/diffusion) — source and selection matrix
+- [RFC #29630](https://github.com/sgl-project/sglang/issues/29630) — the unified `sglang.kernels` namespace
