@@ -20,8 +20,8 @@ def validate_experimental_sgl_marlin_server_args(
 
     # A provided adapter path implicitly enables LoRA later unless it was
     # explicitly disabled. No-LoRA delegates to the stock Marlin fused path.
-    lora_enabled = bool(server_args.enable_lora) or (
-        server_args.enable_lora is None and bool(server_args.lora_paths)
+    lora_enabled = bool(resolved_args.enable_lora) or (
+        resolved_args.enable_lora is None and bool(server_args.lora_paths)
     )
     if not lora_enabled:
         return

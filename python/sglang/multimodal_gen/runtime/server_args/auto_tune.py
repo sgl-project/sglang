@@ -286,12 +286,68 @@ class ServerArgsAutoTuner:
         if not layerwise_components:
             return
 
+        min_available_gb = self._get_min_available_device_memory_gb()
         logger.info(
-            "Auto memory policy for %s selected layerwise offload components: %s",
+            "Auto memory policy for %s: %s of free device memory selects "
+            "layerwise offload for %s. Explicit placement flags always win, "
+            "and the per-component lines below say where each one's weights "
+            "landed -- see the model's cookbook page for what to expect from "
+            "your memory budget.",
             args.pipeline_config.__class__.__name__,
+            (
+                f"{min_available_gb:.1f} GiB"
+                if min_available_gb is not None
+                else "an unknown amount"
+            ),
             ", ".join(layerwise_components),
         )
         args.layerwise_offload_components = layerwise_components
+        self._warn_if_resident_dit_contradicts_its_own_threshold(layerwise_components)
+
+    def _warn_if_resident_dit_contradicts_its_own_threshold(
+        self, layerwise_components: list[str]
+    ) -> None:
+        """Name the missing declaration when the DiT stays resident on a small card.
+
+        A model that sets `keep_resident_min_available_gb` is saying to keep
+        components resident only above that much device memory. If the auto
+        policy nonetheless leaves the DiT resident on a card far below it, the
+        two statements disagree, and the cause is almost always that the model
+        never declared `dit_layerwise_offload_modes` -- its default is an empty
+        tuple, so the DiT is never selected in any mode. That surfaces as a
+        failure during load, and it is worth naming the missing knob rather than
+        leaving the allocator to report it.
+
+        A warning rather than an error: a small model's DiT can legitimately fit
+        below the threshold, which is about plenty and not about fit.
+        """
+        args = self.server_args
+        deployment_config = self._deployment_config()
+        threshold_gb = deployment_config.keep_resident_min_available_gb
+        if threshold_gb is None:
+            return
+        if LAYERWISE_OFFLOAD_DIT_GROUP in (
+            normalize_layerwise_offload_components(layerwise_components) or ()
+        ):
+            return
+        if args.performance_mode in deployment_config.dit_layerwise_offload_modes:
+            return
+        available_gb = self._get_min_available_device_memory_gb()
+        if available_gb is None or available_gb >= threshold_gb:
+            return
+        logger.warning(
+            "%s keeps its DiT resident with %.1f GiB of device memory available, "
+            "below the %.1f GiB this model declares as its threshold for keeping "
+            "components resident. The DiT is not in the automatic layerwise "
+            "selection because the model does not list %r in "
+            "dit_layerwise_offload_modes. If the DiT does not fit, pass "
+            "--layerwise-offload-components dit,... explicitly, or add the mode "
+            "to the model's deployment config.",
+            args.pipeline_config.__class__.__name__,
+            available_gb,
+            threshold_gb,
+            args.performance_mode,
+        )
 
     def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
         args = self.server_args

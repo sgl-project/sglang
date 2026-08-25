@@ -20,6 +20,18 @@ from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_dcp_size,
+    configured_pp_size,
+    configured_tp_size,
+    get_device,
+    get_exec,
+    get_lora,
+    get_model,
+    get_parallel,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -96,37 +108,37 @@ class StartupWeightLoadOptions:
         server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> StartupWeightLoadOptions:
-        cuda_graph_config = server_args.cuda_graph_config
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         cuda_graph_enabled = any(
             getattr(cuda_graph_config, phase).backend != Backend.DISABLED
             for phase in Phase.ALL
         )
         return cls(
-            device=server_args.device,
+            device=get_device().device,
             is_cuda_platform=current_platform.is_cuda(),
             cuda_graph_enabled=cuda_graph_enabled,
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
-            speculative_algorithm=server_args.speculative_algorithm,
-            tp_size=server_args.tp_size,
-            attn_cp_size=server_args.attn_cp_size,
-            dcp_size=server_args.dcp_size,
-            pp_size=server_args.pp_size,
-            dp_size=server_args.dp_size,
-            ep_size=server_args.ep_size,
-            cpu_offload_gb=server_args.cpu_offload_gb,
-            offload_group_size=server_args.offload_group_size,
-            enable_memory_saver=server_args.enable_memory_saver,
-            enable_weights_cpu_backup=server_args.enable_weights_cpu_backup,
-            enable_lora=server_args.enable_lora,
-            has_lora_paths=bool(server_args.lora_paths),
-            weight_loader_disable_mmap=server_args.weight_loader_disable_mmap,
+            speculative_algorithm=get_spec().speculative_algorithm,
+            tp_size=configured_tp_size(),
+            attn_cp_size=configured_attn_cp_size(),
+            dcp_size=configured_dcp_size(),
+            pp_size=configured_pp_size(),
+            dp_size=get_parallel().dp_size,
+            ep_size=get_parallel().ep_size,
+            cpu_offload_gb=get_exec().offload.cpu_offload_gb,
+            offload_group_size=get_exec().offload.offload_group_size,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_weights_cpu_backup=get_exec().features.enable_weights_cpu_backup,
+            enable_lora=get_lora().enable_lora,
+            has_lora_paths=bool(get_lora().lora_paths),
+            weight_loader_disable_mmap=get_model().weight_loader_disable_mmap,
             weight_loader_drop_cache_after_load=(
-                server_args.weight_loader_drop_cache_after_load
+                get_model().weight_loader_drop_cache_after_load
             ),
-            has_custom_weight_loader=bool(server_args.custom_weight_loader),
-            enable_torch_compile=server_args.enable_torch_compile,
-            prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
+            has_custom_weight_loader=bool(get_model().custom_weight_loader),
+            enable_torch_compile=get_exec().graph.enable_torch_compile,
+            prefetch_num_threads=get_model().weight_loader_prefetch_num_threads,
         )
 
 

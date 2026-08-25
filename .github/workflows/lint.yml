@@ -13,16 +13,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect Rust workspace changes
-        id: paths
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            rust_workspace:
-              - 'rust/**'
-              - 'proto/sglang/runtime/v1/sglang.proto'
-              - '.github/workflows/lint.yml'
-
       # Fail-fast gate: docs_new/ was renamed to docs/ (#32123). git's rename
       # detection silently re-adds NEW files under docs_new/ on merge without a
       # conflict, which would resurrect the directory. We check the checked-out
@@ -60,13 +50,6 @@ jobs:
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
-      # Not in the rust-ext build job: its cache key covers the built .so files,
-      # and a test script is not a build input. Tests take ~1s; the timeout is
-      # for a cold cache, which codegens the dependency graph first.
-      - name: Run rust/ workspace tests
-        if: steps.paths.outputs.rust_workspace == 'true'
-        run: cd rust && timeout 900 cargo test --workspace
-
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
         with:
@@ -79,6 +62,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Check cookbook authoring contracts
+        run: node docs/scripts/check_cookbook_configs.mjs
 
       # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are

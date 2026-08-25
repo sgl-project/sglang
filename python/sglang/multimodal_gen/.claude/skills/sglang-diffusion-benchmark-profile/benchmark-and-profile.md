@@ -135,19 +135,83 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
+The helper defaults to eager. Add `--torch-compile` only for a labeled compile
+control. `--no-torch-compile` remains accepted for compatibility but is no
+longer required.
+
+Run one explicit quality or BCG comparator with `--quality lossless|high` and
+`--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
+exclusive in this helper. A high+BCG command is only a compatibility probe:
+it is invalid if request-scoped DiT fusions mount after the lossless warmup
+graphs were captured. When a preset has explicit width and height, the helper
+declares that same `--warmup-resolutions` value automatically:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality high \
+  --breakable-cuda-graph \
+  --label bcg-high \
+  --output-dir "${BENCH_DIR}"
+```
+
+For optimization discovery, use the full repeated matrix. It runs
+Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
+holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
+whether the combination is actually supported; do not average them when the
+runtime rejects the combination or the helper detects a late quality-fusion
+mount. The helper also hashes every generated artifact, first requires the two
+Eager rows at each quality to agree, then rejects any BCG row whose hash differs
+from that Eager reference. Cleanup occurs only after all eight runs, including
+on failure or interruption:
+
+```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality-bcg-matrix \
+  --label h200 \
+  --output-dir "${BENCH_DIR}" \
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
+```
+
+Before starting, confirm the chosen GPU set has no foreign process and remains
+unchanged through every run boundary. The helper rejects a BCG row unless its
+log contains `[Diffusion BCG] captured` and contains none of: support-gate
+disable, capture failure, `serving signature MISSED`, a message that no graph
+will be captured, or a request-scoped high-quality DiT fusion mounted after
+capture. Do not average rejected rows with valid results.
+
+BCG signatures include more than width and height. The public
+`--warmup-resolutions` flag declares only `WxH`; synthetic warmup still uses
+the model's own frame-count and conditioning defaults. A short video preset
+can therefore capture a default temporal shape and miss the actual request
+even at the same resolution. The helper marks that row invalid. Use a request
+whose complete temporal/conditioning contract matches warmup, or fix the
+model's BCG warmup/padding contract before claiming a speedup.
+
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
 do not compare its per-stage values with synchronized results.
 
-Keep `torch.compile` off when the task requires it:
+For downloaded checkpoints, isolate and clean the model cache after the preset
+finishes. Cleanup also runs after an error or interruption, and appends a JSONL
+record with pre/post byte and weight-file counts:
 
 ```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
 PYTHONPATH=python python3 "$BENCH_PY" \
-  --model flux \
+  --model longcat-image \
   --label baseline \
   --output-dir "${BENCH_DIR}" \
-  --no-torch-compile
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
 ```
+
+The helper refuses to reuse an existing per-run cache directory and never
+redirects `SGLANG_CACHE_DIR`, so compiled kernel caches remain separate. Never
+point this option at a shared Hugging Face or ModelScope cache.
 
 Run the `LTX-2.3` one-stage skill preset:
 
@@ -177,7 +241,7 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 ```
 
 Run the current-source MiniMax-H3 T2VA preset. The helper forces eager mode
-for this model even when its global compile default is enabled:
+for this model even when `--torch-compile` is requested:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
@@ -215,8 +279,8 @@ Use the preset categories this way:
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
-| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
-| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
 | `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
 | `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt, 2 GPUs, TP size 2 |
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
@@ -225,8 +289,43 @@ Use the preset categories this way:
 | `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, `--cfg-parallel-size 2`, 768x512, 121 frames, seed 42 |
 | `ideogram4-fp8` | `ideogram-ai/ideogram-4-fp8` | Yes: `ideogram4_fp8_t2i_2gpu` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, FlashAttention backend; sampling preset owns steps/guidance |
 | `cosmos3-super-t2v` | `nvidia/Cosmos3-Super` | Yes: `cosmos3_super_t2v_2gpu` | Prompt, 1280x720, 81 frames, seed 42, 2 GPUs, TP size 2, guardrails disabled for benchmark isolation |
+| `cosmos3-super-t2v-cfg2tp2` | `nvidia/Cosmos3-Super` | No | Explicit four-GPU TP2 x CFG2 throughput comparator. On H200 it was 48.00% faster end to end than TP2, but the topology changed the deterministic output (SSIM 0.914244, PSNR 29.469771 dB), so do not treat it as lossless-equivalent or select it automatically. |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
-| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | No | Current-source H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's `task`, `conditions`, `target`, and audio/video flow shifts to a generated config. |
+| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
+| `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
+| `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
+| `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
+| `lingbot-world` | `robbyant/lingbot-world-fast-diffusers` | No | One-H200 offline single-chunk profile for the registered causal DMD path: 832x480x9, four steps, guidance 1.0, the shared image fixture, and forward-camera actions for all nine frames. Keep stateful websocket latency as a separate metric. |
+| `lingbot-world-v2` | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | No | Matching controlled single-chunk profile for the separately registered v2 checkpoint. The fixed shape, action program, and schedule make v1/v2 hotspot comparisons reproducible without presenting one-chunk e2e as stateful realtime latency. |
+| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/high comparisons do not measure an offload-policy change. |
+| `wan21-t2v-1.3b` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU 832x480, 81-frame Wan2.1 baseline at 50 steps and guidance 3.0. Keep it separate from FastWan and TurboWan because the longer schedule changes the end-to-end weight of VAE optimizations. |
+| `wan21-t2v-14b` | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | No | Cookbook-aligned four-GPU CFG/Ulysses baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Text encoding stays CPU-offloaded as in the documented deployment command. |
+| `wan21-i2v-14b-480p` | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Uses the shared cat fixture and its motion prompt. |
+| `wan21-i2v-14b-720p` | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 1280x720, 81 frames, 50 steps, and guidance 5.0. Keep it separate from 480P because it is a distinct checkpoint and attention shape. |
+| `wan21-fun-inp-1.3b` | `weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers` | No | Registered one-GPU Wan2.1 Fun image-conditioned path at 832x480, 81 frames, 50 steps, and guidance 6.0. Uses the shared cat fixture and motion prompt. |
+| `krea2-turbo` | `krea/Krea-2-Turbo` | No | Recent T2I checkpoint at 1024x1024, 8 steps, guidance 1.0. |
+| `krea2-raw` | `krea/Krea-2-Raw` | No | Recent T2I checkpoint at 1024x1024, 50 steps, guidance 4.5; keep separate from Turbo because CFG and the longer schedule change the hotspot mix. |
+| `ideogram4-fast` | `fal/ideogram-v4-fast` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
+| `ideogram4-instant` | `fal/ideogram-v4-instant` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
+| `longlive2-t2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 832x480, 61-frame causal DMD T2V baseline at 4 steps and guidance 1.0. |
+| `longlive2-i2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 960x928, 61-frame causal DMD I2V baseline using the cat image. |
+| `fast-hunyuan` | `FastVideo/FastHunyuan-diffusers` | No | Validated one-H200 832x480, 61-frame FastHunyuan baseline using its registered 6-step schedule. |
+| `turbowan21-t2v-1.3b` | `IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU TurboWan path at 832x480, 81 frames, and 4 steps. |
+| `turbowan21-t2v-14b-480p` | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers` | No | One-H200 TurboWan 14B path at 832x480, 81 frames, and its 4-step DMD schedule. |
+| `turbowan21-t2v-14b-720p` | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers` | No | One-H200 high-resolution TurboWan 14B path at 1280x720, 81 frames, and its 4-step DMD schedule. Keep it separate because it is a distinct checkpoint. |
+| `turbowan22-i2v-a14b` | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 1280x720, 81 frames, and its 4-step DMD schedule. Uses the shared cat fixture and keeps both high- and low-noise guidance at 3.5. |
+| `helios-mid` | `BestWishYsh/Helios-Mid` | No | CI-sized 640x384, 33-frame pyramid-SR baseline using Helios-Mid's 20-step schedule. |
+| `helios-distilled` | `BestWishYsh/Helios-Distilled` | No | CI-sized 640x384, 33-frame DMD baseline at 10 steps and guidance 1.0. |
+| `joy-echo` | `jdopensource/JoyAI-Echo` | No | CI-aligned two-GPU Ulysses baseline at 640x384, 33 frames, 8 steps, with the cross-request memory bank disabled for isolated single-request timing. |
+| `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
+| `cosmos3-edge-t2v` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2V baseline at Edge's native 832x480 video shape, 81 frames, 35 steps, and guidance 5.0. |
+| `cosmos3-edge-i2v` | `nvidia/Cosmos3-Edge` | No | Matching one-GPU I2V baseline with the shared cat fixture; keep it separate because image conditioning adds the VAE encode and latent-mask paths. |
+| `cosmos3-super-i2v` | `nvidia/Cosmos3-Super-Image2Video` | No | Registered specialized I2V checkpoint with the shared cat fixture; 1280x720, 81 frames, 35 steps, guidance 6.0, flow shift 10.0, seed 42, 2 GPUs, TP size 2, and guardrails disabled for benchmark isolation. |
+| `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
+| `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
+| `ltx25-diffusion-decoder` | `Lightricks/LTX-2.5-Diffusers` | No | Same fixed DiT workload with `--use-diffusion-decoder`; attribute decoder time separately and confirm NATTEN `na3d` is active. |
 | `ltx2` | `Lightricks/LTX-2` | No | Current-source two-stage LTX-2 preset with 2 GPUs, CFG parallel, 768x512, 121 frames |
 | `qwen-image` | `Qwen/Qwen-Image` | No | Current-source extra covering the base Qwen-Image native path, separate from the nightly `Qwen-Image-2512` case |
 | `qwen-edit-2509` | `Qwen/Qwen-Image-Edit-2509` | No | Current-source extra for the pre-2511 edit-plus path; uses the cat image, 1024x1024 |
@@ -239,12 +338,14 @@ Use the preset categories this way:
 | `glm-image` | `zai-org/GLM-Image` | No | Current-source extra for GLM-Image |
 | `sana-1.5-1.6b` | `Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers` | No | Current-source extra for a SANA native image path |
 | `fastwan22-ti2v-5b` | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | No | Current-source extra matching the FastWan2.2 TI2V registered path |
+| `wan22-t2v-nvfp4` | `nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4` | No | Blackwell-only one-GPU ModelOpt NVFP4 T2V baseline at 832x480 and 81 frames. Manual mode keeps the DiT resident so the trace measures FP4 kernels instead of layerwise transfer. |
 | `ltx23-hq-two-stage` | `Lightricks/LTX-2.3` | No | Current-source extra for `LTX2TwoStageHQPipeline` with `--ltx2-two-stage-device-mode=original`; high-resolution and VRAM-heavy |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage-cfg-parallel` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution CFG-parallel stress preset matching `ltx23-two-stage` plus `--cfg-parallel-size 2` |
-| `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
-| `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
+| `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only native T2V preset at a model-supported 960x544 resolution, 65 requested frames, and 30 steps. Sequence-parallel runs may increase the frame count to satisfy their topology; record the resolved shape from the runtime log. |
+| `mova-360p` | `OpenMOSS-Team/MOVA-360p` | No | Two-GPU Ulysses I2VA baseline at 640x352 and 193 frames. Uses the upstream single-person fixture and a two-step profiling schedule. |
+| `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Four-GPU Ulysses I2VA baseline at 1280x720 and 193 frames. Uses the same upstream single-person fixture and two-step profiling schedule. |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
 | `joyai-edit` | `jdopensource/JoyAI-Image-Edit-Diffusers` | No | Skill-only JoyAI image-edit preset; uses the cat image, 1024x1024, 40 steps, guidance 4.0, 2-GPU CFG parallel |
 | `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
@@ -263,6 +364,11 @@ For MiniMax-H3, keep the native contract intact:
   `--model-variant`; do not point at a checkpoint subdirectory
 - use eager BF16/FP32 for consistency ground truth; current H3
   `torch.compile` changes numerical output
+- keep BCG off in the validated recipe. The support gate alone is not enough:
+  prompt-dependent packed-sequence host boundaries can differ between warmup
+  and serving and cause a signature miss. Any experimental fix must prove real
+  segment replay, byte-identical media, and an e2e win without excessive graph
+  memory
 - use Ulysses, not Ring, for H3's packed multi-segment attention; CFG parallel
   is invalid because the released pipeline has one denoising branch
 - keep the released overlapping tiled video-VAE decode. H3 rejects
@@ -512,7 +618,24 @@ Always keep:
 - exact command line, model shape, dtype, request `quality`, GPU topology, and
   whether synchronized stage profiling was enabled
 
-Never keep a perf dump produced after a diffusers-backend fallback.
+Never keep a perf dump produced after a diffusers-backend fallback. Also reject
+a zero-exit run if either the requested perf dump or generated media is absent:
+some generation failures are reported through the response payload without a
+nonzero process exit.
+
+For `quality=lossless`, compare saved artifact hashes and require byte equality
+for a claimed lossless fast path or BCG change. For `quality=high`, keep the
+lossless artifact as ground truth and report both aggregate and worst-frame
+SSIM/PSNR. Repository defaults are SSIM 0.95 / PSNR 28 dB for images and SSIM
+0.92 / PSNR 24 dB for videos; checked-in model/hardware consistency metadata
+may override them. Always inspect the image or a start/middle/end video contact
+sheet in addition to scalar metrics.
+
+Use denoise timing to locate the opportunity, but gate a performance PR on
+repeated saved-request end-to-end time. The project threshold for this sweep is
+at least 1.5% mean e2e improvement on same-GPU ABBA runs. Attach one
+representative baseline/candidate profile plus before/after images or videos to
+the PR description.
 
 Stage durations are host wall times around asynchronous GPU launches unless
 `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Without the sync, queued denoise
@@ -653,9 +776,14 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
-- [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
+- [ ] quality/BCG applicability matrix attempted on one GPU set
+- [ ] BCG rows show capture and no disable/failure/signature-miss/late-quality-fusion marker
+- [ ] request shape, seed, steps, guidance, topology, residency, and synchronized stage profiling match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
-- [ ] reference image or video checked for correctness
+- [ ] lossless artifact hash is exact; high-quality aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
+- [ ] reference image or start/middle/end video contact sheet checked visually
+- [ ] any PR claim has repeated saved-request e2e improvement >= 1.5%
+- [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files
 - [ ] any remaining kernel work handed off with perf/profile evidence attached

@@ -2,11 +2,17 @@
 
 from typing import Literal, get_args
 
+from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
+    AutoRoundConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     BitsAndBytesConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
@@ -21,9 +27,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
     NPUMXFP4Config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 
 QuantizationMethods = Literal[
+    "auto-round",
     "fp8",
     "modelopt",
     "modelopt_fp8",
@@ -33,12 +40,14 @@ QuantizationMethods = Literal[
     "mxfp8",
     "mxfp4",
     "mxfp4_npu",
+    "kitchen_int8",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "auto-round": AutoRoundConfig,
     "modelopt": ModelOptFp8DiffusionConfig,
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
@@ -48,6 +57,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "mxfp4": Mxfp4Config,
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,
+    "kitchen_int8": KitchenInt8Config,
 }
 
 

@@ -11,10 +11,21 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    keyframe_encoding,
     material_io,
     reference_encoding,
 )
+
+
+def test_keyframe_rng_supports_cpu_and_default_device():
+    initial_state = torch.random.get_rng_state()
+
+    for device in (None, torch.device("cpu")):
+        with keyframe_encoding.minimax_h3_scoped_encode_rng(42, device):
+            assert torch.initial_seed() == 42
+        torch.testing.assert_close(torch.random.get_rng_state(), initial_state)
 
 
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
@@ -256,3 +267,42 @@ def test_audio_decode_is_bounded_float_pcm_without_temp_files(monkeypatch):
     assert ffmpeg[ffmpeg.index("-ss") + 1] == "2.25"
     assert ffmpeg.index("-ss") < ffmpeg.index("-i")
     assert ffmpeg[-3:] == ["-f", "f32le", "pipe:1"]
+
+
+def test_reference_audio_encode_sets_forward_context(monkeypatch):
+    class FakeAudioVAE(torch.nn.Module):
+        attn_proj = True
+
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1))
+            self.mean_proj = torch.nn.Identity()
+
+        def preprocess(self, waveform, _sample_rate):
+            return waveform
+
+        def encoder(self, _audio_data):
+            return torch.ones(2, 32, 4)
+
+        def pre_block(self, hidden_states):
+            assert get_forward_context().current_timestep == 0
+            return hidden_states
+
+    monkeypatch.setattr(
+        reference_encoding,
+        "_load_waveform",
+        lambda *_args, **_kwargs: (torch.ones(2, 320), 32000),
+    )
+
+    result = reference_encoding.minimax_h3_encode_reference_audio_rows(
+        FakeAudioVAE(),
+        "/input/ref.wav",
+        SimpleNamespace(
+            latent_channels=32,
+            latents_mean=[0.0] * 32,
+            latents_std=[1.0] * 32,
+        ),
+    )
+
+    assert result["rows"].shape == (8, 32)
+    assert result["ref_audio_t"] == 4

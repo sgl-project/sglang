@@ -1,15 +1,34 @@
-"""Registered diffusion-model kernels and their public wrappers.
+"""Fused kernels for diffusion (multimodal-generation) models.
 
-Hot paths import concrete implementations from submodules. The package-level
-wrappers remain available for backward compatibility.
+This module is the **only** supported import surface for these kernels::
+
+    from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
+
+Importing a submodule directly (``...diffusion.norm.norm_triton``) couples the
+caller to the file layout; ``test_import_surface.py`` guards against it.  The
+one exception is a test that deliberately exercises a single backend.
+
+Layout -- one subpackage per **operator domain** (``norm``, ``modulate``,
+``rope``, ``activation``, ``attention``, ``layout``) with the backend carried
+as a filename suffix (``_triton`` / ``_jit`` / ``_cutedsl`` / ``_flydsl``, or
+``_bitexact`` where that is the more informative label), matching how
+``ops/attention`` and ``ops/gemm`` are organized.  ``common`` holds shared
+numerics and platform plumbing, ``sites`` the request-scoped mount policy, and
+``ext`` the JIT C++/CUDA extensions that are not kernels.  Start from
+``README.md``: several norms look interchangeable and are not.
+
+Resolution is lazy (PEP 562).  The backends have disjoint, heavy dependencies
+-- Triton, CUTLASS/CuTe-DSL, and FlyDSL (ROCm) -- so an eager
+re-export would turn every one of them into a hard import-time requirement on
+every platform.  ``_EXPORTS`` maps a symbol to its module and the import
+happens on first attribute access.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
     FormatSignature,
@@ -17,106 +36,472 @@ from sglang.kernels.spec import (
     KernelSpec,
 )
 
-if TYPE_CHECKING:
-    import torch
-    from torch import nn
-
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 
-register_kernel(
-    KernelSpec(
-        op="diffusion.apply_group_norm_silu",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.diffusion.group_norm_silu:apply_group_norm_silu",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(description="fused GroupNorm + SiLU"),
-        description="Fused group-norm + SiLU (Triton).",
-    )
+# ---------------------------------------------------------------------------
+# Registry inventory.  Metadata only -- registering imports neither torch nor a
+# backend and triggers no JIT build.  Ops carrying several backends (e.g.
+# ``scale_residual_norm_scale_shift`` in Triton, CuTe-DSL and FlyDSL) are
+# inventory: callers name the one they want via ``select_kernel``.
+# ---------------------------------------------------------------------------
+_SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
+    (
+        "diffusion.apply_group_norm_silu",
+        KernelBackend.TRITON,
+        "norm.group_norm_silu:apply_group_norm_silu",
+        _CUDA,
+        "Fused GroupNorm + SiLU.",
+    ),
+    (
+        "diffusion.group_norm_silu_4d",
+        KernelBackend.TRITON,
+        "norm.group_norm_silu_twopass_triton:group_norm_silu_4d",
+        _CUDA,
+        "Channels-last two-pass GroupNorm(+SiLU), 4D.",
+    ),
+    (
+        "diffusion.group_norm_silu_rows",
+        KernelBackend.TRITON,
+        "norm.group_norm_silu_twopass_triton:group_norm_silu_rows",
+        _CUDA,
+        "Channels-last two-pass GroupNorm(+SiLU) over (N, L, C) rows.",
+    ),
+    (
+        "diffusion.wan_rmsnorm_silu",
+        KernelBackend.TRITON,
+        "norm.wan_rmsnorm_silu_triton:wan_rmsnorm_silu",
+        _CUDA,
+        "Wan VAE channels_last_3d RMSNorm + SiLU.",
+    ),
+    (
+        "diffusion.rmsnorm_scale_shift",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_scale_shift_bitexact:fused_rmsnorm_scale_shift_bitexact",
+        _CUDA,
+        "Bit-exact RMSNorm + adaLN scale/shift.",
+    ),
+    (
+        "diffusion.scale_residual_norm_scale_shift",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_scale_shift_bitexact:fused_scale_residual_rmsnorm_scale_shift_bitexact",
+        _CUDA,
+        "Bit-exact residual-gate add + RMSNorm + scale/shift.",
+    ),
+    (
+        "diffusion.scale_residual_norm_scale_shift",
+        KernelBackend.CUTE_DSL,
+        "norm.scale_residual_norm_cutedsl:fused_scale_residual_norm_scale_shift",
+        _CUDA,
+        "CuTe-DSL residual + norm + scale/shift.",
+    ),
+    (
+        "diffusion.scale_residual_norm_scale_shift",
+        KernelBackend.FLYDSL,
+        "norm.fused_residual_norm_flydsl:flydsl_fused_residual_norm_scale_shift",
+        _HIP,
+        "FlyDSL (ROCm gfx950) residual + norm + scale/shift.",
+    ),
+    (
+        "diffusion.norm_scale_shift",
+        KernelBackend.CUTE_DSL,
+        "norm.scale_residual_norm_cutedsl:fused_norm_scale_shift",
+        _CUDA,
+        "CuTe-DSL norm + scale/shift.",
+    ),
+    (
+        "diffusion.norm_scale_shift",
+        KernelBackend.FLYDSL,
+        "norm.fused_residual_norm_flydsl:flydsl_norm_scale_shift",
+        _HIP,
+        "FlyDSL (ROCm gfx950) norm + scale/shift.",
+    ),
+    (
+        "diffusion.layernorm_modulate",
+        KernelBackend.TRITON,
+        "norm.layernorm_modulate_triton:fused_layernorm_modulate",
+        _CUDA,
+        "Bit-exact LayerNorm + adaLN modulate.",
+    ),
+    (
+        "diffusion.qk_head_layernorm",
+        KernelBackend.TRITON,
+        "norm.layernorm_modulate_triton:fused_qk_head_layernorm",
+        _CUDA,
+        "Bit-exact per-head LayerNorm for q/k.",
+    ),
+    (
+        "diffusion.qk_rmsnorm_native",
+        KernelBackend.TRITON,
+        "norm.zimage_qk_rmsnorm_triton:zimage_qk_rmsnorm_native",
+        _CUDA,
+        "Z-Image bf16-native per-head QK RMSNorm.",
+    ),
+    (
+        "diffusion.rmsnorm_scale",
+        KernelBackend.TRITON,
+        "norm.native_bf16_rmsnorm_triton:rmsnorm_scale",
+        _CUDA,
+        "BF16-native RMSNorm * scale.",
+    ),
+    (
+        "diffusion.rmsnorm_tanh_residual",
+        KernelBackend.TRITON,
+        "norm.native_bf16_rmsnorm_triton:rmsnorm_tanh_residual",
+        _CUDA,
+        "BF16-native x + tanh(gate) * RMSNorm(y).",
+    ),
+    (
+        "diffusion.modulate_scale_shift",
+        KernelBackend.JIT,
+        "modulate.modulate_scale_shift_jit:modulate_scale_shift",
+        _CUDA,
+        "Bit-exact adaLN modulate x * (1 + scale) + shift.",
+    ),
+    (
+        "diffusion.residual_gate_add",
+        KernelBackend.JIT,
+        "modulate.residual_gate_add_jit:residual_gate_add",
+        _CUDA,
+        "Fused residual + gate * update.",
+    ),
+    (
+        "diffusion.timestep_embedding",
+        KernelBackend.JIT,
+        "modulate.timestep_embedding_jit:timestep_embedding",
+        _CUDA,
+        "Sinusoidal timestep embedding.",
+    ),
+    (
+        "diffusion.temb_table_slices",
+        KernelBackend.TRITON,
+        "modulate.wan_temb_table_slices_triton:fused_temb_table_slices",
+        _CUDA,
+        "Contiguous adaLN slices for Wan2.2-TI2V.",
+    ),
+    (
+        "diffusion.ltx2_ada_values",
+        KernelBackend.TRITON,
+        "modulate.ltx2_ada_values_triton:ltx2_ada_values9",
+        _CUDA,
+        "LTX-2 nine-way adaLN value split.",
+    ),
+    (
+        "diffusion.fused_inplace_qknorm_rope",
+        KernelBackend.JIT,
+        "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
+        _CUDA,
+        "Fused in-place QK RMS-norm + RoPE.",
+    ),
+    (
+        "diffusion.ltx2_qknorm_split_rope",
+        KernelBackend.JIT,
+        "rope.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
+        _CUDA,
+        "LTX-2 QK-norm + split RoPE.",
+    ),
+    (
+        "diffusion.ltx25_decoder_rope",
+        KernelBackend.JIT,
+        "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
+        _CUDA,
+        "Paired LTX-2.5 decoder 3D RoPE.",
+    ),
+    (
+        "diffusion.rope_rotate_half",
+        KernelBackend.TRITON,
+        "rope.rope_rotate_half_bitexact:fused_rope_rotate_half_bitexact",
+        _CUDA,
+        "Bit-exact rotate-half RoPE.",
+    ),
+    (
+        "diffusion.interleaved_rope_fp64",
+        KernelBackend.JIT,
+        "rope.interleaved_rope_fp64_jit:fused_interleaved_rope_fp64",
+        _CUDA,
+        "Paired interleaved RoPE with fp64 Diffusers semantics.",
+    ),
+    (
+        "diffusion.hunyuan_qkv_rope_pack",
+        KernelBackend.TRITON,
+        "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
+        _CUDA,
+        "HunyuanVideo QKV pack + RoPE.",
+    ),
+    (
+        "diffusion.silu_mul",
+        KernelBackend.TRITON,
+        "activation.silu_mul_bitexact:fused_silu_mul_bitexact",
+        _CUDA,
+        "Bit-exact silu(a) * b for split-projection SwiGLU.",
+    ),
+    (
+        "diffusion.bias_silu",
+        KernelBackend.TRITON,
+        "activation.sana_conv_post_triton:fused_bias_silu",
+        _CUDA,
+        "Bit-exact conv bias + SiLU (Sana GLUMB).",
+    ),
+    (
+        "diffusion.bias_glu",
+        KernelBackend.TRITON,
+        "activation.sana_conv_post_triton:fused_bias_glu",
+        _CUDA,
+        "Bit-exact conv bias + GLU (Sana GLUMB).",
+    ),
+    (
+        "diffusion.linear_gelu_tanh",
+        KernelBackend.AOT,
+        "sites.fused_linear_gelu_site:fused_linear_gelu_tanh",
+        _CUDA,
+        "Linear + tanh-GELU via the cublasLt epilogue.",
+    ),
+    (
+        "diffusion.sparse_linear_attn_fwd",
+        KernelBackend.TRITON,
+        "attention.sparse_linear_attn_triton:_attn_fwd",
+        _CUDA,
+        "Sparse linear attention forward.",
+    ),
+    (
+        "diffusion.bigdn",
+        KernelBackend.TRITON,
+        "attention.sana_wm_gdn_triton:fused_bigdn_func",
+        _CUDA,
+        "Sana-WM bidirectional gated delta-net.",
+    ),
+    (
+        "diffusion.usp_merge_heads",
+        KernelBackend.JIT,
+        "layout.usp_relayout_jit:usp_merge_heads",
+        _CUDA,
+        "USP all-to-all output head merge.",
+    ),
+    (
+        "diffusion.pack_qkv_destination_major",
+        KernelBackend.TRITON,
+        "layout.ulysses_qkv_triton:pack_qkv_destination_major",
+        _CUDA,
+        "Ulysses destination-major QKV pack.",
+    ),
+    (
+        "diffusion.varlen_pack_qkv",
+        KernelBackend.TRITON,
+        "layout.varlen_pack_pad_triton:fused_pack_qkv",
+        _CUDA,
+        "Varlen gather of Q/K/V at valid positions.",
+    ),
+    (
+        "diffusion.varlen_scatter_to_padded",
+        KernelBackend.TRITON,
+        "layout.varlen_pack_pad_triton:fused_scatter_to_padded",
+        _CUDA,
+        "Varlen scatter back to the dense layout.",
+    ),
+    (
+        "diffusion.causal_conv3d_cat_pad",
+        KernelBackend.JIT,
+        "layout.causal_conv3d_cat_pad_jit:fused_causal_conv3d_cat_pad_cuda",
+        _CUDA,
+        "Causal Conv3d cat + pad.",
+    ),
+    (
+        "diffusion.causal_conv3d_cat_pad",
+        KernelBackend.TRITON,
+        "layout.causal_conv3d_cat_pad_triton:fused_causal_conv3d_cat_pad",
+        _CUDA,
+        "Causal Conv3d cat + pad (Triton).",
+    ),
+    (
+        "diffusion.cat_pad_channels_last_3d",
+        KernelBackend.TRITON,
+        "layout.wan_causal_cache_triton:cat_pad_channels_last_3d",
+        _CUDA,
+        "Wan causal VAE cat + pad in channels_last_3d.",
+    ),
+    (
+        "diffusion.dup_up3d_add",
+        KernelBackend.TRITON,
+        "layout.wan_causal_cache_triton:dup_up3d_add",
+        _CUDA,
+        "Wan causal VAE main + DupUp3D(src).",
+    ),
 )
-register_kernel(
-    KernelSpec(
-        op="diffusion.residual_gate_add",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(description="residual + gate * update"),
-        description="Fused residual gate-add (sglang.kernels.jit).",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="diffusion.fused_inplace_qknorm_rope",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.diffusion.qknorm_rope:fused_inplace_qknorm_rope",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True, description="fused in-place QK-norm + RoPE"
-        ),
-        description="Fused QK-norm + RoPE (sglang.kernels.jit).",
-    )
-)
-# Migrated from multimodal_gen (RFC #29630, Phase 2.5). Hot paths import the
-# Triton symbol directly; the registry entry remains for namespace discovery.
-register_kernel(
-    KernelSpec(
-        op="diffusion.sparse_linear_attn_fwd",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:_attn_fwd",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(description="sparse linear attention fwd"),
-        description="Sparse linear attention forward (Triton).",
-    )
-)
 
-
-def apply_group_norm_silu(
-    x: torch.Tensor, norm: nn.Module, activation: nn.Module
-) -> torch.Tensor:
-    """Fused GroupNorm + SiLU (falls back to eager when unsupported)."""
-    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.TRITON)(
-        x, norm, activation
+for _op, _backend, _target, _caps, _description in _SPECS:
+    register_kernel(
+        KernelSpec(
+            op=_op,
+            backend=_backend,
+            target=f"sglang.kernels.ops.diffusion.{_target}",
+            capabilities=_caps,
+            format_signature=FormatSignature(description=_description),
+            description=_description,
+        )
     )
 
+# ---------------------------------------------------------------------------
+# Public export table: symbol -> owning submodule.  Sorted by domain, module,
+# then symbol; a new public kernel belongs here and nowhere else.
+# ---------------------------------------------------------------------------
+_EXPORTS: dict[str, str] = {
+    "load_extension_with_recovery": "ext.loader",
+    # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
+    "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "apply_group_norm_silu": "norm.group_norm_silu",
+    "triton_group_norm_silu": "norm.group_norm_silu_triton",
+    "can_use_group_norm_silu_4d": "norm.group_norm_silu_twopass_triton",
+    "can_use_group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
+    "group_norm_silu_4d": "norm.group_norm_silu_twopass_triton",
+    "group_norm_silu_rows": "norm.group_norm_silu_twopass_triton",
+    "can_use_fused_layernorm_modulate": "norm.layernorm_modulate_triton",
+    "can_use_fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
+    "fused_layernorm_modulate": "norm.layernorm_modulate_triton",
+    "fused_layernorm_modulate_raw": "norm.layernorm_modulate_triton",
+    "fused_qk_head_layernorm": "norm.layernorm_modulate_triton",
+    "is_plain_layer_norm": "norm.layernorm_modulate_triton",
+    "rmsnorm_scale": "norm.native_bf16_rmsnorm_triton",
+    "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
+    "norm_infer": "norm.norm_triton",
+    "rms_norm_fn": "norm.norm_triton",
+    "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
+    "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
+    "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
+    "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
+    "fused_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "fused_scale_residual_norm_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
+    "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
+    "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
+    "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
+    # adaLN modulation, gating and timestep conditioning
+    "indexed_gate_bf16": "modulate.indexed_modulation_triton",
+    "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
+    "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
+    "ltx2_ada_values9": "modulate.ltx2_ada_values_triton",
+    "can_use_modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
+    "modulate_scale_shift": "modulate.modulate_scale_shift_jit",
+    "modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
+    "can_use_residual_gate_add_cuda": "modulate.residual_gate_add_jit",
+    "residual_gate_add": "modulate.residual_gate_add_jit",
+    "residual_gate_add_cuda": "modulate.residual_gate_add_jit",
+    "fuse_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
+    "fuse_residual_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
+    "fuse_scale_shift_kernel": "modulate.scale_shift_triton",
+    "try_fused_scaled_residual_add_exact": "modulate.scale_shift_triton",
+    "timestep_embedding": "modulate.timestep_embedding_jit",
+    "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
+    "fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
+    # Rotary embeddings and the QK-norm chains fused around them
+    "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
+    "can_use_ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
+    "ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
+    "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
+    "can_use_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
+    "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
+    "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
+    "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
+    "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
+    "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
+    "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "apply_rotary_embedding": "rope.rotary_triton",
+    # Activation-function fusions
+    "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
+    "can_use_fused_bias_silu": "activation.sana_conv_post_triton",
+    "fused_bias_glu": "activation.sana_conv_post_triton",
+    "fused_bias_silu": "activation.sana_conv_post_triton",
+    "can_use_fused_silu_mul": "activation.silu_mul_bitexact",
+    "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    # Diffusion attention kernels
+    "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
+    "fused_bigdn_func": "attention.sana_wm_gdn_triton",
+    "fused_qk_inv_rms": "attention.sana_wm_gdn_triton",
+    "prepare_rope_tables": "attention.sana_wm_gdn_triton",
+    "_attn_fwd": "attention.sparse_linear_attn_triton",
+    "get_block_map": "attention.sparse_linear_attn_triton",
+    # Data movement: bitwise identical to the aten chains they replace
+    "can_use_fused_causal_conv3d_cat_pad_cuda": "layout.causal_conv3d_cat_pad_jit",
+    "fused_causal_conv3d_cat_pad_cuda": "layout.causal_conv3d_cat_pad_jit",
+    "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
+    "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "can_use_usp_merge_heads": "layout.usp_relayout_jit",
+    "usp_merge_heads": "layout.usp_relayout_jit",
+    "build_inv_indices": "layout.varlen_pack_pad_triton",
+    "fused_pack_qkv": "layout.varlen_pack_pad_triton",
+    "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
+    "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
+    "dup_up3d_add": "layout.wan_causal_cache_triton",
+    # Fusion-site policy: quality gate, first-sight verification, mount
+    "BitExactFusionGate": "sites.bitexact_gate",
+    "flashinfer_rmsnorm_diagnostic_hint": "sites.bitexact_gate",
+    "tensors_equal": "sites.bitexact_gate",
+    "fused_gate_rmsnorm_active": "sites.fused_gate_rmsnorm_site",
+    "fused_rmsnorm_scale": "sites.fused_gate_rmsnorm_site",
+    "fused_rmsnorm_tanh_residual": "sites.fused_gate_rmsnorm_site",
+    "mark_fused_gate_rmsnorm_site": "sites.fused_gate_rmsnorm_site",
+    "mount_fused_gate_rmsnorm": "sites.fused_gate_rmsnorm_site",
+    "unmount_fused_gate_rmsnorm": "sites.fused_gate_rmsnorm_site",
+    "can_use_linear_gelu": "sites.fused_linear_gelu_site",
+    "fused_gelu_active": "sites.fused_linear_gelu_site",
+    "fused_linear_gelu_tanh": "sites.fused_linear_gelu_site",
+    "mark_fused_gelu_site": "sites.fused_linear_gelu_site",
+    "mount_fused_linear_gelu": "sites.fused_linear_gelu_site",
+    "unmount_fused_linear_gelu": "sites.fused_linear_gelu_site",
+    "can_use_ln_modulate": "sites.fused_ln_modulate_site",
+    "fused_ln_modulate": "sites.fused_ln_modulate_site",
+    "fused_ln_modulate_active": "sites.fused_ln_modulate_site",
+    "mark_fused_ln_modulate_site": "sites.fused_ln_modulate_site",
+    "mount_fused_ln_modulate": "sites.fused_ln_modulate_site",
+    "unmount_fused_ln_modulate": "sites.fused_ln_modulate_site",
+    "mark_hunyuan_qknorm_site": "sites.hunyuan_qknorm_site",
+    "mount_hunyuan_qknorm": "sites.hunyuan_qknorm_site",
+    "try_hunyuan_qknorm": "sites.hunyuan_qknorm_site",
+    "unmount_hunyuan_qknorm": "sites.hunyuan_qknorm_site",
+    "can_use_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "fused_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "ltx2_rms_norm_modulate_active": "sites.ltx2_rmsnorm_modulate_site",
+    "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
+    "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
+    "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
+    "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "try_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "unmount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "mark_sana_video_linear_attention_site": "sites.sana_video_linear_attention_site",
+    "mount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "sana_video_linear_attention_active": "sites.sana_video_linear_attention_site",
+    "try_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "unmount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "QualityGatedFusion": "sites.quality_gate",
+    # JIT C++/CUDA extensions (not kernels, not in the registry)
+    "interpolate": "ext.hunyuan3d_rasterizer",
+    "rasterize": "ext.hunyuan3d_rasterizer",
+    "meshVerticeInpaint": "ext.mesh_processor",
+}
 
-def residual_gate_add(
-    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
-) -> torch.Tensor:
-    """Fused ``residual + gate * update``."""
-    return get_kernel("diffusion.residual_gate_add", KernelBackend.JIT)(
-        residual, update, gate
-    )
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public symbol to its submodule on first access (PEP 562)."""
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(f"{__name__}.{module}"), name)
+    globals()[name] = value  # cache; later lookups skip __getattr__ entirely
+    return value
 
 
-def fused_inplace_qknorm_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    is_neox: bool,
-    eps: float = 1e-6,
-    head_dim: int = 0,
-    rope_dim: int = 0,
-) -> None:
-    """Fused in-place QK RMS-norm + RoPE."""
-    return get_kernel("diffusion.fused_inplace_qknorm_rope", KernelBackend.JIT)(
-        q,
-        k,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        is_neox=is_neox,
-        eps=eps,
-        head_dim=head_dim,
-        rope_dim=rope_dim,
-    )
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))
 
 
-__all__ = [
-    "apply_group_norm_silu",
-    "residual_gate_add",
-    "fused_inplace_qknorm_rope",
-]
+__all__ = sorted(_EXPORTS)

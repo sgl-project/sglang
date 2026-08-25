@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 # Note: AMD registration removed - test_model_file_verifier fails on AMD
-register_cpu_ci(est_time=540, suite="base-c-test-cpu")
+register_cpu_ci(est_time=146, suite="base-c-test-cpu")
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
