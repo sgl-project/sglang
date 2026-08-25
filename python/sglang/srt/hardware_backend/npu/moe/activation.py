@@ -22,7 +22,7 @@ class BaseActivation(ABC):
 
 
 # =============================================================================
-# Concrete activation implementations (unchanged except removed 8.)
+# Concrete activation implementations
 # =============================================================================
 class NPUSwiglu(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -35,27 +35,6 @@ class NPUSwigluQuant(BaseActivation):
             hidden_states,
             quant_mode=1,
             activate_left=True,
-        )
-        return hidden_states, swiglu_out_scale
-
-
-class NPUSwigluMXFP8Quant(BaseActivation):
-    """SwiGLU then MXFP8 requantisation for W4A8 MXFP MoE.
-
-    gmm1 (fp4 weights) produces bf16 output; this activation step runs
-    ``npu_swiglu`` then ``npu_dynamic_mx_quant(dst_type=float8_e4m3fn)`` to
-    produce the e4m3 payload + e8m0 block scale that gmm2 expects.  Mirrors
-    vllm-ascend's separate swiglu + requant for W4A8MXFP (which uses
-    ``npu_swiglu_group_quant``; here we use the standard swiglu +
-    dynamic-mx-quant pair instead of a custom fused op).
-    """
-
-    def _apply_activation(self, hidden_states: torch.Tensor):
-        # hidden_states: gmm1 output [tokens, 2*inter] bf16
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        # [tokens, inter] → FP8 e4m3 + e8m0 block scale
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            hidden_states, dst_type=torch.float8_e4m3fn
         )
         return hidden_states, swiglu_out_scale
 
@@ -86,11 +65,31 @@ class NPUSwigluQuantWithScales(BaseActivation):
 
 
 class NPUSwigluDeepEPKernel(BaseActivation):
-    def __init__(self, need_quant: bool = True):
-        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+    """DeepEP grouped SwiGLU for the Ascend MoE runner; picks ``swiglu_quant`` vs the MiniMax
+    SwiGLU-OAI variant (``swiglu_oai_quant``: ``gate*sigmoid(gate*alpha)*(up+1)`` w/ clamping)
+    based on whether ``alpha``/``limit`` are given. The runner must forward
+    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU."""
 
-        self._kernel = swiglu_quant
+    def __init__(
+        self,
+        need_quant: bool = True,
+        alpha: Optional[float] = None,
+        limit: Optional[float] = None,
+    ):
         self.need_quant = need_quant
+        self.alpha = alpha
+        self.limit = limit
+        self._use_oai = alpha is not None and limit is not None
+        if self._use_oai:
+            from sgl_kernel_npu.activation.swiglu_oai_quant import (
+                swiglu_oai_quant,
+            )
+
+            self._kernel = swiglu_oai_quant
+        else:
+            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+            self._kernel = swiglu_quant
 
     def _apply_activation(
         self,
@@ -98,12 +97,55 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        hidden_states, per_token_scale = self._kernel(
-            hidden_states, group_list, group_list_type, need_quant=self.need_quant
-        )
+        if self._use_oai:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states,
+                self.alpha,
+                self.limit,
+                need_quant=self.need_quant,
+                group_list=group_list,
+                group_list_type=group_list_type,
+            )
+        else:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states, group_list, group_list_type, need_quant=self.need_quant
+            )
         if self.need_quant:
             return hidden_states, per_token_scale
         return hidden_states, None
+
+
+class NPUSitu(BaseActivation):
+    """SiTU activation and optional INT8 requantization for grouped rows."""
+
+    def __init__(
+        self,
+        *,
+        need_quant: bool,
+        beta: float = 4.0,
+        linear_beta: Optional[float] = 25.0,
+    ):
+        from sgl_kernel_npu.activation.situ import situ
+
+        self.situ = situ
+        self.need_quant = need_quant
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ(
+            hidden_states,
+            group_list,
+            group_list_type,
+            need_quant=self.need_quant,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
 
 
 class NPUGeluAndMul(BaseActivation):

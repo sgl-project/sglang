@@ -15,6 +15,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.runtime_context import (
+    get_lora,
+    get_serving,
+)
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -292,14 +297,25 @@ class RuntimeHandle:
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
         ready_event = None
+        gen = None
         try:
-            ready_event = self._install_on_ready(chunk_callback) if stream else None
+            ready_event = self._install_on_ready(chunk_callback)
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
+                completed_choices = set()
+                # generate_request does not normalize obj until iteration begins.
+                sampling_params = obj.sampling_params or {}
+                expected_choices = max(1, int(sampling_params.get("n", 1)))
                 async for chunk in gen:
-                    finished = (
+                    choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    if choice_finished:
+                        choice_id = chunk.get(
+                            "index", chunk.get("meta_info", {}).get("id")
+                        )
+                        completed_choices.add(choice_id)
+                    finished = len(completed_choices) >= expected_choices
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
@@ -313,15 +329,26 @@ class RuntimeHandle:
                 self._safe_callback(chunk_callback, {}, finished=True)
             else:
                 result = await gen.__anext__()
-                self._safe_callback(chunk_callback, result, finished=True)
+                chunks = result if isinstance(result, list) else [result]
+                for index, chunk in enumerate(chunks):
+                    keep_going = await self._send_with_backpressure(
+                        chunk_callback,
+                        ready_event,
+                        chunk,
+                        finished=index == len(chunks) - 1,
+                        timeout_abort_rid=obj.rid,
+                    )
+                    if not keep_going:
+                        return
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
         finally:
-            if stream:
-                self._uninstall_on_ready(chunk_callback)
+            if gen is not None:
+                await gen.aclose()
+            self._uninstall_on_ready(chunk_callback)
 
     async def _run_embed(self, obj, chunk_callback, request):
         try:
@@ -376,17 +403,31 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": self.server_args.tokenizer_path,
+            "served_model_name": self.tokenizer_manager.served_model_name,
+            "tokenizer_path": get_serving().tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.tokenizer_manager.config_value("weight_version"),
+            "load_format": self.tokenizer_manager.config_value("load_format"),
+            "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
+            "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if embedding_model_spec is not None:
+            result["embedding"] = resolved_embedding_plan(
+                embedding_model_spec,
+                server_args=self.server_args,
+                model_config=model_config,
+            )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
         result.update(self.scheduler_info)
+        result["kv_events"] = (
+            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
@@ -424,9 +465,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.server_args.enable_lora and hasattr(
-            self.tokenizer_manager, "lora_registry"
-        ):
+        if get_lora().enable_lora and hasattr(self.tokenizer_manager, "lora_registry"):
             lora_registry = self.tokenizer_manager.lora_registry
             for _, lora_ref in lora_registry.get_all_adapters().items():
                 models.append(

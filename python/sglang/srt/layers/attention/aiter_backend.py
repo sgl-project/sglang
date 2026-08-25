@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 
 """
 end to end attention solution with aiter kernels
@@ -43,6 +47,7 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        flash_attn_varlen_fp8_pertensor_func,
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
@@ -64,8 +69,12 @@ from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    scaled_fp8_quant,
+)
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -127,6 +136,11 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
+
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -142,14 +156,14 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
 
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -857,6 +871,11 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
+        verify_tokens_per_req = (
+            forward_batch.input_ids.shape[0] // forward_batch.batch_size
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -866,6 +885,7 @@ class AiterAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            verify_tokens_per_req=verify_tokens_per_req,
         )
 
         # Refill the SWA write-target buffer from the live out_cache_loc and
@@ -1196,8 +1216,8 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
+                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
-                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -1500,6 +1520,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        verify_tokens_per_req: Optional[int],
     ):
 
         num_kv_splits = None
@@ -1652,11 +1673,17 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
+            assert verify_tokens_per_req is not None
+            # MLA uses a fixed draft length (num_draft_tokens); the non-MLA
+            # unified path derives it per batch from input_ids.
+            tokens_per_req = (
+                self.num_draft_tokens if self.use_mla else verify_tokens_per_req
+            )
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * tokens_per_req,
+                step=tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1689,9 +1716,9 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = self.num_draft_tokens
 
             if self.use_mla:
+                max_q_len = self.num_draft_tokens
                 if _use_mla_ps_kernel:
                     num_kv_splits = self.max_split_per_batch
 
@@ -1735,6 +1762,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
@@ -1753,7 +1781,7 @@ class AiterAttnBackend(AttentionBackend):
                             bs,
                             seq_lens,
                             req_pool_indices,
-                            self.num_draft_tokens,
+                            verify_tokens_per_req,
                             page_table_dest=page_table,
                             swa_page_table_dest=swa_page_table,
                         )
@@ -2262,12 +2290,15 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
-                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
-                        # Present the local KV head as per-Q-head stride-0 views so
-                        # target_verify uses the same local head mapping as the model.
-                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
-                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                    # GQA-packing fix: do NOT expand the single KV head to
+                    # tp_q_head_num. Passing K/V with the true kv-head count (exactly
+                    # like forward_decode) lets unified_attention derive
+                    # num_queries_per_kv = tp_q_head_num (the GQA group) and pack all Q
+                    # heads against one KV load. The old stride-0 .expand() made the
+                    # wrapper see num_kv_heads=tp_q_head_num -> num_queries_per_kv=1 ->
+                    # full MHA tiling (~7x more KV traffic at long context; trace
+                    # signature num_query_heads_16/num_queries_per_kv_1). GQA head
+                    # mapping here is identical to the proven decode path.
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
@@ -2278,7 +2309,9 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        seqused_k=(
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -2314,12 +2347,106 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            # draft_extend (EAGLE-v2 KV catch-up) is decode-shaped: short Q
+            # (accepted tokens) against long paged KV, GQA. The default
+            # mha_batch_prefill_func FMHA has no split-KV, so at short Q it is
+            # occupancy-starved (~0.2% HBM BW, ~400x over the memory floor).
+            # Route it through unified_attention (GQA-packed + split-KV), exactly
+            # like target_verify, so it runs near the memory floor.
+            if (
+                self._use_unified_verify
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
+            ):
+                bs = forward_batch.batch_size
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                page_table, swa_page_table = self._build_unified_page_table_from_spec(
+                    self.forward_metadata, bs
+                )
+                pt = page_table
+                de_window = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    de_window = (layer.sliding_window_size - 1, 0)
+                    if swa_page_table is not None:
+                        pt = swa_page_table
+                kv_indptr = self.forward_metadata.kv_indptr
+                seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.qo_indptr[: bs + 1],
+                    seqused_k=seqused_k,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=pt.shape[1] * self.page_size,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=de_window,
+                    block_table=pt,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
             bs0 = forward_batch.batch_size + 1
             q_descale = None
 
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
+
+            if (
+                is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+                and self.kv_cache_dtype == fp8_dtype
+            ):
+                q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                fp8_q_descale = (
+                    layer.k_scale if layer.k_scale is not None else self.k_scale
+                )
+                o = flash_attn_varlen_fp8_pertensor_func(
+                    q_c.to(fp8_dtype),
+                    k_c.to(fp8_dtype),
+                    v_c.to(fp8_dtype),
+                    fp8_q_descale.reshape(1),
+                    k_descale.reshape(1),
+                    v_descale.reshape(1),
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
@@ -2547,6 +2674,12 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    q, _ = scaled_fp8_quant(q, q_descale)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2566,7 +2699,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=window_size,
                     block_table=page_table,
                     softcap=0,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
@@ -2828,7 +2961,7 @@ class AiterMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int

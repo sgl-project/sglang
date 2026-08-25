@@ -16,7 +16,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix
 
 BertConfig = None
@@ -365,9 +365,7 @@ class BertModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        pooling_type = (
-            PoolingType.CLS if get_server_args().is_embedding else PoolingType.LAST
-        )
+        pooling_type = PoolingType.CLS if get_model().is_embedding else PoolingType.LAST
         self.pooler = (
             BertPooler(config)
             if self.use_bert_pooler

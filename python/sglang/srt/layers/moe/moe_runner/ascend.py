@@ -10,16 +10,14 @@ import torch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
+    NPUSitu,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
-    NPUSwigluMXFP8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUMXFP4W4A4MoEMethod,
-    NPUMXFP4W4A8MoEMethod,
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
@@ -91,42 +89,33 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if isinstance(kernel, (NPUMXFP8MoEMethod, NPUMXFP4W4A4MoEMethod)):
-            if isinstance(kernel, NPUMXFP4W4A4MoEMethod) and (
-                get_moe_a2a_backend().is_deepep()
-            ):
-                # W4A4's fp4 fused gmm1 on DeepEP's (low-latency 3D) dispatch is
-                # untested; restrict to ascend_tp like the W4A8 path.
-                raise ValueError(
-                    "MXFP4 W4A4 MoE on Ascend is TP-only. Run without "
-                    "--moe-a2a-backend deepep."
-                )
-            # MXFP8 / W4A4 fuse gate/up + swiglu + requant into gmm1, so there is
-            # no separate activation step — run() skips it. Left None on purpose
-            # so that reaching for it fails loudly instead of silently applying
-            # an unfused swiglu to already-requantised activations. For MXFP8 this
-            # holds for both dispatchers: ascend_tp gets its activation quant
-            # fused into routing, DeepEP dispatches bf16 and gmm1 quantises it
-            # itself. W4A4 always dispatches bf16 (no fp4 routing quant) and gmm1
-            # quantises to fp4 itself.
+        if isinstance(kernel, NPUMXFP8MoEMethod):
+            # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
+            # separate activation step — run() skips it. Left None on purpose so
+            # that reaching for it fails loudly instead of silently applying an
+            # unfused swiglu to already-requantised activations. This holds for
+            # both dispatchers: ascend_tp gets its activation quant fused into
+            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
-        elif isinstance(kernel, NPUMXFP4W4A8MoEMethod):
-            if get_moe_a2a_backend().is_deepep():
-                raise ValueError(
-                    "MXFP4 W4A8 MoE on Ascend is TP-only: it takes its "
-                    "activation quant from npu_moe_init_routing_v2(quant_mode=3), "
-                    "which the DeepEP dispatch path does not go through. Run "
-                    "without --moe-a2a-backend deepep."
-                )
-            # W4A8 gmm1 (fp4 weight) produces bf16 output → separate swiglu +
-            # FP8 requant step, unlike MXFP8 which fuses everything into gmm1.
-            self.activation = NPUSwigluMXFP8Quant()
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
-            self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
+            if config.activation == "situ":
+                self.activation = NPUSitu(
+                    need_quant=is_quant_kernel,
+                    beta=(
+                        config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
+                    ),
+                    linear_beta=config.gemm1_clamp_limit,
+                )
+            else:
+                self.activation = NPUSwigluDeepEPKernel(
+                    need_quant=is_quant_kernel,
+                    alpha=config.gemm1_alpha,
+                    limit=config.gemm1_clamp_limit,
+                )
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
@@ -170,10 +159,10 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, (NPUMXFP8MoEMethod, NPUMXFP4W4A4MoEMethod)):
+        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
             # --- w13 projection + activation, fused into one kernel ---
-            # MXFP8 / W4A4 gmm1 returns activations already requantised for gmm2,
-            # so there is no separate activation step to run.
+            # MXFP8 gmm1 returns activations already requantised for gmm2, so
+            # there is no separate activation step to run.
             hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
                 quant_info,
                 x,
@@ -194,8 +183,11 @@ class AscendRunnerCore(MoeRunnerCore):
             )
 
             # --- Activation ---
-            # The DeepEP kernel expects extra dispatch metadata
-            if isinstance(self.activation, NPUSwigluDeepEPKernel):
+            # Grouped-row activations require dispatch metadata.
+            if isinstance(
+                self.activation,
+                (NPUSwigluDeepEPKernel, NPUSitu),
+            ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
                     group_list=expert_tokens,

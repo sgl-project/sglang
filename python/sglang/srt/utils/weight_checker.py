@@ -56,6 +56,7 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "inv_freq",
     "freqs_cis",
     "_weight_fp32",
+    "expert_mask_gpu",
 )
 
 
@@ -194,6 +195,9 @@ def _check_tensors(
         actual_should_compare,
         actual_comparable,
     ) in zip(expect_tensors, actual_tensors, strict=True):
+        if ".cos_sin_cache" in expect_name:
+            # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
+            continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             should_compare == actual_should_compare

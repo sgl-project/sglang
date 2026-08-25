@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
 
+
 class Mxfp4W4A8Config(QuantizationConfig):
     """Expert-only MXFP4 W4A8 online quantization config.
 
@@ -100,10 +101,10 @@ class Mxfp4W4A8Config(QuantizationConfig):
                 )
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
-                    NPUMXFP4W4A8FusedMoEMethod,
+                    NPUW4A8MXFP4OnlineMoEMethod,
                 )
 
-                return NPUMXFP4W4A8FusedMoEMethod(self)
+                return NPUW4A8MXFP4OnlineMoEMethod(self)
             raise NotImplementedError(
                 "mxfp_w4a8 (MXFP4 weights + MXFP8 activations, W4A8) FusedMoE is "
                 "currently only implemented for the Ascend NPU backend; no "

@@ -21,14 +21,15 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:sgl_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             in_place=True,
             description="per-token FP8 quantization into output_q/output_s",
         ),
-        description="Per-token FP8 quantization (sgl_kernel wheel).",
+        description="Per-token FP8 quantization (sglang.kernels.jit).",
     )
 )
 # fp8 / int8 are legacy aliases of the same 8bit kernel in the wheel; register
@@ -78,7 +79,7 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.AOT)(
+    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
 
@@ -172,7 +173,6 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
     ("fp8_kernel", "w8a8_block_fp8_matmul"),
-    ("fp8_kernel", "mxfp8_block_scaled_matmul_triton"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
     ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),

@@ -1417,6 +1417,7 @@ class MoriKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1424,12 +1425,17 @@ class MoriKVSender(CommonKVSender):
         if should_skip:
             return
 
+        transfer_state_indices = (
+            None
+            if self.kv_mgr._should_skip_cp_replicated_state_transfer()
+            else state_indices
+        )
         normalized_state = (
-            _normalize_state_indices_per_component(state_indices)
+            _normalize_state_indices_per_component(transfer_state_indices)
             if is_last_chunk
             else None
         )
-        self._record_transfer_indices(kv_indices, state_indices)
+        self._record_transfer_indices(kv_indices, transfer_state_indices)
         wait_event = getattr(self, "_early_send_wait_event", None)
         self._early_send_wait_event = None
         self.kv_mgr.enqueue_transfer(

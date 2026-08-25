@@ -10,11 +10,11 @@ from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache_components import (
+from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache

@@ -57,7 +57,7 @@ class Mxfp4W4A4Config(QuantizationConfig):
       single-level RTN degenerated under greedy decoding, so the finer FP8 L0
       scale is used for the non-expert layers.
     * ``FusedMoE`` → single-level MXFP4 experts
-      (``NPUMXFP4W4A4FusedMoEMethod``). MoE has no grouped dual-level kernel, so
+      (``NPUW4A4MXFP4OnlineMoEMethod``). MoE has no grouped dual-level kernel, so
       the experts stay single-level; the online-RTN risk is contained by the
       mixed-precision layout (only the experts drop to W4A4 — the surrounding
       Linear layers keep the more accurate dual-level MXFP4).
@@ -165,7 +165,7 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 )
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
-                    NPUMXFP4W4A4FusedMoEMethod,
+                    NPUW4A4MXFP4OnlineMoEMethod,
                 )
 
                 # Experts run single-level MXFP4 (packed fp4 weights + fp4
@@ -174,7 +174,7 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 # risk is mitigated by keeping this to the experts only (the
                 # mixed-precision layout — non-expert layers stay MXFP8/BF16).
                 # Requires Ascend 950 (A5).
-                return NPUMXFP4W4A4FusedMoEMethod(self)
+                return NPUW4A4MXFP4OnlineMoEMethod(self)
             # MoE single-level MXFP4 W4A4 has no CUDA/other-device kernel; fall
             # back to unquantised rather than fail load on non-NPU backends.
             logger.warning(

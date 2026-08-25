@@ -58,20 +58,23 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    check_equal_or_regex_match,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -130,6 +133,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
 
+    @property
+    def kv_cache_quant_algo(self) -> Optional[str]:
+        """Duck-typed by configure_kv_cache_dtype to resolve --kv-cache-dtype
+        auto: loaded scales need the fp8 pool they calibrate, never bf16."""
+        if (
+            self.kv_cache_scheme is not None
+            and CompressedTensorsKVCacheMethod.is_supported_scheme(self.kv_cache_scheme)
+        ):
+            return "FP8"
+        return None
+
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
@@ -155,8 +169,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = hf_to_sglang_mapper.apply_list(
             self.sparsity_ignore_list
         )
-        if self.kv_cache_scheme is not None:
-            self.kv_cache_scheme = hf_to_sglang_mapper.apply_dict(self.kv_cache_scheme)
+        # kv_cache_scheme is deliberately not remapped: it holds schema fields
+        # (type/num_bits/strategy), never module names, and apply_dict drops
+        # keys a mapper deletion rule happens to match.
 
     def get_quant_method(
         self,
@@ -175,9 +190,48 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            scheme = self.get_lm_head_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                # Unquantized head: fall back to the embedding default.
+                return None
+            layer.scheme = scheme
+            return CompressedTensorsLinearMethod(self)
+
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            if self.kv_cache_scheme is None:
+                return None
+            if not CompressedTensorsKVCacheMethod.is_supported_scheme(
+                self.kv_cache_scheme
+            ):
+                # Degrade, don't refuse to boot: unquantized-scale KV serves fine.
+                logger.warning_once(
+                    f"Ignoring compressed-tensors kv_cache_scheme "
+                    f"{self.kv_cache_scheme}: only static symmetric "
+                    f"per-tensor FP8 scales are supported."
+                )
+                return None
+            return CompressedTensorsKVCacheMethod(self)
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            # Detect MXFP4 before the scheme-based path: MXFP4 uses a
+            # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
+            # handles all MoE backends, bypassing the scheme abstraction.
+            if self._is_mxfp4_moe(layer_name=prefix):
+                from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+                logger.info_once(
+                    "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
+                )
+                return Mxfp4MoEMethod(prefix=prefix)
+
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -248,6 +302,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             quant_format=quant_format,
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
+            kv_cache_scheme=config.get("kv_cache_scheme"),
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
@@ -305,7 +360,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
+
+                # A config_group may carry its own format. When several groups
+                # use different formats, compressed-tensors sets the top-level
+                # format to "mixed-precision" and the real format lives on each
+                # group, so the per-group value must win.
+                group_format = quant_config.get("format")
+                target_scheme_map[target]["format"] = group_format
+                act_quant_format = is_activation_quantization_format(
+                    group_format if group_format is not None else quant_format
+                )
+
+                if act_quant_format:
                     input_activations = quant_config.get("input_activations")
                     # When activation quant format is set but no
                     # input_activations provided: valid for w8a16fp8 (FLOAT
@@ -330,6 +396,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if _is_xpu:
+            if error:
+                raise RuntimeError(
+                    f"Quantization scheme requiring compute capability "
+                    f"{min_capability} is not supported on XPU."
+                )
+            return False
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -548,6 +622,28 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
 
+    def _is_mxfp4_moe(self, layer_name: str) -> bool:
+        """Detect MXFP4-quantized MoE from global format or target scheme."""
+        if "mxfp4" in (self.quant_format or ""):
+            return True
+        self._add_fused_moe_to_target_scheme_map()
+        for key in ["FusedMoE", "Linear"]:
+            scheme = self.target_scheme_map.get(key)
+            if scheme is None:
+                continue
+            wq = scheme.get("weights")
+            if wq is None:
+                continue
+            if (
+                wq.num_bits == 4
+                and wq.type == QuantizationType.FLOAT
+                and wq.strategy == QuantizationStrategy.GROUP.value
+                and wq.group_size == 32
+                and wq.symmetric
+            ):
+                return True
+        return False
+
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -572,13 +668,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_w4 and weight_quant.symmetric and is_token and is_dynamic
 
     def _get_scheme_from_parts(
-        self, weight_quant: BaseModel, input_quant: BaseModel
+        self,
+        weight_quant: BaseModel,
+        input_quant: BaseModel,
+        format: Optional[str] = None,
     ) -> CompressedTensorsLinearScheme:
+        # The format of the config_group this layer matched, when it declares
+        # one. Falls back to the top-level format, which is "mixed-precision"
+        # (i.e. meaningless on its own) for multi-group checkpoints.
+        quant_format = format if format is not None else self.quant_format
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
-                self.quant_format == CompressionFormat.pack_quantized.value
+                quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
                 return CompressedTensorsWNA16(
@@ -593,7 +696,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
-        if is_activation_quantization_format(self.quant_format):
+        if is_activation_quantization_format(quant_format):
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -606,9 +709,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
-                is_fp8_w8a8_supported = self._check_scheme_supported(
-                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
-                )
+                if _is_xpu:
+                    is_fp8_w8a8_supported = True
+                else:
+                    is_fp8_w8a8_supported = self._check_scheme_supported(
+                        CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                    )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
@@ -771,7 +877,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
 
     def get_linear_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+        self,
+        layer: torch.nn.Module,
+        layer_name: Optional[str] = None,
+        matched_target: Optional[str] = None,
     ) -> Optional[CompressedTensorsLinearScheme]:
         """
         compressed-tensors supports non uniform in the following way:
@@ -793,12 +902,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         # need to make accelerate optional in ct to do this
 
         # Use the new get_scheme_dict method to extract QuantizationArgs
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        scheme_dict = self.get_scheme_dict(layer, layer_name, matched_target)
         weight_quant = None
         input_quant = None
+        scheme_format = None
         if scheme_dict:
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
+            scheme_format = scheme_dict.get("format")
 
         # Find the sparsity scheme of the layer
         # assume that fused layers inerhit first component's sparsity scheme
@@ -834,21 +945,85 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme = self._get_scheme_from_parts(  # type: ignore
                 weight_quant=weight_quant,
                 input_quant=input_quant,
+                format=scheme_format,
             )
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if not _is_npu:
+        if _is_xpu:
+            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+                raise RuntimeError(
+                    f"{scheme.__class__.__name__} is not supported on XPU "
+                    "(no XPU kernel implementation)."
+                )
+        elif not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 
+    def get_lm_head_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[CompressedTensorsLinearScheme]:
+        """Resolve the scheme for a ParallelLMHead, or None if the checkpoint
+        stores the head unquantized.
+
+        The head is treated as quantized only when a config target names it by
+        layer name (exact or ``re:`` regex, e.g. ``re:.*lm_head``). Module-type
+        targets like ``Linear`` are not consulted: llm-compressor emits those
+        for decoder linears, and checkpoints following the common convention
+        leave the head out of both ``targets`` and ``ignore`` — matching by
+        name keeps such heads on the unquantized path instead of tripping
+        ``find_matched_target``'s unmatched-layer error.
+        """
+        if layer_name is None or not self.target_scheme_map:
+            return None
+        if should_ignore_layer(
+            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return None
+        # check_equal_or_regex_match also accepts dotted-suffix targets
+        # (e.g. target "lm_head" for a "language_model.lm_head" prefix), which
+        # find_matched_target's exact/regex name pass would miss — so the match
+        # made here is carried through instead of being re-derived downstream.
+        # When several config groups name the head, the first target in config
+        # order wins — the same first-match rule find_matched_target applies
+        # to every other layer.
+        matched_target = next(
+            (
+                target
+                for target in self.target_scheme_map
+                if check_equal_or_regex_match(layer_name=layer_name, targets=[target])
+            ),
+            None,
+        )
+        if matched_target is None:
+            return None
+        weights = self.target_scheme_map[matched_target].get("weights")
+        if weights is not None and weights.block_structure:
+            # The vocab-parallel weight loader shards output_dim=0 params by
+            # vocab index; a block weight_scale's first dim is vocab/block_n,
+            # which that loader cannot shard or even load at TP=1.
+            raise NotImplementedError(
+                "Block-quantized lm_head is not supported; use channel or "
+                "tensor weight scales for the head."
+            )
+        return self.get_linear_scheme(
+            layer=layer, layer_name=layer_name, matched_target=matched_target
+        )
+
     def get_scheme_dict(
-        self, layer: torch.nn.Module, layer_name: str | None = None
+        self,
+        layer: torch.nn.Module,
+        layer_name: str | None = None,
+        matched_target: str | None = None,
     ) -> dict[str, QuantizationArgs | str | None] | None:
         """
         Extract the QuantizationArgs for a given layer.
+
+        A caller that already resolved the layer's target (e.g. via
+        suffix-aware matching) passes it as ``matched_target`` to skip
+        ``find_matched_target``'s stricter exact/regex lookup.
 
         Returns:
             dict with {
@@ -864,12 +1039,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=self.target_scheme_map.keys(),
-                fused_mapping=self.packed_modules_mapping,
-            )
+            if matched_target is None:
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
+                    module=layer,
+                    targets=self.target_scheme_map.keys(),
+                    fused_mapping=self.packed_modules_mapping,
+                )
 
             return self.target_scheme_map[matched_target]
 
@@ -956,6 +1132,27 @@ class CompressedTensorsConfig(QuantizationConfig):
             return False
 
         return weight_quant.num_bits == input_quant.num_bits == 8
+
+
+class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
+    """Load calibrated k_scale / v_scale from a compressed-tensors checkpoint
+    that declares a ``kv_cache_scheme`` (static per-tensor FP8)."""
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        assert self.is_supported_scheme(quant_config.kv_cache_scheme)
+        super().__init__(quant_config)
+
+    @staticmethod
+    def is_supported_scheme(kv_cache_scheme: Dict[str, Any]) -> bool:
+        """Static symmetric per-tensor FP8 — all BaseKVCacheMethod can
+        represent. Dynamic schemes serialize no k_scale/v_scale tensors."""
+        return (
+            kv_cache_scheme.get("type") == "float"
+            and kv_cache_scheme.get("num_bits") == 8
+            and kv_cache_scheme.get("strategy") == "tensor"
+            and kv_cache_scheme.get("symmetric", True)
+            and not kv_cache_scheme.get("dynamic", False)
+        )
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):
