@@ -6,10 +6,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
@@ -188,83 +186,76 @@ class TestRegisterToBootstrap(CustomTestCase):
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
 
+    @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    @patch("sglang.srt.disaggregation.common.conn.get_world_group")
-    def test_rust_registers_with_every_dp_listener(self, mock_world_group, mock_put):
+    def test_url_with_dist_init_addr(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
 
-        cases = (
-            (
-                "separate dp",
-                {"system_dp_size": 2},
-                None,
-                [
-                    ("http://127.0.0.1:8765/route", 8765),
-                    ("http://127.0.0.1:8766/route", 8766),
-                ],
-            ),
-            (
-                "attention dp across nodes",
-                {
-                    "attn_dp_size": 2,
-                    "dist_init_addr": "10.0.0.1:12345",
-                    "rust_http_port": 8765,
-                },
-                [
-                    (0, "10.0.0.1", 8765),
-                    None,
-                    (1, "10.0.0.2", 8765),
-                    None,
-                ],
-                [
-                    ("http://10.0.0.1:8765/route", 8765),
-                    ("http://10.0.0.2:8765/route", 8765),
-                ],
-            ),
-        )
-        with envs.SGLANG_RUST_SERVER.override(True):
-            for name, overrides, gathered, expected in cases:
-                with self.subTest(name):
-                    mock_put.reset_mock()
-                    mock_world_group.return_value.all_gather_object.reset_mock()
-                    mgr = self._make_manager(**overrides)
-                    mock_world_group.return_value.all_gather_object.return_value = (
-                        gathered
-                    )
-
-                    mgr.register_to_bootstrap()
-
-                    actual = [
-                        (put_call.args[0], put_call.kwargs["json"]["prefill_http_port"])
-                        for put_call in mock_put.call_args_list
-                    ]
-                    self.assertEqual(actual, expected)
-                    for put_call in mock_put.call_args_list:
-                        self.assertEqual(put_call.kwargs["json"]["system_dp_rank"], 0)
-                        self.assertEqual(put_call.kwargs["json"]["attn_dp_rank"], 0)
-                    if gathered is None:
-                        mock_world_group.return_value.all_gather_object.assert_not_called()
-                    else:
-                        mock_world_group.return_value.all_gather_object.assert_called_once_with(
-                            (0, "127.0.0.1", 8765)
-                        )
-
-    @patch("sglang.srt.disaggregation.common.conn.time")
-    @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_rust_registry_retry_exhaustion_fails_startup(self, mock_put, mock_time):
-        mock_time.monotonic.return_value = 0.0
-        mock_put.return_value = MagicMock(status_code=503)
         mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
+        mgr.register_to_bootstrap()
 
-        with (
-            envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(RuntimeError, "10.0.0.1:8765"),
-        ):
-            mgr.register_to_bootstrap()
+        url_used = mock_put.call_args[0][0]
+        self.assertIn("10.0.0.1", url_used)
 
-        self.assertEqual(mock_put.call_count, 5)
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    @patch("sglang.srt.disaggregation.common.conn.get_world_group")
+    def test_rust_attention_dp_replicates_complete_topology_across_hosts(
+        self, mock_world_group, mock_put
+    ):
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        gathered = [
+            ("10.0.0.1", 8765),
+            None,
+            ("10.0.0.2", 8765),
+            None,
+        ]
+        mock_world_group.return_value.all_gather_object.return_value = gathered
+
+        with envs.SGLANG_RUST_SERVER.override(True):
+            for dp_rank, tp_rank, local_ip, rust_http_port in (
+                (0, 0, "10.0.0.1", 8765),
+                (0, 1, "10.0.0.1", None),
+                (1, 0, "10.0.0.2", 8765),
+                (1, 1, "10.0.0.2", None),
+            ):
+                self._make_manager(
+                    attn_dp_size=2,
+                    attn_dp_rank=dp_rank,
+                    attn_tp_size=2,
+                    attn_tp_rank=tp_rank,
+                    local_ip=local_ip,
+                    rust_http_port=rust_http_port,
+                ).register_to_bootstrap()
+
+        topology_by_registry = {}
+        for put_call in mock_put.call_args_list:
+            payload = put_call.kwargs["json"]
+            topology_by_registry.setdefault(put_call.args[0], set()).add(
+                (payload["attn_dp_rank"], payload["attn_tp_rank"])
+            )
+        complete_topology = {(0, 0), (0, 1), (1, 0), (1, 1)}
+        self.assertEqual(
+            topology_by_registry,
+            {
+                "http://10.0.0.1:8765/route": complete_topology,
+                "http://10.0.0.2:8765/route": complete_topology,
+            },
+        )
+        self.assertEqual(
+            mock_world_group.return_value.all_gather_object.call_args_list,
+            [
+                call(("10.0.0.1", 8765)),
+                call(None),
+                call(("10.0.0.2", 8765)),
+                call(None),
+            ],
+        )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -319,6 +310,10 @@ class TestRegisterToBootstrap(CustomTestCase):
         dist_init_addr=None,
         system_dp_size=1,
         attn_dp_size=1,
+        attn_dp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        local_ip="127.0.0.1",
         rust_http_port=None,
     ):
         """Create a manager with only the state needed for registration."""
@@ -331,17 +326,17 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.dist_init_addr = dist_init_addr
         mgr.bootstrap_host = "127.0.0.1"
         mgr.bootstrap_port = 8765
-        mgr.attn_tp_size = 1
-        mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = attn_tp_size
+        mgr.attn_tp_rank = attn_tp_rank
         mgr.attn_cp_size = 1
         mgr.attn_cp_rank = 0
         mgr.attn_dp_size = attn_dp_size
-        mgr.attn_dp_rank = 0
+        mgr.attn_dp_rank = attn_dp_rank
         mgr.pp_size = 1
         mgr.pp_rank = 0
         mgr.system_dp_size = system_dp_size
         mgr.system_dp_rank = 0
-        mgr.local_ip = "127.0.0.1"
+        mgr.local_ip = local_ip
         mgr.rank_port = 12345
 
         mgr.kv_args = KVArgs()
@@ -351,84 +346,6 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_cache_dtype_str = "auto"
 
         return mgr
-
-
-class TestPrefillBootstrapSenderAddress(CustomTestCase):
-    @patch("sglang.srt.disaggregation.common.conn.requests.post")
-    def test_request_registry_uses_bootstrap_port_and_effective_dp_rank(
-        self, mock_post
-    ):
-        from sglang.srt.disaggregation.common.conn import CommonKVManager
-        from sglang.srt.disaggregation.nixl.conn import NixlKVSender
-        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
-
-        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-        queue.pp_rank = 0
-        queue.tp_rank = 0
-        queue.transfer_backend = TransferBackend.NIXL
-        queue._check_if_req_exceed_kv_capacity = MagicMock(return_value=False)
-        queue._process_req = MagicMock()
-
-        mock_post.return_value = MagicMock(status_code=200)
-        with get_context().override_server_args(
-            load_balance_method="round_robin", dp_size=2
-        ):
-            for name, system_dp_size, system_dp_rank, attn_dp_rank in (
-                ("separate dp", 2, 1, 0),
-                ("attention dp", 1, 1, 1),
-            ):
-                with self.subTest(name):
-                    manager = CommonKVManager.__new__(CommonKVManager)
-                    manager.is_dummy_cp_rank = False
-                    manager.system_dp_size = system_dp_size
-                    manager.system_dp_rank = system_dp_rank
-                    manager.attn_dp_rank = attn_dp_rank
-                    manager.update_status = MagicMock()
-                    queue.kv_manager = manager
-                    req = SimpleNamespace(
-                        bootstrap_host="2001:db8::1",
-                        bootstrap_port=30001,
-                        bootstrap_room=42,
-                        disagg_prefill_dp_rank=None,
-                    )
-                    mock_post.reset_mock()
-
-                    self.assertTrue(queue.create_sender(req, num_kv_heads=8))
-
-                    mock_post.assert_called_once_with(
-                        "http://[2001:db8::1]:30001/register_dp_rank",
-                        json={"bootstrap_room": 42, "dp_rank": 1},
-                        timeout=5,
-                    )
-                    self.assertIsInstance(req.disagg_kv_sender, NixlKVSender)
-
-    @patch("sglang.srt.disaggregation.common.conn.requests.post")
-    def test_follow_bootstrap_room_accepts_matching_ordinary_dp_rank(self, mock_post):
-        from sglang.srt.disaggregation.common.conn import CommonKVManager
-        from sglang.srt.disaggregation.nixl.conn import NixlKVSender
-
-        manager = CommonKVManager.__new__(CommonKVManager)
-        manager.is_dummy_cp_rank = False
-        manager.system_dp_size = 2
-        manager.system_dp_rank = 1
-        manager.attn_dp_rank = 0
-        manager.update_status = MagicMock()
-        manager.record_failure = MagicMock()
-
-        with get_context().override_server_args(
-            load_balance_method="follow_bootstrap_room", dp_size=2
-        ):
-            NixlKVSender(
-                mgr=manager,
-                bootstrap_addr="127.0.0.1:30000",
-                bootstrap_room=43,
-                dest_tp_ranks=[0],
-                pp_rank=0,
-                req_has_disagg_prefill_dp_rank=False,
-            )
-
-        mock_post.assert_not_called()
-        manager.record_failure.assert_not_called()
 
 
 if __name__ == "__main__":

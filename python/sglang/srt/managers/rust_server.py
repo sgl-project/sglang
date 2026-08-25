@@ -397,14 +397,15 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
-        # Each DP scheduler owns an HTTP listener at the base port plus its DP rank.
-        parallel_state = scheduler.ps
+        http_addr = f"{server_args.host}:{server_args.port}"
+
+        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
+        # so the rank is not conflated with rank 0 of a one-rank group.
+        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         http_port = server_args.port
-        dp_note = ""
-        if parallel_state.dp_size > 1:
-            http_port += parallel_state.dp_rank
-            dp_note = f" (DP rank {parallel_state.dp_rank}/{parallel_state.dp_size})"
-        http_addr = f"{server_args.host}:{http_port}"
+        if dp_rank is not None:
+            http_port += dp_rank
+            http_addr = f"{server_args.host}:{http_port}"
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -465,6 +466,9 @@ class RustServer:
 
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
+        dp_note = (
+            "" if dp_rank is None else f" (DP rank {dp_rank}/{scheduler.ps.dp_size})"
+        )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
             http_addr,
