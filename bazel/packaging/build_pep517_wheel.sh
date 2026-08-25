@@ -61,7 +61,9 @@ for source in "${params[@]:1}"; do
 done
 
 cp "$stage/README.md" "$stage/python/README.md"
-cp "$stage/LICENSE" "$stage/python/LICENSE"
+# Keep LICENSE only at the synthetic SCM root. Copying it into python/ makes
+# newer setuptools add a dist-info/licenses entry absent from the authoritative
+# repository build.
 
 # setuptools-scm is both the version provider and setuptools' authoritative
 # package-data file finder. The pretend version avoids reading checkout history,
