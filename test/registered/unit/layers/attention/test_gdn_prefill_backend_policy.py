@@ -108,6 +108,17 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner(self)), "flashinfer")
 
+    def test_selects_flashinfer_for_sm120_gdn(self):
+        # SM120 (consumer/workstation Blackwell) uses the same C++ path as SM90,
+        # which requires float32 SSM state.
+        runner = make_runner(self, state_dtype=torch.float32)
+        self.assertEqual(self.apply_policy(runner, capability=(12, 0)), "flashinfer")
+
+    def test_rejects_sm120_with_bfloat16_state(self):
+        # SM120 requires float32 state; bfloat16 is only valid on SM100.
+        runner = make_runner(self, state_dtype=torch.bfloat16)
+        self.assertIsNone(self.apply_policy(runner, capability=(12, 0)))
+
     def test_selects_flashinfer_for_radix_cache_strategies(self):
         for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
@@ -165,10 +176,12 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_rejects_unsupported_capability(self):
         cases = (
             ("non_cuda", {}, {"cuda": False}),
-            ("hopper", {}, {"capability": (9, 0)}),
-            ("future_sm", {}, {"capability": (12, 0)}),
+            ("future_sm", {}, {"capability": (13, 0)}),
             ("cuda_12", {}, {"cuda_version": "12.9"}),
-            ("fp32_state", {"state_dtype": torch.float32}, {}),
+            # SM100 requires bfloat16 state; float32 is a dtype mismatch.
+            ("sm100_fp32_state", {"state_dtype": torch.float32}, {"capability": (10, 0)}),
+            # SM120 requires float32 state; bfloat16 is a dtype mismatch.
+            ("sm120_bf16_state", {"state_dtype": torch.bfloat16}, {"capability": (12, 0)}),
             ("key_dim", {"key_dim": 64}, {}),
             ("value_dim", {"value_dim": 64}, {}),
             ("missing_api", {}, {"flashinfer_available": False}),
