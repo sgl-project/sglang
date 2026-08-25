@@ -19,6 +19,10 @@ cd "${stage}/src"
 case "${backend}" in
   cpu) cp pyproject_cpu.toml pyproject.toml ;;
   cuda) ;;
+  rocm)
+    cp pyproject_rocm.toml pyproject.toml
+    cp setup_rocm.py setup.py
+    ;;
   *)
     echo "unsupported sgl-kernel backend: ${backend}" >&2
     exit 2

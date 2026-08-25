@@ -32,6 +32,15 @@ kernel_wheel(
     target_compatible_with = ["//bazel/platforms:cuda"],
 )
 
+kernel_wheel(
+    name = "rocm_wheel",
+    srcs = [":wheel_sources"],
+    backend = "rocm",
+    source_root = "python/sglang/kernels/aot",
+    tags = ["manual"],
+    target_compatible_with = ["//bazel/platforms:rocm"],
+)
+
 filegroup(
     name = "main_wheel_pep517_sources",
     srcs = pep517_source_glob(["**"]),

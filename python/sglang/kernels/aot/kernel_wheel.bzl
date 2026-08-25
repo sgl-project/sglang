@@ -29,7 +29,7 @@ kernel_wheel = rule(
     attrs = {
         "backend": attr.string(
             mandatory = True,
-            values = ["cpu", "cuda"],
+            values = ["cpu", "cuda", "rocm"],
         ),
         "source_root": attr.string(mandatory = True),
         "srcs": attr.label_list(allow_files = True),
