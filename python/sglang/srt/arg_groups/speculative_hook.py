@@ -289,7 +289,8 @@ def _resolve_dflash_block_size(
     server_args: ServerArgs, *, tree_width: int, draft_config
 ) -> int:
     """The draft block width, from (in order) the explicit flag, the
-    --speculative-num-draft-tokens alias, the draft checkpoint, or a hardcoded default."""
+    --speculative-num-draft-tokens alias, the draft checkpoint, or a hardcoded default.
+    """
     explicit = server_args.speculative_dflash_block_size
     alias = server_args.speculative_num_draft_tokens
 
@@ -376,12 +377,41 @@ def _resolve_dflash_widths(server_args: ServerArgs) -> None:
     server_args.speculative_num_draft_tokens = 1 + (block_size - 1) * tree_width
     server_args.speculative_eagle_topk = tree_width
 
+    _log_dflash_widths(tree_width=tree_width, block_size=block_size)
+
+
+def _log_dflash_widths(*, tree_width: int, block_size: int) -> None:
+    """Record the resolved verify shape so a run can be reconstructed from its log.
+
+    Only for tree runs; at width 1 these are the values every DFLASH launch has always
+    had, so logging them would be noise. `SGLANG_DFLASH_FORCE_TREE_VERIFY` has to be
+    part of the condition rather than the width alone: it is the one switch that
+    decouples the verify *shape* from the resolved widths (it sends a width-1 run down
+    the tree path, leaving tree_width at 1), so gating on `tree_width > 1` would leave
+    that configuration indistinguishable from a plain chain run in the log.
+    """
+    from sglang.srt.environ import envs
+
+    force_tree_verify = envs.SGLANG_DFLASH_FORCE_TREE_VERIFY.get()
+    if tree_width <= 1 and not force_tree_verify:
+        return
+
+    logger.info(
+        "DFLASH tree verify: tree_width=%d, block_size=%d, verify_width=%d, "
+        "force_tree_verify=%s",
+        tree_width,
+        block_size,
+        1 + (block_size - 1) * tree_width,
+        force_tree_verify,
+    )
+
 
 def _validate_dflash_tree_selector(
     *, draft_config, tree_width: int, block_size: int
 ) -> None:
     """The tree is a beam over the candidate selector's transition lattice, so the checkpoint
-    must have a selector and the beam cannot be wider than the lattice's candidate axis."""
+    must have a selector and the beam cannot be wider than the lattice's candidate axis.
+    """
     if not draft_config.selector_rank or not draft_config.selector_top_k:
         raise ValueError(
             f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires a DFlash 2 draft checkpoint with a "
@@ -489,7 +519,6 @@ def _validate_dflash_tree_admission(server_args: ServerArgs) -> None:
             f"{_DFLASH_TREE_WIDTH_FLAG}={tree_width}. Use SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed "
             "or unset SGLANG_SIMULATE_ACC_LEN."
         )
-
 
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
