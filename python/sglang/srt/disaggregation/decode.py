@@ -94,6 +94,9 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
@@ -316,6 +319,12 @@ class DecodeRequest:
         return self.req.priority
 
 
+@dataclass
+class DemotedRequest:
+    req: Req
+    demoted_start_time: float
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -368,6 +377,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
+        self.demotion_queue: List[DemotedRequest] = []
         self.pending_reqs: List[DecodeRequest] = []
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
@@ -783,6 +793,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
         self.retracted_queue.clear()
+        for entry in self.demotion_queue:
+            retraction_discard(
+                entry.req,
+                self.tree_cache,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+        self.demotion_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -846,6 +863,76 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if i not in indices_to_remove
         ]
 
+        return resumed_reqs
+
+    def add_demoted_req(
+        self, req: Req, demoted_start_time: Optional[float] = None
+    ) -> None:
+        self.demotion_queue.append(
+            DemotedRequest(
+                req=req,
+                demoted_start_time=(
+                    time.monotonic()
+                    if demoted_start_time is None
+                    else demoted_start_time
+                ),
+            )
+        )
+
+    def resume_demoted_reqs(self) -> List[Req]:
+        """Restore demoted requests only after their recovery duration expires."""
+        recovery_duration = (
+            self.scheduler.server_args.proactive_demotion_recovery_duration
+        )
+        now = time.monotonic()
+        resumed_reqs: List[Req] = []
+        indices_to_remove = set()
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        if uses_swa_tail_prealloc:
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(count_retracted=False)
+            )
+        else:
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                count_retracted=False
+            )
+
+        for i, entry in enumerate(self.demotion_queue):
+            if now - entry.demoted_start_time < recovery_duration:
+                continue
+            req = entry.req
+            if self.req_to_token_pool.available_size() <= 0:
+                break
+
+            full_required, swa_required = self._prealloc_required_tokens(req)
+            if full_required > full_allocatable_tokens:
+                break
+            if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+                break
+
+            self._pre_alloc(req)
+            req.is_retracted = False
+            retraction_restore(
+                req,
+                self.tree_cache,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
+            full_allocatable_tokens -= full_required
+            if uses_swa_tail_prealloc:
+                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                    count_retracted=False,
+                    extra_reserved_reqs=len(resumed_reqs),
+                )
+
+        self.demotion_queue = [
+            entry
+            for i, entry in enumerate(self.demotion_queue)
+            if i not in indices_to_remove
+        ]
         return resumed_reqs
 
     def _update_handshake_waiters(
@@ -2701,6 +2788,108 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    def need_to_proactive_retract_request(self: Scheduler) -> bool:
+        # Experimental: strategy to proactively demote the longest request when
+        # the output length distribution is imbalanced and the cache usage is high.
+        collector = getattr(self, "decode_metric_collector", None)
+        if collector is None:
+            return False
+
+        updated = collector.maybe_update()
+        if updated is not None:
+            p50_output_len, p95_output_len = updated
+            self.if_output_len_imbalance = (
+                p50_output_len is not None
+                and p95_output_len is not None
+                and p50_output_len > 0
+                and p95_output_len
+                >= p50_output_len
+                * self.server_args.proactive_decode_demotion_output_len_threthold
+            )
+
+        if not self.if_output_len_imbalance:
+            return False
+
+        cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+        return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
+
+    def proactively_demote_longest_request(self: Scheduler) -> bool:
+        batch = self.running_batch
+        if batch is None or batch.is_empty():
+            return False
+
+        # This runs before the next forward is launched. In overlap mode,
+        # _apply_war_barrier has already ordered the scheduler stream after the
+        # previous forward, and result processing skips requests marked here as
+        # retracted.
+        collector = getattr(self, "decode_metric_collector", None)
+        p50_output_len = getattr(collector, "p50_output_len", None)
+        if p50_output_len is None or p50_output_len <= 0:
+            return False
+
+        candidate_threshold = (
+            self.server_args.candidate_demotion_output_len_threthold
+        )
+        demoted_any = False
+        candidates = [
+            (index, req)
+            for index, req in enumerate(batch.reqs)
+            if not req.finished()
+            and not req.is_retracted
+            and len(req.output_ids) > candidate_threshold * p50_output_len
+        ]
+        while (
+            self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            > self.server_args.proactive_decode_safe_cache_usage
+        ):
+            if not candidates:
+                break
+
+            victim_index, victim = max(
+                candidates, key=lambda item: item[1].seqlen
+            )
+            backup_saved = batch.release_req(
+                victim_index,
+                max(0, batch.batch_size() - 1),
+                self.server_args,
+            )
+            if backup_saved:
+                victim.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.add_demoted_req(victim)
+                demoted_any = True
+            else:
+                victim.to_finish = FINISH_ABORT(
+                    "Proactive demotion host KV backup failed; request aborted.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(victim, finished_reason=victim.to_finish.to_json()),
+                    victim,
+                )
+
+            batch.filter_batch(
+                keep_indices=[
+                    index
+                    for index, _ in enumerate(batch.reqs)
+                    if index != victim_index
+                ]
+            )
+            batch.batch_is_full = False
+            self.new_token_ratio_tracker.current = (
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
+                    batch.reqs
+                )
+            )
+            candidates = [(index, req) for index, req in candidates if index != victim_index]
+            logger.warning(
+                "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
+                victim.rid,
+                victim.seqlen,
+                len(victim.output_ids),
+            )
+
+        return demoted_any
+
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
@@ -2715,6 +2904,13 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
+
+        resumed_demoted_reqs = self.disagg_decode_prealloc_queue.resume_demoted_reqs()
+        self.waiting_queue.extend(resumed_demoted_reqs)
+
+        if self.need_to_proactive_retract_request():
+            self.proactively_demote_longest_request()
+
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return

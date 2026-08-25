@@ -112,13 +112,21 @@ class SchedulerLoadInquirer:
             decode_retracted_queue = (
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
+            decode_demotion_queue = (
+                self.get_disagg_decode_prealloc_queue().demotion_queue
+            )
             waiting_queues.append(decode_prealloc_queue)
             waiting_queues.append(decode_transfer_queue)
             waiting_queues.append(decode_retracted_queue)
+            waiting_queues.append(decode_demotion_queue)
             # In disaggregated decode, transfer-queue requests and transferred
             # waiting-queue requests have already pre-allocated decode-side KV
             # slots, so they are already included in num_used_tokens.
-            pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
+            pending_token_queues = [
+                decode_prealloc_queue,
+                decode_retracted_queue,
+                decode_demotion_queue,
+            ]
             # KV not yet arrived from the prefill side.
             awaiting_kv_tokens = sum(
                 req.seqlen

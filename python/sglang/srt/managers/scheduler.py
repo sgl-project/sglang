@@ -283,6 +283,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.decode_metric_collector import DecodeMetricCollector
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -1329,6 +1330,8 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        self.decode_metric_collector = None
+        self.if_output_len_imbalance = False
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1422,6 +1425,8 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+            if self.server_args.enable_proactive_decode_promotion:
+                self.decode_metric_collector = DecodeMetricCollector()
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -4058,6 +4063,8 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+            if self.decode_metric_collector is not None:
+                self.decode_metric_collector.observe_batch_output_lengths(batch.reqs)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -4240,6 +4247,7 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+            idle &= len(self.disagg_decode_prealloc_queue.demotion_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -4252,6 +4260,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+                idle &= len(self.disagg_decode_prealloc_queue.demotion_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
@@ -4758,6 +4767,23 @@ class Scheduler(
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+
+            if self.disagg_decode_prealloc_queue.demotion_queue:
+                remaining_demoted = []
+                for entry in self.disagg_decode_prealloc_queue.demotion_queue:
+                    req = entry.req
+                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                        retraction_discard(
+                            req,
+                            self.tree_cache,
+                            get_disagg().disaggregation_decode_retraction_backup,
+                        )
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            _make_abort_req(req), req
+                        )
+                    else:
+                        remaining_demoted.append(entry)
+                self.disagg_decode_prealloc_queue.demotion_queue = remaining_demoted
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

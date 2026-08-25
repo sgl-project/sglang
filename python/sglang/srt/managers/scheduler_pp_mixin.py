@@ -367,6 +367,8 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
+        # TODO(zhangmj): need to support proactive decode demotion with PP
+        # consensus in the future.
         self.init_pp_loop_state()
 
         # PD additional state initialization
