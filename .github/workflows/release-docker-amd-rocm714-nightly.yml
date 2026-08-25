@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly ROCm7.14 (AMD)
+name: Release Docker Images Nightly ROCm7.14 AITER dc4bdf1c (AMD)
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +18,7 @@ on:
   # until the workflow file exists on the default branch.
   push:
     branches:
-      - bingxche/rocm714-ci-test-20260825
+      - bingxche/rocm714-aiter-dc4bdf1c-ci-test-20260825
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
@@ -93,8 +93,8 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           case "${{ matrix.gpu_arch }}" in
-            gfx942-rocm714) rocm_tag="rocm714-mi30x" ;;
-            gfx950-rocm714) rocm_tag="rocm714-mi35x" ;;
+            gfx942-rocm714) rocm_tag="rocm714-aiter-dc4bdf1c-mi30x" ;;
+            gfx950-rocm714) rocm_tag="rocm714-aiter-dc4bdf1c-mi35x" ;;
             *)
               echo "Unsupported gfx arch"
               exit 1
