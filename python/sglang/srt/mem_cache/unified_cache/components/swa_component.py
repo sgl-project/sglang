@@ -1148,7 +1148,7 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value

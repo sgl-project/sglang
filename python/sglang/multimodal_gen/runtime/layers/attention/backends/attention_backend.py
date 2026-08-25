@@ -209,6 +209,21 @@ class AttentionImpl(ABC, Generic[T]):
             f"{type(self).__name__} does not implement packed varlen attention"
         )
 
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one rotated KV chunk for ring merging.
+
+        Inputs use packed ``[T, H, D]`` layout. The returned attention output
+        has the query shape and softmax LSE uses ``[H, Tq]`` layout.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement ring KV-chunk attention"
+        )
+
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
     return wrap_method_with_debug_kernel_once(

@@ -68,6 +68,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -206,6 +207,8 @@ class GenerateReqInput:
     ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Optional request-scoped video processor configuration.
+    video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.
@@ -317,7 +320,6 @@ class GenerateReqInput:
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    mm_data_mooncake: Optional[List[Any]] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
@@ -1024,10 +1026,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    # Pickled Optional[List[{"url": MultimodalDataInputItem, "modality": Modality}]]
-    # from MMReceiverBase._extract_url_data. "url" is ImageData.url,
-    # dict["url"] when present, or the original raw multimodal item.
-    mm_data_mooncake: Optional[PickleWrapper] = None
     # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
@@ -1044,11 +1042,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     cache_salt: Optional[str] = None
 
     def wrap_pickle_fields(self):
-        self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
-        self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1460,6 +1456,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1550,6 +1548,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1928,6 +1928,10 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = True
 
 
+class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+    pass
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
@@ -2006,6 +2010,7 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
