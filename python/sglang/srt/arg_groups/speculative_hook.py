@@ -189,6 +189,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     from sglang.srt.arg_groups.overrides import resolved_view
+
     if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
         raise ValueError(
             "DFLASH speculative decoding only supports CUDA and NPU devices."
