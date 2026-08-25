@@ -1851,7 +1851,8 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
-    prefetch_stats: Dict[str, float] = field(default_factory=dict)`r`n
+    prefetch_stats: Dict[str, float] = field(default_factory=dict)
+
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
     def __init__(
@@ -1972,7 +1973,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, outcome=outcome
                 ).inc(increment)
             self._last_prefetch_outcomes[outcome] = current
-    def log_prefetched_tokens\(self, prefetched_tokens: int\):
+    def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
@@ -2007,7 +2008,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
-        self.log_prefetch_outcomes(storage_metrics.prefetch_stats)`r`n
+        self.log_prefetch_outcomes(storage_metrics.prefetch_stats)
+
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):
     def __init__(self, ep_size: int) -> None:
