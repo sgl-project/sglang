@@ -293,6 +293,12 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    @property
+    def bootstrap_dp_rank(self) -> int:
+        if self.system_dp_size > 1:
+            return self.system_dp_rank
+        return self.attn_dp_rank
+
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
 
@@ -769,23 +775,62 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
-    def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP PUT."""
+    def _bootstrap_registry_endpoints(self) -> List[NetworkAddress]:
         if self.dist_init_addr:
-            # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
-            # Single-node case: bootstrap server's host is the same as http server's host
-            host = self.bootstrap_host
-            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
-            # and can't be connected to; rewrite it to the same-family loopback,
-            # which the wildcard listener also binds.  (self.local_ip is wrong
-            # here — it can resolve to a different family than the listener,
-            # e.g. IPv6 while the server is bound to 0.0.0.0.)
-            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+                self.bootstrap_host, self.bootstrap_host
+            )
 
-        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
-        url = f"{bootstrap_na.to_url()}/route"
+        if not envs.SGLANG_RUST_SERVER.get():
+            return [NetworkAddress(host, self.bootstrap_port)]
+
+        if self.system_dp_size > 1:
+            return [
+                NetworkAddress(host, self.bootstrap_port + dp_rank)
+                for dp_rank in range(self.system_dp_size)
+            ]
+
+        if self.attn_dp_size == 1:
+            return [NetworkAddress(host, self.bootstrap_port)]
+
+        local_endpoint = None
+        if self.kv_args.rust_http_port is not None:
+            local_endpoint = (
+                self.bootstrap_dp_rank,
+                self.local_ip,
+                self.kv_args.rust_http_port,
+            )
+        gathered = get_world_group().all_gather_object(local_endpoint)
+
+        endpoints_by_rank: Dict[int, NetworkAddress] = {}
+        for endpoint in gathered:
+            if endpoint is None:
+                continue
+            dp_rank, endpoint_host, endpoint_port = endpoint
+            if dp_rank in endpoints_by_rank:
+                raise RuntimeError(
+                    f"Multiple embedded Rust bootstrap registries found for "
+                    f"attention DP rank {dp_rank}."
+                )
+            endpoints_by_rank[dp_rank] = NetworkAddress(
+                str(endpoint_host), int(endpoint_port)
+            )
+
+        expected_ranks = set(range(self.attn_dp_size))
+        actual_ranks = set(endpoints_by_rank)
+        if actual_ranks != expected_ranks:
+            raise RuntimeError(
+                "Embedded Rust bootstrap registry discovery did not find "
+                f"exactly one listener for every attention DP rank: "
+                f"expected {sorted(expected_ranks)}, found {sorted(actual_ranks)}."
+            )
+        return [endpoints_by_rank[dp_rank] for dp_rank in range(self.attn_dp_size)]
+
+    def register_to_bootstrap(self):
+        """Register prefill server info with every serving bootstrap registry."""
+        endpoints = self._bootstrap_registry_endpoints()
         payload = {
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
@@ -803,39 +848,56 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
-            # Self-register the HTTP API port so the decode can derive the PD
-            # retract rebootstrap /generate URL from bootstrap info instead of a
-            # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": get_serving().port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        pending = endpoints
         for attempt in range(max_retries):
-            try:
-                response = requests.put(url, json=payload, timeout=5)
-                if response.status_code == 200:
-                    logger.debug("Prefill successfully registered to bootstrap server.")
-                    return
-                logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
+            failed = []
+            for endpoint in pending:
+                url = f"{endpoint.to_url()}/route"
+                endpoint_payload = dict(payload)
+                endpoint_payload["prefill_http_port"] = (
+                    endpoint.port
+                    if envs.SGLANG_RUST_SERVER.get()
+                    else get_serving().port
                 )
-            except Exception as e:
-                # Walk to root cause to skip misleading urllib3 wrapper messages
-                cause = e
-                while cause.__cause__ is not None:
-                    cause = cause.__cause__
-                logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
-                )
+                try:
+                    response = requests.put(url, json=endpoint_payload, timeout=5)
+                    if response.status_code == 200:
+                        logger.debug(
+                            "Prefill successfully registered with bootstrap "
+                            "registry %s.",
+                            url,
+                        )
+                        continue
+                    logger.warning(
+                        f"Prefill register attempt {attempt + 1}/{max_retries} "
+                        f"for {url} failed: status {response.status_code}"
+                    )
+                except Exception as e:
+                    # Walk to root cause to skip misleading urllib3 wrapper messages
+                    cause = e
+                    while cause.__cause__ is not None:
+                        cause = cause.__cause__
+                    logger.warning(
+                        f"Prefill register attempt {attempt + 1}/{max_retries} "
+                        f"for {url} failed: {cause}"
+                    )
+                failed.append(endpoint)
+            if not failed:
+                return
+            pending = failed
             if attempt == max_retries - 1:
                 break
             delay = min(initial_delay * (2**attempt), max_delay) * (
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
+        unresolved = ", ".join(endpoint.to_url() for endpoint in pending)
         error_message = (
-            f"Prefill instance failed to register to bootstrap server "
-            f"{url} after {max_retries} retries"
+            f"Prefill instance failed to register with bootstrap registries "
+            f"{unresolved} after {max_retries} retries"
         )
         logger.error(error_message)
         if envs.SGLANG_RUST_SERVER.get():
@@ -1192,7 +1254,7 @@ class CommonKVSender(BaseKVSender):
             if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.system_dp_rank
+                self.kv_mgr.bootstrap_dp_rank
                 != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -1202,7 +1264,7 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.system_dp_rank} but bootstrap_room "
+                        f"{self.kv_mgr.bootstrap_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
                         f"{self.bootstrap_room % get_parallel().dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
@@ -1216,7 +1278,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.system_dp_rank,
+            "dp_rank": self.kv_mgr.bootstrap_dp_rank,
         }
         try:
             response = requests.post(url, json=payload, timeout=5)

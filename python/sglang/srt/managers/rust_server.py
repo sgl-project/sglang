@@ -360,10 +360,12 @@ class RustServer:
     def __init__(
         self,
         server: Server,
+        http_port: int,
         mm_spec: Optional[NativeMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
+        self.http_port = http_port
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
@@ -395,13 +397,14 @@ class RustServer:
                 "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
                 "drop --preferred-sampling-params and send those values per request."
             )
-        http_addr = f"{server_args.host}:{server_args.port}"
-
-        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
-        # so the rank is not conflated with rank 0 of a one-rank group.
-        dp_rank = scheduler.ps.dp_rank if scheduler.ps.dp_size > 1 else None
-        if dp_rank is not None:
-            http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
+        # Each DP scheduler owns an HTTP listener at the base port plus its DP rank.
+        parallel_state = scheduler.ps
+        http_port = server_args.port
+        dp_note = ""
+        if parallel_state.dp_size > 1:
+            http_port += parallel_state.dp_rank
+            dp_note = f" (DP rank {parallel_state.dp_rank}/{parallel_state.dp_size})"
+        http_addr = f"{server_args.host}:{http_port}"
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -462,16 +465,13 @@ class RustServer:
 
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
-        dp_note = (
-            "" if dp_rank is None else f" (DP rank {dp_rank}/{scheduler.ps.dp_size})"
-        )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
             http_addr,
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, http_port=http_port, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
