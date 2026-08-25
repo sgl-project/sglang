@@ -1885,12 +1885,6 @@ else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_xpu if _is_xpu else grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
-    if _is_cpu:
-        # topk_sigmoid/topk_softmax are imported only for GPU backends above.
-        # A CPU without AMX should stay on the torch-native fallback.
-        fused_topk = fused_topk_torch_native
-    else:
-        pass  # do nothing for other devices
 
 
 def remap_topk_for_per_rank_shared_slots(
