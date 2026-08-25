@@ -23,6 +23,8 @@ Use these paths:
   (local or Hub)
 - `--quantization`: override the quantization method used by the transformer loader
 - `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
+- `--component-quantizations.<component>`: explicitly apply supported online quantization to an unquantized component
+- `--component-quantization-ignored-layers.<component>`: component-local layer patterns to keep unquantized during that online quantization
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
@@ -51,12 +53,12 @@ repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
 MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
-including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
-exports are also auto-detected: the presence of an input scale selects static
-activation scaling, while its absence selects dynamic scaling. Pass one selected
-FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
-direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
-usage is documented in
+including `pruned_fp8_scaled`, serialized ConvRot formats, and the official
+NVFP4-AWQ Qwen3-VL encoder. Other Comfy FP8 exports are also auto-detected: the
+presence of an input scale selects static activation scaling, while its absence
+selects dynamic scaling. Pass one selected DiT or component file by local path,
+`owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do not
+combine it with an explicit quantization option. Its GGUF usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quantized Component Repositories
@@ -78,13 +80,15 @@ paths:
 | Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
 | Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
 
-`--quantization` is the explicit override for the transformer loader; it is not
-the boundary of component quantization support. Other pre-quantized component
-repositories select their format through their own metadata and the capability
-of the selected loader. A generic string override without a matching
-materialization backend would advertise support that the component does not
-have, while a quantized weight file without matching config metadata cannot be
-identified or restored generically.
+`--quantization` is the explicit override for the primary transformer loader;
+`--component-quantizations.<component>` expresses the same intent for one
+supported component. Pair the latter with
+`--component-quantization-ignored-layers.<component>` to keep matching layers
+unquantized. Pre-quantized component repositories instead select their format
+through their own metadata and the capability of the selected loader. A generic
+string override without a matching materialization backend would advertise
+support that the component does not have, while a quantized weight file without
+matching config metadata cannot be identified or restored generically.
 
 ## Quant Families
 
@@ -145,20 +149,28 @@ backend.
       <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
     </tr>
     <tr>
-      <td><code>modelopt-nvfp4</code></td>
-      <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
-      <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
-      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
+      <td><code>auto-round</code> W4A16</td>
+      <td>Transformer component repo with a self-describing <code>quantization_config</code> and <code>auto_round:auto_gptq</code> packing</td>
+      <td><code>--transformer-path</code></td>
+      <td>Native dense DiTs with compatible component parameter mappings; MiniMax-H3 Diffusers components are supported</td>
       <td>None</td>
-      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+      <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
+      <td><code>modelopt-nvfp4</code></td>
+      <td>Mixed transformer directory/repo with <code>config.json</code>, raw or Comfy layer-marked NVFP4 safetensors, or full ModelOpt Diffusers repo</td>
+      <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
+      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511, MiniMax-H3</td>
+      <td>None</td>
+      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select NVFP4 plus INT8 or FP8 companion linears automatically; omit <code>--quantization</code>.</td>
     </tr>
     <tr>
       <td><code>gguf</code></td>
-      <td>One selected GGUF DiT file</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs</td>
+      <td>One selected GGUF DiT or native encoder file</td>
+      <td><code>--transformer-weights-path</code>, or an explicit encoder file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs and its Qwen3-VL text encoder</td>
       <td>None</td>
-      <td>CUDA only; auto-detected; supports standard and K-quant GGML types; FSDP and the separate Qwen3-VL text-encoder GGUF files are not supported</td>
+      <td>CUDA only and auto-detected; supports standard and K-quant GGML types. TP requires aligned GGML blocks; component/layerwise offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>comfy-fp8</code></td>
@@ -187,10 +199,34 @@ backend.
     <tr>
       <td><code>comfy-w4a8-convrot</code></td>
       <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 FL2VA / Ref2VA DiTs</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 FL2VA / Ref2VA DiTs and its native Qwen3-VL encoder</td>
       <td><code>comfy-kitchen&gt;=0.2.27</code></td>
-      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
+      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. Mixed encoder files may keep their embedding tensorwise INT8. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-w4a4-convrot</code></td>
+      <td>Safetensors with serialized <code>convrot_w4a4</code> metadata, optionally mixed with <code>int8_tensorwise</code> layers</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.text_encoder</code></td>
+      <td>Native DiTs and encoders with matching parameter mappings; MiniMax-H3 FL2VA / Ref2VA DiTs and Qwen3-VL encoder layouts are recognized</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>Auto-detected; omit <code>--quantization</code>. Each layer dispatches to its serialized W4A4 or INT8 ConvRot kernel. CUDA requires SM75+; TP must preserve each format's quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-nvfp4-full-precision</code></td>
+      <td>Safetensors with serialized <code>nvfp4</code> and optional row-wise <code>int8_tensorwise</code> layer metadata</td>
+      <td><code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 native Qwen3-VL encoder</td>
+      <td>None</td>
+      <td>Auto-detected; omit explicit quantization. Preserves packed storage, high-nibble-first weights, swizzled block scales, and AWQ input pre-scales. Each active NVFP4 matrix is dequantized for BF16/FP16 compute, so this is a memory path rather than a native FP4 speed path.</td>
+    </tr>
+    <tr>
+      <td><code>quanto-int8</code></td>
+      <td>One native encoder safetensors file with an embedded Quanto quantization map</td>
+      <td>An explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native encoders whose mapped linear layers consume every declared qint8 entry; MiniMax-H3's Qwen3-VL encoder is supported</td>
+      <td>None</td>
+      <td>Auto-detected weight-only qint8 storage. Each active matrix is dequantized to the compute dtype for the ordinary linear operation, so this reduces stored/resident weight memory rather than promising INT8 GEMM speed. TP and offload are supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -218,11 +254,11 @@ backend.
     </tr>
     <tr>
       <td><code>gguf</code></td>
-      <td>A single community <code>.gguf</code> holding the transformer</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 <code>fl2va</code> (original and pruned AdaLN curve)</td>
+      <td>A single community <code>.gguf</code> holding a transformer or native encoder</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.&lt;component&gt;</code></td>
+      <td>MiniMax-H3 <code>fl2va</code> DiT (original and pruned AdaLN curve) and Qwen3-VL text encoder</td>
       <td>None</td>
-      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Shrinks the download and the host memory offload pins (17.5 vs 61.7 GiB for H3) rather than peak VRAM, which offload already bounds. Dequantized per use, so it is not faster. See <a href="#gguf">GGUF</a>.</td>
+      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Packed weights reduce checkpoint and resident-weight memory; they are dequantized per use, so this is not a speed claim. See <a href="#gguf">GGUF</a>.</td>
     </tr>
   </tbody>
 </table>

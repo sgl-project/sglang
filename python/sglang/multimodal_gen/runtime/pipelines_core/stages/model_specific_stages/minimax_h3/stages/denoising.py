@@ -47,6 +47,7 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+_REFINED_PROMPT_EMBEDS_KEY = "_minimax_h3_refined_prompt_embeds"
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -339,25 +340,28 @@ def _precompute_refined_prompt_embeds(
     positive: Any,
     *,
     device: torch.device,
+    shared_conditioning: dict[str, Any] | None = None,
 ) -> bool:
-    """Move request-static text refinement out of the denoise hot loop."""
+    """Refine text once for outputs that share the encoded presentation."""
     refine = getattr(model, "refine_prompt_embeds", None)
     if not callable(refine):
         return False
 
     static_kwargs = positive.static_kwargs
     prompt_embeds = static_kwargs["prompt_embeds"]
-    refiner_params = static_kwargs["refiner_packed_seq_params"]
-    if isinstance(refiner_params, dict):
-        refiner_cu = refiner_params["cu_seqlens_q"]
-    else:
-        refiner_cu = refiner_params.cu_seqlens_q
-    with torch.inference_mode():
-        refined = refine(
-            prompt_embeds,
-            refiner_cu,
-            device=device,
-        )
+    refined = (
+        shared_conditioning.get(_REFINED_PROMPT_EMBEDS_KEY)
+        if shared_conditioning is not None
+        else None
+    )
+    if refined is None:
+        refiner_params = static_kwargs["refiner_packed_seq_params"]
+        if isinstance(refiner_params, dict):
+            refiner_cu = refiner_params["cu_seqlens_q"]
+        else:
+            refiner_cu = refiner_params.cu_seqlens_q
+        with torch.inference_mode():
+            refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -365,6 +369,8 @@ def _precompute_refined_prompt_embeds(
             "MiniMax H3 refined prompt row count changed: "
             f"{int(prompt_embeds.shape[0])} -> {int(refined.shape[0])}"
         )
+    if shared_conditioning is not None:
+        shared_conditioning.setdefault(_REFINED_PROMPT_EMBEDS_KEY, refined)
     static_kwargs["prompt_embeds"] = refined
     static_kwargs["refined_prompt_embeds_length"] = int(refined.shape[0])
     return True
@@ -614,8 +620,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not (current_platform.is_cuda() or current_platform.is_mps()):
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_mps()
+            or current_platform.is_npu()
+        ):
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+            )
+
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
@@ -660,6 +673,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 model,
                 positive,
                 device=device,
+                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,

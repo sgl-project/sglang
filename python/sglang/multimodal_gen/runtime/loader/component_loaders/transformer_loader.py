@@ -100,15 +100,33 @@ def _server_args_for_transformer_component(
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
-    if component_weights_path is not None:
+    component_quantization = server_args.component_quantizations.get(component_name)
+    component_ignored_layers = server_args.component_quantization_ignored_layers.get(
+        component_name
+    )
+    if (
+        component_weights_path is not None
+        or component_quantization is not None
+        or component_ignored_layers is not None
+    ):
         component_server_args = copy.copy(server_args)
-        component_server_args.transformer_weights_path = component_weights_path
-        component_server_args.nunchaku_config = None
-        logger.info(
-            "Using transformer_weights_path override for %s: %s",
-            component_name,
-            component_weights_path,
-        )
+        if component_weights_path is not None:
+            component_server_args.transformer_weights_path = component_weights_path
+            component_server_args.nunchaku_config = None
+            logger.info(
+                "Using transformer_weights_path override for %s: %s",
+                component_name,
+                component_weights_path,
+            )
+        if component_quantization is not None:
+            component_server_args.quantization = component_quantization
+            logger.info(
+                "Using quantization override %s for %s",
+                component_quantization,
+                component_name,
+            )
+        if component_ignored_layers is not None:
+            component_server_args.quantization_ignored_layers = component_ignored_layers
         return component_server_args
 
     if component_name not in ("transformer_2", "unconditional_transformer"):
@@ -135,6 +153,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     allow_global_attention_backend_fallback = False
+    supports_online_quantization_override = True
 
     component_names = [
         "transformer",
@@ -222,7 +241,7 @@ class TransformerLoader(ComponentLoader):
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:
             dit_config.arch_config.checkpoint_uses_diffusers_layout = (
-                cls_name == "MiniMaxH3Transformer3DModel"
+                cls_name != model_cls.__name__
             )
 
         checkpoint_quant_config = None
@@ -238,7 +257,10 @@ class TransformerLoader(ComponentLoader):
                     safetensors_list
                 )
                 checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers
+                    layer_markers,
+                    safetensors_list,
+                    dit_config.arch_config.param_names_mapping,
+                    dit_config.arch_config.reverse_param_names_mapping,
                 )
                 if adaln_curve_shape is not None:
                     (
@@ -289,6 +311,15 @@ class TransformerLoader(ComponentLoader):
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
                 "inference; use TP and/or sequence parallelism instead"
+            )
+        if (
+            use_fsdp
+            and quant_spec.quant_config is not None
+            and quant_spec.quant_config.get_name() == "auto-round"
+        ):
+            raise ValueError(
+                "AutoRound checkpoints do not support diffusion FSDP inference; "
+                "use TP and/or sequence parallelism instead"
             )
 
         if quant_spec.gguf_file is not None:

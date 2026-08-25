@@ -25,12 +25,14 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
+    mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
     mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
+    unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
     unmount_sana_video_linear_attention,
 )
@@ -183,6 +185,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
+    ),
+    (
+        "LingBot Video fused RMSNorm",
+        mount_lingbot_video_rmsnorm,
+        unmount_lingbot_video_rmsnorm,
     ),
     (
         "SANA-Video BF16-input linear attention",
