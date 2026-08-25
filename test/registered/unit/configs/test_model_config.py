@@ -7,6 +7,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_multimodal_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -54,6 +55,9 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 
 
 class TestDraftModelConfig(CustomTestCase):
+    def test_nemotron_h_omni_is_multimodal(self):
+        self.assertTrue(is_multimodal_model(["NemotronH_Omni_Reasoning_V3"]))
+
     def test_qwen35_mtp_depth_is_synced_to_text_config(self):
         config = object.__new__(ModelConfig)
         config.is_draft_model = True

@@ -206,6 +206,35 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMambaCacheChunkSize(CustomTestCase):
+    def test_uses_canonical_text_config_for_composed_model(self):
+        server_args = object.__new__(ServerArgs)
+        server_args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(mamba_chunk_size=32),
+            hf_text_config=SimpleNamespace(mamba_chunk_size=128),
+        )
+
+        with patch(
+            "sglang.srt.server_args.resolved_view",
+            return_value=SimpleNamespace(page_size=64),
+        ):
+            self.assertEqual(server_args.mamba_cache_chunk_size, 128)
+
+    def test_preserves_text_only_config_behavior(self):
+        server_args = object.__new__(ServerArgs)
+        text_config = SimpleNamespace(mamba_chunk_size=128)
+        server_args.get_model_config = lambda: SimpleNamespace(
+            hf_config=text_config,
+            hf_text_config=text_config,
+        )
+
+        with patch(
+            "sglang.srt.server_args.resolved_view",
+            return_value=SimpleNamespace(page_size=64),
+        ):
+            self.assertEqual(server_args.mamba_cache_chunk_size, 128)
+
+
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
         server_args = ServerArgs(

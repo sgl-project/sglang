@@ -48,7 +48,7 @@ class TestSchedulerMoeConfig(CustomTestCase):
             hf_text_config=llm_config,
         )
 
-        init_moe.assert_called_once_with(scheduler.server_args)
+        init_moe.assert_called_once_with()
         self.assertFalse(scheduler.require_mlp_sync)
 
     def test_canonical_text_config_takes_precedence(self):
@@ -60,7 +60,7 @@ class TestSchedulerMoeConfig(CustomTestCase):
             hf_text_config=llm_config,
         )
 
-        init_moe.assert_called_once_with(scheduler.server_args)
+        init_moe.assert_called_once_with()
 
     def test_skips_moe_initialization_for_non_moe_text_config(self):
         outer_config = SimpleNamespace()

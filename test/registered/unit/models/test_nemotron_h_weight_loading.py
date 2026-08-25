@@ -1,13 +1,4 @@
-"""
-Unit tests for NemotronHForCausalLM.load_weights.
-
-Regression test for Nemotron-H expert scale checkpoint tensors that map to
-parameters absent from the current runtime model.
-"""
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+"""Unit tests for Nemotron-H target and MTP checkpoint weight loading."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,6 +7,10 @@ import torch
 
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.nemotron_h_mtp import NemotronHForCausalLMMTP
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class _FakePPGroup:
@@ -52,7 +47,7 @@ class _RecordingStackedParam:
         self.loads.append((param, loaded_weight, shard_id))
 
 
-class TestNemotronHWeightLoading(unittest.TestCase):
+class TestNemotronHWeightLoading(CustomTestCase):
     def _make_minimal_model(
         self, named_parameters=(), model_class=NemotronHForCausalLM
     ):

@@ -104,9 +104,7 @@ class TestRadioWeightLoading(CustomTestCase):
                 weight = torch.ones(1)
 
                 self.assertEqual(
-                    model.load_weights(
-                        [(f"radio_model.hf_model.{source}", weight)]
-                    ),
+                    model.load_weights([(f"radio_model.hf_model.{source}", weight)]),
                     {target},
                 )
                 self.assertEqual(parameter.loads, [(parameter, weight, None)])
