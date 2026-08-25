@@ -4,10 +4,23 @@ load("@rules_python//python/uv:lock.bzl", uv_lock = "lock")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "hf_management.requirements.in",
+    "hf_management.requirements.lock.txt",
     "profiles.json",
     "srt_empty_bootstrap.requirements.in",
     "srt_empty_bootstrap.requirements.lock.txt",
 ])
+
+uv_lock(
+    name = "hf_management_requirements",
+    srcs = ["hf_management.requirements.in"],
+    out = "hf_management.requirements.lock.txt",
+    args = [
+        "--python-version",
+        "3.12",
+    ],
+    tags = ["manual"],
+)
 
 uv_lock(
     name = "srt_empty_bootstrap_requirements",
@@ -44,6 +57,12 @@ py_test(
 )
 
 py_test(
+    name = "hf_hub_management_test",
+    srcs = ["hf_hub_management_test.py"],
+    deps = ["//python/sglang/srt/utils/hf_transformers:hub"],
+)
+
+py_test(
     name = "hf_transformers_patches_test",
     srcs = ["hf_transformers_patches_test.py"],
     deps = ["//python/sglang/srt/utils:hf_transformers_patches"],
@@ -59,6 +78,7 @@ test_suite(
     name = "torch_free_tests",
     tests = [
         ":environ_test",
+        ":hf_hub_management_test",
         ":hf_transformers_patches_test",
         ":kernel_metadata_test",
         ":package_profiles_test",

@@ -1,0 +1,15 @@
+load("@hf_management//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//python/sglang:__subpackages__"])
+
+py_library(
+    name = "hub",
+    srcs = ["hub.py"],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+    deps = [requirement("huggingface-hub")],
+)

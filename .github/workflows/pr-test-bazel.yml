@@ -69,5 +69,6 @@ jobs:
         run: |
           git diff --exit-code -- \
             MODULE.bazel.lock \
+            bazel/python/hf_management.requirements.lock.txt \
             bazel/python/srt_empty_bootstrap.requirements.lock.txt \
             bazel/rust/sglang-crates.lock.json

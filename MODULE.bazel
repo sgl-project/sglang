@@ -57,7 +57,16 @@ pip.parse(
     python_version = "3.12",
     requirements_lock = "//bazel/python:srt_empty_bootstrap.requirements.lock.txt",
 )
-use_repo(pip, "srt_empty_bootstrap")
+pip.parse(
+    hub_name = "hf_management",
+    python_version = "3.12",
+    requirements_lock = "//bazel/python:hf_management.requirements.lock.txt",
+)
+use_repo(
+    pip,
+    "hf_management",
+    "srt_empty_bootstrap",
+)
 
 # Keep the primary Cargo workspace authoritative. crate_universe mirrors its
 # checked Cargo.lock and writes only the Bazel rendering lock below.
