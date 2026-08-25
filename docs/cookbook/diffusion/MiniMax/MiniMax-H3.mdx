@@ -1060,6 +1060,19 @@ W4A4 Qwen3-VL files use the same overlay, for example:
 This checkpoint keeps its unmarked embedding and vision tower in their source
 precision; no explicit component quantization option is needed.
 
+The official Comfy NVFP4-AWQ encoder uses the same flagless overlay:
+
+```bash Overlay
+--component-paths.text_encoder \
+  Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+```
+
+SGLang auto-detects its row-wise INT8 embedding, NVFP4 language linears, and
+AWQ input pre-scales. The weights stay compressed at rest; each active linear
+is dequantized for a BF16/FP16 matrix multiplication, so this path primarily
+reduces resident memory rather than encoder latency. Do not add a component or
+transformer quantization option.
+
 The same component option accepts a self-describing Quanto qint8 file without
 an additional quantization flag:
 
