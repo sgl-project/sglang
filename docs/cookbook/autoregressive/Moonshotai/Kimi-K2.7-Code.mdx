@@ -533,52 +533,7 @@ sglang serve \
 
 ## 5. Benchmark
 
-### 5.1 Accuracy Benchmark
-
-**Test Environment:**
-
-- Hardware: 4× AMD MI355X
-- Model: `amd/Kimi-K2.7-Code-MXFP4` (MXFP4)
-- Tensor Parallelism: 4
-- Docker Image: `rocm/sgl-dev:v0.5.17-rocm720-mi35x-20260812` (ROCm 7.2)
-
-GSM8K accuracy of the MXFP4 checkpoint, measured on the deployed server across several client parallelism levels (2,000 questions each):
-
-```shell Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-questions 2000 \
-  --parallel <PARALLEL> \
-  --port 30000
-```
-
-<table>
-  <thead>
-    <tr>
-      <th>Parallel</th>
-      <th>GSM8K Accuracy</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>100</td>
-      <td>0.951</td>
-    </tr>
-    <tr>
-      <td>300</td>
-      <td>0.953</td>
-    </tr>
-    <tr>
-      <td>600</td>
-      <td>0.942</td>
-    </tr>
-    <tr>
-      <td>1200</td>
-      <td>0.950</td>
-    </tr>
-  </tbody>
-</table>
-
-#### Model Card Reference (Official)
+### 5.1 Model Card Benchmarks (Official)
 
 The following results are from the official Kimi-K2.7-Code model card. They were evaluated with thinking mode enabled through Kimi Code CLI at `temperature=1.0`, `top_p=0.95`, and a 262,144-token context length unless otherwise stated.
 
@@ -631,7 +586,7 @@ The following results are from the official Kimi-K2.7-Code model card. They were
   </tbody>
 </table>
 
-### 5.2 Speed Benchmark
+### 5.2 MXFP4 Benchmark
 
 **Test Environment:**
 
@@ -640,9 +595,47 @@ The following results are from the official Kimi-K2.7-Code model card. They were
 - Tensor Parallelism: 4
 - Docker Image: `rocm/sgl-dev:v0.5.17-rocm720-mi35x-20260812` (ROCm 7.2)
 
-We use SGLang's built-in `bench_serving` tool with the `random` dataset (input 8192, output 1024, range ratio 0.8). For each concurrency `C`, `--num-prompts` is set to `C × 5`.
+#### 5.2.1 Accuracy Benchmark
 
-#### 5.2.1 Latency Benchmark
+GSM8K accuracy of the MXFP4 checkpoint, measured on the deployed server across several client parallelism levels (2,000 questions each):
+
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py \
+  --num-questions 2000 \
+  --parallel <PARALLEL> \
+  --port 30000
+```
+
+<table>
+  <thead>
+    <tr>
+      <th>Parallel</th>
+      <th>GSM8K Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>100</td>
+      <td>0.951</td>
+    </tr>
+    <tr>
+      <td>300</td>
+      <td>0.953</td>
+    </tr>
+    <tr>
+      <td>600</td>
+      <td>0.942</td>
+    </tr>
+    <tr>
+      <td>1200</td>
+      <td>0.950</td>
+    </tr>
+  </tbody>
+</table>
+
+#### 5.2.2 Latency Benchmark
+
+We use SGLang's built-in `bench_serving` tool with the `random` dataset (input 8192, output 1024, range ratio 0.8). For each concurrency `C`, `--num-prompts` is set to `C × 5`.
 
 ```shell Command
 python3 -m sglang.bench_serving \
