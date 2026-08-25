@@ -11,6 +11,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
@@ -42,11 +43,6 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_xpu():
-    from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
-
-    causal_conv1d_fn = causal_conv1d_fn_xpu
-    causal_conv1d_update = causal_conv1d_update_xpu
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -71,6 +67,7 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     if (
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
+        or get_exec().deterministic.enable_deterministic_inference
         or get_memory().enable_page_major_kv_layout
         or sm_major not in (9, 10)
     ):
@@ -113,6 +110,18 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return "flashinfer"
 
 
+def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flashinfer()
+    ):
+        raise ValueError(
+            "FlashInfer GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -127,6 +136,13 @@ class GDNKernelDispatcher:
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
+            self.decode_kernel = triton_kernel
+        elif decode_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # The fused SYCL kernel is dispatched via XpuGDNAttnBackend.forward_fused_gdn,
+            # outside this dispatcher; Triton is the dispatcher-level kernel for requests
+            # that hook doesn't handle (e.g. verify).
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
@@ -154,6 +170,12 @@ class GDNKernelDispatcher:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
         if prefill_backend.is_triton():
+            self.extend_kernel = triton_kernel
+        elif prefill_backend.is_intel_xpu():
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            # See the decode branch above: intel_xpu uses Triton as its
+            # dispatcher-level fallback kernel.
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
@@ -359,6 +381,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
+        _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
@@ -369,6 +392,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         backends = model_runner.linear_attn_backends
+        self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )

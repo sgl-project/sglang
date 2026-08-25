@@ -1,36 +1,44 @@
 ---
 title: "Diffusion Cookbook"
-description: "Cookbook recipes for running diffusion models with SGLang"
+description: "Author and review deployment-focused diffusion model recipes for SGLang."
 metatags:
-    description: "Explore SGLang diffusion cookbook structure, categories, and contribution guidance for image and video generation recipes."
+    description: "SGLang diffusion cookbook structure, model-page standards, and contribution guidance."
 ---
 
 # SGLang Diffusion Cookbook
 
-<div style={{display: 'flex', gap: '8px'}}>
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License" /></a>
-  <a href="https://github.com/sgl-project/sglang/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
-</div>
+The diffusion cookbook is a set of model-specific, validated deployment guides. Each page
+should let a reader answer three questions quickly: what the model is good at, which
+checkpoint and base topology to choose, and which optional features change performance,
+memory, or quality.
 
-Create a comprehensive cookbook for diffusion models in SGLang, demonstrating SGLang's performance advantages for image and video generation workloads.
+## What every model page includes
 
-## 🎯 What You'll Find Here
+1. A compact capability tag row using the shared `DiffusionModelTags` component.
+2. A short introduction that states the model's capability range, strongest use case, and
+   an important limitation or deployment tradeoff.
+3. Verified base launch recipes for the hardware actually tested.
+4. Matching request examples for every public task or checkpoint partition.
+5. Optional attention, quantization, caching, compile, and offload recipes with explicit
+   quality contracts and validation scope.
 
-This cookbook aggregates battle-tested SGLang recipes covering:
+Tags describe the model, not every runtime flag. Prefer `video + audio`, `multi-reference`,
+or `4–15 seconds` over generic labels such as `native`, `fast`, or `high quality`.
 
-- **Models**: Mainstream Image and Video generation  Models
-- **Use Cases**: Inference serving, deployment strategies
-- **Hardware**: GPU and CPU configurations, optimization for different accelerators
-- **Best Practices**: Configuration templates, performance tuning, troubleshooting guides
+## Keep the command picker small
 
-Each recipe provides step-by-step instructions to help you quickly implement SGLang solutions for your specific requirements.
+The command picker selects a runnable base recipe: hardware topology, checkpoint partition,
+request mode, and a validated placement profile. Independent feature knobs do not need to
+become picker dimensions.
 
-## 🚀 Quick Start
+Document orthogonal controls as feature overlays instead:
 
-1. Browse the recipe index above to find your model
-2. Follow the step-by-step instructions in each guide
-3. Adapt configurations to your specific hardware and requirements
-4. Join our community to share feedback and improvements
+| Feature class | Where it belongs | Required context |
+| --- | --- | --- |
+| Attention backend | Optional feature overlays | Default backend, precision/approximation contract, installation, measured hardware |
+| Online or pre-quantized weights | Optional feature overlays | Weight source, protected precision-sensitive layers, quality and memory tradeoff |
+| Cache-DiT and sampling controls | Request/sampling recipes | Quality level, incompatible placement modes, task-specific validation |
+| TP, Ulysses, Ring, FSDP, residency | Base picker only for verified cells | Exact GPU count, topology, memory, and latency evidence |
 
 For memory placement, prefer the unified
 [`--component-residency`](/docs/sglang-diffusion/api/cli#component-residency)
@@ -40,62 +48,25 @@ selector. Each component resolves to exactly one of `resident`,
 `--image-encoder-cpu-offload`, and `--vae-cpu-offload` remain supported by all
 recipes that already use them.
 
-The sglang diffusion cookbook directory structure are shown below:
+## Contributing a model
 
-```text Example
-docs/cookbook/diffusion/
-├── README.mdx             # Main cookbook (this file)
-├── Qwen-Image/            # Qwen-Image series docs
-│   ├── Qwen-Image.mdx
-│   └── Qwen-Image-Edit.mdx
-├── Wan/                   # Wan series docs
-│   ├── Wan2.1.mdx
-│   └── Wan2.2.mdx
-├── Z-Image/               # Z-Image series docs
-│   └── Z-Image-Turbo.mdx
-├── Ernie-Image/           # ERNIE-Image series docs
-│   └── Ernie-Image.mdx
-└── ...
+Use the repo-local `cookbook-add-model` skill and its
+`templates/diffusion-page.mdx.tmpl` template. The full category contract lives in
+`.claude/skills/cookbook-add-model/references/diffusion-authoring.md`.
+
+Before opening a PR, run:
+
+```bash Command
+node docs/scripts/check_cookbook_configs.mjs
+cd docs
+mint validate
+mint broken-links --check-anchors --check-redirects
 ```
 
-## 🤝 Contributing
+The static cookbook check requires every diffusion model page to use the shared tag widget,
+the standard introduction heading, 4–6 tags, and a substantive two-paragraph lead. Mintlify
+validation then catches MDX, navigation, and internal-link problems.
 
-We believe the best documentation comes from practitioners. Whether you've optimized SGLang for a specific model, solved a tricky deployment challenge, or discovered performance improvements, we encourage you to contribute your recipes!
-
-**💪How to Contribute**
-
-- Comment below if interested (mention which role)
-- Join discussion on implementation details
-- Fork repo and work on assigned section
-- Submit PR following SGLang cookbook standards
-- Iterate based on review feedback
-
-**To contribute:**
-
-```shell Command
-# Fork the repo and clone locally
-git clone https://github.com/YOUR_USERNAME/sglang.git
-cd sglang
-
-# Create a new branch
-git checkout -b add-my-recipe
-
-# Add your recipe under docs/cookbook/diffusion/
-# Submit a PR!
-```
-
-## 📖 Resources
-
-- [SGLang GitHub](https://github.com/sgl-project/sglang)
-- [SGLang Documentation](/)
-- [SGLang Diffusion Documentation](/docs/sglang-diffusion/index)
-- [SLACK Channel](https://sgl-fru7574.slack.com/archives/C07GLLLESNR)
-- [Community Slack/Discord](https://discord.gg/MpEEuAeb)
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](https://github.com/sgl-project/sglang/blob/main/LICENSE) file for details.
-
----
-
-**Let's build this resource together!** 🚀 Star the repo and contribute your recipes to help the SGLang community grow.
+For runtime concepts and platform support, see the
+[SGLang Diffusion documentation](/docs/sglang-diffusion/index) and
+[compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
