@@ -46,6 +46,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_segments_group = []
 
     @property
     def size_full(self):
@@ -63,11 +64,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_segments_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            free_group = self.free_group
+            self.free_group = []
+            self.free(torch.cat(free_group))
+        if self.free_segments_group:
+            segment_groups = self.free_segments_group
+            self.free_segments_group = []
+            for segments, swa_evicted_seqlen in segment_groups:
+                self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
@@ -130,16 +139,49 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         data-dependent dedup. Default: plain free()."""
         self.free(free_index)
 
-    def free_segments(self, segments):
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free an SWA-only contiguous segment of one request's KV row.
+
+        SWA allocators may use ``start_pos`` to avoid data-dependent page
+        discovery. Other implementations retain the legacy free_swa path.
+        """
+        self.free_swa(free_index)
+
+    def free_segments(self, segments, *, swa_evicted_seqlen: int | None = None):
         """Free disjoint ascending ``(free_index, start_pos)`` segments of one
         request's kv row; a boundary page shared by consecutive segments is
-        emitted once (the later segment's head is trimmed)."""
+        emitted once (the later segment's head is trimmed).
+
+        ``swa_evicted_seqlen`` is ignored by non-SWA allocators. Composite SWA
+        allocators use it to select the still-live SWA suffix without inspecting
+        device mappings. ``None`` retains their legacy mapping-discovery path.
+        Each call remains a separate request when deferred by a free group.
+        """
+        segments = [
+            (free_index, start_pos)
+            for free_index, start_pos in segments
+            if free_index.numel() > 0
+        ]
+        if not segments:
+            return
+        if not self.is_not_in_free_group:
+            self.free_segments_group.append(
+                (
+                    [
+                        (self._copy_for_free_group(free_index), start_pos)
+                        for free_index, start_pos in segments
+                    ],
+                    swa_evicted_seqlen,
+                )
+            )
+            return
+        self._free_segments_impl(segments, swa_evicted_seqlen=swa_evicted_seqlen)
+
+    def _free_segments_impl(self, segments, *, swa_evicted_seqlen: int | None) -> None:
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
             n = free_index.numel()
-            if n == 0:
-                continue
             seg_end = start_pos + n
             if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
                 boundary = (start_pos // ps + 1) * ps

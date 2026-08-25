@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
     ComponentAction,
+    FreeComponentDeviceSlot,
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -939,7 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeComponentDeviceSlot, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -990,9 +994,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
+                full_value = value_slice[dup_start:consumed_from]
                 step_actions.append(
-                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                    FreeComponentDeviceSlot(
+                        [full_value], component_type=BASE_COMPONENT_TYPE
+                    )
                 )
+                if ComponentType.SWA in self.components_by_type:
+                    swa_start = max(
+                        dup_start,
+                        state.params.swa_evicted_seqlen - state.total_prefix_length,
+                    )
+                    if swa_start < consumed_from:
+                        step_actions.append(
+                            FreeComponentDeviceSlot(
+                                [value_slice[swa_start:consumed_from]],
+                                component_type=ComponentType.SWA,
+                            )
+                        )
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))

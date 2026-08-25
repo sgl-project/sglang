@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -131,7 +132,10 @@ class TestFreeSegment(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
         )
-        req = SimpleNamespace(req_pool_idx=0)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            kv=SimpleNamespace(swa_evicted_seqlen=0),
+        )
 
         before = len(alloc.free_pages)
         alloc.free_group_begin()
@@ -226,6 +230,96 @@ class TestBaseFallbackFreeSegments(unittest.TestCase):
         alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])
         per_call_pages = [set((t // PAGE_SIZE).tolist()) for t in alloc.freed]
         self.assertEqual(per_call_pages, [{0, 1}, {2}])
+
+
+class TestSWADenseSegmentRelease(unittest.TestCase):
+    def _make_swa_allocator(self):
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = PAGE_SIZE
+        alloc.device = "cpu"
+        alloc.full_attn_allocator = _make_allocator(need_sort=True)
+        alloc.swa_attn_allocator = _make_allocator(need_sort=True)
+        alloc.full_to_swa_index_mapping = torch.zeros(
+            NUM_PAGES * PAGE_SIZE + PAGE_SIZE + 1, dtype=torch.int64
+        )
+        alloc.is_not_in_free_group = True
+        alloc.free_group = []
+        alloc.swa_free_group = []
+        alloc.free_segments_group = []
+        alloc.swa_free_segments_group = []
+        return alloc
+
+    def test_releases_swa_window_segment_without_unique(self):
+        alloc = self._make_swa_allocator()
+        full_row = alloc.full_attn_allocator.alloc(3 * PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(3 * PAGE_SIZE)
+        alloc.full_to_swa_index_mapping[full_row] = swa_row
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            alloc.free_swa_segment(full_row[: 2 * PAGE_SIZE], start_pos=0)
+
+        self.assertEqual(len(alloc.full_attn_allocator.release_pages), 0)
+        self.assertEqual(len(alloc.swa_attn_allocator.release_pages), 2)
+        self.assertTrue(
+            torch.all(alloc.full_to_swa_index_mapping[full_row[: 2 * PAGE_SIZE]] == 0)
+        )
+        self.assertTrue(
+            torch.all(alloc.full_to_swa_index_mapping[full_row[2 * PAGE_SIZE :]] > 0)
+        )
+
+    def test_known_frontier_is_fast_and_unknown_frontier_uses_legacy(self):
+        alloc = self._make_swa_allocator()
+        full_row = alloc.full_attn_allocator.alloc(3 * PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(2 * PAGE_SIZE)
+        alloc.full_to_swa_index_mapping[full_row[PAGE_SIZE:]] = swa_row
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            alloc.free_segments([(full_row, 0)], swa_evicted_seqlen=PAGE_SIZE)
+
+        self.assertEqual(len(alloc.full_attn_allocator.release_pages), 3)
+        self.assertEqual(len(alloc.swa_attn_allocator.release_pages), 2)
+        self.assertTrue(torch.all(alloc.full_to_swa_index_mapping[full_row] == 0))
+
+        fallback = self._make_swa_allocator()
+        indices = torch.arange(1, PAGE_SIZE + 1, dtype=torch.int64)
+        with patch.object(fallback, "free") as legacy_free:
+            fallback.free_segments([(indices, 0)])
+        legacy_free.assert_called_once_with(indices)
+
+    def test_grouped_requests_with_same_positions_remain_distinct(self):
+        alloc = self._make_swa_allocator()
+        first_full = alloc.full_attn_allocator.alloc(PAGE_SIZE)
+        first_swa = alloc.swa_attn_allocator.alloc(PAGE_SIZE)
+        second_full = alloc.full_attn_allocator.alloc(PAGE_SIZE)
+        second_swa = alloc.swa_attn_allocator.alloc(PAGE_SIZE)
+        alloc.full_to_swa_index_mapping[first_full] = first_swa
+        alloc.full_to_swa_index_mapping[second_full] = second_swa
+        expected_full_pages = torch.unique(
+            torch.cat((first_full, second_full)) // PAGE_SIZE
+        )
+        expected_swa_pages = torch.unique(
+            torch.cat((first_swa, second_swa)) // PAGE_SIZE
+        )
+
+        alloc.free_group_begin()
+        alloc.free_segments([(first_full, 0)], swa_evicted_seqlen=0)
+        alloc.free_segments([(second_full, 0)], swa_evicted_seqlen=0)
+        first_full.zero_()
+        second_full.zero_()
+        alloc.free_group_end()
+
+        self.assertTrue(
+            torch.equal(
+                torch.sort(alloc.full_attn_allocator.release_pages)[0],
+                expected_full_pages,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                torch.sort(alloc.swa_attn_allocator.release_pages)[0],
+                expected_swa_pages,
+            )
+        )
 
 
 if __name__ == "__main__":
