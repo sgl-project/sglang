@@ -79,6 +79,17 @@ class TestAmdCiLatestReleaseTag(CustomTestCase):
         ):
             self.assertEqual(self.helper.get_latest_release_tag(), "")
 
+    def test_missing_release_helper_yields_empty_instead_of_a_traceback(self):
+        # Branches from before #35196 keep the ordering helper at
+        # python/tools/get_version_tag.py, so a cherry-pick of this script onto
+        # one of them finds nothing at VERSION_HELPER_PATH. Guessing an order
+        # there could name an image the nightly never published.
+        with patch.object(
+            self.helper, "VERSION_HELPER_PATH", Path("/nonexistent/get_version_tag.py")
+        ):
+            self.assertIsNone(self.helper.load_parse_version_tuple())
+            self.assertEqual(self.helper.get_latest_release_tag(), "")
+
     def test_failed_git_invocation_is_reported_but_not_fatal(self):
         failed = Mock(returncode=128, stdout="", stderr="no such remote")
 

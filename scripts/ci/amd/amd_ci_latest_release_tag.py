@@ -28,7 +28,21 @@ REF_PREFIX = "refs/tags/"
 
 
 def load_parse_version_tuple():
-    """Import the shared PEP 440 tag ordering by path, without running its CLI."""
+    """Import the shared PEP 440 tag ordering by path, without running its CLI.
+
+    Returns None when the release helper is not in this checkout. That happens on
+    branches from before #35196 moved it under scripts/release/, where it is
+    still at python/tools/get_version_tag.py -- picking a tag without the shared
+    ordering risks naming an image the nightly never published, so callers are
+    left with their default instead.
+    """
+    if not VERSION_HELPER_PATH.is_file():
+        print(
+            f"WARNING: {VERSION_HELPER_PATH} is missing, so release tags cannot "
+            "be ordered the way the nightly image was published",
+            file=sys.stderr,
+        )
+        return None
     spec = importlib.util.spec_from_file_location(
         "get_version_tag", VERSION_HELPER_PATH
     )
@@ -75,19 +89,23 @@ def list_local_tags() -> list:
 
 def get_latest_release_tag(remote: str = "origin") -> str:
     """Return the highest release tag, or "" so callers can keep a default."""
+    parse_version_tuple = load_parse_version_tuple()
+    if parse_version_tuple is None:
+        return ""
     tags = list_remote_tags(remote) or list_local_tags()
     if not tags:
+        print(
+            f"WARNING: no {TAG_PATTERN} tags on {remote} or in the local clone",
+            file=sys.stderr,
+        )
         return ""
-    return sorted(tags, key=load_parse_version_tuple(), reverse=True)[0]
+    return sorted(tags, key=parse_version_tuple, reverse=True)[0]
 
 
 def main() -> None:
     tag = get_latest_release_tag()
     if not tag:
-        print(
-            f"ERROR: no {TAG_PATTERN} tags found on origin or in the local clone",
-            file=sys.stderr,
-        )
+        print("ERROR: could not resolve a release tag", file=sys.stderr)
         sys.exit(1)
     print(tag)
 
