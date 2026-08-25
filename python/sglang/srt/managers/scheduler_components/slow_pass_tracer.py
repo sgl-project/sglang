@@ -35,8 +35,6 @@ class SlowPassTracer:
             yield
             return
         start = time.perf_counter()
-        # One process-wide watchdog: the scheduler loop is the only user, and
-        # passes are wrapped non-overlapping, so re-arming per pass is safe.
         faulthandler.dump_traceback_later(self.timeout_s, repeat=False, exit=False)
         try:
             yield
