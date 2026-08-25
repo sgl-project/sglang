@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_mm,
     get_parallel,
     get_schedule,
     get_spec,
@@ -1253,7 +1254,7 @@ class KVCacheConfigurator:
 
         token_to_kv_pool = NPUMiniMaxSparseKVPool(
             size=max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=self.model_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1846,7 +1847,7 @@ class KVCacheConfigurator:
             )
         mm_reservation_gb = mm_runtime_reservation_gb(
             is_multimodal=self.model_config.is_multimodal,
-            mm_feature_transport=self.server_args.mm_feature_transport,
+            mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
@@ -2219,16 +2220,16 @@ def calculate_mla_kv_cache_dim(
     # since it is not compatible for trtllm and other mla attn backend due to the different
     # kv cache layout.
     if (
-        server_args.dsa_prefill_backend == "trtllm"
-        or server_args.dsa_decode_backend == "trtllm"
+        get_exec().kernel.dsa_prefill_backend == "trtllm"
+        or get_exec().kernel.dsa_decode_backend == "trtllm"
     ):
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        server_args.dsa_prefill_backend in ("tilelang", "aiter")
-        or server_args.dsa_decode_backend in ("tilelang", "aiter")
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
     ):
         return kv_cache_dim
 

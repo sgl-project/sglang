@@ -184,6 +184,7 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
                 mamba_radix_cache_strategy="no_buffer",
                 disable_overlap_schedule=True,
             )
+            resolved.resolve_once()
         finally:
             os.environ.clear()
             os.environ.update(environ_before)

@@ -57,12 +57,12 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_device,
     get_disagg,
     get_exec,
     get_mm,
     get_model,
-    publish,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
@@ -448,9 +448,7 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
-        # The DP and TP encoder workers are spawned, so this constructor is
-        # the first publish in those processes.
-        publish(server_args, role="encoder")
+        ensure_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(

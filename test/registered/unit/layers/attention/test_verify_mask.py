@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from sglang.srt.layers.attention.verify_mask import (
     maybe_create_verify_mask,
     tree_mask_numel,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -123,6 +125,24 @@ def _mask(numel, **kwargs):
     )
 
 
+@contextlib.contextmanager
+def _published(speculative_attention_mode):
+    """The backend reads the mode from the config bags, so publish one.
+
+    A stand-in on the model runner stopped being read when the mode became a
+    published leaf -- the record it would come from is not the one this process
+    resolved.
+    """
+    override = get_context().override_server_args(
+        speculative_attention_mode=speculative_attention_mode
+    )
+    override.install()
+    try:
+        yield
+    finally:
+        override.restore()
+
+
 def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
     model_runner = SimpleNamespace(
         kv_cache_dtype=None,
@@ -133,11 +153,12 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         ),
         model_config=SimpleNamespace(context_len=_MAX_CONTEXT_LEN),
     )
-    return HybridAttnBackend(
-        model_runner,
-        prefill_backend=_FakeAttnBackend(prefill_mask),
-        decode_backend=_FakeAttnBackend(decode_mask),
-    )
+    with _published(speculative_attention_mode):
+        return HybridAttnBackend(
+            model_runner,
+            prefill_backend=_FakeAttnBackend(prefill_mask),
+            decode_backend=_FakeAttnBackend(decode_mask),
+        )
 
 
 class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
