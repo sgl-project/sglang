@@ -2300,6 +2300,7 @@ fn release_window_lock_breaks_on_a_tombstone_carrying_the_uuid() {
         Some(99),
         &mut device_frees,
         &mut host_frees,
+        None,
     );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
@@ -2320,6 +2321,7 @@ fn release_window_lock_panics_on_a_non_swa_component() {
         None,
         &mut device_frees,
         &mut host_frees,
+        None,
     );
 }
 
@@ -2355,6 +2357,45 @@ fn release_lock_skip_set_leaves_a_relocked_tombstone_credited() {
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
     assert_eq!(tc.swa_evictable_size(), 1);
+    assert_eq!(tc.swa_protected_size(), 2);
+}
+
+#[test]
+fn release_window_lock_skip_set_leaves_a_relocked_tombstone_credited() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, b, c] = chain(&mut tc);
+    store_swa_device(&mut tc, a);
+    store_swa_device(&mut tc, c);
+    let swa = swa_component(2);
+    let first = swa.acquire_component_lock(
+        &mut tc,
+        c,
+        IncLockRefResult::default(),
+        /* lock_host = */ false,
+    );
+    assert!(first.skip_lock_node_ids[&SWA].contains(&tc.arena.node(b).id));
+
+    store_swa_device(&mut tc, b);
+    let _ = swa.acquire_component_lock(
+        &mut tc,
+        c,
+        IncLockRefResult::default(),
+        /* lock_host = */ false,
+    );
+    assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
+
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    tc.dec_swa_lock_only_with_skip(
+        tc.arena.node(c).id,
+        first.swa_uuid_for_lock,
+        Some(&first.skip_lock_node_ids),
+        &mut device_frees,
+        &mut host_frees,
+    );
+
+    assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
+    assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.swa_protected_size(), 2);
 }
 
@@ -2481,7 +2522,7 @@ fn release_window_lock_passes_over_an_unlocked_valued_node() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     // No uuid bound: the walk crosses the valued-but-unlocked a to the root.
-    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees);
+    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees, None);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2503,7 +2544,7 @@ fn release_window_lock_passes_over_a_mid_chain_tombstone_without_a_uuid() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     // No uuid bound: the walk crosses the mid-chain tombstone b and releases a.
-    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees);
+    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees, None);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);

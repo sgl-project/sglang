@@ -1131,7 +1131,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
     }
 
     /// Early-release the SWA lock along [node, swa_uuid_for_lock] while
-    /// leaving Full and Mamba locks intact.
+    /// leaving the higher-priority Full lock intact. The tree core separately
+    /// releases any co-located lower-priority locks.
     ///
     /// Called when a request's decode position has advanced past the sliding
     /// window — the SWA portion of the tree lock is no longer needed but the
@@ -1146,6 +1147,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         swa_uuid_for_lock: Option<i64>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        skip_lock_node_ids: Option<&HashSet<NodeId>>,
     ) {
         let ct = SWA;
         let mut cur = node_id;
@@ -1155,6 +1157,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 break;
             }
             let parent = node.parent();
+            if skip_lock_node_ids.is_some_and(|ids| ids.contains(&node.id)) {
+                cur = parent;
+                continue;
+            }
+
             // Acquire skips tombstoned nodes; release must skip them too. Same
             // for nodes with lock_ref == 0 — acquire never credited them.
             if !node.has_device_value(SWA) || node.device_lock_ref(SWA) == 0 {

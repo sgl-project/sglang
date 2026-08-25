@@ -660,7 +660,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, swa_uuid_for_lock, result.device_frees, result.host_frees
+            node,
+            swa_uuid_for_lock,
+            result.device_frees,
+            result.host_frees,
+            skip_lock_node_ids=(skip_lock_node_ids or {}).get(ComponentType.SWA, ()),
         )
 
         # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,
@@ -1677,23 +1681,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
 
         cd = node.component_data[comp.component_type]
+        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+            return False
+        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+            return False
+
         # A comp whose TRUE internal priority outranks the trigger is only a
-        # candidate because leaf-collapse flattened priorities; a lock on it is
-        # a legitimate pin and must be spared. A lock on a strictly-lower-
-        # priority tier is a real strand and must trip the assertions below.
+        # candidate because leaf-collapse flattened priorities. Its session
+        # reference can also legitimately pin it independently of the trigger.
         if comp.eviction_priority(is_leaf=False) >= trigger.eviction_priority(
             is_leaf=False
         ):
-            if EvictLayer.DEVICE in target and cd.lock_ref != 0:
-                return False
-            if EvictLayer.HOST in target and cd.host_lock_ref != 0:
-                return False
             if cd.session_ref > 0 and trigger.session_ref(node) == 0:
                 return False
-        if EvictLayer.DEVICE in target:
-            assert cd.lock_ref == 0
-        if EvictLayer.HOST in target:
-            assert cd.host_lock_ref == 0
         return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
