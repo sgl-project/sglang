@@ -246,7 +246,13 @@ class SchedulerPoolStatsObserver:
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
-        mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
+        # MLX backend: MlxAuxiliaryStateReqToTokenPool has no separate
+        # `mamba_allocator`; its `mamba_pool` (MlxAuxiliaryStatePool) exposes the
+        # allocator API (available_size/alloc/free) directly. Fall back to it.
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is None:
+            mamba_allocator = self.req_to_token_pool.mamba_pool
+        mamba_available_size = mamba_allocator.available_size()
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running
         # requests) -- this feeds throttle decisions (get_max_pool_usage) which asserts
         # usage >= 0. With int8 checkpoints the radix-cached states live in a SEPARATE
