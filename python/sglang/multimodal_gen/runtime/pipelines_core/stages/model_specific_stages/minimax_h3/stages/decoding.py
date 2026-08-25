@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -43,6 +43,39 @@ def _required_tensor(value, path: str) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise ValueError(f"{path} must be a torch.Tensor")
     return value
+
+
+@contextmanager
+def _deterministic_audio_decode_context():
+    """Deterministic-algorithm scope for the fp32 audio-VAE decode.
+
+    Without it, cuDNN picks conv algorithms from free-workspace state, so the
+    same audio latent decodes to different bytes on a server process's first
+    request than on every later one. Deterministic algorithms with TF32 off
+    keep cuDNN speed (unlike the encode-side context, which disables cuDNN);
+    if first-request divergence ever reappears, escalate to
+    reference_encoding._AudioVAEDeterminismContext.
+    """
+    b = torch.backends
+    saved = (
+        b.cudnn.allow_tf32,
+        b.cuda.matmul.allow_tf32,
+        b.cudnn.deterministic,
+        b.cudnn.benchmark,
+    )
+    b.cudnn.allow_tf32 = False
+    b.cuda.matmul.allow_tf32 = False
+    b.cudnn.deterministic = True
+    b.cudnn.benchmark = False
+    try:
+        yield
+    finally:
+        (
+            b.cudnn.allow_tf32,
+            b.cuda.matmul.allow_tf32,
+            b.cudnn.deterministic,
+            b.cudnn.benchmark,
+        ) = saved
 
 
 @functools.lru_cache(maxsize=None)
@@ -306,7 +339,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 if audio_latent.is_cuda
                 else nullcontext()
             )
-            with autocast_context:
+            with _deterministic_audio_decode_context(), autocast_context:
                 audio_decode = self._get_vae_decode_fn(
                     audio_vae,
                     server_args,
