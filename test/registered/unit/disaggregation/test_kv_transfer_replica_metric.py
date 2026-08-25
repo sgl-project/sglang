@@ -9,11 +9,13 @@ on the shared CommonKVManager.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +72,50 @@ def _make_sender(kv_mgr):
 
 
 class TestKVTransferReplicaMetric(CustomTestCase):
+    def test_mooncake_does_not_count_cp_replicated_state_that_is_skipped(self):
+        state_indices = [np.array([9], dtype=np.int32)]
+
+        for cp_rank, expected_kv_count, expected_state_count in (
+            (0, 2, 1),
+            (1, 0, 0),
+        ):
+            with self.subTest(cp_rank=cp_rank):
+                mgr = SimpleNamespace(
+                    kv_shard_rank=cp_rank,
+                    kv_shard_size=2,
+                    add_transfer_request=Mock(),
+                    _should_skip_cp_replicated_state_transfer=(
+                        lambda cp_rank=cp_rank: cp_rank != 0
+                    ),
+                )
+                sender = MooncakeKVSender.__new__(MooncakeKVSender)
+                sender.kv_mgr = mgr
+                sender.bootstrap_room = 17
+                sender.aux_index = 3
+                sender.curr_idx = 0
+                sender.num_kv_indices = 2
+                sender.trace_ctx = Mock()
+                sender._transfer_metric = KVTransferMetric()
+                sender._transfer_num_kv_indices = 0
+                sender._transfer_num_state_indices = 0
+
+                # Both logical pages are owned by rank 0, so rank 1 must still
+                # enqueue an empty final chunk but must not count the replicated
+                # state that Mooncake's worker skips for nonzero CP ranks.
+                sender.send(
+                    np.array([0, 2], dtype=np.int32),
+                    state_indices=state_indices,
+                )
+
+                self.assertEqual(sender._transfer_num_kv_indices, expected_kv_count)
+                self.assertEqual(
+                    sender._transfer_num_state_indices, expected_state_count
+                )
+                mgr.add_transfer_request.assert_called_once()
+                call = mgr.add_transfer_request.call_args
+                self.assertTrue(call.args[3])
+                self.assertEqual(len(call.args[1]), expected_kv_count)
+
     def test_mla_scales_kv_and_state_bytes_by_fan_out(self):
         # CP rank 0 replicates to 4 decode TP ranks; both kv and state scale.
         mgr = _make_kv_mgr(is_mla_backend=True)
