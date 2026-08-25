@@ -483,10 +483,6 @@ class AscendAttnBackend(AttentionBackend):
         # device idle. Take them from the host mirrors instead. Gated on dLLM so
         # the decode/prefill path stays byte-identical.
         is_dllm = forward_batch.forward_mode.is_dllm_extend()
-        if is_dllm:
-            seq_lens_max = int(forward_batch.seq_lens_cpu.max())
-        else:
-            seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             if (
                 forward_batch.spec_algorithm is not None
@@ -511,6 +507,8 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_max = forward_batch.seq_lens.max()
             seq_lens_max += self.speculative_step_id + 1
+        elif is_dllm:
+            seq_lens_max = int(forward_batch.seq_lens_cpu.max())
         else:
             seq_lens_max = forward_batch.seq_lens.max()
         self.forward_metadata.block_tables = (

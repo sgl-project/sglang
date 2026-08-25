@@ -376,7 +376,6 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             # Prefer the host mirror kept by batch prep over re-reading the
             # device tensor: .cpu() here is a blocking D2H behind whatever is
             # already queued on the stream, once per replay.
-            #
             seq_lens_cpu = (
                 forward_batch.seq_lens_cpu
                 if forward_batch.seq_lens_cpu is not None
