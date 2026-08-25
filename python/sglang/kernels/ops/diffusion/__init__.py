@@ -345,6 +345,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
@@ -469,6 +470,11 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
+    "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
+    "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "try_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "unmount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
     "mark_sana_video_linear_attention_site": "sites.sana_video_linear_attention_site",
     "mount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
     "sana_video_linear_attention_active": "sites.sana_video_linear_attention_site",
