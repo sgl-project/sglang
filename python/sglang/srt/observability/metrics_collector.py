@@ -1973,6 +1973,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, outcome=outcome
                 ).inc(increment)
             self._last_prefetch_outcomes[outcome] = current
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
