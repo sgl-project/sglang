@@ -135,8 +135,6 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-_k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
-_k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -297,7 +295,7 @@ class KimiK3MLP(nn.Module):
         # but allow the NPU launcher to retain the proven attention-TP layout
         # without a device-type branch in shared model code.
         self._dense_attn_tp = (
-            _k3_dense_mlp_attn_tp
+            get_parallel().enable_dense_mlp_attn_tp
             and is_dp_attention_enabled()
             and tp_rank is None
             and tp_size is None
@@ -553,12 +551,14 @@ class KimiK3MoE(nn.Module):
         # a2a: the block runs on partial batches (shard / DP-local rows), and
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
-        self._shared_experts_tp1 = self._ep_a2a and not _k3_shared_experts_attn_tp
+        self._shared_experts_tp1 = (
+            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
+        )
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
         self._shared_experts_attn_tp_comm = (
-            _k3_shared_experts_attn_tp
+            get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
@@ -3339,9 +3339,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 for backend, indices in deferred_by_backend.items():
                     group_items = [selected_items[index] for index in indices]
                     group_configs = [deferred[index] for index in indices]
-                    # `indices` are positions within selected_items (this
-                    # vision-DP rank's shard), while grid_thws_host is indexed
-                    # by global image position; map back before reading it.
+                    # Map backend-group positions through the rank-local shard to global grid rows.
                     global_indices = [image_indices[index] for index in indices]
                     first_config = group_configs[0]
                     if backend == "gpu":

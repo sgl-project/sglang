@@ -503,12 +503,7 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
 
 
 def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
-    """The owner-rank loader materializes exactly the requested images and
-    reads their grids by global image index: grid_thws_host is indexed by
-    global batch position while deferred groups carry shard-local positions,
-    so a shard like [1] must check and split by image 1's own grid. The
-    per-image grids must differ, or a wrong-row read compares equal and
-    passes silently."""
+    """A vision-DP owner uses each assigned image's grid when preprocessing."""
     from unittest.mock import patch as mock_patch
 
     from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -554,12 +549,10 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     calls = []
 
     def fake_preprocess(images, resize_configs, *args, **kwargs):
-        # Returns each requested image's true grid, in request order, with
-        # pixel rows tagged by image id so the split stays observable.
         ids = [int(image[0, 0, 0]) for image in images]
         calls.append(ids)
         pixel_values = torch.cat(
-            [torch.full((patch_counts[i], 2), float(i)) for i in ids]
+            [torch.full(size=(patch_counts[i], 2), fill_value=float(i)) for i in ids]
         )
         return pixel_values, torch.tensor([grids[i] for i in ids])
 
@@ -580,8 +573,6 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     assert calls == [[1]]
     assert one.dtype == torch.float32
-    # Image 1's 2 patch rows, tagged with its id: checked and split by
-    # image 1's own grid, not by the row at its shard-local position.
     assert one.shape == (2, 2)
     assert (one == 1.0).all()
 

@@ -1726,29 +1726,60 @@ class BaseMultimodalProcessor(ABC):
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
+        all_collected_items = self._finalize_mm_items(
+            all_collected_items,
+            images=base_output.images,
+        )
 
-        for item in all_collected_items:
+        return all_collected_items, input_ids, ret
+
+    def _finalize_mm_items(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        images: Optional[List[Any]],
+    ) -> List[MultimodalDataItem]:
+        mm_items = self._postprocess_mm_items_before_transport(
+            mm_items,
+            images=images,
+        )
+
+        for item in mm_items:
             if item.format in (
                 MultimodalInputFormat.PROCESSOR_OUTPUT,
                 MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
             ):
                 item.set_pad_value()
 
-        self._precompute_hashes_before_cpu_transfer(all_collected_items)
+        self._precompute_hashes_before_cpu_transfer(mm_items)
+        return self._prepare_mm_items_for_transport(mm_items)
 
-        # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
-        # plain CPU tensor. The scheduler copies out and releases each slice.
-        if self.use_cuda_ipc:
-            # post-process, prepare for cuda-ipc transfer
-            for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor):
-                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                if isinstance(item.precomputed_embeddings, torch.Tensor):
-                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                        item.precomputed_embeddings
-                    )
+    def _postprocess_mm_items_before_transport(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        images: Optional[List[Any]],
+    ) -> List[MultimodalDataItem]:
+        """Apply model-specific item reshaping while features are still tensors."""
+        return mm_items
 
-        return all_collected_items, input_ids, ret
+    def _prepare_mm_items_for_transport(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> List[MultimodalDataItem]:
+        """Wrap final GPU features for dispatch to the scheduler."""
+        if not self.use_cuda_ipc:
+            return mm_items
+
+        # Pool misses fall back to plain CPU tensors. The scheduler copies out
+        # and releases each successful pool slice.
+        for item in mm_items:
+            if isinstance(item.feature, torch.Tensor):
+                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+            if isinstance(item.precomputed_embeddings, torch.Tensor):
+                item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                    item.precomputed_embeddings
+                )
+        return mm_items
 
     async def process_and_combine_mm_data_async(
         self,

@@ -32,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -46,7 +47,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
@@ -121,7 +121,7 @@ def _register_legacy_hicache_draft(
         host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         pool_label="draft",
     )
@@ -146,6 +146,18 @@ def _register_legacy_hicache_draft(
 BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 
+def uses_ssm_state(model_config) -> bool:
+    """Whether the model keeps recurrent/conv state alongside its attention KV."""
+    spec = linear_attn_model_spec(model_config)
+    return (
+        hybrid_gdn_config(model_config) is not None
+        or mamba2_config(model_config) is not None
+        or (spec.uses_mamba_radix_cache if spec is not None else False)
+        or kimi_linear_config(model_config) is not None
+        or hybrid_lightning_config(model_config) is not None
+    )
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -165,8 +177,13 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        # Host-pool retraction transfers full and sliding-window components
+        # only, so a model with recurrent state stays on cpu_tensor.
+        supports_host_pool = not uses_ssm_state(
+            tp_worker.model_runner.model_config
+        ) and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
         # TODO(zhangmj): maintain host_pool for priority scheduling, but need
         # to disable when disable hicache.
@@ -224,15 +241,7 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
-    _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
-    is_hybrid_ssm = (
-        hybrid_gdn_config(tp_worker.model_runner.model_config) is not None
-        or mamba2_config(tp_worker.model_runner.model_config) is not None
-        or _registry_needs_mamba
-        or kimi_linear_config(tp_worker.model_runner.model_config) is not None
-        or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
-    )
+    is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
