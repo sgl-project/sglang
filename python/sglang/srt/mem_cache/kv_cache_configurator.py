@@ -2229,7 +2229,7 @@ def calculate_mla_kv_cache_dim(
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
         get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
-        or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
     ):
         return kv_cache_dim
 
