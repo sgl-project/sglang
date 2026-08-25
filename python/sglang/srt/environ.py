@@ -640,6 +640,11 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+
+    # Cap finished-request final emissions per pass (0 = unlimited) so a
+    # completion wave's payload assembly spreads over a few passes; KV release
+    # and abort semantics are unchanged, only the finish event is delayed.
+    SGLANG_OPT_STREAM_FINISH_BUDGET = EnvInt(64)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout

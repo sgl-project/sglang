@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+STREAM_FINISH_BUDGET = envs.SGLANG_OPT_STREAM_FINISH_BUDGET.get()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -60,6 +62,9 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    # Emissions deferred by SGLANG_OPT_STREAM_FINISH_BUDGET; drained FIFO.
+    _deferred_finished: deque = field(default_factory=deque)
+    _deferred_rids: set = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
@@ -144,17 +149,33 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        finish_budget = STREAM_FINISH_BUDGET
+        drained: List[Req] = []
+        if self._deferred_finished:
+            n_drain = len(self._deferred_finished)
+            if finish_budget > 0:
+                n_drain = min(n_drain, finish_budget)
+            for _ in range(n_drain):
+                req = self._deferred_finished.popleft()
+                self._deferred_rids.discard(req.rid)
+                if not req.finished_output:
+                    drained.append(req)
+            return_logprob = return_logprob or any(
+                req.return_logprob for req in drained
+            )
+
+        all_reqs = drained + reqs if drained else reqs
         return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
+            req.return_hidden_states for req in all_reqs if req is not skip_req
         )
         return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
+            req.return_routed_experts for req in all_reqs if req is not skip_req
         )
         return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
+            req.return_indexer_topk for req in all_reqs if req is not skip_req
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_mask for req in all_reqs if req is not skip_req
         )
 
         acc = _GenerationStreamAccumulator(
@@ -171,13 +192,27 @@ class SchedulerOutputStreamer:
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
         )
-        for req in reqs:
+        emitted_finished = 0
+        drained_ids = {id(req) for req in drained}
+        for req in all_reqs:
             if req is skip_req:
                 continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
+            if (
+                finish_budget > 0
+                and req.finished()
+                and emitted_finished >= finish_budget
+                and id(req) not in drained_ids
+            ):
+                if req.rid not in self._deferred_rids:
+                    self._deferred_rids.add(req.rid)
+                    self._deferred_finished.append(req)
+                continue
+            if req.finished():
+                emitted_finished += 1
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
