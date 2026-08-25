@@ -34,6 +34,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.glm4v import (
+    _glm_effective_presize_budget,
     glm_budget_kwargs,
     glm_decode_frames_at,
     glm_max_image_tokens_from_configs,
@@ -562,6 +563,12 @@ class EncoderPreprocessor:
             )
             if budget_kwargs is not None:
                 video_processor_kwargs.update(budget_kwargs)
+                video_configs = [
+                    _glm_effective_presize_budget(
+                        config, budget_kwargs.get("max_image_tokens")
+                    )
+                    for config in video_configs
+                ]
 
             framed = any(isinstance(video, list) for video in video_items)
             if framed:

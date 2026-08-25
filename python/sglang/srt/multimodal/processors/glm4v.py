@@ -115,11 +115,54 @@ def glm_processor_video_config(processor):
     """Read GLM video defaults exposed by the model's HF processor."""
     if processor is None:
         return {}
-    return {
+    config = {
         key: value
         for key in GLM_MEDIA_CONFIG_KEYS
         if (value := getattr(processor, key, None)) is not None
     }
+    budget = _glm_processor_resize_budget(processor)
+    if budget is not None:
+        config["_presize_budget"] = budget
+    return config
+
+
+def _glm_processor_resize_budget(processor):
+    """Resize geometry inputs mirroring the HF GLM video processor.
+
+    The budget comes from the processor's token limits, not `size`: on
+    Glm5NextVideoProcessor `size.longest_edge` is a sentinel (1) and the real
+    bound is `max_image_tokens * temporal_patch_size * (patch*merge)^2`.
+    """
+    max_image_tokens = getattr(processor, "max_image_tokens", None)
+    if not max_image_tokens:
+        return None
+    patch_size = getattr(processor, "patch_size", None) or GLM_VIDEO_PATCH_SIZE
+    merge_size = getattr(processor, "merge_size", None) or GLM_VIDEO_MERGE_SIZE
+    expand_factor = getattr(processor, "patch_expand_factor", None) or 1
+    temporal_factor = getattr(processor, "temporal_patch_size", None) or 2
+    pixels_per_token = int(temporal_factor * (patch_size * merge_size) ** 2)
+    return {
+        "factor": int(patch_size * merge_size * expand_factor),
+        "temporal_factor": int(temporal_factor),
+        "pixels_per_token": pixels_per_token,
+        "min_pixels": int(getattr(processor, "min_image_tokens", None) or 0)
+        * pixels_per_token,
+        "max_pixels": int(max_image_tokens) * pixels_per_token,
+        "resize_mode": getattr(processor, "resize_mode", None) or "resize",
+    }
+
+
+def _glm_effective_presize_budget(video_config, effective_max_image_tokens):
+    """Overlay the call-effective token budget onto a video's presize budget."""
+    budget = video_config.get("_presize_budget") if video_config else None
+    if not budget or effective_max_image_tokens is None:
+        return video_config
+    config = dict(video_config)
+    config["_presize_budget"] = {
+        **budget,
+        "max_pixels": int(effective_max_image_tokens) * budget["pixels_per_token"],
+    }
+    return config
 
 
 def _merge_glm_video_configs(default_config, item_configs):
@@ -247,6 +290,107 @@ def preprocess_video_frames_sync(frame_list: List[dict]):
     )
 
 
+GLM_VIDEO_PRE_RESIZE_CHUNK = 64
+
+
+def _vendor_smart_resize_canvas(
+    num_frames, height, width, *, temporal_factor, factor, min_pixels, max_pixels
+):
+    """Replica of the vendor Glm5Next smart_resize (align-ceil + budget search)."""
+
+    def align(value):
+        return math.ceil(value / factor) * factor
+
+    def fit_within_budget(aligned_frames):
+        low, high = 1, height
+        best_height, best_width = factor, factor
+        while low <= high:
+            content_height = (low + high) // 2
+            content_width = max(1, math.floor(width * content_height / height))
+            candidate_height = align(content_height)
+            candidate_width = align(content_width)
+            if aligned_frames * candidate_height * candidate_width <= max_pixels:
+                best_height, best_width = candidate_height, candidate_width
+                low = content_height + 1
+            else:
+                high = content_height - 1
+        return best_height, best_width
+
+    aligned_frames = max(
+        temporal_factor, round(num_frames / temporal_factor) * temporal_factor
+    )
+    canvas_height, canvas_width = align(height), align(width)
+    if aligned_frames * canvas_height * canvas_width > max_pixels:
+        canvas_height, canvas_width = fit_within_budget(aligned_frames)
+    elif aligned_frames * canvas_height * canvas_width < min_pixels:
+        scale = math.sqrt(min_pixels / (num_frames * height * width))
+        canvas_height = align(max(1, math.ceil(height * scale)))
+        canvas_width = align(max(1, math.ceil(width * scale)))
+        if aligned_frames * canvas_height * canvas_width > max_pixels:
+            canvas_height, canvas_width = fit_within_budget(aligned_frames)
+    return canvas_height, canvas_width
+
+
+def _pre_resize_frames_for_processor(
+    frames,
+    *,
+    factor,
+    temporal_factor,
+    pixels_per_token,
+    min_pixels,
+    max_pixels,
+    resize_mode,
+):
+    """Reproduce the HF GLM video processor's resize+pad output ahead of time.
+
+    The HF Glm5Next video processor converts the full stacked tensor to
+    float32 at native resolution before resizing; handing it an exact copy of
+    its own output makes its resize a no-op, keeping the final grid identical
+    while bounding the allocation. The resize runs in chunks because
+    torchvision materializes float32 intermediates.
+    """
+    import torchvision.transforms.functional as TF
+
+    if not isinstance(frames, torch.Tensor):
+        frames = torch.from_numpy(np.asarray(frames))
+    nchw = frames.permute(0, 3, 1, 2)
+    num_frames, _, height, width = nchw.shape
+    canvas_height, canvas_width = _vendor_smart_resize_canvas(
+        num_frames,
+        height,
+        width,
+        temporal_factor=temporal_factor,
+        factor=factor,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    if resize_mode == "resize":
+        content_height, content_width = canvas_height, canvas_width
+    else:
+        scale = min(canvas_height / height, canvas_width / width)
+        if num_frames * height * width >= min_pixels:
+            scale = min(1.0, scale)
+        content_height = max(1, min(canvas_height, math.floor(height * scale)))
+        content_width = max(1, min(canvas_width, math.floor(width * scale)))
+    if (content_height, content_width) != (height, width):
+        nchw = torch.cat(
+            [
+                TF.resize(
+                    chunk,
+                    [content_height, content_width],
+                    interpolation=TF.InterpolationMode.BICUBIC,
+                    antialias=True,
+                )
+                for chunk in nchw.split(GLM_VIDEO_PRE_RESIZE_CHUNK)
+            ]
+        )
+    if (content_height, content_width) != (canvas_height, canvas_width):
+        nchw = torch.nn.functional.pad(
+            nchw, (0, canvas_width - content_width, 0, canvas_height - content_height)
+        )
+    return nchw.permute(0, 2, 3, 1).contiguous()
+
+
 def glm_decode_frames_at(vr, indices, video_config=None):
     """Decode only an explicitly assigned frame subset for one encoder rank."""
     indices = list(indices)
@@ -261,6 +405,8 @@ def glm_decode_frames_at(vr, indices, video_config=None):
     max_tokens_per_frame = video_config.get("max_tokens_per_frame")
     if max_tokens_per_frame is not None:
         frames = _resize_frames_to_max_tokens(frames, max_tokens_per_frame)
+    elif budget := video_config.get("_presize_budget"):
+        frames = _pre_resize_frames_for_processor(frames, **budget)
     return frames
 
 
@@ -281,6 +427,7 @@ def glm_sample_and_decode_sync(vr, video_config=None):
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     smart_rgb_conversion = True
+    video_preprocessing_device = "cpu"
     models = [
         m
         for m in [
@@ -373,12 +520,21 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
 
         video_metadata = None
+        videos_kwargs = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
+            videos_kwargs = glm_budget_kwargs(
+                video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+                count=len(base_output.videos),
+                split=True,
+            )
+            effective_max_image_tokens = (videos_kwargs or {}).get("max_image_tokens")
             loop = asyncio.get_running_loop()
             decode_tasks = []
             for index, video in enumerate(base_output.videos):
-                video_config = (
-                    video_configs[index] if index < len(video_configs) else {}
+                video_config = _glm_effective_presize_budget(
+                    video_configs[index] if index < len(video_configs) else {},
+                    effective_max_image_tokens,
                 )
                 if isinstance(video, VideoDecoderWrapper):
                     decode_tasks.append(
@@ -415,12 +571,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # indices for timestamps and prevent a second HF sampling pass.
             combine_kwargs["video_metadata"] = video_metadata
             combine_kwargs["do_sample_frames"] = False
-            videos_kwargs = glm_budget_kwargs(
-                video_processor,
-                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
-                count=len(base_output.videos),
-                split=True,
-            )
             processor_video_config = {
                 key: value
                 for key, value in self.video_config.items()

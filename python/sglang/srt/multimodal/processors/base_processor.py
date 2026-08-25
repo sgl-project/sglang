@@ -701,6 +701,14 @@ class BaseMultimodalProcessor(ABC):
             if device is not None:
                 kwargs["device"] = device
 
+        # Model families may keep video preprocessing off the GPU: the
+        # tokenizer process otherwise competes with the scheduler's pools for
+        # device memory on long videos.
+        if videos:
+            video_device = getattr(self, "video_preprocessing_device", None)
+            if video_device is not None:
+                kwargs["device"] = video_device
+
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
             bos = getattr(tokenizer, "bos_token", None)
