@@ -1,15 +1,18 @@
-import sys
-import threading
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+"""Unit tests for srt/disaggregation/common/conn — receiver connection_pool invalidation."""
 
-import pytest
-
-from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.test.test_utils import CustomTestCase
 
 
 def _receiver(connection_pool, entries):
@@ -52,84 +55,100 @@ def _fetching_receiver(connection_pool):
     return receiver
 
 
-def test_invalidate_removes_matching_generation():
-    stale = [
-        {"rank_ip": "10.0.0.1", "rank_port": 1001},
-        {"rank_ip": "10.0.0.1", "rank_port": 1002},
-    ]
-    retained = [{"rank_ip": "10.0.0.2", "rank_port": 2001}]
-    receiver = _receiver(
-        {"stale": stale, "retained": retained},
-        {"stale": stale},
-    )
+class TestReceiverConnectionPool(CustomTestCase):
+    """Identity-scoped invalidation of cached prefill bootstrap metadata."""
 
-    receiver.invalidate_cached_bootstrap_infos()
+    def test_invalidate_removes_matching_generation(self):
+        stale = [
+            {"rank_ip": "10.0.0.1", "rank_port": 1001},
+            {"rank_ip": "10.0.0.1", "rank_port": 1002},
+        ]
+        retained = [{"rank_ip": "10.0.0.2", "rank_port": 2001}]
+        receiver = _receiver(
+            {"stale": stale, "retained": retained},
+            {"stale": stale},
+        )
 
-    assert receiver.kv_mgr.connection_pool == {"retained": retained}
-    assert receiver._connection_pool_entries == {}
+        receiver.invalidate_cached_bootstrap_infos()
 
+        self.assertEqual(receiver.kv_mgr.connection_pool, {"retained": retained})
+        self.assertEqual(receiver._connection_pool_entries, {})
 
-def test_invalidate_preserves_concurrent_replacement_generation():
-    stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-    replacement = [{"rank_ip": "10.0.0.1", "rank_port": 2001}]
-    receiver = _receiver(
-        {"key": replacement},
-        {"key": stale},
-    )
+    def test_invalidate_preserves_concurrent_replacement_generation(self):
+        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        replacement = [{"rank_ip": "10.0.0.1", "rank_port": 2001}]
+        receiver = _receiver(
+            {"key": replacement},
+            {"key": stale},
+        )
 
-    receiver.invalidate_cached_bootstrap_infos()
+        receiver.invalidate_cached_bootstrap_infos()
 
-    assert receiver.kv_mgr.connection_pool == {"key": replacement}
+        self.assertEqual(receiver.kv_mgr.connection_pool, {"key": replacement})
 
+    def test_invalidate_removes_all_matching_cp_entries(self):
+        stale_cp0 = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        stale_cp1 = [{"rank_ip": "10.0.0.1", "rank_port": 1002}]
+        receiver = _receiver(
+            {"cp0": stale_cp0, "cp1": stale_cp1},
+            {"cp0": stale_cp0, "cp1": stale_cp1},
+        )
 
-def test_invalidate_removes_all_matching_cp_entries():
-    stale_cp0 = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-    stale_cp1 = [{"rank_ip": "10.0.0.1", "rank_port": 1002}]
-    receiver = _receiver(
-        {"cp0": stale_cp0, "cp1": stale_cp1},
-        {"cp0": stale_cp0, "cp1": stale_cp1},
-    )
+        receiver.invalidate_cached_bootstrap_infos()
 
-    receiver.invalidate_cached_bootstrap_infos()
+        self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
-    assert receiver.kv_mgr.connection_pool == {}
+    def test_invalidate_without_initialized_entries_is_noop(self):
+        # A receiver can hit a failure path before __init__ populated
+        # _connection_pool_entries; invalidation must not raise AttributeError
+        # and mask the original failure.
+        receiver = object.__new__(CommonKVReceiver)
+        receiver.kv_mgr = SimpleNamespace(
+            connection_pool={"key": [{"rank_ip": "10.0.0.1", "rank_port": 1001}]},
+            connection_lock=threading.Lock(),
+        )
 
+        receiver.invalidate_cached_bootstrap_infos()
 
-def test_next_receiver_refetches_after_invalidation():
-    stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-    connection_pool = {"prefill:8998_0_0_0": stale}
-    stale_receiver = _receiver(
-        connection_pool,
-        {"prefill:8998_0_0_0": stale},
-    )
-    stale_receiver.invalidate_cached_bootstrap_infos()
+        self.assertEqual(
+            receiver.kv_mgr.connection_pool,
+            {"key": [{"rank_ip": "10.0.0.1", "rank_port": 1001}]},
+        )
 
-    receiver = _fetching_receiver(connection_pool)
-    receiver._setup_bootstrap_infos()
+    def test_next_receiver_refetches_after_invalidation(self):
+        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        connection_pool = {"prefill:8998_0_0_0": stale}
+        stale_receiver = _receiver(
+            connection_pool,
+            {"prefill:8998_0_0_0": stale},
+        )
+        stale_receiver.invalidate_cached_bootstrap_infos()
 
-    assert receiver.fetch_count == 1
-    assert receiver.bootstrap_infos[0]["rank_port"] == 2001
-    assert (
-        connection_pool["prefill:8998_0_0_0"]
-        is receiver._connection_pool_entries["prefill:8998_0_0_0"]
-    )
+        receiver = _fetching_receiver(connection_pool)
+        receiver._setup_bootstrap_infos()
 
+        self.assertEqual(receiver.fetch_count, 1)
+        self.assertEqual(receiver.bootstrap_infos[0]["rank_port"], 2001)
+        self.assertIs(
+            connection_pool["prefill:8998_0_0_0"],
+            receiver._connection_pool_entries["prefill:8998_0_0_0"],
+        )
 
-@patch("sglang.srt.disaggregation.common.conn.time.time", return_value=3.0)
-def test_waiting_timeout_invalidates_cached_generation(_mock_time):
-    stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-    receiver = _receiver({"key": stale}, {"key": stale})
-    receiver.bootstrap_room = 1
-    receiver.bootstrap_infos = stale
-    receiver.init_time = 1.0
-    receiver.abort_notified = True
-    receiver.kv_mgr.waiting_timeout = 1.0
-    receiver.kv_mgr.record_failure = Mock()
-    receiver.kv_mgr.update_status = Mock()
+    @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=3.0)
+    def test_waiting_timeout_invalidates_cached_generation(self, _mock_time):
+        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        receiver = _receiver({"key": stale}, {"key": stale})
+        receiver.bootstrap_room = 1
+        receiver.bootstrap_infos = stale
+        receiver.init_time = 1.0
+        receiver.abort_notified = True
+        receiver.kv_mgr.waiting_timeout = 1.0
+        receiver.kv_mgr.record_failure = Mock()
+        receiver.kv_mgr.update_status = Mock()
 
-    assert receiver._check_waiting_timeout() == KVPoll.Failed
-    assert receiver.kv_mgr.connection_pool == {}
+        self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
+        self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    unittest.main()
