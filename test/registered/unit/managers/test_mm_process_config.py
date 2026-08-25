@@ -472,8 +472,9 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         ):
             processor = BaseMultimodalProcessor()
 
+        hf_processor = SimpleNamespace(tokenizer=object())
         processor.mm_processor_executor = MultimodalProcessorExecutor(
-            SimpleNamespace(tokenizer=object()), max_workers=2
+            lambda: hf_processor, max_workers=2
         )
         processor.process_and_combine_mm_data = MagicMock(
             side_effect=lambda *_args, **_kwargs: threading.current_thread().name
@@ -517,7 +518,8 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             MultimodalProcessorExecutor,
         )
 
-        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
         return_processor = lambda *, processor: processor
         try:
             first = await executor.run(return_processor)
@@ -527,30 +529,37 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, second)
 
-    async def test_replacement_worker_lazily_clones_processor(self):
-        from sglang.srt.multimodal.processors import executor as executor_module
+    async def test_clone_carries_customization_applied_after_construction(self):
+        """A subclass keeps customizing `_processor` after `super().__init__()`.
 
-        source_processor = object()
-        replacement_clone = SimpleNamespace(tokenizer=object())
-        with patch.object(
-            executor_module.copy,
-            "deepcopy",
-            return_value=replacement_clone,
-        ) as deepcopy:
-            executor = executor_module.MultimodalProcessorExecutor(
-                source_processor, max_workers=2
-            )
-            executor._processor_clones.clear()
-            return_processor = lambda *, processor: processor
-            try:
-                first = await executor.run(return_processor)
-                second = await executor.run(return_processor)
-            finally:
-                executor.shutdown()
+        Sarashina2Vision patches its image processor there and Pixtral sets
+        `patch_size` / `spatial_merge_size`; a clone snapshotted while the pool
+        was built would serve requests from a half-configured processor.
+        """
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
 
-        self.assertIs(first, replacement_clone)
-        self.assertIs(first, second)
-        self.assertEqual(deepcopy.call_count, 3)
+        owner = SimpleNamespace(_processor=SimpleNamespace(patch_size=16))
+        executor = MultimodalProcessorExecutor(lambda: owner._processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        owner._processor.patch_size = 14
+
+        seen = await executor.run(lambda *, processor: processor.patch_size)
+        self.assertEqual(seen, 14)
+
+    async def test_worker_gets_a_clone_not_the_shared_processor(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        worker_processor = await executor.run(lambda *, processor: processor)
+        self.assertIsNot(worker_processor, hf_processor)
 
 
 class TestProcessMmDataKwargs(CustomTestCase):

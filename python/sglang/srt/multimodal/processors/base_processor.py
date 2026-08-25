@@ -347,8 +347,11 @@ class BaseMultimodalProcessor(ABC):
         self.mm_processor_executor = None
         if self.mm_processor_worker_num > 1:
             try:
+                # A callable, not the object: subclasses finish customizing
+                # `_processor` after this returns, and the workers must clone it
+                # as the subclass left it.
                 self.mm_processor_executor = MultimodalProcessorExecutor(
-                    self._processor, self.mm_processor_worker_num
+                    lambda: self._processor, self.mm_processor_worker_num
                 )
             except Exception:
                 logger.warning(
