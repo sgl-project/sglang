@@ -1,6 +1,8 @@
+import sys
 import unittest
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -75,6 +77,16 @@ class TestDeepseekVL2ImageFeatures(CustomTestCase):
         )
 
         self.assertEqual(vision.parameter_lookups, 1)
+
+    def test_missing_timm_error_suppresses_import_cause(self) -> None:
+        with mock.patch.dict(sys.modules, {"timm": None}):
+            with self.assertRaisesRegex(ImportError, "Please install timm") as error:
+                DeepseekVL2ForCausalLM._init_vision_module(
+                    vision_config=mock.sentinel.vision_config,
+                    quant_config=None,
+                )
+
+        self.assertIsNone(error.exception.__cause__)
 
 
 if __name__ == "__main__":
