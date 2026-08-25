@@ -1,3 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["sglang-crates.lock.json"])
+exports_files([
+    "sgl-model-gateway-crates.lock.json",
+    "sglang-crates.lock.json",
+])

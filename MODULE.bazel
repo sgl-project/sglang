@@ -99,4 +99,21 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
-use_repo(crate, "sglang_crates")
+crate.from_cargo(
+    name = "sgl_model_gateway_crates",
+    cargo_lockfile = "//sgl-model-gateway:Cargo.lock",
+    lockfile = "//bazel/rust:sgl-model-gateway-crates.lock.json",
+    manifests = ["//sgl-model-gateway:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(
+    crate,
+    "sgl_model_gateway_crates",
+    "sglang_crates",
+)
