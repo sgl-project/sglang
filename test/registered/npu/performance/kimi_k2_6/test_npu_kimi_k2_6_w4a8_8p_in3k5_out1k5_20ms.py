@@ -53,6 +53,8 @@ KIMI_K2_6_OTHER_ARGS = [
     6144,
     "--max-prefill-tokens",
     65536,
+    "--max-total-tokens",
+    32256,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",

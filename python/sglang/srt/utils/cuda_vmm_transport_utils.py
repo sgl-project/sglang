@@ -10,22 +10,6 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.cuda_vmm_utils import (
-    _FD_SEND_TIMEOUT_S,
-    VmmReservation,
-    _get_cuda_driver,
-    _recv_fd,
-    _send_fd,
-    align_up,
-    allocation_handle_type_name,
-    check_drv,
-    get_allocation_granularity,
-    get_device_allocation_handle_type,
-    import_and_map_alloc,
-    make_device_allocation_prop,
-    release_mappings,
-    tensor_from_pointer,
-)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -42,6 +26,22 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     get_mm_feature_pool_size_per_worker,
+)
+from sglang.srt.utils.cuda_vmm_utils import (
+    _FD_SEND_TIMEOUT_S,
+    VmmReservation,
+    _get_cuda_driver,
+    _recv_fd,
+    _send_fd,
+    align_up,
+    allocation_handle_type_name,
+    check_drv,
+    get_allocation_granularity,
+    get_device_allocation_handle_type,
+    import_and_map_alloc,
+    make_device_allocation_prop,
+    release_mappings,
+    tensor_from_pointer,
 )
 
 logger = logging.getLogger(__name__)

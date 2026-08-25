@@ -91,6 +91,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -2005,7 +2006,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 

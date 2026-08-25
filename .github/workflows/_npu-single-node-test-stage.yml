@@ -58,6 +58,11 @@ on:
         description: 'GitHub token for API calls'
         type: string
         default: ${{ github.token }}
+      test_timeout_minutes:
+        required: false
+        type: string
+        default: '300'
+        description: 'timeout-minutes for the Run test step'
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -210,7 +215,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 300
+        timeout-minutes: ${{ fromJson(inputs.test_timeout_minutes) }}
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com

@@ -16,6 +16,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -177,6 +178,12 @@ def run_evalscope(
         text=True,
         bufsize=1,
         shell=True,
+        start_new_session=True,
+    )
+
+    logger.info(
+        f"run_evalscope spawned: pid={process.pid} "
+        f"pgid={os.getpgid(process.pid)} cmd={cmd}"
     )
 
     output_lines = []
@@ -187,6 +194,13 @@ def run_evalscope(
             output_lines.append(line.strip())
 
         process.wait()
+
+        logger.info(
+            f"run_evalscope finished: pid={process.pid} "
+            f"returncode={process.returncode}"
+        )
+
+        kill_process_group(process)
 
         if process.returncode != 0:
             logger.error(f"Command failed with return code: {process.returncode}")
@@ -204,12 +218,10 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                for item in report_data:
-                    score = item.get("score")
-                    if score is not None:
-                        metrics["accuracy"] = float(score)
-                        logger.info(f"The Final Accuracy from report: {score}")
-                        break
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
@@ -245,11 +257,14 @@ def run_evalscope(
             logger.warning("Process did not terminate gracefully, killing it...")
             process.kill()
             logger.info("Process killed")
+        kill_process_group(process)
         raise
+
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
         process.wait(timeout=5)
+        kill_process_group(process)
         raise
 
 

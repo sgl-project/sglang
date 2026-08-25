@@ -96,6 +96,7 @@ def compute_post_capture_kv_resize(
     )
     pool.finalize_backing(config)
     model_runner.token_to_kv_pool_allocator.resize(config)
+    model_runner.req_to_token_pool.reset_aux_cache_allocator()
 
     capped_max_running_requests = None
     if model_runner.max_running_requests is not None:

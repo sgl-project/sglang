@@ -297,6 +297,9 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     automatically via HuggingFace Hub (if the path is an HF cache entry);
     if repair fails a clear RuntimeError is raised.
     """
+    if os.path.isfile(model_path):
+        return [str(model_path)] if str(model_path).endswith(".safetensors") else []
+
     found = sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
     index_path = os.path.join(

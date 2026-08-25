@@ -278,6 +278,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:

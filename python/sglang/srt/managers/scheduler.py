@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_serving,
     get_spec,
 )
@@ -102,7 +103,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -137,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -178,6 +180,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -293,7 +297,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -329,6 +333,10 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.weight_versions import (
+    compute_weight_version_spans,
+    record_weight_version_events,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -1608,6 +1616,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_ipc,
                 ),
                 (
+                    UpdateWeightVersionReqInput,
+                    self.handle_update_weight_version,
+                ),
+                (
                     GetWeightsByNameReqInput,
                     self.weight_updater.get_weights_by_name,
                 ),
@@ -2821,13 +2833,13 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = AbortReq(
+            abort_req = _make_abort_req(
+                req,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
-                rid=req.rid,
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
@@ -2870,13 +2882,13 @@ class Scheduler(
                 message = "The request is aborted by a higher priority request."
 
         self.ipc_channels.send_to_tokenizer.send_output(
-            AbortReq(
+            _make_abort_req(
+                req_to_abort,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
-                rid=req_to_abort.rid,
             ),
             req_to_abort,
         )
@@ -2896,13 +2908,13 @@ class Scheduler(
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
+                    _make_abort_req(
+                        req,
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                             "message": "Request waiting timeout reached.",
                         },
-                        rid=req.rid,
                     ),
                     req,
                 )
@@ -3035,7 +3047,7 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3617,10 +3629,7 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                    ),
+                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
 
@@ -4386,6 +4395,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 
@@ -4412,6 +4422,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
+        ret["world_size"] = compute_world_size(get_server_args())
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
@@ -4453,6 +4464,9 @@ class Scheduler(
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
+
+        if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
+            ret["env_vars"] = exportable_env_vars()
 
         # These fields are not msgpack-serializable (a config object and a bound
         # signal handler); no reader consumes them.
@@ -4569,6 +4583,42 @@ class Scheduler(
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    def handle_update_weight_version(
+        self, recv_req: UpdateWeightVersionReqInput
+    ) -> UpdateWeightVersionReqOutput:
+        self.record_weight_version_change(new_version=recv_req.new_version)
+        return UpdateWeightVersionReqOutput()
+
+    def record_weight_version_change(self, new_version: Optional[str]) -> None:
+        if new_version is None or new_version == get_serving().weight_version:
+            return
+
+        old_version = get_serving().weight_version
+        get_context().override("scheduler.weight_version", weight_version=new_version)
+
+        live_reqs = {
+            *self.collect_inflight_reqs(),
+            *self.waiting_queue,
+            *([self.chunked_req] if self.chunked_req is not None else []),
+        }
+        if self.hisparse_coordinator is not None:
+            live_reqs.update(
+                act.req for act in self.hisparse_coordinator.ack_staging_queue
+            )
+        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
+        logger.info(
+            f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+        )
+
+    def collect_inflight_reqs(self) -> Set[Req]:
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.last_batch]
+        else:
+            inflight_batches = [*self.running_mbs, *self.mbs]
+        return {
+            req for batch in inflight_batches if batch is not None for req in batch.reqs
+        }
+
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
@@ -4594,7 +4644,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4627,7 +4677,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
+                    _make_abort_req(req), req
                 )
                 if (
                     req.req_pool_idx is not None
@@ -4703,20 +4753,14 @@ class Scheduler(
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
                         self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
+                            _make_abort_req(decode_req), decode_req
                         )
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
-        else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
-
-        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
-        for req in inflight_reqs:
+        for req in self.collect_inflight_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
@@ -5231,3 +5275,17 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+    )

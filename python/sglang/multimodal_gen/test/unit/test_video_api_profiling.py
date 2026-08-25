@@ -2,7 +2,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeVideoGenerationsRequest,
     VideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+    RealtimeChunkInputs,
+    build_realtime_sampling_params,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
@@ -49,4 +54,30 @@ def test_video_api_forwards_profiling_options():
     assert kwargs["profile"] is True
     assert kwargs["num_profiled_timesteps"] == 3
     assert kwargs["profile_all_stages"] is False
+    assert kwargs["quality"] == "high"
+
+
+def test_realtime_video_api_forwards_sampling_quality():
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="profile this realtime request",
+        first_frame="cat.png",
+        quality="high",
+    )
+    chunk_inputs = RealtimeChunkInputs(prompt=request.prompt)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.entrypoints.openai.realtime."
+        "realtime_adapter.build_sampling_params",
+        side_effect=lambda request_id, **kwargs: kwargs,
+    ):
+        kwargs = build_realtime_sampling_params(
+            "realtime-profile-request",
+            request=request,
+            chunk_inputs=chunk_inputs,
+            num_frames=9,
+            num_inference_steps=4,
+            chunk_size=9,
+        )
+
     assert kwargs["quality"] == "high"

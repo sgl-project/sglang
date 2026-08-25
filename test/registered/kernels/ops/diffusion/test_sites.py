@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 import sglang.kernels.ops.diffusion.sites.fused_gate_rmsnorm_site as gate_rmsnorm
 import sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site as linear_gelu
+import sglang.kernels.ops.diffusion.sites.lingbot_video_rmsnorm_site as lingbot_video_rmsnorm
 import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
@@ -454,6 +455,53 @@ def test_sana_video_linear_attention_quality_path_and_guards():
     )
     sana_video_linear_attention.unmount_sana_video_linear_attention(site)
     assert not sana_video_linear_attention.sana_video_linear_attention_active(site)
+
+
+@requires_cuda
+@torch.no_grad()
+def test_lingbot_video_rmsnorm_quality_path_and_guards():
+    torch.manual_seed(1)
+    site = nn.Module()
+    site.weight = nn.Parameter(torch.randn(2048, device="cuda", dtype=torch.float32))
+    lingbot_video_rmsnorm.mark_lingbot_video_rmsnorm_site(site)
+    hidden_states = torch.randn(1, 128, 2048, device="cuda", dtype=torch.bfloat16)
+
+    assert (
+        lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
+            site, hidden_states, site.weight, 1e-6
+        )
+        is None
+    )
+    assert lingbot_video_rmsnorm.mount_lingbot_video_rmsnorm(site)
+    output = lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
+        site, hidden_states, site.weight, 1e-6
+    )
+    states_fp32 = hidden_states.float()
+    variance = states_fp32.pow(2).mean(-1, keepdim=True)
+    normalized = states_fp32 * torch.rsqrt(variance + 1e-6)
+    reference = (site.weight * normalized).bfloat16()
+    torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+
+    bf16_site = nn.Module()
+    bf16_site.weight = nn.Parameter(
+        torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+    )
+    lingbot_video_rmsnorm.mark_lingbot_video_rmsnorm_site(bf16_site)
+    assert lingbot_video_rmsnorm.mount_lingbot_video_rmsnorm(bf16_site)
+    bf16_output = lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
+        bf16_site, hidden_states, bf16_site.weight, 1e-6
+    )
+    bf16_reference = (bf16_site.weight * normalized).bfloat16()
+    torch.testing.assert_close(bf16_output, bf16_reference, atol=3e-2, rtol=3e-2)
+
+    assert (
+        lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
+            site, hidden_states.float(), site.weight, 1e-6
+        )
+        is None
+    )
+    lingbot_video_rmsnorm.unmount_lingbot_video_rmsnorm(site)
+    assert not lingbot_video_rmsnorm.lingbot_video_rmsnorm_active(site)
 
 
 if __name__ == "__main__":

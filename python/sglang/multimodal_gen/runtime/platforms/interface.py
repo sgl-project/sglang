@@ -188,6 +188,10 @@ class Platform:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
+    def is_device_type(self, device_type: str | None) -> bool:
+        """Return whether a device type belongs to this platform."""
+        return device_type == self.device_type
+
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS

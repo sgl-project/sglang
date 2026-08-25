@@ -13,6 +13,7 @@ one field that is deliberately read before resolution touches it.
 """
 
 import ast
+import functools
 import pathlib
 import unittest
 
@@ -51,6 +52,24 @@ _STALE_FROM_THE_REGISTRIES = frozenset(
 )
 
 
+@functools.lru_cache(maxsize=None)
+def _parsed(path):
+    return ast.parse(path.read_text(encoding="utf-8-sig"))
+
+
+@functools.lru_cache(maxsize=None)
+def _declared_resolution_fields(path):
+    fields = set()
+    for node in ast.walk(_parsed(path)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "declare_resolution"
+        ):
+            fields |= {kw.arg for kw in node.keywords if kw.arg}
+    return frozenset(fields)
+
+
 def _registry_declared_fields():
     """What the live registries and passes declare.
 
@@ -79,7 +98,7 @@ def _registry_collection_is_after_the_build():
     collection above this handler's own `get_model_config()` call does not move
     it above the configuration another handler already cached.
     """
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    tree = _parsed(_SRT / "server_args.py")
     handler = next(
         node
         for node in ast.walk(tree)
@@ -129,7 +148,7 @@ def _server_args_names(tree, path):
 def _constructor_reads():
     """Fields `ModelConfig.from_server_args` takes off the record."""
     path = _SRT / "configs/model_config.py"
-    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    tree = _parsed(path)
     constructor = next(
         node
         for node in ast.walk(tree)
@@ -177,7 +196,7 @@ def _late_resolution_fields():
         path = _SRT / name
         if not path.exists():
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        tree = _parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -205,7 +224,7 @@ def _hook_declarations(dispatch, source_module):
     `test_every_opaque_callback_is_still_late`.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -225,22 +244,14 @@ def _hook_declarations(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for inner in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "declare_resolution"
-            ):
-                for keyword in inner.keywords:
-                    if keyword.arg:
-                        out[keyword.arg] = max(out.get(keyword.arg, 0), node.lineno)
+        for field in _declared_resolution_fields(path):
+            out[field] = max(out.get(field, 0), node.lineno)
     return out
 
 
 def _pipeline():
     """(ordered steps, {step: methods it reaches}) for the resolution dispatch."""
-    source = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
-    tree = ast.parse(source)
+    tree = _parsed(_SRT / "server_args.py")
     record = next(
         node
         for node in tree.body
@@ -305,7 +316,7 @@ def _opaque_callback_positions(dispatch, source_module):
     it.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -349,7 +360,7 @@ def _opaque_callback_positions(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for spelling in callbacks_in(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        for spelling in callbacks_in(_parsed(path)):
             positions[spelling] = min(positions.get(spelling, 10**9), node.lineno)
     return positions
 
@@ -392,7 +403,7 @@ def _declaration_positions():
 
     source_module = _SRT / "server_args.py"
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -405,15 +416,7 @@ def _declaration_positions():
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             return frozenset()
-        fields = set()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "declare_resolution"
-            ):
-                fields |= {kw.arg for kw in node.keywords if kw.arg}
-        return frozenset(fields)
+        return _declared_resolution_fields(path)
 
     declared_at = {}
     for index, step in enumerate(steps):

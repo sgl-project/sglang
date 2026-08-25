@@ -89,7 +89,7 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertFalse(is_interleave())
         self.assertEqual(get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG)
 
-    def test_get_cp_strategy_is_initialized_under_cp_v1_and_cp_v2(self):
+    def test_get_cp_strategy_is_initialized_under_cp_v2(self):
         init_cp_strategy(
             SimpleNamespace(
                 enable_prefill_cp=True,
@@ -99,16 +99,11 @@ class TestCPStrategyUnit(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
             self.assertTrue(is_cp_enabled())
             self.assertTrue(is_interleave())
-
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ):
-            self.assertIsNotNone(get_cp_strategy())
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
@@ -311,12 +306,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             forward_mode=_ExtendMode(),
             extend_seq_lens_cpu=[7],
         )
-
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
-        ):
-            self.assertFalse(enable_cp_v2())
-            self.assertFalse(is_cp_v2_active(active_batch))
 
         with patch(
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True

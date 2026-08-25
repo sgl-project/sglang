@@ -42,6 +42,14 @@ class CacheConfig(msgspec.Struct):
     pp_rank: int
     dp_size: int
     ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    enable_dp_attention: bool
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"

@@ -187,6 +187,9 @@ sgl-eval run gsm8k \\
       match: { ...cell.match, spec: "dspark" },
       flags: cell.flags.flatMap((f) => (f === "--speculative-algorithm NEXTN" ? DSPARK_FLAGS : [f])),
     });
+    // hw|quant pairs with a measured full-GSM8K DSPARK run; see the mdx
+    // DSPARK tip for scores and stop rates.
+    const DSPARK_VERIFIED = new Set(["b200|bf16", "h200|bf16", "h200|fp8"]);
     const lowLatencyCells = [
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "low-latency", spec: "nextn", nodes: "single" },
@@ -342,8 +345,35 @@ sgl-eval run gsm8k \\
     return [
       ...lowLatencyCells.flatMap((c) => [
         c,
-        dsparkTwin(c, c.match.hw === "b200" && c.match.quant === "bf16"),
+        dsparkTwin(c, DSPARK_VERIFIED.has(`${c.match.hw}|${c.match.quant}`)),
       ]),
+    // INT4/MXFP4 have no NEXTN low-latency cell (their twin source), so the
+    // DSPARK legs validated on 4xH200 are listed directly.
+    {
+      match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        ...DSPARK_FLAGS,
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        ...DSPARK_FLAGS,
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
       verified: false,

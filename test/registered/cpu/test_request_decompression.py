@@ -8,7 +8,7 @@ from sglang.srt.entrypoints.http_request_decompression import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 PAYLOAD = b'{"text":"hello world","n":7}'
 COMPRESSED = zstandard.ZstdCompressor().compress(PAYLOAD)

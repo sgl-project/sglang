@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=25, suite="base-b-test-cpu")
+register_cpu_ci(est_time=14, suite="base-b-test-cpu")
 
 torch.manual_seed(42)
 

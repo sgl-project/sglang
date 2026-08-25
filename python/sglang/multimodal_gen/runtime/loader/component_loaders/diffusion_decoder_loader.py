@@ -30,6 +30,9 @@ class DiffusionDecoderLoader(PlainStateDictComponentLoader):
         *args,
     ):
         config = self.load_component_config(component_model_path, component_name)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
         class_name = config.pop("_class_name", None)
         if class_name is None:
             raise ValueError(
@@ -54,6 +57,6 @@ class DiffusionDecoderLoader(PlainStateDictComponentLoader):
             model = model_cls(decoder_config).to(device=target_device, dtype=dtype)
 
         model.load_state_dict(
-            load_safetensors_state_dict(component_model_path), strict=True
+            load_safetensors_state_dict(component_weights_path), strict=True
         )
         return model

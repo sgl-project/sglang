@@ -179,6 +179,22 @@ _EXPOSED = {
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
+    # The daemon command and constructor snapshot the resolved startup layout
+    # before the daemon's loading lifecycle can apply any runtime overrides.
+    ("weight_cache/daemon.py", "attn_cp_size"),
+    ("weight_cache/daemon.py", "deepep_mode"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "enable_dp_attention"),
+    ("weight_cache/daemon.py", "enable_dp_lm_head"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
+    ("weight_cache/daemon.py", "moe_a2a_backend"),
+    ("weight_cache/daemon.py", "moe_dense_tp_size"),
+    ("weight_cache/daemon.py", "moe_dp_size"),
+    ("weight_cache/daemon.py", "pp_size"),
+    ("weight_cache/daemon.py", "quantization"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -196,6 +212,11 @@ _OVERRIDDEN_AND_READ = {
     ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
     ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
@@ -661,8 +682,11 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         root = _PACKAGE_ROOT
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "_late_resolution" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):
@@ -713,6 +737,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                             written |= _expanded_override_keys(rel, tree, node, kw)
         return written
 
+    _READS_CACHE = None
+
     def _supplied_instance_reads(self) -> set:
         """Three spellings of the same read: ``server_args.field`` off the
         parameter, ``getattr(server_args, "field", default)`` with a literal
@@ -725,13 +751,18 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         census still does not count -- but those reads are gone for every
         resolution-written field and ``test_chain_read_ratchet.py`` holds them
         at zero, so the gap is no longer where the risk is."""
+        if TestSuppliedInstanceExposure._READS_CACHE is not None:
+            return TestSuppliedInstanceExposure._READS_CACHE
         pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
             if rel.startswith(_OWNERS):
                 continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "server_args" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 # A silently dropped module shrinks `found` and reads as
                 # intentional surface shrinkage under the bidirectional pin.
@@ -797,6 +828,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         and node.value.value.id == "self"
                     ):
                         pairs.add((rel, node.attr))
+        TestSuppliedInstanceExposure._READS_CACHE = pairs
         return pairs
 
     @staticmethod
@@ -805,8 +837,13 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         written = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "record_config_updates" not in source and not (
+                "get_context" in source and "override" in source
+            ):
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 raise AssertionError(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):

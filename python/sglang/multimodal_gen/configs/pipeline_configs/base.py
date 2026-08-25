@@ -225,6 +225,9 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
+    # Optional request-scoped override. The loader keeps the reference decode
+    # dtype resident so lossless requests never consume pre-rounded weights.
+    vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.

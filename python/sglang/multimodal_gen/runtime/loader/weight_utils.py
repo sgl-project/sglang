@@ -240,6 +240,15 @@ def safetensors_weights_iterator(
             if use_runai_model_streamer
             else FALLBACK_READER.name
         )
+    elif to_cpu:
+        # A host-bound load keeps the checkpoint mapping: mapped pages are the
+        # zero-copy optimum there, and everything downstream that budgets host
+        # memory (layerwise offload, pinning, the mapped-weight gate) assumes
+        # them. The streamer materializes anonymous copies instead -- measured
+        # as the whole 61.7 GB DiT landing in host anon on the 5090 CI runner
+        # -- and its strengths (direct-to-GPU, remote streaming) do not apply
+        # to a local file headed for the CPU.
+        requested = FALLBACK_READER.name
     backend = select_weight_reader(
         requested=requested, needs_key_filter=key_filter is not None
     )

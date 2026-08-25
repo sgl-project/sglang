@@ -19,6 +19,9 @@ if _is_cuda:
     )
 
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.shuffle_rows_with_scales import (
+        shuffle_rows_with_scales,
+    )
 
 
 def cutlass_fused_experts_fp8(
@@ -207,8 +210,11 @@ def cutlass_fused_experts_fp8(
         )
     else:
         a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-        rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+        # One gather for both: the scale rows are 1/32 of the value rows, so
+        # walking the map a second time for them was almost pure launch latency.
+        rep_a_q, rep_a1_scales = shuffle_rows_with_scales(
+            a_q, a1_scale, a_map, m * topk
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)

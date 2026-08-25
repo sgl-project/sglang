@@ -14,6 +14,7 @@ resolve them with ``importlib``/``ast`` without importing torch backends.
 """
 
 import ast
+import functools
 import importlib
 import pathlib
 import subprocess
@@ -25,7 +26,7 @@ from sglang.kernels.ops.diffusion import _EXPORTS, _SPECS
 from sglang.kernels.registry import registry
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 PACKAGE = "sglang.kernels.ops.diffusion"
 _PACKAGE_DIR = pathlib.Path(importlib.import_module(PACKAGE).__file__ or "").parent
@@ -74,6 +75,52 @@ def _module_defines(module_path: str) -> set[str]:
     return names
 
 
+@functools.lru_cache(maxsize=None)
+def _scan_root(root: str) -> tuple[frozenset[str], tuple[str, ...]]:
+    unexported: set[str] = set()
+    offenders: list[str] = []
+    root_dir = _REPO_ROOT / root
+    if not root_dir.exists():
+        return frozenset(), ()
+
+    for path in root_dir.rglob("*.py"):
+        rel = path.relative_to(_REPO_ROOT).as_posix()
+        if rel.startswith("python/sglang/kernels/ops/diffusion/"):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if PACKAGE not in source:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        allowlisted = rel in _DEEP_IMPORT_ALLOWLIST
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module == PACKAGE:
+                    unexported.update(
+                        a.name
+                        for a in node.names
+                        if a.name not in _EXPORTS and not a.name.startswith("_")
+                    )
+                elif (
+                    not allowlisted
+                    and node.module
+                    and node.module.startswith(f"{PACKAGE}.")
+                ):
+                    offenders.append(f"{rel}:{node.lineno} imports {node.module}")
+            elif isinstance(node, ast.Import) and not allowlisted:
+                offenders.extend(
+                    f"{rel}:{node.lineno} imports {a.name}"
+                    for a in node.names
+                    if a.name.startswith(f"{PACKAGE}.")
+                )
+    return frozenset(unexported), tuple(offenders)
+
+
 def test_every_export_resolves_to_a_real_symbol():
     missing = [
         f"{symbol} -> {module}"
@@ -92,26 +139,9 @@ def test_every_symbol_imported_from_the_facade_is_exported():
     or code path runs, on the platform that has the backend.  Enumerating the
     call sites catches it here instead.
     """
-    unexported = set()
+    unexported: set[str] = set()
     for root in ("python/sglang", "test", "benchmark"):
-        root_dir = _REPO_ROOT / root
-        if not root_dir.exists():
-            continue
-        for path in root_dir.rglob("*.py"):
-            rel = path.relative_to(_REPO_ROOT).as_posix()
-            if rel.startswith("python/sglang/kernels/ops/diffusion/"):
-                continue
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module == PACKAGE:
-                    unexported.update(
-                        a.name
-                        for a in node.names
-                        if a.name not in _EXPORTS and not a.name.startswith("_")
-                    )
+        unexported.update(_scan_root(root)[0])
     assert not unexported, f"imported but not in _EXPORTS: {sorted(unexported)}"
 
 
@@ -174,34 +204,10 @@ def test_importing_the_package_does_not_import_any_leaf_module():
 
 @pytest.mark.parametrize("root", ["python/sglang", "test", "benchmark"])
 def test_runtime_code_imports_only_through_the_facade(root):
-    root_dir = _REPO_ROOT / root
-    if not root_dir.exists():  # source checkouts only
+    if not (_REPO_ROOT / root).exists():  # source checkouts only
         pytest.skip(f"{root} not present in this install")
 
-    offenders = []
-    for path in root_dir.rglob("*.py"):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        if rel.startswith("python/sglang/kernels/ops/diffusion/"):
-            continue  # intra-package imports are the point of the subpackages
-        if rel in _DEEP_IMPORT_ALLOWLIST:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module
-                and node.module.startswith(f"{PACKAGE}.")
-            ):
-                offenders.append(f"{rel}:{node.lineno} imports {node.module}")
-            elif isinstance(node, ast.Import):
-                offenders.extend(
-                    f"{rel}:{node.lineno} imports {a.name}"
-                    for a in node.names
-                    if a.name.startswith(f"{PACKAGE}.")
-                )
+    offenders = _scan_root(root)[1]
     assert not offenders, (
         "import from sglang.kernels.ops.diffusion instead of a submodule:\n  "
         + "\n  ".join(offenders)

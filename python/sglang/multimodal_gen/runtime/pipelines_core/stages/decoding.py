@@ -321,7 +321,11 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        vae_dtype = resolve_decode_precision(server_args, self.component_name)
+        vae_dtype = resolve_decode_precision(
+            server_args,
+            self.component_name,
+            quality=batch.sampling_params.quality,
+        )
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,

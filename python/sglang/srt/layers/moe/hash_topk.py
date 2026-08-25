@@ -23,12 +23,13 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class HashTopK(nn.Module):
@@ -177,6 +178,38 @@ class HashTopK(nn.Module):
 
         return topk_weights, topk_ids
 
+    def _forward_xpu(
+        self, router_logits: torch.Tensor, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The XPU 'hash_topk' kernel currently supports the 'sqrtsoftplus' score func only.
+        # Other score funcs fall back to the torch implementation; more will be supported in the future.
+        if self.score_func == "sqrtsoftplus":
+            from sgl_kernel import hash_topk
+
+            num_tokens = router_logits.size(0)
+            topk_routed = self.tid2eid.size(1)
+            topk_fused = topk_routed + self.num_fused_shared_experts
+            topk_ids = torch.empty(
+                (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, topk_fused),
+                dtype=torch.float32,
+                device=router_logits.device,
+            )
+            hash_topk(
+                router_logits,
+                input_ids,
+                self.tid2eid,
+                topk_weights,
+                topk_ids,
+                self.routed_scaling_factor,
+                self.score_func,
+            )
+            return topk_weights, topk_ids
+        else:
+            return self._forward_torch(router_logits, input_ids)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -189,7 +222,9 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        if _is_xpu:
+            topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
+        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(

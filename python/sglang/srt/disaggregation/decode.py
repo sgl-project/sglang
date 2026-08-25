@@ -162,12 +162,27 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
+
+    def reset_aux_cache_allocator(self) -> None:
+        pass
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        return physical_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        pass
 
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse

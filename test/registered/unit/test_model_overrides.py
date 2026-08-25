@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     register_model_override,
     validate_declarations,
 )
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
@@ -77,6 +78,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
+                    "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
@@ -293,6 +295,235 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         "qk_rope_head_dim": 8,
         "v_head_dim": 16,
     }
+
+    @staticmethod
+    def _minicpm_overrides(
+        architecture,
+        *,
+        sparse_attention=False,
+        lightning_attention=False,
+        attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
+        disaggregation_mode="null",
+        enable_dp_attention=False,
+        enable_hierarchical_cache=False,
+    ):
+        args = SimpleNamespace(
+            attention_backend=attention_backend,
+            prefill_attention_backend=prefill_attention_backend,
+            decode_attention_backend=decode_attention_backend,
+            disaggregation_mode=disaggregation_mode,
+            enable_dp_attention=enable_dp_attention,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+        )
+        args.is_attention_backend_not_set = lambda: all(
+            backend is None
+            for backend in (
+                args.attention_backend,
+                args.prefill_attention_backend,
+                args.decode_attention_backend,
+            )
+        )
+        mixer_types = []
+        if sparse_attention:
+            mixer_types.append("minicpm4")
+        if lightning_attention:
+            mixer_types.append("lightning-attn")
+        if not mixer_types:
+            mixer_types.append("minicpm4")
+        declarations = collect_model_override_declarations(
+            architecture,
+            args,
+            hf_config=MiniCPMHybridConfig(
+                num_hidden_layers=len(mixer_types),
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                mixer_types=mixer_types,
+                sparse_config={} if sparse_attention else None,
+            ),
+        )
+        return {
+            field: value
+            for _, declaration in declarations
+            for field, value in declaration.items()
+        }
+
+    def test_minicpm_disables_radix_cache_only_for_hybrid_layers(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                self.assertNotIn(
+                    "disable_radix_cache",
+                    self._minicpm_overrides(architecture),
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, sparse_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, lightning_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+
+    def test_minicpm_rejects_dp_attention(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM does not support DP attention",
+                ):
+                    self._minicpm_overrides(
+                        architecture,
+                        enable_dp_attention=True,
+                    )
+
+    def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
+        for capability in ("sparse_attention", "lightning_attention"):
+            with self.subTest(capability=capability):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM SALA does not support hierarchical cache",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        enable_hierarchical_cache=True,
+                        **{capability: True},
+                    )
+
+    def test_sparse_minicpm_defaults_to_sparse_attention_backend(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=False,
+        ):
+            for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+                with self.subTest(architecture=architecture):
+                    self.assertEqual(
+                        self._minicpm_overrides(
+                            architecture,
+                            sparse_attention=True,
+                        )["attention_backend"],
+                        "minicpm_flashattn",
+                    )
+
+    def test_minicpm_overrides_use_config_capabilities(self):
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            disaggregation_mode="null",
+            enable_dp_attention=False,
+            enable_hierarchical_cache=False,
+            is_attention_backend_not_set=lambda: True,
+        )
+        config = SimpleNamespace(
+            has_minicpm_sparse_attention=True,
+            has_lightning_layers=False,
+        )
+
+        with patch.object(
+            overrides_module, "is_blackwell_supported", return_value=False
+        ):
+            overrides = overrides_module._minicpm_sala_overrides(args, config)
+
+        self.assertTrue(overrides["disable_radix_cache"])
+        self.assertEqual(overrides["attention_backend"], "minicpm_flashattn")
+
+    def test_sparse_minicpm_defaults_to_flashinfer_on_blackwell(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=True,
+        ):
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                )["attention_backend"],
+                "minicpm_flashinfer",
+            )
+
+    def test_minicpm_preserves_explicit_attention_backend(self):
+        overrides = self._minicpm_overrides(
+            "MiniCPMSALAForCausalLM",
+            sparse_attention=True,
+            attention_backend="fa3",
+        )
+        self.assertNotIn("attention_backend", overrides)
+
+    def test_sparse_minicpm_rejects_pd_disaggregation(self):
+        for disaggregation_mode in ("prefill", "decode"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode=disaggregation_mode,
+                    )
+        for backend_field in (
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            with self.subTest(backend_field=backend_field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode="decode",
+                        **{backend_field: "minicpm_flashattn"},
+                    )
+
+    def test_minicpm_force_dense_uses_stock_attention_backend(self):
+        with envs.SGLANG_MINICPM_FORCE_DENSE.override(True):
+            self.assertNotIn(
+                "attention_backend",
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                ),
+            )
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    attention_backend="minicpm_flashinfer",
+                )["attention_backend"],
+                "flashinfer",
+            )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        attention_backend="minicpm_flashattn",
+                    )["attention_backend"],
+                    "fa4",
+                )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=False,
+            ):
+                split_overrides = self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    prefill_attention_backend="minicpm_flashattn",
+                    decode_attention_backend="minicpm_flashattn",
+                )
+                self.assertEqual(split_overrides["prefill_attention_backend"], "fa3")
+                self.assertEqual(split_overrides["decode_attention_backend"], "fa3")
 
     def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs

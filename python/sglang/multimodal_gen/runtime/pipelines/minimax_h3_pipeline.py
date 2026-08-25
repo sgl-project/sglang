@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import shutil
+
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -24,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -45,6 +48,24 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
         "transformer",
     ]
+
+    def __init__(self, *args, **kwargs):
+        # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
+        # image and CI dependency installer.
+        if not current_platform.is_rocm():
+            missing_media_tools = [
+                executable
+                for executable in ("ffmpeg", "ffprobe")
+                if shutil.which(executable) is None
+            ]
+            if missing_media_tools:
+                raise RuntimeError(
+                    "MiniMax H3 requires ffmpeg and ffprobe for media processing "
+                    "and validated output delivery; missing executables: "
+                    f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
+                    "package before starting SGLang."
+                )
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def model_subfolder_for_variant(variant: str) -> str:

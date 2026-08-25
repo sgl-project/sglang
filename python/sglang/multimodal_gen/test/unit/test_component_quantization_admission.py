@@ -2,6 +2,7 @@
 
 import re
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.adapter_loader import (
@@ -33,6 +34,29 @@ class _TestLoader(PlainStateDictComponentLoader):
 
 
 class TestComponentQuantizationAdmission(unittest.TestCase):
+    def test_plain_loader_resolves_weights_separately_from_config(self):
+        server_args = SimpleNamespace(
+            component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"}
+        )
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.resolve_weight",
+                return_value="resolved",
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.materialize_weight",
+                return_value="/cache/vocoder.safetensors",
+            ),
+        ):
+            self.assertEqual(
+                _TestLoader().resolve_component_weights_path(
+                    "/base/vocoder", server_args, "vocoder"
+                ),
+                "/cache/vocoder.safetensors",
+            )
+
     def test_plain_checkpoint_config_is_accepted(self):
         config = {"_class_name": "TestModel"}
 

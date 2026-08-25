@@ -43,6 +43,7 @@ class _FakeServerArgs:
         self.revision = "test-revision"
         self.trust_remote_code = True
         self.layerwise_components = set()
+        self.component_quantizations = {}
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
@@ -123,6 +124,28 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_weights_override_keeps_base_component_config(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_weights_paths = {
+            "audio_vae": "owner/repo/audio_vae.safetensors"
+        }
+
+        with (
+            patch.object(vae_loader, "resolve_weight", return_value="resolved"),
+            patch.object(
+                vae_loader,
+                "materialize_weight",
+                return_value="/cache/audio.safetensors",
+            ),
+        ):
+            self.assertEqual(
+                loader.resolve_model_weights_path(
+                    "/base/audio_vae", server_args, "audio_vae"
+                ),
+                "/cache/audio.safetensors",
+            )
+
     def test_mps_layerwise_load_uses_residency_api(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())

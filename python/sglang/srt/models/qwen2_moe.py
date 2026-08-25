@@ -154,6 +154,7 @@ def can_fuse_shared_expert(
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
         or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mori()
     ):
         return False
 

@@ -16,6 +16,10 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
+    # Check Eager/BCG at lossless/high on one GPU set; high+BCG is invalid when
+    # request-scoped DiT fusions mount only after lossless graph capture.
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
+
     # Clean an isolated model cache even if the run fails or is interrupted
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model longcat-image --model-cache-root /task/model-caches --cleanup-model-cache
 
@@ -37,6 +41,7 @@ Input images required for image-guided models:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -74,8 +79,38 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
+BENCHMARK_QUALITY_LEVELS = ("lossless", "high")
+BCG_CAPTURE_SIGNAL = "[diffusion bcg] captured"
+BCG_INVALID_SIGNALS = (
+    "[diffusion bcg] capture failed",
+    "[diffusion bcg] disabled",
+    "[diffusion bcg] serving signature missed",
+    "no graph will be captured",
+    "quality='high' cannot be used with breakable cuda graphs",
+)
+BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
+QUALITY_BCG_ABBA_MATRIX = (
+    ("eager-lossless-a", "lossless", False),
+    ("bcg-lossless-a", "lossless", True),
+    ("bcg-lossless-b", "lossless", True),
+    ("eager-lossless-b", "lossless", False),
+    ("eager-high-a", "high", False),
+    ("bcg-high-a", "high", True),
+    ("bcg-high-b", "high", True),
+    ("eager-high-b", "high", False),
+)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 CATALOG_TABLE_WIDTH = 140
-RESULTS_TABLE_WIDTH = 105
+RESULTS_TABLE_WIDTH = 124
 MODEL_CACHE_MARKER = ".sglang-diffusion-benchmark-cache"
 MODEL_WEIGHT_SUFFIXES = {
     ".bin",
@@ -85,6 +120,7 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
+GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -150,6 +186,9 @@ LINGBOT_VIDEO_PROMPT = json.dumps(
     },
     separators=(",", ":"),
 )
+LINGBOT_WORLD_CONFIG_OVERRIDES = {
+    "actions": [["w"] for _ in range(9)],
+}
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -296,6 +335,22 @@ MODELS = {
             "--tp-size=2",
         ],
     },
+    # Explicit throughput comparator. CFG parallelism changes sampling numerics,
+    # so compare its output against the TP=2 preset before using the speedup.
+    "cosmos3-super-t2v-cfg2tp2": {
+        "path": "nvidia/Cosmos3-Super",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--num-gpus=4",
+            "--tp-size=2",
+        ],
+    },
     # 11. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
@@ -381,6 +436,42 @@ MODELS = {
             "--performance-mode=manual",
         ],
     },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "sana-wm-bidirectional": {
+        "path": "Efficient-Large-Model/SANA-WM_bidirectional",
+        "prompt": "a camera moving forward and turning left",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "extra_args": [
+            "--pipeline-class-name=SanaWMTwoStagePipeline",
+            "--width=1280",
+            "--height=704",
+            "--num-frames=49",
+            "--fps=16",
+            "--num-inference-steps=20",
+            "--guidance-scale=4.5",
+            "--action=w-16,wl-16,l-16",
+            "--performance-mode=manual",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "sana-wm-streaming": {
+        "path": "Efficient-Large-Model/SANA-WM_streaming",
+        "prompt": "a camera moving forward and turning left",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "extra_args": [
+            "--pipeline-class-name=SanaWMTwoStagePipeline",
+            "--streaming",
+            "--refiner-chunked",
+            "--width=1280",
+            "--height=704",
+            "--num-frames=49",
+            "--fps=16",
+            "--action=w-16,wl-16,l-16",
+            "--performance-mode=manual",
+        ],
+    },
     "lingbot-video-moe": {
         "path": "robbyant/lingbot-video-moe-30b-a3b",
         "prompt": LINGBOT_VIDEO_PROMPT,
@@ -393,6 +484,290 @@ MODELS = {
             "--num-inference-steps=12",
             "--text-encoder-cpu-offload",
             "--performance-mode=manual",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "lingbot-world": {
+        "path": "robbyant/lingbot-world-fast-diffusers",
+        "prompt": "A slow aerial orbit around a pastel island hotel in the ocean.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "config_overrides": LINGBOT_WORLD_CONFIG_OVERRIDES,
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=9",
+            "--fps=16",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+            "--text-encoder-cpu-offload",
+            "--warmup-mode=off",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "lingbot-world-v2": {
+        "path": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        "prompt": "A slow aerial orbit around a pastel island hotel in the ocean.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "config_overrides": LINGBOT_WORLD_CONFIG_OVERRIDES,
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=9",
+            "--fps=16",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+            "--text-encoder-cpu-offload",
+            "--warmup-mode=off",
+        ],
+    },
+    "fastwan21-t2v-1.3b": {
+        "path": "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon walks through a sunlit forest.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
+            "--fps=16",
+            "--num-inference-steps=3",
+            "--performance-mode=manual",
+            "--dit-layerwise-offload=false",
+            "--dit-cpu-offload=false",
+        ],
+    },
+    "wan21-t2v-1.3b": {
+        "path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon walks through a sunlit forest.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=3.0",
+        ],
+    },
+    "wan21-t2v-14b": {
+        "path": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
+    "wan21-i2v-14b-480p": {
+        "path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
+    "wan21-i2v-14b-720p": {
+        "path": "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
+    "wan21-fun-inp-1.3b": {
+        "path": "weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=6.0",
+        ],
+    },
+    "krea2-turbo": {
+        "path": "krea/Krea-2-Turbo",
+        "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=8",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "krea2-raw": {
+        "path": "krea/Krea-2-Raw",
+        "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.5",
+        ],
+    },
+    "ideogram4-fast": {
+        "path": "fal/ideogram-v4-fast",
+        "prompt": "A vintage travel poster for Kyoto with crisp readable lettering.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "ideogram4-instant": {
+        "path": "fal/ideogram-v4-instant",
+        "prompt": "A vintage travel poster for Kyoto with crisp readable lettering.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "longlive2-t2v": {
+        "path": "Rabinovich/LongLive-2.0-5B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "longlive2-i2v": {
+        "path": "Rabinovich/LongLive-2.0-5B-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=960",
+            "--height=928",
+            "--num-frames=61",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "fast-hunyuan": {
+        "path": "FastVideo/FastHunyuan-diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
+            "--num-inference-steps=6",
+        ],
+    },
+    "turbowan21-t2v-1.3b": {
+        "path": "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--num-inference-steps=4",
+        ],
+    },
+    "turbowan21-t2v-14b-480p": {
+        "path": "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--num-inference-steps=4",
+        ],
+    },
+    "turbowan21-t2v-14b-720p": {
+        "path": "IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--num-inference-steps=4",
+        ],
+    },
+    "turbowan22-i2v-a14b": {
+        "path": "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=4",
+            "--guidance-scale=3.5",
+            "--guidance-scale-2=3.5",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
+    "helios-mid": {
+        "path": "BestWishYsh/Helios-Mid",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=20",
+        ],
+    },
+    "helios-distilled": {
+        "path": "BestWishYsh/Helios-Distilled",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=10",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "joy-echo": {
+        "path": "jdopensource/JoyAI-Echo",
+        "prompt": "A curious raccoon",
+        "seed": 42,
+        "config_overrides": {
+            "enable_memory_bank": False,
+        },
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=8",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
         ],
     },
     "cosmos3-edge-t2i": {
@@ -409,6 +784,62 @@ MODELS = {
             "--num-inference-steps=35",
             "--guidance-scale=7.0",
             "--performance-mode=manual",
+        ],
+    },
+    "cosmos3-edge-t2v": {
+        "path": "nvidia/Cosmos3-Edge",
+        "prompt": "A warehouse robot carefully places a blue box on a shelf.",
+        "seed": 42,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=24",
+            "--num-inference-steps=35",
+            "--guidance-scale=5.0",
+            "--performance-mode=manual",
+        ],
+    },
+    "cosmos3-edge-i2v": {
+        "path": "nvidia/Cosmos3-Edge",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=24",
+            "--num-inference-steps=35",
+            "--guidance-scale=5.0",
+            "--performance-mode=manual",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "cosmos3-super-i2v": {
+        "path": "nvidia/Cosmos3-Super-Image2Video",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "seed": 42,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--fps=24",
+            "--num-inference-steps=35",
+            "--guidance-scale=6.0",
+            "--flow-shift=10.0",
+            "--num-gpus=2",
+            "--tp-size=2",
         ],
     },
     "cosmos3-super-t2i-distilled": {
@@ -575,6 +1006,19 @@ MODELS = {
             "--num-frames=81",
         ],
     },
+    # Blackwell-only ModelOpt NVFP4 comparator.
+    "wan22-t2v-nvfp4": {
+        "path": "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--performance-mode=manual",
+            "--dit-layerwise-offload=false",
+            "--dit-cpu-offload=false",
+        ],
+    },
     "ltx23-hq-two-stage": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -648,13 +1092,26 @@ MODELS = {
             "--text-encoder-cpu-offload",
             "--pin-cpu-memory",
             "--num-frames=65",
-            "--width=848",
-            "--height=480",
+            "--width=960",
+            "--height=544",
             "--num-inference-steps=30",
         ],
     },
-    # Skill-only extra preset
-    # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    # Skill-only extra presets
+    # Require: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    "mova-360p": {
+        "path": "OpenMOSS-Team/MOVA-360p",
+        "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
+        "image_path": str(ASSET_DIR / "mova_single_person.jpg"),
+        "extra_args": [
+            "--adjust-frames=false",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
+            "--num-frames=193",
+            "--fps=24",
+            "--num-inference-steps=2",
+        ],
+    },
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
         "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
@@ -1078,6 +1535,9 @@ def build_sglang_cmd(
     perf_dump_path: str | None = None,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     seed: int = 42,
     save_output: bool = True,
     artifact_dir: Path | None = None,
@@ -1086,6 +1546,18 @@ def build_sglang_cmd(
     Build the `sglang generate` command for the given model.
     Matches the commands in benchmark-and-profile.md exactly.
     """
+    if quality not in BENCHMARK_QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {BENCHMARK_QUALITY_LEVELS}, got {quality!r}"
+        )
+    if torch_compile and breakable_cuda_graph:
+        raise ValueError("torch.compile and breakable CUDA graph are comparators")
+    if bcg_text_buckets is not None:
+        if not breakable_cuda_graph:
+            raise ValueError("bcg_text_buckets requires breakable_cuda_graph=True")
+        if not bcg_text_buckets or any(bucket <= 0 for bucket in bcg_text_buckets):
+            raise ValueError("bcg_text_buckets must contain positive integers")
+
     cfg = MODELS[model_key]
 
     cmd = [
@@ -1119,11 +1591,29 @@ def build_sglang_cmd(
         cmd.append(f"--config={config_path}")
 
     cmd.extend(cfg["extra_args"])
+    cmd.append(f"--quality={quality}")
 
     if save_output:
         cmd.append("--save-output")
     if warmup:
         cmd.extend(["--warmup-mode", "request"])
+    if breakable_cuda_graph:
+        cmd.append("--enable-breakable-cuda-graph")
+        parsed_args = _parse_cli_args(cmd)
+        if (
+            "warmup-resolutions" not in parsed_args
+            and "width" in parsed_args
+            and "height" in parsed_args
+        ):
+            cmd.extend(
+                [
+                    "--warmup-resolutions",
+                    f"{parsed_args['width']}x{parsed_args['height']}",
+                ]
+            )
+        if bcg_text_buckets is not None:
+            cmd.append("--bcg-text-buckets")
+            cmd.extend(str(bucket) for bucket in bcg_text_buckets)
     if torch_compile and not cfg.get("force_eager", False):
         cmd.append("--enable-torch-compile")
     if perf_dump_path:
@@ -1138,7 +1628,11 @@ def _run_benchmark_once_impl(
     output_dir: Path,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     model_cache_dir: Path | None = None,
+    cuda_visible_devices: str | None = None,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -1148,7 +1642,14 @@ def _run_benchmark_once_impl(
         perf_dump_path=str(perf_path),
         warmup=warmup,
         torch_compile=torch_compile,
+        quality=quality,
+        breakable_cuda_graph=breakable_cuda_graph,
+        bcg_text_buckets=bcg_text_buckets,
         artifact_dir=output_dir,
+    )
+    output_file_name = f"{model_key}-{label}"
+    cmd.extend(
+        ["--output-path", str(output_dir), "--output-file-name", output_file_name]
     )
 
     env = os.environ.copy()
@@ -1178,7 +1679,9 @@ def _run_benchmark_once_impl(
         print("  fail early and report a misleading unsupported-model error.")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": 0.0}
 
-    if not env.get("CUDA_VISIBLE_DEVICES"):
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    elif not env.get("CUDA_VISIBLE_DEVICES"):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
         )
@@ -1199,12 +1702,28 @@ def _run_benchmark_once_impl(
         bufsize=1,
     )
     fallback_detected = False
+    bcg_capture_detected = False
+    bcg_invalid_signals: set[str] = set()
     assert process.stdout is not None
     try:
         for line in process.stdout:
             print(line, end="")
-            if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+            lower_line = line.lower()
+            if any(signal in lower_line for signal in DIFFUSERS_FALLBACK_SIGNALS):
                 fallback_detected = True
+            if BCG_CAPTURE_SIGNAL in lower_line:
+                bcg_capture_detected = True
+            if (
+                quality == "high"
+                and breakable_cuda_graph
+                and bcg_capture_detected
+                and "mounted " in lower_line
+                and "for quality=high" in lower_line
+            ):
+                bcg_invalid_signals.add(BCG_LATE_QUALITY_FUSION_SIGNAL)
+            bcg_invalid_signals.update(
+                signal for signal in BCG_INVALID_SIGNALS if signal in lower_line
+            )
     except BaseException:
         if process.poll() is None:
             process.terminate()
@@ -1224,11 +1743,67 @@ def _run_benchmark_once_impl(
         )
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
+    if breakable_cuda_graph and (not bcg_capture_detected or bcg_invalid_signals):
+        reason = (
+            ", ".join(sorted(bcg_invalid_signals))
+            if bcg_invalid_signals
+            else "no '[Diffusion BCG] captured' marker"
+        )
+        print(
+            "  ERROR: BCG evidence is invalid: "
+            f"{reason}. Do not report this run as BCG performance."
+        )
+        return {
+            "model": model_key,
+            "label": label,
+            "quality": quality,
+            "breakable_cuda_graph": True,
+            "bcg_capture_detected": bcg_capture_detected,
+            "bcg_invalid_signals": sorted(bcg_invalid_signals),
+            "error": True,
+            "elapsed_s": elapsed,
+        }
+
     if returncode != 0:
         print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
-    metrics = {"model": model_key, "label": label, "elapsed_s": elapsed, "error": False}
+    output_artifacts = sorted(
+        path
+        for path in output_dir.rglob(f"{output_file_name}*")
+        if path.is_file() and path.suffix.lower() in GENERATED_OUTPUT_SUFFIXES
+    )
+    missing_artifacts = []
+    if not perf_path.is_file():
+        missing_artifacts.append("perf dump")
+    if not output_artifacts:
+        missing_artifacts.append("generated output")
+    if missing_artifacts:
+        print(
+            "  ERROR: command returned zero without required benchmark artifacts: "
+            + ", ".join(missing_artifacts)
+        )
+        return {
+            "model": model_key,
+            "label": label,
+            "quality": quality,
+            "breakable_cuda_graph": breakable_cuda_graph,
+            "missing_artifacts": missing_artifacts,
+            "error": True,
+            "elapsed_s": elapsed,
+        }
+
+    metrics = {
+        "model": model_key,
+        "label": label,
+        "quality": quality,
+        "breakable_cuda_graph": breakable_cuda_graph,
+        "bcg_capture_detected": bcg_capture_detected,
+        "elapsed_s": elapsed,
+        "output_artifacts": [str(path) for path in output_artifacts],
+        "output_sha256": [_sha256_file(path) for path in output_artifacts],
+        "error": False,
+    }
     if perf_path.exists():
         try:
             with open(perf_path) as f:
@@ -1287,12 +1862,53 @@ def _run_benchmark_once_impl(
     return metrics
 
 
+def _validate_quality_bcg_output_hashes(results: list[dict]) -> None:
+    """Reject BCG rows whose generated artifacts differ from eager."""
+    for quality in BENCHMARK_QUALITY_LEVELS:
+        quality_results = [
+            result for result in results if result.get("quality") == quality
+        ]
+        eager_results = [
+            result
+            for result in quality_results
+            if not result.get("breakable_cuda_graph") and not result.get("error")
+        ]
+        eager_hashes = [
+            tuple(result.get("output_sha256", ())) for result in eager_results
+        ]
+        if not eager_hashes or any(not hashes for hashes in eager_hashes):
+            continue
+
+        reference_hashes = eager_hashes[0]
+        if any(hashes != reference_hashes for hashes in eager_hashes[1:]):
+            reason = f"eager {quality} output hashes are unstable"
+            for result in quality_results:
+                result["error"] = True
+                result["output_hash_error"] = reason
+            print(f"  ERROR: {reason}; do not use this matrix as BCG evidence.")
+            continue
+
+        for result in quality_results:
+            if not result.get("breakable_cuda_graph") or result.get("error"):
+                continue
+            output_hashes = tuple(result.get("output_sha256", ()))
+            if not output_hashes or output_hashes == reference_hashes:
+                continue
+            reason = f"BCG {quality} output hash differs from eager"
+            result["error"] = True
+            result["output_hash_error"] = reason
+            print(f"  ERROR: {reason}; do not report this row as BCG performance.")
+
+
 def run_benchmark_once(
     model_key: str,
     label: str,
     output_dir: Path,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     model_cache_root: Path | None = None,
     cleanup_model_cache: bool = False,
     cleanup_ledger_path: Path | None = None,
@@ -1310,6 +1926,9 @@ def run_benchmark_once(
             output_dir,
             warmup=warmup,
             torch_compile=torch_compile,
+            quality=quality,
+            breakable_cuda_graph=breakable_cuda_graph,
+            bcg_text_buckets=bcg_text_buckets,
             model_cache_dir=cache_dir,
         )
         exit_reason = "error" if result.get("error") else "success"
@@ -1338,6 +1957,78 @@ def run_benchmark_once(
             )
 
 
+def run_quality_bcg_matrix(
+    model_key: str,
+    label: str,
+    output_dir: Path,
+    warmup: bool = True,
+    bcg_text_buckets: list[int] | None = None,
+    model_cache_root: Path | None = None,
+    cleanup_model_cache: bool = False,
+    cleanup_ledger_path: Path | None = None,
+) -> list[dict]:
+    """Run the quality/BCG applicability matrix on one fixed GPU set.
+
+    A high+BCG cell is intentionally retained as a compatibility check. It is
+    invalid when request-scoped DiT fusions mount after graph capture.
+    """
+    cache_dir = None
+    exit_reason = "error"
+    if model_cache_root is not None:
+        cache_dir = _prepare_model_cache(
+            model_cache_root, model_key, f"{label}-quality-bcg-matrix"
+        )
+
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cuda_visible_devices:
+        cuda_visible_devices = ",".join(
+            str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
+        )
+
+    results: list[dict] = []
+    try:
+        for mode_label, quality, breakable_cuda_graph in QUALITY_BCG_ABBA_MATRIX:
+            result = _run_benchmark_once_impl(
+                model_key,
+                f"{label}-{mode_label}",
+                output_dir,
+                warmup=warmup,
+                quality=quality,
+                breakable_cuda_graph=breakable_cuda_graph,
+                bcg_text_buckets=(bcg_text_buckets if breakable_cuda_graph else None),
+                model_cache_dir=cache_dir,
+                cuda_visible_devices=cuda_visible_devices,
+            )
+            results.append(result)
+        _validate_quality_bcg_output_hashes(results)
+        exit_reason = (
+            "error" if any(result.get("error") for result in results) else "success"
+        )
+        return results
+    except KeyboardInterrupt:
+        exit_reason = "interrupted"
+        raise
+    finally:
+        if cleanup_model_cache and cache_dir is not None:
+            assert model_cache_root is not None
+            ledger_path = cleanup_ledger_path or output_dir / "cleanup.jsonl"
+            record = _cleanup_model_cache(
+                model_cache_root,
+                cache_dir,
+                ledger_path,
+                model_key,
+                f"{label}-quality-bcg-matrix",
+                exit_reason,
+            )
+            before = record["before"]
+            assert isinstance(before, dict)
+            print(
+                "  Cleaned isolated model cache after the full matrix: "
+                f"{before['total_bytes']} bytes, "
+                f"{before['weight_file_count']} weight files; ledger={ledger_path}"
+            )
+
+
 def print_results_table(results: list[dict]):
     """Print a compact table for one or more benchmark runs."""
     print()
@@ -1347,7 +2038,7 @@ def print_results_table(results: list[dict]):
     print("=" * RESULTS_TABLE_WIDTH)
 
     print(
-        f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
+        f"{'Model':<24} {'Nightly':<28} {'Label':<31} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
     print("-" * RESULTS_TABLE_WIDTH)
 
@@ -1359,7 +2050,7 @@ def print_results_table(results: list[dict]):
         e2e_text = f"{e2e_s:.2f}" if isinstance(e2e_s, float) else "n/a"
         mem_text = f"{peak_mem:.1f}" if isinstance(peak_mem, float) else "n/a"
         print(
-            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
+            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<31} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
     print("-" * RESULTS_TABLE_WIDTH)
@@ -1407,6 +2098,34 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
+    parser.add_argument(
+        "--quality",
+        choices=BENCHMARK_QUALITY_LEVELS,
+        default="lossless",
+        help="Request quality for a single run (default: lossless).",
+    )
+    parser.add_argument(
+        "--breakable-cuda-graph",
+        action="store_true",
+        help=(
+            "Run a BCG comparator. The result is invalid unless capture is "
+            "observed and no disable/failure/signature-miss marker appears."
+        ),
+    )
+    parser.add_argument(
+        "--bcg-text-buckets",
+        type=int,
+        nargs="+",
+        help="Optional positive text buckets for a BCG run or matrix.",
+    )
+    parser.add_argument(
+        "--quality-bcg-matrix",
+        action="store_true",
+        help=(
+            "Run lossless/high Eager-vs-BCG as two ABBA pairs on one GPU set "
+            "and one task-owned model cache."
+        ),
+    )
     compile_group = parser.add_mutually_exclusive_group()
     compile_group.add_argument(
         "--torch-compile",
@@ -1453,6 +2172,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
     torch_compile = args.torch_compile and not args.no_torch_compile
+    if args.quality_bcg_matrix and torch_compile:
+        parser.error("--quality-bcg-matrix cannot be combined with --torch-compile")
+    if args.breakable_cuda_graph and torch_compile:
+        parser.error("--breakable-cuda-graph cannot be combined with --torch-compile")
+    if args.bcg_text_buckets and not (
+        args.breakable_cuda_graph or args.quality_bcg_matrix
+    ):
+        parser.error(
+            "--bcg-text-buckets requires --breakable-cuda-graph or "
+            "--quality-bcg-matrix"
+        )
     if args.cleanup_model_cache and not args.model_cache_root:
         parser.error("--cleanup-model-cache requires --model-cache-root")
     model_cache_root = (
@@ -1466,18 +2196,35 @@ def main():
     results = []
 
     for model_key in models_to_run:
-        results.append(
-            run_benchmark_once(
-                model_key,
-                args.label,
-                output_dir,
-                warmup=warmup,
-                torch_compile=torch_compile,
-                model_cache_root=model_cache_root,
-                cleanup_model_cache=args.cleanup_model_cache,
-                cleanup_ledger_path=cleanup_ledger_path,
+        if args.quality_bcg_matrix:
+            results.extend(
+                run_quality_bcg_matrix(
+                    model_key,
+                    args.label,
+                    output_dir,
+                    warmup=warmup,
+                    bcg_text_buckets=args.bcg_text_buckets,
+                    model_cache_root=model_cache_root,
+                    cleanup_model_cache=args.cleanup_model_cache,
+                    cleanup_ledger_path=cleanup_ledger_path,
+                )
             )
-        )
+        else:
+            results.append(
+                run_benchmark_once(
+                    model_key,
+                    args.label,
+                    output_dir,
+                    warmup=warmup,
+                    torch_compile=torch_compile,
+                    quality=args.quality,
+                    breakable_cuda_graph=args.breakable_cuda_graph,
+                    bcg_text_buckets=args.bcg_text_buckets,
+                    model_cache_root=model_cache_root,
+                    cleanup_model_cache=args.cleanup_model_cache,
+                    cleanup_ledger_path=cleanup_ledger_path,
+                )
+            )
 
     if results:
         print_results_table(results)

@@ -1,3 +1,4 @@
+import base64
 import functools
 import json
 import os
@@ -24,6 +25,9 @@ def _default_hip() -> bool:
         return False
 
 
+_NON_UTF8_PREFIX = "base64:"
+
+
 def _default_cache_subdir(name: str) -> str:
     """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
 
@@ -36,11 +40,12 @@ def _default_cache_subdir(name: str) -> str:
 class EnvField:
     _allow_set_name = True
 
-    def __init__(self, default: Any):
+    def __init__(self, default: Any, secret: bool = False):
         self.default = default
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
+        self.secret = secret
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -156,8 +161,8 @@ class _DeprecatedEnvFallback:
         SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
     """
 
-    def __init__(self, default: Any, deprecated_name: str):
-        super().__init__(default)
+    def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
+        super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
@@ -317,6 +322,7 @@ class Envs:
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+    SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
 
     # ===================================================================
     # Logging
@@ -670,7 +676,7 @@ class Envs:
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.
-    EXA_API_KEY = EnvStr(None)
+    EXA_API_KEY = EnvStr(None, secret=True)
     SGLANG_EXA_NUM_RESULTS = EnvInt(10)
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
@@ -860,9 +866,6 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
-    # Keep K3 shared experts and dense MLPs sharded over attention TP.
-    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
-    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
@@ -1077,6 +1080,11 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # MiniCPM sparse attention developer switches
+    SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
+    SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
+    SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
@@ -1535,6 +1543,28 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def exportable_env_vars() -> dict[str, str]:
+    return {
+        field.name: _exportable_value(os.environ[field.name])
+        for field in sorted(
+            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
+            key=lambda field: field.name,
+        )
+        if not field.secret and field.name in os.environ
+    }
+
+
+def _exportable_value(value: str) -> str:
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return (
+            _NON_UTF8_PREFIX
+            + base64.b64encode(value.encode(errors="surrogateescape")).decode()
+        )
+    return value
 
 
 class _DeprecatedEnv:

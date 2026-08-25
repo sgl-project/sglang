@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    _precompute_refined_prompt_embeds,
+)
 
 
 def _branch(
@@ -193,3 +196,30 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_grouped_outputs_share_prompt_refinement():
+    class Refiner:
+        calls = 0
+
+        def refine_prompt_embeds(self, prompt_embeds, refiner_cu, *, device):
+            del refiner_cu
+            self.calls += 1
+            return torch.ones(
+                prompt_embeds.shape[0], 5376, dtype=prompt_embeds.dtype, device=device
+            )
+
+    model = Refiner()
+    conditioning = {}
+    first, second = _branch("t2va"), _branch("t2va")
+
+    for branch in (first, second):
+        assert _precompute_refined_prompt_embeds(
+            model,
+            branch,
+            device=torch.device("cpu"),
+            shared_conditioning=conditioning,
+        )
+
+    assert model.calls == 1
+    assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]

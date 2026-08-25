@@ -1323,14 +1323,26 @@ class _FileBackedBlock(torch.nn.Module):
         self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
 
 
+class _TransposedFileBackedBlock(torch.nn.Module):
+    """A mapped weight whose layout is not contiguous, as an FP8 weight is."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8).t(), requires_grad=False)
+
+
 class _FileBackedModel(torch.nn.Module):
-    def __init__(self, path: pathlib.Path, num_blocks: int = 1) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        num_blocks: int = 1,
+        block_cls=_FileBackedBlock,
+    ) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList(
-            [
-                _FileBackedBlock(path.with_name(f"{path.name}.{i}"))
-                for i in range(num_blocks)
-            ]
+            [block_cls(path.with_name(f"{path.name}.{i}")) for i in range(num_blocks)]
         )
 
 
@@ -1450,6 +1462,7 @@ def _mapped_manager(
     available_bytes=None,
     num_blocks=1,
     pin_budget_bytes=None,
+    block_cls=_FileBackedBlock,
 ):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -1460,7 +1473,9 @@ def _mapped_manager(
     monkeypatch.setattr(
         host_memory_budget, "host_memory_available_bytes", lambda: available_bytes
     )
-    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=num_blocks)
+    model = _FileBackedModel(
+        tmp_path / "weights.bin", num_blocks=num_blocks, block_cls=block_cls
+    )
     return LayerwiseOffloadManager(
         model=model,
         layers_attr_str="blocks",
@@ -1669,6 +1684,55 @@ def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
     )
     names = {name for name, _ in manager.iter_cpu_weights()}
     assert "blocks.0.weight" in names
+
+
+def test_a_non_contiguous_mapped_weight_keeps_its_layout(tmp_path, monkeypatch):
+    """Staying mapped costs the layout, so a strided weight must not stay.
+
+    The reload path allocates with `torch.empty(shape)` and copies, which is
+    layout-agnostic: values survive, strides do not. ModelOpt FP8 calls its
+    transposed layout a correctness requirement, so such a weight has to take
+    the strided path even when its storage is a mapping the copies cannot
+    afford.
+    """
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=0.001,
+        pin_budget_bytes=0,
+        block_cls=_TransposedFileBackedBlock,
+    )
+    name = "blocks.0.weight"
+    assert name not in manager._mapped_cpu_weights[0], (
+        "a non-contiguous weight stayed mapped, so its layout is dropped "
+        "on reload without any error"
+    )
+    stored = manager._strided_cpu_weights[0][name]
+    assert not stored.is_contiguous()
+    assert stored.stride() == (1, 8)
+    assert manager._weight_metadata[0][name]["preserve_strides"] is True
+
+
+def test_refitting_a_mapped_weight_updates_the_store(tmp_path, monkeypatch):
+    """A refit must reach a mapped weight without writing to the checkpoint."""
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    path = tmp_path / "weights.bin.0"
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
+    name = "blocks.0.weight"
+    assert manager._weight_metadata[0][name]["mapped"] is True
+    on_disk_before = path.read_bytes()
+
+    new_weight = torch.full((8, 8), 3.0)
+    updated = manager.update_cpu_weights({name: new_weight})
+
+    assert updated == {name}
+    assert torch.equal(manager._mapped_cpu_weights[0][name], new_weight)
+    assert path.read_bytes() == on_disk_before, "the checkpoint was written to"
 
 
 def test_layerwise_tuning_defaults_match_the_group():

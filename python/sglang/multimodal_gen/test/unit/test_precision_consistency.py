@@ -106,6 +106,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         config = {
             "vae_precision": "fp16",
             "vae_decode_precision": None,
+            "vae_decode_precision_high": None,
             "audio_vae_precision": "bf16",
             "dit_precision": "fp32",
             "image_encoder_precision": "fp16",
@@ -139,8 +140,28 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             resolve_decode_precision(self._server_args(vae_decode_precision="bf16")),
             torch.bfloat16,
         )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="high",
+            ),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="lossless",
+            ),
+            torch.float16,
+        )
         with self.assertRaisesRegex(ValueError, "Unsupported vae_decode_precision"):
             resolve_decode_precision(self._server_args(vae_decode_precision="fp8"))
+        with self.assertRaisesRegex(
+            ValueError, "Unsupported vae_decode_precision_high"
+        ):
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="fp8"), quality="high"
+            )
 
     def test_component_precision_mapping(self):
         server_args = self._server_args()

@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
+from sglang.kernels.ops.diffusion import (
+    mark_lingbot_video_rmsnorm_site,
+    try_lingbot_video_rmsnorm,
+)
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
@@ -75,8 +79,15 @@ class LingBotVideoRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.variance_epsilon = eps
+        mark_lingbot_video_rmsnorm_site(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fused = try_lingbot_video_rmsnorm(
+            self, hidden_states, self.weight, self.variance_epsilon
+        )
+        if fused is not None:
+            return fused
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

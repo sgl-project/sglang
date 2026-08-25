@@ -118,8 +118,10 @@ framework-specific optimization workflow.
   fusions and decode-scoped VAE rewrites. Mounting is all-or-nothing per
   transformer/fusion family; VAE gates reset after every decode.
 - Current families include FLUX affine-folded LN+modulate / fused GELU sites,
-  GLM-Image fused GELU sites, generic KL VAE decoder rewrites used by
-  FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE RMSNorm+SiLU.
+  GLM/Qwen/Hunyuan/LTX fused GELU sites, LTX RMSNorm+modulate, Hunyuan QK
+  RMSNorm, Ideogram gated RMSNorm, SANA-Video linear attention, generic KL VAE
+  decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE
+  RMSNorm+SiLU.
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test_quality_gate.py`, `test_fused_ln_modulate.py`,
@@ -295,6 +297,20 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Request-Scoped DiT Fusions with Breakable CUDA Graphs**
+
+- `quality=high` DiT sites are mounted at a request boundary. BCG warmup uses
+  the model's lossless sampling default unless a quality-aware graph variant
+  was captured explicitly.
+- A graph captured before the high-quality mount retains the lossless module
+  branches. Replaying it after the mount silently bypasses the requested high
+  kernels even when the tensor signature matches.
+- Workflow rule: a high+BCG cell is valid only when the model has no
+  request-scoped DiT quality sites, or when logs prove those sites were mounted
+  before the matching graph capture. A mount after `[Diffusion BCG] captured`
+  invalidates the row; do not use its latency or output as high-quality
+  evidence.
+
 **Recent Model Audit Boundaries**
 
 - LongCat-Image supports breakable CUDA graph at fixed, captured resolutions.
@@ -318,7 +334,10 @@ framework-specific optimization workflow.
 - LingBot Video MoE's router implements sigmoid+bias grouped top-k in
   `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
   compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
-  writing a new router kernel.
+  writing a new router kernel. Its released eager path still expands RMSNorm
+  into `pow/mean/rsqrt` chains. #35969 is a measured `quality=high` candidate
+  that dispatches existing Triton row kernels by weight dtype and hidden size;
+  it is not current-main behavior until the PR merges.
 - LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
   decoder separately: confirm NATTEN `na3d` is active, then inspect its
   per-block 3D RoPE construction and split QKV/SwiGLU projections.
@@ -381,6 +400,13 @@ framework-specific optimization workflow.
   every additional served resolution in `--warmup-resolutions`, and use
   `--bcg-text-buckets` for prompt signatures. Check this path before proposing
   a second graph-capture mechanism for launch-bound traces.
+- A valid BCG benchmark must show `[Diffusion BCG] captured` and no support
+  disable, capture failure, `serving signature MISSED`, or eager-fallback
+  marker. Width and height are not the whole signature: public
+  `--warmup-resolutions` does not override a video model's synthetic warmup
+  frame count, so a short profiling request can capture the default temporal
+  shape and then miss during serving. Reject that timing instead of labeling
+  it BCG.
 - LongCat-Image uses this generic runner directly: one 1024x1024 capture covers
   short and long prompts because text conditioning is fixed at 512 tokens.
   Keep eager as the baseline because the gain is hardware-dependent; an H200
@@ -410,7 +436,10 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
   - #34172 LTX2 quality-high fusion; #34305/#34314 Ideogram eager fusions.
   - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
-    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3.
+    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3; #35728
+    SANA-Video linear attention.
+  - #35961 SANA-Video lossless shared-kernel reuse and #35969 LingBot
+    `quality=high` RMSNorm are open candidates, not current-main fast paths.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -426,7 +455,8 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #19516 Qwen-Image CUDA Graph.
   - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
   - #34174 automatic default-resolution BCG warmup; #34210 Z-Image BCG
-    correctness; #34929 LTX2.3 BCG. #34618 is a closed Cosmos BCG experiment,
+    correctness; #34929 LTX2.3 BCG; #35724 LongCat-Image BCG; #35729
+    SANA-Video fixed-300-token BCG. #34618 is a closed Cosmos BCG experiment,
     not a reusable mainline fast path.
 
 **Constraints and Fallbacks**
