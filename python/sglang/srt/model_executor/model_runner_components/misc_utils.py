@@ -8,7 +8,11 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_kimi_k3,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_schedule
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_context,
+    get_schedule,
+)
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
@@ -29,10 +33,11 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+    # Chunked prefix cache is a prefill feature: the prefill half decides.
+    prefill_backend, _ = attention_backends()
     if (
         not use_mla_backend
-        or get_exec().kernel.attention_backend
-        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        or prefill_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(

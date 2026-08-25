@@ -10,11 +10,14 @@ import socket
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.weight_cache.protocol import (
     get_socket_path,
     recv_msg,
     send_msg,
+)
+from sglang.srt.weight_cache.transport import (
+    TORCH_IPC_BACKEND,
+    get_client_transport_backend,
 )
 
 
@@ -39,14 +42,18 @@ def fetch_state(gpu_id: int):
             },
         )
         response = recv_msg(client)
+        backend = get_client_transport_backend(
+            response.get("transport_backend", TORCH_IPC_BACKEND)
+        )
+        response = backend.recv_fetch_state_response(client, response)
     if response.get("status") != "ok":
         raise RuntimeError(f"fetch_state failed for {socket_path}: {response}")
-    return response["entries"]
+    return response["entries"], backend
 
 
 def compare_rank(left_gpu_id: int, right_gpu_id: int, rank: int) -> tuple[int, int]:
-    left = fetch_state(left_gpu_id)
-    right = fetch_state(right_gpu_id)
+    left, left_backend = fetch_state(left_gpu_id)
+    right, right_backend = fetch_state(right_gpu_id)
     if set(left) != set(right):
         raise AssertionError(
             f"rank {rank} state keys differ: "
@@ -64,8 +71,8 @@ def compare_rank(left_gpu_id: int, right_gpu_id: int, rank: int) -> tuple[int, i
                     f"rank {rank} {name} metadata {field} differs: "
                     f"{left_entry[field]!r} != {right_entry[field]!r}"
                 )
-        left_tensor = MultiprocessingSerializer.deserialize(left_entry["handle"])
-        right_tensor = MultiprocessingSerializer.deserialize(right_entry["handle"])
+        left_tensor = left_backend.import_tensor(left_entry)
+        right_tensor = right_backend.import_tensor(right_entry)
         right_on_left = right_tensor.to(left_tensor.device)
         if not torch.equal(left_tensor, right_on_left):
             detail = "values differ"

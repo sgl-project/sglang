@@ -21,11 +21,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -142,6 +143,32 @@ def _validate_glm_image_resolution_alignment(width: int, height: int) -> None:
         )
 
 
+def center_crop_glm_image_output(
+    frames: torch.Tensor,
+    target_width: int | None,
+    target_height: int | None,
+) -> torch.Tensor:
+    """Center-crop decoded GLM-Image pixels back to the requested canvas."""
+    if None in (target_width, target_height):
+        return frames
+
+    decoded_height, decoded_width = frames.shape[-2:]
+    if target_width > decoded_width or target_height > decoded_height:
+        raise ValueError(
+            "Cannot crop GLM-Image output to a canvas larger than the decoded "
+            f"image: requested {target_width}x{target_height}, decoded "
+            f"{decoded_width}x{decoded_height}"
+        )
+    if (target_width, target_height) == (decoded_width, decoded_height):
+        return frames
+
+    left = (decoded_width - target_width) // 2
+    top = (decoded_height - target_height) // 2
+    return frames[
+        ..., top : top + target_height, left : left + target_width
+    ].contiguous()
+
+
 def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
     pooler_output = getattr(image_features, "pooler_output", None)
     if pooler_output is not None:
@@ -234,6 +261,19 @@ class GlmImageAR(PipelineStage):
         super().__init__()
         self.processor = processor
         self.vision_language_encoder = vision_language_encoder
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if not isinstance(self.vision_language_encoder, torch.nn.Module):
+            return []
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "vision_language_encoder",
+                memory_intensive=True,
+            )
+        ]
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -668,7 +708,7 @@ class GlmImageAR(PipelineStage):
         width = batch.width
         if batch.image_path is not None:
             ar_condition_images = [
-                resize_glm_image_to_alignment(load_image(img_path))
+                load_image(img_path)
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -679,6 +719,11 @@ class GlmImageAR(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        if getattr(batch, "requested_width", None) is None:
+            batch.requested_width = width
+        if getattr(batch, "requested_height", None) is None:
+            batch.requested_height = height
 
         requested_width = width
         requested_height = height
@@ -693,6 +738,11 @@ class GlmImageAR(PipelineStage):
                 width,
                 height,
             )
+
+        if ar_condition_images is not None:
+            ar_condition_images = [
+                resize_glm_image_to_alignment(image) for image in ar_condition_images
+            ]
 
         time_start = time.time()
         num_outputs = _num_outputs_per_prompt(batch)
@@ -759,7 +809,7 @@ class GlmImageAR(PipelineStage):
         prior_token_id = torch.cat(prior_token_ids, dim=0)
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
-        logger.info(f"generate_prior_tokens time: {time_end - time_start}")
+        logger.debug("generate_prior_tokens time: %.3fs", time_end - time_start)
 
         batch.prior_token_id = prior_token_id
         batch.prior_token_image_ids = prior_token_image_ids
@@ -771,6 +821,34 @@ class GlmImageAR(PipelineStage):
             batch.usage = usage
 
         return batch
+
+
+class GlmImageDecodingStage(DecodingStage):
+    """Decode on the D32 canvas, then restore the user-requested dimensions."""
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        output_batch = super().forward(batch, server_args)
+        if output_batch.output is not None:
+            output_batch.output = center_crop_glm_image_output(
+                output_batch.output,
+                batch.requested_width,
+                batch.requested_height,
+            )
+        if output_batch.trajectory_decoded is not None:
+            output_batch.trajectory_decoded = [
+                center_crop_glm_image_output(
+                    decoded,
+                    batch.requested_width,
+                    batch.requested_height,
+                )
+                for decoded in output_batch.trajectory_decoded
+            ]
+        return output_batch
 
 
 class GlmImageBeforeDenoisingStage(PipelineStage):
@@ -827,7 +905,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        uses: list[ComponentUse] = []
+        uses = [ComponentUse(stage_name, "text_encoder", memory_intensive=True)]
+        if self.vae is not None:
+            uses.append(ComponentUse(stage_name, "vae", phase="condition_image"))
         if self.transformer is not None:
             uses.append(
                 ComponentUse(
@@ -1120,6 +1200,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = _repeat_to_batch(prior_token_id, batch_size)
 
         # 3. Encode input prompt
+        self.begin_declared_component_use(
+            component_name="text_encoder", module=self.text_encoder
+        )
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt,
             do_classifier_free_guidance,
@@ -1175,6 +1258,11 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             latents_mean = latents_mean.to(device=device, dtype=vae_dtype)
             latents_std = latents_std.to(device=device, dtype=vae_dtype)
 
+            self.begin_declared_component_use(
+                component_name="vae",
+                module=self.vae,
+                phase="condition_image",
+            )
             for condition_image, condition_image_prior_token_id in zip(
                 ar_condition_images, prior_token_image_ids
             ):
@@ -1182,7 +1270,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     condition_image, self.vae, device=device
                 )
                 condition_image = _repeat_to_batch(condition_image, batch_size)
-
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
                     generator=generator,

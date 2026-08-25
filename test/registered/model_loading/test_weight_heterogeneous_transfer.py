@@ -10,9 +10,26 @@ import torch
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_enable_ipc_weight_cache,
 )
+from sglang.srt.weight_cache.daemon import (
+    WeightCacheDaemon,
+    WeightCacheDaemonArgs,
+    launch_weight_cache_daemons,
+)
 from sglang.srt.weight_cache.mooncake_weight_adapter import (
     build_mooncake_weight_manifests,
 )
+from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
+from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
+    SourceWeightsManifest,
+    WeightHeterogeneousTransferError,
+    WeightParallelLayout,
+    _initialize_weight_transfer_engine,
+    _resolve_active_moe_runner_backend,
+    fetch_source_weights_manifest,
+    transfer_weights_from_source_daemons,
+    validate_weight_heterogeneous_transfer_configuration,
+)
+from sglang.srt.weight_cache.weight_manifest_server import WeightManifestServer
 from sglang.srt.weight_cache.weight_runtime_manifest import (
     IMMUTABLE_WEIGHT_GENERATION,
     ImmutableWeightRuntimeManifestBuilder,
@@ -20,26 +37,39 @@ from sglang.srt.weight_cache.weight_runtime_manifest import (
     WeightParallelTopology,
     model_identity_from_config,
 )
-from sglang.srt.weight_cache.daemon import (
-    WeightCacheDaemon,
-    launch_weight_cache_daemons,
-)
-from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
-    _initialize_weight_transfer_engine,
-    _resolve_active_moe_runner_backend,
-    fetch_source_weights_manifest,
-    transfer_weights_from_source_daemons,
-    WeightHeterogeneousTransferError,
-    WeightParallelLayout,
-    SourceWeightsManifest,
-    validate_weight_heterogeneous_transfer_configuration,
-)
-from sglang.srt.weight_cache.weight_manifest_server import WeightManifestServer
-from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
 from sglang.test.ci.ci_register import register_cuda_ci
 
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+
+def _daemon_server_args(**overrides):
+    values = {
+        "model_path": "/models/demo",
+        "tp_size": 1,
+        "pp_size": 1,
+        "dp_size": 1,
+        "ep_size": 1,
+        "moe_dp_size": 1,
+        "enable_dp_attention": False,
+        "enable_dp_lm_head": False,
+        "attn_cp_size": 1,
+        "moe_dense_tp_size": 1,
+        "moe_a2a_backend": "none",
+        "deepep_mode": "auto",
+        "load_format": "auto",
+        "dtype": "auto",
+        "quantization": None,
+        "model_loader_extra_config": {},
+        "trust_remote_code": False,
+        "revision": None,
+        "nnodes": 1,
+        "node_rank": 0,
+        "base_gpu_id": 0,
+        "gpu_id_step": 1,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 class TestWeightHeterogeneousTransfer(unittest.TestCase):
@@ -331,17 +361,24 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
     def test_heterogeneous_socket_paths_use_physical_gpu_rank(self):
         daemon = WeightCacheDaemon(
-            model_path="/models/demo",
+            server_args=_daemon_server_args(tp_size=2),
             gpu_id=4,
-            tp_size=2,
             tp_rank=0,
-            enable_weight_heterogeneous_copy=True,
-            weight_heterogeneous_transfer_registry_url="http://source:31999",
+            pp_rank=0,
+            daemon_args=WeightCacheDaemonArgs(
+                enable_weight_heterogeneous_copy=True,
+                weight_heterogeneous_transfer_registry_url="http://source:31999",
+                weight_cache_socket_rank=4,
+            ),
         )
         self.assertEqual(daemon.socket_path, get_socket_path(4))
         self.assertEqual(daemon.ready_path, get_ready_path(4))
 
-    def test_client_uses_physical_socket_without_heterogeneous_server_args(self):
+    @patch(
+        "sglang.srt.model_executor.model_runner_components.load_model_utils.get_model",
+        return_value=SimpleNamespace(weight_cache_mode="client"),
+    )
+    def test_client_uses_physical_socket_without_heterogeneous_server_args(self, _):
         client_load_config = SimpleNamespace(
             load_format="auto", weight_cache_socket=None
         )
@@ -371,17 +408,23 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
     def test_source_and_target_gates_are_mutually_exclusive(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             WeightCacheDaemon(
-                model_path="/models/demo",
+                server_args=_daemon_server_args(),
                 gpu_id=0,
-                enable_weight_heterogeneous_copy=True,
-                weight_heterogeneous_copy=True,
-                weight_heterogeneous_transfer_registry_url="http://source:31999",
+                tp_rank=0,
+                pp_rank=0,
+                daemon_args=WeightCacheDaemonArgs(
+                    enable_weight_heterogeneous_copy=True,
+                    weight_heterogeneous_copy=True,
+                    weight_heterogeneous_transfer_registry_url="http://source:31999",
+                ),
             )
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             launch_weight_cache_daemons(
-                model_path="/models/demo",
-                enable_weight_heterogeneous_copy=True,
-                weight_heterogeneous_copy=True,
+                _daemon_server_args(),
+                daemon_args=WeightCacheDaemonArgs(
+                    enable_weight_heterogeneous_copy=True,
+                    weight_heterogeneous_copy=True,
+                ),
             )
 
     def test_daemon_socket_does_not_serve_weight_manifests(self):
@@ -410,39 +453,41 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
 
     def test_target_launcher_passes_manifest_registry_url(self):
-        process = MagicMock(pid=123, returncode=0)
-        process.poll.return_value = 0
-        commands = []
-
-        def spawn(command):
-            commands.append(command)
-            return process
+        process = MagicMock(pid=123, exitcode=0)
+        process.is_alive.return_value = False
 
         with (
             patch(
                 "sglang.srt.weight_cache.daemon.cleanup_stale_daemon_files"
             ) as cleanup,
             patch("sglang.srt.weight_cache.daemon.os.path.exists", return_value=True),
-            patch("subprocess.Popen", side_effect=spawn),
+            patch(
+                "sglang.srt.weight_cache.daemon.spawn_weight_cache_daemon",
+                return_value=process,
+            ) as spawn,
         ):
             with self.assertRaisesRegex(RuntimeError, "exited with code 0"):
                 launch_weight_cache_daemons(
-                    model_path="/models/demo",
-                    tp_size=1,
-                    base_gpu_id=4,
-                    weight_heterogeneous_copy=True,
-                    weight_heterogeneous_transfer_source_ip="source",
-                    weight_heterogeneous_transfer_source_port=31999,
+                    _daemon_server_args(base_gpu_id=4),
                     timeout=1,
+                    daemon_args=WeightCacheDaemonArgs(
+                        weight_heterogeneous_copy=True,
+                        weight_heterogeneous_transfer_source_ip="source",
+                        weight_heterogeneous_transfer_source_port=31999,
+                    ),
                 )
 
         cleanup.assert_called_once_with(4, force=False)
-        self.assertIn("--weight-cache-socket-rank", commands[0])
-        self.assertIn("4", commands[0])
-        self.assertIn("--weight-heterogeneous-copy", commands[0])
-        self.assertIn("--weight-heterogeneous-transfer-registry-url", commands[0])
-        self.assertIn("http://source:31999", commands[0])
-        self.assertNotIn("--cache-id", commands[0])
+        spawn.assert_called_once()
+        call = spawn.call_args
+        self.assertEqual(call.kwargs["socket_rank"], 4)
+        self.assertEqual(call.kwargs["gpu_id"], 4)
+        child_args = call.kwargs["daemon_args"]
+        self.assertTrue(child_args.weight_heterogeneous_copy)
+        self.assertEqual(
+            child_args.weight_heterogeneous_transfer_registry_url,
+            "http://source:31999",
+        )
 
 
 if __name__ == "__main__":

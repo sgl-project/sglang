@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -47,7 +47,6 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,10 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_exec().kernel.attention_backend):
+    # This writer's one caller is `alloc_for_extend`, so the prefill half
+    # decides; the fallback below pays several `.item()` syncs per request.
+    prefill_backend, _ = attention_backends()
+    if support_triton(prefill_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -106,19 +108,21 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_exec().kernel.attention_backend
-    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+    prefill_backend, decode_backend = attention_backends()
+    uses_triton_dispatch = prefill_backend not in (
+        "ascend",
+        "torch_native",
+    ) and decode_backend not in ("ascend", "torch_native")
 
-    if _is_hip and uses_triton_dispatch:
-        # HIP-only: the legacy get_last_loc_triton kernel emits a
+    if (_is_hip or _is_npu) and uses_triton_dispatch:
+        # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
         # page_size>1 (e.g. with aiter unified attention or the triton
-        # attention backend). The bug is in the Triton HIP codegen, not
-        # in any particular attention backend, so route every HIP path
-        # that would otherwise use get_last_loc_triton through the
-        # int32-safe variant. Non-HIP hardware keeps the original
-        # dispatcher below.
+        # attention backend), and can fault in the equivalent NPU DSV4
+        # allocation path. Route those paths through the variant whose
+        # in-kernel result remains int32 and is promoted only after launch.
+        # Other hardware/backends keep the original dispatcher below.
         return get_last_loc_triton_safe(
             req_to_token, req_pool_indices_tensor, prefix_lens_tensor
         )
@@ -166,30 +170,6 @@ def alloc_token_slots(
     return out_cache_loc
 
 
-def _compute_dsv4_state_lens(batch, *, is_decode: bool):
-    """Per-req c{4,128}_state pool alloc lens (``DSV4StateLens``) for this step.
-    None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``).
-    """
-    allocator = batch.token_to_kv_pool_allocator
-    if not hasattr(allocator, "compute_dsv4_state_lens_extend"):
-        return None
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-        maybe_evict_dsv4_state,
-    )
-
-    if is_decode:
-        for req in batch.reqs:
-            maybe_evict_dsv4_state(batch, req, req.seqlen - 1)
-        return allocator.compute_dsv4_state_lens_decode(batch.reqs)
-    prefix_lens = batch.prefix_lens
-    for req, prefix_len in zip(batch.reqs, prefix_lens):
-        if prefix_len > 0:
-            maybe_evict_dsv4_state(batch, req, prefix_len)
-    return allocator.compute_dsv4_state_lens_extend(
-        batch.reqs, batch.seq_lens_cpu.tolist(), prefix_lens
-    )
-
-
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -199,7 +179,6 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
@@ -207,15 +186,13 @@ def alloc_paged_token_slots_extend(
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req tables for the c-pool / state last_loc lookup.
+        # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-        if dsv4_state_lens is not None:
-            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
     out = allocator.alloc_extend(
         prefix_lens,
@@ -364,7 +341,6 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
         )
 
@@ -382,6 +358,14 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -460,7 +444,6 @@ def _alloc_extend_loc_with_kv_reuse(
                 last_loc=torch.cat(last_loc),
                 extend_num_tokens=alloc_extend_num_tokens,
                 req_pool_indices=req_pool_indices_device,
-                dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
                 batch=batch,
             )
 
@@ -491,7 +474,6 @@ def alloc_paged_token_slots_decode(
     last_loc: torch.Tensor,
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
@@ -500,17 +482,15 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
+    # DSV4-NPU allocator also needs req_pool_indices for C128 KV allocation and
     # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
+    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req tables for the last_loc lookup.
+        # Per-call per-req C128 table for the last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-        if dsv4_state_lens is not None:
-            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
     out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs)
 
@@ -565,7 +545,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             last_loc=last_loc,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
             batch=batch,
         )
 
@@ -586,6 +565,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
+
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
