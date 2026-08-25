@@ -7,7 +7,13 @@ lives in the MODEL repo (`moonshotai/Kimi-K3`), so this script fetches
 whenever the model repo's encoder changes:
 
     pip install tiktoken transformers
-    python3 gen_kimi_k3_cases.py [--model-dir DIR] [--full-vocab]
+    python3 gen_kimi_k3_cases.py --full-vocab [--model-dir DIR]
+
+ALWAYS pass `--full-vocab` when regenerating for commit. Without it both the
+`full_vocab_token_ids` on every case and the chunking fixture's `"full"` block
+are silently omitted (they are gated on the real vocabulary being loaded), which
+disarms `full_vocab_parity_when_available` for anyone who has the 296k-entry
+vocab -- and CI does not, so the loss ships green.
 
 Two fixtures come out, testing two different things:
 
@@ -41,7 +47,16 @@ import os
 import sys
 import urllib.request
 
-HF_BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main"
+# Pinned to a REVISION, not `main`. The encoder is a moving target and its
+# BEHAVIOUR changes across commits, so a fixture quietly regenerated against a
+# newer commit than the Rust mirrors is exactly how the two drifted apart.
+# Bump this deliberately, then re-run BOTH generators -- this one first, with
+# `--full-vocab`, since it is what populates the cache the other one reads -- and
+# land the fixture delta in the same commit as the Rust change it forces. The
+# cache is keyed by revision (see `fetch`), so a bump re-fetches by construction
+# rather than by remembering to clear a directory.
+KIMI_K3_REVISION = "a590ce090cb049c93a33dfe8c208ec652aa20503"
+HF_BASE = f"https://huggingface.co/moonshotai/Kimi-K3/resolve/{KIMI_K3_REVISION}"
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 TINY_DIR = os.path.join(OUT_DIR, "kimi_k3_tiny_vocab")
 
@@ -69,10 +84,20 @@ SPECIAL_OFFSETS = {
 
 
 def fetch(model_dir, name):
-    path = os.path.join(model_dir, name)
+    """Cache one encoder source, keyed BY REVISION.
+
+    The revision subdirectory is what makes `KIMI_K3_REVISION` mean anything. A
+    bare existence check would silently reuse whatever a previous run left
+    behind, so bumping the revision would regenerate the fixtures against the
+    OLD encoder and report success -- failing in exactly the drift direction the
+    pin exists to prevent. Verified: with a flat cache, pinning a sha of all
+    zeros still wrote fixtures.
+    """
+    revision_dir = os.path.join(model_dir, KIMI_K3_REVISION)
+    path = os.path.join(revision_dir, name)
     if not os.path.exists(path):
-        os.makedirs(model_dir, exist_ok=True)
-        print(f"fetching {name} -> {path}", file=sys.stderr)
+        os.makedirs(revision_dir, exist_ok=True)
+        print(f"fetching {name}@{KIMI_K3_REVISION[:8]} -> {path}", file=sys.stderr)
         urllib.request.urlretrieve(f"{HF_BASE}/{name}", path)
     return path
 
@@ -712,15 +737,9 @@ def cases():
             None,
             {},
         ),
-        (
-            "unknown_role_renders_nothing",
-            [
-                {"role": "user", "content": "a"},
-                {"role": "developer", "content": "ignored"},
-            ],
-            None,
-            {},
-        ),
+        # An unknown role no longer "renders nothing" — the reference REFUSES it,
+        # so there are no segments and no ids to pin. The refusal itself is a
+        # reject case in `gen_kimi_k3_render_cases.py` (`misc_unknown_role`).
     ]
 
 

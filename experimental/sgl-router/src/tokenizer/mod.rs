@@ -749,7 +749,16 @@ impl TokenizerRegistry {
             // to append after the prompt ids either.
             ChatEncoder::KimiK3(tk) => {
                 let segments = kimi_k3::render_segments(messages, tools, &opts.kimi_k3)
-                    .inspect_err(|e| entry.log_fallback(model_id, &format!("render failed: {e:#}")))
+                    // EVERY `kimi_k3::RenderErr` is a REQUEST error the engine
+                    // rejects identically, and it is the whole error type of
+                    // `render_segments` — so this needs no downcast and cannot
+                    // miss a class. It must not consume the model's one-shot
+                    // broken-encoder WARN latch; genuine breakage on this path is
+                    // the tokenize failure below, which does own the latch.
+                    .inspect_err(|e| {
+                        tracing::debug!(model = %model_id, error = %e,
+                            "kimi-k3 request-level render error (engine-invalid request)");
+                    })
                     .ok()?;
                 return match tk.encode_segments(&segments) {
                     Ok(ids) if !ids.is_empty() => Some(ids),
@@ -842,8 +851,15 @@ impl TokenizerRegistry {
         let encoded = match &entry.encoder {
             ChatEncoder::KimiK3(tk) => {
                 let segments = kimi_k3::render_segments(messages, tools, &opts.kimi_k3)
+                    // Same reasoning as `encode_chat`. This site matters MORE for
+                    // K3 than it looks: `ChatEncoder::render_plain` errors
+                    // unconditionally for K3, so `encode_chat_extension` always
+                    // declines and this is the ONLY extension path — a request
+                    // whose render was correctly excused above would otherwise
+                    // burn the latch here microseconds later.
                     .inspect_err(|e| {
-                        entry.log_fallback(model_id, &format!("plain render failed: {e:#}"))
+                        tracing::debug!(model = %model_id, error = %e,
+                            "kimi-k3 request-level render error (engine-invalid request)");
                     })
                     .ok()?;
                 tk.encode_segments(&segments)
@@ -1138,7 +1154,7 @@ fn is_deepseek_v4(model_id: &str) -> bool {
 /// rendering a different format's prompt and calling it engine-equivalent (a
 /// wrong answer). This function prefers the former, as the encoder-attach path
 /// does for unresolved markers.
-fn is_kimi_k3(model_id: &str) -> bool {
+pub(crate) fn is_kimi_k3(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
     if !id.contains("kimi") {
         return false;

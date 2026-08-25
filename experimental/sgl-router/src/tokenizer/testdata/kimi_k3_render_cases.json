@@ -6278,6 +6278,823 @@
   ]
  },
  {
+  "name": "as_reasoning_null",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "a",
+    "reasoning": null
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "as_reasoning_content_null",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "a",
+    "reasoning_content": null
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "as_reasoning_empty_then_null_alias",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "a",
+    "reasoning_content": "",
+    "reasoning": null
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
   "name": "as_reasoning_whitespace_only",
   "messages": [
    {
@@ -6454,6 +7271,10 @@
    {
     "text": "<|sep|>",
     "allow_special": true
+   },
+   {
+    "text": "   \n  ",
+    "allow_special": false
    },
    {
     "text": "<|close|>",
@@ -9316,6 +10137,10192 @@
    },
    {
     "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_literal_text_preserved",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"exp\":1e2,\"arr\":[1,2],\"trail\":1.50,\"neg\":-0.0}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "exp",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1e2",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "arr",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "array",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "[1,2]",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "trail",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1.50",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "neg",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "-0.0",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_nested_spacing",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\": { \"b\" : [ 1,2 ] }}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{ \"b\" : [ 1,2 ] }",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_value_decoded",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"s\":\"a\\nb \\u4f60\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "s",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "string",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "a\nb 你",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_trailing_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":1} then junk"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_empty",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": ""
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_whitespace_only",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "   "
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "   ",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_non_object_array",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "[1,2]"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "[1,2]",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_bare_number",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "7"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "7",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_duplicate_keys",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":1,\"a\":2}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "2",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_trailing_comma",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":1,}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"a\":1,}",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_empty_object",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_mapping_reserialized",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": {
+        "arr": [
+         1,
+         2
+        ],
+        "exp": 100.0
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "arr",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "array",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "[1, 2]",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "exp",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "100.0",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_truncated",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":1"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"a\":1",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_truncated_at_colon",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"a\":",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_missing_colon",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\" 1}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"a\" 1}",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_non_string_key",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{1:2}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{1:2}",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_junk_separator",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":1 2}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"a\":1 2}",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_bare_open_brace",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "json",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_spaced_separators",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\": 1 , \"b\": [1, 2] }"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "b",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "array",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "[1, 2]",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "tool",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "r",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   }
+  ]
+ },
+ {
+  "name": "tc_args_str_multibyte_literal",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{\"a\":{\"k\":\"你好\"},\"b\":1}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "r"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "system",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "thinking-effort",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "user",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "q",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|end_of_msg|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "message",
+    "allow_special": false
+   },
+   {
+    "text": " role",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "assistant",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "think",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "response",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "tools",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "call",
+    "allow_special": false
+   },
+   {
+    "text": " tool",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "f",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " index",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "a",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "object",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "{\"k\":\"你好\"}",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "<|open|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
+    "allow_special": false
+   },
+   {
+    "text": " key",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "b",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": " type",
+    "allow_special": false
+   },
+   {
+    "text": "=\"",
+    "allow_special": false
+   },
+   {
+    "text": "number",
+    "allow_special": false
+   },
+   {
+    "text": "\"",
+    "allow_special": false
+   },
+   {
+    "text": "<|sep|>",
+    "allow_special": true
+   },
+   {
+    "text": "1",
+    "allow_special": false
+   },
+   {
+    "text": "<|close|>",
+    "allow_special": true
+   },
+   {
+    "text": "argument",
     "allow_special": false
    },
    {
@@ -17693,129 +28700,6 @@
   ]
  },
  {
-  "name": "misc_unknown_role",
-  "messages": [
-   {
-    "role": "narrator",
-    "content": "aside"
-   }
-  ],
-  "tools": null,
-  "opts": {
-   "thinking": true,
-   "thinking_effort": "max",
-   "tool_choice": null,
-   "response_format": null,
-   "add_generation_prompt": true
-  },
-  "segments": [
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": " role",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "system",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": " type",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "thinking-effort",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
-    "allow_special": false
-   },
-   {
-    "text": "<|close|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|end_of_msg|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": " role",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "assistant",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "think",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   }
-  ]
- },
- {
   "name": "misc_unicode_and_newlines",
   "messages": [
    {
@@ -18158,137 +29042,6 @@
   ]
  },
  {
-  "name": "misc_batched_conversation",
-  "messages": [
-   [
-    {
-     "role": "user",
-     "content": "a"
-    }
-   ],
-   [
-    {
-     "role": "user",
-     "content": "b"
-    }
-   ]
-  ],
-  "tools": null,
-  "opts": {
-   "thinking": true,
-   "thinking_effort": "max",
-   "tool_choice": null,
-   "response_format": null,
-   "add_generation_prompt": true
-  },
-  "segments": [
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": " role",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "system",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": " type",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "thinking-effort",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=max`.",
-    "allow_special": false
-   },
-   {
-    "text": "<|close|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|end_of_msg|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "message",
-    "allow_special": false
-   },
-   {
-    "text": " role",
-    "allow_special": false
-   },
-   {
-    "text": "=\"",
-    "allow_special": false
-   },
-   {
-    "text": "assistant",
-    "allow_special": false
-   },
-   {
-    "text": "\"",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   },
-   {
-    "text": "<|open|>",
-    "allow_special": true
-   },
-   {
-    "text": "think",
-    "allow_special": false
-   },
-   {
-    "text": "<|sep|>",
-    "allow_special": true
-   }
-  ]
- },
- {
   "name": "part_missing_type",
   "messages": [
    {
@@ -18471,5 +29224,199 @@
   },
   "segments": [],
   "raises": "AssertionError"
+ },
+ {
+  "name": "misc_unknown_role",
+  "messages": [
+   {
+    "role": "narrator",
+    "content": "aside"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_unknown_role_at_index_1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "developer",
+    "content": "note"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_role_wrong_type",
+  "messages": [
+   {
+    "role": 123,
+    "content": "aside"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_role_missing",
+  "messages": [
+   {
+    "content": "aside"
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_batched_conversation",
+  "messages": [
+   [
+    {
+     "role": "user",
+     "content": "a"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ]
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_batched_conversation_at_index_1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   [
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ]
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_messages_is_a_string",
+  "messages": "hi",
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "misc_messages_is_a_mapping",
+  "messages": {
+   "role": "user",
+   "content": "q"
+  },
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "ValueError"
+ },
+ {
+  "name": "tc_arguments_wrong_type",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "function": {
+       "name": "f",
+       "arguments": 7
+      }
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "opts": {
+   "thinking": true,
+   "thinking_effort": "max",
+   "tool_choice": null,
+   "response_format": null,
+   "add_generation_prompt": true
+  },
+  "segments": [],
+  "raises": "TypeError"
  }
 ]

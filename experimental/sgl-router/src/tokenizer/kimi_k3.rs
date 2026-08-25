@@ -20,6 +20,15 @@
 //! `add_generation_prompt=True`, and a `thinking_effort` that defaults to
 //! `"max"`), not from an sglang server flag.
 //!
+//! # Which revision this mirrors
+//!
+//! `moonshotai/Kimi-K3` at `a590ce09`. That matters because the model repo moves
+//! under this file and the encoder's BEHAVIOUR moves with it — the same repo has
+//! shipped two different tool-argument renderings. The fixture generators pin
+//! the same revision (`KIMI_K3_REVISION` in `testdata/gen_kimi_k3_cases.py`), so
+//! a bump lands as one commit: new revision, regenerated fixtures, and whatever
+//! change to this file they force.
+//!
 //! # Segments, not a string
 //!
 //! The K3 encoder does not emit one prompt string. It emits a list of
@@ -363,18 +372,31 @@ fn default_thinking_effort() -> &'static Option<ThinkingEffort> {
 /// `messages` array; `tools` is the request's top-level `tools` array (OpenAI
 /// format), or `None`.
 ///
-/// Returns `Err` — the caller then falls back to raw prompt-text routing —
-/// whenever the reference encoder would itself raise: a tool result whose name
-/// cannot be resolved, a tool call with no function name, or `arguments` that
-/// are neither an object, a JSON-object string, nor absent. Rendering something
-/// plausible instead would produce ids that silently disagree with the engine,
-/// which is worse than routing by raw text.
+/// Returns [`RenderErr`] — the caller then falls back to raw prompt-text
+/// routing — whenever the reference encoder would itself raise. That set is the
+/// variants of `RenderErr`, which is the whole error type here precisely so this
+/// list cannot drift: a non-list `messages`, a message that is not a mapping, an
+/// unknown or missing role, an unsupported `thinking_effort`, a malformed
+/// content part, a tool call with no `function.name`, `arguments` of the wrong
+/// TYPE, and an unresolvable tool-result name.
+///
+/// Note what is NOT an error: a string `arguments` that is not a well-formed
+/// JSON object renders as a raw `<json>` block, matching the reference.
+///
+/// Rendering something plausible instead would produce ids that silently
+/// disagree with the engine, which is worse than routing by raw text.
 pub fn render_segments(
     messages: &serde_json::Value,
     tools: Option<&serde_json::Value>,
     opts: &RenderOpts,
-) -> Result<Vec<Segment>> {
-    let raw = messages.as_array().map(Vec::as_slice).unwrap_or(&[]);
+) -> RenderResult<Vec<Segment>> {
+    // A non-list `messages` used to render an empty prompt and report success;
+    // the reference `enumerate`s it and refuses at the first element.
+    let Some(raw) = messages.as_array().map(Vec::as_slice) else {
+        return Err(RenderErr::MessagesNotAList {
+            found: py_type_name(messages),
+        });
+    };
     let ordered = sort_tool_results_by_call_order(raw);
 
     let mut out = Segments::default();
@@ -389,7 +411,7 @@ pub fn render_segments(
 
     if opts.thinking {
         if opts.thinking_effort == RequestedEffort::Invalid {
-            bail!("unsupported thinking_effort (the reference encoder accepts only low/high/max)");
+            return Err(RenderErr::UnsupportedThinkingEffort);
         }
         if let RequestedEffort::Valid(effort) = opts.thinking_effort {
             internal_system_message(
@@ -412,12 +434,34 @@ pub fn render_segments(
     let mut last_tool_calls: Option<&serde_json::Value> = None;
     let mut tool_index: usize = 0;
 
-    for message in &ordered {
+    for (message_index, message) in ordered.iter().enumerate() {
+        // A message that is not a mapping used to be SKIPPED. That did NOT
+        // render an empty prompt — a batched call still emitted the effort
+        // preamble and the generation prompt, ~10 segments with the whole
+        // conversation missing — which is why `mod.rs`'s zero-token guard could
+        // never catch it, and why the ids were stamped engine-equivalent and
+        // forwardable. The reference refuses it now.
         let Some(obj) = message.as_object() else {
-            continue;
+            return Err(RenderErr::MessageNotAMapping {
+                index: message_index,
+                found: py_type_name(message),
+            });
         };
-        let role = obj.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        match role {
+        // `message.get("role")`, so a MISSING role reaches the same refusal as
+        // an unrecognised one rather than raising a distinct error earlier.
+        //
+        // Lowercased for the same reason `super::dsv4` lowercases: the engine's
+        // generic-role model case-normalizes (`_normalize_role`), so `"System"`
+        // reaches the reference encoder as `system` and renders. Comparing
+        // case-sensitively here would refuse a request the engine serves. The
+        // user-role model is a bare `Literal["user"]`, so `"User"` is a 422 at
+        // the engine and lowercasing it here is harmless alignment.
+        let role = obj
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match role.as_str() {
             "user" => {
                 open_tag(&mut out, "message", &named_attrs("user", message));
                 render_content(&mut out, message.get("content"))?;
@@ -456,9 +500,16 @@ pub fn render_segments(
                 render_assistant_body(&mut out, message, opts.thinking)?;
                 close_message(&mut out);
             }
-            // Any other role renders nothing at all, matching the reference
-            // encoder's if/elif chain with no else.
-            _ => {}
+            // An unrecognised role used to render nothing FOR THAT TURN while
+            // the rest of the prompt rendered normally and reported success — so
+            // a typo'd role silently dropped a message and the router then
+            // routed on, and forwarded, a prefix the engine never produces.
+            other => {
+                return Err(RenderErr::UnknownRole {
+                    index: message_index,
+                    role: other.to_string(),
+                })
+            }
         }
     }
 
@@ -693,7 +744,7 @@ fn extract_response_schema(response_format: &serde_json::Value) -> Option<serde_
 
 /// A message's `content`: a bare string, or a list of typed parts where image
 /// parts become the image placeholder.
-fn render_content(out: &mut Segments, content: Option<&serde_json::Value>) -> Result<()> {
+fn render_content(out: &mut Segments, content: Option<&serde_json::Value>) -> RenderResult<()> {
     match content {
         None | Some(serde_json::Value::Null) => Ok(()),
         Some(serde_json::Value::String(s)) => {
@@ -701,7 +752,16 @@ fn render_content(out: &mut Segments, content: Option<&serde_json::Value>) -> Re
             Ok(())
         }
         Some(serde_json::Value::Array(parts)) => {
-            for part in parts {
+            for (part_index, part) in parts.iter().enumerate() {
+                // `part["type"]` on a non-mapping is a TypeError in the
+                // reference, not a KeyError — so the shape is checked before the
+                // key. The fixture battery asserts that split.
+                if !part.is_object() {
+                    return Err(RenderErr::ContentPartNotAMapping {
+                        index: part_index,
+                        found: py_type_name(part),
+                    });
+                }
                 let part_type = part
                     .get("type")
                     // A part with NO `type` is malformed: the reference indexes
@@ -710,14 +770,17 @@ fn render_content(out: &mut Segments, content: Option<&serde_json::Value>) -> Re
                     // render the engine will never produce. A `type` that is
                     // present but not a string is different — Python's `in` test
                     // just fails, and the part falls through to its `text`.
-                    .ok_or_else(|| anyhow::anyhow!("content part has no `type` field"))?
+                    .ok_or(RenderErr::ContentPartMissingType { index: part_index })?
                     .as_str()
                     .unwrap_or_default();
                 if matches!(part_type, "image" | "image_url") {
                     out.control(IMAGE_PLACEHOLDER);
                 } else {
                     let Some(text) = part.get("text") else {
-                        bail!("content part of type {part_type:?} has no `text` field");
+                        return Err(RenderErr::ContentPartMissingText {
+                            index: part_index,
+                            part_type: part_type.to_string(),
+                        });
                     };
                     out.text(py_str(text));
                 }
@@ -728,14 +791,9 @@ fn render_content(out: &mut Segments, content: Option<&serde_json::Value>) -> Re
         // reaches `for part in content` and raises. Erroring here degrades the
         // request to raw-text routing, which is right — rendering some
         // plausible stringification would produce ids the engine never sees.
-        Some(other) => bail!(
-            "message content must be a string or a list of parts, got {}",
-            match other {
-                serde_json::Value::Object(_) => "an object",
-                serde_json::Value::Bool(_) => "a boolean",
-                _ => "a number",
-            }
-        ),
+        Some(other) => Err(RenderErr::ContentNotStringOrParts {
+            found: py_type_name(other),
+        }),
     }
 }
 
@@ -745,7 +803,7 @@ fn render_assistant_body(
     out: &mut Segments,
     message: &serde_json::Value,
     thinking: bool,
-) -> Result<()> {
+) -> RenderResult<()> {
     if thinking {
         // Structural: the tags are emitted even with nothing to put in them.
         // `reasoning_content or reasoning` is Python's `or`, so an EMPTY
@@ -753,11 +811,20 @@ fn render_assistant_body(
         let reasoning = message
             .get("reasoning_content")
             .filter(|v| json_truthy(v))
-            .or_else(|| message.get("reasoning"));
+            .or_else(|| message.get("reasoning"))
+            // The reference's condition is a CONJUNCTION: `reasoning_content or
+            // reasoning` then `is not None and str(...) != ""`. The null guard
+            // must apply to the RESULT of the `or`, so a present `"reasoning":
+            // null` renders nothing rather than the four characters `None`.
+            // Deliberately `is_null`, NOT `json_truthy`: the reference tests
+            // `is not None`, so `false` / `0` / `[]` DO render.
+            .filter(|v| !v.is_null());
         open_tag(out, "think", &[]);
         if let Some(r) = reasoning {
+            // Only an EMPTY string counts as no reasoning, so whitespace-only
+            // reasoning is still rendered into the think channel.
             let text = py_str(r);
-            if !text.trim().is_empty() {
+            if !text.is_empty() {
                 out.text(text);
             }
         }
@@ -784,11 +851,15 @@ fn render_assistant_body(
 }
 
 /// One `<call tool=… index=…>` and its arguments.
-fn render_tool_call(out: &mut Segments, call: &serde_json::Value, index: usize) -> Result<()> {
+fn render_tool_call(
+    out: &mut Segments,
+    call: &serde_json::Value,
+    index: usize,
+) -> RenderResult<()> {
     // `tool_call.get("function", tool_call)` — the OpenAI nesting is optional.
     let func = call.get("function").unwrap_or(call);
     let Some(name) = func.get("name").and_then(|n| n.as_str()) else {
-        bail!("tool_call at index {index} has no `function.name`");
+        return Err(RenderErr::ToolCallWithoutName { index });
     };
     open_tag(
         out,
@@ -800,24 +871,25 @@ fn render_tool_call(out: &mut Segments, call: &serde_json::Value, index: usize) 
     );
 
     match normalize_tool_arguments(func.get("arguments"))? {
-        // A string that did not parse as JSON is passed through verbatim inside
-        // a `<json>` block rather than being dropped or guessed at.
+        // A string that is not a well-formed JSON OBJECT is passed through
+        // verbatim inside a `<json>` block rather than being dropped, guessed
+        // at, or turned into an error.
         ToolArguments::RawJsonBlock(raw) => {
             open_tag(out, "json", &[("type".into(), "object".into())]);
             out.text(raw);
             close_tag(out, "json");
         }
-        ToolArguments::Object(map) => {
-            for (key, value) in map {
+        ToolArguments::Arguments(args) => {
+            for arg in args {
                 open_tag(
                     out,
                     "argument",
                     &[
-                        ("key".into(), key),
-                        ("type".into(), xtml_type(&value).into()),
+                        ("key".into(), arg.key),
+                        ("type".into(), arg.arg_type.into()),
                     ],
                 );
-                out.text(xtml_value(&value));
+                out.text(arg.text);
                 close_tag(out, "argument");
             }
         }
@@ -827,39 +899,361 @@ fn render_tool_call(out: &mut Segments, call: &serde_json::Value, index: usize) 
     Ok(())
 }
 
+/// Errors from rendering. EVERY variant mirrors an exception the REFERENCE
+/// encoder itself raises, so the engine rejects the same input and a caller
+/// treating this as a client error rather than encoder breakage reproduces the
+/// engine's own outcome.
+///
+/// This is the entire error type of [`render_segments`], deliberately.
+/// `super::dsv4::RenderErr` is the same shape for the same reason: with a typed
+/// error the request-vs-breakage split is exhaustive **by construction**, where
+/// a runtime downcast over `anyhow` silently lets each new `bail!` escape the
+/// classification. That is not hypothetical — the two-variant version of this
+/// type covered 2 of the 10 refusals the fixture battery already recorded.
+///
+/// A future variant that is a ROUTER limitation rather than an engine rejection
+/// must NOT be added here. Two consumers key on this type: `super::mod` keeps a
+/// client error from consuming the model's one-shot broken-encoder WARN latch,
+/// and `crate::server::routes::chat` keeps it out of the broken-offload metric
+/// `sgl_router_ingress_tokenize_errors_total`.
+///
+/// Every variant is pinned by a `raises` case in
+/// `testdata/kimi_k3_render_cases.json`, and the fixture harness asserts the
+/// CLASS — each reject case must surface as a `RenderErr` — so a new reference
+/// refusal cannot be added without being classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderErr {
+    /// `messages` is not a list at all. The reference `enumerate`s whatever it
+    /// is and hits the per-message mapping check (`ValueError`).
+    MessagesNotAList { found: &'static str },
+    /// A message that is not a mapping. A batched call — a list OF
+    /// conversations rather than of messages — is the shape that lands here
+    /// (`ValueError`).
+    MessageNotAMapping { index: usize, found: &'static str },
+    /// A role the reference does not define, including a missing or non-string
+    /// one (`ValueError`). Roles are compared after ASCII-lowercasing, matching
+    /// the engine's own `_normalize_role`.
+    UnknownRole { index: usize, role: String },
+    /// `thinking_effort` outside `_VALID_THINKING_EFFORTS` (`AssertionError`).
+    /// Cheap for a client to trigger: the reference's own rendered preamble
+    /// advertises `medium` as supported and then refuses it.
+    UnsupportedThinkingEffort,
+    /// A content part that is not a mapping at all. The reference indexes
+    /// `part["type"]`, and subscripting a str/int/list with a string key is a
+    /// `TypeError` — a DIFFERENT exception from a mapping that merely lacks the
+    /// key, which is why these are two variants and not one.
+    ContentPartNotAMapping { index: usize, found: &'static str },
+    /// A mapping content part with no `type` key; the reference indexes
+    /// `part["type"]` and gets a `KeyError`.
+    ContentPartMissingType { index: usize },
+    /// A non-image content part with no `text` (`KeyError`).
+    ContentPartMissingText { index: usize, part_type: String },
+    /// `content` is neither a string nor a list of parts, so the reference
+    /// reaches `for part in content` and raises (`TypeError`).
+    ContentNotStringOrParts { found: &'static str },
+    /// A `tool_calls` entry with no `function.name`; the reference indexes
+    /// `fn["name"]` (`KeyError`).
+    ToolCallWithoutName { index: usize },
+    /// `arguments` is neither a mapping, a string, nor absent (`TypeError`).
+    ToolArgumentsWrongType { found: &'static str },
+    /// A `tool` message whose name resolves neither from its own `tool`/`name`
+    /// nor from the preceding assistant turn's `tool_calls` (`ValueError`).
+    UnresolvableToolName { index: usize },
+}
+
+impl std::fmt::Display for RenderErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderErr::MessagesNotAList { found } => {
+                write!(f, "Kimi K3 messages must be a list, got {found}")
+            }
+            RenderErr::MessageNotAMapping { index, found } => write!(
+                f,
+                "Kimi K3 messages must be dicts, got {found} at index {index}"
+            ),
+            RenderErr::UnknownRole { index, role } => {
+                write!(f, "unknown message role {role:?} at index {index}")
+            }
+            RenderErr::UnsupportedThinkingEffort => write!(
+                f,
+                "unsupported thinking_effort (the reference accepts only low/high/max)"
+            ),
+            RenderErr::ContentPartNotAMapping { index, found } => {
+                write!(f, "content part {index} must be a mapping, got {found}")
+            }
+            RenderErr::ContentPartMissingType { index } => {
+                write!(f, "content part {index} has no `type` field")
+            }
+            RenderErr::ContentPartMissingText { index, part_type } => write!(
+                f,
+                "content part {index} of type {part_type:?} has no `text` field"
+            ),
+            RenderErr::ContentNotStringOrParts { found } => write!(
+                f,
+                "message content must be a string or a list of parts, got {found}"
+            ),
+            RenderErr::ToolCallWithoutName { index } => {
+                write!(f, "tool_call at index {index} has no `function.name`")
+            }
+            RenderErr::ToolArgumentsWrongType { found } => write!(
+                f,
+                "Kimi K3 tool call arguments must be a dict or a JSON object string, got {found}"
+            ),
+            RenderErr::UnresolvableToolName { index } => write!(
+                f,
+                "tool message {index} needs a resolvable tool name: carry `tool`/`name`, \
+                 or match a preceding assistant tool_call by order"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RenderErr {}
+
+/// Every render path returns [`RenderErr`]; see that type for why it is typed
+/// rather than `anyhow`.
+type RenderResult<T> = std::result::Result<T, RenderErr>;
+
+/// Python's `type(x).__name__` for a JSON value, so a refusal names the shape
+/// the way the reference's own message does — `list`, not the XTML vocabulary's
+/// `array`.
+fn py_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "NoneType",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(n) if n.is_f64() => "float",
+        serde_json::Value::Number(_) => "int",
+        serde_json::Value::String(_) => "str",
+        serde_json::Value::Array(_) => "list",
+        serde_json::Value::Object(_) => "dict",
+    }
+}
+
+/// One rendered `<argument>`: its key, its XTML type, and the EXACT text that
+/// becomes the tag body. Mirrors `encoding_k3.XtmlArgument`.
+///
+/// The text is carried instead of the parsed value because the reference keeps
+/// each non-string value's ORIGINAL JSON literal — `1e2` stays `1e2`, `[1,2]`
+/// keeps its exact bytes — and re-serializing a `serde_json::Value` cannot
+/// reproduce that.
+struct XtmlArgument {
+    key: String,
+    arg_type: &'static str,
+    text: String,
+}
+
 /// Normalized `tool_calls[].function.arguments`.
 enum ToolArguments {
-    Object(Vec<(String, serde_json::Value)>),
+    Arguments(Vec<XtmlArgument>),
     RawJsonBlock(String),
 }
 
 /// Mirror `encoding_k3.normalize_tool_arguments`.
 ///
-/// Absent / empty-string arguments become an empty object; an object passes
-/// through; a string is parsed as JSON and must yield an OBJECT. A string that
-/// fails to parse is preserved verbatim as a `<json>` block — but a string that
-/// parses to a non-object (an array, a bare number) is an error, exactly as the
-/// reference encoder raises, because there is no correct rendering for it.
-fn normalize_tool_arguments(arguments: Option<&serde_json::Value>) -> Result<ToolArguments> {
-    let empty = || ToolArguments::Object(Vec::new());
+/// Absent or empty-string arguments render nothing; a MAPPING is rendered
+/// value-by-value through [`xtml_value`], which re-serializes with Python's
+/// default separators; a STRING is parsed one level deep by
+/// [`parse_arguments_object`], which keeps each value's original literal text.
+/// The same logical arguments therefore render differently depending on which
+/// of the two shapes the client sent — `[1, 2]` for a mapping, `[1,2]` for a
+/// string — and that asymmetry is the reference's, so it is pinned by fixture.
+///
+/// Any string that is not a well-formed JSON object — unparsable,
+/// whitespace-only, or valid non-object JSON like `[1,2]` — falls back to the
+/// raw `<json>` block. It is NOT an error: the previous revision raised on
+/// valid non-object JSON, which failed the whole request over a tool call the
+/// engine would have rendered.
+///
+/// The empty test is `is_empty`, NOT `trim().is_empty()`: a whitespace-only
+/// string is a fallback here, not an empty argument list.
+fn normalize_tool_arguments(arguments: Option<&serde_json::Value>) -> RenderResult<ToolArguments> {
     match arguments {
-        None | Some(serde_json::Value::Null) => Ok(empty()),
-        Some(serde_json::Value::Object(map)) => Ok(ToolArguments::Object(
-            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        None | Some(serde_json::Value::Null) => Ok(ToolArguments::Arguments(Vec::new())),
+        Some(serde_json::Value::Object(map)) => Ok(ToolArguments::Arguments(
+            map.iter()
+                .map(|(key, value)| XtmlArgument {
+                    key: key.clone(),
+                    arg_type: xtml_type(value),
+                    text: xtml_value(value),
+                })
+                .collect(),
         )),
         Some(serde_json::Value::String(s)) => {
-            if s.trim().is_empty() {
-                return Ok(empty());
+            if s.is_empty() {
+                return Ok(ToolArguments::Arguments(Vec::new()));
             }
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(serde_json::Value::Object(map)) => {
-                    Ok(ToolArguments::Object(map.into_iter().collect()))
+            Ok(match parse_arguments_object(s) {
+                Ok(args) => ToolArguments::Arguments(args),
+                Err(why) => {
+                    // The render SUCCEEDS from here, so this degradation is
+                    // invisible to every other signal: no fallback log, and the
+                    // ids are still stamped engine-equivalent. It is also the one
+                    // place where a faithful fallback and a DIVERGENT one look
+                    // identical — for the four families listed on
+                    // `parse_arguments_object` the reference parses what we
+                    // refuse, so the raw block silently disagrees with the
+                    // engine's prompt. Carry the cause so the two are
+                    // distinguishable. Never log the argument text itself: it is
+                    // client tool-call payload.
+                    tracing::debug!(
+                        error = %why, len = s.len(),
+                        "kimi-k3 tool arguments are not a well-formed JSON object; \
+                         rendering the raw <json> block"
+                    );
+                    ToolArguments::RawJsonBlock(s.clone())
                 }
-                Ok(_) => bail!("Kimi K3 tool call arguments must be a JSON object"),
-                Err(_) => Ok(ToolArguments::RawJsonBlock(s.clone())),
-            }
+            })
         }
-        Some(_) => bail!("Kimi K3 tool call arguments must be an object or a JSON object string"),
+        Some(other) => Err(RenderErr::ToolArgumentsWrongType {
+            found: py_type_name(other),
+        }),
+    }
+}
+
+/// `encoding_k3._skip_whitespaces`: exactly space, tab, LF and CR.
+///
+/// Measured: serde_json's own whitespace set is these same four, so the point is
+/// NOT that this is narrower than serde's. It is that serde is never invoked at
+/// the six structural positions this skips (before `{`, after `{`, either side
+/// of `:`, after a value, after a separator), so this function alone decides
+/// them — and Rust's `char::is_whitespace` would wrongly accept form feed,
+/// NBSP and U+2028 there, where the reference falls back to the raw block.
+fn skip_json_ws(bytes: &[u8], from: usize) -> usize {
+    let mut idx = from;
+    while matches!(bytes.get(idx), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        idx += 1;
+    }
+    idx
+}
+
+/// `json.JSONDecoder.raw_decode`: parse ONE value starting at `idx` and report
+/// the offset just past it, leaving whatever follows unexamined.
+///
+/// `serde_json::from_str` cannot serve here: it calls `Deserializer::end`, so it
+/// requires the string to hold nothing but the one value. A bare `Deserializer`
+/// would parse-and-stop fine — measured — but does not expose `byte_offset`,
+/// which is the "where did this value end" half of `raw_decode` and the only
+/// reason a `StreamDeserializer` is used.
+fn raw_decode(s: &str, idx: usize) -> Result<(serde_json::Value, usize)> {
+    // A StreamDeserializer, because `byte_offset` — the "where did this value
+    // end" half of `raw_decode` — is only exposed there, and a plain
+    // `Deserializer` would additionally demand the input hold nothing else.
+    let mut stream = serde_json::Deserializer::from_str(&s[idx..]).into_iter::<serde_json::Value>();
+    let Some(value) = stream.next() else {
+        bail!("expected a JSON value at offset {idx}");
+    };
+    let value = value?;
+    Ok((value, idx + stream.byte_offset()))
+}
+
+/// Mirror `encoding_k3._parse_arguments_object`: parse a JSON object string one
+/// level deep, one `<argument>` per top-level pair.
+///
+/// Each value's text is its ORIGINAL slice of `s` unless the value is a string,
+/// in which case it is the decoded (unescaped) string. Nested values are never
+/// re-serialized, so inner spacing and number spelling survive verbatim.
+/// Anything after the closing `}` is ignored, and DUPLICATE KEYS are all kept —
+/// collecting into a `serde_json::Map` would silently drop all but the last.
+///
+/// FOUR divergences from the reference, all measured by differential fuzz over
+/// 134,520 inputs (0 panics; 98.5% byte-exact render agreement). Every one fails
+/// the SAME safe way — Python parses, serde_json refuses, so we emit the raw
+/// `<json>` block — and there was no input where both parsed and rendered
+/// differently, nor any where we accepted what the reference refused. The engine
+/// still re-tokenizes correctly; only the exact prefix-cache match is lost.
+///
+/// 1. Literal control characters inside strings (712 inputs). The reference
+///    decodes with `JSONDecoder(strict=False)`; serde_json rejects them. This is
+///    also what the PREVIOUS revision did with such input, so it is a narrower
+///    improvement rather than a regression.
+/// 2. Non-finite and out-of-f64-range numbers — `NaN`, `Infinity`, `1e309`
+///    (753 inputs). The most reachable of the four: `json.dumps` emits bare
+///    `NaN`/`Infinity` BY DEFAULT, so any Python client serializing a NaN tool
+///    argument produces one, and `json.JSONDecoder` accepts them.
+/// 3. Lone-surrogate `\u` escapes (599 inputs) — arguably unfixable rather than
+///    a defect: a lone surrogate has no Rust `String` encoding at all.
+/// 4. Value nesting at or beyond serde_json's `RECURSION_LIMIT` of 128 (48
+///    inputs); measured fine at 127. The reference tolerated 100,000 levels.
+///
+/// Each family is pinned by a fixture asserting the raw-block fallback, so
+/// "fixing" one is a red test rather than a silent change in rendered bytes.
+///
+/// Indices are BYTE offsets throughout, where the reference's are character
+/// offsets. That is safe because the two are only ever used to CUT the same
+/// string, never compared to each other, and the cuts land identically.
+///
+/// The no-panic argument, stated exactly, because the obvious version of it is
+/// wrong: most indices come from `byte_offset` or from a skip over bytes in
+/// `{space, tab, LF, CR, ',', ':', '{', '}'}`, all < 0x80 and so never a UTF-8
+/// lead or continuation byte. But there IS a third origin — the `idx += 1` past
+/// an unvalidated separator byte, mirroring the reference's `_next_char()` —
+/// which CAN land mid-character. It is safe only because that path reaches
+/// `bail!` before any slice: a continuation byte can never compare equal to
+/// `b','` or `b'}'`, so the `continue`/`return` arms are unreachable from a
+/// mid-character index. A future refactor that recovers from a bad separator
+/// instead of bailing would introduce a slicing panic here.
+fn parse_arguments_object(s: &str) -> Result<Vec<XtmlArgument>> {
+    let bytes = s.as_bytes();
+    let mut idx = skip_json_ws(bytes, 0);
+    if bytes.get(idx) != Some(&b'{') {
+        bail!("JSON arguments must be an object");
+    }
+    idx = skip_json_ws(bytes, idx + 1);
+
+    let mut parsed = Vec::new();
+    match bytes.get(idx) {
+        None => bail!("Unexpected end of JSON object"),
+        // An empty object returns WITHOUT consuming the `}`, as the reference
+        // does; either way the trailing bytes are ignored.
+        Some(&b'}') => return Ok(parsed),
+        Some(_) => {}
+    }
+
+    loop {
+        let (key, after_key) = raw_decode(s, idx)?;
+        idx = after_key;
+        let key = match key {
+            serde_json::Value::String(key) => key,
+            other => bail!("JSON object key must be a string, got {other}"),
+        };
+
+        idx = skip_json_ws(bytes, idx);
+        if bytes.get(idx) != Some(&b':') {
+            bail!("Expects ':' after {key}");
+        }
+        idx = skip_json_ws(bytes, idx + 1);
+
+        let value_start = idx;
+        let (value, after_value) = raw_decode(s, idx)?;
+        idx = after_value;
+        let text = match &value {
+            serde_json::Value::String(decoded) => decoded.clone(),
+            _ => s[value_start..idx].to_string(),
+        };
+        parsed.push(XtmlArgument {
+            key,
+            arg_type: xtml_type(&value),
+            text,
+        });
+
+        // The reference's `_next_char()` reads one CHARACTER and advances; this
+        // advances one BYTE. They differ only for a non-ASCII separator, which
+        // is malformed either way and bails below before anything is sliced —
+        // see the no-panic argument on this function. At the end of the string
+        // both yield nothing and advance nothing.
+        idx = skip_json_ws(bytes, idx);
+        let separator = bytes.get(idx).copied();
+        if separator.is_some() {
+            idx += 1;
+        }
+        idx = skip_json_ws(bytes, idx);
+
+        match separator {
+            Some(b'}') => return Ok(parsed),
+            Some(b',') => continue,
+            Some(other) => bail!("Expect '}}' or ',', got {:?}", other as char),
+            None => bail!("Expect '}}' or ',', got end of input"),
+        }
     }
 }
 
@@ -919,7 +1313,7 @@ fn resolve_tool_result_name(
     message: &serde_json::Value,
     last_tool_calls: Option<&serde_json::Value>,
     tool_index: usize,
-) -> Result<String> {
+) -> RenderResult<String> {
     // `message.get("tool", message.get("name"))` — an explicit null `tool` does
     // NOT fall through to `name`, so key presence is what matters here.
     let own = if message.get("tool").is_some() {
@@ -940,10 +1334,7 @@ fn resolve_tool_result_name(
             }
         }
     }
-    bail!(
-        "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
-         or match a preceding assistant tool_call by order"
-    )
+    Err(RenderErr::UnresolvableToolName { index: tool_index })
 }
 
 /// Re-sort each run of consecutive `tool` messages into the order of the
@@ -1276,7 +1667,8 @@ mod tests {
     #[test]
     fn render_parity_with_reference_encoder() {
         let all = render_cases();
-        assert!(all.len() >= 60, "fixture went missing: {} cases", all.len());
+        let total = all.len();
+        let names: std::collections::HashSet<String> = all.iter().map(|c| c.name.clone()).collect();
         let mut rendered = 0;
         let mut rejected = 0;
         for case in all {
@@ -1293,7 +1685,22 @@ mod tests {
                     "case {} must fail: the reference raises {exc}",
                     case.name
                 ));
-                let _ = err;
+                // `render_segments`' error type IS `RenderErr`, so "this is a
+                // request error, not encoder breakage" is now compiler-enforced
+                // and needs no assertion. What is still worth binding is the
+                // MAPPING: each variant claims in its doc comment to mirror a
+                // specific reference exception, and the fixture records which
+                // one the reference actually raised. Asserting the two agree
+                // pins the taxonomy against the reference rather than against
+                // itself, and it binds every case the generator emits — not
+                // just the ones someone remembered to hand-write.
+                let want_exc = reference_exception_for(&err);
+                assert_eq!(
+                    want_exc, exc,
+                    "case {} — the reference raises {exc}, but {err:?} claims to \
+                     mirror {want_exc}; one of the two is misclassified",
+                    case.name
+                );
                 rejected += 1;
                 continue;
             }
@@ -1311,11 +1718,73 @@ mod tests {
             );
         }
         assert!(
-            rendered >= 55 && rejected >= 8,
-            "expected both halves of the fixture to be exercised, got {rendered} rendered \
-             and {rejected} rejected"
+            rendered + rejected == total,
+            "every case must be either rendered or rejected, got {rendered} + {rejected} \
+             of {total}"
         );
+        // A count records the example; this records the POLICY — the cases whose
+        // absence would silently un-test a behaviour. A deleted or renamed case
+        // then shows up as a diff on this list instead of as a number that still
+        // clears a floor, which is how `unknown_role_renders_nothing` (the only
+        // index>0 refusal in the tree) went missing without a red test.
+        for required in REQUIRED_RENDER_CASES {
+            assert!(
+                names.contains(*required),
+                "required fixture case {required} is missing — if it was renamed, \
+                 update REQUIRED_RENDER_CASES; if it was deleted, say why in the diff"
+            );
+        }
     }
+
+    /// Which reference exception each `RenderErr` variant claims to mirror.
+    ///
+    /// This is the Rust half of the parity contract that the fixture's `raises`
+    /// field is the Python half of. Adding a variant forces an arm here, and the
+    /// battery then checks it against what the reference actually raised.
+    fn reference_exception_for(err: &RenderErr) -> &'static str {
+        match err {
+            RenderErr::MessagesNotAList { .. }
+            | RenderErr::MessageNotAMapping { .. }
+            | RenderErr::UnknownRole { .. }
+            | RenderErr::UnresolvableToolName { .. } => "ValueError",
+            RenderErr::ContentPartMissingType { .. }
+            | RenderErr::ContentPartMissingText { .. }
+            | RenderErr::ToolCallWithoutName { .. } => "KeyError",
+            RenderErr::ContentNotStringOrParts { .. }
+            | RenderErr::ContentPartNotAMapping { .. }
+            | RenderErr::ToolArgumentsWrongType { .. } => "TypeError",
+            RenderErr::UnsupportedThinkingEffort => "AssertionError",
+        }
+    }
+
+    /// Fixture cases whose absence would un-test a behaviour, named rather than
+    /// counted. Keep the reason with the name.
+    const REQUIRED_RENDER_CASES: &[&str] = &[
+        // Refusals at index > 0 — the only shape real traffic takes. Without
+        // these, refusing only at index 0 is a green mutation.
+        "misc_unknown_role_at_index_1",
+        "misc_batched_conversation_at_index_1",
+        // `messages` not a list at all.
+        "misc_messages_is_a_string",
+        // The reference's `is not None` conjunct on reasoning.
+        "as_reasoning_null",
+        "as_reasoning_empty_then_null_alias",
+        // Whitespace-only reasoning DOES render (the `!= ""` half).
+        "as_reasoning_whitespace_only",
+        // Literal argument text, and the mapping path's contrasting spacing.
+        "tc_args_str_literal_text_preserved",
+        "tc_args_mapping_reserialized",
+        // A truncated tool call — what a model emits at `max_tokens`.
+        "tc_args_str_truncated",
+        // `byte_offset` must be the value's end, not the whitespace after it.
+        "tc_args_str_spaced_separators",
+        // A sliced value containing non-ASCII: the slice-panic path.
+        "tc_args_str_multibyte_literal",
+        // Duplicate keys are all kept.
+        "tc_args_str_duplicate_keys",
+        // Wrong-TYPE arguments raise, unlike a non-object argument STRING.
+        "tc_arguments_wrong_type",
+    ];
 
     /// The two properties the multimodal fixtures exist to pin, called out so a
     /// regression names the cause instead of dumping 38 segments.
@@ -1667,33 +2136,226 @@ mod tests {
         assert!(render_segments(&messages, None, &RenderOpts::default()).is_err());
     }
 
-    /// Arguments that parse to a non-object have no rendering, so they error;
-    /// arguments that do not parse at all are preserved verbatim in a `<json>`
-    /// block. The two look similar and behave oppositely.
-    #[test]
-    fn tool_argument_string_handling() {
-        let with_args = |args: serde_json::Value| {
-            json!([
-                {"role": "user", "content": "go"},
-                {"role": "assistant", "content": "",
-                 "tool_calls": [{"id": "c", "function": {"name": "f", "arguments": args}}]},
-            ])
-        };
-        let opts = RenderOpts::default();
-
-        assert!(render_segments(&with_args(json!("[1,2]")), None, &opts).is_err());
-        assert!(render_segments(&with_args(json!("7")), None, &opts).is_err());
-
-        let text: String = render_segments(&with_args(json!("{oops")), None, &opts)
-            .expect("unparsable arguments render as a json block")
+    /// One assistant turn whose single tool call carries `arguments` verbatim,
+    /// rendered to its joined text.
+    fn render_tool_arguments(args: serde_json::Value) -> Result<String> {
+        let messages = json!([
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c", "function": {"name": "f", "arguments": args}}]},
+        ]);
+        Ok(render_segments(&messages, None, &RenderOpts::default())?
             .iter()
             .map(|s| s.text.as_str())
-            .collect();
-        assert!(text.contains("json"), "expected a <json> block: {text}");
-        assert!(
-            text.contains("{oops"),
-            "raw arguments must be preserved: {text}"
+            .collect())
+    }
+
+    /// A JSON-STRING `arguments` is parsed one level deep and every value keeps
+    /// its ORIGINAL literal text. Re-serializing a parsed value instead agrees
+    /// with the reference on canonical `json.dumps` spacing and ONLY on that —
+    /// which is why a battery written in canonical spacing cannot tell the two
+    /// spellings apart. Every case here is one re-serializing gets wrong.
+    #[test]
+    fn tool_argument_string_is_parsed_one_level_deep() {
+        let render = |args: &str| render_tool_arguments(json!(args)).expect("renders");
+
+        for (args, want) in [
+            (
+                r#"{"exp":1e2}"#,
+                r#"key="exp" type="number"<|sep|>1e2<|close|>"#,
+            ),
+            (
+                r#"{"arr":[1,2]}"#,
+                r#"key="arr" type="array"<|sep|>[1,2]<|close|>"#,
+            ),
+            (
+                r#"{"t":1.50}"#,
+                r#"key="t" type="number"<|sep|>1.50<|close|>"#,
+            ),
+            (
+                r#"{"a": { "b" : 1 }}"#,
+                r#"key="a" type="object"<|sep|>{ "b" : 1 }<|close|>"#,
+            ),
+            // Bytes after the closing brace are discarded rather than making the
+            // whole string unparsable.
+            (
+                r#"{"a":1} junk"#,
+                r#"key="a" type="number"<|sep|>1<|close|>"#,
+            ),
+            // A string VALUE is the one that IS decoded, not passed through.
+            (
+                r#"{"s":"a\nb"}"#,
+                "key=\"s\" type=\"string\"<|sep|>a\nb<|close|>",
+            ),
+        ] {
+            let text = render(args);
+            assert!(
+                text.contains(want),
+                "for {args}: wanted {want:?} in {text:?}"
+            );
+        }
+
+        // Duplicate keys are ALL kept; collecting into a map drops the first.
+        let dup = render(r#"{"a":1,"a":2}"#);
+        assert_eq!(
+            dup.matches(r#"argument key="a""#).count(),
+            2,
+            "both duplicate keys must render: {dup}"
         );
+
+        // The MAPPING path is UNCHANGED, so the same logical arguments render
+        // with Python's DEFAULT separators. The asymmetry is the reference's.
+        let mapping = render_tool_arguments(json!({"arr": [1, 2]})).expect("renders");
+        assert!(
+            mapping.contains(r#"key="arr" type="array"<|sep|>[1, 2]<|close|>"#),
+            "a mapping is re-serialized with a space after the comma: {mapping}"
+        );
+    }
+
+    /// Every string that is not a well-formed JSON object falls back to the raw
+    /// `<json>` block. Valid non-object JSON (`[1,2]`, `7`) used to be a hard
+    /// ERROR, which failed the whole request over a tool call the engine renders
+    /// fine — and whitespace-only used to render as NO arguments, silently
+    /// dropping the block.
+    #[test]
+    fn tool_argument_string_falls_back_instead_of_erroring() {
+        for args in ["[1,2]", "7", "{oops", r#"{"a":1,}"#, "   "] {
+            let text = render_tool_arguments(json!(args)).expect("never errors");
+            assert!(
+                text.contains(r#"json type="object""#),
+                "{args:?} must land in a <json> block: {text:?}"
+            );
+            assert!(
+                text.contains(args),
+                "{args:?} must be preserved verbatim: {text:?}"
+            );
+        }
+
+        // Only the EMPTY string means "no arguments" — and it emits no block.
+        let empty = render_tool_arguments(json!("")).expect("renders");
+        assert!(!empty.contains("argument key="), "no arguments: {empty:?}");
+        assert!(
+            !empty.contains(r#"json type="object""#),
+            "and no json block: {empty:?}"
+        );
+    }
+
+    /// A message that is not a mapping, and a role the encoder does not know,
+    /// are REFUSED. Both used to render nothing for that turn and report
+    /// success, so a batched call or a typo'd role silently produced a prompt
+    /// the engine never emits — and the router then routed on it.
+    ///
+    /// The INDEX is asserted, not just the variant. Every refusal fixture used
+    /// to sit at index 0, which left `if index == 0 { refuse } else { continue }`
+    /// green — and that mutation restores the original bug for every real
+    /// conversation, since a stray turn is never the first one.
+    #[test]
+    fn malformed_messages_and_unknown_roles_are_refused() {
+        let opts = RenderOpts::default();
+        let cases: Vec<(serde_json::Value, RenderErr)> = vec![
+            (
+                json!([{"role": "user", "content": "a"}, {"role": "developer", "content": "x"}]),
+                RenderErr::UnknownRole {
+                    index: 1,
+                    role: "developer".into(),
+                },
+            ),
+            (
+                json!([{"role": "user", "content": "a"}, [{"role": "user", "content": "b"}]]),
+                RenderErr::MessageNotAMapping {
+                    index: 1,
+                    found: "list",
+                },
+            ),
+            (
+                json!([{"content": "aside"}]),
+                RenderErr::UnknownRole {
+                    index: 0,
+                    role: String::new(),
+                },
+            ),
+            (
+                json!([{"role": 123, "content": "aside"}]),
+                RenderErr::UnknownRole {
+                    index: 0,
+                    role: String::new(),
+                },
+            ),
+            (json!("hi"), RenderErr::MessagesNotAList { found: "str" }),
+            (
+                json!({"role": "user", "content": "q"}),
+                RenderErr::MessagesNotAList { found: "dict" },
+            ),
+        ];
+        for (messages, want) in &cases {
+            let err = render_segments(messages, None, &opts)
+                .expect_err("the reference refuses this, so the router must too");
+            assert_eq!(&err, want, "wrong refusal for {messages}");
+        }
+    }
+
+    /// Roles are compared after lowercasing, because the ENGINE lowercases before
+    /// its encoder ever sees them (`_normalize_role`). The reference cannot pin
+    /// this — hand it `"System"` directly and it raises — so the oracle is an
+    /// equivalence: a case-variant role must render byte-identically to its
+    /// lowercase spelling. Without it the router refuses `{"role":"Assistant"}`,
+    /// which sglang serves normally.
+    #[test]
+    fn case_variant_roles_render_as_their_lowercase_spelling() {
+        let opts = RenderOpts::default();
+        let convo = |role: &str| {
+            json!([
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c", "function": {"name": "f", "arguments": {}}}]},
+                {"role": role, "content": "r", "tool": "f"},
+            ])
+        };
+        for (variant, canonical) in [("Tool", "tool"), ("TOOL", "tool")] {
+            assert_eq!(
+                render_segments(&convo(variant), None, &opts).expect("renders"),
+                render_segments(&convo(canonical), None, &opts).expect("renders"),
+                "role {variant:?} must render as {canonical:?}"
+            );
+        }
+        for (variant, canonical) in [("System", "system"), ("Assistant", "assistant")] {
+            let mixed =
+                json!([{"role": variant, "content": "s"}, {"role": "user", "content": "q"}]);
+            let lower =
+                json!([{"role": canonical, "content": "s"}, {"role": "user", "content": "q"}]);
+            assert_eq!(
+                render_segments(&mixed, None, &opts).expect("renders"),
+                render_segments(&lower, None, &opts).expect("renders"),
+                "role {variant:?} must render as {canonical:?}"
+            );
+        }
+    }
+
+    /// The four MEASURED divergences from the reference, pinned as our own
+    /// behaviour so a future "fix" is a red test rather than a silent change in
+    /// rendered bytes. The reference PARSES all of these into `<argument>` tags;
+    /// serde_json refuses them, so we emit the raw block. Counts and reasoning
+    /// are on `parse_arguments_object`.
+    #[test]
+    fn known_divergences_fall_back_to_the_raw_json_block() {
+        let deep = format!("{{\"a\":{}1{}}}", "[".repeat(130), "]".repeat(130));
+        let control = "{\"a\":\"x\u{1}y\"}".to_string();
+        for args in [
+            control.as_str(),
+            // `json.dumps` emits these by default, so a Python client reaches them.
+            "{\"a\":NaN}",
+            "{\"a\":Infinity}",
+            "{\"a\":1e309}",
+            // A lone surrogate has no Rust `String` encoding at all.
+            "{\"a\":\"\\ud800\"}",
+            deep.as_str(),
+        ] {
+            let text = render_tool_arguments(json!(args)).expect("never errors");
+            assert!(
+                text.contains(r#"json type="object""#),
+                "{args:?} must fall back to the raw block: {text:?}"
+            );
+        }
     }
 
     /// A vocabulary whose control markers do not resolve must be rejected, not

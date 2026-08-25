@@ -774,13 +774,14 @@ async fn chat_completions_inner(
     // engine-equivalent ids but didn't, the chat request silently fell back to
     // engine-side tokenization. Count only that case (see
     // `ingress_tokenize_offload_failed`); successful forwards and expected
-    // omissions are not problems. A dsv4 render error is a CLIENT error the
-    // engine rejects identically — never broken-offload signal.
+    // omissions are not problems. A render error from an encoder that MIRRORS
+    // the engine is a CLIENT error the engine rejects identically — never
+    // broken-offload signal (see `render_rejects_request`).
     if ingress_tokenize_offload_failed(
         ctx.tokenizers.has_chat_encoder(&model_str),
         request_value.as_ref(),
         request_tokens.as_ref(),
-    ) && !dsv4_render_rejects_request(&ctx.tokenizers, &model_str, request_value.as_ref())
+    ) && !render_rejects_request(&ctx.tokenizers, &model_str, request_value.as_ref())
     {
         ctx.metrics.record_ingress_tokenize_error(&metrics_model);
     }
@@ -1961,6 +1962,50 @@ fn ingress_tokenize_offload_failed(
 /// offload breakage and must not count in
 /// `sgl_router_ingress_tokenize_errors_total`. Only invoked on the failure
 /// path, where the re-render cost is irrelevant.
+/// True when the model's chat encoder REFUSES the request, i.e. the ingress
+/// render failure is the engine's own rejection rather than offload breakage.
+///
+/// `sgl_router_ingress_tokenize_errors_total` is the series that justifies not
+/// rate-limiting the fallback log path, so a client-shaped error must never
+/// drive it — otherwise the metric becomes client-controllable and a real
+/// encoder regression is indistinguishable from a loop of malformed requests.
+/// The counter carries only `model_id` (no `reason`), so this cannot be
+/// subtracted after the fact; it has to be excluded here.
+///
+/// Dispatches per encoder because each mirrors a different reference. Add a new
+/// arm whenever a chat encoder gains a request-level error type.
+fn render_rejects_request(
+    tokenizers: &crate::tokenizer::TokenizerRegistry,
+    model_id: &str,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    dsv4_render_rejects_request(tokenizers, model_id, value)
+        || kimi_k3_render_rejects_request(tokenizers, model_id, value)
+}
+
+/// The K3 arm of [`render_rejects_request`].
+///
+/// `kimi_k3::render_segments`' whole error type is `kimi_k3::RenderErr`, every
+/// variant of which mirrors a reference exception — so "render errored" IS
+/// "the engine rejects this", with no downcast and no class to miss. Note
+/// `messages` is NOT required to be an array here, unlike the dsv4 arm: a
+/// non-list `messages` is itself one of those refusals.
+fn kimi_k3_render_rejects_request(
+    tokenizers: &crate::tokenizer::TokenizerRegistry,
+    model_id: &str,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    if !tokenizers.has_chat_encoder(model_id) || !crate::tokenizer::is_kimi_k3(model_id) {
+        return false;
+    }
+    let Some(v) = value else { return false };
+    let Some(messages) = v.get("messages") else {
+        return false;
+    };
+    let opts = crate::tokenizer::ChatRenderOpts::resolve(v);
+    crate::tokenizer::kimi_k3::render_segments(messages, v.get("tools"), &opts.kimi_k3).is_err()
+}
+
 fn dsv4_render_rejects_request(
     tokenizers: &crate::tokenizer::TokenizerRegistry,
     model_id: &str,
@@ -2256,6 +2301,88 @@ mod tests {
     use anyhow::anyhow;
     use axum::http::StatusCode;
     use reqwest::Url;
+
+    fn k3_cfg(model_id: &str) -> crate::config::Config {
+        crate::config::Config {
+            server: crate::config::ServerConfig {
+                host: "x".into(),
+                port: 0,
+                ..Default::default()
+            },
+            observability: Default::default(),
+            model: crate::config::ModelConfig {
+                id: model_id.into(),
+                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_shards: 1,
+                tokenizer_backend: Default::default(),
+                tokenizer_l1_cache_mb: 0,
+                policy: crate::config::PolicyKind::RoundRobin,
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+                max_output_tokens: None,
+                sampling_overrides: Default::default(),
+                forward_input_ids: true,
+            },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
+            proxy: crate::config::ProxyConfig::default(),
+            active_load: crate::config::ActiveLoadConfig::default(),
+            admission: crate::config::AdmissionConfig::default(),
+            retry: crate::config::RetryConfig::default(),
+        }
+    }
+
+    /// `sgl_router_ingress_tokenize_errors_total` is the series that justifies
+    /// NOT rate-limiting the chat-encoder fallback log, so a client-shaped render
+    /// error must never drive it — the counter carries only `model_id`, with no
+    /// `reason`, so it cannot be subtracted after the fact.
+    ///
+    /// This is the guard for a regression that shipped once: making the K3
+    /// encoder refuse unknown roles turned every `{"role":"developer"}` request
+    /// into a counter increment, because the suppression predicate was gated on
+    /// dsv4's `ForwardParity` and K3 is `Conservative`, so it could never fire.
+    #[test]
+    fn k3_client_render_errors_are_kept_out_of_the_broken_offload_metric() {
+        let model = "moonshotai/Kimi-K3";
+        let reg = crate::tokenizer::TokenizerRegistry::load_from_config(&k3_cfg(model)).unwrap();
+        // The predicate keys on `has_chat_encoder` + the model id, not on which
+        // encoder variant is attached, so any attachment exercises it.
+        reg.attach_chat_encoder_for_test(model, crate::tokenizer::ChatEncoder::DeepSeekV4);
+
+        // Each of these is a `kimi_k3::RenderErr`, i.e. an input the reference
+        // encoder itself refuses, so the engine rejects the request identically.
+        for body in [
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "a"},
+                {"role": "developer", "content": "x"}]}),
+            serde_json::json!({"messages": [{"role": "narrator", "content": "x"}]}),
+            serde_json::json!({"messages": [{"content": "x"}]}),
+            serde_json::json!({"messages": "not a list"}),
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "q"}], "thinking_effort": "medium"}),
+        ] {
+            assert!(
+                render_rejects_request(&reg, model, Some(&body)),
+                "must be excused from the broken-offload metric: {body}"
+            );
+        }
+
+        // A request the encoder renders is NOT excused: a genuine offload failure
+        // on it still has to reach the counter.
+        let ok = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!render_rejects_request(&reg, model, Some(&ok)));
+
+        // And the K3 arm must not claim models that are not K3.
+        let other = "meta-llama/Llama-3";
+        let reg2 = crate::tokenizer::TokenizerRegistry::load_from_config(&k3_cfg(other)).unwrap();
+        reg2.attach_chat_encoder_for_test(other, crate::tokenizer::ChatEncoder::DeepSeekV4);
+        let refusable = serde_json::json!({"messages": [{"role": "narrator", "content": "x"}]});
+        assert!(!render_rejects_request(&reg2, other, Some(&refusable)));
+    }
 
     fn retry_cfg(max_target_itl_ms: Option<u64>, itl_rel_factor: f32) -> RetryConfig {
         RetryConfig {

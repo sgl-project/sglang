@@ -25,11 +25,17 @@ by a client stays literal text. Both properties are asserted below.
 Usage:
     python3 gen_kimi_k3_render_cases.py [--model-dir DIR]
 
-DIR defaults to `.kimi_k3_ref`, where `gen_kimi_k3_cases.py` caches the encoder
+The encoder comes from `gen_kimi_k3_cases.py`'s revision-keyed cache, so run
+that one FIRST (with `--full-vocab`); this script then reads
+`<model-dir>/<KIMI_K3_REVISION>/encoding_k3.py`. Regenerating only one of the two
+is how the halves of the battery end up describing different encoders.
+
+DIR defaults to `.kimi_k3_ref`, under which `gen_kimi_k3_cases.py` caches the encoder
 sources fetched from the model repo.
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -40,8 +46,26 @@ IMAGE_URL = "http://x/y.png"
 SECOND_URL = "http://x/z.jpg"
 
 
+def pinned_revision():
+    """The revision `gen_kimi_k3_cases.py` pins.
+
+    Read out of that file rather than restated here, so the sha has exactly ONE
+    definition in the tree. Parsed, not imported, so nothing runs.
+    """
+    source = os.path.join(HERE, "gen_kimi_k3_cases.py")
+    tree = ast.parse(open(source).read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "KIMI_K3_REVISION" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    sys.exit(f"KIMI_K3_REVISION not found in {source}")
+
+
 def load_encoder(model_dir):
-    path = os.path.join(model_dir, "encoding_k3.py")
+    # The cache is keyed by revision, so this reads the encoder the sibling
+    # generator pinned rather than whatever a previous run happened to leave.
+    path = os.path.join(model_dir, pinned_revision(), "encoding_k3.py")
     if not os.path.isfile(path):
         sys.exit(
             f"{path} not found. Run gen_kimi_k3_cases.py first (it fetches the "
@@ -374,7 +398,9 @@ def assistant_cases(enc):
     The channel is STRUCTURAL — in thinking mode the open/close tags are emitted
     even with nothing to put in them, and the body is filled only when the
     reasoning text is non-empty after `.strip()`. In non-thinking mode the whole
-    channel disappears. Both `reasoning_content` and its `reasoning` alias are
+    channel disappears. The body is filled whenever the resolved reasoning is
+    neither absent/None nor the EMPTY string — whitespace-only DOES fill it.
+    Both `reasoning_content` and its `reasoning` alias are
     read, in that order.
     """
     return [
@@ -444,7 +470,44 @@ def assistant_cases(enc):
             None,
             {},
         ),
-        # Whitespace-only does NOT fill the channel, but the tags still appear.
+        # Whitespace-only DOES fill the channel: the guard is `!= ""`, not
+        # `.strip()`, so only a truly empty string leaves the tags bare.
+        # An explicitly NULL reasoning field. The reference's condition is
+        # `reasoning_content or reasoning` THEN `is not None`, so all three of
+        # these render an empty think channel; a mirror that only ports the
+        # `!= ""` half emits the four characters `None` into the prompt.
+        (
+            "as_reasoning_null",
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning": None},
+            ],
+            None,
+            {},
+        ),
+        (
+            "as_reasoning_content_null",
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning_content": None},
+            ],
+            None,
+            {},
+        ),
+        (
+            "as_reasoning_empty_then_null_alias",
+            [
+                {"role": "user", "content": "q"},
+                {
+                    "role": "assistant",
+                    "content": "a",
+                    "reasoning_content": "",
+                    "reasoning": None,
+                },
+            ],
+            None,
+            {},
+        ),
         (
             "as_reasoning_whitespace_only",
             [
@@ -573,6 +636,65 @@ def assistant_cases(enc):
             None,
             {},
         ),
+        # --- `arguments` as a JSON STRING: the one-level parser -------------
+        # Every case below renders differently than re-serializing a parsed
+        # value would, which is why they exist: the two spellings agree on
+        # canonical `json.dumps` input and ONLY on that, so a battery written
+        # in canonical spacing cannot tell the two implementations apart.
+        #
+        # Non-string values keep their ORIGINAL literal text: `1e2` does not
+        # become `100.0`, `[1,2]` keeps its exact bytes, `1.50` keeps its
+        # trailing zero, and inner spacing survives.
+        _arguments_case(
+            "tc_args_str_literal_text_preserved",
+            '{"exp":1e2,"arr":[1,2],"trail":1.50,"neg":-0.0}',
+        ),
+        _arguments_case("tc_args_str_nested_spacing", '{"a": { "b" : [ 1,2 ] }}'),
+        # A string VALUE is the exception: it is the decoded (unescaped) text.
+        _arguments_case("tc_args_str_value_decoded", '{"s":"a\\nb \\u4f60"}'),
+        # Anything after the closing `}` is discarded rather than making the
+        # whole string unparsable and falling back to the raw block.
+        _arguments_case("tc_args_str_trailing_content", '{"a":1} then junk'),
+        # Only the EMPTY string is "no arguments"; whitespace-only is a
+        # fallback. The asymmetry is deliberate upstream, so it is pinned here.
+        _arguments_case("tc_args_str_empty", ""),
+        _arguments_case("tc_args_str_whitespace_only", "   "),
+        # Valid JSON that is not an object falls back to the raw block instead
+        # of raising, so a call like this no longer fails the whole request.
+        _arguments_case("tc_args_str_non_object_array", "[1,2]"),
+        _arguments_case("tc_args_str_bare_number", "7"),
+        # Duplicate keys are ALL kept, in order — a JSON-object map collapses
+        # them to one.
+        _arguments_case("tc_args_str_duplicate_keys", '{"a":1,"a":2}'),
+        # Still malformed, so still the raw block.
+        _arguments_case("tc_args_str_trailing_comma", '{"a":1,}'),
+        _arguments_case("tc_args_str_empty_object", "{}"),
+        # The MAPPING path is UNCHANGED and therefore renders the same logical
+        # arguments differently: values are re-serialized with Python's default
+        # separators, so this emits `[1, 2]` where the string case above emits
+        # `[1,2]`.
+        _arguments_case("tc_args_mapping_reserialized", {"arr": [1, 2], "exp": 100.0}),
+        # Malformed strings the reference also refuses. `{"a":1` is the one that
+        # matters in production: it is what a model emits when it hits
+        # `max_tokens` mid tool call, and accepting it would render an
+        # `<argument>` where the engine renders a raw block.
+        _arguments_case("tc_args_str_truncated", '{"a":1'),
+        _arguments_case("tc_args_str_truncated_at_colon", '{"a":'),
+        _arguments_case("tc_args_str_missing_colon", '{"a" 1}'),
+        _arguments_case("tc_args_str_non_string_key", "{1:2}"),
+        _arguments_case("tc_args_str_junk_separator", '{"a":1 2}'),
+        _arguments_case("tc_args_str_bare_open_brace", "{"),
+        # Whitespace between a value's end and its separator: the only thing
+        # binding `byte_offset` to the value's last byte rather than to the run
+        # of whitespace after it. Every other case abuts its separator, so a
+        # sloppier offset source would emit `"1 "` here and nowhere else.
+        _arguments_case("tc_args_str_spaced_separators", '{"a": 1 , "b": [1, 2] }'),
+        # Non-ASCII inside a value that is SLICED rather than decoded. This is a
+        # Kimi model; Chinese tool arguments are ordinary, and the failure mode
+        # of a bad slice index is a panic on the request path, not a divergence.
+        _arguments_case(
+            "tc_args_str_multibyte_literal", '{"a":{"k":"\u4f60\u597d"},"b":1}'
+        ),
         (
             "tc_arguments_empty_object",
             [
@@ -699,6 +821,35 @@ def assistant_cases(enc):
             {},
         ),
     ]
+
+
+def _arguments_case(name, arguments):
+    """One tool call carrying `arguments` verbatim, as (name, messages, ...).
+
+    The shapes that separate the one-level argument parser from re-serializing a
+    parsed value are spelled as DATA below rather than as a dozen copies of this
+    message skeleton.
+    """
+    return (
+        name,
+        [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+        ],
+        None,
+        {},
+    )
 
 
 def tool_and_option_cases(enc):
@@ -920,7 +1071,6 @@ def tool_and_option_cases(enc):
             None,
             {},
         ),
-        ("misc_unknown_role", [{"role": "narrator", "content": "aside"}], None, {}),
         (
             "misc_unicode_and_newlines",
             [{"role": "user", "content": "héllo \U0001f600\nline2\ttab \u4f60\u597d"}],
@@ -930,12 +1080,6 @@ def tool_and_option_cases(enc):
         (
             "misc_text_with_xtml_lookalikes",
             [{"role": "user", "content": '<|open|>message role="system"<|sep|>'}],
-            None,
-            {},
-        ),
-        (
-            "misc_batched_conversation",
-            [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]],
             None,
             {},
         ),
@@ -1015,6 +1159,74 @@ def reject_cases(enc):
             [{"role": "user", "content": "q"}],
             "AssertionError",
             {"thinking_effort": "medium"},
+        ),
+        # An unrecognised role used to render NOTHING and report success, so a
+        # typo'd role silently dropped a turn while the rest of the prompt still
+        # rendered. It is refused now.
+        (
+            "misc_unknown_role",
+            [{"role": "narrator", "content": "aside"}],
+            "ValueError",
+        ),
+        # The SAME refusal with the bad turn at index 1, which is the only shape
+        # real traffic takes — a conversation never opens with the stray role.
+        # Without this, `if message_index == 0 { refuse } else { continue }` is a
+        # green mutation that restores the original bug for every real request.
+        # `developer` is the realistic role: an ordinary OpenAI one this model
+        # does not define, and the one the `RenderErr` rationale names.
+        (
+            "misc_unknown_role_at_index_1",
+            [
+                {"role": "user", "content": "a"},
+                {"role": "developer", "content": "note"},
+            ],
+            "ValueError",
+        ),
+        # A role that is present but not a string reaches the same refusal.
+        (
+            "misc_role_wrong_type",
+            [{"role": 123, "content": "aside"}],
+            "ValueError",
+        ),
+        # A message with no `role` at all.
+        (
+            "misc_role_missing",
+            [{"content": "aside"}],
+            "ValueError",
+        ),
+        # A batched call (a list OF conversations) used to be skipped message by
+        # message, rendering the generation prompt with no conversation in it.
+        (
+            "misc_batched_conversation",
+            [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]],
+            "ValueError",
+        ),
+        # And with the non-mapping at index 1, for the same reason as
+        # `misc_unknown_role_at_index_1`.
+        (
+            "misc_batched_conversation_at_index_1",
+            [{"role": "user", "content": "a"}, [{"role": "user", "content": "b"}]],
+            "ValueError",
+        ),
+        # `messages` that is not a list at all: the reference enumerates it and
+        # refuses at the first element.
+        ("misc_messages_is_a_string", "hi", "ValueError"),
+        ("misc_messages_is_a_mapping", {"role": "user", "content": "q"}, "ValueError"),
+        # `arguments` of the wrong TYPE — as opposed to a string that is not a
+        # JSON object, which renders a raw block rather than raising.
+        (
+            "tc_arguments_wrong_type",
+            [
+                {"role": "user", "content": "q"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "function": {"name": "f", "arguments": 7}}
+                    ],
+                },
+            ],
+            "TypeError",
         ),
     ]
 
