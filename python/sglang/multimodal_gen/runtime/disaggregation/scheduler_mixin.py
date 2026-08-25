@@ -24,6 +24,7 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -72,6 +73,36 @@ def _advertised_pool_work_endpoint(server_args) -> str:
     if host == "0.0.0.0":
         host = server_args.disagg_p2p_hostname or "127.0.0.1"
     return server_args.pool_work_endpoint.replace("0.0.0.0", host)
+
+
+def _expand_glm_distributed_outputs(req: Req) -> list[Req]:
+    """Split external-AR tokens into requests for sequential denoising."""
+    output_count = max(1, int(req.num_outputs_per_prompt or 1))
+    if output_count == 1:
+        return [req]
+
+    prior_token_ids = req.prior_token_id
+    if not isinstance(prior_token_ids, torch.Tensor) or (
+        prior_token_ids.shape[0] != output_count
+    ):
+        actual_count = (
+            prior_token_ids.shape[0]
+            if isinstance(prior_token_ids, torch.Tensor)
+            else type(prior_token_ids).__name__
+        )
+        raise RuntimeError(
+            "Cannot split GLM-Image AR output for distributed inference: "
+            f"expected {output_count} token rows, got {actual_count}."
+        )
+
+    usage_by_output = req.extra.get("usage_by_output")
+    output_reqs = expand_request_outputs(req)
+    for output_index, output_req in enumerate(output_reqs):
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
+    return output_reqs
 
 
 # ---------------------------------------------------------------------------
@@ -1526,7 +1557,11 @@ class SchedulerDisaggMixin:
                 self.server_args.pipeline_config.supports_sequential_multi_output_inference()
                 and max(1, int(req.num_outputs_per_prompt or 1)) > 1
             ):
-                output_batch = next(self.worker.execute_forward_sequentially([req]))
+                output_reqs = _expand_glm_distributed_outputs(req)
+                output_batches = list(
+                    self.worker.execute_forward_sequentially(output_reqs)
+                )
+                output_batch = self.worker._merge_expanded_output_batches(output_batches)
             else:
                 output_batch = self.worker.execute_forward([req])
 

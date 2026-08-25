@@ -180,7 +180,7 @@ class _GlmDistributedCluster:
                 "--disagg-role",
                 "server",
                 "--denoiser-urls",
-                f"tcp://0.0.0.0:{self.denoiser_port}",
+                f"tcp://{HOST}:{self.denoiser_port}",
                 "--srt-encoder-url",
                 f"http://{HOST}:{self.ar_port}",
                 "--batching-mode",
