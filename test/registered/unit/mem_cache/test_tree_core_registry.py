@@ -3,7 +3,7 @@
 import unittest
 from unittest import mock
 
-from _unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams

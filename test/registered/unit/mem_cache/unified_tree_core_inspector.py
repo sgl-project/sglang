@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from _unified_tree_core_inspection_interface import (
+from unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
 

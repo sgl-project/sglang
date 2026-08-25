@@ -13,8 +13,8 @@ from typing import Optional
 from unittest import mock
 
 import torch
-from _unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-from _unified_tree_core_inspector import UnifiedTreeCoreInspector
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
