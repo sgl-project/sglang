@@ -189,8 +189,8 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 21649.69, tpot_ms: 106.51, tokens_per_sec_per_gpu: 1129 },
     ],
-    accuracy: { gsm8k_pct: 100 },
-    notes: "gsm8k_pct from a deterministic 20-question window (full run pending); stop rate 100%.",
+    accuracy: { gsm8k_pct: 96.82 },
+    notes: "Full GSM8K stop rate 99.62%.",
   },
 
   // ====================================================================
