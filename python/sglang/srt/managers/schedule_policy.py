@@ -942,7 +942,7 @@ class PrefillAdder:
             reason=reason,
         )
 
-    def _get_dllm_remain_tokens(self) -> int:
+    def _get_dllm_remain_tokens(self, needs_fresh_kv: bool = True) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
             self.dllm_block_size,
@@ -953,9 +953,19 @@ class PrefillAdder:
             # so it goes negative long before the KV pool is full. Grant one
             # whole block or nothing: the denoise algorithms reshape with
             # view(B, block_size), which admits neither a larger nor a ragged row.
+            #
+            # But only override rem_total_tokens, not real pool exhaustion:
+            # a row that needs fresh KV must fit the full admission charge
+            # (`_update_prefill_budget` debits ceil_paged(extend) + one
+            # page_size of alloc_extend overhead) in cur_rem_tokens, or
+            # `alloc_for_extend` fails loudly downstream. Rows reusing
+            # retained FDFO KV (needs_fresh_kv=False) allocate zero fresh
+            # tokens, so gating them would strand their retained blocks.
+            block_charge = self.ceil_paged_tokens(self.dllm_block_size) + self.page_size
+            pool_fits = not needs_fresh_kv or int(self.cur_rem_tokens) >= block_charge
             _rem_tokens = (
                 self.dllm_block_size
-                if self.rem_dllm_tokens >= self.dllm_block_size
+                if pool_fits and self.rem_dllm_tokens >= self.dllm_block_size
                 else 0
             )
         else:
@@ -964,7 +974,11 @@ class PrefillAdder:
             # rem_total_tokens driven negative by the upfront max_new_tokens
             # charge, while a small positive budget is genuine and a full
             # block would overshoot it. The min above caps at block_size, so
-            # this yields exactly one block or nothing.
+            # this yields exactly one block or nothing. No cur_rem_tokens gate
+            # here: the memory_budget's total_offset accrues everything its
+            # current_offset does plus max_new_tokens and the running-batch
+            # reservation (both >= 0), so cur_rem_tokens >= rem_total_tokens > 0
+            # on this path.
             _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
         return _rem_tokens
@@ -998,7 +1012,11 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        # Retained incomplete-block rows take the reuse_kv path in
+        # alloc_for_extend and allocate no fresh tokens.
+        _rem_tokens = self._get_dllm_remain_tokens(
+            needs_fresh_kv=not bool(req.dllm_incomplete_ids)
+        )
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
