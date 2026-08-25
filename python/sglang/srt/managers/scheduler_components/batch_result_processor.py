@@ -332,7 +332,11 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    self._maybe_collect_customized_info(i, req, logits_output)
+                    if (
+                        logits_output is not None
+                        and logits_output.customized_info is not None
+                    ):
+                        self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -1165,7 +1169,10 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_completion_time()
 
-        self._maybe_collect_customized_info(i, req, logits_output)
+        # Gated at the call site: per-request call overhead alone is
+        # measurable at large batches.
+        if logits_output is not None and logits_output.customized_info is not None:
+            self._maybe_collect_customized_info(i, req, logits_output)
 
     def _maybe_update_reasoning_tokens(
         self,

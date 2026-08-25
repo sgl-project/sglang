@@ -3660,6 +3660,10 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # ScheduleBatch field names, resolved once: fields() reflection is on
+    # the per-pass critical path.
+    _schedule_batch_field_names: tuple[str, ...] | None = None
+
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
@@ -3667,9 +3671,11 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        names = Scheduler._schedule_batch_field_names
+        if names is None:
+            names = tuple(f.name for f in dataclasses.fields(batch))
+            Scheduler._schedule_batch_field_names = names
+        attr_snapshot = [getattr(batch, name, None) for name in names]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.

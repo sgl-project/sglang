@@ -144,18 +144,22 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
-        return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
-        )
-        return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
-        )
-        return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
-        )
-        return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
-        )
+        # One fused scan instead of four any() passes over the running batch.
+        return_hidden_states = False
+        return_routed_experts = False
+        return_indexer_topk = False
+        return_sampling_mask = False
+        for req in reqs:
+            if req is skip_req:
+                continue
+            if req.return_hidden_states:
+                return_hidden_states = True
+            if req.return_routed_experts:
+                return_routed_experts = True
+            if req.return_indexer_topk:
+                return_indexer_topk = True
+            if req.return_sampling_mask:
+                return_sampling_mask = True
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
