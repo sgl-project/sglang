@@ -51,8 +51,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
-
 def _kv_cache_to_bnsd(
     k_cache: torch.Tensor, v_cache: torch.Tensor, page_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
@@ -857,6 +855,78 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_scale=layer.idx_v_scale_float,
         )
 
+    def _forward_cuda_sparse_extend(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        layer,
+        disable_value: bool,
+        extend_seq_lens_cpu: Optional[list],
+    ):
+        if (
+            is_gfx95_supported()
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # gfx950 EAGLE verify: per-draft decode rows (not extend prefill).
+            return self._forward_gfx950_triton_verify(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                prefix_lens,
+                layer,
+                disable_value,
+            )
+
+        # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
+        from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+            minimax_sparse_prefill,
+        )
+
+        return minimax_sparse_prefill(
+            q,
+            k_cache,
+            v_cache,
+            None,
+            idx_q,
+            idx_k_cache,
+            idx_v_cache,
+            None,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            self._max_seqlen_q,
+            self._max_seqlen_k,
+            self.block_size_q,
+            self.block_size_k,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            use_msa=self.use_msa,
+            seqlens_cpu=extend_seq_lens_cpu,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
+        )
+
     def _forward_npu_triton_verify(
         self,
         q: torch.Tensor,
@@ -1523,60 +1593,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
-            if (
-                is_gfx95_supported()
-                and forward_batch.forward_mode.is_target_verify()
-            ):
-                # gfx950 EAGLE verify: per-draft decode rows (not extend prefill).
-                idx_o, o = self._forward_gfx950_triton_verify(
-                    q,
-                    k_cache,
-                    v_cache,
-                    idx_q,
-                    idx_k_cache,
-                    idx_v_cache,
-                    forward_batch,
-                    prefix_lens,
-                    layer,
-                    disable_value,
-                )
-            else:
-                from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
-                    minimax_sparse_prefill,
-                )
-
-                idx_o, o = minimax_sparse_prefill(
-                    q,
-                    k_cache,
-                    v_cache,
-                    None,
-                    idx_q,
-                    idx_k_cache,
-                    idx_v_cache,
-                    None,
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    cu_seqlens,
-                    seq_lens,
-                    prefix_lens,
-                    self._max_seqlen_q,
-                    self._max_seqlen_k,
-                    self.block_size_q,
-                    self.block_size_k,
-                    self.topk_blocks,
-                    self.init_blocks,
-                    self.local_blocks,
-                    score_type=self.score_type,
-                    disable_index_value=disable_value,
-                    use_msa=self.use_msa,
-                    seqlens_cpu=extend_seq_lens_cpu,
-                    q_scale=layer.q_scale_float,
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
-                    idx_q_scale=layer.idx_q_scale_float,
-                    idx_k_scale=layer.idx_k_scale_float,
-                    idx_v_scale=layer.idx_v_scale_float,
-                )
+            idx_o, o = self._forward_cuda_sparse_extend(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                layer,
+                disable_value,
+                extend_seq_lens_cpu,
+            )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
