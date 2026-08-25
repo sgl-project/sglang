@@ -36,6 +36,79 @@ cc_import(
     urls = ["https://files.pythonhosted.org/packages/36/99/2848df4e8ed5bf51df1d286d1718510584fa61e88adbc9c5b23d71b38f7c/apache_tvm_ffi-0.1.11-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"],
 )
 
+sgl_kernel_source = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive",
+)
+
+sgl_kernel_source_build_file = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+)
+"""
+
+# Keep these archives aligned with the fallback FetchContent pins in
+# python/sglang/kernels/aot/CMakeLists.txt and cmake/flashmla.cmake.
+sgl_kernel_source(
+    name = "sgl_kernel_cutlass",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "09237099a70f80bff1dc8bb80c843a674bb4fdcb46e43cc6993e711c5ca89bb5",
+    strip_prefix = "cutlass-57e3cfb47a2d9e0d46eb6335c3dc411498efa198",
+    urls = ["https://github.com/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_fmt",
+    build_file_content = sgl_kernel_source_build_file,
+    patch_cmds = ["rm -f support/bazel/BUILD.bazel"],
+    sha256 = "c314292789d28c3c3b420e75a7b2d1706f685f7fb63289128d46aeaea2c6be71",
+    strip_prefix = "fmt-553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28",
+    urls = ["https://github.com/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_triton",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491",
+    strip_prefix = "triton-3.7.1",
+    urls = ["https://github.com/triton-lang/triton/archive/v3.7.1.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_flashinfer",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d",
+    strip_prefix = "flashinfer-bc29697ba20b7e6bdb728ded98f04788e16ee021",
+    urls = ["https://github.com/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_sgl_attn",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c",
+    strip_prefix = "sgl-flash-attn-f89bc2306632d1ec5f97b014dded4254f5b4a907",
+    urls = ["https://github.com/sgl-project/sgl-attn/archive/f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_flashmla",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b",
+    strip_prefix = "FlashMLA-05e26647fe840b8baedae486c2d86d5ce4efeb7c",
+    urls = ["https://github.com/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz"],
+)
+
+sgl_kernel_source(
+    name = "sgl_kernel_flashmla_cutlass",
+    build_file_content = sgl_kernel_source_build_file,
+    sha256 = "9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6",
+    strip_prefix = "cutlass-147f5673d0c1c3dcf66f78d677fd647e4a020219",
+    urls = ["https://github.com/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz"],
+)
+
 rules_rust_pyo3_crates = use_extension(
     "@rules_rust_pyo3//private:internal_extensions.bzl",
     "rust_ext",
