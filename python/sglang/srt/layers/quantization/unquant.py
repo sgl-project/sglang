@@ -297,6 +297,60 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         return F.linear(x, layer.weight, bias)
 
+    def _can_apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> bool:
+        if (
+            torch.compiler.is_compiling()
+            or _use_aiter
+            or not x.is_cuda
+            or x.ndim != 2
+            or x.dtype != torch.bfloat16
+            or layer.weight.dtype != torch.bfloat16
+            or addend.dtype != torch.bfloat16
+            or not addend.is_contiguous()
+            or addend.shape != (x.shape[0], layer.weight.shape[0])
+            or bias is not None
+            or x.requires_grad
+            or addend.requires_grad
+            or layer.weight.requires_grad
+        ):
+            return False
+
+        backend = get_bf16_gemm_backend()
+        if backend in (Bf16GemmBackend.AUTO, Bf16GemmBackend.TORCH):
+            return True
+        return (
+            backend.is_cutedsl()
+            and _use_cutedsl_bf16_gemm is not None
+            and not _use_cutedsl_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        )
+
+    def apply_with_addend(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        addend: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return ``linear(x) + addend`` and reuse ``addend`` when supported.
+
+        The fast path overwrites ``addend``. Callers must treat it as consumed.
+        """
+        if self._can_apply_with_addend(layer, x, addend, bias):
+            # Reuse addend as beta input and output; cuBLAS rounds once after GEMM.
+            return torch.addmm(addend, x, layer.weight.t(), out=addend)
+
+        output = self.apply(layer, x, bias)
+        output.add_(addend)
+        return output
+
     def apply_into(
         self,
         layer: torch.nn.Module,

@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -331,6 +332,27 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        quant_method = self.fc2_latent_proj.quant_method
+        if shared_output is not None and isinstance(
+            quant_method, UnquantizedLinearMethod
+        ):
+            return quant_method.apply_with_addend(
+                self.fc2_latent_proj,
+                final_hidden_states,
+                shared_output,
+                self.fc2_latent_proj.bias,
+            )
+
+        final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,9 +363,10 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
-
-        if shared_output is not None:
+            final_hidden_states = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
+        elif shared_output is not None:
             final_hidden_states += shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
