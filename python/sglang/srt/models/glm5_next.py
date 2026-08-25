@@ -1355,12 +1355,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
 
         if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                f"{type(self).__name__}.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
