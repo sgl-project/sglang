@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from packaging import version
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
@@ -18,39 +17,17 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig as SRTBitsAndBytesConfig,
+)
+from sglang.srt.layers.quantization.bitsandbytes import (
+    calculate_quant_ratio,
+    is_layer_skipped_bnb,
+    require_bitsandbytes,
+)
 
 
-def _require_bitsandbytes() -> None:
-    try:
-        import bitsandbytes
-
-        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-            raise ImportError(
-                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
-            )
-    except ImportError as err:
-        raise ImportError(
-            "Please install bitsandbytes>=0.46.1 via "
-            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
-        ) from err
-
-
-def _calculate_quant_ratio(dtype: torch.dtype) -> int:
-    if dtype.is_floating_point:
-        return torch.finfo(dtype).bits // torch.iinfo(torch.uint8).bits
-    return torch.iinfo(dtype).bits // torch.iinfo(torch.uint8).bits
-
-
-def _is_layer_skipped(prefix: str, skipped_modules: list[str]) -> bool:
-    components = prefix.split(".")
-    if any(module_name in components for module_name in skipped_modules):
-        return True
-
-    prefixes = {".".join(components[: i + 1]) for i in range(len(components))}
-    return bool(set(skipped_modules) & prefixes)
-
-
-class BitsAndBytesConfig(QuantizationConfig):
+class BitsAndBytesConfig(SRTBitsAndBytesConfig, QuantizationConfig):
     """Config class for pre-quantized bitsandbytes 4-bit checkpoints."""
 
     def __init__(
@@ -66,79 +43,26 @@ class BitsAndBytesConfig(QuantizationConfig):
         llm_int8_skip_modules: list[str] | None = None,
         llm_int8_threshold: float = 6.0,
     ) -> None:
-        super().__init__()
-        self.load_in_8bit = load_in_8bit
-        self.load_in_4bit = load_in_4bit
-        self.bnb_4bit_compute_dtype = bnb_4bit_compute_dtype
-        self.bnb_4bit_quant_storage = bnb_4bit_quant_storage
-        self.bnb_4bit_quant_type = bnb_4bit_quant_type
-        self.bnb_4bit_use_double_quant = bnb_4bit_use_double_quant
-        self.llm_int8_enable_fp32_cpu_offload = llm_int8_enable_fp32_cpu_offload
-        self.llm_int8_has_fp16_weight = llm_int8_has_fp16_weight
-        self.llm_int8_skip_modules = llm_int8_skip_modules or []
-        self.llm_int8_threshold = llm_int8_threshold
-
+        super().__init__(
+            load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit,
+            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+            bnb_4bit_quant_storage=bnb_4bit_quant_storage,
+            bnb_4bit_quant_type=bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+            llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload,
+            llm_int8_has_fp16_weight=llm_int8_has_fp16_weight,
+            llm_int8_skip_modules=llm_int8_skip_modules,
+            llm_int8_threshold=llm_int8_threshold,
+        )
         if self.load_in_8bit or not self.load_in_4bit:
             raise ValueError("SGLang diffusion only supports bitsandbytes 4-bit.")
-        if self.bnb_4bit_quant_storage != "uint8":
-            raise ValueError(
-                f"Unsupported bnb_4bit_quant_storage: {self.bnb_4bit_quant_storage}"
-            )
-
-    @classmethod
-    def get_name(cls) -> str:
-        return "bitsandbytes"
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float32, torch.float16, torch.bfloat16]
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 70
-
-    @staticmethod
-    def get_config_filenames() -> list[str]:
-        return []
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
-        def get_safe_value(keys, default_value=None):
-            try:
-                value = QuantizationConfig.get_from_keys(config, keys)
-                return value if value is not None else default_value
-            except ValueError:
-                return default_value
-
-        return cls(
-            load_in_8bit=get_safe_value(["load_in_8bit"], False),
-            load_in_4bit=get_safe_value(["load_in_4bit"], True),
-            bnb_4bit_compute_dtype=get_safe_value(
-                ["bnb_4bit_compute_dtype"], "float32"
-            ),
-            bnb_4bit_quant_storage=get_safe_value(["bnb_4bit_quant_storage"], "uint8"),
-            bnb_4bit_quant_type=get_safe_value(["bnb_4bit_quant_type"], "fp4"),
-            bnb_4bit_use_double_quant=get_safe_value(
-                ["bnb_4bit_use_double_quant"], False
-            ),
-            llm_int8_enable_fp32_cpu_offload=get_safe_value(
-                ["llm_int8_enable_fp32_cpu_offload"], False
-            ),
-            llm_int8_has_fp16_weight=get_safe_value(
-                ["llm_int8_has_fp16_weight"], False
-            ),
-            llm_int8_skip_modules=get_safe_value(["llm_int8_skip_modules"], []),
-            llm_int8_threshold=get_safe_value(["llm_int8_threshold"], 6.0),
-        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
-            if _is_layer_skipped(prefix, self.llm_int8_skip_modules):
+            if is_layer_skipped_bnb(prefix, self.llm_int8_skip_modules):
                 return UnquantizedLinearMethod()
             return BitsAndBytesLinearMethod(self)
         return None
@@ -148,7 +72,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
     """Linear method for pre-quantized bitsandbytes 4-bit weights."""
 
     def __init__(self, quant_config: BitsAndBytesConfig):
-        _require_bitsandbytes()
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(
@@ -161,7 +85,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        quant_ratio = _calculate_quant_ratio(params_dtype)
+        quant_ratio = calculate_quant_ratio(params_dtype)
         output_size_per_partition = sum(output_partition_sizes)
         total_size = input_size_per_partition * output_size_per_partition
         if total_size % quant_ratio != 0:
@@ -255,11 +179,11 @@ class BitsAndBytes4BitLinear(nn.Module):
         compute_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        _require_bitsandbytes()
+        require_bitsandbytes()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
-        quant_ratio = _calculate_quant_ratio(compute_dtype or torch.get_default_dtype())
+        quant_ratio = calculate_quant_ratio(compute_dtype or torch.get_default_dtype())
         total_size = in_features * out_features
         if total_size % quant_ratio != 0:
             raise ValueError(

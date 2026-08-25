@@ -22,7 +22,13 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.runtime_context import get_context, get_observability, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_context,
+    get_disagg,
+    get_observability,
+    get_spec,
+)
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -621,9 +627,8 @@ class SchedulerMetricsReporter:
             msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
         ):
             msg += (
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
@@ -875,9 +880,8 @@ class SchedulerMetricsReporter:
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
-            self.scheduler.server_args.language_only
-            and self.scheduler.server_args.encoder_transfer_backend
-            == "zmq_to_scheduler"
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
         ):
             msg += (
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
@@ -1113,7 +1117,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if self.scheduler.server_args.pp_size > 1:
+            if configured_pp_size() > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

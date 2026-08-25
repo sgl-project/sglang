@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_model,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -31,6 +36,8 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
+    # Draft layers whose KV cache uses the target SWA pool capacity.
+    eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
@@ -73,13 +80,13 @@ def _resolve_eagle_aux_hidden_state(
     if (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
-        and server_args.speculative_draft_model_path
+        and get_spec().speculative_draft_model_path
     ):
         # Load draft config to get layer count for KV cache sizing
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=server_args.speculative_draft_model_path,
-            model_revision=server_args.speculative_draft_model_revision,
+            model_path=get_spec().speculative_draft_model_path,
+            model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
         num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
@@ -91,6 +98,14 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_hidden_layers,
                     draft_model_config.num_attention_layers,
                 )
+            )
+
+        if (
+            draft_model_config.is_hybrid_swa
+            and not draft_model_config.is_deepseek_v4_arch
+        ):
+            config.eagle_draft_swa_num_layers = len(
+                draft_model_config.swa_attention_layer_ids
             )
 
         if spec_algorithm.is_eagle3():
@@ -124,8 +139,8 @@ def _resolve_dflash_aux_hidden_state(
         # Select target layers to capture for building draft context features.
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=(server_args.speculative_draft_model_path),
-            model_revision=server_args.speculative_draft_model_revision,
+            model_path=(get_spec().speculative_draft_model_path),
+            model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
         dflash_draft_config = parse_dflash_draft_config(
@@ -211,23 +226,23 @@ def _resolve_dflash_draft_cell_size(
 
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
             speculative_draft_kv_cache_dtype=(
-                server_args.speculative_draft_kv_cache_dtype
+                get_spec().speculative_draft_kv_cache_dtype
             ),
             model=None,
             model_dtype=draft_model_config.dtype,
             is_draft_worker=True,
             is_dflash=True,
             speculative_draft_attention_backend=(
-                server_args.speculative_draft_attention_backend
+                get_spec().speculative_draft_attention_backend
             ),
         )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=server_args.tp_size,
+            tp_size=configured_tp_size(),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
