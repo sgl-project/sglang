@@ -261,7 +261,11 @@ class EICStorage(HiCacheStorage):
         self.memory_pool_host = memory_pool_host
         self.host_kvcache_layout = self.memory_pool_host.layout
         self.trans_type = eic.TransportType(eic_trans_type)
-        self.kv_cache_dtype = self.memory_pool_host.dtype
+        self.kv_cache_dtype = (
+            hicache_config.kv_cache_dtype
+            if hicache_config.kv_cache_dtype is not None
+            else str(self.memory_pool_host.dtype)
+        )
         self.is_mla_model = hicache_config.is_mla_model
         self.rank = hicache_config.tp_rank
         self.world_size = hicache_config.tp_size
@@ -313,12 +317,13 @@ class EICStorage(HiCacheStorage):
         self.connection.register_memory(vals, meminfo)
 
     def _init_eic_prefix(self):
+        dtype_suffix = f"_dtype_{self.kv_cache_dtype}" if self.kv_cache_dtype is not None else ""
         if self.is_mla_model:
             self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}@sglang"
+                f"{self.model_name}_mla_att_{self.host_kvcache_layout}{dtype_suffix}@sglang"
             )
         else:
-            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}{dtype_suffix}_@sglang"
 
     def _get_eic_key(self, keys: List[str]) -> str:
         return [f"{self.eic_prefix}_{key}" for key in keys]

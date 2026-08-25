@@ -111,6 +111,8 @@ class HiCacheNixl(HiCacheStorage):
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        if storage_config.kv_cache_dtype is not None:
+            self.config_suffix += f"_dtype_{storage_config.kv_cache_dtype}"
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT

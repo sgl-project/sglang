@@ -532,6 +532,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+                self.kv_cache_dtype = None
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -543,6 +544,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
+            self.kv_cache_dtype = storage_config.kv_cache_dtype
             self.split_factor = 0
             if self.should_split_heads:
                 self.split_factor = (
@@ -678,9 +680,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
-        if self.extra_backend_tag is None:
-            return keys
-        return [f"{self.extra_backend_tag}_{key}" for key in keys]
+        tagged = keys
+        if self.extra_backend_tag is not None:
+            tagged = [f"{self.extra_backend_tag}_{key}" for key in tagged]
+        if getattr(self, "kv_cache_dtype", None) is not None:
+            tagged = [f"dtype_{self.kv_cache_dtype}_{key}" for key in tagged]
+        return tagged
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
