@@ -59,6 +59,9 @@ jobs:
           bazel mod graph
           bazel query //...
 
+      - name: Build independent components
+        run: bazel build --config=cpu //:bazel_components
+
       - name: Run CPU foundation tests
         run: bazel test --config=cpu --config=ci //:bazel_smoke
 

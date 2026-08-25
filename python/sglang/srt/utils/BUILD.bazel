@@ -1,0 +1,24 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+package(default_visibility = ["//python/sglang:__subpackages__"])
+
+py_library(
+    name = "safe_pickle",
+    srcs = ["safe_pickle.py"],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+)
+
+py_library(
+    name = "hf_transformers_patches",
+    srcs = ["hf_transformers_patches.py"],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+    deps = ["//python/sglang/srt:environ"],
+)

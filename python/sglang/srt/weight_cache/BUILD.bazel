@@ -1,0 +1,20 @@
+load("@rules_python//python:defs.bzl", "py_library")
+load("@srt_empty_bootstrap//:requirements.bzl", "requirement")
+
+package(default_visibility = ["//python/sglang:__subpackages__"])
+
+# Socket framing, cache fingerprints, and quantization allowlisting are
+# intentionally separate from CUDA IPC transport and daemon lifecycle.
+py_library(
+    name = "protocol",
+    srcs = ["protocol.py"],
+    imports = ["python"],
+    visibility = [
+        "//bazel/python:__subpackages__",
+        "//python/sglang:__subpackages__",
+    ],
+    deps = [
+        "//python/sglang/srt/utils:safe_pickle",
+        requirement("msgspec"),
+    ],
+)

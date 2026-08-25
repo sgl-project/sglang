@@ -9,6 +9,20 @@ test_suite(
 )
 
 filegroup(
+    name = "bazel_components",
+    srcs = [
+        "//python/sglang/kernels:metadata",
+        "//python/sglang/kernels:ngram_corpus_core",
+        "//python/sglang/kernels/aot:cpu_sources",
+        "//python/sglang/srt:environ",
+        "//python/sglang/srt/utils:hf_transformers_patches",
+        "//python/sglang/srt/weight_cache:protocol",
+        "//rust/sglang-grpc:sglang_grpc_core",
+        "//rust/sglang-mm:sglang_mm_core",
+    ],
+)
+
+filegroup(
     name = "bazel_migration_docs",
     srcs = ["bazel/README.md"],
 )
