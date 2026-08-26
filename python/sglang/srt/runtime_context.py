@@ -79,6 +79,23 @@ def _dp():
     return dp_attention
 
 
+@functools.lru_cache(maxsize=1)
+def _parallel_config_leaves() -> frozenset:
+    """Names under the ``parallel`` namespace, for the unpublished error path.
+
+    Read from the field metadata rather than the bag, which is what does not
+    exist yet when this is needed.
+    """
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.server_args import ServerArgs
+
+    return frozenset(
+        field
+        for field, path in namespace_of(ServerArgs).items()
+        if path.split(".")[0] == "parallel"
+    )
+
+
 _PARALLEL_FIELDS = frozenset(
     {
         "world_size",
@@ -157,20 +174,19 @@ class ParallelContext:
         return config
 
     def __getattr__(self, name):
-        # Reached only for names that are neither a live @property nor a slot.
-        # Config leaves are read under ``config``, so naming one here is a
-        # call-site mistake and this only builds the error that says so.
+        # Reached only for names that are neither a live @property nor a slot:
+        # the config leaves that have no live counterpart. They read bare.
         if name.startswith("_"):
             # This also breaks the recursion when the ``_config`` slot itself is
             # still unset (pickle/copy protocols probe attributes before
             # __init__ runs).
             raise AttributeError(name)
         config = self._config
-        if config is not None and name in config._fields:
-            raise AttributeError(
-                f"{name!r} is a parallel config leaf, not live topology; read it "
-                f"as get_parallel().config.{name}"
-            )
+        if config is not None:
+            if name in config._fields:
+                return getattr(config, name)
+        elif name in _parallel_config_leaves():
+            raise ValueError("config namespace 'parallel' not published")
         raise AttributeError(f"ParallelContext has no {name!r}")
 
     def _v(self, name, getter):
