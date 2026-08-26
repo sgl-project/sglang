@@ -123,7 +123,12 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
             "weight",
             npu_format_online_weight(quantized_weight, self.spec),
         )
-        copy_or_rebind_param(layer, "weight_scale", weight_scale.flatten())
+        weight_scale = weight_scale.flatten()
+        copy_or_rebind_param(layer, "weight_scale", weight_scale)
+        if self.spec.mode == "w4a8_int8":
+            copy_or_rebind_param(
+                layer, "weight_offset", torch.zeros_like(weight_scale)
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer._npu_online_dense_loader.finish_post_load()
@@ -143,6 +148,7 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
             quantized_x,
             layer.weight,
             layer.weight_scale,
+            offset=getattr(layer, "weight_offset", None),
             pertoken_scale=dynamic_scale.flatten(),
             bias=bias,
             output_dtype=original_dtype,
@@ -172,10 +178,12 @@ def get_npu_online_linear_method() -> Optional[LinearMethodBase]:
     spec = get_npu_online_integer_quant_spec()
     if spec is None:
         return None
+    if spec.mode == "w4a4_int4":
+        # Naive dense A4W4 collapses model accuracy; retain MoE-only savings.
+        return None
     return {
         "w8a8_int8": NPUOnlineW8A8Int8LinearMethod,
         "w4a8_int8": NPUOnlineW4A8Int8LinearMethod,
-        "w4a4_int4": NPUOnlineW4A4Int4LinearMethod,
     }[spec.mode]()
 
 

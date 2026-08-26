@@ -125,6 +125,9 @@ def npu_format_online_moe_scale(
             f"{scale.dtype}."
         )
 
+    # DynamicQuant may retain the reduced K axis. GMM interprets a rank-3 scale
+    # as per-group, so normalize per-channel scales to [E, N] first.
+    scale = scale.squeeze(-1)
     # GMM consumes each FP32 scale bit pattern in the low half of an INT64 slot.
     return scale.contiguous().view(torch.int32).to(torch.int64)
 
