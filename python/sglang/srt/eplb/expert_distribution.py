@@ -45,7 +45,11 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_device as get_device_namespace
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_device, get_int_env_var
 
@@ -84,7 +88,7 @@ class ExpertDistributionRecorder(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
-        if server_args.expert_distribution_recorder_mode is not None:
+        if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert (
                 expert_location_metadata is not None
             ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
@@ -178,7 +182,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if server_args.should_report_expert_balancedness():
             logger.info(
                 "ExpertDistributionRecorder auto start record since "
-                f"expert_balancedness_report_mode={server_args.expert_balancedness_report_mode}"
+                f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
 
@@ -328,30 +332,30 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
-        if server_args.expert_distribution_recorder_mode == "per_token":
+        if get_exec().moe.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
 
-        if server_args.moe_a2a_backend == "mori":
+        if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
-        if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend != "none" and (
-                server_args.deepep_mode == "normal"
+        if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
+            if get_exec().moe.moe_a2a_backend != "none" and (
+                get_exec().moe.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend == "deepep":
-            if server_args.deepep_mode == "normal":
+        if get_exec().moe.moe_a2a_backend == "deepep":
+            if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
+            elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata,
                     rank,
-                    elastic_ep_enabled=server_args.elastic_ep_backend is not None,
+                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
                 )
             else:
                 raise NotImplementedError
@@ -412,11 +416,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
-            device=server_args.device,
+            device=get_device_namespace().device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
-            not server_args.enable_two_batch_overlap
+            not get_exec().overlap.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
@@ -678,7 +682,7 @@ class _Accumulator(ABC):
             "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
-        }[server_args.expert_distribution_recorder_mode]
+        }[get_exec().moe.expert_distribution_recorder_mode]
 
     def __init__(
         self,

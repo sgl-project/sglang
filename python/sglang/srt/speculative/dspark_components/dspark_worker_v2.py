@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_schedule,
@@ -106,7 +107,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
-        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
             not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
@@ -156,23 +157,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self.sample_from_anchor = bool(self.draft_model.sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
+                self.query_token_num,
+                self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -181,7 +186,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.query_token_num), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -348,12 +353,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                    initialize_dspark_sparse_attn_ops,
-                )
-
-                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config

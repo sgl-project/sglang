@@ -102,6 +102,12 @@ class BaseDiT(nn.Module, ABC):
         """Run model-specific post-load weight fixups after all parameters are materialized."""
         return None
 
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Apply model-specific LoRA transforms after names are normalized."""
+        return adapter
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

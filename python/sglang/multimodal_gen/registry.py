@@ -74,6 +74,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
@@ -150,6 +151,8 @@ from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageEditSamplingParams,
+    LongCatImageEditTurboSamplingParams,
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
@@ -271,11 +274,6 @@ def _discover_and_register_pipelines():
                         _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
                             cls.pipeline_config_cls,
                             cls.sampling_params_cls,
-                        )
-                        logger.debug(
-                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
-                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
-                            f"SamplingParams={cls.sampling_params_cls.__name__}"
                         )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
@@ -1329,6 +1327,34 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
+    register_configs(
+        sampling_param_cls=LongCatImageEditTurboSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower()
+            and "edit" in hf_id.lower()
+            and "turbo" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image-Edit
+    register_configs(
+        sampling_param_cls=LongCatImageEditSamplingParams,
+        pipeline_config_cls=LongCatImageEditPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image-Edit",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower()
+            and "edit" in hf_id.lower()
+            and "turbo" not in hf_id.lower(),
         ],
     )
 

@@ -87,10 +87,23 @@ def launch_server_process(
     server_args: ServerArgs, worker_port: int, dp_id: int
 ) -> mp.Process:
     """Launch a single server process with the given args and port."""
-    server_args = copy.deepcopy(server_args)
-    server_args.port = worker_port
-    server_args.base_gpu_id = dp_id * server_args.tp_size
-    server_args.dp_size = 1
+    # This binding is installed against a released sglang, so it cannot call
+    # into helpers newer than that wheel. Copy first, then write through the
+    # sanctioned channel if the record is resolved (a resolved record refuses
+    # plain assignment), else assign.
+    worker_args = copy.deepcopy(server_args)
+    changes = {
+        "port": worker_port,
+        "base_gpu_id": dp_id * server_args.tp_size,
+        "dp_size": 1,
+    }
+    late = getattr(worker_args, "_late_resolution", None)
+    if late is not None and getattr(worker_args, "_declarations_materialized", False):
+        late("sglang_router.launch_server_process", **changes)
+    else:
+        for field, value in changes.items():
+            setattr(worker_args, field, value)
+    server_args = worker_args
 
     proc = mp.Process(target=run_server, args=(server_args, dp_id))
     proc.start()
@@ -170,6 +183,9 @@ def main():
 
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
+    # Older released wheels resolve in the constructor and have no gate.
+    if hasattr(server_args, "resolve_once"):
+        server_args.resolve_once()
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 
     # Find available ports for workers

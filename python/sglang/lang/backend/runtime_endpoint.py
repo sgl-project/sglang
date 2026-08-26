@@ -393,6 +393,10 @@ class Runtime:
             if is_port_available(port):
                 break
         self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
+        # The spawned server gets a copy of this record, and this object keeps
+        # reading it afterwards -- `get_tokenizer` wants the downloaded GGUF
+        # file and the rewritten ModelScope path, not what the caller typed.
+        self.server_args.resolve_once()
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -455,7 +459,7 @@ class Runtime:
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(
-            self.server_args.tokenizer_path,
+            self.server_args.tokenizer_path or self.server_args.model_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
             revision=self.server_args.revision,
