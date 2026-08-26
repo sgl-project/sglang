@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import affected_tests
 
@@ -18,6 +20,19 @@ class FakeQuery:
             if predicate(expression):
                 return sorted(labels)
         raise AssertionError(f"Unexpected query: {expression}")
+
+
+class InvocationDirectoryTest(unittest.TestCase):
+    def test_prefers_bazel_workspace_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"BUILD_WORKSPACE_DIRECTORY": directory},
+            ):
+                self.assertEqual(
+                    affected_tests.invocation_directory(),
+                    Path(directory),
+                )
 
 
 class ParseNameStatusTest(unittest.TestCase):

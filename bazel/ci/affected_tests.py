@@ -450,10 +450,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def invocation_directory() -> Path:
+    workspace = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
+    return Path(workspace) if workspace else Path.cwd()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     repo = Path(
-        _run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd()).stdout.strip()
+        _run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=invocation_directory(),
+        ).stdout.strip()
     )
     base, head = resolve_range(repo, args.base, args.head)
     changes = git_changes(repo, base, head)
