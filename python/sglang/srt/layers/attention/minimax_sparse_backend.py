@@ -1420,6 +1420,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.local_blocks,
                 score_type=self.score_type,
                 disable_index_value=disable_value,
+                page_size=self.page_size,
                 use_msa=self.use_msa,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
                 q_scale=layer.q_scale_float,

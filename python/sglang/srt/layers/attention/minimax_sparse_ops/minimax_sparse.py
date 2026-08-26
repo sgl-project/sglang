@@ -62,6 +62,7 @@ def minimax_sparse_prefill(
     idx_sm_scale: Optional[float] = None,
     score_type: str = "max",
     disable_index_value: bool = False,
+    page_size: int = 1,
     use_msa: bool = False,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
@@ -81,6 +82,12 @@ def minimax_sparse_prefill(
     kernels. Supplying them avoids recomputing the same block layout twice.
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
+
+    ``page_size`` is the KV pool's allocation granularity; the step-3 kernel uses
+    it to resolve a selected block with one ``req_to_token`` lookup per
+    page-aligned run instead of a per-token gather. It falls back to the gather
+    for page sizes that do not divide (or are not divided by) ``block_size_k``,
+    so it is always safe to pass.
     """
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
@@ -169,6 +176,7 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -191,6 +199,7 @@ def minimax_sparse_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            page_size=page_size,
         )
     return idx_o, o
 
@@ -309,6 +318,7 @@ def minimax_sparse_decode(
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    page_size=page_size,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -325,5 +335,6 @@ def minimax_sparse_decode(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     return idx_o, o

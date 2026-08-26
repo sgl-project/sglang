@@ -14,6 +14,10 @@ from ..common.utils import (
     unit_scale,
 )
 
+# Shortest per-page run worth taking the paged slot resolution for. Below this
+# the [PAGE_RUNS, PAGE_SPAN] reshape costs more than the gather it replaces.
+MIN_PAGE_SPAN = 16
+
 
 @triton.heuristics(
     {
@@ -106,6 +110,9 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGED_KV: tl.constexpr,
+    PAGE_SPAN: tl.constexpr,  # consecutive slots per run
+    PAGE_RUNS: tl.constexpr,  # runs per block (PAGE_SPAN * PAGE_RUNS == BLOCK_SIZE_K)
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -194,12 +201,48 @@ def _gqa_share_sparse_fwd_kernel(
             # paged load K via req_to_token: pos -> slot -> k_cache
             pos = c + off_n
             pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
+            if PAGED_KV:
+                # A block starts at a multiple of block_size, so whenever page and
+                # block sizes divide one another the block covers PAGE_RUNS whole,
+                # page-aligned runs of PAGE_SPAN consecutive slots. One lookup per
+                # run then replaces the BLOCK_SIZE_K-entry index gather.
+                if PAGE_RUNS == 1:
+                    # page_size >= block size: the whole block is one page.
+                    base_slot = tl.load(
+                        req_to_token_ptr + sid * stride_r2t_b + c,
+                        mask=c < seq_len,
+                        other=0,
+                    ).to(tl.int64)
+                    base_slot = tl.where(
+                        base_slot < 0, base_slot + max_slots, base_slot
+                    )
+                    slots = base_slot + off_n.to(tl.int64)
+                else:
+                    # page_size < block size: one lookup per page.
+                    off_p = tl.arange(0, PAGE_RUNS)
+                    run_pos = c + off_p * PAGE_SPAN
+                    bases = tl.load(
+                        req_to_token_ptr + sid * stride_r2t_b + run_pos,
+                        mask=run_pos < seq_len,
+                        other=0,
+                    ).to(tl.int64)
+                    bases = tl.where(bases < 0, bases + max_slots, bases)
+                    slots = tl.reshape(
+                        bases[:, None] + tl.arange(0, PAGE_SPAN).to(tl.int64)[None, :],
+                        BLOCK_SIZE_K,
+                    )
+            else:
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                # Same wrap as `(slots + max_slots) % max_slots` over
+                # [-max_slots, 2 * max_slots), without a runtime integer modulo:
+                # GPUs have no integer div/mod, so the modulo expands into a
+                # reciprocal sequence on every lane of this vector.
+                slots = tl.where(slots < 0, slots + max_slots, slots)
+                slots = tl.where(slots >= max_slots, slots - max_slots, slots)
             # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
             k = tl.load(
                 k_cache_ptr
@@ -289,7 +332,19 @@ def flash_prefill_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
+    """Sparse GQA attention over the selected blocks of the paged main KV cache.
+
+    ``page_size`` is the KV pool's allocation granularity -- the pool hands out
+    ``page_size`` *contiguous* slots per page, which is what makes this work
+    (the MSA path relies on the same contract). When it and
+    ``block_size_k`` divide one another a selected block covers whole,
+    page-aligned runs of consecutive slots, so the inner loop resolves it with
+    one ``req_to_token`` lookup per run instead of a ``block_size_k``-entry
+    gather. Any other page size (and the default 1) keeps the gather, so the
+    argument is always safe to pass; the two paths are bit-identical.
+    """
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     k_scale = unit_scale(k_scale)
@@ -302,6 +357,18 @@ def flash_prefill_with_gqa_share_sparse(
     _, num_v_heads, v_head_dim = v_cache.shape
     batch_size = cu_seqlens.shape[0] - 1
     topk = topk_idx.shape[-1]
+    # A block starts at a multiple of block_size_k, so its slots are consecutive
+    # within page-aligned runs exactly when page and block sizes divide one
+    # another -- either direction:
+    #     page >= block  ->  1 run of block_size_k    (one scalar lookup)
+    #     page <  block  ->  block/page runs of page  (one lookup per page)
+    page_span = min(page_size, block_size_k)
+    paged_kv = (
+        (page_size % block_size_k == 0 or block_size_k % page_size == 0)
+        and max_slots % page_size == 0
+        and page_span >= MIN_PAGE_SPAN
+    )
+    page_runs = block_size_k // page_span if paged_kv else 1
     assert topk_idx.shape[0] == num_k_heads
     # gqa
     assert num_k_heads == num_v_heads
@@ -377,5 +444,8 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        PAGED_KV=paged_kv,
+        PAGE_SPAN=page_span,
+        PAGE_RUNS=page_runs,
     )
     return o
