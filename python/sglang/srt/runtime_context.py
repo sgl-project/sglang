@@ -1059,35 +1059,38 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            apply_fields,
             declare_late_resolution,
+            resolution_result,
         )
 
-        server_args = ServerArgs(model_path="dummy")
-        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__dataclass_fields__
+            ServerArgs.__dataclass_fields__
         )
         if unknown:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
-        # Declared so the projection sees it; late, because the record is
-        # resolved already and not yet published.
-        # Underscore names are not fields at all (they seed private property
-        # caches), so they stay a direct write.
-        declared = {
-            name: value for name, value in self._fields.items() if name[0] != "_"
+        # The caller is the operator here, so their values are the record's raw
+        # input and resolution runs over them, exactly as a launch would.
+        asked = {name: value for name, value in self._fields.items() if name[0] != "_"}
+        server_args = ServerArgs(model_path="dummy", **asked)
+        server_args.resolve_once()
+        # Where resolution decided otherwise, the caller still wins -- through
+        # the channel production late resolution uses, not by writing the field.
+        divergent = {
+            name: value
+            for name, value in asked.items()
+            if resolution_result(server_args, name) != value
         }
-        if declared:
-            declare_late_resolution(server_args, "override_server_args", **declared)
-        # This hook stands in for a launch: the caller's values are both what
-        # the operator passed and what resolution decided, so they go on the
-        # record as well as into the stash. Production late resolution declares
-        # only -- there the record stays the operator's input.
-        apply_fields(server_args, self._fields)
+        if divergent:
+            declare_late_resolution(server_args, "override_server_args", **divergent)
+        # Underscore names are not fields at all, so the record still holds only
+        # what the caller passed.
+        for name, value in self._fields.items():
+            if name[0] == "_":
+                object.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
