@@ -1,8 +1,8 @@
 """Pure-ASGI middleware that decompresses compressed request bodies.
 
-Gated on `SGLANG_ENABLE_REQUEST_DECOMPRESSION` and request header
-`x-body-compressed`, whose value names the method. For example, a caller that
-compressed the body with zstd sets the `x-body-compressed: zstd` header.
+Gated on `SGLANG_ENABLE_REQUEST_DECOMPRESSION` and a request compression
+header. Both the legacy `x-body-compressed` header and the standard
+`Content-Encoding` header are accepted; their value names the method.
 """
 
 import asyncio
@@ -28,14 +28,18 @@ def _rewrite_headers(headers, new_len):
     out = [
         (k, v)
         for (k, v) in headers
-        if k not in (b"content-length", b"x-body-compressed")
+        if k not in (
+            b"content-length",
+            b"x-body-compressed",
+            b"content-encoding",
+        )
     ]
     out.append((b"content-length", str(new_len).encode()))
     return out
 
 
 class RequestDecompressionMiddleware:
-    """Decompress request body per request header `x-body-compressed`."""
+    """Decompress request bodies tagged with a supported compression header."""
 
     def __init__(self, app):
         self.app = app
@@ -44,15 +48,21 @@ class RequestDecompressionMiddleware:
         # No-op passthrough for any request without the compression header.
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        method = Headers(scope=scope).get("x-body-compressed")
+        headers = Headers(scope=scope)
+        method = headers.get("x-body-compressed")
+        if method is None:
+            method = headers.get("content-encoding")
         if method is None:
             return await self.app(scope, receive, send)
+        # Content-Encoding may contain a comma-separated chain. SGLang currently
+        # supports one request-body codec, so use the first value and normalize it.
+        method = method.split(",", 1)[0].strip().lower()
 
         # Fail loud on an unsupported compression method.
         decompress = _DECOMPRESSORS.get(method)
         if decompress is None:
             return await Response(
-                f"unsupported x-body-compressed {method!r}; "
+                f"unsupported request compression {method!r}; "
                 f"supported: {sorted(_DECOMPRESSORS)}",
                 status_code=400,
             )(scope, receive, send)

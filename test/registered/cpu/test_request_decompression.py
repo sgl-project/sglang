@@ -67,6 +67,37 @@ class TestRequestDecompressionMiddleware(unittest.TestCase):
         self.assertEqual(seen["body"], PAYLOAD)
         self.assertEqual(sent, [])
 
+    def test_decompresses_standard_content_encoding_header(self):
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"content-encoding", b"zstd"),
+                (b"content-length", str(len(COMPRESSED)).encode()),
+            ],
+        }
+        seen, sent = _drive(scope, [(COMPRESSED, False)])
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(sent, [])
+
+    def test_normalizes_content_encoding_and_strips_header(self):
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"content-encoding", b" ZSTD, identity "),
+                (b"content-length", str(len(COMPRESSED)).encode()),
+                (b"content-type", b"application/json"),
+            ],
+        }
+        seen, _ = _drive(scope, [(COMPRESSED, False)])
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(
+            seen["scope"]["headers"],
+            [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(PAYLOAD)).encode()),
+            ],
+        )
+
     def test_strips_header_and_fixes_content_length(self):
         scope = {
             "type": "http",
