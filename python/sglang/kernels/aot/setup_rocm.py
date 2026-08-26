@@ -104,6 +104,9 @@ hipcc_flags = [
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
 
+# Extra device flags, so a kernel A/B can be built from an unmodified tree.
+hipcc_flags += os.environ.get("SGL_KERNEL_EXTRA_HIPCC_FLAGS", "").split()
+
 ext_modules = [
     CUDAExtension(
         name="sgl_kernel.common_ops",
