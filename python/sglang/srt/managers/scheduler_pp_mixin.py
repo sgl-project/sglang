@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -37,6 +38,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.sampling.sampling_observer_pp import (
+    add_auxiliary_output_to_pp_tensors,
+    pop_auxiliary_output_from_pp_tensors,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -123,7 +128,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if get_parallel().pp_async_batch_depth > 0:
+                if get_parallel().config.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -139,7 +144,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().pp_async_batch_depth == 0:
+                if get_parallel().config.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -269,7 +274,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                if get_parallel().pp_async_batch_depth > 0:
+                if get_parallel().config.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -287,7 +292,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().pp_async_batch_depth == 0:
+                if get_parallel().config.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -430,7 +435,7 @@ class SchedulerPPMixin:
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
-                if get_parallel().pp_async_batch_depth > 0:
+                if get_parallel().config.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -448,7 +453,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if get_parallel().pp_async_batch_depth == 0:
+                if get_parallel().config.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -559,10 +564,12 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self.pp_loop_size: int = (
+            self.ps.pp_size + get_parallel().config.pp_async_batch_depth
+        )
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
-            not get_parallel().enable_dsa_prefill_context_parallel
+            not get_parallel().config.enable_dsa_prefill_context_parallel
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
@@ -1026,6 +1033,12 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        auxiliary_output = (
+            result.logits_output.auxiliary_device_output
+            if result.logits_output is not None
+            else None
+        )
+        add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1150,6 +1163,16 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        if self.pp_group.is_first_rank:
+            observer = self.tp_worker.model_runner.sampling_observer
+            auxiliary_output = pop_auxiliary_output_from_pp_tensors(
+                pp_outputs.tensors,
+                observer,
+            )
+            if auxiliary_output is not None:
+                if logits_output is None:
+                    logits_output = LogitsProcessorOutput(next_token_logits=None)
+                logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
@@ -1166,6 +1189,7 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
     def _pp_process_batch_result(
@@ -1468,6 +1492,9 @@ class SchedulerPPMixin:
     def process_decode_transfer_queue(
         self: Scheduler, release_rids: Optional[List[str]]
     ):
+        # Resolve held deferred releases every call, independent of release_rids,
+        # so ack/timeout-driven releases still fire when no rids are being polled.
+        self.disagg_decode_transfer_queue.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids

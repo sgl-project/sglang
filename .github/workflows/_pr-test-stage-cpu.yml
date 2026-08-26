@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       check_changes:
-        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / continue_on_error / partition_model_sha.'
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / rust_workspace / continue_on_error / partition_model_sha.'
         type: string
         required: true
       caller_inputs:
@@ -153,6 +153,9 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
+          # Normalized to a literal true/false: EnvBool rejects an empty string,
+          # which is what a missing check-changes output would expand to.
+          SGLANG_SKIP_RUST_TESTS: ${{ fromJson(inputs.check_changes).rust_workspace == 'true' && 'false' || 'true' }}
         run: |
           cd test/
           python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG

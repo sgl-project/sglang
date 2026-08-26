@@ -1,5 +1,6 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import input_to_float8
@@ -13,7 +14,7 @@ from sglang.test.cpu_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
 qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope

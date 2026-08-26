@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
@@ -113,7 +112,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
     def process_prebuilt(
         self: ScheduleBatch,
-        server_args: ServerArgs,
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
@@ -146,7 +144,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
-            server_args,
             last_tokens_tensor,
             future_map,
         )

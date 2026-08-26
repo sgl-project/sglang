@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,17 +26,20 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
     def test_valid_config_accepted(self):
         args = self._validate_config({"image": {"max_pixels": 5000000}})
-        self.assertEqual(args.mm_process_config, {"image": {"max_pixels": 5000000}})
+        self.assertEqual(
+            resolution_result(args, "mm_process_config"),
+            {"image": {"max_pixels": 5000000}},
+        )
 
     def test_empty_config_accepted(self):
         args = self._validate_config({})
-        self.assertEqual(args.mm_process_config, {})
+        self.assertEqual(resolution_result(args, "mm_process_config"), {})
 
     def test_none_config_defaults_to_empty_dict(self):
         args = self._validate_config(None)
         # None is kept as-is for dummy models (default happens after early return)
         # but for real models it would be set to {}
-        self.assertIsNone(args.mm_process_config)
+        self.assertIsNone(resolution_result(args, "mm_process_config"))
 
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
@@ -63,7 +68,7 @@ class TestMmProcessConfigValidation(CustomTestCase):
             "audio": {"sample_rate": 16000},
         }
         args = self._validate_config(config)
-        self.assertEqual(args.mm_process_config, config)
+        self.assertEqual(resolution_result(args, "mm_process_config"), config)
 
 
 class TestBaseProcessorConfigExtraction(CustomTestCase):
@@ -80,15 +85,20 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
+        override = get_context().override_server_args(
+            mm_process_config=mm_process_config,
+            allowed_media_domains=[],
+            mm_processor_worker_num=mm_processor_worker_num,
+            mm_io_worker_num=mm_io_worker_num,
+            mm_preprocess_cache_size_mb=None,
+            tokenizer_worker_num=1,
+            trust_mm_content_hashes=False,
+            media_url_max_file_size_mb=64,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         server_args = MagicMock()
-        server_args.mm_process_config = mm_process_config
-        server_args.mm_processor_worker_num = mm_processor_worker_num
-        server_args.mm_io_worker_num = mm_io_worker_num
-        server_args.mm_preprocess_cache_size_mb = None
-        server_args.tokenizer_worker_num = 1
-        server_args.trust_mm_content_hashes = False
-        server_args.allowed_media_domains = []
-        server_args.media_url_max_file_size_mb = 64
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -170,8 +180,14 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
 
 class TestMultimodalFeatureTransportRuntime(CustomTestCase):
-    @staticmethod
-    def _server_args(mm_feature_transport):
+    def _server_args(self, mm_feature_transport):
+        override = get_context().override_server_args(
+            mm_feature_transport=mm_feature_transport,
+            mm_process_config={},
+            allowed_media_domains=[],
+        )
+        override.install()
+        self.addCleanup(override.restore)
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
             image_processor_backend="auto",
@@ -197,8 +213,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         return processor
 
     def test_cuda_ipc_pool_uses_resolved_server_arg(self):
-        # The processor module can be imported before this instance is built;
-        # transport policy must still resolve from the instance's ServerArgs.
+        # Transport policy resolves from the mm bag, so the test publishes it.
         from sglang.srt.multimodal.processors import base_processor
 
         with (
@@ -792,16 +807,21 @@ class TestDoubleBosGuard(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
+        override = get_context().override_server_args(
+            mm_process_config={},
+            mm_feature_transport="cpu",
+            allowed_media_domains=[],
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         server_args = MagicMock()
-        server_args.mm_process_config = {}
         server_args.mm_processor_worker_num = 0
         server_args.mm_io_worker_num = 0
-        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
-        server_args.allowed_media_domains = []
         server_args.media_url_max_file_size_mb = 64
 
         mock_hf_processor = MagicMock()

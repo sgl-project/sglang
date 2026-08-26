@@ -1226,6 +1226,7 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.3-Flash",
                       "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
@@ -1242,6 +1243,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
                       "cookbook/autoregressive/Qwen/Qwen3.8",
                       "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -1303,6 +1305,12 @@
                     ]
                   },
                   {
+                    "group": "IBM",
+                    "pages": [
+                      "cookbook/autoregressive/IBM/Granite-4.2"
+                    ]
+                  },
+                  {
                     "group": "LiquidAI",
                     "pages": [
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
@@ -1336,6 +1344,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
@@ -1607,6 +1616,7 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",
