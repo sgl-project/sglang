@@ -1326,23 +1326,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
     ) -> None:
         if self.uniform_fp8:
-            # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
-            # Triton kernel (in-place on kv; safe -- kv is not read again),
-            # then a plain e4m3 cast + scatter in the pool setter (per-tensor
-            # scale 1.0). Fusing the store is deferred to the perf phase.
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
-                fused_norm_rope_inplace_triton,
-            )
-
-            fused_norm_rope_inplace_triton(
-                kv,
-                kv_weight,
-                eps,
-                freqs_cis,
+            # Uniform-FP8 (trtllm-gen) layout: one fused CUDA launch does
+            # norm + RoPE + bf16-roundtrip + plain e4m3 cast (per-tensor
+            # scale 1.0) + scatter into the 512-byte-per-token pool rows.
+            # Replaces the Triton norm+rope followed by the pool setter's
+            # cast (vectorized_elementwise) + index_put (index_elementwise),
+            # the dominant "Attn Prep" cost in the kernel-level profile.
+            # Negative swa_loc entries (out-of-window / padded rows) are
+            # skipped in-kernel.
+            pool = self.swa_kv_pool
+            fused_k_norm_rope_flashmla(
+                kv=kv,
+                kv_weight=kv_weight,
+                eps=eps,
+                freqs_cis=freqs_cis,
                 positions=positions,
-            )
-            self.swa_kv_pool.set_key_buffer_fused(
-                self._swa_local_layer_id(layer_id), swa_loc, kv
+                out_loc=swa_loc,
+                kvcache=pool.kv_buffer[self._swa_local_layer_id(layer_id)].view(
+                    torch.uint8
+                ),
+                page_size=pool.page_size,
+                uniform_fp8_store=True,
             )
             return
         fused_k_norm_rope_flashmla(
