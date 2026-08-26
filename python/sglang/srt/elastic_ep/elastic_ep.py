@@ -10,11 +10,11 @@ import torch
 from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
-from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
