@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
@@ -642,6 +643,24 @@ class BaseMultimodalProcessor(ABC):
             return "npu"
         return None
 
+    @contextmanager
+    def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
+        """Release fast-processor CUDA temporaries after CPU feature transport."""
+        can_release = (
+            device is not None
+            and torch.device(device).type == "cuda"
+            and not self.keep_mm_features_on_device
+            and not self.precompute_hash_before_cpu_transfer
+        )
+        if not can_release:
+            yield
+            return
+
+        with torch.cuda.device(device):
+            pool = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool, device=device):
+            yield
+
     def process_mm_data(
         self,
         input_text,
@@ -690,14 +709,15 @@ class BaseMultimodalProcessor(ABC):
             if self.audio_config:
                 kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
+        processor_device = None
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            device = self._fast_image_processor_device(processor)
-            if device is not None:
-                kwargs["device"] = device
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                kwargs["device"] = processor_device
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
@@ -705,24 +725,25 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
-        # Deferred: the hash is computed on the GPU tensor first, and
-        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if (
-            not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        ):
-            # move feature tensors to cpu
-            for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
+        with self._temporary_fast_processor_cuda_pool(processor_device):
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+            # Deferred: the hash is computed on the GPU tensor first, and
+            # _precompute_hashes_before_cpu_transfer moves it down afterwards.
+            if (
+                not self.keep_mm_features_on_device
+                and not self.precompute_hash_before_cpu_transfer
+            ):
+                # move feature tensors to cpu
+                for feature_name in self.FEATURE_NAMES:
+                    if feature_name in result and isinstance(
+                        result[feature_name], torch.Tensor
+                    ):
+                        result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
