@@ -8,6 +8,7 @@ from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
     NPUOnlineDenseWeightLoader,
     get_npu_online_integer_quant_spec,
     npu_dynamic_quantize_weight,
+    npu_format_online_dense_scale,
     npu_format_online_weight,
 )
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
@@ -123,12 +124,15 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
             "weight",
             npu_format_online_weight(quantized_weight, self.spec),
         )
-        weight_scale = weight_scale.flatten()
-        copy_or_rebind_param(layer, "weight_scale", weight_scale)
         if self.spec.mode == "w4a8_int8":
             copy_or_rebind_param(
-                layer, "weight_offset", torch.zeros_like(weight_scale)
+                layer, "weight_offset", torch.zeros_like(weight_scale.flatten())
             )
+        copy_or_rebind_param(
+            layer,
+            "weight_scale",
+            npu_format_online_dense_scale(weight_scale, self.spec),
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer._npu_online_dense_loader.finish_post_load()
