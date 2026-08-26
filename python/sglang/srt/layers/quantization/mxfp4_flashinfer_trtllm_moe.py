@@ -375,8 +375,12 @@ def maybe_fuse_routed_scale_and_shared_add(
     shared: torch.Tensor | None,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
-    # Routed scaling must be applied exactly once. When TopK already folded it
-    # into topk_weights, this helper adds shared only and must not rescale.
+    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
+    # the scaling is folded into the shared-add via `shared.add_(routed,
+    # alpha=scale)`. With no shared output, the missing scale is applied
+    # in-place. Otherwise `routed` is already scale-final and we just add
+    # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -390,6 +394,7 @@ def maybe_fuse_routed_scale_and_shared_add(
             Mxfp4FlashinferTrtllmMoEMethod,
             Mxfp4FlashinferCutlassMoEMethod,
             Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
         ),
     )
     if fused:
