@@ -40,7 +40,7 @@ export const config = {
             "--dsa-prefill-backend trtllm",
             "--dsa-decode-backend trtllm",
           ],
-          hints: ["Reduces KV-cache memory. Validate accuracy and memory headroom for your workload."],
+          hints: ["Measured on GB300: faster than BF16 + TileLang with about 1.8x the KV token capacity."],
         },
         {
           id: "bf16-tilelang",

@@ -86,7 +86,7 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 97.50 },
     notes:
-      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) at the rc2 cut (f13cb6f6a7), speculative decoding off, after two discarded warmups per row: 1,128.32 / 2,418.65 / 3,884.95 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens; the high-concurrency rows with --max-running-requests 256 and decode graph batch 256). Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is the full GSM8K gate on the same server: 97.50% with a 100% stop rate over all 1,319 problems.",
+      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) at the rc2 cut (f13cb6f6a7), speculative decoding off, after two discarded warmups per row: 1,128.32 / 2,418.65 / 3,884.95 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens). The measured server added --max-running-requests 256, --cuda-graph-backend-decode full, --cuda-graph-max-bs-decode 256, --chunked-prefill-size 8192, --max-prefill-tokens 8192, and --disable-shared-experts-fusion to the cell command — the concurrency 64/256 rows are not reproducible at the cell's automatic sizing. Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is the full GSM8K gate on the same server: 97.50% with a 100% stop rate over all 1,319 problems.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", kvDsaPair: "fp8-trtllm" },
@@ -130,8 +130,9 @@ export const benchmarks = [
         tokens_per_sec_per_gpu: 4965.65,
       },
     ],
+    accuracy: { gsm8k_pct: 97.35 },
     notes:
-      "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) at rc2 (f13cb6f6a7), same protocol as the BF16 rows: 1,189.96 / 2,476.87 / 3,972.52 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.3–5.5% above BF16 + TileLang across the curve, and the FP8 pool holds 13.5M tokens per rank vs 7.5M at BF16 (1.8x capacity at identical pool bytes). Sanity requests answered correctly and stopped cleanly; accuracy was not re-run for this variant (the 97.50% GSM8K gate used BF16 KV).",
+      "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) at rc2 (f13cb6f6a7), same protocol as the BF16 rows: 1,189.96 / 2,476.87 / 3,972.52 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.3–5.5% above BF16 + TileLang across the curve, and the FP8 pool holds 13.5M tokens per rank vs 7.5M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 99.92% stop rate (one truncated run of 1,319).",
   },
   { match: { hw: "h100", strategy: "low-latency" } },
   { match: { hw: "h100", strategy: "high-throughput" } },
