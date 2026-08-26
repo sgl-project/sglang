@@ -6,8 +6,8 @@ not an FP4 KV cache; the KV / compressed-C4 cache is FP8 (DSA).
 Same unified_kv + HiSparse path as the base test, but with TP=8 + DP=8
 data-parallel attention (``--dp 8 --enable-dp-attention``). Runs the same two
 checks as the non-DP test under DP attention:
-- ``test_a_gsm8k`` — accuracy/sparse-selection guard; must align with the dense
-  baseline. ~1k-token prompts stay device-resident, so no swap.
+- ``test_a_gsm8k`` — accuracy/sparse-selection guard; must align with the
+  HiSparse-off baseline. ~1k-token prompts stay device-resident, so no swap.
 - ``test_b_long_context_swap`` — swap-path guard: a ~19k-token request whose
   compressed C4 footprint overflows device_buffer_size, forcing host->device
   swap; a buried passcode must be retrieved end-to-end.
@@ -45,26 +45,15 @@ DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 5400
 
-# DeepSeek-V4 ROCm env with the unified_kv attention backend.
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_USE_ROCM700A": "1",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
+    # pinned rather than read from the env like the other dsv4 tests: the
+    # unified_kv layout is what this test covers.
     "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
-    "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
-    "SGLANG_OPT_USE_AITER_INDEXER": "true",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
-    "SGLANG_ROCM_USE_MULTI_STREAM": "false",
     "AITER_BF16_FP8_MOE_BOUND": "0",
-    "SGLANG_EAGER_INPUT_NO_COPY": "true",
 }
 
 # HiSparse config: top_k aligned to the model's index_topk (1024). The swap
