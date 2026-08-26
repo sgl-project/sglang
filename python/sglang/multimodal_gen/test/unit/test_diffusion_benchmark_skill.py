@@ -271,6 +271,14 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 bcg_cmd[bucket_index + 1 : bucket_index + 3], ["256", "512"]
             )
 
+            sana_video_bcg_cmd = module.build_sglang_cmd(
+                "sana-video", breakable_cuda_graph=True
+            )
+            self.assertEqual(
+                sana_video_bcg_cmd[sana_video_bcg_cmd.index("--warmup-num-frames") + 1],
+                "17",
+            )
+
             for _, quality, breakable_cuda_graph in module.QUALITY_BCG_ABBA_MATRIX:
                 module.build_sglang_cmd(
                     "longcat-image",
