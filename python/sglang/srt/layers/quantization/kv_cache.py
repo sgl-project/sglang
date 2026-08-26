@@ -83,3 +83,13 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+class DynamicKVCacheMethod(BaseKVCacheMethod):
+    def __init__(self, kv_cache_dtype,quant_config: QuantizationConfig):
+        self.kv_cache_dtype = kv_cache_dtype
+        super.__init__(quant_config)
+
+    def apply(self, layer: torch.nn.Module) -> torch.Tensor:
+    raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
+
+    def process_weights_after_loading(self, layer) -> None:
