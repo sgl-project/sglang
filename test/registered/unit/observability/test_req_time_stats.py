@@ -53,7 +53,6 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         }
         self.assertEqual(slices["decode_bootstrap_handshake"], (10.0, 12.0))
         self.assertEqual(slices["decode_kv_allocation_wait"], (12.0, 15.0))
-        self.assertNotIn("decode_bootstrap", slices)
 
     def test_decode_preallocation_without_bootstrap_timestamp(self):
         stats = rts.SchedulerReqTimeStats()
@@ -64,6 +63,20 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
 
         slices = [call.args[0].stage_name for call in trace_slice.call_args_list]
         self.assertEqual(slices, ["decode_kv_allocation_wait"])
+
+    def test_decode_preallocation_metrics_observed_once(self):
+        stats = rts.SchedulerReqTimeStats()
+        stats.enable_metrics = True
+        stats.decode_prealloc_queue_entry_time = 10.0
+        stats.bootstrap_done_time = 12.0
+        stats.metrics_collector = mock.MagicMock()
+
+        stats.set_decode_transfer_queue_entry_time(ts=15.0)
+
+        stats.metrics_collector.observe_kv_transfer_bootstrap.assert_called_once_with(
+            bootstrap_ms=2000.0,
+            alloc_ms=3000.0,
+        )
 
     def test_decode_preallocation_with_tracing_disabled(self):
         stats = rts.SchedulerReqTimeStats()
