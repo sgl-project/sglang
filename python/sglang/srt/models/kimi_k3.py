@@ -140,6 +140,7 @@ _is_npu = is_npu()
 # ===== K3-DBG toggles (hard-coded; flip True/False as needed) =====
 K3_DBG_ENABLED = True   # master switch for all K3-DBG prints in this file
 K3_DBG_LAYER2  = True   # binary-search 4 control points (A/B/C/D) on layer 2
+K3_DBG_PREFILL_ONLY = True  # per-layer [KIMI-K3-DBG] prints: PREFILL only (skip DECODE)
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
@@ -2744,7 +2745,7 @@ class KimiK3LinearModel(nn.Module):
                 except Exception:
                     _fm = "?"
                 _is_prefill = "DECODE" not in _fm
-                if not (_DBG_PREFILL_ONLY and not _is_prefill):
+                if not (K3_DBG_PREFILL_ONLY and not _is_prefill):
                     try:
                         _pp_rank = get_pp_group().rank_in_group
                     except Exception:
