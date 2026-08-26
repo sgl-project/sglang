@@ -15,8 +15,9 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
+    const pairing = ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
     return (
-      s.kvDsaPair === "bf16-tilelang" &&
+      s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
       s.hicache === "off"
     );
@@ -26,18 +27,8 @@ export const config = {
     {
       id: "kvDsaPair",
       title: "KV Cache + DSA Backend",
-      default: "bf16-tilelang",
+      default: "fp8-trtllm",
       options: [
-        {
-          id: "bf16-tilelang",
-          label: "BF16 + TileLang",
-          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
-          flags: [
-            "--kv-cache-dtype bfloat16",
-            "--dsa-prefill-backend tilelang",
-            "--dsa-decode-backend tilelang",
-          ],
-        },
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
@@ -49,7 +40,17 @@ export const config = {
             "--dsa-prefill-backend trtllm",
             "--dsa-decode-backend trtllm",
           ],
-          hints: ["Reduces KV-cache memory. Validate accuracy and memory headroom for your workload."],
+          hints: ["Measured on GB300: faster than BF16 + TileLang with about 1.8x the KV token capacity."],
+        },
+        {
+          id: "bf16-tilelang",
+          label: "BF16 + TileLang",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype bfloat16",
+            "--dsa-prefill-backend tilelang",
+            "--dsa-decode-backend tilelang",
+          ],
         },
       ],
     },
@@ -78,6 +79,8 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
+          disabled: (s) => s.strategy === "low-latency",
+          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -86,6 +89,8 @@ export const config = {
           subtitle: "Mooncake",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
+          disabled: (s) => s.strategy === "low-latency",
+          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["Start Mooncake and place the configuration file on every serving node."],
         },
       ],
@@ -240,8 +245,9 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        config.isRecommendedSelection(s) ||
-        (s.kvDsaPair === "fp8-trtllm" && s.mmTransport === "auto" && s.hicache === "off")
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
           ? "verified"
           : "unverified",
       env: [],
@@ -249,10 +255,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
         "--ep-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -269,8 +276,9 @@ sgl-eval run gsm8k \\
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
-        config.isRecommendedSelection(s) ||
-        (s.kvDsaPair === "fp8-trtllm" && s.mmTransport === "auto" && s.hicache === "off")
+        ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off"
           ? "verified"
           : "unverified",
       env: [],
@@ -278,10 +286,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
         "--ep-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -303,6 +312,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -328,6 +338,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -347,6 +358,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -371,6 +383,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -386,10 +399,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -410,10 +424,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -429,10 +444,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -453,10 +469,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -472,10 +489,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
         "--ep-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -496,10 +514,11 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
         "--ep-size 4",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
+        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",

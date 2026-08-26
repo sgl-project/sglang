@@ -25,7 +25,7 @@ Choose your hardware, then choose the operating point that matches your workload
 - **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
@@ -65,7 +65,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>FP8 weights with BF16 KV cache by default</td>
+      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100 and H200</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -102,7 +102,7 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-The default recipe pairs a BF16 KV cache with TileLang DSA. On Blackwell GPUs, the deployment panel also offers FP8 KV with TRT-LLM DSA as a memory-saving option. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination. FP8 KV with TRT-LLM DSA is disabled on H100 and H200.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.3–5.5% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
 ### Extend the cache hierarchy
 
