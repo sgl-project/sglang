@@ -36,6 +36,7 @@ from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
     MultimodalInputs,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.transport import (
@@ -1411,6 +1412,7 @@ def has_shm_features(recv_reqs):
         elif (
             isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
             and req.mm_inputs
+            and isinstance(req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput))
         ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
@@ -1448,6 +1450,7 @@ def unwrap_shm_features(obj):
     if (
         isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
         and obj.mm_inputs
+        and isinstance(obj.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput))
     ):
         for item in obj.mm_inputs.mm_items:
             if item.feature is not None:

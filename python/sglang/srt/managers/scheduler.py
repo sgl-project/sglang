@@ -149,6 +149,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MMInputsProcessError,
+    MMInputsProcessMode,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -2269,80 +2271,17 @@ class Scheduler(
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
-    def _process_and_broadcast_mm_inputs(
-        self,
-        raw_mm_inputs,
-    ):
-        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
-
-        Entry rank:
-        - constructs MultimodalInputs.from_processor_output() once
-        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
-
-        Non-entry ranks:
-        - receive the object via broadcast (if world_size > 1)
-        - otherwise (single-rank / no group) fall back to local from_processor_output
-
-        Returns:
-            MultimodalInputs | None
-        """
-        if raw_mm_inputs is None:
+    def _get_multimodal_inputs(self, mm_inputs, mode: MMInputsProcessMode):
+        if mode is MMInputsProcessMode.NONE:
             return None
-
-        group_world_size = 1
-        try:
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                and self.dp_tp_cpu_group is not None
-            ):
-                group_world_size = torch.distributed.get_world_size(
-                    group=self.dp_tp_cpu_group
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
-            )
-
-        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
-        # process in CPU which occupies the main thread CPU cycle. This computing logic
-        # merely needs to be run on TP0 and be broadcast to other TP ranks.
-        # Since the Scheduler is single-threaded, any large CPU cost will impact
-        # handling of other messages. For example, CPU hits 99.9% can significantly
-        # increase the CUDA kernel launch time.
-        if self.dp_tp_group.rank_in_group == 0:
-            # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
-            # Broadcast to other TP ranks (use src=0 within the group).
-            if group_world_size > 1:
-                obj_list = [image_inputs]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                image_inputs = obj_list[0]
-        else:
-            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
-            if group_world_size > 1:
-                obj_list = [None]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                image_inputs = obj_list[0]
-            else:
-                image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
-
-        return image_inputs
-
-    def _get_multimodal_inputs(self, mm_inputs):
+        if isinstance(mm_inputs, MMInputsProcessError):
+            return mm_inputs
         if isinstance(mm_inputs, MultimodalInputs):
             return mm_inputs
-
-        if get_mm().enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs)
+        if mode is MMInputsProcessMode.BROADCAST:
+            return MMInputsProcessError(
+                "Multimodal broadcast protocol completed without a result"
+            )
         return MultimodalInputs.from_processor_output(mm_inputs)
 
     @staticmethod
@@ -2623,8 +2562,15 @@ class Scheduler(
             return
 
         # Handle multimodal inputs
-        if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+        mm_mode = recv_req.mm_inputs_process_mode
+        if mm_mode is not MMInputsProcessMode.NONE:
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs, mm_mode)
+
+            if isinstance(image_inputs, MMInputsProcessError):
+                req.set_finish_with_abort(image_inputs.message)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
@@ -2942,8 +2888,13 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         # Handle multimodal inputs
-        if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+        mm_mode = recv_req.mm_inputs_process_mode
+        if mm_mode is not MMInputsProcessMode.NONE:
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs, mm_mode)
+            if isinstance(image_inputs, MMInputsProcessError):
+                req.set_finish_with_abort(image_inputs.message)
+                self._add_request_to_queue(req)
+                return
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.

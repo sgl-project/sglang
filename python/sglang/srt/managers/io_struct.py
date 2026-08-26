@@ -90,6 +90,20 @@ class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
+class MMInputsProcessMode(Enum):
+    """Scheduler MM processing protocol selected before TP request broadcast."""
+
+    NONE = 0
+    LOCAL = 1
+    BROADCAST = 2
+
+
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Internal post-fanout sentinel for a root MM processing failure."""
+
+    message: str
+
+
 class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for batched IPC payloads."""
 
@@ -1041,6 +1055,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
+    # Must remain the final field: these request DTOs use array-like msgpack
+    # encoding, so appending preserves the wire indices of existing fields.
+    mm_inputs_process_mode: MMInputsProcessMode = MMInputsProcessMode.NONE
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -1326,6 +1344,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Must remain the final field; see TokenizedGenerateReqInput above.
+    mm_inputs_process_mode: MMInputsProcessMode = MMInputsProcessMode.NONE
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
