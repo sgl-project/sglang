@@ -38,6 +38,7 @@ def _kernel_and_inputs():
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}
     kernel._cake_gdn_logged_routes = set()
     kernel._cake_gdn_prefill_checkpoints = {}
+    kernel._prefill_needs_fp32_state = False
     kernel._flashinfer_gdn_should_use_cp_host = MagicMock(return_value=False)
     kernel._flashinfer_gdn_num_sms = 148
     kernel._flashinfer_gdn_device_name = "NVIDIA B200"
