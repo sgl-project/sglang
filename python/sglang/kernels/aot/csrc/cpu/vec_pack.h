@@ -34,7 +34,7 @@ inline void mm512_load_vec(
     int64_t index,
     int n,
     __m512i& dst) {
-  const __m512 s = _mm512_set1_ps(scale[index]);
+  const __m512 s = _mm512_set1_ps(scale[0]);
   const auto* p = src + index * ld;
   __m256i s8 =
       n >= 32 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)) : _mm256_maskz_loadu_epi8(elem_mask(n), p);
@@ -43,17 +43,6 @@ inline void mm512_load_vec(
   __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
   __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
   dst = (__m512i)_mm512_cvtne2ps_pbh(_mm512_mul_ps(f_hi, s), _mm512_mul_ps(f_lo, s));
-}
-
-inline void mm512_load_vec(
-    const at::Float8_e5m2* __restrict__ src, const float* /*scale*/, int64_t ld, int64_t index, int n, __m512i& dst) {
-  const auto* p = src + index * ld;
-  __m256i s8 =
-      n >= 32 ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)) : _mm256_maskz_loadu_epi8(elem_mask(n), p);
-  __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-  __m512 f_lo = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(a, 0));
-  __m512 f_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(a, 1));
-  dst = (__m512i)_mm512_cvtne2ps_pbh(f_hi, f_lo);
 }
 
 // key: from [N, 32] to [32/2, N, 2]
@@ -232,7 +221,7 @@ void pack_vnni(
 #else
   for (int n = 0; n < N; ++n) {
     index_t index = get_index(ind, n);
-    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
+    float scale = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
         dst[k * ld_dst * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d] * scale;
@@ -320,8 +309,8 @@ void pack_vnni2(
   for (; k < (K >> 1) * 2; k += 2) {
     index_t index0 = get_index(ind, k + 0);
     index_t index1 = get_index(ind, k + 1);
-    float scale0 = src_scale != nullptr ? src_scale[index0] : 1.0f;
-    float scale1 = src_scale != nullptr ? src_scale[index1] : 1.0f;
+    float scale0 = src_scale != nullptr ? src_scale[0] : 1.0f;
+    float scale1 = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int n = 0; n < N; ++n) {
       dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[index0 * ld_src + n] * scale0;
       dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[index1 * ld_src + n] * scale1;
@@ -329,7 +318,7 @@ void pack_vnni2(
   }
   if (K % 2 != 0) {
     index_t index = get_index(ind, K - 1);
-    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
+    float scale = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int n = 0; n < N; ++n) {
       dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[index * ld_src + n] * scale;
       dst[(K >> 1) * ld_dst * 2 + n * 2 + 1] = 0;

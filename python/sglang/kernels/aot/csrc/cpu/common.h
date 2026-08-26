@@ -53,7 +53,7 @@ namespace {
 #define AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, __VA_ARGS__))
 
-// dispatch: bfloat16, float16, int8_t, fp8_e4m3, fp8_e5m2, uint8_t(mxfp4/int4)
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
     switch (TYPE) {                                              \
@@ -71,10 +71,6 @@ namespace {
       }                                                          \
       case at::ScalarType::Float8_e4m3fn: {                      \
         using packed_t = at::Float8_e4m3fn;                      \
-        return __VA_ARGS__();                                    \
-      }                                                          \
-      case at::ScalarType::Float8_e5m2: {                        \
-        using packed_t = at::Float8_e5m2;                        \
         return __VA_ARGS__();                                    \
       }                                                          \
       case at::ScalarType::Byte: {                               \

@@ -53,7 +53,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.kv_cache_quant_method import (
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1748,11 +1748,6 @@ class KVCache(abc.ABC):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
-    def get_kv_scale_buffer(
-        self, layer_id: int
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return None, None
-
     @abc.abstractmethod
     def set_kv_buffer(
         self,
@@ -2286,16 +2281,7 @@ class MHATokenToKVPool(KVCache):
                 v_cpu = self.v_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
-                if self.k_scale_buffer is not None and self.v_scale_buffer is not None:
-                    k_scale_cpu = self.k_scale_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                    v_scale_cpu = self.v_scale_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                    kv_cache_cpu[-1].append([k_cpu, v_cpu, k_scale_cpu, v_scale_cpu])
-                else:
-                    kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                kv_cache_cpu[-1].append([k_cpu, v_cpu])
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -2318,19 +2304,6 @@ class MHATokenToKVPool(KVCache):
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
-                if len(kv_cache_cpu[layer_id][i // chunk_size]) == 4:
-                    k_scale_cpu, v_scale_cpu = (
-                        kv_cache_cpu[layer_id][i // chunk_size][2],
-                        kv_cache_cpu[layer_id][i // chunk_size][3],
-                    )
-                    k_scale_chunk = k_scale_cpu.to(
-                        self.k_scale_buffer[0].device, non_blocking=True
-                    )
-                    v_scale_chunk = v_scale_cpu.to(
-                        self.v_scale_buffer[0].device, non_blocking=True
-                    )
-                    self.k_scale_buffer[layer_id][chunk_indices] = k_scale_chunk
-                    self.v_scale_buffer[layer_id][chunk_indices] = v_scale_chunk
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
@@ -2387,14 +2360,6 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
-
-    def get_kv_scale_buffer(
-        self, layer_id: int
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.k_scale_buffer is None or self.v_scale_buffer is None:
-            return None, None
-        local_layer_id = layer_id - self.start_layer
-        return self.k_scale_buffer[local_layer_id], self.v_scale_buffer[local_layer_id]
 
     def set_kv_buffer(
         self,
@@ -4148,33 +4113,15 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
-                if (
-                    _is_cpu
-                    and _cpu_has_amx_support
-                    and self.dtype == torch.float8_e4m3fn
-                ):
-                    self.kv_scale_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, 1, 1),
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
 
     def _clear_buffers(self):
         del self.kv_buffer
-        if hasattr(self, "kv_scale_buffer"):
-            del self.kv_scale_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
-        if hasattr(self, "kv_scale_buffer"):
-            for kv_scale in self.kv_scale_buffer:
-                kv_size_bytes += get_tensor_size_bytes(kv_scale)
         return kv_size_bytes
 
     # for disagg
@@ -4209,15 +4156,6 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    def get_kv_scale_buffer(
-        self, layer_id: int
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if not hasattr(self, "kv_scale_buffer"):
-            return None, None
-        local_layer_id = layer_id - self.start_layer
-        scale = self.kv_scale_buffer[local_layer_id]
-        return scale, scale
-
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4241,7 +4179,7 @@ class MLATokenToKVPool(KVCache):
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
-            if hasattr(self, "kv_scale_buffer"):
+            if _is_cpu and _cpu_has_amx_support and self.dtype == torch.float8_e4m3fn:
                 if k_scale is None:
                     raise ValueError("CPU FP8 KV cache requires a static K scale.")
                 cache_k = (cache_k / k_scale).to(self.dtype)
@@ -4252,8 +4190,6 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 self.store_dtype
             )
-            if hasattr(self, "kv_scale_buffer"):
-                self.kv_scale_buffer[layer_id - self.start_layer][loc] = k_scale
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
@@ -4367,9 +4303,6 @@ class MLATokenToKVPool(KVCache):
         src_loc_flat = src_loc.view(-1).long()
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
-        if hasattr(self, "kv_scale_buffer"):
-            for kv_scale in self.kv_scale_buffer:
-                kv_scale[tgt_loc_flat] = kv_scale[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
@@ -4382,13 +4315,7 @@ class MLATokenToKVPool(KVCache):
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
-                if hasattr(self, "kv_scale_buffer"):
-                    scale_cpu = self.kv_scale_buffer[layer_id][chunk_indices].to(
-                        "cpu", non_blocking=True
-                    )
-                    kv_cache_cpu[-1].append([kv_cpu, scale_cpu])
-                else:
-                    kv_cache_cpu[-1].append(kv_cpu)
+                kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -4399,17 +4326,9 @@ class MLATokenToKVPool(KVCache):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
-                scale_cpu = None
-                if isinstance(kv_cpu, list):
-                    kv_cpu, scale_cpu = kv_cpu
                 assert kv_cpu.shape[0] == len(chunk_indices)
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-                if scale_cpu is not None:
-                    scale_chunk = scale_cpu.to(
-                        self.kv_scale_buffer[0].device, non_blocking=True
-                    )
-                    self.kv_scale_buffer[layer_id][chunk_indices] = scale_chunk
         current_platform.synchronize()
 
 

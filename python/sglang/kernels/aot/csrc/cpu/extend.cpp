@@ -392,8 +392,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         v_extend.data_ptr<scalar_t>(),                                                     \
         k_buffer.data_ptr<packed_t>(),                                                     \
         v_buffer.data_ptr<packed_t>(),                                                     \
-        conditional_data_ptr<float>(k_buf_scale),                                          \
-        conditional_data_ptr<float>(v_buf_scale),                                          \
+        k_buf_scale_ptr,                                                                   \
+        v_buf_scale_ptr,                                                                   \
         req_to_token.data_ptr<index_t>(),                                                  \
         req_pool_indices.data_ptr<int64_t>(),                                              \
         seq_lens.data_ptr<int64_t>(),                                                      \
@@ -457,8 +457,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
-    std::optional<at::Tensor> k_buf_scale,
-    std::optional<at::Tensor> v_buf_scale,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -544,15 +544,13 @@ void extend_attention_cpu(
   auto kv_dtype = k_buffer.scalar_type();
   if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
     TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
-    TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "float8 scale tensors are required");
-    at::Tensor k_buf_scale_tensor = k_buf_scale.value();
-    at::Tensor v_buf_scale_tensor = v_buf_scale.value();
-    TORCH_CHECK(k_buf_scale_tensor.scalar_type() == at::kFloat, "k_buf_scale should be float32");
-    TORCH_CHECK(v_buf_scale_tensor.scalar_type() == at::kFloat, "v_buf_scale should be float32");
-  } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
-    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+    TORCH_CHECK(k_buf_scale > 0.0 && v_buf_scale > 0.0, "float8 static scales must be positive");
   }
   int num_threads = at::get_num_threads();
+  float k_buf_scale_float = static_cast<float>(k_buf_scale);
+  float v_buf_scale_float = static_cast<float>(v_buf_scale);
+  const float* k_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &k_buf_scale_float : nullptr;
+  const float* v_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &v_buf_scale_float : nullptr;
   auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
 
   bool has_encoder_lens = encoder_lens.has_value();

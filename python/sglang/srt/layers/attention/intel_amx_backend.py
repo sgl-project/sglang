@@ -225,9 +225,8 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        key_scale, value_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-            layer.layer_id
-        )
+        key_scale = layer.k_scale_float or 1.0
+        value_scale = layer.v_scale_float or 1.0
 
         # Gemma4's KV-shared layers pass k=v=None - the layer they share with
         # already wrote their extend K/V to the cache
@@ -293,9 +292,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
         key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        key_scale, value_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-            layer.layer_id
-        )
+        key_scale = layer.k_scale_float or 1.0
+        value_scale = layer.v_scale_float or 1.0
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention

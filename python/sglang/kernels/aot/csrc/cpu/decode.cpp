@@ -105,7 +105,7 @@ void pack_vnni(
 #else
   for (int n = 0; n < N; ++n) {
     index_t index = ind[n];
-    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
+    float scale = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
         dst0[k * ld_dst0 * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d] * scale;
@@ -116,8 +116,8 @@ void pack_vnni(
   for (int n = 0; n < (N >> 1) * 2; n += 2) {
     index_t index0 = ind[n + 0];
     index_t index1 = ind[n + 1];
-    float scale0 = src_scale != nullptr ? src_scale[index0] : 1.0f;
-    float scale1 = src_scale != nullptr ? src_scale[index1] : 1.0f;
+    float scale0 = src_scale != nullptr ? src_scale[0] : 1.0f;
+    float scale1 = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int k = 0; k < Kv; ++k) {
       dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index0 * ld_src + k] * scale0;
       dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = src[index1 * ld_src + k] * scale1;
@@ -125,7 +125,7 @@ void pack_vnni(
   }
   if (N % 2 != 0) {
     index_t index = ind[N - 1];
-    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
+    float scale = src_scale != nullptr ? src_scale[0] : 1.0f;
     for (int k = 0; k < Kv; ++k) {
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index * ld_src + k] * scale;
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
@@ -175,27 +175,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
     out[d] = static_cast<scalar_t>(acc[d] * s);
   }
 }
-
-template <typename scalar_t>
-inline void copy_stub(at::Float8_e5m2* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
-  for (int64_t d = 0; d < size; ++d) {
-    out[d] = static_cast<at::Float8_e5m2>(src[d]);
-  }
-}
-#if defined(CPU_CAPABILITY_AVX512)
-template <>
-inline void copy_stub(at::Float8_e5m2* __restrict__ out, const at::BFloat16* __restrict__ src, int64_t size) {
-  int64_t i = 0;
-  for (; i + 32 <= size; i += 32) {
-    _mm256_storeu_epi8(&out[i], CVT_BF16_TO_FP8(_mm512_loadu_si512(&src[i])));
-  }
-  const int n = static_cast<int>(size - i);
-  if (n > 0) {
-    const __mmask32 mask = static_cast<__mmask32>((1u << n) - 1);
-    _mm256_mask_storeu_epi8(&out[i], mask, CVT_BF16_TO_FP8(_mm512_maskz_loadu_epi16(mask, &src[i])));
-  }
-}
-#endif
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
@@ -254,7 +233,7 @@ struct tinygemm_kernel_nt {
       for (int64_t n = 0; n < BLOCK_N; ++n) {
         float sum = 0.f;
         int64_t b_idx = indices[n];
-        float b_scale = B_scale != nullptr ? B_scale[b_idx] : 1.0f;
+        float b_scale = B_scale != nullptr ? B_scale[0] : 1.0f;
         float new_scale = scale * b_scale;
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         for (int64_t k = 0; k < K; ++k) {
@@ -389,7 +368,7 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + k));
         vb[col] = CVT_FP8_TO_BF16_EXT(s8);
-        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx] * scale), vexp);
+        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[0] * scale), vexp);
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
@@ -407,7 +386,7 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         __m256i s8 = _mm256_maskz_loadu_epi8(mask, B + b_idx * ldb + k);
         vb[col] = CVT_FP8_TO_BF16_EXT(s8);
-        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx] * scale), vexp);
+        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[0] * scale), vexp);
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
@@ -426,97 +405,6 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
       C[row * ldc + col] = _mm512_reduce_add_ps(_mm512_mul_ps(vc[i], vscales[col]));
-    };
-    Unroll<ROWS * COLS>{}(storec);
-  }
-};
-
-template <typename index_t, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e5m2, index_t, BLOCK_M, BLOCK_N> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e5m2* __restrict__ B,
-      const float* __restrict__ B_scale,
-      float* __restrict__ C,
-      const index_t* __restrict__ indices,
-      float scale,
-      int64_t lda,
-      int64_t ldb,
-      int64_t ldc,
-      int64_t K,
-      int64_t max_tokens) {
-    constexpr int ROWS = BLOCK_M;
-    constexpr int COLS = BLOCK_N;
-    __m512 va0, va1;
-    __m512 vb0[COLS], vb1[COLS];
-    __m512 vc[ROWS * COLS];
-    __m512 vscale = _mm512_set1_ps(scale);
-
-    auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
-    Unroll<ROWS * COLS>{}(loadc);
-
-    auto compute = [&](auto i, int64_t k) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-
-      if constexpr (col == 0) {
-        __m512i a16 = _mm512_loadu_si512((__m512i const*)(A + row * lda + k));
-        va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
-        va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
-      }
-
-      if constexpr (row == 0) {
-        int64_t b_idx = indices[col];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + k));
-        __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-        __m256i ah = _mm512_extracti64x4_epi64(a, 0);
-        __m256i bh = _mm512_extracti64x4_epi64(a, 1);
-        vb0[col] = _mm512_cvtph_ps(ah);
-        vb1[col] = _mm512_cvtph_ps(bh);
-      }
-
-      vc[i] = _mm512_fmadd_ps(va0, vb0[col], _mm512_fmadd_ps(va1, vb1[col], vc[i]));
-    };
-
-    auto compute2 = [&](auto i, int64_t k, __mmask32 mask) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-
-      if constexpr (col == 0) {
-        __m512i a16 = _mm512_maskz_loadu_epi16(mask, (const void*)(A + row * lda + k));
-        va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
-        va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
-      }
-
-      if constexpr (row == 0) {
-        int64_t b_idx = indices[col];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        __m256i s8 = _mm256_maskz_loadu_epi8(mask, B + b_idx * ldb + k);
-        __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-        __m256i ah = _mm512_extracti64x4_epi64(a, 0);
-        __m256i bh = _mm512_extracti64x4_epi64(a, 1);
-        vb0[col] = _mm512_cvtph_ps(ah);
-        vb1[col] = _mm512_cvtph_ps(bh);
-      }
-
-      vc[i] = _mm512_fmadd_ps(va0, vb0[col], _mm512_fmadd_ps(va1, vb1[col], vc[i]));
-    };
-
-    int64_t k = 0;
-    for (; k <= K - 32; k += 32) {
-      Unroll<ROWS * COLS>{}(compute, k);
-    }
-    int64_t count = K - k;
-    if (count > 0) {
-      __mmask32 mask = (1ULL << count) - 1;
-      Unroll<ROWS * COLS>{}(compute2, k, mask);
-    }
-
-    auto storec = [&](auto i) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-      C[row * ldc + col] = _mm512_reduce_add_ps(_mm512_mul_ps(vc[i], vscale));
     };
     Unroll<ROWS * COLS>{}(storec);
   }
@@ -645,7 +533,7 @@ inline void tinygemm_kernel_nn_scalar(
       C[m * ldc + n] *= scale[m];
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
-        float b_scale = B_scale != nullptr ? B_scale[b_idx] : 1.0f;
+        float b_scale = B_scale != nullptr ? B_scale[0] : 1.0f;
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         C[m * ldc + n] += A[m * lda + k] * static_cast<float>(B[b_idx * ldb + n]) * b_scale;
       }
@@ -812,7 +700,7 @@ struct tinygemm_kernel_nn<at::Float8_e4m3fn, index_t, BLOCK_M, BLOCK_N> {
         // for COLS = 1, 3, 5, 7 use 256 bit load
         if constexpr (COLS % 2 == 0) {
           if constexpr (col % 2 == 0) {
-            const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx]), vexp);
+            const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[0]), vexp);
             __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + col * 16));
             __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
             __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
@@ -821,97 +709,11 @@ struct tinygemm_kernel_nn<at::Float8_e4m3fn, index_t, BLOCK_M, BLOCK_N> {
             vb[col + 1] = _mm512_mul_ps(f_hi, b_scale);
           }
         } else {
-          const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx]), vexp);
+          const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[0]), vexp);
           __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + col * 16));
           __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
           __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
           vb[col] = _mm512_mul_ps(f_lo, b_scale);
-        }
-      }
-      vc[i] = _mm512_fmadd_ps(va, vb[col], vc[i]);
-    };
-
-    for (int64_t k = 0; k < K; ++k) {
-      Unroll<ROWS * COLS>{}(compute, k);
-    }
-
-    auto storec = [&](auto i) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-      _mm512_storeu_ps(C + row * ldc + col * 16, vc[i]);
-    };
-    Unroll<ROWS * COLS>{}(storec);
-  }
-};
-
-template <typename index_t, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nn<at::Float8_e5m2, index_t, BLOCK_M, BLOCK_N> {
-  static inline void apply(
-      const float* __restrict__ A,
-      const at::Float8_e5m2* __restrict__ B,
-      const float* __restrict__ B_scale,
-      float* __restrict__ C,
-      const index_t* __restrict__ indices,
-      const float* __restrict__ scale,
-      int64_t lda,
-      int64_t ldb,
-      int64_t ldc,
-      int64_t K,
-      int64_t max_tokens) {
-    constexpr int ROWS = BLOCK_M;
-    constexpr int COLS = BLOCK_N / 16;
-
-    __m512 va;
-    __m512 vb[COLS];
-    __m512 vc[ROWS * COLS];
-    __m512 vscale;
-
-    auto loadc = [&](auto i) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds"
-      if constexpr (col == 0) {
-        vscale = _mm512_set1_ps(scale[row]);
-      }
-#pragma GCC diagnostic pop
-      vc[i] = _mm512_loadu_ps(C + row * ldc + col * 16);
-      vc[i] = _mm512_mul_ps(vc[i], vscale);
-    };
-    Unroll<ROWS * COLS>{}(loadc);
-
-    auto compute = [&](auto i, int64_t k) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-
-      if constexpr (col == 0) {
-        va = _mm512_set1_ps(A[row * lda + k]);
-      }
-      if constexpr (row == 0) {
-        if (k + 1 < K) {
-          int64_t b_idx_prefetch = indices[k + 1];
-          _mm_prefetch(B + b_idx_prefetch * ldb + col * 16, _MM_HINT_T0);
-        }
-        int64_t b_idx = indices[k];
-        TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-
-        // for COLS = 2, 4, 6, 8 use 512 bit load
-        // for COLS = 1, 3, 5, 7 use 256 bit load
-        if constexpr (COLS % 2 == 0) {
-          if constexpr (col % 2 == 0) {
-            __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + col * 16));
-            __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-            __m256i ah = _mm512_extracti64x4_epi64(a, 0);
-            __m256i bh = _mm512_extracti64x4_epi64(a, 1);
-            vb[col + 0] = _mm512_cvtph_ps(ah);
-            vb[col + 1] = _mm512_cvtph_ps(bh);
-          }
-        } else {
-          __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + col * 16));
-          __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8), 8);
-          __m256i ah = _mm512_extracti64x4_epi64(a, 0);
-          __m256i bh = _mm512_extracti64x4_epi64(a, 1);
-          vb[col + 0] = _mm512_cvtph_ps(ah);
         }
       }
       vc[i] = _mm512_fmadd_ps(va, vb[col], vc[i]);
@@ -1343,8 +1145,6 @@ template <typename scalar_t, typename packed_t>
 void decode_set_kv_buffer(
     packed_t* __restrict__ k_buffer,
     packed_t* __restrict__ v_buffer,
-    float* __restrict__ k_scale,
-    float* __restrict__ v_scale,
     const scalar_t* __restrict__ key,
     const scalar_t* __restrict__ value,
     const int64_t* __restrict__ loc,
@@ -2003,8 +1803,8 @@ void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
-    std::optional<at::Tensor> k_buf_scale,
-    std::optional<at::Tensor> v_buf_scale,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& output,
     const std::optional<at::Tensor>& key,
     const std::optional<at::Tensor>& value,
@@ -2074,16 +1874,7 @@ void decode_attention_cpu(
   auto kv_dtype = k_buffer.scalar_type();
   if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
     TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
-    TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "Float8 kv_buffer requires scale tensors");
-    at::Tensor k_scale = k_buf_scale.value();
-    at::Tensor v_scale = v_buf_scale.value();
-    TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_buf_scale should be float32");
-    TORCH_CHECK(v_scale.scalar_type() == at::kFloat, "v_buf_scale should be float32");
-    if (is_mla) {
-      TORCH_CHECK(k_scale.data_ptr() == v_scale.data_ptr(), "k_scale and v_scale should be the same one in mla");
-    }
-  } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
-    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
+    TORCH_CHECK(k_buf_scale > 0.0 && v_buf_scale > 0.0, "Float8 kv_buffer requires positive static scales");
   }
 
   // block length for k_buffer and v_buffer
@@ -2100,6 +1891,10 @@ void decode_attention_cpu(
     CHECK_EQ(encoder_lens_t.size(0), num_seqs);
   }
   bool has_sink = sinks.has_value();
+  float k_buf_scale_float = static_cast<float>(k_buf_scale);
+  float v_buf_scale_float = static_cast<float>(v_buf_scale);
+  const float* k_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &k_buf_scale_float : nullptr;
+  const float* v_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &v_buf_scale_float : nullptr;
   at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, query.options());
   CHECK_DIM(1, sinks_tensor);
   CHECK_EQ(sinks_tensor.size(0), num_heads);
@@ -2125,8 +1920,6 @@ void decode_attention_cpu(
           decode_set_kv_buffer(
               (packed_t*)k_buffer_data,
               (packed_t*)v_buffer_data,
-              conditional_data_ptr<float>(k_buf_scale),
-              conditional_data_ptr<float>(v_buf_scale),
               key_tensor.data_ptr<scalar_t>(),
               value_tensor.data_ptr<scalar_t>(),
               loc.data_ptr<int64_t>(),
@@ -2153,8 +1946,8 @@ void decode_attention_cpu(
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
               (const packed_t*)v_buffer_data,
-              conditional_data_ptr<float>(k_buf_scale),
-              conditional_data_ptr<float>(v_buf_scale),
+              k_buf_scale_ptr,
+              v_buf_scale_ptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),
@@ -2190,8 +1983,8 @@ void decode_attention_cpu(
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
               (const packed_t*)v_buffer_data,
-              conditional_data_ptr<float>(k_buf_scale),
-              conditional_data_ptr<float>(v_buf_scale),
+              k_buf_scale_ptr,
+              v_buf_scale_ptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),
@@ -2223,8 +2016,8 @@ void decode_attention_cpu(
               query.data_ptr<scalar_t>(),
               (const packed_t*)k_buffer_data,
               (const packed_t*)v_buffer_data,
-              conditional_data_ptr<float>(k_buf_scale),
-              conditional_data_ptr<float>(v_buf_scale),
+              k_buf_scale_ptr,
+              v_buf_scale_ptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),

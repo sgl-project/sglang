@@ -243,20 +243,15 @@ class TestExtendAttention(CustomTestCase):
         H_BUF = 1 if mla else H_KV
         k_buffer = torch.randn((total_token_num, H_BUF, D), dtype=dtype)
         v_buffer = torch.randn((total_token_num, H_BUF, DV), dtype=dtype)
-        k_scale = None
-        v_scale = None
+        k_scale = 1.0
+        v_scale = 1.0
         if kvcache_dtype == torch.float8_e4m3fn:
-            k_scale = torch.full((total_token_num, 1, 1), 0.5, dtype=torch.float32)
-            v_scale = torch.full((total_token_num, 1, 1), 0.5, dtype=torch.float32)
+            k_scale = 0.5
+            v_scale = 0.5
             k_buffer_fp8 = (k_buffer / 0.5).to(torch.float8_e4m3fn)
             v_buffer_fp8 = (v_buffer / 0.5).to(torch.float8_e4m3fn)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
-        elif kvcache_dtype == torch.float8_e5m2:
-            k_buffer_fp8 = k_buffer.to(torch.float8_e5m2)
-            v_buffer_fp8 = v_buffer.to(torch.float8_e5m2)
-            k_buffer = k_buffer_fp8.to(dtype)
-            v_buffer = v_buffer_fp8.to(dtype)
 
         k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype)
         v_extend = torch.empty((extend_token_num, H_KV, DV), dtype=dtype)
@@ -342,16 +337,8 @@ class TestExtendAttention(CustomTestCase):
             None if kv_from_cache else k_extend,
             None if kv_from_cache else v_extend,
             o_extend,
-            (
-                k_buffer
-                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
-                else k_buffer_fp8
-            ),
-            (
-                v_buffer
-                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
-                else v_buffer_fp8
-            ),
+            (k_buffer if kvcache_dtype != torch.float8_e4m3fn else k_buffer_fp8),
+            (v_buffer if kvcache_dtype != torch.float8_e4m3fn else v_buffer_fp8),
             k_scale,
             v_scale,
             req_to_tokens,
@@ -372,110 +359,44 @@ class TestExtendAttention(CustomTestCase):
         torch.testing.assert_close(o_ref, o_extend, atol=tolerance, rtol=tolerance)
 
     def test_extend_attention(self):
-        for kvcache_dtype in [
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            for is_mla in [True, False]:
-                for is_cross_attn in [True, False]:
-                    if is_mla and is_cross_attn:
-                        continue
-                    self._test_extend_attention_once(
-                        1,
-                        123,
-                        1,
-                        1,
-                        128,
-                        96,
-                        None,
-                        False,
-                        is_mla,
-                        is_cross_attn,
-                        kvcache_dtype,
-                    )
-                    self._test_extend_attention_once(
-                        1,
-                        123,
-                        16,
-                        1,
-                        128,
-                        96,
-                        None,
-                        False,
-                        is_mla,
-                        is_cross_attn,
-                        kvcache_dtype,
-                    )
-                    self._test_extend_attention_once(
-                        4,
-                        1230,
-                        16,
-                        4,
-                        128,
-                        96,
-                        None,
-                        False,
-                        is_mla,
-                        is_cross_attn,
-                        kvcache_dtype,
-                    )
-                    self._test_extend_attention_once(
-                        1,
-                        9000,
-                        16,
-                        1,
-                        32,
-                        32,
-                        None,
-                        False,
-                        is_mla,
-                        is_cross_attn,
-                        kvcache_dtype,
-                    )
-            for has_sink in [True, False]:
-                for sliding_window in [None, 10, 128]:
-                    if not has_sink and sliding_window is not None:
-                        continue
-                    self._test_extend_attention_once(
-                        1,
-                        123,
-                        16,
-                        4,
-                        64,
-                        64,
-                        sliding_window,
-                        has_sink,
-                        False,
-                        False,
-                        kvcache_dtype,
-                    )
-                    self._test_extend_attention_once(
-                        1,
-                        20,
-                        16,
-                        1,
-                        64,
-                        64,
-                        sliding_window,
-                        has_sink,
-                        False,
-                        False,
-                        kvcache_dtype,
-                    )
-                    self._test_extend_attention_once(
-                        1,
-                        20,
-                        1,
-                        1,
-                        64,
-                        64,
-                        sliding_window,
-                        has_sink,
-                        False,
-                        False,
-                        kvcache_dtype,
-                    )
+        for is_mla in [True, False]:
+            for is_cross_attn in [True, False]:
+                if is_mla and is_cross_attn:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 1, 1, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    1, 123, 16, 1, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    4, 1230, 16, 4, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    1, 9000, 16, 1, 32, 32, None, False, is_mla, is_cross_attn
+                )
+        for has_sink in [True, False]:
+            for sliding_window in [None, 10, 128]:
+                if not has_sink and sliding_window is not None:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+
+        fp8_configs = [
+            (1, 123, 16, 1, 128, 96, None, False, False, False),
+            (1, 123, 1, 1, 128, 96, None, False, True, False),
+            (1, 123, 16, 1, 128, 96, None, False, False, True),
+            (1, 20, 1, 1, 64, 64, 10, True, False, False),
+        ]
+        for config in fp8_configs:
+            self._test_extend_attention_once(*config, kvcache_dtype=torch.float8_e4m3fn)
 
     def test_extend_attention_kv_from_cache(self):
         # KV-shared layers pass no extend K/V, so the kernel masks the extend

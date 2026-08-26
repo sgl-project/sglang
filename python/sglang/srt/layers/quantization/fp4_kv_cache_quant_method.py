@@ -336,7 +336,6 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
 
     def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
         buffer_shape = (size, head_num, head_dim)
-        scale_shape = (size, 1, 1)
         return {
             "k_buffer": [
                 torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
@@ -346,14 +345,8 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
                 torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
                 for _ in range(layer_num)
             ],
-            "k_scale_buffer": [
-                torch.zeros(scale_shape, dtype=torch.float32, device=device)
-                for _ in range(layer_num)
-            ],
-            "v_scale_buffer": [
-                torch.zeros(scale_shape, dtype=torch.float32, device=device)
-                for _ in range(layer_num)
-            ],
+            "k_scale_buffer": None,
+            "v_scale_buffer": None,
             "dq_k_buffer": None,
             "dq_v_buffer": None,
             "store_dtype": torch.float8_e4m3fn,
@@ -375,8 +368,6 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
             raise ValueError("CPU FP8 KV cache requires static K/V scales.")
         k_buffer[loc] = (cache_k / k_scale).to(torch.float8_e4m3fn)
         v_buffer[loc] = (cache_v / v_scale).to(torch.float8_e4m3fn)
-        k_scale_buffer[loc] = k_scale
-        v_scale_buffer[loc] = v_scale
 
     def dequantize_prev_kv(
         self, k_fp8, k_scales, v_fp8, v_scales, layer_id
@@ -388,9 +379,7 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
     ) -> int:
-        data_bytes = head_num * head_dim * num_layers * kv_size * 2
-        scale_bytes = torch.float32.itemsize * num_layers * kv_size * 2
-        return data_bytes + scale_bytes
+        return head_num * head_dim * num_layers * kv_size * 2
 
 
 class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
