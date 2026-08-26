@@ -979,6 +979,8 @@ class HiSparseCoordinator:
             if record_plan
             else {}
         )
+        # skip_io is a JIT template flag; the AOT XPU ops do not take it.
+        debug_flags = {} if _is_xpu else dict(skip_io=self.skip_io)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -996,7 +998,7 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            skip_io=self.skip_io,
+            **debug_flags,
             **plan,
         )
         return top_k_indices
