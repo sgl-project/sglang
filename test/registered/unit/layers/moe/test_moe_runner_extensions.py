@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import FusedMoEWithLoRA
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-c-test-cpu")
@@ -57,9 +58,8 @@ def isolated_runner_registries(monkeypatch):
 
     monkeypatch.setattr(moe_utils, "_REGISTERED_MOE_RUNNER_BACKEND_NAMES", set())
     monkeypatch.setattr(runner_module, "_CUSTOM_RUNNER_CORE_FACTORIES", {})
-    monkeypatch.setattr(
-        runner_module, "get_moe_a2a_backend", lambda: MoeA2ABackend.NONE
-    )
+    with get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE):
+        yield
 
 
 def test_registered_runner_core_uses_standard_dispatch(
@@ -142,48 +142,30 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
     monkeypatch.setattr(method, "create_moe_runner", create_runner)
     monkeypatch.setattr(
         fused_moe_layer_module,
-        "get_parallel",
-        lambda: SimpleNamespace(
-            moe_ep_size=1,
-            moe_ep_rank=0,
-            moe_tp_size=1,
-            moe_tp_rank=0,
-        ),
-    )
-    monkeypatch.setattr(
-        fused_moe_layer_module,
-        "get_moe_runner_backend",
-        lambda: MoeRunnerBackend.AUTO,
-    )
-    monkeypatch.setattr(
-        fused_moe_layer_module,
-        "get_moe_a2a_backend",
-        lambda: MoeA2ABackend.NONE,
-    )
-    monkeypatch.setattr(
-        fused_moe_layer_module,
-        "get_server_args",
-        lambda: SimpleNamespace(ep_join_mode="none", moe_runner_backend="auto"),
-    )
-    monkeypatch.setattr(
-        fused_moe_layer_module,
-        "create_kt_config_from_server_args",
-        lambda server_args, layer_id: None,
-    )
-    monkeypatch.setattr(
-        fused_moe_layer_module,
         "create_moe_dispatcher",
         lambda config: SimpleNamespace(),
     )
-    monkeypatch.setattr(fused_moe_layer_module, "print_info_once", lambda message: None)
 
-    layer = FusedMoE(
-        num_experts=2,
-        hidden_size=4,
-        intermediate_size=8,
-        layer_id=0,
-        quant_method=method,
-    )
+    with get_context().override_server_args(
+        model_path="dummy"
+    ), get_flags().moe.override(
+        runner_backend=MoeRunnerBackend.AUTO,
+        a2a_backend=MoeA2ABackend.NONE,
+    ), get_parallel().override(
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        tp_size=1,
+        tp_rank=0,
+    ):
+        layer = FusedMoE(
+            num_experts=2,
+            hidden_size=4,
+            intermediate_size=8,
+            layer_id=0,
+            quant_method=method,
+        )
 
     assert layer.quant_method is method
     assert layer.runner is method.runner
