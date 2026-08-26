@@ -721,13 +721,15 @@ class Grok1ForCausalLM(nn.Module):
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if get_parallel().tp_size > 1:
-            setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
-            setattr(
-                DefaultModelLoader,
-                "_get_weights_iterator",
-                _presharded_get_weights_iterator,
-            )
+        # Installed for every tp_size: a presharded checkpoint has to be reassembled
+        # at tp_size=1 as well, and both helpers fall back to the stock loader when
+        # the checkpoint is not presharded.
+        setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+        setattr(
+            DefaultModelLoader,
+            "_get_weights_iterator",
+            _presharded_get_weights_iterator,
+        )
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
 
@@ -955,9 +957,6 @@ def _prepare_presharded_weights(
     import glob
     import os
 
-    if get_parallel().tp_size == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
-
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf
 
@@ -977,32 +976,49 @@ def _prepare_presharded_weights(
     tp_rank = get_parallel().tp_rank
     tp_size = get_parallel().tp_size
 
-    # How many ways is this checkpoint presharded? (e.g. 8 for xai-org/grok-2)
-    n_ckpt_shards = len(
+    # Width of the presharded checkpoint, derived from the shard ids present.
+    # Use max(id)+1 rather than the count so that a checkpoint missing shards is
+    # reported as such instead of being mistaken for a narrower one.
+    shard_ids = sorted(
         {
-            m.group(1)
+            int(m.group(1))
             for f in glob.glob(os.path.join(hf_folder, "*-TP-*.safetensors"))
             if (m := re.search(r"-TP-(\d{3})\.safetensors$", os.path.basename(f)))
         }
     )
 
+    if not shard_ids:
+        # Not a presharded checkpoint; nothing to do here.
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+
+    n_ckpt_shards = shard_ids[-1] + 1
+    if shard_ids != list(range(n_ckpt_shards)):
+        missing = sorted(set(range(n_ckpt_shards)) - set(shard_ids))
+        raise ValueError(
+            f"Presharded checkpoint in {hf_folder} is incomplete: expected shards "
+            f"TP-000..TP-{n_ckpt_shards - 1:03d}, missing "
+            f"{', '.join(f'TP-{i:03d}' for i in missing)}."
+        )
+
+    # Rank r owns the contiguous slice covered by checkpoint shards
+    # [r*g, (r+1)*g), so it reads g files and concatenates them (see
+    # _presharded_get_weights_iterator). Going above n_ckpt_shards would require
+    # splitting a shard, which is not supported.
+    if tp_size > n_ckpt_shards or n_ckpt_shards % tp_size != 0:
+        raise ValueError(
+            f"Checkpoint is presharded {n_ckpt_shards} ways; tp_size={tp_size} is "
+            f"unsupported. Use a tp_size that divides {n_ckpt_shards}."
+        )
+    g = n_ckpt_shards // tp_size
+
     # The old format
     allow_patterns = [f"*-{tp_rank:03d}.bin"]
+    allow_patterns += [
+        f"*-TP-{r:03d}.safetensors" for r in range(tp_rank * g, (tp_rank + 1) * g)
+    ]
+    allow_patterns += ["*-TP-common.safetensors"]
 
-    if n_ckpt_shards and n_ckpt_shards != tp_size:
-        # Running at a lower TP than the checkpoint was presharded for. Rank r owns
-        # the contiguous slice covered by checkpoint shards [r*g, (r+1)*g), so it
-        # reads g files and concatenates them (see _presharded_get_weights_iterator).
-        # Going above n_ckpt_shards would require splitting a shard; not supported.
-        if tp_size > n_ckpt_shards or n_ckpt_shards % tp_size != 0:
-            raise ValueError(
-                f"Checkpoint is presharded {n_ckpt_shards} ways; tp_size={tp_size} is "
-                f"unsupported. Use a tp_size that divides {n_ckpt_shards}."
-            )
-        g = n_ckpt_shards // tp_size
-        allow_patterns += [
-            f"*-TP-{r:03d}.safetensors" for r in range(tp_rank * g, (tp_rank + 1) * g)
-        ]
+    if g > 1:
         logger.info(
             "Grok: %d-way presharded checkpoint at tp_size=%d; rank %d merges "
             "checkpoint shards %d..%d",
@@ -1012,11 +1028,6 @@ def _prepare_presharded_weights(
             tp_rank * g,
             (tp_rank + 1) * g - 1,
         )
-    else:
-        # The new format (checkpoint shard count matches tp_size)
-        allow_patterns += [f"*-TP-{tp_rank:03d}.safetensors"]
-
-    allow_patterns += ["*-TP-common.safetensors"]
 
     hf_weights_files = []
     for pattern in allow_patterns:
@@ -1063,30 +1074,37 @@ def _group_presharded_files(hf_weights_files):
     return merged, passthrough + single
 
 
-def _shard_concat_dim(name, shape, hidden_size):
-    """Axis along which a presharded expert weight must be concatenated."""
+def _shard_concat_dim(name):
+    """Axis along which a presharded expert weight must be concatenated.
+
+    Only the MoE expert matrices are presharded in known Grok checkpoints, and
+    their axes are fixed. Anything else is rejected rather than guessed: an
+    incorrect axis would yield a plausibly shaped but silently corrupted tensor.
+    """
     if name.endswith(".w2.weight"):  # row-parallel:    [hidden, moe_inter/g]
         return 1
-    if name.endswith(".w1.weight") or name.endswith(".w3.weight"):
+    if name.endswith((".w1.weight", ".w3.weight")):
         return 0  # column-parallel: [moe_inter/g, hidden]
-    # Fallback: the sharded axis is the one that is not the (unsharded) hidden dim.
-    if len(shape) == 2 and shape[0] == hidden_size:
-        return 1
-    return 0
+    raise ValueError(
+        f"Cannot determine the shard axis for presharded tensor '{name}'. Only MoE "
+        "expert weights (w1/w2/w3) are expected to be presharded; refusing to guess."
+    )
 
 
-def _merged_presharded_iterator(merged_groups, hidden_size):
+def _merged_presharded_iterator(merged_groups):
     """Yield (name, tensor) with each tensor rebuilt from its checkpoint shards.
 
     A group's shard files are opened together and concatenated tensor by tensor, so
     peak memory is one merged tensor rather than a whole group.
     """
+    from contextlib import ExitStack
+
     import torch
     from safetensors import safe_open
 
     for prefix, paths in sorted(merged_groups.items()):
-        handles = [safe_open(p, framework="pt") for p in paths]
-        try:
+        with ExitStack() as stack:
+            handles = [stack.enter_context(safe_open(p, framework="pt")) for p in paths]
             keys = list(handles[0].keys())
             for h in handles[1:]:
                 if set(h.keys()) != set(keys):
@@ -1095,12 +1113,8 @@ def _merged_presharded_iterator(merged_groups, hidden_size):
                     )
             for name in keys:
                 parts = [h.get_tensor(name) for h in handles]
-                dim = _shard_concat_dim(name, list(parts[0].shape), hidden_size)
-                yield name, torch.cat(parts, dim=dim)
+                yield name, torch.cat(parts, dim=_shard_concat_dim(name))
                 del parts
-        finally:
-            for h in handles:
-                h.__exit__(None, None, None)
 
 
 def _presharded_get_weights_iterator(self, source, **kwargs):
@@ -1118,13 +1132,10 @@ def _presharded_get_weights_iterator(self, source, **kwargs):
         # Nothing to merge -> preserve stock behaviour exactly.
         return old_get_weights_iterator(self, source, **kwargs)
 
-    hf_config = getattr(getattr(source, "model_config", None), "hf_config", None)
-    hidden_size = getattr(hf_config, "hidden_size", 0) if hf_config else 0
-
     def _gen():
         from sglang.srt.model_loader.weight_utils import safetensors_weights_iterator
 
-        yield from _merged_presharded_iterator(merged_groups, hidden_size)
+        yield from _merged_presharded_iterator(merged_groups)
         if rest:
             yield from safetensors_weights_iterator(rest)
 
