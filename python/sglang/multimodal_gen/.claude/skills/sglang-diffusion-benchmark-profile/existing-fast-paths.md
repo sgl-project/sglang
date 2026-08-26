@@ -24,6 +24,7 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/helios_qk_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
@@ -216,6 +217,30 @@ framework-specific optimization workflow.
   replacements and run independently of the `quality=high` Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
 - Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
+
+15. Helios paired transposed RoPE
+- Kernel: `fused_inplace_helios_qk_rope`.
+- Locations: `rope/helios_qk_rope_jit.py`,
+  `csrc/diffusion/helios_qk_rope.cuh`, and
+  `runtime/models/dits/helios.py`.
+- Use case: apply Helios' transposed fp32 frequency table to already-normalized
+  contiguous Q/K together, in place, instead of launching the eager
+  unflatten/chunk/multiply/add/stack chain twice per attention block.
+- Constraints: CUDA fp16/bf16 Q/K with matching contiguous `[B, S, H, D]`
+  layouts, contiguous fp32 frequencies shaped `[B, S, 2 * D]`, even `D`, and
+  pair-aligned Q/K pointers. Tensor-parallel RMSNorm keeps the eager path.
+  Current real-model validation covers one H100; it is not a multi-GPU scaling
+  claim.
+- Numerical contract: explicit round-to-nearest fp32 operations reproduce the
+  eager elementwise rounding boundaries before the result is cast back to the
+  activation dtype. Correctness tests require `torch.equal`, including the
+  production `[8640, 40, 128]` shape.
+- Validation: `test/registered/kernels/ops/diffusion/test_helios_qk_rope.py`.
+- Microbench:
+  `test/registered/kernels/benchmark/diffusion/bench_helios_qk_rope.py`.
+- Workflow rule: if a Helios trace still shows two transposed-RoPE elementwise
+  ladders per block, check TP mode, dtype, shape, contiguity, and pointer
+  alignment before proposing another RoPE kernel.
 
 **Faster CUDA Kernel Usage Points**
 
