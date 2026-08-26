@@ -4159,6 +4159,9 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        if self.output_streamer._deferred_finished:
+            self.output_streamer.stream_output([], False)
+
         if not self.is_fully_idle():
             return
 
