@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
@@ -65,7 +66,6 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -1153,7 +1153,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1264,7 +1263,7 @@ class KVCacheConfigurator:
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1357,7 +1356,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1382,7 +1380,7 @@ class KVCacheConfigurator:
         """
         full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
         common = {
-            "page_size": self.server_args.page_size,
+            "page_size": get_schedule().page_size,
             "device": self.device,
             "enable_memory_saver": False,
         }
@@ -1397,14 +1395,13 @@ class KVCacheConfigurator:
                 kv_cache_dim=calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
-                    server_args=self.server_args,
                 ),
             )
 
         return SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=0,
             head_dim=0,
@@ -1537,7 +1534,7 @@ class KVCacheConfigurator:
             # with the widening-dequant contract.
             index_dtype=(
                 self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(self.server_args)
+                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
                 else self.model_dtype
             ),
             head_num=self.model_config.get_num_kv_heads(
@@ -1922,7 +1919,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if configured_pp_size() > 1:
+        if get_parallel().config.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -2200,10 +2197,7 @@ class KVCacheConfigurator:
 
 
 def calculate_mla_kv_cache_dim(
-    *,
-    model_config: ModelConfig,
-    kv_cache_dtype: torch.dtype,
-    server_args: ServerArgs,
+    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype

@@ -1200,10 +1200,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             disaggregation_mode=None,
             enable_overlap=False,
             enable_overlap_mlx=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False,
-                enable_hisparse=False,
-            ),
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
