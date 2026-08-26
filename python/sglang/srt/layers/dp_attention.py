@@ -349,7 +349,7 @@ def initialize_dp_attention(
     )
     enable_dp_attention = get_parallel().enable_dp_attention
     dp_size = get_parallel().dp_size
-    attn_cp_size = get_parallel().config.attn_cp_size
+    attn_cp_size = get_parallel().attn_cp_size
 
     dp.enabled = enable_dp_attention
 
@@ -1026,12 +1026,10 @@ def get_moe_cp_size() -> int:
 def is_enable_moe_cp_allgather() -> bool:
     """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE.
 
-    Reads the configured sizes, not the live groups: that very configuration makes
-    ``initialize_model_parallel`` alias ``_MOE_DP`` to ``_ATTN_CP``
-    (``parallel_state.py``), so the live sizes are equal and the comparison would
-    always be false.
+    In that configuration ``initialize_model_parallel`` aliases ``_MOE_DP`` to
+    ``_ATTN_CP``, so the two groups report equal widths.
     """
-    return get_parallel().config.attn_cp_size > get_parallel().config.moe_dp_size
+    return get_parallel().attn_cp_size > get_parallel().moe_dp_size
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

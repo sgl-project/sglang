@@ -11024,20 +11024,16 @@ def resolve_encoder_transfer_backend(
     return "zmq_to_scheduler"
 
 
-def compute_world_size(config) -> int:
-    """Return the total GPU count across all data-parallel replicas.
+def compute_world_size(
+    *, enable_dp_attention: bool, dp_size: int, tp_size: int, pp_size: int
+) -> int:
+    """Total GPU count across all data-parallel replicas.
 
-    Takes the resolved topology -- the published `parallel` bag, or a view over
-    the declarations. `enable_dp_attention` and `dp_size` are both resolution's
-    answers (`_handle_dwdp` fills the pair, DeepSeek MLA context parallelism
-    turns DP attention on), so a raw-record read would size the world from what
-    the operator typed.
+    Takes the values rather than a config object: the two sizes are the widths
+    the launch asked for, which the Ray driver needs before any process group
+    exists, and passing a context would hand it the live groups instead.
     """
-    return (
-        (1 if config.enable_dp_attention else config.dp_size)
-        * config.tp_size
-        * config.pp_size
-    )
+    return (1 if enable_dp_attention else dp_size) * tp_size * pp_size
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
