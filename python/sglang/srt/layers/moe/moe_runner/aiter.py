@@ -128,44 +128,70 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
 
 
 _RECV_BOUND_LOGGED = False
+_RECV_BOUND_WARNED = False
+
+
+def _warn_recv_bound_unavailable() -> None:
+    global _RECV_BOUND_WARNED
+    if not _RECV_BOUND_WARNED:
+        _RECV_BOUND_WARNED = True
+        logger.warning(
+            "SGLANG_MORI_RECV_BOUND is set but --max-running-requests is not, so "
+            "the per-rank decode token ceiling is unknown; leaving the mori "
+            "receive buffer unbounded."
+        )
 
 
 def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
 
-    This value is baked into a cuda graph, so it has to hold for every later
-    replay of that graph -- including replays where a peer carries a wider batch
-    than the one being captured here. It is therefore derived from the widest
-    decode graph *any* rank will replay rather than from the batch in hand: the
-    worst case is every rank routing a full graph's worth of tokens to this one,
-    max_tokens * world_size * topk, where topk already includes the fused shared
-    expert. That quantity is reduced across ranks when it is published, so it
-    needs no assumption that the ranks share a batch size or a graph tier.
+    Worst case fan-in is every rank routing all of its decode tokens to this one,
+    so `max_decode_tokens_per_rank * world_size * topk`, where topk already
+    includes the fused shared expert.
+
+    The per-rank token ceiling comes from the scheduler, not from the batch in
+    hand: a decode batch carries at most `max_running_requests` requests per
+    attention-DP rank, each contributing at most one draft-token width. That
+    matters because the value is baked into a captured cuda graph and must hold
+    for every later replay -- including replays where a peer carries a wider
+    batch, which happens here since `require_mlp_tp_gather()` is false under
+    `--enable-dp-lm-head` and each rank then buckets its own batch size. A
+    ceiling sidesteps the question: no rank can exceed its own scheduler cap, so
+    which tier a peer replays does not matter. It is also identical on every
+    rank by construction, being a function of the server args alone, so no
+    cross-rank agreement has to be established.
 
     Two cases stay unbounded, because a bound below the real fan-in silently
-    drops rows from the all-to-all -- wrong output, not an error:
+    drops rows from the all-to-all -- wrong output rather than an error:
 
-    * Prefill, whose per-rank counts are uneven and not knowable here.
-    * Anything outside capture. Eager decode runs when the batch is wider than
-      every captured tier, so the published width does not bound it, and there
-      is no graph to bake a saving into anyway.
+    * Prefill, whose token count is set by the chunked-prefill size rather than
+      the request cap, and is uneven across ranks.
+    * `max_running_requests` left unset, where it is derived from measured free
+      memory and is not cheaply knowable here.
     """
     if not get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
         return 0
 
     from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-        get_max_decode_graph_tokens,
+    from sglang.srt.runtime_context import (
+        get_parallel,
+        get_schedule,
+        max_speculative_num_draft_tokens,
     )
-    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-    from sglang.srt.runtime_context import get_parallel
 
-    if get_is_extend_in_batch() or not get_is_capture_mode():
+    if get_is_extend_in_batch():
         return 0
 
-    max_tokens = get_max_decode_graph_tokens()
-    if max_tokens <= 0:
+    max_running_requests = get_schedule().max_running_requests
+    if not max_running_requests:
+        _warn_recv_bound_unavailable()
         return 0
+
+    # Ceil: a remainder still lands on some rank, and rounding down would put the
+    # bound below the real fan-in.
+    reqs_per_rank = -(-max_running_requests // get_parallel().attn_dp_size)
+    tokens_per_req = max_speculative_num_draft_tokens() or 1
+    max_tokens = reqs_per_rank * tokens_per_req
 
     bound = max_tokens * get_parallel().moe_ep_size * topk
     # Never grow the tensor, and nothing to do when there is nothing to trim.
@@ -178,7 +204,7 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
         # A bound that never engages is indistinguishable from an unpatched run in
         # the results, so say so once rather than let a no-op look like a win.
         logger.info(
-            "mori recv bound active: %d rows -> %d (graph_tokens=%d ep=%d topk=%d)",
+            "mori recv bound active: %d rows -> %d (tokens_per_rank=%d ep=%d topk=%d)",
             recv_rows,
             bound,
             max_tokens,
