@@ -13,16 +13,15 @@ from sglang.srt.eplb.lplb_solver import (
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import will_use_aiter_moe
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
+from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 def prepare_moe_topk(
@@ -138,13 +137,17 @@ def check_quantized_moe_compatibility(
                 f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
             )
 
+        can_pad_aiter_block_weight = will_use_aiter_moe() and moe_tp_size == 1
         if (
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
-            and not _use_aiter
+            and not can_pad_aiter_block_weight
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                 f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
-                f"You can fix this by setting arguments `--tp` and `--ep` correctly."
+                "AITER can only pad an unaligned block-quantized intermediate "
+                "dimension when moe_tp_size is 1 because a larger MoE TP size "
+                "would split checkpoint quantization blocks. You can fix this "
+                "by setting arguments `--tp` and `--ep` so moe_tp_size is 1."
             )

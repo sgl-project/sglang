@@ -69,6 +69,7 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
     uses_per_rank_fused_shared_slots,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -283,10 +284,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.num_shared_experts = get_num_shared_experts(config)
         self.num_fused_shared_experts = 0
+        self.use_aiter_moe = will_use_aiter_moe()
 
         self.enable_shared_expert_fusion = False  # default to False
         if support_shared_expert_fusion and (
-            _use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion)
+            self.use_aiter_moe or (_is_cuda and enable_cuda_shared_expert_fusion)
         ):
             self.enable_shared_expert_fusion = (
                 self.num_shared_experts > 0
@@ -433,7 +435,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             scale = 1.0 / float(moe_ep_size)
         # Only AITER fuses sigmoid + cast in-kernel; on CUDA keep the legacy
         # eager activation so the NVIDIA path behavior is unchanged.
-        if not _use_aiter:
+        if not self.use_aiter_moe:
             return F.sigmoid(shared_logits) * scale, 1.0
         return shared_logits, scale
 
@@ -461,7 +463,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             fused_append_shared_experts_with_weights,
         )
 
-        if _use_aiter:
+        if self.use_aiter_moe:
             # HIP/aiter: fuse the shared_expert_gate GEMV + sigmoid + scale into
             # the append kernel, eliminating the standalone gate GEMM launch.
             # This subsumes the sigmoid-only fusion: there is no separate gate

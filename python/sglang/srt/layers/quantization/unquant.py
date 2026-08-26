@@ -24,7 +24,11 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
+from sglang.srt.layers.moe.utils import (
+    get_moe_weight_sizes,
+    will_use_aiter_moe,
+    xpu_moe_ld_padding_elems,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -56,9 +60,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUUnquantMoEMethod,
-)
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUUnquantMoEMethod
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
@@ -68,8 +70,14 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
+
+
+def _get_aiter_shuffle_weight():
+    """Import the AITER MoE layout transform only when that runner is active."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight
 
 
 class Bf16GemmBackend(Enum):
@@ -470,9 +478,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
             )
         ):
-            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-                cutedsl_bf16_gemm_out,
-            )
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm_out
 
             return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
 
@@ -572,12 +578,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # dims. Every other device allocates plainly, exactly as before.
         pad_ld_for_xpu = _use_xpu_moe_ld_padding(self.use_triton_kernels)
 
+        use_aiter_moe = will_use_aiter_moe()
+        if use_aiter_moe:
+            w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
+                intermediate_size_per_partition,
+                is_concat=layer.moe_runner_config.is_gated,
+                is_packed=False,
+                is_aiter_moe=True,
+            )
+            layer.hidden_pad = 0
+            layer.intermediate_pad = w2_down_dim - intermediate_size_per_partition
+            weight_attrs = {**extra_weight_attrs, "weight_padded": weight_padded}
+        else:
+            # Preserve the existing CUDA and non-AITER tensor layout exactly.
+            w13_up_dim = (
+                2 * intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else intermediate_size_per_partition
+            )
+            w2_down_dim = intermediate_size_per_partition
+            weight_attrs = extra_weight_attrs
+
         # Fused gate_up_proj (column parallel)
-        w13_up_dim = (
-            2 * intermediate_size_per_partition
-            if layer.moe_runner_config.is_gated
-            else intermediate_size_per_partition
-        )
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
@@ -591,7 +613,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        set_weight_attrs(w13_weight, weight_attrs)
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
@@ -604,7 +626,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
             hidden_size,
-            intermediate_size_per_partition,
+            w2_down_dim,
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
@@ -618,7 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+        set_weight_attrs(w2_weight, weight_attrs)
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
@@ -630,15 +652,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
-            _use_aiter
-            and (
-                get_moe_runner_backend().is_auto()
-                or get_moe_runner_backend().is_aiter()
-            )
+            will_use_aiter_moe()
             and self._aiter_ck_moe_supported(layer)
             and not layer._skip_aiter_moe_shuffle
         )
         if _should_use_aiter_moe:
+            shuffle_weight = _get_aiter_shuffle_weight()
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
             )
@@ -849,7 +868,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def _aiter_ck_moe_supported(self, layer) -> bool:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        return layer.intermediate_size_per_partition % 128 == 0
+        physical_intermediate_size = layer.intermediate_size_per_partition + getattr(
+            layer, "intermediate_pad", 0
+        )
+        return physical_intermediate_size % 128 == 0
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -880,14 +902,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
-        if (
-            _use_aiter
-            and (
-                get_moe_runner_backend().is_auto()
-                or get_moe_runner_backend().is_aiter()
-            )
-            and get_moe_a2a_backend().supports_aiter()
-        ):
+        if will_use_aiter_moe():
             if self._aiter_ck_moe_supported(layer):
                 self._aiter_runner = MoeRunner(
                     MoeRunnerBackend.AITER, moe_runner_config
@@ -927,9 +942,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # torch.compile on this layer only pays off at bs=1; keep the
         # optimized dispatch otherwise.
         if num_tokens == 1:
-            from sglang.srt.layers.moe.fused_moe_native import (
-                fused_moe_forward_native,
-            )
+            from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 
             return fused_moe_forward_native
         return None
@@ -999,14 +1012,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return self.runner.run(dispatch_output, quant_info)
         else:
             if self._aiter_runner is not None:
-                from sglang.srt.layers.moe.moe_runner.aiter import (
-                    AiterMoeQuantInfo,
-                )
+                from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
 
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                    expert_mask=getattr(layer.dispatcher, "expert_mask_gpu", None),
+                    hidden_pad=getattr(layer, "hidden_pad", 0),
+                    intermediate_pad=getattr(layer, "intermediate_pad", 0),
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 

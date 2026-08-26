@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -131,6 +132,14 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
+def _get_aiter_shuffle_ops():
+    """Import AITER layout transforms only when the MoE runner needs them."""
+    from aiter.ops.shuffle import shuffle_scale as aiter_shuffle_scale
+    from aiter.ops.shuffle import shuffle_weight as aiter_shuffle_weight
+
+    return aiter_shuffle_scale, aiter_shuffle_weight
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -141,7 +150,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+    from aiter.ops.shuffle import shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1146,12 +1155,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
-        tp_size = get_parallel().tp_size
+        parallel = get_parallel()
+        tp_size = parallel.tp_size
+        moe_tp_size = getattr(parallel, "moe_tp_size", tp_size)
+        use_aiter_moe = will_use_aiter_moe()
         w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=_use_aiter,
+            is_aiter_moe=use_aiter_moe,
             is_concat=layer.moe_runner_config.is_gated,
             is_packed=False,
         )
@@ -1162,8 +1174,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 quant_config.weight_block_size[1],
             )
 
-            padding_size = get_moe_padding_size(_use_aiter)
-            if not (_use_aiter and padding_size == block_n == block_k):
+            padding_size = get_moe_padding_size(use_aiter_moe)
+            # Padding an entire expert is safe when MoE TP is one: the
+            # checkpoint's block grid still starts at the beginning of the
+            # local tensor and only trailing zeros are added.  An unaligned
+            # MoE-TP split cuts through checkpoint quantization blocks, so a
+            # local trailing pad cannot make its scale grid valid.  Use EP for
+            # that topology instead of silently loading misaligned scales.
+            can_pad_aiter_block_weight = (
+                use_aiter_moe
+                and moe_tp_size == 1
+                and padding_size == block_n == block_k
+            )
+            if not can_pad_aiter_block_weight:
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
                 if intermediate_size_per_partition % block_n != 0:
@@ -1435,8 +1458,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        use_aiter_moe = will_use_aiter_moe()
+        if use_aiter_moe:
+            aiter_shuffle_scale, aiter_shuffle_weight = _get_aiter_shuffle_ops()
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
-        if _use_aiter and self.is_fp4_expert:
+        if use_aiter_moe and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
@@ -1457,7 +1484,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.intermediate_pad = padded_inter - inter_per_part
             layer.hidden_pad = 0
             if padded_inter != inter_per_part:
-                pad_amount = padded_inter - inter_per_part
                 fp4_block_k = 32
 
                 # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
@@ -1524,19 +1550,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 num_experts, num_rows, _ = scale.shape
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
                 scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
+                scale.data = aiter_shuffle_scale(
+                    scale_2d, num_experts, gu_intv, is_w13_scale
+                )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
             is_shuffled = _is_shuffle_moe_mxfp4
             if is_shuffled:
-                layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.data = aiter_shuffle_weight(
                     layer.w13_weight,
                     is_guinterleave=gu_intv,
                     gate_up=True,
                 )
-                layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.data = aiter_shuffle_weight(
                     layer.w2_weight,
                     is_guinterleave=gu_intv,
                     gate_up=False,
@@ -1577,11 +1605,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 getattr(self, "runner", None) is not None
                 and self.runner.runner_backend.is_aiter()
             )
-            if _use_aiter and runner_is_aiter:
-                layer.w13_weight.data = shuffle_weight(
+            if use_aiter_moe and runner_is_aiter:
+                layer.w13_weight.data = aiter_shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
-                layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.data = aiter_shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
             return
@@ -1615,19 +1643,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
-                layer.w13_weight.data = shuffle_weight(
+            if use_aiter_moe:
+                layer.w13_weight.data = aiter_shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
-                layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.data = aiter_shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-        elif _use_aiter:
+        elif use_aiter_moe:
             # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
+            t = aiter_shuffle_weight(layer.w13_weight, (16, 16))
             layer.w13_weight.copy_(t)
             del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
+            t = aiter_shuffle_weight(layer.w2_weight, (16, 16))
             layer.w2_weight.copy_(t)
             del t
         elif _is_cpu:
@@ -1668,7 +1696,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
                     return
 
-                fp4_weight_dtype = _require_fp4_dtype() if _use_aiter else torch.int8
+                fp4_weight_dtype = _require_fp4_dtype() if use_aiter_moe else torch.int8
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
@@ -2298,15 +2326,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
     def process_weights_hip_scale_padding(self, layer: Module):
-        padding_size = get_moe_padding_size(_use_aiter)
-        if _use_aiter:
+        use_aiter_moe = will_use_aiter_moe()
+        padding_size = get_moe_padding_size(use_aiter_moe)
+        if use_aiter_moe:
+            _, aiter_shuffle_weight = _get_aiter_shuffle_ops()
             layer.w13_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w13_weight.data, (16, 16)),
+                aiter_shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
             layer.w2_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w2_weight.data, (16, 16)),
+                aiter_shuffle_weight(layer.w2_weight.data, (16, 16)),
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
@@ -2337,11 +2367,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-            elif (
-                _is_hip
-                and (_use_aiter or _use_hip_int4)
-                and get_moe_a2a_backend().supports_aiter()
-            ):
+            elif will_use_aiter_moe():
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
@@ -2680,7 +2706,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional[AiterMoeQuantInfo]:
-        if not (_use_aiter or _use_hip_int4):
+        use_aiter_moe = will_use_aiter_moe()
+        if not use_aiter_moe:
             return None
         assert not no_combine, f"{no_combine=} is not supported."
 
@@ -2718,7 +2745,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+            expert_mask=getattr(layer.dispatcher, "expert_mask_gpu", None),
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),

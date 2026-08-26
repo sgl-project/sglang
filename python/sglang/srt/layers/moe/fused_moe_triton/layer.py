@@ -34,14 +34,10 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -53,6 +49,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -91,7 +88,6 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
@@ -538,6 +534,14 @@ class FusedMoE(torch.nn.Module):
         else:
             setattr(self, name, tensor)
 
+    @property
+    def use_aiter_padded_loading(self) -> bool:
+        return (
+            will_use_aiter_moe()
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+
     @cached_property
     def use_padded_loading(self) -> bool:
         # This handles the case where the loaded weights are smaller than the padded expert_data
@@ -545,13 +549,59 @@ class FusedMoE(torch.nn.Module):
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # 3. GPU with Aiter padding
-        aiter_padded = (
-            _use_aiter
-            and hasattr(self, "w2_weight")
-            and getattr(self.w2_weight, "weight_padded", False)
+        return (
+            _is_cpu or self.use_flashinfer_trtllm_moe or self.use_aiter_padded_loading
         )
 
-        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+    def _load_aiter_padded_tp_weight(
+        self,
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        param_data_start: int,
+        padded_shard_size: int,
+        shard_dim: int,
+        tp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shard checkpoint data by its logical size, then pad the local buffer.
+
+        AITER can require a physical intermediate dimension larger than the
+        checkpoint's logical TP shard.  Using the padded size to calculate the
+        checkpoint offset would give ranks after zero the wrong slice.
+        """
+        loaded_size = loaded_weight.shape[shard_dim]
+        if self.use_presharded_weights:
+            logical_shard_size = loaded_size
+        else:
+            if loaded_size % self.moe_tp_size != 0:
+                raise ValueError(
+                    "Checkpoint MoE weight cannot be evenly sharded across TP: "
+                    f"shape={tuple(loaded_weight.shape)}, dim={shard_dim}, "
+                    f"tp_size={self.moe_tp_size}."
+                )
+            logical_shard_size = loaded_size // self.moe_tp_size
+
+        if logical_shard_size > padded_shard_size:
+            raise ValueError(
+                f"Logical MoE shard ({logical_shard_size}) exceeds its padded "
+                f"buffer ({padded_shard_size})."
+            )
+
+        param_shard = expert_data.narrow(shard_dim, param_data_start, padded_shard_size)
+        param_shard.zero_()
+
+        if not self.use_presharded_weights:
+            weight_start = logical_shard_size * tp_rank
+            if weight_start + logical_shard_size > loaded_weight.shape[shard_dim]:
+                raise ValueError(
+                    "Checkpoint MoE weight is too small for the requested TP shard: "
+                    f"shape={tuple(loaded_weight.shape)}, dim={shard_dim}, "
+                    f"start={weight_start}, size={logical_shard_size}."
+                )
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, weight_start, logical_shard_size
+            )
+        param_shard = param_shard.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
+        return param_shard, loaded_weight
 
     def _load_per_tensor_weight_scale(
         self,
@@ -665,7 +715,16 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        if self.use_padded_loading:
+        if self.use_aiter_padded_loading and not is_bias:
+            expert_data, loaded_weight = self._load_aiter_padded_tp_weight(
+                expert_data,
+                loaded_weight,
+                start,
+                shard_size,
+                shard_dim,
+                tp_rank,
+            )
+        elif self.use_padded_loading and not self.use_aiter_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
@@ -756,7 +815,16 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if self.use_padded_loading:
+        if self.use_aiter_padded_loading and not is_bias:
+            expert_data, loaded_weight = self._load_aiter_padded_tp_weight(
+                expert_data,
+                loaded_weight,
+                0,
+                shard_size,
+                shard_dim,
+                tp_rank,
+            )
+        elif self.use_padded_loading and not self.use_aiter_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(

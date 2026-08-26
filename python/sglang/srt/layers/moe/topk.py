@@ -18,6 +18,7 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -96,6 +97,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
+    will_use_aiter_moe,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -123,7 +125,6 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
@@ -194,12 +195,27 @@ if _is_cuda or _is_hip or _is_xpu:
             from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
         except ImportError:
             pass
-if _use_aiter:
+
+
+@lru_cache(maxsize=1)
+def _get_aiter_topk_ops():
+    """Import AITER routing ops when the effective MoE backend needs them.
+
+    ``--moe-runner-backend aiter`` is a first-class backend selection and may
+    be used without the broad ``SGLANG_USE_AITER`` switch.  Importing these
+    operators from an environment-derived module constant made routing disagree
+    with weight preparation and runner construction in that configuration.
+    """
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
         from aiter.fused_moe import fused_topk as aiter_fused_topk
-    except ImportError:
-        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    except ImportError as exc:
+        raise ImportError(
+            "aiter is required when the effective MoE runner is AITER"
+        ) from exc
+    return aiter_biased_grouped_topk, aiter_fused_topk
+
+
 if _is_musa:
     try:
         from mate import moe_fused_gate
@@ -849,7 +865,8 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        if _use_aiter:
+        if will_use_aiter_moe():
+            _, aiter_fused_topk = _get_aiter_topk_ops()
 
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
             topk_weights, topk_ids = aiter_fused_topk(
@@ -903,7 +920,8 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        if _use_aiter and correction_bias is not None:
+        if will_use_aiter_moe() and correction_bias is not None:
+            aiter_biased_grouped_topk, _ = _get_aiter_topk_ops()
             aiter_biased_grouped_topk(
                 gating_output,
                 correction_bias.to(dtype=gating_output.dtype),
@@ -1247,7 +1265,11 @@ def biased_topk_jit_kernel_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
+    if (
+        will_use_aiter_moe()
+        and scoring_func == "sqrtsoftplus"
+        and num_fused_shared_experts == 0
+    ):
         from aiter import topk_gating
 
         num_tokens = gating_output.shape[0]
@@ -1611,7 +1633,8 @@ def biased_grouped_topk_gpu(
             topk_group=topk_group,
         )
 
-    elif _use_aiter:
+    elif will_use_aiter_moe():
+        aiter_biased_grouped_topk, _ = _get_aiter_topk_ops()
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
@@ -1945,7 +1968,7 @@ def remap_topk_for_per_rank_shared_slots(
     #     weight must be 1/routed_scaling_factor for (1/rsf) * rsf = 1.0.
     #   * aiter (HIP) path: aiter_biased_grouped_topk folds routed_scaling_factor
     #     into each routed topk weight, and forward_deepep SKIPS the post-MoE
-    #     multiply for _use_aiter (see its `not (... or _use_aiter)` guard). The
+    #     multiply for the effective AITER runner. The
     #     shared weight must therefore be 1.0 -- applying 1/rsf here would
     #     under-weight the always-on shared expert by routed_scaling_factor and
     #     corrupt every MoE layer.
@@ -1958,7 +1981,7 @@ def remap_topk_for_per_rank_shared_slots(
     # one validated on AMD MI355X); those other backends are left at their
     # existing behavior and can be addressed by their maintainers.
     routed_scaling_factor = topk_config.routed_scaling_factor
-    if _use_aiter:
+    if will_use_aiter_moe():
         topk_weights[:, -num_fused_shared_experts:] = 1.0
     elif routed_scaling_factor is not None and routed_scaling_factor != 0:
         topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
@@ -1994,6 +2017,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    use_aiter_moe = will_use_aiter_moe()
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
         num_fused_shared_experts
@@ -2057,7 +2081,7 @@ def _post_process_topk_ids(
         # _fill_padded_rows launch here.
         _fold_pad_into_append = (
             num_fused_shared_experts > 0
-            and _use_aiter
+            and use_aiter_moe
             and use_per_rank_shared_slots
             and not _eplb_remap_enabled()
         )
@@ -2078,7 +2102,7 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    _aiter_append = num_fused_shared_experts > 0 and use_aiter_moe
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2089,7 +2113,7 @@ def _post_process_topk_ids(
         #
         # Shared weight is 1.0 here because this branch is aiter-only:
         # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
-        # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
+        # weights and forward_deepep skips the post-MoE multiply for AITER,
         # so the always-on shared expert must contribute 1.0x. (The eager
         # per-rank shared-slot remap instead sets shared weight to
         # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
@@ -2184,6 +2208,7 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
+    use_aiter_moe = will_use_aiter_moe()
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -2222,7 +2247,7 @@ def select_experts(
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if use_aiter_moe else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -2236,7 +2261,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if use_aiter_moe else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -2253,7 +2278,7 @@ def select_experts(
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=num_routed_topk if use_aiter_moe else top_k,
             renormalize=renormalize,
             correction_bias=correction_bias,
             scoring_func=scoring_func,
@@ -2268,7 +2293,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if use_aiter_moe else top_k,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts,
@@ -2286,7 +2311,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if use_aiter_moe else top_k,
                 renormalize=renormalize,
             )
         else:
@@ -2300,7 +2325,7 @@ def select_experts(
             if (
                 _fused_topk_pack
                 and _is_cuda
-                and not _use_aiter
+                and not use_aiter_moe
                 and scoring_func == "softmax"
                 and correction_bias is None
                 and expert_location_dispatch_info is None
@@ -2330,7 +2355,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if use_aiter_moe else top_k,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
@@ -2348,7 +2373,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=num_routed_topk if use_aiter_moe else top_k,
             renormalize=renormalize,
         )
 

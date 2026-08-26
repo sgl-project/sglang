@@ -60,6 +60,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -2120,7 +2121,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         self.num_fused_shared_experts = 0
-        if _use_aiter and not _disable_shared_experts_fusion():
+        if will_use_aiter_moe() and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0

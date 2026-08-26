@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -367,6 +367,43 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO
     return moe.runner_backend
+
+
+def will_use_aiter_moe() -> bool:
+    """Return whether the effective ROCm MoE runner is AITER.
+
+    An explicit runner selection takes precedence over the broad
+    ``SGLANG_USE_AITER`` default.  Keeping this decision centralized ensures
+    compatibility checks, weight allocation, layout transforms, and runner
+    construction all agree on whether AITER padding is available.
+
+    The distributed dispatchers still use ``SGLANG_USE_AITER`` to select
+    AITER-specific data contracts.  Until those paths are fully driven by the
+    runner selection, allow the standalone explicit backend without the broad
+    switch only for the non-EP dispatcher and fail early for mixed settings.
+    """
+    if not is_hip():
+        return False
+    backend = get_moe_runner_backend()
+    if backend.is_aiter():
+        a2a_backend = get_moe_a2a_backend()
+        if not a2a_backend.supports_aiter():
+            raise ValueError(
+                "moe_runner_backend=aiter is incompatible with "
+                f"moe_a2a_backend={a2a_backend.value}."
+            )
+        if not a2a_backend.is_none() and not envs.SGLANG_USE_AITER.get():
+            raise ValueError(
+                "Explicit moe_runner_backend=aiter without SGLANG_USE_AITER=1 "
+                "is currently supported only with moe_a2a_backend=none; "
+                f"got moe_a2a_backend={a2a_backend.value}."
+            )
+        return True
+    if not backend.is_auto():
+        return False
+    return (
+        envs.SGLANG_USE_AITER.get() or envs.SGLANG_INT4_WEIGHT.get()
+    ) and get_moe_a2a_backend().supports_aiter()
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
