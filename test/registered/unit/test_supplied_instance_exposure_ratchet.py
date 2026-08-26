@@ -219,7 +219,6 @@ _OVERRIDDEN_AND_READ = {
     ("weight_cache/daemon.py", "model_path"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
-    ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
     ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
