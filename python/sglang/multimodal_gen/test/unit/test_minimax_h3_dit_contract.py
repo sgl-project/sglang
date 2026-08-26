@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _diffusers_h3_checkpoint,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -41,6 +43,24 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+def test_pruned_adaln_lora_projection_preserves_affine_term():
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
+        adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
+        adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+    )
+    prefix = "blocks.0.adaln_proj.linear."
+    a = torch.tensor([[2.0, 3.0, 4.0]])
+    b = torch.tensor([[5.0], [6.0]])
+    actual = MiniMaxH3DiTModel.prepare_lora_adapter(
+        model, {prefix + "lora_A": a, prefix + "lora_B": b}
+    )
+    torch.testing.assert_close(actual[prefix + "lora_A"], a @ model.adaln_basis.T)
+    torch.testing.assert_close(
+        actual[prefix + "lora_output_offset"], b @ (a @ model.adaln_mean)
+    )
 
 
 def test_native_weight_names_and_grouped_qkv_reorder():
@@ -83,6 +103,50 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         None,
         None,
     )
+
+    assert mapping("transformer_blocks.7.attn.to_k.qweight") == (
+        "blocks.7.attn.qkv_proj.qweight",
+        1,
+        3,
+    )
+    assert mapping("time_embedder.table") == ("adaln_t_table", None, None)
+    assert mapping("transformer_blocks.7.adaln_proj.folded_bias") == (
+        "blocks.7.adaln_proj.linear.bias",
+        None,
+        None,
+    )
+
+    diffusers_weights = [
+        ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
+        ("transformer_blocks.0.attn.to_k.qweight", torch.full((2, 3), 2)),
+        ("transformer_blocks.0.attn.to_v.qweight", torch.full((2, 3), 3)),
+        (
+            "transformer_blocks.0.ff.net.0.proj.weight",
+            torch.arange(8).reshape(4, 2),
+        ),
+    ]
+    converted = dict(_diffusers_h3_checkpoint(diffusers_weights))
+    assert torch.equal(
+        converted["blocks.0.attn.qkv_proj.qweight"],
+        torch.cat([tensor for _, tensor in diffusers_weights[:3]], dim=1),
+    )
+    assert torch.equal(
+        converted["blocks.0.mlp.fc1.weight"],
+        torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
+    )
+
+    pruned_config = MiniMaxH3DiTConfig()
+    pruned_config.update_model_arch(
+        {
+            "_class_name": "MiniMaxH3PrunedTransformer3DModel",
+            "adaln_rank": 8,
+            "time_embed_dim": 2688,
+            "time_table_size": 1025,
+        }
+    )
+    assert pruned_config.arch_config.time_embed_dim == 8
+    assert pruned_config.arch_config.adaln_curve_grid == 1025
+    assert pruned_config.arch_config.adaln_affine_input_dim == 2688
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(

@@ -201,3 +201,16 @@ register_kernel(
         description="MoE align-block-size, single-launch triton variant.",
     )
 )
+
+# One gather for a quantized activation and its group scales: replaces the pair
+# of shuffle_rows launches the cutlass fp8 blockwise MoE used to walk the same
+# dst2src map with. Byte-identical to those calls.
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_rows_with_scales",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
+        capabilities=_CUDA,
+        description="Row gather of quantized values plus their scales, one launch.",
+    )
+)
