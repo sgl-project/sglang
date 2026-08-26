@@ -8719,9 +8719,10 @@ class ServerArgs:
             )
 
         if requested_transport == "cuda_ipc":
-            if not is_cuda():
+            if not (is_cuda() or is_hip()):
                 raise ValueError(
-                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA."
+                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA "
+                    "or AMD ROCm/HIP."
                 )
             if cfg.nnodes != 1:
                 raise ValueError(
