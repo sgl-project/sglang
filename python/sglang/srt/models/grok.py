@@ -723,6 +723,11 @@ class Grok1ForCausalLM(nn.Module):
 
         if get_parallel().tp_size > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+            setattr(
+                DefaultModelLoader,
+                "_get_weights_iterator",
+                _presharded_get_weights_iterator,
+            )
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
 
@@ -967,13 +972,51 @@ def _prepare_presharded_weights(
     else:
         hf_folder = model_name_or_path
 
+    import re
+
     tp_rank = get_parallel().tp_rank
+    tp_size = get_parallel().tp_size
+
+    # How many ways is this checkpoint presharded? (e.g. 8 for xai-org/grok-2)
+    n_ckpt_shards = len(
+        {
+            m.group(1)
+            for f in glob.glob(os.path.join(hf_folder, "*-TP-*.safetensors"))
+            if (m := re.search(r"-TP-(\d{3})\.safetensors$", os.path.basename(f)))
+        }
+    )
 
     # The old format
     allow_patterns = [f"*-{tp_rank:03d}.bin"]
 
-    # The new format
-    allow_patterns += [f"*-TP-{tp_rank:03d}.safetensors", "*-TP-common.safetensors"]
+    if n_ckpt_shards and n_ckpt_shards != tp_size:
+        # Running at a lower TP than the checkpoint was presharded for. Rank r owns
+        # the contiguous slice covered by checkpoint shards [r*g, (r+1)*g), so it
+        # reads g files and concatenates them (see _presharded_get_weights_iterator).
+        # Going above n_ckpt_shards would require splitting a shard; not supported.
+        if tp_size > n_ckpt_shards or n_ckpt_shards % tp_size != 0:
+            raise ValueError(
+                f"Checkpoint is presharded {n_ckpt_shards} ways; tp_size={tp_size} is "
+                f"unsupported. Use a tp_size that divides {n_ckpt_shards}."
+            )
+        g = n_ckpt_shards // tp_size
+        allow_patterns += [
+            f"*-TP-{r:03d}.safetensors" for r in range(tp_rank * g, (tp_rank + 1) * g)
+        ]
+        logger.info(
+            "Grok: %d-way presharded checkpoint at tp_size=%d; rank %d merges "
+            "checkpoint shards %d..%d",
+            n_ckpt_shards,
+            tp_size,
+            tp_rank,
+            tp_rank * g,
+            (tp_rank + 1) * g - 1,
+        )
+    else:
+        # The new format (checkpoint shard count matches tp_size)
+        allow_patterns += [f"*-TP-{tp_rank:03d}.safetensors"]
+
+    allow_patterns += ["*-TP-common.safetensors"]
 
     hf_weights_files = []
     for pattern in allow_patterns:
@@ -988,6 +1031,104 @@ def _prepare_presharded_weights(
         use_safetensors = False
 
     return hf_folder, hf_weights_files, use_safetensors
+
+
+old_get_weights_iterator = getattr(DefaultModelLoader, "_get_weights_iterator")
+
+
+def _group_presharded_files(hf_weights_files):
+    """Split files into {group_prefix: [shard paths in rank order]} plus the rest.
+
+    Only groups holding more than one checkpoint shard for this rank need merging;
+    single shards, ``*-TP-common`` and ``*.bin`` are passed through untouched.
+    """
+    import os
+    import re
+    from collections import defaultdict
+
+    groups, passthrough = defaultdict(list), []
+    for f in hf_weights_files:
+        m = re.match(r"^(.*)-TP-(\d{3})\.safetensors$", os.path.basename(f))
+        if m:
+            groups[m.group(1)].append((int(m.group(2)), f))
+        else:
+            passthrough.append(f)
+    merged, single = {}, []
+    for prefix, items in groups.items():
+        items.sort()  # ascending checkpoint-shard index => correct concat order
+        if len(items) > 1:
+            merged[prefix] = [p for _, p in items]
+        else:
+            single.append(items[0][1])
+    return merged, passthrough + single
+
+
+def _shard_concat_dim(name, shape, hidden_size):
+    """Axis along which a presharded expert weight must be concatenated."""
+    if name.endswith(".w2.weight"):  # row-parallel:    [hidden, moe_inter/g]
+        return 1
+    if name.endswith(".w1.weight") or name.endswith(".w3.weight"):
+        return 0  # column-parallel: [moe_inter/g, hidden]
+    # Fallback: the sharded axis is the one that is not the (unsharded) hidden dim.
+    if len(shape) == 2 and shape[0] == hidden_size:
+        return 1
+    return 0
+
+
+def _merged_presharded_iterator(merged_groups, hidden_size):
+    """Yield (name, tensor) with each tensor rebuilt from its checkpoint shards.
+
+    A group's shard files are opened together and concatenated tensor by tensor, so
+    peak memory is one merged tensor rather than a whole group.
+    """
+    import torch
+    from safetensors import safe_open
+
+    for prefix, paths in sorted(merged_groups.items()):
+        handles = [safe_open(p, framework="pt") for p in paths]
+        try:
+            keys = list(handles[0].keys())
+            for h in handles[1:]:
+                if set(h.keys()) != set(keys):
+                    raise ValueError(
+                        f"presharded files for {prefix} expose different tensor names"
+                    )
+            for name in keys:
+                parts = [h.get_tensor(name) for h in handles]
+                dim = _shard_concat_dim(name, list(parts[0].shape), hidden_size)
+                yield name, torch.cat(parts, dim=dim)
+                del parts
+        finally:
+            for h in handles:
+                h.__exit__(None, None, None)
+
+
+def _presharded_get_weights_iterator(self, source, **kwargs):
+    """Merge-aware weights iterator; only engages when a rank owns >1 shard."""
+    resolved = kwargs.get("resolved_source")
+    if resolved is not None:
+        hf_weights_files = list(resolved.weight_files)
+    else:
+        _, hf_weights_files, _ = self._prepare_weights(
+            source.model_or_path, source.revision, source.fall_back_to_pt
+        )
+
+    merged_groups, rest = _group_presharded_files(hf_weights_files)
+    if not merged_groups:
+        # Nothing to merge -> preserve stock behaviour exactly.
+        return old_get_weights_iterator(self, source, **kwargs)
+
+    hf_config = getattr(getattr(source, "model_config", None), "hf_config", None)
+    hidden_size = getattr(hf_config, "hidden_size", 0) if hf_config else 0
+
+    def _gen():
+        from sglang.srt.model_loader.weight_utils import safetensors_weights_iterator
+
+        yield from _merged_presharded_iterator(merged_groups, hidden_size)
+        if rest:
+            yield from safetensors_weights_iterator(rest)
+
+    return _gen()
 
 
 class Grok1ModelForCausalLM(Grok1ForCausalLM):
