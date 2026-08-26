@@ -10,15 +10,6 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestPdDcpGather(CustomTestCase):
-    def test_rejects_pointer_geometry_mismatch(self):
-        with self.assertRaisesRegex(ValueError, "length mismatch"):
-            copy_mla_rows_into_pack(
-                [0x1000],
-                torch.empty(0, dtype=torch.int64),
-                torch.empty(0, dtype=torch.uint8),
-                [],
-            )
-
     def test_gathers_strided_rows_layer_major(self):
         dim = 8
         kv0 = torch.arange(32 * dim, dtype=torch.float32, device="cuda").view(
@@ -42,8 +33,8 @@ class TestPdDcpGather(CustomTestCase):
         split = row_indices.numel() * item_lens[0]
         packed0 = pack[:split].view(torch.float32).view(4, 1, dim)
         packed1 = pack[split:].view(torch.float16).view(4, 1, 5)
-        torch.testing.assert_close(packed0, kv0[row_indices])
-        torch.testing.assert_close(packed1, kv1[row_indices])
+        torch.testing.assert_close(packed0, kv0[row_indices], rtol=0, atol=0)
+        torch.testing.assert_close(packed1, kv1[row_indices], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

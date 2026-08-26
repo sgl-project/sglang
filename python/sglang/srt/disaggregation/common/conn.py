@@ -348,7 +348,7 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
-    def _init_dcp_pack_buffers_once(self) -> None:
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
@@ -359,6 +359,7 @@ class CommonKVManager(BaseKVManager):
             self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),
+            dcp_size,
         )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:

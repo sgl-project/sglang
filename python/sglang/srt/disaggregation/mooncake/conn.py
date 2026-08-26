@@ -2046,7 +2046,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
-                        self._init_dcp_pack_buffers_once()
+                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
