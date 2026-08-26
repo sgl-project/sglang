@@ -9,7 +9,7 @@ permissions:
 jobs:
   proof:
     name: PR-controlled gate proof
-    runs-on: ubuntu-latest
+    runs-on: 1-gpu-5090
     steps:
       - name: Emit proof marker
         run: |
