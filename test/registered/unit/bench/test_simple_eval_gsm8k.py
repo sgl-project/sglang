@@ -7,10 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import _run_sgl_eval
+from sglang.test.run_eval import _run_sgl_eval, run_eval
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="base-b-test-cpu")
 
 
 def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None:
@@ -165,6 +165,53 @@ class TestRunSglEval(CustomTestCase):
         for flag, value in (("--top-p", "0.95"), ("--seed", "0"), ("--n-repeats", "1")):
             self.assertIn(flag, cmd)
             self.assertEqual(cmd[cmd.index(flag) + 1], value)
+
+    def test_model_preset_owns_model_and_sampling_defaults(self):
+        cmd = self._capture_cmd(
+            eval_name="mmmu_pro",
+            model=None,
+            num_examples=300,
+            num_threads=None,
+            temperature=None,
+            load_preset_from_model_id="moonshotai/Kimi-K3",
+        )
+
+        self.assertEqual(cmd[:3], ["sgl-eval", "run", "mmmu_pro"])
+        self.assertIn("--load-preset-from-model-id", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--load-preset-from-model-id") + 1],
+            "moonshotai/Kimi-K3",
+        )
+        self.assertEqual(cmd[cmd.index("--num-examples") + 1], "300")
+        for flag in (
+            "--model",
+            "--num-threads",
+            "--temperature",
+            "--top-p",
+            "--max-tokens",
+            "--thinking",
+        ):
+            self.assertNotIn(flag, cmd)
+
+    def test_non_preset_cli_keeps_legacy_top_p_default(self):
+        cmd = self._capture_cmd(top_p=None, _sgl_eval_from_cli=True)
+
+        self.assertIn("--top-p", cmd)
+        self.assertEqual(cmd[cmd.index("--top-p") + 1], "1.0")
+
+    @patch("sglang.test.run_eval._run_sgl_eval", return_value={"score": 0.8})
+    def test_run_eval_dispatches_hyphenated_mmmu_pro_name(self, mock_sgl_eval):
+        args = SimpleNamespace(
+            base_url="http://127.0.0.1:30000",
+            eval_name="mmmu-pro",
+        )
+
+        try:
+            result = run_eval(args)
+        except ValueError as exc:
+            self.fail(f"mmmu-pro must dispatch to sgl-eval: {exc}")
+        self.assertEqual(result, {"score": 0.8})
+        mock_sgl_eval.assert_called_once_with("mmmu_pro", args)
 
     def test_thinking_auto_detected_from_model_name(self):
         self.assertIn(

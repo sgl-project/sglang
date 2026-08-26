@@ -26,6 +26,8 @@ class MiniMaxH3Qwen3VLArchConfig(Qwen3VLArchConfig):
     head_dim: int = 128
     text_len: int = 262144
     hidden_state_skip_layer: int = 0
+    checkpoint_num_hidden_layers: int = MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER
+    conditioning_projection_path: str | None = None
 
 
 @dataclass
@@ -38,6 +40,7 @@ class MiniMaxH3Qwen3VLConfig(Qwen3VLConfig):
         """Select the in-tree extractor after loading the HF architecture."""
 
         arch = self.arch_config
+        arch.checkpoint_num_hidden_layers = int(arch.text_config.num_hidden_layers)
         arch.architectures = ["MiniMaxH3Qwen3VLEncoder"]
         arch.hidden_size = int(arch.text_config.hidden_size)
         arch.intermediate_size = int(arch.text_config.intermediate_size)

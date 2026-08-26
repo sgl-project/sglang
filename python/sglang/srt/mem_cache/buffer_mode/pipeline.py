@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRACTION
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -120,6 +121,14 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     hash_values: list[str]
 
 
+class _AnchorLock(msgspec.Struct):
+    """Pins a staged prefetch's device anchor from IO commit to consumption."""
+
+    node_id: NodeId
+    lock_params: DecLockRefParams
+    tokens: int
+
+
 def _track_content_refs(refs: dict[str, int], hash_values: list[str]) -> None:
     """Add one content ref per page hash (at D2H launch). Refcounted,
     not a flag: several launched entries can carry the same content
@@ -199,6 +208,15 @@ class BufferModePipeline:
         # Metadata-only pending-write backlog cap; beyond it new intents
         # are dropped at admission (re-trigger on a later hit).
         self.write_backlog_cap = write_backlog_cap
+        # Anchor-lock knobs; the cap keeps queued holds from pinning the pool.
+        self.anchor_lock_enabled = envs.SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK.get()
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
+        full_pool = kvcache.full_kv_pool if isinstance(kvcache, SWAKVPool) else kvcache
+        self.anchor_lock_cap_tokens = int(
+            envs.SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP.get() * full_pool.size
+        )
         self.reset()
 
     def reset(self) -> None:
@@ -226,6 +244,10 @@ class BufferModePipeline:
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backlog_cap_hits = 0
+        # rid-keyed anchor locks; released idempotently at every exit.
+        self.anchor_locks: dict[str, _AnchorLock] = {}
+        self.anchor_locked_tokens_ = 0
+        self._anchor_lock_cap_skips = 0
 
     def is_idle(self) -> bool:
         """No queued writes, staged prefetches, or storage writes in flight
@@ -586,6 +608,61 @@ class BufferModePipeline:
 
     # ---- load back pipeline (storage -> staging -> device) ----
 
+    def try_lock_anchor(self, req_id: str, anchor_node_id: NodeId) -> None:
+        """Pin the device anchor at IO commit so eviction cannot invalidate
+        the splice; drift resolves at consumption, and the cap keeps queued
+        holds from making the pool unevictable (over-cap launches unlocked)."""
+        if not self.anchor_lock_enabled or req_id in self.anchor_locks:
+            return
+        prefix_tokens = self._prefetch_prefix_ctx.get(req_id)
+        if not prefix_tokens:
+            return  # root anchor: nothing to pin
+        matched_len = len(prefix_tokens)
+        if self.anchor_locked_tokens_ + matched_len > self.anchor_lock_cap_tokens:
+            self._anchor_lock_cap_skips += 1
+            if (
+                self._anchor_lock_cap_skips <= 3
+                or self._anchor_lock_cap_skips % 1000 == 0
+            ):
+                logger.warning(
+                    "HiCache anchor-lock cap reached (skip %d): locked=%d "
+                    "want=%d cap=%d; launching unlocked.",
+                    self._anchor_lock_cap_skips,
+                    self.anchor_locked_tokens_,
+                    matched_len,
+                    self.anchor_lock_cap_tokens,
+                )
+            return
+        cache = self._cache
+        try:
+            node = cache.tree_core.node_by_id(anchor_node_id)
+        except KeyError:
+            return  # anchor deleted; fetch unlocked
+        if node.component_data[BASE_COMPONENT_TYPE].value is None:
+            # Evicted since enqueue; fetch unlocked.
+            logger.warning("HiCache anchor evicted before IO commit req=%s", req_id)
+            return
+        lock_params = cache.inc_lock_ref(anchor_node_id).to_dec_params()
+        self.anchor_locks[req_id] = _AnchorLock(
+            node_id=anchor_node_id,
+            lock_params=lock_params,
+            tokens=matched_len,
+        )
+        self.anchor_locked_tokens_ += matched_len
+
+    def release_anchor_lock(self, req_id: str) -> None:
+        """Drop a staged prefetch's anchor lock (idempotent; called at every
+        consume/drop/abort exit)."""
+        lock = self.anchor_locks.pop(req_id, None)
+        if lock is None:
+            return
+        self._cache.dec_lock_ref(lock.node_id, lock.lock_params)
+        self.anchor_locked_tokens_ -= lock.tokens
+        assert self.anchor_locked_tokens_ >= 0, (
+            f"anchor-lock accounting corrupted: locked={self.anchor_locked_tokens_} "
+            f"after releasing {req_id}"
+        )
+
     def set_prefix_ctx(self, req_id: str, matched_prefix_tokens) -> None:
         """Record the device-matched prefix at prefetch enqueue; consumed at
         staging commit to build the full-span tree key."""
@@ -627,6 +704,7 @@ class BufferModePipeline:
 
         if num_tokens == 0 or prefix_tokens is None:
             # Nothing usable fetched: recompute.
+            self.release_anchor_lock(req_id)
             cc.append_host_mem_release(
                 host_indices[:num_tokens], extra_pools=aux_xfers or None
             )
@@ -678,10 +756,14 @@ class BufferModePipeline:
         )
 
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
-        """Buffer-mode branch of init_load_back: consume the staged prefetch
-        at prefill admission — device alloc (evict-before-alloc), layer-gated
-        H2D, and a plain insert so downstream sees ordinary tree state.
-        Misaligned or alloc-failed holds drop; the request recomputes."""
+        """Consume the staged prefetch at prefill admission: device alloc,
+        layer-gated H2D, and a plain insert so downstream sees ordinary tree
+        state; invalid holds drop and the request recomputes.
+
+        Ownership contract: cc.load queues the H2D before insert adjudicates
+        ownership, so the live pre-checks below must prove the insert can
+        only ADD nodes — a dedup would free slots the in-flight copy still
+        targets (queued use-after-free)."""
         cache = self._cache
         req = params.req
         assert req is not None
@@ -689,10 +771,12 @@ class BufferModePipeline:
         unchanged = (empty, req.last_node)
         f = self.staged_prefetches.pop(req.rid, None)
         if f is None:
+            self.release_anchor_lock(req.rid)
             return unchanged
         cc = cache.cache_controller
 
         def _drop() -> tuple[torch.Tensor, NodeId]:
+            self.release_anchor_lock(req.rid)
             self._free_staging_now(f.host_indices, f.aux_xfers)
             cc.prefetch_tokens_occupied -= f.occupied_tokens
             return unchanged
@@ -700,8 +784,44 @@ class BufferModePipeline:
         # Splice-validity: the span only fits if the device prefix still
         # ends exactly at the enqueue-time matched_len.
         if len(req.prefix_indices) != f.matched_len:
-            # Prefix moved while held (leaf eviction or sibling extension):
-            # drop and recompute.
+            logger.warning(
+                "HiCache staged prefetch dropped req=%s reason=%s matched=%d "
+                "now=%d tokens_wasted=%d locked=%s",
+                req.rid,
+                "growth" if len(req.prefix_indices) > f.matched_len else "shrink",
+                f.matched_len,
+                len(req.prefix_indices),
+                f.num_tokens,
+                req.rid in self.anchor_locks,
+            )
+            return _drop()
+
+        key = RadixKey(
+            array("q", f.key_tokens),
+            extra_key=f.extra_key,
+            is_bigram=cache.tree_core.is_eagle,
+        ).page_aligned(cache.page_size)
+        span_end = f.matched_len + f.num_tokens
+
+        # Live ownership pre-check: the unified length detects anchor drift,
+        # full_kv_hit_length detects FULL overlap the insert would dedup-free
+        # (an SWA tombstone can mask live FULL from the unified match alone).
+        live = cache.match_prefix(MatchPrefixParams(key=key))
+        if (
+            len(live.device_indices) != f.matched_len
+            or live.full_kv_hit_length != f.matched_len
+        ):
+            logger.warning(
+                "HiCache staged prefetch dropped req=%s reason=overlap "
+                "matched=%d live_unified=%d live_full=%d tokens_wasted=%d "
+                "locked=%s",
+                req.rid,
+                f.matched_len,
+                len(live.device_indices),
+                live.full_kv_hit_length,
+                f.num_tokens,
+                req.rid in self.anchor_locks,
+            )
             return _drop()
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
@@ -748,13 +868,7 @@ class BufferModePipeline:
 
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
-        key = RadixKey(
-            array("q", f.key_tokens),
-            extra_key=f.extra_key,
-            is_bigram=cache.tree_core.is_eagle,
-        ).page_aligned(cache.page_size)
-        span_end = f.matched_len + f.num_tokens
-        cache.insert(
+        insert_result = cache.insert(
             InsertParams(
                 key=key,
                 value=torch.cat([req.prefix_indices, device_indices]),
@@ -773,12 +887,24 @@ class BufferModePipeline:
             hash_values=f.hash_values,
         )
         m = cache.match_prefix(MatchPrefixParams(key=key))
-        if len(m.device_indices) < span_end:
-            # The insert walk did not adopt the full span (should not happen
-            # for a locked prefix); the slots are tree-owned/evictable — do
-            # not splice, the request recomputes.
-            return unchanged
-        return device_indices, m.last_device_node
+        self.release_anchor_lock(req.rid)
+        canonical = m.device_indices[f.matched_len : span_end]
+        if len(m.device_indices) < span_end or not torch.equal(
+            canonical, device_indices
+        ):
+            # Fail-stop: the insert freed or replaced slots the in-flight H2D
+            # still targets; continuing risks silent KV corruption.
+            raise RuntimeError(
+                f"HiCache buffer load-back ownership violation req={f.req_id}: "
+                f"insert prefix_len={insert_result.prefix_len} "
+                f"expected={f.matched_len}, adopted={len(m.device_indices)} "
+                f"span_end={span_end}, canonical_matches_incoming="
+                f"{len(m.device_indices) >= span_end and torch.equal(canonical, device_indices)}; "
+                f"in-flight H2D targets freed slots"
+            )
+        # Canonical ownership: return the post-insert tree slice, never the
+        # raw cc.load allocation (torch.equal here; the tree slice is truth).
+        return canonical, m.last_device_node
 
     def try_finish_load_back(self, ack_id: int) -> bool:
         """Fill ack: free the host bounce and return True when the ack id is
@@ -796,10 +922,11 @@ class BufferModePipeline:
 
         cc.prefetch_tokens_occupied -= f.occupied_tokens
         logger.info(
-            "HiCache prefetch fill committed req=%s filled=%d occupied=%d",
+            "HiCache prefetch fill committed req=%s filled=%d occupied=%d locked=%d",
             f.req_id,
             f.num_tokens,
             cc.prefetch_tokens_occupied,
+            self.anchor_locked_tokens_,
         )
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_prefetched_tokens(f.num_tokens)
@@ -808,6 +935,7 @@ class BufferModePipeline:
     def release_aborted_staged(self, rid: str) -> bool:
         """Free an aborted request's staged prefetch (nothing device-side
         exists yet — only the bounce). Returns True when a hold existed."""
+        self.release_anchor_lock(rid)
         staged = self.staged_prefetches.pop(rid, None)
         if staged is None:
             return False

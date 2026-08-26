@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
@@ -150,61 +151,15 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
         yield module
         return
 
-    original_infos: Dict[str, Dict] = {}
-
-    # Store original device states and move parameters to GPU if they're on CPU
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            original_data = p.data
-            device_data = p.data.to(target_device)
-            original_infos[name] = dict(
-                device=p.device,
-                original_data=original_data,
-                device_data=device_data,
-            )
-            p.data = device_data
-        # Parameters already on target device are not touched
-
-    try:
+    with stage_module_for_post_load(
+        module,
+        target_device,
+        pin_memory=target_device.type != "cpu" and is_pin_memory_available(),
+    ):
         yield module
-
-    finally:
-        # Restore parameters to their original devices, ignoring new parameters
-        pin_memory = is_pin_memory_available()
-        for name, p in module.named_parameters():
-            if name in original_infos:
-                original_info = original_infos[name]
-                device_data = original_info["device_data"]
-                original_data = original_info["original_data"]
-                original_device: torch.device = original_info["device"]
-
-                if (
-                    (device_data.device == p.data.device)
-                    and (device_data.data_ptr() == p.data.data_ptr())
-                    and (device_data.shape == p.data.shape)
-                    and (device_data.dtype == p.data.dtype)
-                ):
-                    original_data.copy_(p.data.to(original_data.device))
-                    p.data = original_data
-                elif original_device.type == "cpu":
-                    # `torch.empty_like` does not support `pin_memory` argument
-                    cpu_data = torch.empty_strided(
-                        size=p.data.size(),
-                        stride=p.data.stride(),
-                        dtype=p.data.dtype,
-                        layout=p.data.layout,
-                        device="cpu",
-                        pin_memory=pin_memory,
-                    )
-                    cpu_data.copy_(p.data)
-                    p.data = cpu_data
-                else:
-                    p.data = p.data.to(original_device)
-        # New parameters or parameters already on target device are untouched
 
 
 logger = logging.getLogger(__name__)
@@ -4346,6 +4301,11 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.EXPERT_PACK:
+        from sglang.srt.model_loader.expert_pack_loader import ExpertPackModelLoader
+
+        return ExpertPackModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
