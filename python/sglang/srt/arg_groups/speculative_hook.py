@@ -263,11 +263,17 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if server_args.speculative_num_draft_tokens is None:
+        from sglang.srt.configs.model_config import draft_model_override_args_json
         from sglang.srt.speculative.dflash_utils import (
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(server_args.json_model_override_args)
+        model_override_args = json.loads(
+            draft_model_override_args_json(
+                draft_override_args=server_args.speculative_draft_json_model_override_args,
+                target_override_args=server_args.json_model_override_args,
+            )
+        )
         inferred_block_size = None
         try:
             from sglang.srt.utils.hf_transformers_utils import get_config
@@ -585,6 +591,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     if draft_backend is None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
+        from sglang.srt.configs.model_config import draft_model_override_args_json
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
         from sglang.srt.utils.hf_transformers_utils import get_config
 
@@ -592,7 +599,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             server_args.speculative_draft_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.speculative_draft_model_revision,
-            model_override_args=json.loads(server_args.json_model_override_args),
+            model_override_args=json.loads(
+                draft_model_override_args_json(
+                    draft_override_args=server_args.speculative_draft_json_model_override_args,
+                    target_override_args=server_args.json_model_override_args,
+                )
+            ),
         )
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config

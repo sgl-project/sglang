@@ -1561,6 +1561,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>pt</code>, <code>safetensors</code>, <code>npcache</code>, <code>dummy</code>, <code>sharded_state</code>, <code>gguf</code>, <code>bitsandbytes</code>, <code>mistral</code>, <code>layered</code>, <code>flash_rl</code>, <code>remote</code>, <code>remote_instance</code>, <code>fastsafetensors</code>, <code>private</code>, <code>runai_streamer</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-draft-json-model-override-args`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A dictionary in JSON string format used to override the draft model's default configuration. If unset, the draft model reuses `--json-model-override-args`; when set, it replaces that value for the draft model (no merging).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-num-steps`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of steps sampled from draft model in Speculative Decoding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

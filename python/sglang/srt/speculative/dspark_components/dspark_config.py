@@ -31,7 +31,10 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 
 
 def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import (
+        draft_model_override_args_json,
+        is_deepseek_v4,
+    )
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
@@ -41,7 +44,12 @@ def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
         draft_model_path,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_spec().speculative_draft_model_revision,
-        model_override_args=json.loads(get_model().json_model_override_args),
+        model_override_args=json.loads(
+            draft_model_override_args_json(
+                draft_override_args=get_spec().speculative_draft_json_model_override_args,
+                target_override_args=get_model().json_model_override_args,
+            )
+        ),
         model_config_parser=get_model().model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
@@ -143,6 +151,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     `--speculative-num-draft-tokens` along with it.
     """
     from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.configs.model_config import draft_model_override_args_json
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     resolving = resolved_view(server_args)
@@ -150,7 +159,12 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
         resolving.speculative_draft_model_path,
         trust_remote_code=resolving.trust_remote_code,
         revision=resolving.speculative_draft_model_revision,
-        model_override_args=json.loads(resolving.json_model_override_args),
+        model_override_args=json.loads(
+            draft_model_override_args_json(
+                draft_override_args=resolving.speculative_draft_json_model_override_args,
+                target_override_args=resolving.json_model_override_args,
+            )
+        ),
     )
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
 

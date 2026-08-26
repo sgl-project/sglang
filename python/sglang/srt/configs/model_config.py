@@ -271,6 +271,20 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def draft_model_override_args_json(
+    *, draft_override_args: Optional[str], target_override_args: str
+) -> str:
+    """The draft model's config override, falling back to the target's when unset.
+
+    Takes the two values rather than a config object: the draft leaf lives in the
+    `spec` namespace and the target leaf in `model`, so post-publish callers read
+    them off different bags while the resolution pipeline reads a resolving view.
+    """
+    if draft_override_args is not None:
+        return draft_override_args
+    return target_override_args
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -599,6 +613,14 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
+        model_override_args = (
+            draft_model_override_args_json(
+                draft_override_args=server_args.speculative_draft_json_model_override_args,
+                target_override_args=server_args.json_model_override_args,
+            )
+            if is_draft_model
+            else server_args.json_model_override_args
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -608,7 +630,7 @@ class ModelConfig:
                 if context_length is not None
                 else server_args.context_length
             ),
-            model_override_args=server_args.json_model_override_args,
+            model_override_args=model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
