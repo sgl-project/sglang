@@ -15,7 +15,7 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
 | per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
-| parallel | `get_parallel()` | **dual**: live topology (tp/pp/moe/attn sizes, ranks, groups — `@property`, read-through) *plus* parallel config-bag leaves via `__getattr__` | live: after dist init; config leaves: after publish |
+| parallel | `get_parallel()` | **dual, spelled**: bare names are the live topology (tp/pp/moe/attn sizes, ranks, groups — `@property`, read-through); `get_parallel().config.<leaf>` is the parallel config bag | live: after dist init; `config`: after publish |
 
 `reset_context()` (unit-test teardown) drops the published config and installs fresh
 flags/resources/forward tiers.
@@ -214,23 +214,29 @@ row for a method the Ray actor does not have, and an effective-field set
 without `load_format` -- and both were invisible because the assertion had
 slack (`>= len(...) - 1`) or compared key names instead of value sources.
 
-### `get_parallel()`: config leaves vs live topology
+### `get_parallel()`: live topology bare, configuration under `config`
 
-Config leaves (`nccl_port`, `enable_dp_attention`, `dp_size`, `ep_size`,
-`dwdp_size`, ...) resolve through the parallel bag; live topology (`tp_size`,
-`attn_tp_group`, ranks) are `@property` and **win on name collisions**. Five topology
-sizes are live-shadowed (`tp/pp/dcp/attn_cp/moe_dp_size`): the live property always
-wins on the accessor, so a config-intent read of those goes through
-`configured_tp_size()` / `configured_pp_size()` / `configured_moe_dp_size()` /
-`configured_attn_cp_size()` (DCP: the live `get_parallel().attn_dcp_size` /
-`.dcp_enabled`, which are safe with no group installed — they answer `1` /
-`False` — but report the *effective* topology, never the requested size;
-a config-intent read would need its own accessor, which no call site
-requires today). A process-global seed field-read of one of these
-sizes (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure; the
-sites that legitimately go around the live property are the `configured_*_size()`
-readers, and those are what the ratchet registers, each with its reason
-(`_CONFIGURED_SIZE_CALL_SITES` in `test_global_config_read_ratchet.py`). A
+**Bare is the live group, `config` is what was configured.** `get_parallel().tp_size`
+and its size / rank / group siblings are `@property` read-through over the canonical
+getters; `get_parallel().config.<leaf>` reads the published `parallel` bag
+(`nccl_port`, `enable_dp_attention`, `dp_size`, `ep_size`, `dwdp_size`, ... and the
+five sizes that also have a live property). A bare read of a config-only leaf raises
+an `AttributeError` naming the `.config` spelling — the tier is never guessed from
+whether a property happens to exist.
+
+The two tiers are **not** two spellings of one number. Live diverges from configured
+wherever elastic EP scales the world away from the launch shape, and wherever
+`initialize_model_parallel` aliases `_MOE_DP` to `_ATTN_CP` (`attn_cp_size >
+moe_dp_size`), which makes a live comparison of that pair degenerate. The five
+live-shadowed sizes (`tp/pp/dcp/attn_cp/moe_dp_size`) are where the choice matters,
+and every business read of `get_parallel().config.<one of them>` is registered with
+its reason in `_CONFIGURED_SIZE_CALL_SITES` (`test_global_config_read_ratchet.py`).
+DCP has a third shape: the live `get_parallel().attn_dcp_size` / `.dcp_enabled`
+answer the *effective* topology (`1` / `False` with no group installed), never the
+requested size — `.config.dcp_size` is the requested one.
+
+A process-global seed field-read of one of these sizes
+(`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
 `server_args` the object was *handed* is a different thing and not a ratchet
 matter — see "Reads that legitimately stay on a ServerArgs instance".
 Fail-loud is narrower: before dist init, a live size/group read raises — except
@@ -238,10 +244,16 @@ the DCP pair, which degrades instead (`dcp_enabled` → `False`,
 `attn_dcp_size` → `1` when no group is installed;
 `test_attn_dcp_defaults_when_group_is_uninitialized` pins this). After init,
 only the DCP group is optional (`_DCP` exists only when `dcp_size > 1`; attn-CP and
-moe-DP always install, as size-1 aliases if unused). `ParallelContext.__getattr__` is deliberately dynamo-traceable (no
+moe-DP always install, as size-1 aliases if unused). The `config` hop is
+deliberately dynamo-traceable (a plain property over a slot, no
 `object.__getattribute__`); gate helpers like `enable_moe_dense_fully_dp()` run inside
 compiled model forwards (`test_parallel_config_leaves_trace_under_torch_compile` pins
 this).
+
+A third surface carries the same names: `ParallelState` (`self.ps` / `mr.ps`), the
+frozen per-process snapshot built once in `Scheduler.__init__` from these configured
+sizes plus this process's ranks, and handed down (draft runners included). Prefer it
+where an object was handed one; it is not a global accessor.
 
 ### Reading config: the seed is off limits
 
@@ -249,14 +261,14 @@ this).
 
 - **a resolved leaf** → its namespace bag (`get_exec().moe.moe_runner_backend`,
   `get_schedule().chunked_prefill_size`, …). Bag-backed reads — a leaf directly, or
-  a bag-derived accessor below, including `configured_*_size()` which reads the
-  parallel bag's own leaf — are what see post-publish overrides. Only the
+  a bag-derived accessor below, including the `get_parallel().config` hop — are
+  what see post-publish overrides. Only the
   instance-derived accessors (the ones with no leaf to read) answer from the
   startup record and therefore do not.
 - **a leaf the caller names at runtime** (a readback reporting a list of fields)
   → `get_context().config_leaf(name)`; it resolves the name through `NS` and
   raises on a non-leaf. A call site that knows its field reads the bag leaf.
-- **the live topology** → `get_parallel()`.
+- **the live topology** → `get_parallel()` (bare names).
 - **a value derived from published leaves** → an accessor in `runtime_context` that
   derives it *from the bags*: `mamba_extra_buffer_enabled()` /
   `mamba_extra_buffer_lazy_enabled()` read `get_memory()` and `get_exec()`, so
@@ -275,24 +287,18 @@ this).
   property with no bag of its own. A new derived member gets an accessor here
   rather than call sites reaching for the record, and only when the bag-derived
   shape above cannot express it.
-- **what was *configured*, where `get_parallel()` shadows it with the live value**
-  → `configured_{tp,pp,moe_dp,attn_cp}_size()` — the full names are
-  `configured_tp_size`, `configured_pp_size`, `configured_moe_dp_size`,
-  `configured_attn_cp_size`. They read the parallel bag's own leaf (going
-  around the live property that shadows those four names), so they answer with
-  the resolved configuration and follow a post-publish override. DCP has no configured accessor because no
-  config-intent DCP call site exists today — the live reads go through
-  `get_parallel().attn_dcp_size` / `.dcp_enabled`, which answer the effective
-  topology (`1` / `False` when no group is installed). A site
-  that must know the *requested* DCP size before dist init needs its own
-  `configured_dcp_size()` (and an entry in `_CONFIGURED_SIZE_CALL_SITES`, which lives
-  in the ratchet test, not in this skill); note the live pair does not *need*
-  dist init — with no group it answers `1` / `False` — it just cannot answer
-  with the requested size. Every (file, accessor) pair is registered
+- **what was *configured*, where the bare name is the live value**
+  → `get_parallel().config.{tp,pp,moe_dp,attn_cp,dcp}_size`. It reads the parallel
+  bag's own leaf, so it answers with the resolved configuration and follows a
+  post-publish override. The DCP live pair (`get_parallel().attn_dcp_size` /
+  `.dcp_enabled`) is a different question again: it answers the effective topology
+  (`1` / `False` when no group is installed), never the requested size, and it does
+  not *need* dist init to answer. Every (file, size) pair is registered
   with its reason in `test_global_config_read_ratchet.py`
   (`_CONFIGURED_SIZE_CALL_SITES`), and that test fails if the code and the list
-  disagree — a new file, or a new accessor in a listed file, has to be added — so a new site needs both an answer the live property cannot give and
-  an entry saying what it is.
+  disagree — a new file, or a new size in a listed file, has to be added — so a new
+  site needs both an answer the live property cannot give and an entry saying what
+  it is.
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
   `draft_attention_backend`, `num_fused_shared_experts` on the model).
@@ -498,13 +504,19 @@ ONE thread — do not design for TBO threads that don't exist.
    — including local copies of an alias, `cfg = sa` — module-level, or parked on an
    instance attribute, plus the `getattr(..., "field")` spelling of each; a name
    computed at runtime or indirection deeper than a local name copy is census-tool
-   territory, per the test's docstring). The scanners match `get_server_args` and
-   `configured_*_size` by their literal names, and the same file *bans*
-   `import ... as` renames of them so that matching stays sound. Exempt by owner
+   territory, per the test's docstring). The scanner matches `get_server_args` by its
+   literal name, and the same file *bans* `import ... as` renames of it so that
+   matching stays sound. Exempt by owner
    module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). The same file
-   carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, accessor) map of every
-   `configured_*_size()` reader with the reason the live property cannot serve it — a new
-   file or a new accessor in a listed file must be added there.
+   carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, size) map of every
+   `get_parallel().config.<live-shadowed size>` reader with the reason the live property
+   cannot serve it — a new file or a new size in a listed file must be added there. Its
+   subject set is *derived* (property names ∩ `parallel` NS leaves), and it resolves
+   every spelling of the call itself — an aliased import, a module-qualified receiver
+   (including the whole dotted path an unaliased `import` binds), a local bound to either
+   hop — so neither a rename nor a new shadowed size escapes it.
+   `TestParallelConfigReadSpellings` in that file runs each spelling, because a spelling
+   the scanner cannot resolve drops the read instead of failing anything.
 6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
@@ -538,8 +550,9 @@ Never module-skip a test "until the migration settles" — seed the context inst
   form** (attribute-source ints get automatic-dynamic after the first size
   change). Bools (≤2 values) are tolerable in any form — see
   `ForwardFlags._GRAPH_VISIBLE`. Config-bag leaves are real instance attributes for
-  exactly this reason, and `ParallelContext.__getattr__` must stay free of
-  `object.__getattribute__` (dynamo graph-breaks on it). Before moving such state,
+  exactly this reason, and the parallel config tier is read through the plain
+  `ParallelContext.config` property for the same reason (`__getattr__` is
+  error-only, and `object.__getattribute__` graph-breaks). Before moving such state,
   prove its readers sit outside compile coverage; a piecewise-prefill boot of a small
   model is the fast check (recompile storms show as `torch._dynamo hit
   config.recompile_limit` during the compile pass).

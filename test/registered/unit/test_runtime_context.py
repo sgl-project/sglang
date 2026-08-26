@@ -907,12 +907,11 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
-        # Regression: parallel config leaves resolve through
-        # ``ParallelContext.__getattr__`` (the bag fallback), and gate helpers
-        # such as ``enable_moe_dense_fully_dp()`` read them inside compiled
-        # model forwards — the fallback body must stay dynamo-traceable
-        # (``object.__getattribute__`` graph-breaks). fullgraph=True turns any
-        # graph break back into a failure.
+        # Regression: gate helpers such as ``enable_moe_dense_fully_dp()`` read
+        # parallel config leaves inside compiled model forwards through the
+        # `config` property, which must stay dynamo-traceable
+        # (``object.__getattribute__`` graph-breaks).
+        # fullgraph=True turns any graph break back into a failure.
         import torch
 
         from sglang.srt.runtime_context import get_parallel
@@ -923,11 +922,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)
             def probe(x):
                 par = get_parallel()
-                if par.enable_prefill_context_parallel:
+                if par.config.enable_prefill_context_parallel:
                     x = x + 1
-                if par.moe_dense_tp_size == 1:
+                if par.config.moe_dense_tp_size == 1:
                     x = x + 2
-                if par.dwdp_size > 1:
+                if par.config.dwdp_size > 1:
                     x = x + 4
                 return x
 
