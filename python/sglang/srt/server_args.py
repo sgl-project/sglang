@@ -67,6 +67,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
+    with_phase,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -4029,8 +4030,18 @@ class ServerArgs:
             )
             # cuda_graph_config was already parsed from the legacy boolean, so
             # flipping the boolean alone would not stop graph capture.
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "HRM-Text (prefix_lm) detected: forcing --attention-backend "
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
@@ -4113,9 +4124,19 @@ class ServerArgs:
                     prefill_only_disable_kv_cache=True,
                 )
                 self._validate_prefill_only_disable_kv_cache_args()
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
             if is_cuda() and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                cfg.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+                    ),
+                )
                 # CUDA-graph sizing has already run by this point and derives
                 # its generic maximum from the 8K chunked-prefill default.
                 # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
@@ -4131,21 +4152,32 @@ class ServerArgs:
                     self, "_cuda_graph_config_locked", set()
                 )
                 if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
-                    prefill_config.max_bs = max(
-                        prefill_config.max_bs or 0,
-                        model_config.context_len,
-                        16384,
-                    )
-                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                        prefill_config.bs = (
-                            self._generate_prefill_cuda_graph_batch_sizes(
-                                prefill_config.max_bs
-                            )
+                    sizing = {
+                        "max_bs": max(
+                            prefill_config.max_bs or 0,
+                            model_config.context_len,
+                            16384,
                         )
+                    }
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        sizing["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                            sizing["max_bs"]
+                        )
+                    self._declare(
+                        "_handle_model_capability_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config, Phase.PREFILL, **sizing
+                        ),
+                    )
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
             logger.info(
                 "EmbeddingGemma detected: disabling radix cache and chunked "
                 "prefill; using breakable CUDA graph for CUDA prefill."
@@ -4690,7 +4722,12 @@ class ServerArgs:
                     "At this moment Ascend platform only support prefill graph compilation with "
                     "cuda_graph_config[prefill].tc_compiler='eager'."
                 )
-                cfg.cuda_graph_config.prefill.tc_compiler = "eager"
+                self._declare(
+                    "_handle_npu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
+                    ),
+                )
 
     def _handle_mps_backends(self):
         cfg = resolving_view(self)
@@ -4708,7 +4745,12 @@ class ServerArgs:
             # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
             # disabled so the default startup doesn't require graph capture.
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
             elif cfg.cuda_graph_config.decode.backend not in (
                 Backend.DISABLED,
                 Backend.FULL,
@@ -4718,7 +4760,12 @@ class ServerArgs:
                     "disabling unsupported decode backend '%s'.",
                     cfg.cuda_graph_config.decode.backend,
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -4803,8 +4850,17 @@ class ServerArgs:
                     sorted(bs),
                     aligned,
                 )
-                cfg.cuda_graph_config.prefill.bs = aligned
-                cfg.cuda_graph_config.prefill.max_bs = aligned[-1]
+                # One decision -- the aligned bucket list and the largest
+                # bucket it implies -- so one declaration.
+                self._declare(
+                    "_apply_deepep_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        bs=aligned,
+                        max_bs=aligned[-1],
+                    ),
+                )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4900,7 +4956,12 @@ class ServerArgs:
                 "Using tc_piecewise CUDA graph for validated multimodal "
                 "decoder prefill."
             )
-            cfg.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+            self._declare(
+                "_apply_cuda_graph_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.TC_PIECEWISE
+                ),
+            )
 
         if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
@@ -4913,10 +4974,20 @@ class ServerArgs:
         cfg = resolving_view(self)
         if cfg.disaggregation_mode == "prefill":
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
         elif cfg.disaggregation_mode == "decode":
             if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         """TcPiecewise (torch.compile + piecewise) is incompatible with
@@ -4992,7 +5063,18 @@ class ServerArgs:
         ]
         for _name, predicate in rules:
             if predicate():
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_tc_piecewise_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
+                # Every rule declares the same value, so the rules after the
+                # first match would only append identical stash entries -- log
+                # noise, and one more pickled copy per child process. One
+                # decision, one declaration (the breakable sibling below
+                # already returns on its first match).
+                break
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
@@ -5045,7 +5127,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_breakable_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_full_prefill_cudagraph_if_incompatible(self):
@@ -5059,7 +5146,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_full_prefill_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
@@ -5089,7 +5181,12 @@ class ServerArgs:
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
             cfg.cuda_graph_config.prefill.backend,
         )
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
     def _validate_cuda_graph_config(self):
         cfg = resolving_view(self)
@@ -5117,8 +5214,18 @@ class ServerArgs:
 
         if cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
             logger.warning("CUDA graph is disabled because --enable-mis is set.")
-        cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
         if not cfg.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
@@ -5166,8 +5273,11 @@ class ServerArgs:
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
         cfg = resolving_view(self)
-        decode_cuda_graph_config = cfg.cuda_graph_config.decode
-        prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
+        # A copy, so what the parse declared stays that entry's value and this
+        # handler's sizing lands as its own declaration below.
+        cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+        decode_cuda_graph_config = cuda_graph_config.decode
+        prefill_cuda_graph_config = cuda_graph_config.prefill
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -5312,6 +5422,11 @@ class ServerArgs:
                 self._generate_prefill_cuda_graph_batch_sizes(
                     prefill_cuda_graph_config.max_bs
                 )
+            )
+
+        if cuda_graph_config != cfg.cuda_graph_config:
+            self._declare(
+                "_handle_gpu_memory_settings", cuda_graph_config=cuda_graph_config
             )
 
         if cfg.mem_fraction_static is None:
@@ -5753,7 +5868,14 @@ class ServerArgs:
                         # The DSA CP field declarations moved to the override
                         # registry (arg_groups/overrides.py:
                         # _deepseek_family_overrides).
-                        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                        self._declare(
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if cfg.dp_size < cfg.tp_size:
@@ -5836,7 +5958,14 @@ class ServerArgs:
                 # the override registry (arg_groups/overrides.py:
                 # _deepseek_family_overrides).
                 if cfg.enable_prefill_cp and self.use_mla_backend():
-                    cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                    self._declare(
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
 
             # Set moe backend for DeepSeek: the sm100 quant/moe resolution
             # moved to the resolution pipeline (arg_groups/overrides.py:
@@ -6332,15 +6461,35 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
 
         if attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             assert (
                 cfg.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
@@ -7186,11 +7335,17 @@ class ServerArgs:
                 and prefill_cfg.max_bs > cfg.chunked_prefill_size
                 and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
             ):
-                prefill_cfg.max_bs = cfg.chunked_prefill_size
+                clamped = {"max_bs": cfg.chunked_prefill_size}
                 if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
-                        prefill_cfg.max_bs
+                    clamped["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                        clamped["max_bs"]
                     )
+                self._declare(
+                    "_handle_data_parallelism",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, **clamped
+                    ),
+                )
 
         # Resolve the phase-aware TP LM-head default before validating the
         # resulting DP/TP LM-head configuration.
@@ -7500,8 +7655,18 @@ class ServerArgs:
                     )
             if cfg.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         if a2a_backend == "deepep_v2":
             self._validate_deepep_v2_model_architecture()
@@ -7541,7 +7706,12 @@ class ServerArgs:
                     "--moe-a2a-backend deepep_v2."
                 )
             # Prefill reads host counts and is not graph-capturable.
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_a2a_moe",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
             )
@@ -9266,8 +9436,18 @@ class ServerArgs:
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         from sglang.srt.arg_groups.overrides import (
             _dllm_attention_backend,
@@ -9403,8 +9583,18 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         if cfg.msprobe_dump_config is not None:
@@ -9413,8 +9603,18 @@ class ServerArgs:
                 "cuda graph is disabled because msProbe only supports dump in eager mode, "
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         # Validate limit_mm_per_prompt modalities

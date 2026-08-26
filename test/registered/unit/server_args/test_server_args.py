@@ -2245,8 +2245,13 @@ class TestDeepEPv2Args(CustomTestCase):
         for mode in ("direct", "hybrid"):
             args = self._args(moe_runner_backend="deep_gemm", deepep_v2_mode=mode)
             args._handle_a2a_moe()
-            self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
-            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+            # The handler declares rather than writing the field. (This
+            # fixture never runs the parse -- it assigns `cuda_graph_config`
+            # directly -- so the declaration is the only place the decision
+            # shows up.)
+            declared = resolution_result(args, "cuda_graph_config")
+            self.assertEqual(declared.decode.backend, Backend.FULL)
+            self.assertEqual(declared.prefill.backend, Backend.DISABLED)
 
     def test_two_batch_overlap_rejected(self):
         args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
