@@ -51,6 +51,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.selective_kv_dequant import (
+    SelectiveKVWorkspace,
+    dequantize_dsa_prefix_kv_selective,
+    resolve_selective_kv_mode,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -321,6 +326,13 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        self._selective_kv_mode = resolve_selective_kv_mode(
+            envs.SGLANG_EXPERIMENTAL_DSA_SELECTIVE_KV_NO_DEDUP.get(),
+            envs.SGLANG_EXPERIMENTAL_DSA_SELECTIVE_KV_DENSE_EPOCH.get(),
+        )
+        # The object itself owns no storage. Buffers are allocated lazily only
+        # when an experimental path passes its conservative shape gate.
+        self._selective_kv_workspace = SelectiveKVWorkspace(self.device)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -2112,9 +2124,23 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self._selective_kv_mode == "off":
+                        # Preserve the established default path without
+                        # result-wrapper or workspace overhead.
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
+                    else:
+                        selective_result = dequantize_dsa_prefix_kv_selective(
+                            kv_cache,
+                            page_table_1_flattened,
+                            page_table_1,
+                            num_pool_rows=kv_cache.numel() // kv_cache.shape[-1],
+                            mode=self._selective_kv_mode,
+                            workspace=self._selective_kv_workspace,
+                        )
+                        kv_cache = selective_result.kv_cache
+                        page_table_1 = selective_result.remapped_topk
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 

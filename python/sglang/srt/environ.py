@@ -1399,6 +1399,17 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Experimental BF16 FlashMLA sparse-prefill probe: gather/dequantize one
+    # physical FP8 KV row per top-k occurrence instead of materializing the
+    # whole prefix.  This intentionally does not deduplicate overlapping top-k
+    # rows; it is default-off and exists to measure the attainable selective
+    # bandwidth benefit before promoting the fixed-workspace dedup kernel.
+    SGLANG_EXPERIMENTAL_DSA_SELECTIVE_KV_NO_DEDUP = EnvBool(False)
+    # Experimental follow-up to the no-dedup probe. A persistent dense epoch
+    # map deduplicates physical KV slots, prefix-scans them into a fixed BF16
+    # workspace, and remaps sparse indices without reading num_unique on the
+    # host. Default OFF until SM90 numerical, Nsight and E2E gates pass.
+    SGLANG_EXPERIMENTAL_DSA_SELECTIVE_KV_DENSE_EPOCH = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

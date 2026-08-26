@@ -1069,7 +1069,7 @@ def run_dsa_sparse_attention_case(
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
     index_pattern: str = "trailing",
     loc_layout: str = "shuffled_pages",
-) -> None:
+) -> DSASparseAttentionFixture:
     fixture = build_dsa_sparse_attention_fixture(
         testcase,
         case,
@@ -1089,6 +1089,7 @@ def run_dsa_sparse_attention_case(
     atol = DSA_SPARSE_FP8_ATOL if fp8_kv_cache else DSA_SPARSE_ATOL
     rtol = DSA_SPARSE_FP8_RTOL if fp8_kv_cache else DSA_SPARSE_RTOL
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
 
 
 # ---------------------------------------------------------------------------
@@ -1384,7 +1385,7 @@ def run_dsa_sparse_fp8_prefill_case(
     case: DSAAttentionCase,
     *,
     dsa_prefill_backend: str = "flashmla_auto",
-) -> None:
+) -> DSASparseAttentionFixture:
     """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
     prefix, `get_topk_transform_method` returns `RAGGED` (the only path
     that exercises `dequantize_k_cache_paged` + the
@@ -1400,7 +1401,7 @@ def run_dsa_sparse_fp8_prefill_case(
         )
     if not case.forward_mode.is_extend_without_speculative():
         raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")
-    run_dsa_sparse_attention_case(
+    return run_dsa_sparse_attention_case(
         testcase,
         case,
         dsa_prefill_backend=dsa_prefill_backend,
