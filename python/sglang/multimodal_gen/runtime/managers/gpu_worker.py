@@ -291,7 +291,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         from sglang.srt.server_args import ServerArgs as SrtServerArgs
 
         if get_context()._server_args is None:
-            publish(SrtServerArgs(model_path="dummy"), role="diffusion_gpu_worker")
+            # Carry the width the srt TP group was just installed with. srt
+            # reads a size from the published configuration and a rank from the
+            # live group, so a dummy that says tp_size=1 next to a wider group
+            # hands `linear.py` a real rank with an unsharded size.
+            publish(
+                SrtServerArgs(model_path="dummy", tp_size=self.server_args.tp_size),
+                role="diffusion_gpu_worker",
+            )
 
         # set proc title
         if model_parallel_is_initialized():

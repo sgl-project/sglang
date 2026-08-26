@@ -282,15 +282,22 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
+        # ``get_parallel()`` itself cannot fail; the reads below are what
+        # raise when the ``parallel`` bag was never published (ValueError) or
+        # the live groups are absent (AssertionError/RuntimeError), so they
+        # have to sit inside the guard.
         try:
-            parallel = get_parallel().config
-        except ValueError:
+            parallel = get_parallel()
+            enable_prefill_cp = parallel.enable_prefill_cp
+            cp_size = parallel.attn_cp_size
+            cp_strategy = parallel.cp_strategy
+        except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if parallel.enable_prefill_cp:
+        if enable_prefill_cp:
             init_cp_strategy(
                 enable_prefill_cp=True,
-                cp_size=parallel.attn_cp_size,
-                cp_strategy=parallel.cp_strategy,
+                cp_size=cp_size,
+                cp_strategy=cp_strategy,
             )
     return _STRATEGY
 

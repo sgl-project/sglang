@@ -109,9 +109,15 @@ def mixer2_gated_norm_tensor_parallel(
 
     import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
 
-    # Force attn-TP rank through the context (the weight loader reads it via
-    # get_parallel().attn_tp_rank); avoids calling initialize_dp_attention.
-    with get_parallel().override(attn_tp_rank=local_rank):
+    # Force the TP topology through the context; avoids calling
+    # initialize_dp_attention. The weight loader reads
+    # get_parallel().attn_tp_rank, and Mixer2RMSNormGated reads
+    # get_parallel().tp_size / .tp_rank (dp attention is off here, so it takes
+    # the plain-TP branch) -- sizes answer from the published bag, which this
+    # worker never publishes.
+    with get_parallel().override(
+        attn_tp_rank=local_rank, tp_size=world_size, tp_rank=local_rank
+    ):
         # create gated-norm with TP
         mixer = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,

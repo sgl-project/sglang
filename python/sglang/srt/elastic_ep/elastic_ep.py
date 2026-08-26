@@ -127,7 +127,7 @@ class ElasticEPStateManager:
 
         if get_exec().moe.ep_join_mode == "scale":
             inst.effective_ep_size = (
-                get_parallel().ep_join_rank_offset + get_parallel().config.tp_size
+                get_parallel().ep_join_rank_offset + get_parallel().tp_size
             )
             inst.original_ep_size = (
                 get_parallel().elastic_ep_initial_size

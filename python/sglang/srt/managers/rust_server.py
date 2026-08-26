@@ -275,7 +275,7 @@ class NativeMmHost:
         )
 
         return (
-            get_parallel().config.tp_size > 1
+            get_parallel().tp_size > 1
             and determine_tensor_transport_mode() != "default"
             and not self.server_args.skip_tokenizer_init
         )
