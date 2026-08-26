@@ -123,6 +123,14 @@ class Platform:
 
     supported_quantization: list[str] = []
 
+    def get_compile_backend(self, mode: str | None = None) -> str:
+        """Return the backend used to compile diffusion modules."""
+        return self.simple_compile_backend
+
+    def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
+        """Return backend-specific options for a diffusion module."""
+        return None
+
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
         return self.is_cuda_static()
@@ -187,6 +195,10 @@ class Platform:
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
+
+    def is_device_type(self, device_type: str | None) -> bool:
+        """Return whether a device type belongs to this platform."""
+        return device_type == self.device_type
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
