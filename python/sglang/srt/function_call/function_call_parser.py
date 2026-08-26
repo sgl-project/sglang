@@ -49,6 +49,7 @@ from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
+    get_json_schema_properties,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,17 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.detector_tools: List[Tool] = []
+        for tool in tools:
+            parameters = tool.function.parameters
+            if isinstance(parameters, dict):
+                properties = get_json_schema_properties(parameters)
+                if properties != parameters.get("properties", {}):
+                    function = tool.function.model_copy(
+                        update={"parameters": parameters | {"properties": properties}}
+                    )
+                    tool = tool.model_copy(update={"function": function})
+            self.detector_tools.append(tool)
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def has_tool_call(self, text: str) -> bool:
@@ -148,7 +160,7 @@ class FunctionCallParser:
         if not self.tools:
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        parsed_result = self.detector.detect_and_parse(full_text, self.detector_tools)
         tool_call_list = parsed_result.calls
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
@@ -172,7 +184,9 @@ class FunctionCallParser:
         final_normal_text = ""
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        sp_result = self.detector.parse_streaming_increment(
+            chunk_text, self.detector_tools
+        )
         if sp_result.normal_text:
             final_normal_text = sp_result.normal_text
         if sp_result.calls:
@@ -189,7 +203,7 @@ class FunctionCallParser:
         """
         if not self.tools:
             return "", []
-        sp_result = self.detector.finish(self.tools)
+        sp_result = self.detector.finish(self.detector_tools)
         return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(

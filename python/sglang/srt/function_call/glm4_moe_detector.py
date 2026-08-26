@@ -566,7 +566,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                        else:
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(

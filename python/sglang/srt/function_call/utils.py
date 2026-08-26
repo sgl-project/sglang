@@ -304,6 +304,31 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
+def get_json_schema_properties(schema: Any) -> Dict[str, Any]:
+    """Collect properties declared directly or in root schema combinators."""
+    if not isinstance(schema, dict):
+        return {}
+
+    direct_properties = schema.get("properties")
+    if not isinstance(direct_properties, dict):
+        direct_properties = {}
+    properties = direct_properties.copy()
+
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(keyword)
+        if not isinstance(branches, list):
+            continue
+        for branch in branches:
+            for name, property_schema in get_json_schema_properties(branch).items():
+                if name in direct_properties:
+                    continue
+                if name in properties and properties[name] != property_schema:
+                    properties[name] = {keyword: [properties[name], property_schema]}
+                else:
+                    properties[name] = property_schema
+    return properties
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.
