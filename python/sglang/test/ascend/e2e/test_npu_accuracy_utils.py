@@ -227,7 +227,6 @@ def run_evalscope(
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
-                r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
                 r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
                 r"accuracy\s*[:=]?\s*([\d.]+)",
@@ -236,13 +235,9 @@ def run_evalscope(
             ]
 
             for pattern in accuracy_patterns:
-                matches = list(re.finditer(pattern, full_output))
+                matches = re.findall(pattern, full_output)
                 if matches:
-                    final_accuracy = float(matches[-1].group(1))
-                    # evalscope 1.11+ reports accuracy as a percentage (e.g. 66.67%);
-                    # normalize it to a 0-1 fraction to compare against the baseline.
-                    if "%" in matches[-1].group(0):
-                        final_accuracy /= 100.0
+                    final_accuracy = float(matches[-1])
                     metrics["accuracy"] = final_accuracy
                     logger.info(f"The Final Accuracy from output: {final_accuracy}")
                     break
