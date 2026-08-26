@@ -182,8 +182,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
 
     V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-    offs_v = tl.arange(0, V_BLOCK)
-    mask_v = offs_v < V_PER_GROUP * HEAD_V
 
     # ── Input dimensions (contiguous layout) ──
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
