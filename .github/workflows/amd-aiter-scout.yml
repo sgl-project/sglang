@@ -106,6 +106,7 @@ jobs:
     secrets: inherit
     with:
       ref: amd/aiter-ci
+      rocm_version: rocm724
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
@@ -128,6 +129,7 @@ jobs:
     secrets: inherit
     with:
       ref: amd/aiter-ci
+      rocm_version: rocm724
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}

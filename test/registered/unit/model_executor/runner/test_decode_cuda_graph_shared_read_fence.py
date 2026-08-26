@@ -16,18 +16,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 DECODE = ForwardMode.DECODE
-VERIFY = ForwardMode.TARGET_VERIFY
-EXTEND = ForwardMode.EXTEND
 
 
-def _runner(*, owns_verify: bool = False, has_marker: bool = False):
+def _runner(*, has_marker: bool = False):
     runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
-    runner.model_runner = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(
-            is_last_shared_read_phase=lambda fm: owns_verify and fm.is_target_verify()
-        ),
-        shared_read_done_event=None,
-    )
+    runner.model_runner = SimpleNamespace(shared_read_done_event=None)
     runner.in_graph_metadata_prep_done = object() if has_marker else None
     return runner
 
@@ -40,24 +33,22 @@ def _backend(declared: SharedReadEnds):
 
 
 @pytest.mark.parametrize(
-    "mode, owns_verify, declared, has_marker, expected",
+    "declared, has_marker, expected",
     [
-        # Only decode / target verify publish; anything else keeps the coarse fence.
-        (EXTEND, False, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.UNKNOWN),
-        # Target verify publishes only when it is the step's last reading phase.
-        (VERIFY, False, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.UNKNOWN),
-        (VERIFY, True, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
-        # A backend that keeps reading through the graph is never advanced.
-        (VERIFY, True, SharedReadEnds.POST_REPLAY, True, SharedReadEnds.POST_REPLAY),
-        # Nothing to demote: the declaration is honored as-is.
-        (DECODE, False, SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
+        # The backend's declaration decides where the record lands.
+        (SharedReadEnds.IN_REPLAY, True, SharedReadEnds.IN_REPLAY),
         # Nowhere to record in-graph -> fall back to the pre-replay record.
-        (DECODE, False, SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
+        (SharedReadEnds.IN_REPLAY, False, SharedReadEnds.PRE_REPLAY),
+        # Only an in-graph declaration is demoted; the rest pass through.
+        (SharedReadEnds.POST_REPLAY, False, SharedReadEnds.POST_REPLAY),
     ],
 )
-def test_resolve_shared_read_ends(mode, owns_verify, declared, has_marker, expected):
-    runner = _runner(owns_verify=owns_verify, has_marker=has_marker)
-    assert runner._resolve_shared_read_ends(_backend(declared), mode) is expected
+def test_resolve_shared_read_ends(declared, has_marker, expected):
+    runner = _runner(has_marker=has_marker)
+    backend = _backend(declared)
+
+    assert runner._resolve_shared_read_ends(backend, DECODE) is expected
+    backend.shared_read_ends.assert_called_once_with(DECODE)
 
 
 def test_publish_read_done():

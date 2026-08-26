@@ -450,7 +450,6 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

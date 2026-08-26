@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextMod
 class IdeogramQwen3VLTextEncoder(TextEncoder):
     """Language-only Qwen3-VL text encoder stored inside Ideogram checkpoints."""
 
+    manages_checkpoint_quantization = True
     _activation_layers = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
     layer_names = ["language_model.layers"]
 
@@ -110,7 +111,7 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
             position_ids = pos_2d[None, ...].expand(4, 1, -1)
             attention_mask = torch.ones_like(cur_token_ids)
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs = self.forward(
+                outputs = self(
                     input_ids=cur_token_ids,
                     position_ids=position_ids,
                     attention_mask=attention_mask,

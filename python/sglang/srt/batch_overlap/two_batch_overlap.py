@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -678,6 +679,12 @@ class TboForwardBatchPreparer:
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        if _is_hip:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
+            n_tokens = end_token_index - start_token_index
+            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
@@ -729,8 +736,8 @@ class TboForwardBatchPreparer:
             "forward_mode",
             "is_extend_in_batch",
             "return_logprob",
-            "can_run_dp_cuda_graph",
-            "can_run_dp_breakable_cuda_graph",
+            "can_run_decode_cuda_graph",
+            "can_run_dp_prefill_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
@@ -762,7 +769,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_parallel().moe_dense_tp_size == 1
+            get_parallel().config.moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index

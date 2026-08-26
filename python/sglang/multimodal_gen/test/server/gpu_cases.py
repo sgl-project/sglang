@@ -489,6 +489,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
         ),
         REALTIME_MODEL_sampling_params,
         run_component_accuracy_check=False,
@@ -652,6 +655,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
             output_size="1344x768",
             seconds=5,
             output_format="mp4",
+            expect_audio_output=True,
             num_outputs_per_prompt=1,
             extras={
                 "task": "fl2va",
@@ -683,7 +687,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
-    )
+    ),
 ]
 
 TWO_GPU_CASES = [
@@ -723,6 +727,7 @@ TWO_GPU_CASES = [
             output_size="1344x768",
             seconds=4,
             output_format="mp4",
+            expect_audio_output=True,
             num_outputs_per_prompt=1,
             extras={
                 "task": "t2va",
@@ -739,6 +744,73 @@ TWO_GPU_CASES = [
             },
         ),
         run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "minimax_h3_ref2va_video_audio_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "Follow the motion and appearance of <Video 1> while moving the "
+                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
+                "reference with coherent timing."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "ref2va",
+                "conditions": [
+                    {
+                        "type": "video_audio",
+                        "uri": (
+                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                            "ref2va.mp4"
+                        ),
+                        "role": "reference",
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -1080,6 +1152,74 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
     )
 
 
+def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
+    """MiniMax-H3 on a pretend 12 GiB card with a pretend 32 GiB host.
+
+    This is the cookbook's consumer recipe, and it guards the whole constrained
+    placement stack at once: the deployment-size gate that keeps the VAE on its
+    checkpoint mapping, per-layer pinning under a small budget, the courier
+    thread that ships still-mapped layers, and the decode-scoped VAE residency
+    that decodes inside the VRAM the denoise just vacated. The runner's real
+    card and host are never short, so the pretend sizes are what route the run
+    onto those paths: the allocator cap makes "fits 12 GiB" enforced rather
+    than inferred, and the runtime peak baseline is that budget.
+    """
+    return DiffusionTestCase(
+        "minimax_h3_t2va_consumer_budget_1gpu_5090",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--layerwise-resident-layers",
+                "video_vae=36",
+            ],
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
+                "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": "12",
+                # the decode holds two thirds of the decoder against the 12 GiB
+                # cap; without expandable segments, fragmentation tips the
+                # last hundred MiB over
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=("A cat walking on a sunny beach, gentle waves, soft camera pan."),
+            output_size="672x384",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 384,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 1101,
+            },
+        ),
+        run_perf_check=True,
+        perf_repeat_requests=2,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+
+
 ONE_GPU_5090_CANARY_CASE_IDS = (
     "zimage_image_t2i",
     "flux_2_klein_base_image_t2i",
@@ -1090,6 +1230,7 @@ if not current_platform.is_hip():
 
 ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
+ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
 
 
 # Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
@@ -1177,6 +1318,8 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
@@ -1215,6 +1358,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
         # padded for cold-cache CI.
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,

@@ -56,6 +56,7 @@ from .group_coordinator import (
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
+    new_device_group,
 )
 
 logger = init_logger(__name__)
@@ -66,10 +67,18 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+# all ranks serving one pipeline replica (every dim except dp); with
+# dp_size == 1 it coincides with the world group
+_REPLICA: GroupCoordinator | None = None
+# Corresponding TP lanes across the replicated encoder copies in one pipeline
+# replica. None means the encoder has only one TP copy, so batch DP cannot run.
+_ENCODER_DP: GroupCoordinator | None = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
+_REPLICA_PARALLEL_AXES = "tp-sp-pp-cfg"
+_ENCODER_DP_PARALLEL_AXES = "sp-pp-cfg"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -187,6 +196,8 @@ def init_parallel_group_coordinator(
         "sequence",
         "classifier_free_guidance",
         "vae_decode",
+        "replica",
+        "encoder_data",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -204,19 +215,19 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
+        group_name = {
+            "tensor": "tp_group",
+            "vae_decode": "vae_decode_group",
+            "replica": "replica_group",
+            "encoder_data": "encoder_dp_group",
+        }.get(parallel_mode, "cfg_group")
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
             use_device_communicator=parallel_mode != "tensor",
             use_srt_custom_allreduce=parallel_mode == "tensor",
-            group_name=(
-                "tp_group"
-                if parallel_mode == "tensor"
-                else (
-                    "vae_decode_group" if parallel_mode == "vae_decode" else "cfg_group"
-                )
-            ),
+            group_name=group_name,
         )
 
 
@@ -226,6 +237,12 @@ def _get_vae_decode_group_ranks(
     # VAE decode happens after each DP replica owns a different request result.
     # Decode can shard one request across TP/SP/PP/CFG ranks, but must not cross DP.
     return rank_generator.get_ranks(_VAE_DECODE_PARALLEL_AXES)
+
+
+def _get_encoder_data_parallel_group_ranks(
+    rank_generator: RankGenerator,
+) -> list[list[int]]:
+    return rank_generator.get_ranks(_ENCODER_DP_PARALLEL_AXES)
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -322,6 +339,35 @@ def get_sp_group() -> SequenceParallelGroupCoordinator:
 def get_dp_group() -> GroupCoordinator:
     assert _DP is not None, "data parallel group is not initialized"
     return _DP
+
+
+def get_replica_group() -> GroupCoordinator:
+    """The ranks that share this rank's request batch — its pipeline replica.
+
+    Replica-wide encoder folding uses this group rather than the world group,
+    which spans replicas when dp_size > 1. The encoder batch-DP group is the
+    orthogonal non-TP subset of this replica. A process that only initialized
+    the world group has exactly one replica by construction, so the world group
+    doubles as it."""
+    if _REPLICA is not None:
+        return _REPLICA
+    return get_world_group()
+
+
+def get_encoder_data_parallel_group() -> GroupCoordinator | None:
+    """Encoder copies that may split a batch inside one pipeline replica.
+
+    Native encoders use the DiT TP group when they are not folded. The batch-DP
+    group is therefore the orthogonal non-TP part of the replica: ranks with the
+    same TP coordinate receive different batch slices, while every rank in one
+    TP group receives the same slice. A pure-TP replica has only one encoder
+    copy and returns None.
+    """
+    if _ENCODER_DP is not None:
+        return _ENCODER_DP
+    if not model_parallel_is_initialized():
+        return get_world_group()
+    return None
 
 
 # xDiT
@@ -486,6 +532,64 @@ def initialize_model_parallel(
     )
     _sync_srt_tp_group()
 
+    global _REPLICA
+    assert _REPLICA is None, "replica group is already initialized"
+    if data_parallel_size == 1:
+        _REPLICA = get_world_group()
+    else:
+        replica_axis_groups = [
+            group
+            for degree, group in (
+                (tensor_parallel_degree, _TP),
+                (sequence_parallel_degree, _SP),
+                (pipeline_parallel_degree, _PP),
+                (classifier_free_guidance_degree, _CFG),
+            )
+            if degree > 1
+        ]
+        if len(replica_axis_groups) <= 1:
+            # One nontrivial axis already is the replica group. If every axis
+            # is size one, any singleton axis group represents the replica.
+            _REPLICA = replica_axis_groups[0] if replica_axis_groups else _TP
+        else:
+            _REPLICA = init_parallel_group_coordinator(
+                group_ranks=rank_generator.get_ranks(_REPLICA_PARALLEL_AXES),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="replica",
+            )
+
+    global _ENCODER_DP
+    assert _ENCODER_DP is None, "encoder data parallel group is already initialized"
+    encoder_dp_degree = (
+        sequence_parallel_degree
+        * pipeline_parallel_degree
+        * classifier_free_guidance_degree
+    )
+    if tensor_parallel_degree == 1:
+        # With no encoder TP sharding, every replica rank owns a full encoder.
+        _ENCODER_DP = _REPLICA
+    elif encoder_dp_degree > 1:
+        nontrivial_groups = [
+            group
+            for degree, group in (
+                (sequence_parallel_degree, _SP),
+                (pipeline_parallel_degree, _PP),
+                (classifier_free_guidance_degree, _CFG),
+            )
+            if degree > 1
+        ]
+        if len(nontrivial_groups) == 1:
+            # Reuse the existing axis group in the common TP x SP case.
+            _ENCODER_DP = nontrivial_groups[0]
+        else:
+            _ENCODER_DP = init_parallel_group_coordinator(
+                group_ranks=_get_encoder_data_parallel_group_ranks(rank_generator),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="encoder_data",
+            )
+
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
     _VAE_DECODE = init_parallel_group_coordinator(
@@ -595,42 +699,24 @@ def model_parallel_is_initialized() -> bool:
     )
 
 
-_TP_STATE_PATCHED = False
-
-
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
-
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
-
-    """
-    global _TP_STATE_PATCHED
-    assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
-
-    _TP_STATE_PATCHED = True
+def use_tensor_parallel_group(tp_group: GroupCoordinator):
+    """Use one TP group consistently across diffusion and reused SRT modules."""
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
-    patch_srt_tp = srt_parallel_state._TP is old_tp_group
-    patch_srt_attention_tp = srt_parallel_state._ATTN_TP is old_tp_group
+    old_srt_tp_group = srt_parallel_state._TP
+    old_srt_attention_tp_group = srt_parallel_state._ATTN_TP
     global _TP
     _TP = tp_group
-    if patch_srt_tp:
-        srt_parallel_state._TP = tp_group
-    if patch_srt_attention_tp:
-        srt_parallel_state._ATTN_TP = tp_group
+    srt_parallel_state._TP = tp_group
+    srt_parallel_state._ATTN_TP = tp_group
     try:
         yield
     finally:
-        # restore the original state
-        _TP_STATE_PATCHED = False
         _TP = old_tp_group
-        if patch_srt_tp and srt_parallel_state._TP is tp_group:
-            srt_parallel_state._TP = old_tp_group
-        if patch_srt_attention_tp and srt_parallel_state._ATTN_TP is tp_group:
-            srt_parallel_state._ATTN_TP = old_tp_group
+        srt_parallel_state._TP = old_srt_tp_group
+        srt_parallel_state._ATTN_TP = old_srt_attention_tp_group
 
 
 def get_tp_world_size() -> int:
@@ -914,9 +1000,7 @@ def init_dit_group(
 ) -> None:
     global _DIT
     assert _DIT is None, "DIT group is already initialized"
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    _DIT = new_device_group(list(range(dit_parallel_size)), backend)
 
 
 def get_dit_group() -> ProcessGroup:
@@ -933,12 +1017,12 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    _VAE = new_device_group(vae_ranks, backend)
 
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
+    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
@@ -948,9 +1032,25 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
 
-    for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
-        if group is not None:
+    destroyed_groups = []
+    for group in (
+        _TP,
+        _SP,
+        _DP,
+        _CFG,
+        _PP,
+        _REPLICA,
+        _ENCODER_DP,
+        _VAE_DECODE,
+    ):
+        # Replica-derived groups may alias each other or the world group.
+        if (
+            group is not None
+            and group is not _WORLD
+            and all(group is not destroyed for destroyed in destroyed_groups)
+        ):
             group.destroy()
+            destroyed_groups.append(group)
 
     # Ulysses and Ring groups are created separately from the SP coordinator,
     # so GroupCoordinator.destroy() does not own or release them. Explicitly
@@ -972,4 +1072,6 @@ def destroy_model_parallel() -> None:
         if group is not None:
             torch.distributed.destroy_process_group(group)
 
-    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8
+    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP = (
+        None,
+    ) * 10

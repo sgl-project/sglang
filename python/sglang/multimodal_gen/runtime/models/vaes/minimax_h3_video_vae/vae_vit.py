@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ViT3D decoder for the MiniMax H3 visual VAE (inference-only bundle).
+from contextlib import nullcontext
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -20,6 +22,10 @@ def _linear_with_module_dtype(linear, tensor, out_dtype=None):
     if out_dtype is not None and output.dtype != out_dtype:
         output = output.to(out_dtype)
     return output
+
+
+def _cuda_autocast_disabled(tensor: torch.Tensor):
+    return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
 
 
 def _pack_tensors_3d(tensors, patch_size, patch_size_t):
@@ -264,7 +270,7 @@ class ViT3DDecoder(ViTBase):
         hidden_states = _pack_tensors_3d(x, 1, 1)
         latent_size = (latent_T, latent_H, latent_W)
 
-        with torch.autocast("cuda", enabled=False):
+        with _cuda_autocast_disabled(hidden_states):
             hidden_states = _linear_with_module_dtype(
                 self.x_embedder, hidden_states, hidden_states.dtype
             )
@@ -339,7 +345,7 @@ class ViT3DDecoder(ViTBase):
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
-        with torch.autocast("cuda", enabled=False):
+        with _cuda_autocast_disabled(hidden_states):
             output = _linear_with_module_dtype(
                 self.proj_out, hidden_states, hidden_states.dtype
             )

@@ -9,7 +9,7 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
-Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`) and therefore applies to any model component using these layers (e.g. diffusion transformer / DiT and encoders).
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible component overrides fail unless a sparse backend is being replaced for cross-attention.
 
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
@@ -129,7 +129,14 @@ The selection order in `runtime/layers/attention/selector.py` is:
 1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
 2. Component override from `--component-attention-backends` while that component is being constructed
 3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
-4. Auto selection (platform capability, dtype, and installed packages)
+4. Layer or component default, when declared
+5. Auto selection (platform capability, dtype, and installed packages)
+
+An explicit global backend mismatch fails for DiT self-attention. Auxiliary
+components may fall back to their declared default or another compatible backend.
+Sparse backends selected for self-attention similarly fall back to a compatible
+dense backend for cross-attention. Explicit component overrides are otherwise
+strict.
 
 ## Configuration
 
@@ -399,6 +406,12 @@ Some backends require additional configuration. You can pass these parameters vi
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`0,1`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`dense_backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`str`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Backend used for the dense prefix: `fa` (default) or `sage_attn`. `sage_attn` is approximate.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`fa`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`kv_splits`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int | str`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>KV split factor passed to the Sol-Attn kernel. Use `auto` on long sequences.</td>
@@ -625,6 +638,60 @@ sglang generate \
 ```
 
 Component keys match pipeline module names from `model_index.json`, such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`.
+Use this override when the fallback must be pinned: unlike the global backend,
+an incompatible component override raises an error instead of selecting another
+backend. The one role-based exception is a sparse self-attention backend, which
+uses a compatible dense backend for cross-attention layers in the same component.
+
+### Per-request override (denoise loop)
+
+A single server can serve exact and approximate attention side by side: requests
+may switch the DiT denoise attention backend via the `attention_backend_override`
+sampling param. Valid values are the exact/drop-in dense kernels — `fa`,
+`torch_sdpa`, `sage_attn`, `sage_attn_3`. The field participates in the
+dynamic-batch signature, so requests with different backends never share a batch.
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "..." \
+  --attention-backend-override sage_attn
+```
+
+```python
+client.images.generate(
+    model="<MODEL_PATH_OR_ID>",
+    prompt="...",
+    extra_body={"attention_backend_override": "sage_attn"},
+)
+```
+
+Incompatible server settings **reject the request** (with a server log) instead
+of silently falling back: breakable CUDA graphs and `torch.compile` bake the
+attention kernel into a captured/traced graph; sparse server backends
+(`sliding_tile_attn`, `video_sparse_attn`, ...) cannot be mixed with per-request
+dense switching; under ring parallelism the target must be ring-capable. Note
+`sage_attn` / `sage_attn_3` are lossy (quantized attention) — validate quality
+on your workload.
+
+### Sage then Sol hybrid
+
+`sol_attn` keeps the first `dense_steps` steps dense. Set
+`dense_backend=sage_attn` to run that prefix on SageAttention and the tail on
+Sol sparse attention. Keep the text encoder on `torch_sdpa`:
+
+```bash
+sglang generate \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --attention-backend sol_attn \
+  --attention-backend-config dense_backend=sage_attn,dense_steps=10 \
+  --component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+Both `sage_attn` and `sol_attn` are approximate. The default DiT backend remains `fa`.
 
 ### Using Sliding Tile Attention (STA)
 

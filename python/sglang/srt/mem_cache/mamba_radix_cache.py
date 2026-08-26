@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -441,7 +441,7 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
@@ -458,10 +458,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.page_size = params.page_size
         self.disable = params.disable
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -497,7 +498,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -819,7 +820,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
-        self._record_remove_event(x)
+        self.kv_events.record_remove(x)
         # Tree values are page-aligned copies of a kv row: page-exact segment.
         self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
@@ -1301,7 +1302,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1330,7 +1331,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
+            self.kv_events.record_remove(node.parent)
             self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)

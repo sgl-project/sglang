@@ -41,7 +41,13 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_flags,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -111,16 +117,15 @@ def capture_cuda_graphs(
 
     if model_runner.is_draft_worker:
         moe_runner_backend = (
-            model_runner.server_args.speculative_moe_runner_backend
-            or model_runner.server_args.moe_runner_backend
+            get_spec().speculative_moe_runner_backend
+            or get_exec().moe.moe_runner_backend
         )
         moe_a2a_backend = (
-            model_runner.server_args.speculative_moe_a2a_backend
-            or model_runner.server_args.moe_a2a_backend
+            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
         )
     else:
-        moe_runner_backend = model_runner.server_args.moe_runner_backend
-        moe_a2a_backend = model_runner.server_args.moe_a2a_backend
+        moe_runner_backend = get_exec().moe.moe_runner_backend
+        moe_a2a_backend = get_exec().moe.moe_a2a_backend
 
     uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
     if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
@@ -200,7 +205,7 @@ def capture_cuda_graphs(
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,
-        enable_symm_mem=model_runner.server_args.enable_symm_mem,
+        enable_symm_mem=get_exec().comm.enable_symm_mem,
         device=model_runner.device,
         forward_stream=model_runner.forward_stream,
     )
@@ -261,8 +266,7 @@ def capture_prefill_graph(
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and get_server_return_hidden_states_mode(model_runner.server_args)
-        < CaptureHiddenMode.FULL
+        and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
@@ -272,7 +276,7 @@ def capture_prefill_graph(
         return result(eager_runner)
 
     if (
-        model_runner.server_args.enable_lora
+        model_runner.lora_manager is not None
         and not model_runner.lora_manager.supports_prefill_cuda_graph
     ):
         logger.warning(
@@ -293,19 +297,17 @@ def capture_prefill_graph(
         return result(None)
 
     # Disable prefill CUDA graph for non capture size
-    if not model_runner.server_args.cuda_graph_config.prefill.bs:
+    if not get_exec().graph.cuda_graph_config.prefill.bs:
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return result(None)
 
-    prefill_config = model_runner.server_args.cuda_graph_config.prefill
+    prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
         max_capture_requests = prefill_config.full_prefill_max_req
         if max_capture_requests is None:
-            max_capture_requests = max(
-                model_runner.server_args.chunked_prefill_size // 512, 1
-            )
+            max_capture_requests = max(get_schedule().chunked_prefill_size // 512, 1)
         max_capture_requests = min(
             max_capture_requests, model_runner.req_to_token_pool.size
         )
@@ -419,7 +421,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if (
         model_runner.spec_algorithm.is_speculative()
         and not model_runner.is_draft_worker
-        and model_runner.server_args.disaggregation_mode == "prefill"
+        and get_disagg().disaggregation_mode == "prefill"
     ):
         return no_capture
     if not model_runner.is_generation:
@@ -454,7 +456,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1
     capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
-    decode_backend = model_runner.server_args.cuda_graph_config.decode.backend
+    decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "
         f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "

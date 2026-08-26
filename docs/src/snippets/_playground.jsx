@@ -171,13 +171,15 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → hw|quant → quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → hw → default.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
       `${sel.hw}|${sel.quant}`,
       sel.quant,
+      sel.hw,
+      "default",
     ];
     for (const k of keys) {
       const hit = config.modelNames[k];
@@ -233,7 +235,9 @@ export const Playground = ({ config }) => {
     }
     const hidden = entry.hide ? matchConstraint(base, entry.hide) : false;
     let disabled = entry.disabled === true || entry.disable === true;
-    let disableReason = entry.disableReason || "";
+    let disableReason = typeof entry.disableReason === "function"
+      ? entry.disableReason(base)
+      : entry.disableReason || "";
     if (!disabled && entry.disable && typeof entry.disable === "object") {
       if (Array.isArray(entry.disable)) {
         for (const item of entry.disable) {
@@ -336,11 +340,13 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // --tp / --ep spelling families: configs write either the canonical
-  // --tp-size / --ep-size or the short --tp / --ep. Parse and strip every
-  // spelling; when re-emitting, keep the spelling the base already uses.
+  // --tp / --ep / --dp spelling families: configs write either the canonical
+  // --tp-size / --ep-size / --dp-size, a short alias, or the long form. Parse
+  // and strip every spelling; when re-emitting, keep the spelling the base
+  // already uses.
   const TP_HEADS = ["--tp-size", "--tp", "--tensor-parallel-size"];
   const EP_HEADS = ["--ep-size", "--ep", "--expert-parallel-size"];
+  const DP_HEADS = ["--dp-size", "--dp", "--data-parallel-size"];
   const parseIntFlagAny = (flags, heads) => {
     for (const head of heads) {
       const n = parseIntFlag(flags, head);
@@ -356,17 +362,17 @@ export const Playground = ({ config }) => {
   // insertion still works in partial cells).
   const ANCHOR_NEAR_MODEL_PATH = ["--model-path"];
   const ANCHOR_NEAR_TP         = ["--tp-size", "--tp", "--model-path"];
-  const ANCHOR_NEAR_DP         = ["--dp", "--tp-size", "--tp", "--model-path"];
-  const ANCHOR_NEAR_DPATTN     = ["--enable-dp-attention", "--dp", "--tp-size", "--tp", "--model-path"];
+  const ANCHOR_NEAR_DP         = ["--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
+  const ANCHOR_NEAR_DPATTN     = ["--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
   const ANCHOR_NEAR_MOE        = ["--moe-a2a-backend", "--moe-runner-backend",
-                                  "--enable-dp-attention", "--dp", "--tp-size", "--tp", "--model-path"];
+                                  "--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
 
   // Helper bundle passed to every axis handler.
   const helpers = {
     matchConstraint, evaluateChip, findEntry, isHidden,
     stripFlagsByFirstToken, stripEnvByPrefix, insertBeforeTail, insertAfter,
     parseIntFlag, hasFlag, findFlagArg,
-    TP_HEADS, EP_HEADS, parseIntFlagAny, flagSpelling,
+    TP_HEADS, EP_HEADS, DP_HEADS, parseIntFlagAny, flagSpelling,
     ANCHOR_NEAR_MODEL_PATH, ANCHOR_NEAR_TP, ANCHOR_NEAR_DP,
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
@@ -431,7 +437,7 @@ export const Playground = ({ config }) => {
       // baked strategy (legacy mode flags mapped to zigzag/interleave).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
-        const dpVal = h.parseIntFlag(flags, "--dp");
+        const dpVal = h.parseIntFlagAny(flags, h.DP_HEADS);
         const hasDpAttn = h.hasFlag(flags, "--enable-dp-attention");
         let dpAttn;
         if (dpVal !== null) dpAttn = dpVal;
@@ -468,7 +474,7 @@ export const Playground = ({ config }) => {
           const dpIntent = (value.dpAttn !== null && value.dpAttn !== undefined)
             ? value.dpAttn
             : (h.hasFlag(flags, "--enable-dp-attention")
-                ? (h.parseIntFlag(flags, "--dp") ?? 1) : false);
+                ? (h.parseIntFlagAny(flags, h.DP_HEADS) ?? 1) : false);
           if (typeof dpIntent === "number" && dpIntent > 1) return null;
           return h.parseIntFlagAny(flags, h.TP_HEADS);
         };
@@ -525,10 +531,13 @@ export const Playground = ({ config }) => {
         }
         if (value.dpAttn !== null && value.dpAttn !== undefined
             && !blocked("dpAttn", value.dpAttn)) {
-          flags = h.stripFlagsByFirstToken(flags, ["--dp", "--enable-dp-attention"]);
+          // Capture the spelling before stripping — the TP/EP handlers do the
+          // same, and a lookup on the stripped array always hits the fallback.
+          const dpHead = h.flagSpelling(flags, h.DP_HEADS, "--dp-size");
+          flags = h.stripFlagsByFirstToken(flags, [...h.DP_HEADS, "--enable-dp-attention"]);
           if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
-              `--dp ${value.dpAttn}`,
+              `${dpHead} ${value.dpAttn}`,
               "--enable-dp-attention",
             ]);
           }
@@ -611,23 +620,21 @@ export const Playground = ({ config }) => {
     // ---- Axis: MoE Parallelism ----------------------------------------------
     // Backend single-select + EP numeric knob; either is optional. Picking the
     // "megamoe" backend reveals a Quantization sub-select (W4A8 / W4A4) in the same
-    // row — W4A4 adds the FP4-activations env vars.
+    // row — W4A4 adds the FP4-activations server flag.
     moe: {
       initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
-      // mmQuant is derived from the base env (FP4 activations present → W4A4).
+      // mmQuant is derived from the base flag (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
-        const baseEnv = (cell && cell.env) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
-        const fp4Acts = baseEnv.some(
-          (e) => e.startsWith("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"));
+        const w4a4 = h.hasFlag(flags, "--enable-w4a4-mxfp4-megamoe");
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlagAny(flags, h.EP_HEADS),
-          mmQuant: fp4Acts ? "w4a4" : "w4a8",
+          mmQuant: w4a4 ? "w4a4" : "w4a8",
         };
       },
 
@@ -651,15 +658,19 @@ export const Playground = ({ config }) => {
           if (opt?.env?.length) env = [...env, ...opt.env];
         }
         // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
-        // DeepEP dispatch + any prior megamoe env, then re-add the selected quant's
-        // env. When the backend is explicitly switched away from megamoe, only drop
-        // the megamoe quant env (leave DeepEP dispatch intact).
+        // DeepEP dispatch + any prior MegaMoE quant settings, then re-add the
+        // selected quant's flags/env. When the backend is explicitly switched
+        // away from MegaMoE, only drop the MegaMoE quant settings (leave DeepEP
+        // dispatch intact).
         const mq = fc.megamoeQuant;
         if (mq) {
           const quantKeys = [];
+          const quantFlagHeads = [];
           for (const o of (mq.options || [])) {
             for (const e of (o.env || [])) quantKeys.push(e.split("=")[0]);
+            for (const f of (o.flags || [])) quantFlagHeads.push(f.split(/[\s=]/)[0]);
           }
+          flags = h.stripFlagsByFirstToken(flags, quantFlagHeads);
           const effBackend = value.backend !== null
             ? value.backend : (derived && derived.backend);
           if (effBackend === "megamoe") {
@@ -667,6 +678,9 @@ export const Playground = ({ config }) => {
             const quant = value.mmQuant != null
               ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
             const opt = (mq.options || []).find((o) => o.id === quant);
+            if (opt?.flags?.length) {
+              flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, opt.flags);
+            }
             if (opt?.env?.length) env = [...env, ...opt.env];
           } else if (value.backend !== null) {
             env = h.stripEnvByPrefix(env, quantKeys);
@@ -702,6 +716,10 @@ export const Playground = ({ config }) => {
           && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
           && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
         const backendIsMega = slotDisplay("backend") === "megamoe";
+        // `ep.showWhen` (function of base) drops the whole EP select on bases
+        // where EP is not a supported lever (e.g. the single-shape A3 recipe).
+        const epShown = !!fc.ep
+          && !(typeof fc.ep.showWhen === "function" && !fc.ep.showWhen(base));
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -723,7 +741,7 @@ export const Playground = ({ config }) => {
                     (v) => setSlot("mmQuant", v), base)}
                 </span>
               )}
-              {fc.ep && (
+              {epShown && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
                   {renderSelect(slotDisplay("ep"), fc.ep.values || [null],
@@ -825,6 +843,8 @@ export const Playground = ({ config }) => {
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
               || head === "--speculative-dspark-block-size"
+              || head === "--enable-linear-replayssm-spec"
+              || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -850,7 +870,8 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-          "--speculative-dspark-block-size",
+          "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
+          "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
@@ -909,10 +930,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
-        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
-          return { flags, env };
-        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -921,6 +938,16 @@ export const Playground = ({ config }) => {
           : ((sel && sel.pdMode) || "off");
 
         if (mode === "prefill" || mode === "decode") {
+          // PD and some speculative algorithms cannot run together. Keep the
+          // PD card reachable for a speculative base recipe, then make the
+          // user's explicit PD-role selection win by removing the whole
+          // speculative flag family before composing the role command.
+          const specAlgorithm = (h.findFlagArg(
+            flags, "--speculative-algorithm") || "").toUpperCase();
+          if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+            flags = flags.filter((flag) =>
+              !flag.split(/[\s=]/)[0].startsWith("--speculative-"));
+          }
           const backend = value.transferBackend || (backends[0] || {}).id || "mooncake";
           const adds = [
             `--disaggregation-mode ${mode}`,
@@ -1461,7 +1488,7 @@ export const Playground = ({ config }) => {
     if (multinode && !f.some((x) => x.startsWith("--nnodes"))) {
       // Insert the multi-node trio after the last parallelism flag (matches
       // _deployment.jsx so untouched-base output is byte-identical).
-      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp-size", "--tp"];
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp"];
       let at = -1;
       for (const anchor of PARALLELISM_ANCHORS) {
         at = f.findIndex((x) => x.split(/[\s=]/)[0] === anchor);
@@ -2155,10 +2182,12 @@ export const Playground = ({ config }) => {
   let pgFlagsLatest = [];
   let pgEnvLatest = [];
   // Render-only ratio injection (before the host/port tail); skipped if the
-  // flags somehow already carry the family.
+  // flags already carry the family, or the base cell sizes the pool explicitly
+  // with --max-mamba-cache-size (the ratio would contradict its slot count).
   const withRatio = (fl, value) => {
     if (!value) return fl;
-    if (fl.some((f) => f.startsWith("--mamba-full-memory-ratio"))) return fl;
+    if (fl.some((f) =>
+      f.startsWith("--mamba-full-memory-ratio") || f.startsWith("--max-mamba-cache-size"))) return fl;
     const out = [...fl];
     const line = `--mamba-full-memory-ratio ${value}`;
     const i = out.findIndex((f) => f.startsWith("--host"));

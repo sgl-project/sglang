@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -17,8 +17,7 @@ import torch
 import transformers
 from PIL import Image
 
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_mm, get_model
 
 CONTENT_HASH_PREFIX = "sha256:"
 _SHA256_HEX_LENGTH = 64
@@ -379,11 +378,17 @@ def resolve_multimodal_item_hash(
 def build_processor_fingerprint(
     processor: Any,
     hf_config: Any,
-    server_args: ServerArgs,
     *,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Fingerprint preprocessing choices that can change processor output."""
+    """Fingerprint preprocessing choices that can change processor output.
+
+    Every config value comes from the published bags, which is the only source
+    that answers the *effective* preprocessing config. Taking any of them from
+    a handed ``ServerArgs`` would let two callers with the same effective
+    config disagree on the digest -- and an omitted one silently fingerprint
+    the empty config, which is how incompatible artifacts get reused.
+    """
     processor_payload = (
         processor.preprocess_fingerprint_payload()
         if isinstance(processor, PreprocessFingerprintProvider)
@@ -395,10 +400,10 @@ def build_processor_fingerprint(
         "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
         "model_type": hf_payload.get("model_type"),
         "architectures": hf_payload.get("architectures"),
-        "model_revision": server_args.revision,
-        "processor_revision": server_args.revision,
-        "disable_fast_image_processor": server_args.disable_fast_image_processor,
-        "mm_process_config": server_args.mm_process_config or {},
+        "model_revision": get_model().revision,
+        "processor_revision": get_model().revision,
+        "disable_fast_image_processor": get_mm().disable_fast_image_processor,
+        "mm_process_config": get_mm().mm_process_config or {},
         "processor": processor_payload,
         "extra": extra or {},
     }

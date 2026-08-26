@@ -39,10 +39,12 @@ RUN source /opt/.venv/bin/activate && \
     git checkout ${VER_SGLANG} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install . && \
+    uv pip install ".[diffusion]" && \
     cd sglang/kernels/aot && \
     cp pyproject_cpu.toml pyproject.toml && \
-    uv pip install .
+    uv pip install . && \
+    source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && \
+    uv pip install "$SGL_EVAL_SPEC"
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
