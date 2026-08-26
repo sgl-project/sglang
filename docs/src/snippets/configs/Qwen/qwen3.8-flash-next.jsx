@@ -43,6 +43,30 @@ export const config = {
     { id: "single", label: "Single Node" },
   ],
 
+  // Orthogonal knobs — layered onto the matched cell, never part of the cell
+  // key (see overlayDims in _deployment.jsx).
+  overlayDims: [
+    {
+      id: "pleOffload",
+      title: "PLE Offload",
+      // Offloads the 51B N-gram embedding table to CPU pinned memory and
+      // prefetches it on a side CUDA stream (--ple-offload-embedding). The
+      // path is CUDA-only, so the row is hidden on the AMD cells. The server
+      // already auto-enables it for BF16 on CUDA, hence the default chip is
+      // Auto and adds no flag.
+      showWhen: (sel) => !["mi350x", "mi355x"].includes(sel.hw),
+      default: "auto",
+      options: [
+        { id: "auto", label: "Auto",
+          hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
+        { id: "on",   label: "On",
+          flags: ["--ple-offload-embedding"] },
+        { id: "off",  label: "Off",
+          flags: ["--no-ple-offload-embedding"] },
+      ],
+    },
+  ],
+
   modelNames: {
     "default|bf16":  "Qwen/Qwen3.8-Flash-Next",
     // Separate repos, not revisions of the BF16 one.
