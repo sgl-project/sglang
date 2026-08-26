@@ -10,13 +10,16 @@ the fixture only launches the server; the kit owns the `test_*` methods.
 """
 
 import asyncio
+import json
 import time
 
+import aiohttp
 import requests
 
 from sglang.test.server_fixtures.streaming_session_fixture import (
     _abort_repro_run_all,
     _concurrent_logprob_run,
+    _make_token_sized_ids,
     _stress_run_all,
 )
 
@@ -439,4 +442,127 @@ class AbortLeakReproKitMixin:
             health.status_code,
             200,
             "Server unhealthy after abort-heavy streaming session cleanup.",
+        )
+
+
+async def _client_disconnect_turn(
+    http: aiohttp.ClientSession,
+    base_url: str,
+    input_ids: list,
+    session_id: str,
+    gen_len: int,
+    disconnect_after_chunks: int = 0,
+) -> dict:
+    """Stream one session turn; optionally drop the connection mid-stream.
+
+    Returns the last received meta_info."""
+    payload = {
+        "input_ids": input_ids,
+        "session_params": {"id": session_id, "rid": None},
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": gen_len,
+            "ignore_eos": True,
+            "skip_special_tokens": False,
+        },
+        "stream": True,
+    }
+    last_meta: dict = {}
+    chunks = 0
+    async with http.post(base_url + "/generate", json=payload) as resp:
+        assert resp.status == 200, await resp.text()
+        async for raw_line in resp.content:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                continue
+            item = json.loads(data)
+            if item.get("meta_info") is not None:
+                last_meta = item["meta_info"]
+            chunks += 1
+            if disconnect_after_chunks and chunks >= disconnect_after_chunks:
+                # Exiting the context with the body unread closes the
+                # connection: a mid-turn client disconnect.
+                return last_meta
+    return last_meta
+
+
+async def _client_disconnect_run(base_url: str, tokenizer) -> None:
+    """Repro for #36475: disconnect mid-turn, immediately send the next turn.
+
+    The next turn must be admitted against the last completed turn (rollback
+    semantics, like an explicit /abort_request), not silently corrupted."""
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        async with http.post(
+            base_url + "/open_session",
+            json={"capacity_of_str_len": 10_000_000, "streaming": True},
+        ) as resp:
+            assert resp.status == 200, await resp.text()
+            session_id = await resp.json()
+
+        turn_ids = [
+            _make_token_sized_ids(
+                tokenizer, prefix=f"[disconnect repro turn{i}]", min_tokens=n
+            )
+            for i, n in enumerate((512, 64, 64))
+        ]
+        # The session controller strips a leading BOS from appended turns.
+        bos = getattr(tokenizer, "bos_token_id", None)
+        for ids in turn_ids:
+            if bos is not None and ids and ids[0] == bos:
+                ids.pop(0)
+        turn0_ids, turn1_ids, turn2_ids = turn_ids
+        gen_len = 48
+
+        turn0_meta = await _client_disconnect_turn(
+            http, base_url, turn0_ids, session_id, gen_len
+        )
+        turn0_total = turn0_meta["prompt_tokens"] + turn0_meta["completion_tokens"]
+
+        # Turn 1: disconnect after the first streamed chunk.
+        turn1_meta = await _client_disconnect_turn(
+            http, base_url, turn1_ids, session_id, gen_len, disconnect_after_chunks=1
+        )
+        assert turn1_meta["prompt_tokens"] == turn0_total + len(
+            turn1_ids
+        ), f"turn1 lost inherited context: {turn1_meta}"
+
+        # Turn 2 must run against the rolled-back session (last completed
+        # turn = turn 0), not be pre-aborted with a one-token context.
+        turn2_meta = await _client_disconnect_turn(
+            http, base_url, turn2_ids, session_id, gen_len
+        )
+        expected = turn0_total + len(turn2_ids)
+        assert turn2_meta.get("prompt_tokens") == expected, (
+            "turn2 after mid-turn client disconnect lost session context: "
+            f"expected prompt_tokens={expected}, got {turn2_meta}"
+        )
+        finish_type = (turn2_meta.get("finish_reason") or {}).get("type")
+        assert finish_type != "abort", (
+            "turn2 after mid-turn client disconnect was pre-aborted: " f"{turn2_meta}"
+        )
+
+
+class ClientDisconnectKitMixin:
+    """Client disconnects mid-turn (issue #36475)."""
+
+    def test_client_disconnect_next_turn_rolls_back(self) -> None:
+        requests.post(self.base_url + "/flush_cache")
+
+        asyncio.run(_client_disconnect_run(self.base_url, self.tokenizer))
+
+        time.sleep(5)
+        self.assertIsNone(
+            self.process.poll(),
+            "Server crashed during client-disconnect streaming session repro.",
+        )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(
+            health.status_code,
+            200,
+            "Server unhealthy after client-disconnect streaming session repro.",
         )
