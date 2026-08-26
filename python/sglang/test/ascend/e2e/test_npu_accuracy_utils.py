@@ -227,10 +227,12 @@ def run_evalscope(
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
+                # Add adaptation for evalscope 1.11+ table format
                 r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
                 r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
                 r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
                 r"accuracy\s*[:=]?\s*([\d.]+)",
+                # Keep compatibility with legacy evalscope 1.10 table format
                 r"Accuracy\s*[:=]?\s*([\d.]+)",
                 r"score\s*[:=]?\s*([\d.]+)",
             ]
