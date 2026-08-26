@@ -42,6 +42,8 @@ The LTX series supports one-stage and two-stage pipelines. LTX-2.3 also supports
 
 **Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode. For multi-GPU serving, start from the 2-GPU or 4-GPU presets and only change parallelism if you need more memory headroom.
 
+CPU deployment is also supported with the new `XEON` target in the selector. When `XEON` is selected, the generated server command switches to CPU execution by adding `--device cpu` and `--disable-overlap-schedule` automatically.
+
 <LTXDeployment />
 
 ### 3.2 Configuration Tips
