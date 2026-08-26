@@ -185,13 +185,10 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):
-    """
-    Layout of the FP8 activation scales DeepEP v2 dispatches to DeepGEMM.
+    """FP8 activation-scale layout for DeepEP v2 -> DeepGEMM.
 
-    Both fields come from the DeepGEMM JIT configuration and therefore vary by
-    HARDWARE, not by runner: Hopper wants row-major fp32, Blackwell wants
-    column-major packed UE8M0. Resolving them here keeps the dispatcher from
-    importing deep_gemm_wrapper and reading JIT flags itself.
+    DeepGEMM JIT selects row-major fp32 on Hopper and column-major packed UE8M0
+    on Blackwell, keeping its configuration out of the dispatcher.
     """
 
     tma_aligned: bool
@@ -332,11 +329,7 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 
 
 def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
-    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into.
-
-    deepep_v2 dispatches FP8 activations plus scales, which only the deep_gemm
-    runner consumes; MoeRunner rejects any other runner for this backend.
-    """
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
     from sglang.srt.layers import deep_gemm_wrapper
 
     return DeepEPv2Fp8ScaleFormat(
@@ -539,11 +532,10 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, DeepEP v2, Mooncake,
-    Mori, or PPLX).
+    """Return whether the backend belongs to the DeepEP family.
 
     These backends combine across EP inside the dispatcher, so a caller must
-    take the a2a forward path and must not add a post-experts all-reduce.
+    take the A2A path and skip post-experts all-reduce.
     """
     b = get_moe_a2a_backend()
     return (
