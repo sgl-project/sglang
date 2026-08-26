@@ -58,7 +58,6 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 logger = logging.getLogger(__name__)
 
 _PP_ADMIT_FLOW = envs.SGLANG_PP_PD_ADMIT_FLOW.get()
-_PP_ADMIT_FLOW_MARGIN = envs.SGLANG_PP_PD_ADMIT_FLOW_MARGIN.get()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -878,10 +877,6 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            if _PP_ADMIT_FLOW:
-                good_bootstrapped_rids = self._pp_admit_flow_apply_margin(
-                    good_bootstrapped_rids
-                )
         elif _PP_ADMIT_FLOW:
             # Forward PP0's verdict verbatim; local readiness is handled later.
             message = PPAdmissionMessage.from_payload(
@@ -920,14 +915,6 @@ class SchedulerPPMixin:
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
-
-    def _pp_admit_flow_apply_margin(self: Scheduler, good_rids: List[str]):
-        """Give other ranks a bounded sender-handshake head start."""
-        return self.pp_admission_state.apply_margin(
-            good_rids,
-            _PP_ADMIT_FLOW_MARGIN,
-            (req.rid for req in self.disagg_prefill_bootstrap_queue.queue),
-        )
 
     def _pp_admit_flow_admit(
         self: Scheduler, intended: PPAdmissionVerdict

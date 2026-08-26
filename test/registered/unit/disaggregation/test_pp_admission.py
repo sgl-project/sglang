@@ -118,7 +118,6 @@ class TestPPAdmission(unittest.TestCase):
     def test_pp_admission_defaults_off(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(envs.SGLANG_PP_PD_ADMIT_FLOW.get())
-            self.assertEqual(envs.SGLANG_PP_PD_ADMIT_FLOW_MARGIN.get(), 1)
 
 
 if __name__ == "__main__":

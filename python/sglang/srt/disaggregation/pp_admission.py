@@ -103,31 +103,10 @@ class PPAdmissionState:
     """Scheduler-local state for the optional PP admission fast path."""
 
     step: int = 0
-    first_seen: dict[str, int] = field(default_factory=dict)
     deferred_rids: dict[str, None] = field(default_factory=dict)
     deferred_bootstrap: list[DeferredBootstrapRequest] = field(default_factory=list)
     local_failures: dict[str, None] = field(default_factory=dict)
     uniform_failures_applied: dict[str, None] = field(default_factory=dict)
-
-    def apply_margin(
-        self, admitted_rids: Iterable[str], margin: int, live_rids: Iterable[str]
-    ) -> list[str]:
-        if margin <= 0:
-            return list(admitted_rids)
-
-        ready = []
-        for rid in admitted_rids:
-            first = self.first_seen.setdefault(rid, self.step)
-            if self.step - first >= margin:
-                ready.append(rid)
-                self.first_seen.pop(rid, None)
-
-        if len(self.first_seen) > 4096:
-            live = set(live_rids)
-            self.first_seen = {
-                rid: first for rid, first in self.first_seen.items() if rid in live
-            }
-        return ready
 
     def defer_verdict(self, rid: str) -> None:
         self.deferred_rids[rid] = None
