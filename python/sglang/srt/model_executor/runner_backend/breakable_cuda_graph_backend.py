@@ -76,6 +76,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._use_symmetric_memory_graph_pool = (
+            cuda_graph_runner.model_runner.spec_algorithm.is_speculative()
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -95,7 +98,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
-        set_use_dedicated_symmetric_memory_graph_pool(True)
+        set_use_dedicated_symmetric_memory_graph_pool(
+            self._use_symmetric_memory_graph_pool
+        )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
@@ -130,7 +135,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         prime_graph = None
-        with defer_symmetric_memory_graph_registration(self._tp_group) as should_prime:
+        with defer_symmetric_memory_graph_registration(
+            self._tp_group,
+            enabled=self._use_symmetric_memory_graph_pool,
+        ) as should_prime:
             if should_prime:
                 # Keep lazy/JIT work from the final warmup out of this extra capture.
                 self._device_module.synchronize()

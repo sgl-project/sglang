@@ -246,11 +246,17 @@ def get_nccl_mem_pool(*, graph_capture: bool = False) -> torch.cuda.MemPool:
 @contextmanager
 def defer_symmetric_memory_graph_registration(
     group_coordinator: GroupCoordinator,
+    *,
+    enabled: bool,
 ):
     """Prime graph-private segments, then register them outside capture."""
     global _defer_graph_registration, _deferred_graph_comm_ptrs
 
-    if not is_symmetric_memory_enabled() or group_coordinator.world_size == 1:
+    if (
+        not enabled
+        or not is_symmetric_memory_enabled()
+        or group_coordinator.world_size == 1
+    ):
         yield False
         return
 

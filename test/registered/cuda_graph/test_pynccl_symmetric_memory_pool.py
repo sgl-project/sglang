@@ -30,6 +30,7 @@ def test_cuda_graph_collective_with_capture_only_allocations() -> None:
         FullCudaGraphBackend,
     )
     from sglang.srt.runtime_context import get_context
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -67,7 +68,10 @@ def test_cuda_graph_collective_with_capture_only_allocations() -> None:
 
     runner = SimpleNamespace(
         device_module=torch.cuda,
-        model_runner=SimpleNamespace(tp_group=tp_group),
+        model_runner=SimpleNamespace(
+            tp_group=tp_group,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        ),
         enable_profile_cuda_graph=False,
     )
     backend = FullCudaGraphBackend(runner)
