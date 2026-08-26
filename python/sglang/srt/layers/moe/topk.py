@@ -2072,19 +2072,31 @@ def capture_routed_experts_if_allowed(
     topk_config: TopKConfig,
     layer_id: Optional[int],
     topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> None:
     """Single capture site for every backend, gated by the per-config opt-out.
 
     Routing all backends through here keeps the draft-side opt-out from being
     bypassed by an inlined capturer call.
+
+    Rows at or past ``num_token_non_padded`` still hold whatever the router left
+    there; ``_post_process_topk_ids`` masks them only further down, and on ROCm it
+    masks them to 0, a valid expert id. Capture runs ahead of both, so mask a copy
+    here: replay consumers skip -1 rows, and treating a padded row as a real
+    selection makes a whole padded region replay one stale routing row.
     """
     if not topk_config.allow_routed_experts_capture:
         return
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    cap = get_global_experts_capturer()
+    if cap is None:
+        return
+    if num_token_non_padded is not None:
+        topk_ids = topk_ids.clone()
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    cap.capture(
+        layer_id=layer_id,
+        topk_indices=topk_ids,
+    )
 
 
 def _post_process_topk_ids(
@@ -2103,7 +2115,9 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config, layer_id, topk_ids, num_token_non_padded
+    )
     recorder_topk_ids = None
     _fold_pad_into_append = False
     if _is_cuda:
