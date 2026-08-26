@@ -2008,6 +2008,14 @@ class KimiK3DeltaAttention(nn.Module):
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
             self._qkvgb_w = torch.cat(weights, dim=0).contiguous()
+            # qkvgb is the only forward path for this opt-in instance.  Rebind
+            # the source parameters to slices of the dense merged storage so
+            # their serialized block-FP8 buffers can be released instead of
+            # retaining another full qkvg copy for every KDA layer.
+            offset = 0
+            for mod, size in zip(mods, sizes):
+                mod.weight.data = self._qkvgb_w[offset : offset + size]
+                offset += size
         else:
             self._qkvgb_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
         self._qkvgb_qkvg_size, self._qkvgb_b_size = sizes
