@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers import sampler
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=1, suite="base-a-test-1-npu-a2")
 
 
 def _sample(
@@ -109,3 +114,7 @@ def test_eager_out_of_range_top_k_uses_fallback(monkeypatch) -> None:
 
     assert output.shape == (1,)
     assert fused_calls == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
