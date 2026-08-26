@@ -36,6 +36,7 @@ import unittest.mock
 import torch
 
 import sglang
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -270,7 +271,10 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         for field in dataclasses.fields(server_args):
             if field.name in _NOT_COMPARABLE:
                 continue
-            value = getattr(server_args, field.name)
+            # The resolution result, not the field: a declaration-only resolver
+            # never writes the field, so comparing fields would miss exactly
+            # the decisions a leak would shift.
+            value = resolution_result(server_args, field.name)
             # Nested dataclasses (cuda_graph_config) compare structurally, and
             # everything else is deep-copied: a snapshot that stored the live
             # list/dict would follow an in-place mutation, which is exactly the
@@ -382,10 +386,13 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
                 # differs from the cpu that `default_before` resolved to.
                 expected = (
                     "cuda_ipc"
-                    if intermediate.mm_feature_transport == "cuda_ipc"
+                    if resolution_result(intermediate, "mm_feature_transport")
+                    == "cuda_ipc"
                     else "cpu"
                 )
-                self.assertEqual(after.mm_feature_transport, expected)
+                self.assertEqual(
+                    resolution_result(after, "mm_feature_transport"), expected
+                )
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):
         for label, config, kwargs in _SHAPES:
@@ -689,13 +696,14 @@ class TestForksResolveFirst(CustomTestCase):
                 continue
             try:
                 source = path.read_text(encoding="utf-8-sig")
+                if "Process" not in source:
+                    continue
                 tree = ast.parse(source)
             except (SyntaxError, UnicodeDecodeError):
                 continue
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                body = ast.get_source_segment(source, node) or ""
                 forks = [
                     call
                     for call in ast.walk(node)
@@ -714,6 +722,7 @@ class TestForksResolveFirst(CustomTestCase):
                 ]
                 if not forks:
                     continue
+                body = ast.get_source_segment(source, node) or ""
                 examined += 1
                 # `spawn` starts a fresh interpreter, so the child may probe.
                 if 'get_context("spawn")' in body or "'spawn'" in body:
@@ -759,31 +768,43 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         server_args.resolve_once()
         return server_args
 
-    def test_a_bare_replace_would_resolve_a_second_time(self):
-        """Why the helper exists. If this stops drifting, the pipeline became
-        idempotent and the helper's reason is gone -- read it again before
-        deleting either."""
+    def test_a_bare_replace_resolves_again_and_lands_in_the_same_place(self):
+        """A bare copy resolves to the same place: the fields are the raw input.
+
+        `dataclasses.replace` copies the fields, so a bare copy re-runs
+        resolution over the *same input* the parent got -- the DP-attention
+        halving and the conservativeness scaling apply once. `replace_resolved`
+        buys something else: it carries the parent's declarations and its
+        `model_config`, so the copy answers without resolving at all.
+        """
         parent = self._resolved()
         bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
-            getattr(bare, "_declarations_materialized", False),
+            getattr(bare, "_resolution_finished", False),
             "a bare replace carried the flag; then this test proves nothing",
         )
         bare.resolve_once()
+        drifted = {
+            field.name: (
+                resolution_result(parent, field.name),
+                resolution_result(bare, field.name),
+            )
+            for field in dataclasses.fields(parent)
+            if field.name not in ("dist_init_addr", "random_seed")
+            and repr(resolution_result(parent, field.name))
+            != repr(resolution_result(bare, field.name))
+        }
         self.assertEqual(
-            (bare.chunked_prefill_size, round(bare.schedule_conservativeness, 4)),
-            (
-                parent.chunked_prefill_size // 2,
-                round(parent.schedule_conservativeness * 0.3, 4),
-            ),
-            "the second pass no longer drifts; this is the drift the copy "
-            "helper exists to avoid",
+            drifted,
+            {},
+            "resolving a bare copy landed somewhere else, so the pipeline is "
+            "reading its own output again",
         )
 
     def test_replace_resolved_keeps_the_parents_resolution(self):
         parent = self._resolved()
         copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
-        self.assertTrue(getattr(copy_, "_declarations_materialized", False))
+        self.assertTrue(getattr(copy_, "_resolution_finished", False))
         drifted = {
             field.name: (getattr(parent, field.name), getattr(copy_, field.name))
             for field in dataclasses.fields(parent)
@@ -842,12 +863,12 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         self.addCleanup(reset_context)
         reset_context()
         publish(copy_, role="scheduler")
-        self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
+        self.assertEqual(get_parallel().config.dist_init_addr, "1.2.3.4:5000")
         self.assertEqual(
             get_schedule().chunked_prefill_size,
-            parent.chunked_prefill_size,
-            "publishing the copy re-ran resolution; the bag disagrees with the "
-            "record the parent resolved",
+            resolution_result(parent, "chunked_prefill_size"),
+            "publishing the copy re-ran resolution; the bag disagrees with what "
+            "the parent's resolution decided",
         )
 
     def test_no_bare_replace_of_a_record_outside_the_helper(self):
@@ -939,7 +960,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "_run_resolution_pipeline" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             # The full (class, function, ...) scope chain, so the assertion can
@@ -988,7 +1012,10 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         callers = []
         for path in sorted(package_root.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                source = path.read_text()
+                if "resolve_once" not in source:
+                    continue
+                tree = ast.parse(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
