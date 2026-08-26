@@ -525,6 +525,13 @@ export const config = {
     // TP4 the BF16/FP8 cells use. That leaves one rank, so there is no EP to
     // spend and the two tiers differ only by the MTP head — `ep_size *
     // moe_dp_size <= tp_size` would reject an --ep here.
+    //
+    // These are the measured commands verbatim, which is why --mem-fraction-static,
+    // --chunked-prefill-size and --max-running-requests are absent where the
+    // BF16/FP8 cells pin them: the runs left all three to their defaults (48
+    // concurrent, 16384-token prefill chunks). That chunk size sits outside the
+    // window the flashinfer GDN prefill default covers, so the explicit
+    // --linear-attn-prefill-backend pin is what keeps prefill off Triton here.
     // No H200 cell: SM90 has no FP4 tensor cores.
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -533,8 +540,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -542,7 +547,6 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--max-running-requests 96",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -555,8 +559,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -572,8 +574,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -581,7 +581,6 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--max-running-requests 96",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -594,8 +593,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -611,8 +608,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
@@ -620,7 +615,6 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--max-running-requests 96",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -633,8 +627,6 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
-        "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
