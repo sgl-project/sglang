@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -65,7 +66,6 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
     TritonKernelTopKOutput,
-    apply_simulated_expert_routing,
     capture_routed_experts_if_allowed,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -106,6 +106,25 @@ def _require_block_routing_ep1(moe_ep_size: int) -> None:
         raise ValueError(
             "LLaDA2 block routing does not support expert parallelism; "
             f"expected moe_ep_size=1, got moe_ep_size={moe_ep_size}"
+        )
+
+
+def _require_block_routing_simulated_experts_compatibility() -> None:
+    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if simulate_uniform_experts and simulate_round_robin_experts:
+        raise ValueError(
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+        )
+    if simulate_uniform_experts:
+        raise ValueError(
+            "LLaDA2 block routing does not support " "SGLANG_SIMULATE_UNIFORM_EXPERTS"
+        )
+    if simulate_round_robin_experts:
+        raise ValueError(
+            "LLaDA2 block routing does not support "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
         )
 
 
@@ -568,6 +587,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.use_block_routing = getattr(config, "expert_capacity", None) is not None
         if self.use_block_routing:
+            _require_block_routing_simulated_experts_compatibility()
             _require_block_routing_ep1(get_parallel().moe_ep_size)
             if _is_npu:
                 raise ValueError(
@@ -668,7 +688,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
-            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
@@ -771,14 +790,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     ):
         """Convert block-routing results to the selected MoE runner format."""
         # Block routing computes its own top-k and therefore bypasses TopK.forward,
-        # which normally applies benchmark routing overrides and invokes these
-        # diagnostics before producing runner output.
-        topk_weights, topk_ids = apply_simulated_expert_routing(
-            topk_weights,
-            topk_ids,
-            router_logits,
-            layer_id=self.layer_id,
-        )
+        # which normally invokes these diagnostics before producing runner output.
         capture_routed_experts_if_allowed(
             self.topk.topk_config, self.layer_id, topk_ids
         )

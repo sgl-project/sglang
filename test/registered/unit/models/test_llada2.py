@@ -240,107 +240,62 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
             topk_ids=topk_ids
         )
 
-    @patch("sglang.srt.models.llada2.get_moe_runner_backend")
-    @patch("sglang.srt.models.llada2.get_global_expert_distribution_recorder")
-    @patch("sglang.srt.models.llada2.capture_routed_experts_if_allowed")
-    @patch(
-        "sglang.srt.layers.moe.topk.torch.randint",
-        return_value=torch.tensor([[1], [3]]),
-    )
-    def test_block_routing_applies_uniform_expert_simulation_before_diagnostics(
-        self,
-        _randint,
-        capture_routed_experts,
-        get_recorder,
-        backend,
-    ):
-        backend.return_value.is_triton_kernels.return_value = False
-        backend.return_value.is_aiter.return_value = False
-
-        block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
-        nn.Module.__init__(block)
-        block.layer_id = 1
-        block.routed_scaling_factor = 1.0
-        block.topk = SimpleNamespace(topk_config=object())
-        block.experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=False)
-        router_logits = torch.zeros((2, 4))
-
-        with envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True):
-            result = block._make_block_topk_output(
-                router_logits,
-                torch.tensor([[0.2, 0.8], [0.4, 0.6]]),
-                torch.tensor([[0, 1], [1, 2]], dtype=torch.int32),
+    def test_block_routing_rejects_uniform_expert_simulation(self):
+        with (
+            get_parallel().override(tp_size=1, moe_ep_size=1),
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True),
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.override(False),
+            self.assertRaisesRegex(
+                ValueError, r"does not support SGLANG_SIMULATE_UNIFORM_EXPERTS"
+            ),
+        ):
+            LLaDA2MoeSparseMoeBlock(
+                layer_id=0,
+                config=SimpleNamespace(
+                    num_experts_per_tok=8,
+                    norm_topk_prob=True,
+                    hidden_size=1024,
+                    num_shared_experts=1,
+                    expert_capacity=48,
+                ),
             )
 
-        expected_ids = torch.tensor([[1, 3], [3, 1]], dtype=torch.int32)
-        torch.testing.assert_close(result.topk_ids, expected_ids)
-        torch.testing.assert_close(result.topk_weights, torch.full((2, 2), 0.5))
-        capture_routed_experts.assert_called_once()
-        capture_args = capture_routed_experts.call_args.args
-        self.assertIs(capture_args[0], block.topk.topk_config)
-        self.assertEqual(capture_args[1], block.layer_id)
-        torch.testing.assert_close(capture_args[2], expected_ids)
-        get_recorder.return_value.on_select_experts.assert_called_once()
-        torch.testing.assert_close(
-            get_recorder.return_value.on_select_experts.call_args.kwargs["topk_ids"],
-            expected_ids,
-        )
-
-    @patch("sglang.srt.models.llada2.get_moe_runner_backend")
-    @patch("sglang.srt.models.llada2.get_global_expert_distribution_recorder")
-    @patch("sglang.srt.models.llada2.capture_routed_experts_if_allowed")
-    def test_block_routing_applies_round_robin_expert_simulation_before_diagnostics(
-        self,
-        capture_routed_experts,
-        get_recorder,
-        backend,
-    ):
-        backend.return_value.is_triton_kernels.return_value = False
-        backend.return_value.is_aiter.return_value = False
-
-        block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
-        nn.Module.__init__(block)
-        block.layer_id = 1
-        block.routed_scaling_factor = 1.0
-        block.topk = SimpleNamespace(topk_config=object())
-        block.experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=False)
-        router_logits = torch.zeros((2, 4))
-
-        with envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.override(True):
-            result = block._make_block_topk_output(
-                router_logits,
-                torch.tensor([[0.2, 0.8], [0.4, 0.6]]),
-                torch.tensor([[0, 1], [1, 2]], dtype=torch.int32),
+    def test_block_routing_rejects_round_robin_expert_simulation(self):
+        with (
+            get_parallel().override(tp_size=1, moe_ep_size=1),
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(False),
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.override(True),
+            self.assertRaisesRegex(
+                ValueError, r"does not support SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+            ),
+        ):
+            LLaDA2MoeSparseMoeBlock(
+                layer_id=0,
+                config=SimpleNamespace(
+                    num_experts_per_tok=8,
+                    norm_topk_prob=True,
+                    hidden_size=1024,
+                    num_shared_experts=1,
+                    expert_capacity=48,
+                ),
             )
-
-        expected_ids = torch.tensor([[1, 3], [2, 0]], dtype=torch.int32)
-        torch.testing.assert_close(result.topk_ids, expected_ids)
-        torch.testing.assert_close(result.topk_weights, torch.full((2, 2), 0.5))
-        capture_routed_experts.assert_called_once()
-        capture_args = capture_routed_experts.call_args.args
-        self.assertIs(capture_args[0], block.topk.topk_config)
-        self.assertEqual(capture_args[1], block.layer_id)
-        torch.testing.assert_close(capture_args[2], expected_ids)
-        get_recorder.return_value.on_select_experts.assert_called_once()
-        torch.testing.assert_close(
-            get_recorder.return_value.on_select_experts.call_args.kwargs["topk_ids"],
-            expected_ids,
-        )
 
     def test_block_routing_rejects_conflicting_expert_simulations(self):
-        block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
-        nn.Module.__init__(block)
-        block.layer_id = 1
-
         with (
+            get_parallel().override(tp_size=1, moe_ep_size=1),
             envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True),
             envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.override(True),
             self.assertRaisesRegex(ValueError, r"mutually exclusive"),
         ):
-            block._make_block_topk_output(
-                torch.zeros((1, 4)),
-                torch.tensor([[0.2, 0.8]]),
-                torch.tensor([[0, 1]], dtype=torch.int32),
+            LLaDA2MoeSparseMoeBlock(
+                layer_id=0,
+                config=SimpleNamespace(
+                    num_experts_per_tok=8,
+                    norm_topk_prob=True,
+                    hidden_size=1024,
+                    num_shared_experts=1,
+                    expert_capacity=48,
+                ),
             )
 
 
