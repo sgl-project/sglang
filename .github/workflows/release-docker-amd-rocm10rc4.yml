@@ -21,6 +21,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The full PR workflow chains the AMD extra suite, which needs these scopes.
+# Reusable workflows cannot elevate permissions granted by their caller.
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 env:
   # Scratch registry for the ROCm 10 RC4 bring-up images.
   IMAGE_REPO: bingxche/sgl-test
@@ -102,14 +110,27 @@ jobs:
           docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t ${IMAGE_REPO}:${tag}-${{ env.DATE }} --no-cache
           docker push ${IMAGE_REPO}:${tag}-${{ env.DATE }}
 
-  validate:
-    name: Validate ROCm 10 RC4 on MI300 and MI35x
+  validate-pr:
+    name: Run full AMD PR suite with ROCm 10 RC4
+    needs: publish
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/pr-test-amd-rocm720.yml
+    with:
+      rocm_version: rocm10rc4
+      ref: ${{ github.sha }}
+      runner_arch: mi300
+      run_all_tests: true
+      continue_on_error: true
+    secrets: inherit
+
+  validate-nightly:
+    name: Run full AMD nightly suite with ROCm 10 RC4
     needs: publish
     if: github.event_name == 'push'
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
       rocm_version: rocm10rc4
       ref: ${{ github.sha }}
-      job_filter: nightly-perf-2-gpu-text-rocm720,nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720
+      job_filter: all
       continue_on_error: true
     secrets: inherit
