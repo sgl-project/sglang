@@ -141,6 +141,7 @@ class ForwardMetadata:
 class TritonAttnBackend(AttentionBackend):
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
+    supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch

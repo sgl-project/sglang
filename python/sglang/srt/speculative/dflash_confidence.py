@@ -1,0 +1,231 @@
+"""Confidence-driven, cross-request verification planning for DFlash2.
+
+This module deliberately schedules only the *currently proposed* linear prefix.
+A suffix that is not selected for target verification is discarded and drafted
+again from the next target-verified bonus token.  It is therefore not a source
+of generated output or KV state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    SpsAdditiveCostTable,
+    SpsCostTable,
+)
+
+
+@dataclass(frozen=True)
+class DFlashSpsBudgetDecision:
+    """SPS-selected total target-verify width and its throughput prediction."""
+
+    budget: int
+    predicted_step_seconds: float | None = None
+    predicted_theta: float | None = None
+
+
+@dataclass(frozen=True)
+class DFlashConfidenceDecision:
+    """A deterministic verify-prefix decision for one target-verify batch."""
+
+    verify_lens: torch.Tensor
+    deferred_tokens: int
+    low_confidence_tokens: int
+
+
+def selector_selected_path_confidence(
+    scores: torch.Tensor, path_indices: torch.Tensor
+) -> torch.Tensor:
+    """Return conditional probabilities for the selector path actually proposed.
+
+    ``scores[b, j, p, c]`` describes candidate ``c`` at position ``j`` given
+    predecessor candidate ``p``. ``path_indices[b, j]`` identifies the candidate
+    selected by the selector walk. The returned factor is
+    ``P(path_j | anchor)`` for ``j=0`` and ``P(path_j | path_{j-1})`` afterward.
+    Prefix survival is then formed by ``plan_verify_prefixes`` with ``cumprod``.
+    The score uses the selector's native temperature rather than request sampling
+    temperature, so it remains a model-likelihood signal suitable for later STS.
+    """
+
+    if scores.ndim != 4:
+        raise ValueError(f"expected selector scores [B, L, K, K], got {scores.shape}")
+    batch, positions, predecessors, candidates = scores.shape
+    if predecessors != candidates:
+        raise ValueError(
+            "expected square selector lattice [B, L, K, K], got " f"{scores.shape}"
+        )
+    if path_indices.shape != (batch, positions):
+        raise ValueError(
+            "expected path_indices [B, L] matching selector scores, got "
+            f"{path_indices.shape} for scores {scores.shape}"
+        )
+    if path_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"path_indices must be int32 or int64, got {path_indices.dtype}"
+        )
+    if bool(((path_indices < 0) | (path_indices >= candidates)).any()):
+        raise ValueError("path_indices contains a candidate outside the selector top-k")
+
+    predecessor_indices = torch.cat(
+        (torch.zeros_like(path_indices[:, :1]), path_indices[:, :-1]), dim=1
+    )
+    selected_rows = scores.gather(
+        2,
+        predecessor_indices.to(torch.long)
+        .unsqueeze(-1)
+        .unsqueeze(-1)
+        .expand(-1, -1, 1, candidates),
+    ).squeeze(2)
+    return (
+        torch.softmax(selected_rows.float(), dim=-1)
+        .gather(-1, path_indices.to(torch.long).unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
+def select_sps_verify_token_budget(
+    confidence: torch.Tensor,
+    *,
+    verify_num_draft_tokens: int,
+    min_verify_len: int,
+    sps_table: SpsCostTable | SpsAdditiveCostTable,
+) -> DFlashSpsBudgetDecision:
+    """Choose DFlash's verify width with DSpark's SPS table objective.
+
+    This intentionally depends only on the lightweight SPS table module, rather
+    than the DSpark worker planner. It maximizes expected committed tokens per
+    measured verify-step second over every admissible number of draft positions.
+    """
+
+    if confidence.ndim != 2:
+        raise ValueError(f"expected confidence [B, gamma], got {confidence.shape}")
+    bs, gamma = confidence.shape
+    if verify_num_draft_tokens != gamma + 1:
+        raise ValueError(
+            "verify_num_draft_tokens must equal confidence width + 1; "
+            f"got {verify_num_draft_tokens=} and gamma={gamma}"
+        )
+    if not 1 <= min_verify_len <= verify_num_draft_tokens:
+        raise ValueError(
+            f"min_verify_len must be in [1, {verify_num_draft_tokens}], got {min_verify_len}"
+        )
+
+    survival = torch.cumprod(confidence.float().clamp(0.0, 1.0), dim=1)
+    candidates = torch.sort(survival.reshape(-1).double(), descending=True).values
+    expected = torch.cat(
+        (
+            torch.tensor([float(bs)], dtype=torch.float64),
+            float(bs) + torch.cumsum(candidates, dim=0),
+        )
+    )
+    budgets = range(expected.numel())
+    if isinstance(sps_table, SpsAdditiveCostTable):
+        step_seconds = torch.tensor(
+            [sps_table.step_time(num_reqs=bs, budget=k) for k in budgets],
+            dtype=torch.float64,
+        )
+        theta = expected / step_seconds
+        best = int(torch.argmax(theta))
+        predicted_step_seconds = float(step_seconds[best])
+    else:
+        sps = torch.tensor(
+            [sps_table.lookup(bs + k) for k in budgets], dtype=torch.float64
+        )
+        theta = expected * sps
+        best = int(torch.argmax(theta))
+        predicted_step_seconds = float(1.0 / sps[best]) if sps[best] > 0 else None
+
+    total = min(
+        bs * verify_num_draft_tokens,
+        max(bs * min_verify_len, bs + best),
+    )
+    return DFlashSpsBudgetDecision(
+        budget=total,
+        predicted_step_seconds=predicted_step_seconds,
+        predicted_theta=float(theta[best]),
+    )
+
+
+def plan_verify_prefixes(
+    confidence: torch.Tensor,
+    *,
+    verify_num_draft_tokens: int,
+    confidence_threshold: float,
+    min_verify_len: int,
+    target_verify_tokens: int,
+) -> DFlashConfidenceDecision:
+    """Allocate a target-verify token budget across request-local prefixes.
+
+    Every request verifies at least its anchor. An anchor-only window still
+    commits the target bonus, preserving progress without forcing a proposal.
+    Optional positions compete globally by cumulative survival probability, so
+    higher-confidence paths are verified first, matching DSpark's top-k
+    scheduling objective. Prefix expansion is performed one request at a time
+    to keep every selected per-request set contiguous.
+    """
+
+    if confidence.ndim != 2:
+        raise ValueError(f"expected confidence [B, gamma], got {confidence.shape}")
+    bs, gamma = confidence.shape
+    if verify_num_draft_tokens != gamma + 1:
+        raise ValueError(
+            "verify_num_draft_tokens must equal confidence width + 1; "
+            f"got {verify_num_draft_tokens=} and gamma={gamma}"
+        )
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("confidence_threshold must be in [0, 1]")
+    if not 1 <= min_verify_len <= verify_num_draft_tokens:
+        raise ValueError(
+            "min_verify_len must verify at least the anchor, got "
+            f"{min_verify_len} for verify width {verify_num_draft_tokens}"
+        )
+
+    # Do not mutate the selector-confidence buffer: in overlap mode it may be
+    # published to the asynchronous relay after this planner returns.
+    confidence = confidence.float().clamp(0.0, 1.0)
+    survival = torch.cumprod(confidence, dim=1)
+    # DSpark's ScheduleVerifyLensTopk selects the largest cumulative-survival
+    # probabilities. Since survival is non-increasing along every request,
+    # allocating winning request runs preserves its prefix semantics.
+    priority = survival
+    required_extra = min_verify_len - 1
+    max_extra = gamma
+    requested_total = max(bs * min_verify_len, int(target_verify_tokens))
+    budget_extra = min(max(0, requested_total - bs), bs * max_extra)
+    budget_extra = max(budget_extra, bs * required_extra)
+
+    lengths = torch.full(
+        (bs,), min_verify_len, dtype=torch.int32, device=confidence.device
+    )
+    remaining = budget_extra - bs * required_extra
+    low_confidence_tokens = int((survival < confidence_threshold).sum().item())
+
+    # A global top-k over survival values is prefix-safe: survival is
+    # non-increasing along every request, so choosing position n also chooses
+    # every earlier position in that request. Match DSpark's deterministic
+    # descending order: survival, then position, then request index.
+    if remaining:
+        candidate_priority = priority[:, required_extra:]
+        request_index = torch.arange(bs, device=confidence.device).view(-1, 1)
+        request_index = request_index.expand_as(candidate_priority).reshape(-1)
+        position_index = torch.arange(
+            candidate_priority.shape[1], device=confidence.device
+        ).view(1, -1)
+        position_index = position_index.expand_as(candidate_priority).reshape(-1)
+        flat_priority = candidate_priority.reshape(-1)
+        order = torch.arange(flat_priority.numel(), device=confidence.device)
+        order = order[torch.argsort(request_index[order], stable=True)]
+        order = order[torch.argsort(position_index[order], stable=True)]
+        order = order[torch.argsort(-flat_priority[order], stable=True)]
+        chosen_requests = request_index[order[:remaining]]
+        lengths += torch.bincount(chosen_requests, minlength=bs).to(torch.int32)
+
+    deferred_tokens = int((verify_num_draft_tokens - lengths).sum().item())
+    return DFlashConfidenceDecision(
+        verify_lens=lengths,
+        deferred_tokens=deferred_tokens,
+        low_confidence_tokens=low_confidence_tokens,
+    )

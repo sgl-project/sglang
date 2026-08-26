@@ -577,6 +577,34 @@ class DFlashDraftModel(nn.Module):
                 prefix=embed_prefix,
             )
 
+        # DFLASH_CONFIDENCE can consume the same trained per-position head used
+        # by DSpark. It is opt-in at checkpoint level so existing DFlash drafts
+        # retain their original parameter layout and selector-score fallback.
+        self.confidence_head: Optional[nn.Module] = None
+        self.markov_head: Optional[nn.Module] = None
+        if bool(getattr(config, "enable_confidence_head", False)):
+            from sglang.srt.models.dspark import (
+                DSparkConfidenceHead,
+                build_markov_head,
+            )
+
+            markov_rank = int(getattr(config, "markov_rank", 0))
+            with_markov = bool(
+                getattr(config, "confidence_head_with_markov", markov_rank > 0)
+            )
+            if with_markov and markov_rank <= 0:
+                raise ValueError(
+                    "DFLASH confidence_head_with_markov requires markov_rank > 0, "
+                    f"got markov_rank={markov_rank}."
+                )
+            if with_markov:
+                self.markov_head = build_markov_head(config)
+            self.confidence_head = DSparkConfidenceHead(
+                hidden_size=hidden_size,
+                markov_rank=markov_rank,
+                with_markov=with_markov,
+            )
+
         def grouped_conv():
             if not draft_config.conv_kernel_size:
                 return None
@@ -752,6 +780,7 @@ class DFlashDraftModel(nn.Module):
                 return aliased_name
             return None
 
+        loaded_auxiliary_params = set()
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
@@ -763,6 +792,8 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                if resolved_name.startswith(("confidence_head.", "markov_head.")):
+                    loaded_auxiliary_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -799,6 +830,52 @@ class DFlashDraftModel(nn.Module):
                         )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if resolved_name.startswith(("confidence_head.", "markov_head.")):
+                    loaded_auxiliary_params.add(resolved_name)
+
+        if self.confidence_head is not None:
+            confidence_param_names = {
+                name for name in params_dict if name.startswith("confidence_head.")
+            }
+            missing = confidence_param_names - loaded_auxiliary_params
+            if missing:
+                raise ValueError(
+                    "DFLASH confidence head is enabled but the checkpoint is missing "
+                    f"{sorted(missing)}. Provide a checkpoint with trained "
+                    "confidence_head weights or set enable_confidence_head=False."
+                )
+            if self.markov_head is not None:
+                markov_param_names = {
+                    name for name in params_dict if name.startswith("markov_head.")
+                }
+                missing = markov_param_names - loaded_auxiliary_params
+                if missing:
+                    raise ValueError(
+                        "DFLASH confidence head uses Markov features but the checkpoint "
+                        f"is missing {sorted(missing)}. Provide a checkpoint with trained "
+                        "markov_head weights or disable confidence_head_with_markov."
+                    )
+
+    def compute_confidence(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        anchor_tokens: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Predict selected-path survival probabilities with the DSpark head."""
+        confidence_head = self.confidence_head
+        if confidence_head is None:
+            return None
+        markov_embed_stack = None
+        if confidence_head.with_markov:
+            assert self.markov_head is not None
+            previous_tokens = torch.cat(
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, :-1]], dim=1
+            )
+            markov_embed_stack = self.markov_head.get_prev_embeddings(previous_tokens)
+        confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
+        return confidence_head.apply_sts(confidence_raw)
 
 
 class DFlashLagunaAttention(DFlashAttention):
@@ -1009,10 +1086,13 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Walk one path, with q over the K candidates for the verify. greedy_mask
-        rows take the argmax, selected rather than branched, so one captured graph
-        serves greedy and sampling batches alike."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Walk one path and return tokens, selected indices, and q rows.
+
+        ``path_indices[b, j]`` identifies the candidate selected at position ``j``
+        and therefore the predecessor row at position ``j + 1``. This lets
+        confidence scheduling score the exact selected path.
+        """
         if scores.is_cuda:
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
@@ -1060,7 +1140,7 @@ class CandidateSelector(nn.Module):
         q_rows = torch.where(
             greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
         )
-        return tokens, q_rows
+        return tokens, path_indices, q_rows
 
 
 class DFlash2DraftModel(DFlashDraftModel):

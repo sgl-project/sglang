@@ -254,6 +254,7 @@ def _selector_walk_kernel(
     temperatures_ptr,
     greedy_ptr,
     tokens_ptr,
+    indices_ptr,
     q_ptr,
     slots: tl.constexpr,
     top_k: tl.constexpr,
@@ -285,6 +286,7 @@ def _selector_walk_kernel(
             index = tl.minimum(index, top_k - 1)
         tl.store(q_ptr + base + offsets, probabilities)
         tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
+        tl.store(indices_ptr + row * slots + slot, index)
         previous = index
 
 
@@ -298,6 +300,7 @@ def selector_walk_triton(
 ):
     batch, slots, top_k = candidate_ids.shape
     tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+    path_indices = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
     q_rows = torch.empty(
         (batch, slots, top_k), dtype=torch.float32, device=scores.device
     )
@@ -308,9 +311,10 @@ def selector_walk_triton(
         temperatures.contiguous(),
         greedy_mask.contiguous(),
         tokens,
+        path_indices,
         q_rows,
         slots=slots,
         top_k=top_k,
         num_warps=1,
     )
-    return tokens, q_rows
+    return tokens, path_indices, q_rows

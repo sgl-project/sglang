@@ -343,7 +343,7 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 # Speculative algorithms whose verify forward presents a uniform per-request
 # token width, which is what the LoRA segment layout assumes.
-_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK", "DFLASH_CONFIDENCE")
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -2194,6 +2194,36 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    speculative_dflash_confidence_threshold: A[
+        float,
+        "DFLASH_CONFIDENCE only. Selector survival threshold used for diagnostics and verify-prefix planning.",
+        NS("spec"),
+    ] = 0.5
+    speculative_dflash_confidence_min_verify_len: A[
+        int,
+        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token; 1 means anchor-only verification and a bonus-only commit step.",
+        NS("spec"),
+    ] = 1
+    speculative_dflash_confidence_target_verify_tokens: A[
+        int,
+        "DFLASH_CONFIDENCE only. Fixed total target-verify token target; zero preserves full verification without an SPS table.",
+        NS("spec"),
+    ] = 0
+    speculative_dflash_confidence_sps_table_path: A[
+        Optional[str],
+        "DFLASH_CONFIDENCE only. Path to a DSpark-format pre-profiled SPS cost table JSON.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_confidence_sts_path: A[
+        Optional[str],
+        "DFLASH_CONFIDENCE only. Path to a DSpark-format per-position sequential temperature scaling calibration JSON for the trained confidence head.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_confidence_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DFLASH_CONFIDENCE only. Fill compact ragged verification to its CUDA Graph token bucket.",
+        NS("spec"),
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
@@ -6841,21 +6871,25 @@ class ServerArgs:
             ragged_mode = read_ragged_verify_mode()
             if ragged_mode is not RaggedVerifyMode.STATIC:
                 # Ragged ring-writes need the KDA fold-every-commit family
-                # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
+                # (DSPARK/DFLASH/DFLASH_CONFIDENCE) + the triton verify kernel (nv_cutedsl falls
                 # back to it for ragged layouts). The GDN ring-write kernels do
                 # not take the ragged layout and the flashinfer verify kernel
                 # never writes the ring -> a stale ring would be folded; keep
                 # refusing those combinations.
                 _algo = (self.speculative_algorithm or "").upper()
                 verify = self.linear_attn_verify_backend
-                if _algo not in ("DSPARK", "DFLASH") or verify not in (
+                if _algo not in (
+                    "DSPARK",
+                    "DFLASH",
+                    "DFLASH_CONFIDENCE",
+                ) or verify not in (
                     "triton",
                     "nv_cutedsl",
                 ):
                     raise ValueError(
                         "--enable-linear-replayssm-spec with "
                         f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                        "KDA fold-every-commit family (DSPARK/DFLASH) and a "
+                        "KDA fold-every-commit family (DSPARK/DFLASH/DFLASH_CONFIDENCE) and a "
                         "ring-writing verify kernel (--linear-attn-verify-backend "
                         "triton or nv_cutedsl); got "
                         f"algorithm={self.speculative_algorithm!r}, "
@@ -10211,20 +10245,28 @@ class ServerArgs:
             )
             raise ValueError(
                 "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
-                "DFLASH, or DSPARK speculative decoding, not "
+                "DFLASH, DFLASH_CONFIDENCE, or DSPARK speculative decoding, not "
                 f"{self.speculative_algorithm}{promoted}."
             )
 
         ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+        dflash_confidence_ragged = (
+            self.speculative_algorithm == "DFLASH_CONFIDENCE"
+            and (
+                int(self.speculative_dflash_confidence_target_verify_tokens) > 0
+                or self.speculative_dflash_confidence_sps_table_path is not None
+            )
+        )
 
         # Each entry: (is unsupported, why). Reasons are appended to a shared
         # prefix so the message names the combination, not just the flag.
         unsupported = [
             (
-                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
-                f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
-                "the per-request verify lengths it schedules break the "
-                "uniform-width LoRA segment layout",
+                (self.speculative_algorithm == "DSPARK" and ragged_mode != "static")
+                or dflash_confidence_ragged,
+                "does not support per-request ragged verification: the "
+                "uniform-width LoRA segment layout would apply adapters to "
+                "the wrong tokens",
             ),
             (
                 self.speculative_adaptive,

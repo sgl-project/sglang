@@ -53,7 +53,13 @@ class DFlashVerifyInput(SpecInput):
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_req == -1:
-            self.num_tokens_per_req = int(self.draft_token_num)
+            # A compact ragged verify input is not uniformly block-sized.
+            # Advertise width=1 so fixed-width graph runners reject it and
+            # take their eager ragged path when they were not captured ragged.
+            self.num_tokens_per_req = (
+                1 if self.ragged_verify_layout is not None else int(self.draft_token_num)
+            )
+        # Logits are scattered back to the original strided block after verify.
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
     def prepare_for_verify(
