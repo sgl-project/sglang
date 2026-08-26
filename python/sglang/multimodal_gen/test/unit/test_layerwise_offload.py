@@ -206,6 +206,8 @@ def _server_args(**kwargs):
         component_residency=None,
         disagg_role=RoleType.MONOLITHIC,
         performance_mode="auto",
+        num_gpus=1,
+        nnodes=1,
         _required_resident_components=set(),
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
@@ -899,6 +901,29 @@ def test_resident_layers_off_by_default_streams_everything(monkeypatch):
     assert 2 not in manager._gpu_layers
 
 
+def test_resident_layer_size_and_runtime_reconfiguration(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    full_bytes = sum(manager.layer_weight_bytes().values())
+
+    assert manager.resident_weight_bytes(0) == 0
+    assert manager.resident_weight_bytes(4) == full_bytes
+    assert manager.resident_weight_bytes(2) * 2 == full_bytes
+    assert manager.peak_managed_device_weight_bytes(0) == full_bytes // 4
+    assert manager.peak_managed_device_weight_bytes(2) == 3 * full_bytes // 4
+    assert manager.peak_managed_device_weight_bytes(4) == full_bytes
+
+    _arm_residency(manager)
+    previous = manager.set_resident_layers(1)
+    assert previous == 2
+    assert manager.resident_layers == 1
+    assert manager._resident_set == {0}
+    assert manager._residency_active is False
+    assert not manager._gpu_layers
+
+
 def test_prepare_for_next_req_repins_residents(monkeypatch):
     _patch_fake_device(monkeypatch)
     manager = _resident_manager(
@@ -1509,6 +1534,38 @@ def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=64)
     assert not manager._mapped_cpu_weights[0], "a copy was affordable"
     assert manager._consolidated_cpu_weights[0]
+
+
+def test_anonymous_layer_store_can_reassign_its_pin_budget(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=4 * 1024**3,
+        num_blocks=2,
+    )
+    original = manager.pinned_layer_indices()
+    assert original == (0, 1)
+    committed = manager._pin_budget.committed_bytes
+    pinned_store_bytes = sum(
+        manager.layer_host_store_bytes()[layer_idx] for layer_idx in original
+    )
+
+    previous = manager.set_pinned_layers(())
+    assert previous == original
+    assert manager.pinned_layer_indices() == ()
+    assert manager._pin_budget.committed_bytes == committed - pinned_store_bytes
+    assert all(
+        not buffer.is_pinned()
+        for stores in manager._consolidated_cpu_weights.values()
+        for buffer in stores.values()
+    )
+
+    manager.set_pinned_layers(previous)
+    assert manager.pinned_layer_indices() == original
+    assert manager._pin_budget.committed_bytes == committed
 
 
 def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):

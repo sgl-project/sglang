@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -111,6 +112,36 @@ def _print_case_log_separator(case_id: str, state: str) -> None:
     )
 
 
+def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
+    """Representative workload passed to startup residency calibration."""
+    sampling = case.sampling_params
+    if sampling is None:
+        return {}
+    overrides: dict[str, Any] = {}
+    if sampling.output_size:
+        width, height = sampling.output_size.lower().split("x", 1)
+        overrides.update(width=int(width), height=int(height))
+    if sampling.num_frames is not None:
+        overrides["num_frames"] = sampling.num_frames
+    elif sampling.fps is not None:
+        # /v1/videos resolves an omitted num_frames from seconds * fps.
+        overrides["num_frames"] = sampling.seconds * sampling.fps
+    if sampling.fps is not None:
+        overrides["fps"] = sampling.fps
+    for name in ("num_inference_steps", "guidance_scale", "true_cfg_scale"):
+        value = sampling.extras.get(name)
+        if value is not None:
+            overrides[name] = value
+    return overrides
+
+
+def _has_server_option(extra_args: str, case_extras: list[str], option: str) -> bool:
+    tokens = shlex.split(extra_args)
+    for extra in case_extras:
+        tokens.extend(shlex.split(extra))
+    return option in tokens or any(token.startswith(f"{option}=") for token in tokens)
+
+
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
@@ -134,6 +165,15 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
+
+    has_explicit_warmup_workload = _has_server_option(
+        extra_args, server_args.extras, "--warmup-sampling-params"
+    )
+    if not has_explicit_warmup_workload:
+        warmup_sampling_params = _case_warmup_sampling_params(case)
+        if warmup_sampling_params:
+            encoded = json.dumps(warmup_sampling_params, separators=(",", ":"))
+            extra_args += f" --warmup-sampling-params {shlex.quote(encoded)}"
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 

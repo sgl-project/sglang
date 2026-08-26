@@ -28,6 +28,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
     LongLive2T2VConfig,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
@@ -53,6 +54,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
+    _apply_warmup_sampling_overrides,
     _resolve_warmup_num_frames,
     build_warmup_reqs,
     should_include_warmup_image,
@@ -107,6 +109,51 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
 
 class TestWarmupReqCfgParallel(unittest.TestCase):
     """Warmup request construction and req-based warmup guards."""
+
+    def test_sampling_workload_override_accepts_json(self):
+        defaults = SamplingParams(
+            width=1024,
+            height=1024,
+            num_frames=81,
+            num_inference_steps=35,
+        )
+        server_args = SimpleNamespace(
+            warmup_sampling_params=(
+                '{"width":832,"height":480,"num_frames":9,' '"num_inference_steps":4}'
+            )
+        )
+
+        overridden = _apply_warmup_sampling_overrides(server_args, defaults)
+
+        self.assertEqual(
+            (
+                overridden.width,
+                overridden.height,
+                overridden.num_frames,
+                overridden.num_inference_steps,
+            ),
+            (832, 480, 9, 4),
+        )
+        self.assertEqual((defaults.width, defaults.height), (1024, 1024))
+
+    def test_sampling_workload_override_rejects_unknown_field(self):
+        server_args = SimpleNamespace(
+            warmup_sampling_params={"not_a_sampling_field": 1}
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid --warmup-sampling-params"):
+            _apply_warmup_sampling_overrides(server_args, SamplingParams())
+
+    def test_sampling_workload_override_supports_fixed_model_fields(self):
+        defaults = MiniMaxH3SamplingParams()
+        server_args = SimpleNamespace(
+            warmup_sampling_params={"num_frames": 49, "fps": 12}
+        )
+
+        overridden = _apply_warmup_sampling_overrides(server_args, defaults)
+
+        self.assertEqual((overridden.num_frames, overridden.fps), (49, 12))
+        self.assertEqual((defaults.num_frames, defaults.fps), (1, 24))
 
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args

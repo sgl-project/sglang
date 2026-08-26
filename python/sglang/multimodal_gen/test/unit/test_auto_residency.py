@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
@@ -22,8 +23,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     apply_promotions,
     collect_promotion_candidates,
     component_resident_size_bytes,
+    component_runtime_weight_bytes,
     estimate_default_workload_peak_bytes,
+    estimate_workload_phase_peaks,
     format_applied_changes,
+    module_uses_quantized_weights,
     plan_auto_residency,
     rank_candidates_by_h2d_savings,
     rollback_promotions,
@@ -140,6 +144,37 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == fallback
 
+    def test_weight_floor_prevents_scaling_constant_component_memory(self):
+        small = WarmupMemoryRecord(
+            width=832,
+            height=480,
+            num_frames=9,
+            baseline_allocated_bytes=GIB_BYTES,
+            peak_reserved_bytes=int(29.5 * GIB_BYTES),
+            succeeded=True,
+        )
+        large = WarmupMemoryRecord(
+            width=832,
+            height=480,
+            num_frames=17,
+            baseline_allocated_bytes=GIB_BYTES,
+            peak_reserved_bytes=int(29.4 * GIB_BYTES),
+            succeeded=True,
+        )
+        target_units = 1024 * 1024 * 81
+
+        estimate = estimate_default_workload_peak_bytes(
+            records=[small, large],
+            target_units=target_units,
+            constant_weight_bytes=int(29.4 * GIB_BYTES),
+        )
+        fallback_without_weights = estimate_default_workload_peak_bytes(
+            records=[small, large], target_units=target_units
+        )
+
+        assert estimate < 50 * GIB_BYTES
+        assert estimate < fallback_without_weights
+
     def test_covering_measurement_bounds_the_target(self):
         capped = _record(num_frames=17, peak_gib=12)
         full = _record(width=1280, height=720, num_frames=81, peak_gib=30)
@@ -195,6 +230,51 @@ class TestEstimateDefaultWorkloadPeak:
             estimate_default_workload_peak_bytes(records=[], target_units=None) is None
         )
 
+    def test_phase_estimation_preserves_active_component_membership(self):
+        small = _record(num_frames=9, peak_gib=30)
+        large = _record(num_frames=17, peak_gib=32)
+        small = WarmupMemoryRecord(
+            width=small.width,
+            height=small.height,
+            num_frames=small.num_frames,
+            baseline_allocated_bytes=small.baseline_allocated_bytes,
+            peak_reserved_bytes=small.peak_reserved_bytes,
+            succeeded=small.succeeded,
+            phase_peak_reserved_bytes={"denoise": 30 * GIB_BYTES},
+            phase_active_components={"denoise": ("transformer",)},
+        )
+        large = WarmupMemoryRecord(
+            width=large.width,
+            height=large.height,
+            num_frames=large.num_frames,
+            baseline_allocated_bytes=large.baseline_allocated_bytes,
+            peak_reserved_bytes=large.peak_reserved_bytes,
+            succeeded=large.succeeded,
+            phase_peak_reserved_bytes={"denoise": 32 * GIB_BYTES},
+            phase_active_components={"denoise": ("transformer",)},
+        )
+
+        peaks, active = estimate_workload_phase_peaks(
+            records=[small, large],
+            target_units=832 * 480 * 81,
+            component_weight_bytes={"transformer": 28 * GIB_BYTES},
+        )
+
+        assert peaks["denoise"] >= 32 * GIB_BYTES
+        assert active == {"denoise": ("transformer",)}
+
+
+def test_loaded_native_quantization_config_is_detected_with_bf16_weights():
+    linear = LinearBase.__new__(LinearBase)
+    nn.Module.__init__(linear)
+    linear.quant_config = object()
+    linear.register_parameter(
+        "weight",
+        nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False),
+    )
+
+    assert module_uses_quantized_weights(linear)
+
 
 def _candidate(
     name: str,
@@ -203,12 +283,18 @@ def _candidate(
     weight_gib: int = 10,
     h2d_gib: int | None = None,
 ) -> PromotionCandidate:
+    layerwise = mode == LAYERWISE_OFFLOAD
     return PromotionCandidate(
         component_name=name,
         residency_mode=mode,
         promoted_weight_bytes=weight_gib * GIB_BYTES,
         h2d_bytes_per_request=(h2d_gib if h2d_gib is not None else weight_gib)
         * GIB_BYTES,
+        target_layerwise_resident_layers=(1,) if layerwise else None,
+        target_layerwise_pinned_layers=((),) if layerwise else None,
+        permanent_residency=True,
+        active_device_delta_bytes=0,
+        inactive_device_delta_bytes=weight_gib * GIB_BYTES,
     )
 
 
@@ -219,6 +305,12 @@ def _report(
     estimated_gib: int | None = 50,
     candidates: list[PromotionCandidate] | None = None,
     skip_reason: str | None = None,
+    phase_peaks_gib: dict[str, int] | None = None,
+    phase_components: dict[str, tuple[str, ...]] | None = None,
+    node_rank: int = 0,
+    pinned_host_gib: int = 0,
+    host_pin_capacity_gib: int = 0,
+    host_transition_headroom_gib: int = 0,
 ) -> RankResidencyReport:
     return RankResidencyReport(
         rank=rank,
@@ -226,6 +318,14 @@ def _report(
         estimated_peak_bytes=(
             None if estimated_gib is None else estimated_gib * GIB_BYTES
         ),
+        estimated_peak_bytes_by_phase={
+            name: value * GIB_BYTES for name, value in (phase_peaks_gib or {}).items()
+        },
+        active_components_by_phase=phase_components or {},
+        node_rank=node_rank,
+        pinned_host_bytes=pinned_host_gib * GIB_BYTES,
+        host_pin_capacity_bytes=host_pin_capacity_gib * GIB_BYTES,
+        host_transition_headroom_bytes=(host_transition_headroom_gib * GIB_BYTES),
         candidates=candidates if candidates is not None else [_candidate("vae")],
         skip_reason=skip_reason,
     )
@@ -306,12 +406,250 @@ class TestPlanAutoResidency:
         plan = plan_auto_residency(reports=[_report(candidates=[])])
         assert plan.skip_reason is not None
 
+    def test_component_active_phase_is_not_double_counted(self):
+        # Cosmos3-Super TP2: the 66 GiB denoise peak already includes the
+        # roughly 60 GiB/rank DiT. Keeping it resident adds those bytes only
+        # to the 4 GiB idle phase, matching the measured 73 GiB resident peak
+        # instead of inventing a 126 GiB denoise peak.
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=139,
+                    estimated_gib=66,
+                    candidates=[_candidate("transformer", weight_gib=60)],
+                    phase_peaks_gib={"denoise": 66, "idle": 4},
+                    phase_components={"denoise": ("transformer",), "idle": ()},
+                )
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "transformer"
+        ]
+
+    def test_other_phase_can_block_component_residency(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=139,
+                    estimated_gib=90,
+                    candidates=[_candidate("transformer", weight_gib=60)],
+                    phase_peaks_gib={"denoise": 66, "decode": 90},
+                    phase_components={"denoise": ("transformer",), "decode": ()},
+                )
+            ]
+        )
+
+        assert not plan.promotions
+
+    def test_redundant_phase_constraints_collapse_to_the_highest_peak(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=70,
+                    candidates=[_candidate("transformer", weight_gib=10)],
+                    phase_peaks_gib={
+                        "denoise:first": 60,
+                        "denoise:later": 70,
+                        "decode": 50,
+                    },
+                    phase_components={
+                        "denoise:first": ("transformer",),
+                        "denoise:later": ("transformer",),
+                        "decode": ("vae",),
+                    },
+                )
+            ]
+        )
+
+        assert "gpu:rank0:denoise:first" not in plan.resource_budget_bytes
+        assert plan.resource_budget_bytes["gpu:rank0:denoise:later"] == (20 * GIB_BYTES)
+        assert "gpu:rank0:decode" in plan.resource_budget_bytes
+
+    def test_negative_gpu_headroom_is_not_treated_as_zero_capacity(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=80,
+                    estimated_gib=76,
+                    candidates=[_candidate("transformer", weight_gib=10)],
+                    phase_peaks_gib={"denoise": 76},
+                    phase_components={"denoise": ("transformer",)},
+                )
+            ]
+        )
+
+        assert plan.promotions == []
+        assert plan.skip_reason == "no placement satisfies all resource budgets"
+
+    def test_each_rank_keeps_a_reserve_scaled_to_its_own_gpu(self):
+        candidate = _candidate("vae", weight_gib=1)
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    budget_gib=40,
+                    estimated_gib=20,
+                    candidates=[candidate],
+                    phase_peaks_gib={"decode": 20},
+                    phase_components={"decode": ("vae",)},
+                ),
+                _report(
+                    rank=1,
+                    budget_gib=140,
+                    estimated_gib=100,
+                    candidates=[candidate],
+                    phase_peaks_gib={"decode": 100},
+                    phase_components={"decode": ("vae",)},
+                ),
+            ]
+        )
+
+        assert plan.resource_budget_bytes["gpu:rank0:decode"] == 16 * GIB_BYTES
+        assert plan.resource_budget_bytes["gpu:rank1:decode"] == 26 * GIB_BYTES
+        assert plan.reserve_bytes == 14 * GIB_BYTES
+
+    def test_partial_layer_residency_is_selected_when_full_dit_does_not_fit(self):
+        full = _candidate(
+            "transformer",
+            mode=LAYERWISE_OFFLOAD,
+            weight_gib=30,
+            h2d_gib=300,
+        )
+        partial = PromotionCandidate(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=90 * GIB_BYTES,
+            target_layerwise_resident_layers=(12,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=10 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=70,
+                    candidates=[full, partial],
+                    phase_peaks_gib={"denoise": 70},
+                    phase_components={"denoise": ("transformer",)},
+                )
+            ]
+        )
+
+        assert len(plan.promotions) == 1
+        assert plan.promotions[0].target_layerwise_resident_layers == (12,)
+
+    def test_node_hostpin_is_optimized_with_the_same_selection_vector(self):
+        cold_pageable = PromotionCandidate(
+            component_name="cold_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=0,
+            h2d_bytes_per_request=-GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            pinned_host_delta_bytes=-10 * GIB_BYTES,
+        )
+        hot_pinned = PromotionCandidate(
+            component_name="hot_dit",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=10 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    pinned_host_gib=10,
+                    host_pin_capacity_gib=10,
+                    candidates=[cold_pageable, hot_pinned],
+                )
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "cold_encoder",
+            "hot_dit",
+        ]
+        assert plan.resource_budget_bytes["hostpin:node0"] == 0
+
+    def test_dynamic_hostpin_is_not_planned_across_workers(self):
+        pin_more = PromotionCandidate(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=10 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+                _report(
+                    rank=1,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+            ]
+        )
+
+        assert plan.promotions == []
+        assert plan.skip_reason == (
+            "dynamic HostPin placement requires a single-worker node"
+        )
+
+    def test_hostpin_repack_must_fit_transition_headroom(self):
+        pin_more = PromotionCandidate(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=4 * GIB_BYTES,
+            host_pin_scratch_bytes=6 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    host_pin_capacity_gib=10,
+                    host_transition_headroom_gib=5,
+                    candidates=[pin_more],
+                )
+            ]
+        )
+
+        assert plan.promotions == []
+        assert plan.resource_budget_bytes["hostram:node0:pin"] == 5 * GIB_BYTES
+
 
 class _FakeLayerwiseManager:
-    def __init__(self, tensors: dict[str, torch.Tensor]):
+    def __init__(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        resident_layers: int = 0,
+        event_log: list[str] | None = None,
+        event_name: str = "manager",
+    ):
         self.enabled = True
         self._configured = True
         self._tensors = tensors
+        self.num_layers = max(1, len(tensors))
+        self.resident_layers = resident_layers
+        self.residency_policy = "leading"
+        self.pin_cpu_memory = True
+        self._pinned_layers: tuple[int, ...] = ()
+        self._event_log = event_log
+        self._event_name = event_name
         self.fail_load = False
         self.load_all_layers_calls = 0
         self.remove_hooks_calls = 0
@@ -326,6 +664,57 @@ class _FakeLayerwiseManager:
         return sum(
             tensor.numel() * tensor.element_size() for tensor in self._tensors.values()
         )
+
+    def resident_weight_bytes(self, resident_layers=None):
+        count = self.resident_layers if resident_layers is None else resident_layers
+        return (
+            self.offloaded_weight_bytes()
+            * min(count, self.num_layers)
+            // self.num_layers
+        )
+
+    def peak_managed_device_weight_bytes(self, resident_layers=None):
+        count = self.resident_layers if resident_layers is None else resident_layers
+        return (
+            self.offloaded_weight_bytes()
+            * min(count + 1, self.num_layers)
+            // self.num_layers
+        )
+
+    def layer_weight_bytes(self):
+        total = self.offloaded_weight_bytes()
+        base, remainder = divmod(total, self.num_layers)
+        return {
+            layer_idx: base + (1 if layer_idx < remainder else 0)
+            for layer_idx in range(self.num_layers)
+        }
+
+    def layer_host_store_bytes(self):
+        return self.layer_weight_bytes()
+
+    def pinned_host_weight_bytes(self):
+        layer_bytes = self.layer_weight_bytes()
+        return sum(layer_bytes[layer_idx] for layer_idx in self._pinned_layers)
+
+    def pinnable_layer_indices(self):
+        return tuple(range(self.num_layers))
+
+    def pinned_layer_indices(self):
+        return self._pinned_layers
+
+    def set_pinned_layers(self, pinned_layers):
+        previous = self._pinned_layers
+        target = tuple(sorted(pinned_layers))
+        if target != previous and self._event_log is not None:
+            action = "pin" if target else "unpin"
+            self._event_log.append(f"{self._event_name}:{action}")
+        self._pinned_layers = target
+        return previous
+
+    def set_resident_layers(self, resident_layers):
+        previous = self.resident_layers
+        self.resident_layers = min(max(0, resident_layers), self.num_layers)
+        return previous
 
     def load_all_layers(self):
         self.load_all_layers_calls += 1
@@ -388,6 +777,20 @@ class TestSizeAccounting:
         expected = sum(t.numel() * t.element_size() for t in cpu_weights.values())
         assert component_resident_size_bytes(module, LAYERWISE_OFFLOAD) == expected
 
+    def test_layerwise_runtime_floor_uses_only_the_streaming_window(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+                "layers.2.w": torch.zeros(16),
+            }
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        runtime = component_runtime_weight_bytes({"transformer": module})
+
+        assert runtime["transformer"] == manager.peak_managed_device_weight_bytes()
+
 
 class TestCollectPromotionCandidates:
     def _modes(self, mapping):
@@ -424,15 +827,24 @@ class TestCollectPromotionCandidates:
             custom_strategy_names={"custom"},
             num_inference_steps=50,
         )
-        by_name = {c.component_name: c for c in candidates}
+        permanent_candidates = {
+            candidate.component_name: candidate
+            for candidate in candidates
+            if candidate.permanent_residency
+        }
         # resident vae, explicit placement, custom strategy, non-module: out
-        assert set(by_name) == {"text_encoder", "transformer"}
-        assert by_name["text_encoder"].h2d_bytes_per_request == (
-            by_name["text_encoder"].promoted_weight_bytes
+        assert set(permanent_candidates) == {"text_encoder", "transformer"}
+        assert permanent_candidates["text_encoder"].h2d_bytes_per_request == (
+            permanent_candidates["text_encoder"].promoted_weight_bytes
         )
         # layerwise DiT re-streams its layers once per denoise step
-        assert by_name["transformer"].h2d_bytes_per_request == (
-            by_name["transformer"].promoted_weight_bytes * 50
+        assert permanent_candidates["transformer"].h2d_bytes_per_request == (
+            permanent_candidates["transformer"].promoted_weight_bytes * 100
+        )
+        assert any(
+            candidate.component_name == "transformer"
+            and candidate.target_layerwise_resident_layers == (1,)
+            for candidate in candidates
         )
 
     def test_mechanism_mismatch_is_not_a_candidate(self):
@@ -449,6 +861,56 @@ class TestCollectPromotionCandidates:
             num_inference_steps=10,
         )
         assert candidates == []
+
+    def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            }
+        )
+        manager._pinned_layers = (0, 1)
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_promotion_candidates(
+            modules={"text_encoder": module},
+            residency_mode_of=self._modes({"text_encoder": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+
+        assert any(
+            candidate.target_layerwise_pinned_layers == ((),)
+            and candidate.pinned_host_delta_bytes < 0
+            and candidate.host_unpin_scratch_bytes > 0
+            for candidate in candidates
+        )
+
+    def test_multi_worker_candidate_keeps_existing_hostpin_placement(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            }
+        )
+        manager._pinned_layers = (0, 1)
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_promotion_candidates(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            allow_host_pin_reallocation=False,
+        )
+        permanent = next(
+            candidate for candidate in candidates if candidate.permanent_residency
+        )
+
+        assert permanent.target_layerwise_pinned_layers == ((0, 1),)
+        assert permanent.pinned_host_delta_bytes == 0
 
 
 class TestApplyAndRollback:
@@ -490,6 +952,49 @@ class TestApplyAndRollback:
         assert manager.register_hooks_calls == 1
         assert args.required == set()
 
+    def test_partial_layerwise_promotion_restores_exact_group_counts(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {
+                    "layers.0.w": torch.zeros(16),
+                    "layers.1.w": torch.zeros(16),
+                    "layers.2.w": torch.zeros(16),
+                },
+                resident_layers=1,
+            ),
+            _FakeLayerwiseManager(
+                {
+                    "layers.0.w": torch.zeros(16),
+                    "layers.1.w": torch.zeros(16),
+                }
+            ),
+        ]
+        module = _FakeLayerwiseDit(managers)
+        args = _StubResidencyArgs()
+        candidate = PromotionCandidate(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(2, 2),
+            target_layerwise_pinned_layers=((), ()),
+        )
+
+        applied = apply_promotions(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+
+        assert [manager.resident_layers for manager in managers] == [2, 2]
+        assert args.required == set()
+        rollback_promotions(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert [manager.resident_layers for manager in managers] == [1, 0]
+
     def test_mid_failure_rolls_back_already_applied_promotions(self):
         manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
         module = _FakeLayerwiseDit([manager])
@@ -506,7 +1011,111 @@ class TestApplyAndRollback:
             )
         assert args.required == set()
         assert manager.enabled is True
-        assert manager.register_hooks_calls == 1
+        # Validation finishes before any placement is touched.
+        assert manager.register_hooks_calls == 0
+
+    def test_hostpin_handoff_releases_all_components_before_acquiring(
+        self, monkeypatch
+    ):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        source_manager._pinned_layers = (0,)
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        modules = {
+            "source": _FakeLayerwiseDit([source_manager]),
+            "target": _FakeLayerwiseDit([target_manager]),
+        }
+        candidates = [
+            PromotionCandidate(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                promoted_weight_bytes=0,
+                h2d_bytes_per_request=-1,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((),),
+                pinned_host_delta_bytes=-source_manager.offloaded_weight_bytes(),
+            ),
+            PromotionCandidate(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                promoted_weight_bytes=0,
+                h2d_bytes_per_request=10,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((0,),),
+                pinned_host_delta_bytes=target_manager.offloaded_weight_bytes(),
+            ),
+        ]
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "auto_residency.release_unused_pinned_memory",
+            lambda: events.append("flush"),
+        )
+
+        applied = apply_promotions(
+            plan=_plan_for(candidates),
+            modules=modules,
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["source:unpin", "flush", "target:pin"]
+        assert all(promotion.pinned_host_changed for promotion in applied)
+
+    def test_hostpin_rollback_releases_new_owner_before_restoring_old_owner(
+        self, monkeypatch
+    ):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        target_manager._pinned_layers = (0,)
+        modules = {
+            "source": _FakeLayerwiseDit([source_manager]),
+            "target": _FakeLayerwiseDit([target_manager]),
+        }
+        applied = [
+            AppliedPromotion(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(0,),
+                previous_layerwise_pinned_layers=((0,),),
+                pinned_host_changed=True,
+            ),
+            AppliedPromotion(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(0,),
+                previous_layerwise_pinned_layers=((),),
+                pinned_host_changed=True,
+            ),
+        ]
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "auto_residency.release_unused_pinned_memory",
+            lambda: events.append("flush"),
+        )
+
+        rollback_promotions(
+            applied=applied,
+            modules=modules,
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["target:unpin", "flush", "source:pin"]
 
     def test_enable_offload_does_not_double_register_hooks(self):
         manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
@@ -613,7 +1222,7 @@ class TestAppliedChangesLog:
             ]
         )
         message = format_applied_changes(plan=plan)
-        assert "text_encoder: layerwise-offload -> resident" in message
+        assert "text_encoder: permanent resident layers=(1,)" in message
         assert "vae: component-offload -> resident" in message
         assert "--component-residency text_encoder=resident vae=resident" in message
         assert "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1" in message
@@ -686,7 +1295,7 @@ class TestWarmupFrameAdjustment:
 class TestCalibrationFrames:
     def _patch_gate(self, monkeypatch, reason: str | None = None) -> None:
         monkeypatch.setattr(
-            "sglang.multimodal_gen.runtime.server_warmup.auto_residency_skip_reason",
+            "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
             lambda _args: reason,
         )
 
@@ -772,6 +1381,7 @@ class TestAutoResidencySkipReason:
             performance_mode="auto",
             warmup_mode="server",
             warmup_resolutions=None,
+            disagg_role="monolithic",
             backend="sglang",
             enable_breakable_cuda_graph=False,
             enable_torch_compile=False,
@@ -780,8 +1390,10 @@ class TestAutoResidencySkipReason:
             ulysses_degree=1,
             use_fsdp_inference=False,
             quantization=None,
+            component_quantizations={},
             transformer_weights_path=None,
             nunchaku_config=None,
+            direct_gpu_weight_loading=False,
             pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
         )
         for key, value in overrides.items():
@@ -811,17 +1423,17 @@ class TestAutoResidencySkipReason:
         "overrides, expected_fragment",
         [
             ({"warmup_mode": "request"}, "server warmup"),
+            ({"disagg_role": "denoiser"}, "server warmup"),
             ({"backend": "diffusers"}, "diffusers"),
             ({"enable_breakable_cuda_graph": True}, "CUDA graph"),
             # compile warmup strips the memory layout (layerwise DiT +
             # resident aux components on CPU): its peaks are not serving peaks
             ({"enable_torch_compile": True}, "stripped memory layout"),
             ({"batching_max_size": 4}, "batching"),
-            ({"dp_size": 2}, "dp replicas"),
-            ({"ulysses_degree": 2}, "Ulysses"),
-            ({"use_fsdp_inference": True}, "FSDP"),
             ({"quantization": "fp8"}, "quantized"),
+            ({"component_quantizations": {"transformer": "fp8"}}, "quantized"),
             ({"transformer_weights_path": "/x.safetensors"}, "quantized"),
+            ({"direct_gpu_weight_loading": True}, "direct GPU"),
         ],
     )
     def test_excluded_paths(self, monkeypatch, overrides, expected_fragment):
@@ -835,6 +1447,20 @@ class TestAutoResidencySkipReason:
         monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
         reason = self._skip_reason(self._base_args())
         assert reason is not None and "cache-dit" in reason
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"dp_size": 2},
+            {"ulysses_degree": 2},
+            {"use_fsdp_inference": True},
+        ],
+    )
+    def test_parallel_paths_reach_platform_gate(self, monkeypatch, overrides):
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        reason = self._skip_reason(self._base_args(**overrides))
+        assert reason is None or reason == "requires CUDA"
 
     def test_eligible_path_reaches_platform_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)

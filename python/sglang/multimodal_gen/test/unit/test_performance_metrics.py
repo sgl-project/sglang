@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -6,6 +7,10 @@ import torch
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    DefaultWorkload,
+    WarmupMemoryRecord,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -87,6 +92,69 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert worker._runtime_peak_reserved_mb == 3072.0
     assert metrics.memory_snapshots["load_peak"].peak_reserved_mb == 5120.0
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
+
+
+def test_server_warmup_preserves_peak_after_managed_stage_timeline():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:denoise:use:transformer": (("transformer",), 10)
+    }
+    device_module = Mock()
+    device_module.max_memory_reserved.return_value = 12
+    req = SimpleNamespace(width=64, height=64, num_frames=1)
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            baseline_allocated_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert record.peak_reserved_bytes == 12
+    assert record.phase_peak_reserved_bytes["request:untracked"] == 12
+    assert record.phase_active_components["request:untracked"] == ()
+
+
+def test_loaded_quantized_checkpoint_disables_auto_residency():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.rank = 0
+    quantized_module = torch.nn.Module()
+    quantized_module.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.ones(1, dtype=torch.int8), requires_grad=False),
+    )
+    worker.pipeline = SimpleNamespace(modules={"transformer": quantized_module})
+
+    report = worker._build_auto_residency_report(
+        workload=DefaultWorkload(
+            width=64,
+            height=64,
+            num_frames=1,
+            num_inference_steps=1,
+        ),
+        records=[
+            WarmupMemoryRecord(
+                width=64,
+                height=64,
+                num_frames=1,
+                baseline_allocated_bytes=1,
+                peak_reserved_bytes=2,
+                succeeded=True,
+            )
+        ],
+    )
+
+    assert report.skip_reason == "loaded quantized components: transformer"
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

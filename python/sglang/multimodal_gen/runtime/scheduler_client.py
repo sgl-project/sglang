@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import pickle
 import time
@@ -135,6 +136,11 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
     return next(counter) % dp_size
 
 
+def _is_warmup_batch(batch: Any) -> bool:
+    reqs = batch if isinstance(batch, list) else [batch]
+    return bool(reqs) and all(isinstance(req, Req) and req.is_warmup for req in reqs)
+
+
 def _merge_fanout_results(results: list[Any]) -> Any:
     """One reply for a control op sent to every replica: the first error wins,
     because "succeeded" must mean succeeded everywhere."""
@@ -142,6 +148,62 @@ def _merge_fanout_results(results: list[Any]) -> Any:
         if isinstance(result, OutputBatch) and result.error:
             return result
     return results[0]
+
+
+def _auto_residency_status(result: Any) -> str | None:
+    if not isinstance(result, OutputBatch) or not isinstance(result.output, dict):
+        return None
+    return result.output.get("status")
+
+
+def _merge_auto_residency_results(results: list[Any]) -> Any:
+    """Preserve the strongest replica-wide auto-residency outcome.
+
+    Replicas plan against their own measured headroom, so one may keep the
+    original placement while another promotes. If any replica promoted, the
+    orchestrator must still run the validation warmup everywhere. A failed
+    local rollback remains fatal and takes precedence over that success.
+    """
+    rollback_failed = next(
+        (
+            result
+            for result in results
+            if _auto_residency_status(result) == "rollback_failed"
+        ),
+        None,
+    )
+    if rollback_failed is not None:
+        return rollback_failed
+
+    promoted = next(
+        (result for result in results if _auto_residency_status(result) == "promoted"),
+        None,
+    )
+    if promoted is not None:
+        replica_errors = [
+            result.error
+            for result in results
+            if isinstance(result, OutputBatch) and result.error is not None
+        ]
+        if replica_errors:
+            logger.warning(
+                "Auto residency kept the original placement on %d replica(s): %s",
+                len(replica_errors),
+                replica_errors[0],
+            )
+        return promoted
+
+    rolled_back = next(
+        (
+            result
+            for result in results
+            if _auto_residency_status(result) == "rolled_back"
+        ),
+        None,
+    )
+    if rolled_back is not None:
+        return rolled_back
+    return _merge_fanout_results(results)
 
 
 class SchedulerClient:
@@ -189,9 +251,13 @@ class SchedulerClient:
     def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _CONTROL_REQ_TYPES) or _is_warmup_batch(batch):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
-            output_batch = _merge_fanout_results(results)
+            output_batch = (
+                _merge_auto_residency_results(results)
+                if isinstance(batch, AutoResidencyReq)
+                else _merge_fanout_results(results)
+            )
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
@@ -263,12 +329,20 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
-            # replica state (weights, LoRA, memory) must change everywhere
-            results = [
-                await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
-            ]
-            output_batch = _merge_fanout_results(results)
+        if isinstance(batch, _CONTROL_REQ_TYPES) or _is_warmup_batch(batch):
+            # Every replica must receive the state change or calibration
+            # request; the measured values and selected placements may differ.
+            results = await asyncio.gather(
+                *(
+                    self._forward_one(endpoint, batch, timeout_ms)
+                    for endpoint in endpoints
+                )
+            )
+            output_batch = (
+                _merge_auto_residency_results(results)
+                if isinstance(batch, AutoResidencyReq)
+                else _merge_fanout_results(results)
+            )
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(

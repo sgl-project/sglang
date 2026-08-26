@@ -7,11 +7,17 @@ from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    auto_residency_args_skip_reason,
+)
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -75,15 +81,7 @@ def should_run_server_warmup(server_args: ServerArgs) -> bool:
 
 def is_realtime_serving(server_args: ServerArgs) -> bool:
     """Synthetic warmup has no realtime session state."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
-            get_realtime_model_adapter,
-        )
-
-        get_realtime_model_adapter(server_args)
-        return True
-    except Exception:
-        return False
+    return has_realtime_model_adapter(server_args)
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
@@ -103,64 +101,17 @@ def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
 
 
 def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
-    """Server-args-only gate for the warmup-calibrated residency promotion.
+    """Final gate for warmup-calibrated residency promotion.
 
     Only rules out paths the promotion was not designed for; the workers
     re-check per component (explicit placement, FSDP modules, custom
     strategies, missing sizes) and per measurement.
     """
-    from sglang.multimodal_gen import envs
-    from sglang.multimodal_gen.configs.quantization.nunchaku import (
-        NunchakuSVDQuantArgs,
-    )
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
-    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
-        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
-    if server_args.performance_mode != "auto":
-        return f"performance_mode={server_args.performance_mode}"
+    args_reason = auto_residency_args_skip_reason(server_args)
+    if args_reason is not None:
+        return args_reason
     if not should_run_synthetic_server_warmup(server_args):
         return "no synthetic server warmup to calibrate from"
-    if server_args.backend == "diffusers":
-        return "diffusers backend"
-    if server_args.enable_breakable_cuda_graph:
-        return "breakable CUDA graph captures during warmup"
-    if server_args.enable_torch_compile:
-        # Compile warmup runs a deliberately stripped memory layout: the DiT
-        # is temporarily layerwise-offloaded (offload_during_compile) and
-        # _move_resident_components_for_warmup evicts resident aux components
-        # for the denoise. Peaks measured there are far below a real
-        # request's, and the post-promotion re-warm (also a warmup layout)
-        # cannot catch the difference.
-        return "torch.compile warmup uses a stripped memory layout"
-    if envs.SGLANG_CACHE_DIT_ENABLED:
-        return "cache-dit enabled"
-    if server_args.batching_max_size > 1:
-        return "dynamic batching enabled"
-    if (server_args.dp_size or 1) > 1:
-        return "dp replicas warm up independently"
-    if (server_args.ulysses_degree or 1) > 1:
-        # Sequence-parallel workers can have a different execution order
-        # after residency changes; keep their configured placement until that
-        # interaction is explicitly calibrated and validated.
-        return "Ulysses sequence parallelism"
-    if server_args.use_fsdp_inference:
-        return "FSDP inference"
-    nunchaku = server_args.nunchaku_config
-    svdquant_enabled = nunchaku is not None and (
-        not isinstance(nunchaku, NunchakuSVDQuantArgs) or nunchaku.enable_svdquant
-    )
-    if (
-        server_args.quantization is not None
-        or server_args.transformer_weights_path
-        or svdquant_enabled
-    ):
-        # Residency changes shift the memory layout, which measurably moved
-        # fp8-quantized DiT outputs in the past (see PR #29649); keep
-        # quantized checkpoints on their configured strategy.
-        return "quantized checkpoint"
-    if not current_platform.is_cuda():
-        return "requires CUDA"
     return None
 
 

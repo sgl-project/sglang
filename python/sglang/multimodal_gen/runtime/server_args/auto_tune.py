@@ -10,6 +10,13 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.quantization.nunchaku import (
+    NunchakuSVDQuantArgs,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -41,6 +48,54 @@ IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
 
+def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
+    """Return why args cannot use warmup-calibrated residency."""
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if (
+        server_args.warmup_mode != "server"
+        or server_args.disagg_role != RoleType.MONOLITHIC
+    ):
+        return "no synthetic server warmup to calibrate from"
+    task_type = server_args.pipeline_config.task_type
+    if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
+        return "no synthetic server warmup to calibrate from"
+    if has_realtime_model_adapter(server_args):
+        return "realtime serving has no representative synthetic warmup"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup temporarily evicts resident auxiliaries and may
+        # layerwise-offload the DiT, so its peak is not a serving peak.
+        return "torch.compile warmup uses a stripped memory layout"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    nunchaku = server_args.nunchaku_config
+    svdquant_enabled = nunchaku is not None and (
+        not isinstance(nunchaku, NunchakuSVDQuantArgs) or nunchaku.enable_svdquant
+    )
+    if (
+        server_args.quantization is not None
+        or server_args.component_quantizations
+        or server_args.transformer_weights_path
+        or svdquant_enabled
+    ):
+        # Residency changes can perturb quantized numerical paths through a
+        # different allocation and kernel layout.
+        return "quantized checkpoint"
+    if server_args.direct_gpu_weight_loading:
+        return "direct GPU weight loading requires a fixed resident placement"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
+
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
@@ -50,6 +105,10 @@ class ServerArgsAutoTuner:
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
+
+    def _uses_warmup_calibrated_residency(self) -> bool:
+        """Whether warmup will replace coarse pre-load residency defaults."""
+        return auto_residency_args_skip_reason(self.server_args) is None
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
@@ -122,6 +181,11 @@ class ServerArgsAutoTuner:
     def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
+            return
+        if self._uses_warmup_calibrated_residency():
+            # Keep the load-safe placement until warmup has measured the real
+            # workload. The post-warmup planner replaces model/card thresholds
+            # with component sizes and per-phase headroom.
             return
 
         # Explicit placement is component-scoped; unmatched components still
@@ -516,6 +580,8 @@ class ServerArgsAutoTuner:
     ) -> list[str]:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
+            return components
+        if self._uses_warmup_calibrated_residency():
             return components
 
         deployment_config = self._deployment_config()

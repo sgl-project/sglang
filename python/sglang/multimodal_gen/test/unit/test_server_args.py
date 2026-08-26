@@ -1423,6 +1423,35 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.layerwise_offload_components, ["dit"])
         self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
 
+    def test_server_warmup_defers_high_memory_residency_to_calibration(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "server"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
+
+    def test_no_warmup_keeps_model_residency_fallback(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "off"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("vae"), RESIDENT)
+
+    def test_realtime_server_keeps_model_residency_fallback(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "server"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
         cosmos3_deployment = Cosmos3Config(

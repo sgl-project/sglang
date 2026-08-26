@@ -129,6 +129,11 @@ class ComponentResidencyManager:
         ] = {}
         self._uses_seen: dict[str, ComponentUse] = {}
         self._modules_seen: dict[str, nn.Module] = {}
+        self._track_warmup_memory = False
+        self._warmup_phase_key: str | None = None
+        self._warmup_phase_components: tuple[str, ...] = ()
+        self._warmup_phase_peaks: dict[str, tuple[tuple[str, ...], int]] = {}
+        self._completed_warmup_phase_peaks: dict[str, tuple[tuple[str, ...], int]] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -188,6 +193,21 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+        self._track_warmup_memory = (
+            self.state.batch_is_warmup
+            and current_platform.is_cuda()
+            and torch.get_device_module().is_available()
+        )
+        self._warmup_phase_key = None
+        self._warmup_phase_components = ()
+        self._warmup_phase_peaks = {}
+        self._completed_warmup_phase_peaks = {}
+        if self._track_warmup_memory:
+            # GPUWorker reset the request peak before entering the pipeline.
+            # Start the first interval without another reset so preprocessing
+            # before stage 0 remains part of the placement constraints.
+            self._warmup_phase_key = "request:before-stage"
+            self._warmup_phase_components = self._warmup_active_components()
 
     @staticmethod
     def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
@@ -205,6 +225,11 @@ class ComponentResidencyManager:
         self.state.stage_index = stage_index
         self.state.stage_name = self.stage_name(stage)
         self.state.next_stage_name = self._next_stage_name(stage_index)
+        if self._track_warmup_memory:
+            self._begin_warmup_phase(
+                key=f"{stage_index}:{self.state.stage_name}:setup",
+                components=self._warmup_active_components(),
+            )
 
     def begin_stage(self) -> None:
         """Prepare a stage that declares one uninterrupted component use."""
@@ -214,6 +239,7 @@ class ComponentResidencyManager:
 
     def end_stage(self) -> None:
         """Close the component interval owned by the current stage."""
+        self._record_warmup_phase_peak()
         if self._active_use is None:
             return
         if self._active_use.stage_name != self.state.stage_name:
@@ -244,7 +270,13 @@ class ComponentResidencyManager:
                 self._active_use_module is not None
                 and active_module is not self._active_use_module
             )
+            requires_prepare = active_module is not None and (
+                self._active_use_module is None
+                or module_changed
+                or use.target_dtype != previous_use.target_dtype
+            )
             if module_changed:
+                self._begin_warmup_transition(previous_use, None)
                 self._disable_active_nvtx()
                 self._finish_use(
                     previous_use,
@@ -252,18 +284,19 @@ class ComponentResidencyManager:
                     keep_on_warmup=False,
                     force=True,
                 )
-            if active_module is not None and (
-                self._active_use_module is None
-                or module_changed
-                or use.target_dtype != previous_use.target_dtype
-            ):
+                self._begin_warmup_transition(None, use)
+            elif requires_prepare:
+                self._begin_warmup_transition(previous_use, use)
+            if requires_prepare:
                 active_module = self._prepare_forward_use(use, module=active_module)
+                self._begin_warmup_use(use)
                 self._active_use = use
                 self._active_use_module = active_module
                 self.state.current_use = use
             self._enable_nvtx_for_use(use, active_module)
             return
         if self._active_use is not None:
+            self._begin_warmup_transition(self._active_use, None)
             self._disable_active_nvtx()
             self._finish_use(
                 self._active_use,
@@ -273,8 +306,10 @@ class ComponentResidencyManager:
             self._active_use = None
             self._active_use_module = None
             self.state.current_use = None
+        self._begin_warmup_transition(None, use)
         self._mark_current_use(use)
         module = self._prepare_forward_use(use, module=module)
+        self._begin_warmup_use(use)
         self._active_use = use
         self._active_use_module = module
         self._enable_nvtx_for_use(use, module)
@@ -284,6 +319,7 @@ class ComponentResidencyManager:
         """End one sequential component use interval."""
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
+        self._begin_warmup_transition(self._active_use, None)
         self._disable_active_nvtx()
         self._finish_use(
             self._active_use,
@@ -297,6 +333,7 @@ class ComponentResidencyManager:
         self._active_use = None
         self._active_use_module = None
         self.state.current_use = None
+        self._begin_warmup_between_uses()
         self._prefetch_next_memory_intensive_use()
 
     @contextmanager
@@ -359,6 +396,7 @@ class ComponentResidencyManager:
         if self._active_use is None:
             return
         active_use = self._active_use
+        self._begin_warmup_transition(active_use, None)
         self._disable_active_nvtx()
         self._finish_use(
             active_use,
@@ -368,6 +406,7 @@ class ComponentResidencyManager:
         self._active_use = None
         self._active_use_module = None
         self.state.current_use = None
+        self._begin_warmup_between_uses()
         if prefetch_next:
             self._prefetch_next_memory_intensive_use()
 
@@ -515,11 +554,97 @@ class ComponentResidencyManager:
                 not self._is_single_dit_component(component_name) or keep_single_dit
             )
             strategy = self.strategy_for(component_name, module)
+            if self._track_warmup_memory:
+                will_prepare = self.state.batch_is_warmup and preferred
+                self._begin_warmup_phase(
+                    key=f"request:cleanup:{component_name}",
+                    components=self._warmup_active_components(
+                        (use,) if will_prepare else ()
+                    ),
+                )
             was_on_supported_device = self._module_on_supported_device(module)
             strategy.finish_request(module, use, self.state, preferred=preferred)
             self._empty_cache_after_large_release(
                 use, strategy, module, was_on_supported_device
             )
+        if self._track_warmup_memory:
+            self._record_warmup_phase_peak()
+            self._warmup_phase_peaks["idle"] = (
+                self._warmup_active_components(),
+                int(torch.get_device_module().memory_reserved()),
+            )
+            self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
+        self._track_warmup_memory = False
+
+    def _begin_warmup_phase(self, *, key: str, components: tuple[str, ...]) -> None:
+        if not self._track_warmup_memory:
+            return
+        self._record_warmup_phase_peak()
+        self._warmup_phase_key = key
+        self._warmup_phase_components = tuple(sorted(set(components)))
+        torch.get_device_module().reset_peak_memory_stats()
+
+    def _begin_warmup_transition(
+        self, previous: ComponentUse | None, upcoming: ComponentUse | None
+    ) -> None:
+        if not self._track_warmup_memory:
+            return
+        previous_name = previous.component_name if previous is not None else "idle"
+        upcoming_name = upcoming.component_name if upcoming is not None else "idle"
+        self._begin_warmup_phase(
+            key=(
+                f"{self.state.stage_index}:{self.state.stage_name}:transition:"
+                f"{previous_name}->{upcoming_name}"
+            ),
+            components=self._warmup_active_components(
+                tuple(use for use in (previous, upcoming) if use is not None)
+            ),
+        )
+
+    def _begin_warmup_use(self, use: ComponentUse) -> None:
+        phase = use.phase or use.component_name
+        self._begin_warmup_phase(
+            key=f"{self.state.stage_index}:{self.state.stage_name}:use:{phase}",
+            components=self._warmup_active_components((use,)),
+        )
+
+    def _begin_warmup_between_uses(self) -> None:
+        self._begin_warmup_phase(
+            key=f"{self.state.stage_index}:{self.state.stage_name}:between",
+            components=self._warmup_active_components(),
+        )
+
+    def _warmup_active_components(
+        self, active_uses: Sequence[ComponentUse] = ()
+    ) -> tuple[str, ...]:
+        components = {use.component_name for use in active_uses}
+        for component_name, module in self.pipeline.modules.items():
+            if not isinstance(module, nn.Module):
+                continue
+            if is_layerwise_offloaded_module(module):
+                continue
+            if self._module_on_supported_device(module):
+                components.add(component_name)
+        return tuple(sorted(components))
+
+    def _record_warmup_phase_peak(self) -> None:
+        if not self._track_warmup_memory or self._warmup_phase_key is None:
+            return
+        peak = int(torch.get_device_module().max_memory_reserved())
+        previous = self._warmup_phase_peaks.get(self._warmup_phase_key)
+        if previous is None or peak > previous[1]:
+            self._warmup_phase_peaks[self._warmup_phase_key] = (
+                self._warmup_phase_components,
+                peak,
+            )
+
+    def take_warmup_phase_peaks(
+        self,
+    ) -> dict[str, tuple[tuple[str, ...], int]]:
+        """Return and clear the most recently completed warmup phase peaks."""
+        peaks = self._completed_warmup_phase_peaks
+        self._completed_warmup_phase_peaks = {}
+        return peaks
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)

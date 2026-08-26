@@ -13,8 +13,9 @@ callers send them through the scheduler client so warmup exercises the same
 request transport path as real generation.
 """
 
+import json
 from copy import copy
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -28,6 +29,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
+)
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    auto_residency_args_skip_reason,
 )
 from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -59,13 +63,44 @@ def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
         config_classes = get_pipeline_config_classes(pipeline_class_name)
         if config_classes is not None:
             _, sampling_params_cls = config_classes
-            return sampling_params_cls()
+            defaults = sampling_params_cls()
+            return _apply_warmup_sampling_overrides(server_args, defaults)
 
-    return SamplingParams.from_pretrained(
+    defaults = SamplingParams.from_pretrained(
         server_args.model_path,
         backend=server_args.backend,
         model_id=server_args.model_id,
     )
+    return _apply_warmup_sampling_overrides(server_args, defaults)
+
+
+def _apply_warmup_sampling_overrides(
+    server_args: ServerArgs, defaults: SamplingParams
+) -> SamplingParams:
+    value = server_args.warmup_sampling_params
+    if value is None:
+        return defaults
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "--warmup-sampling-params must be a JSON object"
+            ) from error
+    if not isinstance(value, dict):
+        raise ValueError("--warmup-sampling-params must be a JSON object")
+    field_names = {item.name for item in fields(defaults)}
+    unknown = value.keys() - field_names
+    if unknown:
+        raise ValueError(
+            "invalid --warmup-sampling-params fields: " f"{', '.join(sorted(unknown))}"
+        )
+    updated = copy(defaults)
+    for name, field_value in value.items():
+        # Some model contracts intentionally expose fixed dataclass fields
+        # with init=False; a warmup workload still needs to mirror the request.
+        object.__setattr__(updated, name, field_value)
+    return updated
 
 
 def _resolve_default_warmup_resolution(
@@ -359,22 +394,17 @@ def _resolve_calibration_num_frames(
     """A second, smaller warmup frame count for auto-residency calibration.
 
     Only produced when the main video warmup was frame-capped and the
-    auto-residency promotion is actually eligible to consume the measurement
-    (``auto_residency_skip_reason``): the estimator then has two workload
+    auto-residency promotion is actually eligible to consume the measurement:
+    the estimator then has two workload
     sizes to fit the constant/linear split of the peak. Returns None when a
     second measurement adds no information (same adjusted frames) or would
     never be read.
     """
-    # local import: server_warmup imports this module at module level
-    from sglang.multimodal_gen.runtime.server_warmup import (
-        auto_residency_skip_reason,
-    )
-
     if not server_based_warmup or not _is_video_warmup_task(server_args):
         return None
     if warmup_num_frames is None:
         return None
-    if auto_residency_skip_reason(server_args) is not None:
+    if auto_residency_args_skip_reason(server_args) is not None:
         return None
     default_num_frames = sampling_defaults.num_frames or 1
     if warmup_num_frames >= default_num_frames:

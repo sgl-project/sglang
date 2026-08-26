@@ -170,7 +170,8 @@ class Cosmos3Config(PipelineConfig):
         return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        # Keep the DiT and VAE resident when the GPUs have the headroom.
+        # Fallback for offline and no-warmup paths. Server warmup calibration
+        # starts from an offloaded placement and derives residency directly.
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "vae"),

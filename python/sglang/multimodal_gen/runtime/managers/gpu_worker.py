@@ -43,7 +43,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
-    get_world_group,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
@@ -63,10 +62,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     WarmupMemoryRecord,
     apply_promotions,
     collect_promotion_candidates,
+    component_runtime_weight_bytes,
     describe_error,
     estimate_default_workload_peak_bytes,
+    estimate_workload_phase_peaks,
     format_applied_changes,
     format_plan_summary,
+    layerwise_host_pin_capacity_bytes,
+    layerwise_pinned_host_bytes,
+    module_uses_quantized_weights,
     plan_auto_residency,
     plan_summary_payload,
     rank_candidates_by_h2d_savings,
@@ -75,6 +79,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     peek_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HOST_COPY_RESERVE_BYTES,
+    host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -549,8 +557,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         measure_server_warmup = (
             req.is_warmup
             and bool(req.extra.get("server_based_warmup"))
-            and not current_platform.is_cpu()
-            and not current_platform.is_mps()
+            and current_platform.is_cuda()
         )
         warmup_baseline_allocated_bytes = 0
         try:
@@ -693,16 +700,35 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_server_warmup_memory(
         self, *, req: Req, baseline_allocated_bytes: int, succeeded: bool
     ) -> None:
+        phase_peaks: dict[str, int] = {}
+        phase_components: dict[str, tuple[str, ...]] = {}
+        residency_manager = peek_global_component_residency_manager()
+        if residency_manager is not None:
+            for phase_name, (
+                components,
+                peak_bytes,
+            ) in residency_manager.take_warmup_phase_peaks().items():
+                phase_peaks[phase_name] = peak_bytes
+                phase_components[phase_name] = components
+        request_peak = max(
+            int(torch.get_device_module().max_memory_reserved()),
+            max(phase_peaks.values(), default=0),
+        )
+        if request_peak > max(phase_peaks.values(), default=0):
+            # Work after the residency-managed stage timeline (for example,
+            # output materialization) must remain a placement constraint.
+            phase_peaks["request:untracked"] = request_peak
+            phase_components["request:untracked"] = ()
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
                 width=int(req.width or 0),
                 height=int(req.height or 0),
                 num_frames=int(req.num_frames or 1),
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
-                peak_reserved_bytes=int(
-                    torch.get_device_module().max_memory_reserved()
-                ),
+                peak_reserved_bytes=request_peak,
                 succeeded=succeeded,
+                phase_peak_reserved_bytes=phase_peaks,
+                phase_active_components=phase_components,
             )
         )
 
@@ -1117,14 +1143,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> List[str]:
         """Which currently offloaded components would fit in the headroom.
 
-        Reuses the auto-residency candidate collection and its H2D-savings
-        greedy order, so this post-request hint names the same components,
-        in the same order, that ``--performance-mode auto`` would promote
-        (it deliberately does not maximize the component count the way the
-        old fixed cheap-first order did, and it omits components driven by a
-        pipeline-custom residency strategy -- user flags cannot act on
-        those). Unlike the promotion plan it applies no reserve or margin:
-        it reports raw capacity after this request, not a placement decision.
+        Reuses the auto-residency candidate frontier and benefit ranking, but
+        remains a raw-capacity hint rather than the phase-constrained joint
+        plan. It omits components driven by a pipeline-custom residency
+        strategy because user residency flags cannot control them, and it
+        applies no reserve or activation margin.
         """
         if not self.pipeline or not self.pipeline.modules:
             return []
@@ -1141,10 +1164,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             num_inference_steps=(
                 workload.num_inference_steps if workload is not None else 1
             ),
+            allow_host_pin_reallocation=self.server_args.num_gpus == 1,
         )
 
         can_stay_resident = []
+        seen_components: set[str] = set()
         for candidate in rank_candidates_by_h2d_savings(candidates):
+            if (
+                not candidate.permanent_residency
+                or candidate.component_name in seen_components
+            ):
+                continue
+            seen_components.add(candidate.component_name)
             usage_gb = candidate.promoted_weight_bytes / GIB_BYTES
             if usage_gb <= remaining_gpu_mem_gb:
                 can_stay_resident.append(candidate.component_name)
@@ -1163,12 +1194,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         an uncaught raise there would leave the peer ranks parked in the
         collective until the group timeout.
         """
-        if (self.server_args.dp_size or 1) > 1:
-            # DP replicas dequeue control reqs at independent times, but the
-            # gather below spans the whole torch world; entering it per
-            # replica would deadlock. (The HTTP orchestrator also gates this
-            # case; this guard keeps the worker safe on its own.)
-            return OutputBatch(output={"status": PROMOTION_STATUS_SKIPPED})
         if self._auto_residency_applied:
             # one-shot per process: records measured after a promotion
             # describe the promoted layout, not the startup strategy
@@ -1315,6 +1340,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         elif workload.workload_units() is None:
             skip_reason = "default workload resolution unknown"
         else:
+            quantized_components = [
+                name
+                for name, module in self.pipeline.modules.items()
+                if isinstance(module, torch.nn.Module)
+                and module_uses_quantized_weights(module)
+            ]
+            if quantized_components:
+                skip_reason = (
+                    "loaded quantized components: "
+                    f"{', '.join(sorted(quantized_components))}"
+                )
+        if skip_reason is None:
             # A probe that failed at or below the target is a measurement, not
             # missing data: the card cannot hold the default workload as it is
             # already configured, and promoting weights would only add to it.
@@ -1339,8 +1376,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 candidates=[],
                 skip_reason=skip_reason,
             )
+        runtime_weights_by_component = component_runtime_weight_bytes(
+            self.pipeline.modules
+        )
         estimated_peak_bytes = estimate_default_workload_peak_bytes(
-            records=records, target_units=workload.workload_units()
+            records=records,
+            target_units=workload.workload_units(),
+            constant_weight_bytes=max(runtime_weights_by_component.values(), default=0),
+        )
+        estimated_phase_peaks, active_components_by_phase = (
+            estimate_workload_phase_peaks(
+                records=records,
+                target_units=workload.workload_units(),
+                component_weight_bytes=runtime_weights_by_component,
+            )
         )
         # What this process may still grow into: free VRAM plus what its
         # allocator already reserved. Unlike the raw device total, this
@@ -1355,21 +1404,34 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             explicit_residency_mode_of=self.server_args.explicit_residency_mode,
             custom_strategy_names=self.pipeline.component_residency_strategies,
             num_inference_steps=workload.num_inference_steps,
+            allow_host_pin_reallocation=self.server_args.num_gpus == 1,
         )
         return RankResidencyReport(
             rank=self.rank,
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
+            estimated_peak_bytes_by_phase=estimated_phase_peaks,
+            active_components_by_phase=active_components_by_phase,
+            node_rank=self.server_args.node_rank,
+            pinned_host_bytes=layerwise_pinned_host_bytes(self.pipeline.modules),
+            host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(
+                self.pipeline.modules
+            ),
+            host_transition_headroom_bytes=max(
+                0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+            ),
             candidates=candidates,
             skip_reason=skip_reason,
         )
 
     def _auto_residency_all_gather(self, obj: Any) -> list[Any]:
-        world_group = get_world_group()
-        if world_group.world_size == 1:
+        replica_group = get_replica_group()
+        if replica_group.world_size == 1:
             return [obj]
-        gathered: list[Any] = [None] * world_group.world_size
-        torch.distributed.all_gather_object(gathered, obj, group=world_group.cpu_group)
+        gathered: list[Any] = [None] * replica_group.world_size
+        torch.distributed.all_gather_object(
+            gathered, obj, group=replica_group.cpu_group
+        )
         return gathered
 
     def _rollback_applied_promotions(self) -> str | None:
