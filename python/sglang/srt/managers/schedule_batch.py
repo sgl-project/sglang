@@ -79,6 +79,14 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.beam_search.batch_tail import (
+    BeamTail,
+    append_beam_tail,
+    beam_retraction_order,
+    num_beam_member_rows,
+    strip_beam_tail,
+)
+from sglang.srt.beam_search.fork import free_member_rows
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -1206,6 +1214,9 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # Beam search overlay: leader and internal members share one BeamGroup.
+        self.beam_group = None
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -1220,6 +1231,12 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    @property
+    def is_beam_leader(self) -> bool:
+        """The user-visible row of a beam group; the group's other rows are
+        scheduler-internal and never streamed to the user."""
+        return self.beam_group is not None and self.beam_group.leader is self
 
     @property
     def is_prefill_only(self) -> bool:
@@ -2216,6 +2233,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
+    # Member rows riding one forward; None whenever reqs and rows are 1:1.
+    beam_tail: Optional[BeamTail] = None
+
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -2835,7 +2855,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_algorithm.is_none():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            return new_pages * page_size + num_beam_member_rows(requests)
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
@@ -2862,6 +2882,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
+        sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2876,6 +2897,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
+            if req.beam_group is not None:
+                # Free member rows before release_req: they need the leader's kv
+                # info, which still carries the lockstep allocated length.
+                req.to_finish = FINISH_ABORT(
+                    "Beam search group aborted: KV cache pool is full. Beam "
+                    "groups cannot be retracted, so they are aborted instead "
+                    "of being requeued.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                free_member_rows(
+                    req.beam_group,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                )
+                # Aborting, so a host backup to resume from would be wasted.
+                self.release_req(
+                    idx, len(sorted_indices), server_args, offload_kv=False
+                )
+                continue
             # release memory and don't insert into the tree because we need the space instantly
             if self.release_req(idx, len(sorted_indices), server_args):
                 retracted_reqs.append(req)
@@ -2906,6 +2947,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
+            if last_req.beam_group is not None:
+                free_member_rows(
+                    last_req.beam_group,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                )
             self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
@@ -3112,6 +3159,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_prepare_for_decode(self)
             return
 
+        # Beam member rows ride this decode batch: append them to the row
+        # tensors before allocation so alloc_for_decode covers them too.
+        strip_beam_tail(self)
+        append_beam_tail(self)
+
         if self.sampling_info.penalizer_orchestrator.is_required:
             self.cumulate_penalty_output_tokens()
 
@@ -3184,6 +3236,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -3266,6 +3319,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        strip_beam_tail(self)
+        strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.

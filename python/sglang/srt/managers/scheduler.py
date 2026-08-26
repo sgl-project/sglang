@@ -62,6 +62,7 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -2204,7 +2205,20 @@ class Scheduler(
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
 
+    def init_beam_coordinator(self) -> None:
+        self.beam_coordinator = BeamCoordinator(
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            dllm_enabled=self.dllm_config is not None,
+            max_req_len=self.max_req_len,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            future_map=self.future_map,
+        )
+
     def init_batch_result_processor(self) -> None:
+        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -2224,6 +2238,7 @@ class Scheduler(
                 model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
         )
 
@@ -2443,6 +2458,7 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
+            is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -2493,6 +2509,14 @@ class Scheduler(
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
                 )
+
+            if is_beam:
+                error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
+                if error_msg:
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2867,6 +2891,7 @@ class Scheduler(
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2908,6 +2933,7 @@ class Scheduler(
                     req,
                 )
                 deleted_reqs.add(req)
+                self.beam_coordinator.retire_group(req)
 
         if deleted_reqs:
             self.waiting_queue = [
@@ -3223,9 +3249,24 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_num_allocatable_reqs(self, running_bs):
-        res = get_parallel().config.pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+    def get_num_allocatable_reqs(
+        self,
+        running_bs: int,
+        beam_width: Optional[int] = None,
+        running_batch: Optional[ScheduleBatch] = None,
+    ) -> int:
+        pp_budget = get_parallel().config.pp_max_micro_batch_size - running_bs
+        available = self.req_to_token_pool.available_size()
+
+        active_batch = running_batch or self.running_batch
+        available = max(
+            available - self.beam_coordinator.pending_member_rows(active_batch), 0
+        )
+        res = min(pp_budget, available)
+        if beam_width is not None:
+            # A beam candidate owns beam_width rows once decoding.
+            res = min(res, available // beam_width)
+
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -3285,7 +3326,9 @@ class Scheduler(
             and self.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
-                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+                num_allocatable_reqs=self.get_num_allocatable_reqs(
+                    running_bs, running_batch=running_batch
+                ),
             )
         ):
             return None, running_batch
@@ -3296,7 +3339,7 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
@@ -3373,7 +3416,14 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            candidate_beam_width = (
+                req.beam_group.beam_width if req.beam_group is not None else None
+            )
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs,
+                candidate_beam_width,
+                running_batch=running_batch,
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -3526,6 +3576,8 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Beam member rows are not supported inside a mixed extend batch.
+            and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3621,6 +3673,10 @@ class Scheduler(
                     _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
+            for req in reqs_to_abort:
+                # Member rows were freed inside retract_decode; the group only
+                # has to leave the live set.
+                self.beam_coordinator.retire_group(req)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -3808,7 +3864,9 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
+                            self._relay_forward_payload(
+                                batch, future_indices, batch_result
+                            )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -3841,7 +3899,7 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
@@ -3878,7 +3936,9 @@ class Scheduler(
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
-                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
@@ -3957,7 +4017,10 @@ class Scheduler(
             model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
-        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        future_indices: torch.Tensor,
+        batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
         if self.spec_algorithm.is_ngram():
@@ -3971,7 +4034,14 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
+        if batch.beam_tail is not None:
+            # The worker sliced the tail off before sampling, so sampled tokens
+            # cover only the reqs-aligned rows; the coordinator relays the rest.
+            future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
+        self.beam_coordinator.maybe_select_and_relay(
+            batch, batch_result, chunked_req=self.chunked_req
+        )
 
     def _copy_auxiliary_output_to_cpu(
         self,
@@ -4012,7 +4082,9 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
-            self._relay_forward_payload(batch_result.future_indices, batch_result)
+            self._relay_forward_payload(
+                cur_batch, batch_result.future_indices, batch_result
+            )
 
         # Run device-to-host copy on a separate stream to avoid blocking the
         # forward stream. The copy waits for the sampled result and can overlap
@@ -4630,6 +4702,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self.beam_coordinator.retire_group(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
