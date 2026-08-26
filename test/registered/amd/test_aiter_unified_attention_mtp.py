@@ -25,12 +25,18 @@ if _RUNNABLE:
 @unittest.skipUnless(_RUNNABLE, "requires HIP gfx950 with aiter")
 class TestAiterUnifiedAttentionMTP(CustomTestCase):
     def test_matches_aiter(self):
+        # TP2 shard of Qwen3.5-397B-A17B: 32 q / 2 kv heads split over two ranks.
+        self._check_matches_aiter(num_query_heads=16, num_kv_heads=1)
+
+    def test_matches_aiter_multi_kv_head(self):
+        # TP1, the same model unsharded: still 16:1, but two kv heads.
+        self._check_matches_aiter(num_query_heads=32, num_kv_heads=2)
+
+    def _check_matches_aiter(self, num_query_heads: int, num_kv_heads: int):
         torch.manual_seed(0)
         device = "cuda"
         query_lens = [4, 2]
         kv_lens_list = [1024, 769]
-        num_query_heads = 16
-        num_kv_heads = 1
         head_size = 256
         block_size = 16
         max_kv_len = max(kv_lens_list)

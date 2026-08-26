@@ -619,7 +619,11 @@ def qwen35_mtp_unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
 
     assert 1 < max_seqlen_q <= 4
-    assert num_query_heads == 16 and num_kv_heads == 1
+    # Ratio, not absolute counts: block_m=32 // num_queries_per_kv gives block_q=2,
+    # which packs two draft tokens per tile. Any (16N : N) GQA layout works because
+    # the kernel indexes KV through kv_head_idx = program_id(1).
+    assert num_query_heads % num_kv_heads == 0
+    assert num_queries_per_kv == 16
     assert head_size == 256 and k.shape[1] == 16
     assert q.dtype == torch.bfloat16
     assert k.dtype == e4m3_dtype and v.dtype == e4m3_dtype
