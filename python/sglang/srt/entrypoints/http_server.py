@@ -2142,7 +2142,6 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
 
 
 async def _send_disaggregation_warmup_requests(
-    server_args: ServerArgs,
     url: str,
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
@@ -2321,7 +2320,6 @@ def _execute_server_warmup(server_args: ServerArgs):
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
-                    server_args=server_args,
                     url=url,
                     headers=headers,
                     ssl_verify=ssl_verify,

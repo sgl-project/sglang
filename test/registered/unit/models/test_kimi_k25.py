@@ -648,6 +648,14 @@ def _k3_preprocess_config(
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
+        base_gpu_id=0,
+        rl_on_policy_target=None,
+        tp_size=1,
+    )
+    with get_context().override_server_args(
+        mm_feature_transport="cpu",
+        mm_process_config={},
+        allowed_media_domains=[],
         image_processor_backend="auto",
         disable_fast_image_processor=False,
         skip_tokenizer_init=False,
@@ -656,13 +664,7 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         tokenizer_worker_num=1,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        base_gpu_id=0,
-        rl_on_policy_target=None,
         media_url_max_file_size_mb=64,
-    )
-    # The multimodal config comes from the bags.
-    with get_context().override_server_args(
-        mm_feature_transport="cpu", mm_process_config={}, allowed_media_domains=[]
     ):
         processor = processor_cls(
             hf_config=SimpleNamespace(media_placeholder_token_id=42),

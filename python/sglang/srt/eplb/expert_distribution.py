@@ -671,12 +671,10 @@ class _Accumulator(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _Accumulator:
-        return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank
-        )
+        return _Accumulator.get_class()(server_args, expert_location_metadata, rank)
 
     @staticmethod
-    def get_class(server_args: ServerArgs) -> Type[_Accumulator]:
+    def get_class() -> Type[_Accumulator]:
         return {
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,
