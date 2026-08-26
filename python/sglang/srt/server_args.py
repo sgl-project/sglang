@@ -1256,6 +1256,9 @@ class ServerArgs:
         "defaults to --port + 10000.",
         NS("serving"),
     ] = None
+    # Env-only knob (SGLANG_GRPC_WORKER_THREADS), so it carries no CLI surface;
+    # it is a field so the projection can see what resolution read.
+    grpc_worker_threads: A[Optional[int], Arg(no_cli=True), NS("serving")] = None
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
@@ -3670,7 +3673,7 @@ class ServerArgs:
         except BaseException:
             # The handlers that ran already declared, and they are not
             # idempotent over their own output.
-            object.__setattr__(self, "_resolution_failed", True)
+            self._resolution_failed = True
             raise
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
@@ -3721,8 +3724,10 @@ class ServerArgs:
 
         # Everything outside the fields, enumerated from the instance: the raw
         # snapshot, the stash, and what resolution memoized -- including the
-        # `get_model_config()` cache, which a resolved copy can no longer fill
-        # (the read-only guard refuses the write).
+        # `get_model_config()` cache. That slot is `_model_config`, an
+        # underscore name that is not a dataclass field, so the read-only guard
+        # exempts it and a resolved copy could refill it; carrying it over
+        # keeps the copy from paying for a rebuild it does not need.
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
             if name in field_names or name == "_resolution_finished":
@@ -4446,7 +4451,10 @@ class ServerArgs:
 
         # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
         # native server, falling back to SGLANG_GRPC_PORT.
-        self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
+        self._declare(
+            "_handle_deprecated_args",
+            grpc_worker_threads=envs.SGLANG_GRPC_WORKER_THREADS.get(),
+        )
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         if cfg.grpc_port is None and grpc_port_env is not None:
@@ -4470,10 +4478,10 @@ class ServerArgs:
                     "--grpc-port / SGLANG_GRPC_PORT "
                     f"({cfg.grpc_port}) must be between 1 and 65535"
                 )
-            if self.grpc_worker_threads < 1:
+            if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
                 raise ValueError(
                     "SGLANG_GRPC_WORKER_THREADS "
-                    f"({self.grpc_worker_threads}) must be >= 1"
+                    f"({cfg.grpc_worker_threads}) must be >= 1"
                 )
 
         # Native gRPC is incompatible with launch paths it doesn't wire into.
@@ -7251,7 +7259,6 @@ class ServerArgs:
             "_handle_dwdp",
             ep_size=cfg.dwdp_size,
         )
-        self.moe_ep_size = cfg.dwdp_size
         self._declare(
             "_handle_dwdp",
             moe_dp_size=1,
@@ -7270,7 +7277,7 @@ class ServerArgs:
 
         logger.info(
             f"DWDP enabled: dwdp_size={cfg.dwdp_size}, "
-            f"auto-forced dp_size={cfg.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"auto-forced dp_size={cfg.dp_size}, ep_size={cfg.dwdp_size}, "
             f"moe_dense_tp_size=1, moe_a2a_backend=none, "
             f"dp_attention_local_control_broadcast=True, "
             f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
@@ -10071,7 +10078,7 @@ class ServerArgs:
         cfg = resolving_view(self)
         from sglang.srt.configs.model_config import ModelConfig
 
-        memo = getattr(self, "model_config", None)
+        memo = getattr(self, "_model_config", None)
         if memo is not None:
             # The key is the path this record carried when the cache was
             # filled. The GGUF and ModelScope handlers declare a different
@@ -10085,7 +10092,7 @@ class ServerArgs:
                 return memo
 
         model_config = ModelConfig.from_server_args(self)
-        self.model_config = model_config
+        self._model_config = model_config
         self._model_config_built_from = cfg.model_path
         if model_config.is_hybrid_swa:
             logger.info(
@@ -10120,7 +10127,6 @@ class ServerArgs:
         if (
             getattr(self, "_resolution_finished", False)
             and not getattr(self, "_internal_write", False)
-            and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
@@ -10200,7 +10206,7 @@ class ServerArgs:
             # is supported.
             result = max(candidate_steps) + 1
         if getattr(self, "_resolution_finished", False):
-            object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
+            self._max_speculative_num_draft_tokens = result
         return result
 
     @property
@@ -10777,7 +10783,7 @@ class ServerArgs:
             result = json.loads(self.modelexpress_config)
         else:
             result = self.modelexpress_config
-        object.__setattr__(self, "_mx_config_cache", result)
+        self._mx_config_cache = result
         return result
 
     @property
@@ -10950,14 +10956,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
         and is_sm100_supported()
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
-
-
-# Caches, which the read-only guard lets through: a value the record derived
-# from itself is not resolved configuration, and a key that can invalidate on a
-# resolved record needs the refill to be storable there. Only the public-named
-# ones are listed -- a cache key spelled with a leading underscore is already
-# exempt.
-_CACHE_SLOTS = frozenset({"model_config"})
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
