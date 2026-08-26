@@ -4,11 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
+from sglang.srt.models import qwen4_exp_mtp
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _qwen4_exp_fused_shared_expert_mapping,
@@ -305,3 +307,39 @@ def test_mtp_required_shared_expert_missing_fails_closed():
             model,
             [("mtp.layers.0.mlp.shared_expert.gate_proj.weight", torch.tensor(1.0))],
         )
+
+
+def test_mtp_lm_head_reads_published_parallel_config(monkeypatch):
+    captured = {}
+    parallel = SimpleNamespace(
+        tp_size=1,
+        config=SimpleNamespace(enable_dp_lm_head=True),
+    )
+
+    class _RecordingLMHead(nn.Module):
+        def __init__(self, *args, use_attn_tp_group, **kwargs):
+            super().__init__()
+            captured["use_attn_tp_group"] = use_attn_tp_group
+
+    monkeypatch.setattr(qwen4_exp_mtp, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(qwen4_exp_mtp, "get_pp_group", lambda: object())
+    monkeypatch.setattr(
+        qwen4_exp_mtp, "Qwen4ExpModel", lambda *args, **kwargs: nn.Identity()
+    )
+    monkeypatch.setattr(qwen4_exp_mtp, "ParallelLMHead", _RecordingLMHead)
+    monkeypatch.setattr(qwen4_exp_mtp, "LogitsProcessor", lambda config: object())
+
+    config = SimpleNamespace(
+        num_hidden_layers=48,
+        layer_types=["linear_attention"] * 48,
+        full_attention_interval=4,
+        ple_layer_ids=[0],
+        hidden_size=8,
+        hc_count=1,
+        rms_norm_eps=1e-6,
+        vocab_size=16,
+    )
+
+    Qwen4ExpForCausalLMMTP(config)
+
+    assert captured["use_attn_tp_group"] is True
