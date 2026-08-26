@@ -274,8 +274,8 @@ def _local_prefill_cuda_graph_vote(
         return_logprob = local_batch.return_logprob
     elif (
         mode.is_decode()
-        # decode->extend conversion eligibility; needs a captured-graph runner
-        # (PrefillCudaGraphRunner or its Mixed subclass), not the eager fallback.
+        # decode->extend conversion eligibility; needs the captured-graph
+        # prefill runner, not the eager fallback.
         and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
         and spec_algorithm.is_none()
         and not local_batch.return_logprob

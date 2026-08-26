@@ -257,6 +257,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     def __init__(self, model_runner: ModelRunner):
+        if get_schedule().enable_mixed_chunk:
+            backend = get_exec().graph.cuda_graph_config.prefill.backend
+            assert backend == Backend.BREAKABLE, (
+                "Mixed chunk prefill requires the breakable prefill CUDA "
+                f"graph backend; got '{backend}'."
+            )
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
@@ -1437,11 +1443,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    def _graph_replay_forward_mode(
-        self, mode: Optional[ForwardMode]
-    ) -> Optional[ForwardMode]:
-        return mode
-
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
@@ -1514,9 +1515,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.num_token_non_padded
         )
 
-        pcg_forward_mode = self._graph_replay_forward_mode(forward_batch.forward_mode)
-        pcg_global_forward_mode = self._graph_replay_forward_mode(
-            forward_batch.global_forward_mode
+        # MIXED replays the EXTEND-captured graphs.
+        pcg_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.forward_mode == ForwardMode.MIXED
+            else forward_batch.forward_mode
+        )
+        pcg_global_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.global_forward_mode == ForwardMode.MIXED
+            else forward_batch.global_forward_mode
         )
 
         static_forward_batch = ForwardBatch(

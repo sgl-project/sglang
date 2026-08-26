@@ -12,10 +12,8 @@ Public API:
   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
     capture-loop scaffolding on top of BaseRunner.
   - DecodeCudaGraphRunner — concrete decode-phase runner.
-  - PrefillCudaGraphRunner — concrete prefill-phase runner (pure extend).
-  - MixedCudaGraphRunner — extend-family runner constructed instead of
-    PrefillCudaGraphRunner under --enable-mixed-chunk; replays MIXED
-    batches on the EXTEND-captured graphs.
+  - PrefillCudaGraphRunner — concrete prefill-phase runner (extend family;
+    MIXED batches replay the EXTEND-captured graphs).
   - EagerRunner — no-cuda-graph runner; runs model.forward live (the
     eager dual of the cuda-graph runners), mode-dispatched over decode +
     extend + idle.
@@ -36,9 +34,6 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner  # noqa: F401
-from sglang.srt.model_executor.runner.mixed_cuda_graph_runner import (  # noqa: F401
-    MixedCudaGraphRunner,
-)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
     PrefillCudaGraphRunner,
 )

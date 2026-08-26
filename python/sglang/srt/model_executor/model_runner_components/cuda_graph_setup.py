@@ -36,7 +36,6 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 )
 from sglang.srt.model_executor.runner import (
     EagerRunner,
-    MixedCudaGraphRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
@@ -389,13 +388,7 @@ def capture_prefill_graph(
         f"avail mem={before_mem:.2f} GB"
     )
 
-    # MIXED batches (mixed chunking) replay the EXTEND graphs via the subclass.
-    prefill_runner_cls = (
-        MixedCudaGraphRunner
-        if get_schedule().enable_mixed_chunk
-        else PrefillCudaGraphRunner
-    )
-    prefill_runner = prefill_runner_cls(model_runner)
+    prefill_runner = PrefillCudaGraphRunner(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem
