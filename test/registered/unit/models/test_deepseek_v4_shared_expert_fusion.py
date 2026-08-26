@@ -64,16 +64,16 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_disables_shared_fusion_without_enforce(self):
         self._publish(enforce=False)
-        self.assertEqual(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), None
-            ),
-            "Config does not support fused shared expert(s).",
-        )
         with patch(
             "sglang.srt.distributed.parallel_state._MOE_EP",
             new_callable=lambda: SimpleNamespace(world_size=1),
         ):
+            self.assertEqual(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), None
+                ),
+                "Config does not support fused shared expert(s).",
+            )
             self._install()
             # The decision lands on the ACTIVE flag; the config intent is untouched.
             self.assertTrue(is_shared_experts_fusion_disabled())
