@@ -108,13 +108,21 @@ class StateStorage:
         )
 
     def pending_request_slots(self, table, req: Req) -> int:
-        """Slots acquire will allocate for this request's working/tracking state."""
-        return int(not req.kv.holds_mamba) + (
-            table.mamba_initial_tracking_slots
-            if table.enable_mamba_extra_buffer
-            and req.kv.mamba_ping_pong_track_buffer is None
-            else 0
-        )
+        """Slots acquire will allocate for this request's working/tracking state.
+
+        Fixed system prompt: a warm request gets a sentinel-only ping-pong
+        buffer (reserved slot 0, no real allocation), so it charges no
+        tracking slots; a cold request (warm-up pass / post-eviction) still
+        needs the full tracking slots."""
+        tracking_slots = 0
+        if table.enable_mamba_extra_buffer and req.kv.mamba_ping_pong_track_buffer is None:
+            from sglang.srt.system_prompt import is_system_prefix_warm
+
+            if not is_system_prefix_warm(
+                req.system_prefix_boundary, req.prefix_len, req.mamba_branching_seqlen
+            ):
+                tracking_slots = table.mamba_initial_tracking_slots
+        return int(not req.kv.holds_mamba) + tracking_slots
 
     def held_request_slots(self, table, req: Req) -> int:
         """Slots the request holds before acquire: its working and tracking
@@ -137,7 +145,8 @@ class StateStorage:
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it, and one that holds tracking slots keeps
         those. Every slot taken comes from one allocation, so a shortfall
-        hands out nothing."""
+        hands out nothing. A warm fixed-system-prompt request gets a
+        sentinel-only ping-pong buffer instead (no real allocation)."""
         assert len(rows) == len(reqs)
         tracking = table.enable_mamba_extra_buffer
         needing = [req for req in reqs if not req.kv.holds_mamba]
@@ -147,8 +156,40 @@ class StateStorage:
             if tracking
             else []
         )
-        per_request = table.mamba_initial_tracking_slots if untracked else 0
-        count = len(needing) + per_request * len(untracked)
+        # Fixed system prompt, warm request: the boundary state is already
+        # cached and the suffix is neither tracked (mask=False in the extend
+        # prepare) nor donated (cap_mamba_donate_len), so it needs no real
+        # ping-pong slot. Use reserved slot 0 as the sentinel: it is a valid
+        # dummy write/gather/COW target, so any index consumer (decode track
+        # kernel dst, donate path, COW-from-root under eviction) stays in
+        # bounds. Every position is marked empty so release() frees nothing
+        # of it -- slot 0 never returns to the free list. Real allocations
+        # start at 1, so the all-empty marking is a no-op on cold buffers.
+        from sglang.srt.system_prompt import is_system_prefix_warm
+
+        warm_untracked, cold_untracked = [], []
+        for req in untracked:
+            if is_system_prefix_warm(
+                req.system_prefix_boundary, req.prefix_len, req.mamba_branching_seqlen
+            ):
+                warm_untracked.append(req)
+            else:
+                cold_untracked.append(req)
+        for req in warm_untracked:
+            size = table.mamba_ping_pong_track_buffer_size
+            req.kv.mamba_ping_pong_track_buffer = torch.zeros(
+                (size,), dtype=torch.int64, device=table.device
+            )
+            req.kv.mamba_ping_pong_empty = [True] * size
+            req.kv.mamba_prev_track_seqlen = None
+            req.kv.mamba_next_track_idx = 0
+            req.kv.mamba_last_track_idx = (
+                0
+                if table.enable_mamba_extra_buffer_lazy
+                else table.get_mamba_ping_pong_other_idx(0)
+            )
+        per_request = table.mamba_initial_tracking_slots if cold_untracked else 0
+        count = len(needing) + per_request * len(cold_untracked)
         mids = buffers = None
         if count:
             slots = self.slots.alloc(count)
@@ -175,9 +216,9 @@ class StateStorage:
                     self.slots.translate(mids).to(torch.int64),
                     async_h2d(needing_rows, dtype=torch.int64, device=table.device),
                 )
-            if untracked:
+            if cold_untracked:
                 buffers = self._hand_out_tracking(
-                    table, untracked, slots[len(needing) :]
+                    table, cold_untracked, slots[len(needing) :]
                 )
         # Device rows: indexing a device tensor with a Python list syncs the host.
         row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
@@ -190,7 +231,7 @@ class StateStorage:
         if tracking:
             ping_pong_tensor = (
                 buffers
-                if buffers is not None and len(untracked) == len(reqs)
+                if buffers is not None and len(cold_untracked) == len(reqs)
                 else torch.stack([req.kv.mamba_ping_pong_track_buffer for req in reqs])
             )
             table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (

@@ -308,6 +308,9 @@ class SchedulePolicy:
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
+        # (Fixed-system-prompt warm/cold detection needs no match here: every
+        # admitted request is re-matched by init_next_round_input before any
+        # warm-detection consumer reads its fields.)
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
@@ -1103,6 +1106,12 @@ class PrefillAdder:
         their host-hit metadata may still describe an already consumed hit.
         The state owner includes initial tracking buffers. Future radix CoW
         checkpoints are allocated by the cache, outside request acquisition.
+
+        Fixed system prompt: the warm/cold charging lives in
+        ``StateStorage.pending_request_slots`` -- a warm request charges its
+        running slot only (sentinel ping-pong buffer), a cold one the full
+        running + tracking cost, so a cold request is never admitted on a
+        single free slot and then crash-allocating more.
         """
         if not self.memory_budget.has_state_slots:
             return 0
