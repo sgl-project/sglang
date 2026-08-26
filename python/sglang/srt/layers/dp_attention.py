@@ -347,8 +347,8 @@ def initialize_dp_attention(
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = get_parallel().config.enable_dp_attention
-    dp_size = get_parallel().config.dp_size
+    enable_dp_attention = get_parallel().enable_dp_attention
+    dp_size = get_parallel().dp_size
     attn_cp_size = get_parallel().config.attn_cp_size
 
     dp.enabled = enable_dp_attention
@@ -361,11 +361,8 @@ def initialize_dp_attention(
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if (
-        get_exec().moe.elastic_ep_backend is not None
-        and get_parallel().config.max_ep_size
-    ):
-        _ATTN_DP_RANK = tp_rank + get_parallel().config.ep_join_rank_offset
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
         if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 
