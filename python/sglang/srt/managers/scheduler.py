@@ -29,11 +29,6 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     attention_backends,
-    configured_attn_cp_size,
-    configured_dcp_size,
-    configured_moe_dp_size,
-    configured_pp_size,
-    configured_tp_size,
     get_device,
     get_disagg,
     get_exec,
@@ -463,38 +458,38 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
-        self.enable_dp_attention = get_parallel().enable_dp_attention
+        self.enable_dp_attention = get_parallel().config.enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
-                get_parallel().enable_dp_attention,
+                get_parallel().config.enable_dp_attention,
                 tp_rank,
-                configured_tp_size(),
-                get_parallel().dp_size,
-                configured_attn_cp_size(),
+                get_parallel().config.tp_size,
+                get_parallel().config.dp_size,
+                get_parallel().config.attn_cp_size,
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=configured_tp_size(),
+            tp_size=get_parallel().config.tp_size,
             pp_rank=pp_rank,
-            pp_size=configured_pp_size(),
+            pp_size=get_parallel().config.pp_size,
             dp_rank=dp_rank,
-            dp_size=get_parallel().dp_size,
+            dp_size=get_parallel().config.dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=configured_attn_cp_size(),
-            attn_dcp_rank=tp_rank % configured_dcp_size(),
-            attn_dcp_size=configured_dcp_size(),
+            attn_cp_size=get_parallel().config.attn_cp_size,
+            attn_dcp_rank=tp_rank % get_parallel().config.dcp_size,
+            attn_dcp_size=get_parallel().config.dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
-            moe_ep_size=get_parallel().ep_size,
+            moe_ep_size=get_parallel().config.ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=configured_moe_dp_size(),
+            moe_dp_size=get_parallel().config.moe_dp_size,
             gpu_id=gpu_id,
         )
 
@@ -1069,7 +1064,7 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_parallel().pp_max_micro_batch_size:
+        if not get_parallel().config.pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
@@ -1414,7 +1409,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
-                dp_size=get_parallel().dp_size,
+                dp_size=get_parallel().config.dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -3233,7 +3228,7 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_parallel().pp_max_micro_batch_size - running_bs
+        res = get_parallel().config.pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -4890,7 +4885,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = get_parallel().max_ep_size or old_ep_size
+        max_ep_size = get_parallel().config.max_ep_size or old_ep_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5095,7 +5090,7 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif configured_pp_size() > 1:
+        elif get_parallel().config.pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -5104,14 +5099,14 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if configured_pp_size() > 1:
+        if get_parallel().config.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
-        if configured_pp_size() > 1:
+        if get_parallel().config.pp_size > 1:
             scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
@@ -5152,15 +5147,15 @@ def configure_scheduler_process(
     prefix = ""
     if shown_dp is not None:
         prefix += f" DP{shown_dp}"
-    if configured_pp_size() > 1:
+    if get_parallel().config.pp_size > 1:
         prefix += f" PP{pp_rank}"
-    if configured_attn_cp_size() > 1:
+    if get_parallel().config.attn_cp_size > 1:
         prefix += f" ATTN_CP{attn_cp_rank}"
-    if configured_moe_dp_size() > 1:
+    if get_parallel().config.moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
-    if configured_tp_size() > 1:
+    if get_parallel().config.tp_size > 1:
         prefix += f" TP{shown_tp}"
-    if get_parallel().ep_size > 1:
+    if get_parallel().config.ep_size > 1:
         prefix += f" EP{shown_moe_ep}"
 
     # Config the process
@@ -5174,7 +5169,10 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
-            configured_pp_size(), configured_tp_size(), get_parallel().nnodes, gpu_id
+            get_parallel().config.pp_size,
+            get_parallel().config.tp_size,
+            get_parallel().config.nnodes,
+            gpu_id,
         )
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)

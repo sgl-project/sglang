@@ -844,7 +844,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         self.addCleanup(reset_context)
         reset_context()
         publish(copy_, role="scheduler")
-        self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
+        self.assertEqual(get_parallel().config.dist_init_addr, "1.2.3.4:5000")
         self.assertEqual(
             get_schedule().chunked_prefill_size,
             parent.chunked_prefill_size,

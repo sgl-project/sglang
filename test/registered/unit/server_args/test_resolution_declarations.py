@@ -396,9 +396,10 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        shadowed = _live_topology_leaves()
+        # The five sizes keep a live property shadowing the bare name; the
+        # comparison below reaches them anyway, through `get_parallel().config`.
         self.assertGreaterEqual(
-            shadowed
+            _live_topology_leaves()
             & {
                 "tp_size",
                 "pp_size",
@@ -407,8 +408,7 @@ class TestResolutionDeclarations(CustomTestCase):
                 "dcp_size",
             },
             {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology; if it "
-            "is a plain config leaf now, it belongs in the comparison below",
+            "a parallel size stopped being served from the live topology",
         )
 
         compared = 0
@@ -418,17 +418,16 @@ class TestResolutionDeclarations(CustomTestCase):
             server_args = self._resolve(shape)
             publish(server_args, role="scheduler")
             for field, path in mapping.items():
-                if field in shadowed:
-                    # Served from the process groups by design; `configured_*()`
-                    # is what answers with the configured value, and
-                    # test_launch_path_reads_configured_sizes pins that.
-                    continue
                 groups = path.split(".")
                 accessor = getattr(runtime_context, f"get_{groups[0]}", None)
                 if accessor is None:
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
+                if groups[0] == "parallel":
+                    # Bare names there are the live topology; the published
+                    # leaves are one hop down, so the reader takes that hop.
+                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
