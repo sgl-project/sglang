@@ -107,6 +107,14 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
     )
 
 
+def autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    return tensor.device.type == current_platform.device_type and autocast_enabled(
+        dtype, disable_autocast
+    )
+
+
 def autocast_context(
     dtype: torch.dtype,
     disable_autocast: bool,
