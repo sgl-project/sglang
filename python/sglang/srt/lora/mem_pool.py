@@ -149,6 +149,7 @@ class LoRAMemoryPool:
         enable_lora_overlap_loading: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
+        self.base_model = base_model
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
@@ -248,7 +249,9 @@ class LoRAMemoryPool:
                 return False
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
-            target_module_names = get_normalized_target_modules(config.target_modules)
+            target_module_names = get_normalized_target_modules(
+                config.target_modules, base_model=self.base_model
+            )
             if "all" in target_module_names:
                 return True
             return target_module_names.issubset(self.target_modules)
