@@ -238,7 +238,12 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+            skip_attn_backend_init=(
+                True
+                if not _is_npu
+                or (idle_layout is None and num_tokens_per_req is not None)
+                else None
+            ),
         )
 
     def run_non_compact(
