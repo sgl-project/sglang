@@ -60,6 +60,10 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_ple_nvme import (
+    NVMePLEEmbedding,
+    is_nvme_ple_embedding,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -488,21 +492,32 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
-        )
-        self.ngram_embedding.register_buffer(
-            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
-        )
+        nvme_snapshot = envs.SGLANG_QWEN4_PLE_NVME_PATH.get()
+        if nvme_snapshot:
+            if get_parallel().tp_size != 1:
+                raise NotImplementedError("Qwen4 NVMe PLE currently supports TP1 only")
+            self.ngram_embedding = NVMePLEEmbedding(
+                nvme_snapshot,
+                num_embeddings=padded_vocab_size,
+                embedding_dim=self.head_dim_per_ngram,
+                expected_shards=int(config.split_ngram_parts),
+            )
+        else:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if (quant_config is not None and quant_config.get_name() == "fp8")
+                    or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
+            self.ngram_embedding.register_buffer(
+                "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+            )
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -891,7 +906,9 @@ class Qwen4ExpPLELayer(nn.Module):
             ple_layer_index=ple_layer_index,
             quant_config=quant_config,
         )
-        if config.ple_offload_embedding:
+        if config.ple_offload_embedding and not is_nvme_ple_embedding(
+            self.ple_embedding.ngram_embedding
+        ):
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 self.ple_embedding.ngram_embedding
             )
@@ -942,7 +959,10 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            torch.cuda.Stream()
+            if config.ple_offload_embedding
+            or is_nvme_ple_embedding(self.ple_embedding.ngram_embedding)
+            else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1135,18 +1155,39 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
-        self._prefetch_state = prefetched, semantic_tokens, physical_tokens
+        pending_nvme = None
+        if is_nvme_ple_embedding(offloaded_embedding):
+            pending_nvme = offloaded_embedding.start_gather(lookup_ids)
+        else:
+            stream.wait_stream(torch.cuda.current_stream())
+            lookup_ids.record_stream(stream)
+            with torch.cuda.stream(stream):
+                offloaded_embedding.gather(lookup_ids, out=output_view)
+        self._prefetch_state = (
+            prefetched,
+            semantic_tokens,
+            physical_tokens,
+            pending_nvme,
+        )
 
     def _consume_prefetched_embeddings(
         self, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
-        embeddings, semantic_tokens, physical_tokens = self._prefetch_state
+        embeddings, semantic_tokens, physical_tokens, pending_nvme = (
+            self._prefetch_state
+        )
+        if pending_nvme is not None:
+            output_view = embeddings.view(
+                embeddings.shape[0], self.ple_embedding.ngram_heads, -1
+            )
+            self.ple_embedding.ngram_embedding.finish_gather(
+                pending_nvme,
+                embeddings.device,
+                out=output_view,
+                stream=self._prefetch_stream,
+            )
         torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
@@ -1874,6 +1915,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if is_nvme_ple_embedding(emb):
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn

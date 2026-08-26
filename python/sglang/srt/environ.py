@@ -294,6 +294,14 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Stream Qwen4's PLE n-gram table from a local safetensors snapshot instead
+    # of allocating it in host or device memory. An empty path disables it.
+    SGLANG_QWEN4_PLE_NVME_PATH = EnvStr("")
+    SGLANG_QWEN4_PLE_NVME_BACKEND = EnvStr("io_uring")
+    SGLANG_QWEN4_PLE_NVME_QUEUE_DEPTH = EnvInt(512)
+    SGLANG_QWEN4_PLE_NVME_MAX_BATCH_PAGES = EnvInt(4096)
+    SGLANG_QWEN4_PLE_NVME_CACHE_PAGES = EnvInt(0)
+    SGLANG_QWEN4_PLE_NVME_LOG_INTERVAL = EnvInt(1000)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
