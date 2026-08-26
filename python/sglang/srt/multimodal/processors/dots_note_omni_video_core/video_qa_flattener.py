@@ -102,7 +102,7 @@ class VideoQAFlattener:
         elif self.ai_k_mode == "eval_ek":
             groups = round((k_max - 1) / math.log(k_max))
         else:
-            groups = round(math.exp(random.uniform(0.0, math.log(k_max))))
+            groups = round(math.exp(self.rng.uniform(0.0, math.log(k_max))))
         groups = max(1, min(k_max, groups))
         if groups == 1:
             return [0, n_frames]

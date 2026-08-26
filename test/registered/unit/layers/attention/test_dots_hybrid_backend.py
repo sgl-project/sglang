@@ -15,8 +15,12 @@ from sglang.srt.layers.attention.dots_hybrid_backend import (
     DotsSWAMLAAttnBackend,
     _metadata_mismatches_dp_padded_batch,
     _normalize_cache_seqlens_rows,
+    wrap_dots_attention_backend,
 )
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMetadata,
+)
 from sglang.srt.layers.attention.swa_mla_fallback.ops import (
     gather_page64_kv_latent,
 )
@@ -99,6 +103,33 @@ def test_normalize_cache_seqlens_truncates_extra_rows():
     normalized = _normalize_cache_seqlens_rows(cache_seqlens, seq_lens, 2)
 
     assert torch.equal(normalized, torch.tensor([17, 23], dtype=torch.int32))
+
+
+def test_dsa_target_gets_dedicated_flash_attention_swa_backend(monkeypatch):
+    full_dsa_backend = SimpleNamespace()
+
+    def init_fa_backend(self, runner):
+        self.token_to_kv_pool = object()
+        self.req_to_token_pool = object()
+
+    monkeypatch.setattr(FlashAttentionBackend, "__init__", init_fa_backend)
+    monkeypatch.setattr(
+        "sglang.srt.layers.attention.attention_registry.create_dsa_backend",
+        lambda runner: SimpleNamespace(),
+    )
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_draft_model=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        )
+    )
+    backend = wrap_dots_attention_backend(runner, full_dsa_backend)
+
+    assert isinstance(backend, DotsHybridAttnBackend)
+    assert isinstance(backend.swa_backend, DotsSWAMLAAttnBackend)
+    assert isinstance(backend.swa_backend.backend, FlashAttentionBackend)
+    assert backend.swa_backend.backend is not full_dsa_backend
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

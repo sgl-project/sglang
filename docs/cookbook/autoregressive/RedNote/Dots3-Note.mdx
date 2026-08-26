@@ -87,7 +87,7 @@ dots3.note is RedNote's native multimodal omni model, built on the dots3 languag
 
 **MoE runner.** Leave the runner at the cell default: `deep_gemm` for BF16 checkpoints, `auto` for quantized ones. DeepEP is the all-to-all transport in every cell (`--moe-a2a-backend deepep`, dispatch tokens per rank tuned via `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128`).
 
-**Attention backend.** FA3 across the board: prefill, decode, and draft (`--prefill-attention-backend fa3 --decode-attention-backend fa3 --speculative-draft-attention-backend fa3`) with `--page-size 64`. MTP target verification uses FA3's absorbed SWA-MLA fallback, which consumes the same paged latent KV view as decode.
+**Attention backend.** FA3 across the board (`--attention-backend fa3`) with `--page-size 64`; the MTP draft inherits the target backend. MTP target verification uses FA3's absorbed SWA-MLA fallback, which consumes the same paged latent KV view as decode. Dots3-Note's built-in MTP draft automatically reuses the target model path.
 
 **DSA.** DSA indexing on full-attention layers is on by default. To disable it, add `--json-model-override-args '{"index_topk":null}'`.
 
