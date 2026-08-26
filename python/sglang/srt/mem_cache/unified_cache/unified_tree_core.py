@@ -515,6 +515,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The hash values owned by this node, excluding its ancestors."""
         return self.node_by_id(node_id).hash_value or []
 
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node that was built while storage was disabled.
+
+        Page hashes chain from the parent's last hash, so a node whose parent has
+        none restarts the chain mid-sequence: its keys then encode only a suffix
+        of the prefix they claim to represent, which would alias unrelated
+        requests that happen to start with those tokens. Walks parent-before-child
+        so each node hashes against an already-filled parent. Returns the number
+        of nodes filled.
+        """
+        filled = 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            # The root anchors every chain and is seeded with an empty hash list.
+            if node is not self.root_node and node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+                filled += 1
+            stack.extend(node.children.values())
+        return filled
+
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches; the single root serves every namespace."""
         return self.root_node.id
@@ -1203,7 +1224,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """Return the next device leaf to evict for a component, or None when done."""
+        """Advance one component eviction step and report whether it progressed."""
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
@@ -1215,6 +1236,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
+        result.made_progress = result.node_id is not None or bool(result.tracker)
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:

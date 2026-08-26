@@ -177,6 +177,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      rocm_version: rocm724
       run_all_tests: true
     secrets: inherit
 
@@ -216,6 +217,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      rocm_version: rocm724
     secrets: inherit
 
   run-nightly-tests-npu:

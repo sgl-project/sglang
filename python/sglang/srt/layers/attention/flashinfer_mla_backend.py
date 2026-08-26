@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 
 """
 Support attention backend for flashinfer MLA.
@@ -1101,7 +1106,7 @@ class FlashInferMLAMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self,

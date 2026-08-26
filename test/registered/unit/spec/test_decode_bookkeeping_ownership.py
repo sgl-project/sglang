@@ -101,6 +101,8 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    # NPU page-boundary clamp on req and slot clocks.
+    (_SS, "StreamingSession.try_match_prefix", "kv_committed_len"): 2,
 }
 
 

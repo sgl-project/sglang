@@ -31,6 +31,11 @@ from sglang.srt.runtime_context import get_parallel
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 
+def unwrap_lora_layer(module: nn.Module) -> nn.Module:
+    """Return the plain module behind a LoRA wrapper, or the module itself."""
+    return module.base_layer if isinstance(module, BaseLayerWithLoRA) else module
+
+
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,

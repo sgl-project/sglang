@@ -71,6 +71,9 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.full_window_pages = (
+            self.sliding_window_size + params.page_size - 1
+        ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -532,10 +535,14 @@ class SWAComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
-        """Return the next device-leaf node for the driver to evict, or None.
-        Internal nodes are tombstoned inline (no IO). If the previous node's
-        eviction removed the cursor, the walk resumes from the partition
-        sentinel with session refs on, else it restarts at the LRU tail."""
+        """Advance one device-eviction step and return a leaf, if selected.
+
+        An internal tombstone is one complete step so the caller can apply its
+        pending frees and recheck allocator capacity before the next mutation.
+        If the previous node's eviction removed the cursor, the walk resumes
+        from the partition sentinel with session refs on, else it restarts at
+        the LRU tail.
+        """
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -545,34 +552,36 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_lru_no_lock()
             )
-        while (
-            tracker[ct] < self._evict_device_request_cnt
-            and self._evict_device_cursor is not None
-            and lru.in_list(self._evict_device_cursor)
+        if (
+            tracker[ct] >= self._evict_device_request_cnt
+            or self._evict_device_cursor is None
+            or not lru.in_list(self._evict_device_cursor)
         ):
-            x = self._evict_device_cursor
-            assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
-            ):
-                self._evict_device_cursor = (
-                    lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
-                )
-                return x.id
-            if not enabled:
-                x_next = lru.get_prev_no_lock(x)
-            self.tree_core._evict_component_and_detach_lru(
-                x,
-                self,
-                target=EvictLayer.DEVICE,
-                tracker=tracker,
-                device_frees=device_frees,
-                host_frees=host_frees,
+            return None
+
+        x = self._evict_device_cursor
+        assert x.component_data[ct].value is not None
+        if x in self.tree_core.evictable_device_leaves and (
+            not enabled or self._can_evict_leaf_atomically(x)
+        ):
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
-            self.tree_core._cascade_evict(
-                x, self, tracker, device_frees=device_frees, host_frees=host_frees
-            )
-            self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+            return x.id
+        if not enabled:
+            x_next = lru.get_prev_no_lock(x)
+        self.tree_core._evict_component_and_detach_lru(
+            x,
+            self,
+            target=EvictLayer.DEVICE,
+            tracker=tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+        )
+        self.tree_core._cascade_evict(
+            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+        )
+        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
     def _evict_device_end(self) -> None:
@@ -770,16 +779,32 @@ class SWAComponent(TreeComponent):
         # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
-        sw_pages = (
-            self.cache.sliding_window_size + self.cache.page_size - 1
-        ) // self.cache.page_size
-        if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
+        sw_pages = self.full_window_pages
+        if sw_pages == 0:
             return PreparePrefetchResult()
-        num_tokens = sw_pages * self.cache.page_size
-        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        prefetch_pages = prefetch_tokens // self.cache.page_size
+        if prefetch_pages >= sw_pages:
+            num_pages = sw_pages
+        elif prefetch_pages <= 0:
+            return PreparePrefetchResult()
+        elif (
+            self.tree_core.is_root(node_id)
+            or self.cache.host_memory_mode == "buffer_only"
+        ):
+            # Sub-window fetch: at root the sequence IS its window; mid-tree
+            # (buffer mode) the window head is the device prefix's own ring
+            # state, so only the suffix needs fetching.
+            num_pages = prefetch_pages
+        else:
+            # Cache-mode graft: a mid-tree window head is not
+            # device-guaranteed, require a full window.
+            return PreparePrefetchResult()
+        num_tokens = num_pages * self.cache.page_size
+        host_indices = self.cache.host_pool_group.alloc(
+            num_tokens,
+            pool=PoolName.SWA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -869,12 +894,14 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.PREFETCH:
             assert host_indices is not None
-            sw_pages = host_indices.numel() // self.tree_core.page_size
+            # Keys are unknowable at build time; placeholders carry the
+            # count, _sync_trailing_keys fills the real trailing hashes.
+            num_pages = host_indices.numel() // self.tree_core.page_size
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * sw_pages,
+                    keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
@@ -997,6 +1024,13 @@ class SWAComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
+        if anchor is not self.tree_core.root_node:
+            # Cache-mode graft commit only (buffer fills never reach here):
+            # a hit-shrunk window mid-tree is missing its head — drop it.
+            # Root anchors are complete windows of their own.
+            if window_require_pages < self.full_window_pages:
+                self._release_swa_host(host_indices, cache_actions)
+                return
         if (
             target is None
             or window_require_pages == 0
@@ -1094,7 +1128,7 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._swa_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
@@ -1121,7 +1155,7 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value

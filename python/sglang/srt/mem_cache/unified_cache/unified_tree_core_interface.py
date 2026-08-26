@@ -41,7 +41,15 @@ class BaseEvictionResult(msgspec.Struct):
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
+    """One device-walk step.
+
+    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
+    also covers an internal tombstone that returned no leaf, distinguishing it
+    from true walk exhaustion.
+    """
+
     node_id: Optional[NodeId] = None
+    made_progress: bool = False
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -174,6 +182,16 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
+        ...
+
+    @abstractmethod
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches for the namespace."""
         ...
@@ -220,8 +238,11 @@ class UnifiedTreeCoreInterface(ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted);
-        tracker is the caller's running totals, read for the doneness check."""
+        """Advance one eviction step.
+
+        A missing ``node_id`` is exhausted only when ``made_progress`` is also
+        false. ``tracker`` is the caller's running totals, read for doneness.
+        """
         ...
 
     @abstractmethod
