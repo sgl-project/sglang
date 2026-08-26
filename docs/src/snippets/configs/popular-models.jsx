@@ -13,20 +13,20 @@
 
 export const popularModels = [
   {
-    name: "Qwen3.8-27B",
+    name: "Qwen3.8-Flash-Next",
     vendor: "Qwen",
-    href: "/cookbook/autoregressive/Qwen/Qwen3.8-27B",
+    href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
     logo: "/cards/logos/qwen.png",
     badge: "New",
-    tags: ["4 platforms", "Hybrid GDN", "BF16 / FP8 / NVFP4"],
+    tags: ["6 platforms", "GDN + QSA hybrid", "BF16 / FP8 / NVFP4"],
     hero: {
       eyebrow: "Featured model \u00b7 New",
-      headline: "Meet Qwen3.8-27B on SGLang",
+      headline: "Meet Qwen3.8-Flash-Next on SGLang",
       blurb:
-        "A dense hybrid Gated Delta Networks model \u2014 48 GDN linear-attention layers interleaved with 16 full-attention, an in-checkpoint MTP head, and a native 262,144-token context. The cookbook covers single-GPU serving on H200 and RTX PRO 6000 / 5090.",
-      tags: ["Dense 27B", "262K context", "Single-GPU"],
-      cta: "Open the Qwen3.8-27B cookbook",
-      caption: "Qwen3.8-27B deployment guide",
+        "Qwen's early preview of the Qwen4 architecture \u2014 176B total parameters with 6B active, three of every four layers Gated DeltaNet and the fourth global attention running Qwen Sparse Attention, over an ultra-sparse MoE with an in-checkpoint MTP head. The cookbook covers single-node TP4 serving on H200 / B200 / B300 / GB300 and TP8 on MI350X / MI355X.",
+      tags: ["176B / 6B active", "262K context", "Single-node"],
+      cta: "Open the Qwen3.8-Flash-Next cookbook",
+      caption: "Qwen3.8-Flash-Next deployment guide",
     },
   },
   {

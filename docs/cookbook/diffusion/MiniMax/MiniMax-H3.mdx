@@ -76,26 +76,32 @@ Static H3 head or partition violations disable Copy before they reach
 
 Start with the command emitted by the builder. Every row below is an overlay on
 the same native SGLang pipeline; component repositories contribute their own
-config and weights, while weight files retain the base component config.
+config and weights, while weight files retain the base component config. Storage
+layout and inference behavior are separate contracts: for example, a PEFT file
+may be either a normal style adapter or a timestep-distilled Turbo adapter.
 
 | Scope | Format or variant | Add to the base command | Contract |
 | --- | --- | --- | --- |
-| Full model | Official mixed BF16/FP32 | `--model-variant fl2va` or `--model-variant ref2va` | Lossless reference and consistency GT path. |
+| Full model | Official mixed BF16/FP32, CFG-distilled | `--model-variant fl2va` or `--model-variant ref2va` | Lossless reference and consistency GT path. CFG distillation removes the negative branch; it is not the few-step timestep distillation used by Turbo releases. |
 | DiT | Official Diffusers component layout | `--component-paths.transformer MiniMaxAI/MiniMax-H3/transformer` (`fl2va`) or `.../transformer_ref` (`ref2va`) | Loads the official component through the native SGLang graph; no Diffusers runtime fallback. |
 | DiT | [AdaLN-pruned Diffusers component](https://huggingface.co/multimodalart/MiniMax-H3-Pruned) | `--component-paths.transformer multimodalart/MiniMax-H3-Pruned/transformer` or `.../transformer_ref` | Approximate curve-AdaLN architecture; its config and basis metadata are loaded natively. |
-| DiT | [Full or AdaLN-pruned BF16 safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Weight-only override. Match the FL2VA/Ref2VA partition; pruned or dtype-converted exports are approximate. |
+| DiT | [Full or AdaLN-pruned](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), or [LoRA-merged/remixed](https://huggingface.co/FX-FeiHou/MiniMax-H3-Remix) BF16 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Weight-only override for a native full/pruned H3 layout. Match the FL2VA/Ref2VA partition; pruned, merged, or dtype-converted exports are approximate, and any author-specific sampler remains a separate requirement. |
 | DiT | Comfy FP8 or self-describing MXFP8 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Per-layer metadata selects static/dynamic FP8 or MXFP8 automatically. |
 | DiT | ConvRot INT8, W4A8, W4A4, or mixed W4A4+INT8 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. TP must preserve each file's ConvRot group boundaries. |
 | DiT | [NVFP4, optionally mixed with INT8 or FP8](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; NVFP4 execution requires NVIDIA compute capability 10.0+. |
 | DiT | [AutoRound W4A16 component](https://huggingface.co/Ar4ikov/MiniMax-H3-transformer-W4A16-RTN) | `--component-paths.transformer Ar4ikov/MiniMax-H3-transformer-W4A16-RTN` | Self-describing Diffusers component; SGLang reuses the SRT GPTQ/Marlin backend. The linked export is FL2VA. |
 | DiT | GGUF, full or AdaLN-pruned ([full](https://huggingface.co/leejet/MiniMax-H3-GGUF), [pruned](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `--component-weights-paths.transformer OWNER/REPO/FILE.gguf` | CUDA capacity path; aligned TP and layerwise offload are supported, FSDP and LoRA are not. |
-| DiT | Online FP8 or ConvRot INT8 | `--component-quantizations.transformer fp8` or `... kitchen_int8` | Quantizes the official weights during load; this is not a pre-quantized checkpoint format. |
 | Text encoder | [Serialized FP8 component](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct-FP8) | `--component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8` | Only eligible language-model linears use FP8; embeddings, norms, and the vision tower keep their declared precision. |
 | Text encoder | ConvRot INT8, W4A8, or W4A4 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. Unmarked vision and embedding tensors keep their declared precision. |
 | Text encoder | [NVFP4-AWQ](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders) or [Quanto qint8](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) safetensors | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Memory-oriented formats: compressed storage is restored, then each active matrix uses BF16/FP16 compute. |
 | Text encoder | [GGUF Qwen3-VL](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) | `--component-weights-paths.text_encoder OWNER/REPO/FILE.gguf` | CUDA capacity path with encoder TP/layerwise support; encoder FSDP is not supported. |
 | Text encoder | [Compact Qwen3-VL 4B/8B + ClipProj](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3) | `--component-paths.text_encoder ENCODER_REPO --component-paths.conditioning_projection PROJECTION.safetensors` | Approximate conditioning replacement. A separate weight-only override may quantize the selected small encoder. |
-| Adapter | Native fused or Diffusers/PEFT LoRA | `--lora-path OWNER/REPO [--lora-weight-name FILE] --lora-merge-mode auto` | Layout and alpha metadata are normalized at load time; see [LoRA recipes](#5-lora-recipes). |
+| DiT or adapter | Timestep-distilled Turbo, as merged weights or LoRA ([Larry](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), [LightX2V](https://huggingface.co/lightx2v/Minimax-h3-Turbo), [merged Ref2VA INT8 example](https://huggingface.co/PulpCut/MiniMax-H3-Ref2VA-Turbo-INT8-ConvRot)) | Use `--component-weights-paths.transformer ...` for merged weights, or `--lora-path OWNER/REPO --lora-weight-name FILE --lora-merge-mode auto` for LoRA | Few-step semantic variant. Pin the exact FL2VA/Ref2VA file and its NFE/sigma schedule, scale, and alpha; storage-format detection does not infer sampling behavior. See [LoRA recipes](#5-lora-recipes). |
+| Adapter | Style, subject, or behavior LoRA ([example](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA)) | `--lora-path OWNER/REPO [--lora-weight-name FILE] --lora-merge-mode auto` | Native fused and Diffusers/PEFT layouts are normalized at load time. Keep the base schedule unless the author specifies another one, and preserve any trigger phrase, scale, and alpha metadata. |
+
+The rows compose rather than enumerate every cross-product. A Turbo-merged INT8
+ConvRot checkpoint, for example, must satisfy both the Turbo sampling contract
+and the ConvRot storage/backend contract.
 
 For H3, the registered component names are `transformer`, `text_encoder`,
 `video_vae`, and `audio_vae`. The shorter `--transformer-weights-path` and
@@ -113,6 +119,13 @@ compact-encoder, and LoRA routes are outside that baseline and the audited
 `quality="high"` contract. Packed and per-layer mixed formats reject FSDP unless
 their row says otherwise; see
 [Quantization](/docs/sglang-diffusion/quantization) for backend-wide constraints.
+
+LoRA tensors alone do not make an execution-coupled release portable. Sparse-
+attention/SLA adapters and causal-streaming adapters such as RAVEN also require
+their matching attention or streaming pipeline; they are not standard H3 LoRA
+overlays in SGLang. Likewise, a remixed checkpoint that prescribes a custom
+sampler is only covered when that sampler contract can be reproduced—the fact
+that its safetensors layout loads is not sufficient.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident by default.
 The model fits without FSDP, so this path avoids the per-block parameter
@@ -564,7 +577,7 @@ Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
 may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
 `default` adapter namespace. SGLang normalizes both layouts.
 
-The following FL2VA adapters have distinct purposes:
+The following pinned FL2VA adapters have distinct purposes:
 
 | Recipe | Repository and pinned file | Request setting | Prompt requirement |
 | --- | --- | --- | --- |
@@ -616,11 +629,13 @@ repository metadata, so `--lora-alpha 8` is required to reproduce the author's
 reference implementation. Start with the Larry 8-evaluation recipe when
 preserving fine visual detail is more important than minimum latency.
 
-These adapters were trained for the **FL2VA** partition and apply to `t2va` or
-`fl2va` requests. Do not use them with the separate `ref2va` weights unless
-the adapter author explicitly provides Ref2VA-compatible weights. Also avoid
-stacking a distilled adapter with `quality: "high"`: both alter denoising, and
-that combination has not been quality-validated.
+The pinned files above were trained for the **FL2VA** partition and apply to
+`t2va` or `fl2va` requests. Some repositories, including LightX2V, publish
+separate files for Ref2VA/Ref2V; select one explicitly for a `ref2va` server
+rather than reusing an FL2VA file. Those Ref2VA files are not yet a pinned,
+validated recipe on this page. Also avoid stacking a distilled adapter with
+`quality: "high"`: both alter denoising, and that combination has not been
+quality-validated.
 
 AdaLN-pruned Diffusers components that publish `adaln_basis` and `adaln_mean`
 can also consume a LoRA trained against the released full-width AdaLN modules:
