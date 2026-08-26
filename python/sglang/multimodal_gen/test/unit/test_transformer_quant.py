@@ -96,6 +96,7 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    _enforce_quantized_component_offload_capability,
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
@@ -136,6 +137,14 @@ class _FakeQuantConfig:
         return "modelopt_fp4"
 
 
+class _QuantizedOffloadSafeModel:
+    supports_quantized_component_offload = True
+
+
+class _QuantizedOffloadUnsafeModel:
+    supports_quantized_component_offload = False
+
+
 def _make_quant_config(name: str, **attrs):
     cls = type(
         f"_Fake{name.title().replace('_', '')}QuantConfig",
@@ -149,6 +158,30 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def test_model_capability_can_keep_quantized_transformer_resident(self):
+        server_args = SimpleNamespace(dit_cpu_offload=True)
+
+        _enforce_quantized_component_offload_capability(
+            server_args=server_args,
+            quant_config=_FakeQuantConfig(),
+            component_name=None,
+            model_cls=_QuantizedOffloadUnsafeModel,
+        )
+
+        self.assertFalse(server_args.dit_cpu_offload)
+
+    def test_model_capability_preserves_supported_quantized_offload(self):
+        server_args = SimpleNamespace(dit_cpu_offload=True)
+
+        _enforce_quantized_component_offload_capability(
+            server_args=server_args,
+            quant_config=_FakeQuantConfig(),
+            component_name=None,
+            model_cls=_QuantizedOffloadSafeModel,
+        )
+
+        self.assertTrue(server_args.dit_cpu_offload)
+
     def test_autoround_config_is_inferred_and_remapped_to_native_prefixes(self):
         layer_config = {
             "bits": 4,
