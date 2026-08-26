@@ -108,6 +108,12 @@ def _pp_debug_tensor_dict(
                 summary += f",summary_error={exc!r}"
         summaries.append(summary)
 
+    # ===== K3-DBG: gate the [PP-COMM] per-tensor summary. Set False to
+    # silence the rank-by-rank PP wire dump; True to re-enable when
+    # investigating. =====
+    K3_DBG_PP_COMM_ENABLED = False
+    if not K3_DBG_PP_COMM_ENABLED:
+        return
     logger.warning(
         "[PP-COMM] direction=%s seq=%d global_rank=%d pp_rank=%d peer_global_rank=%d "
         "msg_type=%s tensors={%s}",

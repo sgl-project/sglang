@@ -136,6 +136,10 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+# ===== K3-DBG toggles (hard-coded; flip True/False as needed) =====
+K3_DBG_ENABLED = True   # master switch for all K3-DBG prints in this file
+K3_DBG_LAYER2  = True   # binary-search 4 control points (A/B/C/D) on layer 2
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
@@ -2362,6 +2366,23 @@ class KimiK3DecoderLayer(nn.Module):
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
 
+        # ===== K3-DBG: layer 2 binary-search (4 control points A/B/C/D) =====
+        # A = layer entry hidden; B = after attn; C = after attn-reduce;
+        # D = after MLP. If A already diverges, bug is upstream (PP entry
+        # or block_residual sync). If A matches but B/C/D diverge, bug is
+        # in attn / attn-reduce / MLP itself.
+        _is_l2 = K3_DBG_ENABLED and K3_DBG_LAYER2 and self.layer_idx == 2
+        if _is_l2:
+            _ps_sh_a = tuple(prefix_sum.shape) if prefix_sum is not None else None
+            print(
+                f"[K3-L2] A-ENTRY layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                f"hidden.shape={tuple(hidden_states.shape)} "
+                f"ps.shape={_ps_sh_a} input_sharded={input_sharded} "
+                f"is_write={self.is_block_write_layer}",
+                flush=True,
+            )
+
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
         # the fast kernel; standalone copy on other paths). ----
@@ -2408,6 +2429,15 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+
+        if _is_l2:
+            print(
+                f"[K3-L2] B-AFTER-ATTN layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                f"hidden.shape={tuple(hidden_states.shape)} "
+                f"prefix_sum.shape={tuple(prefix_sum.shape) if prefix_sum is not None else None}",
+                flush=True,
+            )
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
@@ -2463,6 +2493,16 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
             prefix_sum = None
 
+        if _is_l2:
+            print(
+                f"[K3-L2] C-AFTER-ATTNREDUCE layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                f"hidden.shape={tuple(hidden_states.shape)} "
+                f"sp_moe={self._sp_moe} ar_fusion={self.all_reduce_fusion} "
+                f"shard_lo={shard_lo} agg2_fused={agg2_fused}",
+                flush=True,
+            )
+
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
         if not agg2_fused:
             hidden_states, prefix_sum = attn_res.forward(
@@ -2479,6 +2519,16 @@ class KimiK3DecoderLayer(nn.Module):
         out = self.mlp(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
         )
+
+        if _is_l2:
+            print(
+                f"[K3-L2] D-AFTER-MLP layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"out.sum={out.float().sum().item():.6f} "
+                f"out.shape={tuple(out.shape)} "
+                f"shard_lo={shard_lo} keep_sharded={keep_sharded}",
+                flush=True,
+            )
+
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
@@ -2619,6 +2669,23 @@ class KimiK3LinearModel(nn.Module):
             and self.dspark_layers_to_capture is None
             and k3_sp_collective.enabled()
         )
+
+        # ===== K3-DBG: per-segment state =====
+        if K3_DBG_ENABLED:
+            try:
+                _br_shape = tuple(attn_res.block_residual.shape) if attn_res is not None else None
+                _nvb = attn_res.num_valid_blocks if attn_res is not None else None
+                _bsz = self.config.attn_res_block_size
+            except Exception as _e:
+                _br_shape, _nvb, _bsz = f"err:{_e}", None, None
+            print(
+                f"[K3-DBG] seg_init pp_rank={self.pp_rank} "
+                f"pp_world={self.pp_group.world_size} attn_res={attn_res is not None} "
+                f"sp_attn_res={sp_attn_res} sp_coll={k3_sp_collective.enabled()} "
+                f"block_size={_bsz} br_shape={_br_shape} nvb={_nvb} "
+                f"end_layer={self.end_layer} start_layer={self.start_layer}",
+                flush=True,
+            )
         sp_sharded = False
         aux_hidden_states = []
         # Binary-search DBG: print at layer 1 (first standard transformer
@@ -2628,8 +2695,8 @@ class KimiK3LinearModel(nn.Module):
         # at each PP stage boundary.
         # Global debug switch: flip _DBG_ENABLED to False to disable ALL
         # hidden-state norm printing below (back to no-debug behavior).
-        _DBG_ENABLED = False  # <-- set False to disable debug printing
-        _DBG_LAYERS = {1, 23}
+        _DBG_ENABLED = True #-- set False to disable debug printing
+        _DBG_LAYERS = {0, 1, 2, 3, 4, 5}
         # PREFILL-only: only print on prefill/extension phases, not decode,
         # so a single-request prefill shows layer 1/23 norm without decode spam.
         _DBG_PREFILL_ONLY = True
@@ -2644,7 +2711,8 @@ class KimiK3LinearModel(nn.Module):
             # Activations are replicated across TP ranks, so the local norm
             # is already the full-hidden norm on every rank.
             # Whole block can be toggled off via SGLANG_K3_DBG=0.
-            if _DBG_ENABLED and i in _DBG_LAYERS:
+            # if _DBG_ENABLED and i in _DBG_LAYERS
+            if _DBG_ENABLED: # print all layers for now.
                 try:
                     _fm = forward_batch.forward_mode.name
                 except Exception:
@@ -2674,9 +2742,47 @@ class KimiK3LinearModel(nn.Module):
                     except Exception as _e:
                         _hs = f"ERR:{_e!s:.30}"
                         _shape = "?"
+                    try:
+                        if attn_res is not None:
+                            _r_valid = attn_res.num_valid_blocks
+                            _r = attn_res.block_residual[:, :_r_valid, :]
+                            _r_shape = list(_r.shape)
+                            if _r_valid > 0:
+                                _r_norm = _r.float().norm().item()
+                                _r_sum = _r.float().sum().item()
+                                _r_block_norms = [
+                                    _r[:, j, :].float().norm().item()
+                                    for j in range(_r_valid)
+                                ]
+                            else:
+                                _r_norm = 0.0
+                                _r_sum = 0.0
+                                _r_block_norms = []
+                        elif residual is not None:
+                            _r_valid = 1
+                            _r = residual
+                            _r_shape = list(_r.shape)
+                            _r_norm = _r.float().norm().item()
+                            _r_sum = _r.float().sum().item()
+                            _r_block_norms = [_r_norm]
+                        else:
+                            _r_valid = 0
+                            _r_shape = None
+                            _r_norm = 0.0
+                            _r_sum = 0.0
+                            _r_block_norms = []
+                    except Exception as _e:
+                        _r_valid = -1
+                        _r_shape = "?"
+                        _r_norm = f"ERR:{_e!s:.30}"
+                        _r_sum = "?"
+                        _r_block_norms = "?"
                     print(
                         f"[KIMI-K3-DBG pp={_pp_rank}/{_pp_size} tp={_tp_rank}/{_tp_size} "
-                        f"layer={i:3d} mode={_fm}] hidden_norm={_hs} shape={_shape}",
+                        f"layer={i:3d} mode={_fm}] hidden_norm={_hs} shape={_shape} "
+                        f"attn_res_valid={_r_valid} attn_res_shape={_r_shape} "
+                        f"attn_res_norm={_r_norm} attn_res_sum={_r_sum} "
+                        f"attn_res_block_norms={_r_block_norms}",
                         flush=True,
                     )
             if sp_sharded and not self.layers[i]._sp_moe:
@@ -2704,6 +2810,20 @@ class KimiK3LinearModel(nn.Module):
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
             if attn_res is not None:
+                # ===== K3-DBG: pre-send block_residual state =====
+                if K3_DBG_ENABLED:
+                    try:
+                        _br_full_shape = tuple(attn_res.block_residual.shape)
+                        _nvb_send = attn_res.num_valid_blocks
+                    except Exception as _e2:
+                        _br_full_shape, _nvb_send = f"err:{_e2}", None
+                    print(
+                        f"[K3-DBG] pre-send pp_rank={self.pp_rank} "
+                        f"br.shape={_br_full_shape} nvb={_nvb_send} "
+                        f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                        f"hidden.edge0={hidden_states.flatten()[0].item():.6f}",
+                        flush=True,
+                    )
                 if residual is not None:
                     # Materialize the delayed MLP add: the wire carries the
                     # full stream head (bit-identical to the fused fold).
