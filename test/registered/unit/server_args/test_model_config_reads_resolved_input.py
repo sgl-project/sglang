@@ -26,8 +26,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
 # Read for what the caller asked for: the constructor passes it through and
-# never stores it, while resolution later overwrites the field with the value
-# the architecture implies. Two quantities sharing one name.
+# never stores it, while resolution declares the value the architecture implies.
+# Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
 # Declared after the first `get_model_config()`, so the cached configuration
@@ -125,6 +125,13 @@ def _registry_collection_is_after_the_build():
 
 
 def _server_args_names(tree, path):
+    """Every local that names the record, including the read views over it.
+
+    A resolution-time reader reads through `resolving_view(server_args)` (the
+    declaration stash over the fields): declaration-only resolvers write no
+    field, so a field read there answers with the raw input. `cfg.dtype` after `cfg = resolving_view(sa)` is
+    the same read this scan is looking for, so the local it binds counts.
+    """
     names = {"self"} if path.name == "server_args.py" else {"server_args"}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -142,6 +149,32 @@ def _server_args_names(tree, path):
                 continue
             if text == "ServerArgs":
                 names.add(arg.arg)
+    # `cfg = resolving_view(server_args)` / `resolved_view(server_args)`
+    for _ in range(2):  # a view over a view-holding local is still one
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            bare = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in ("resolving_view", "resolved_view")
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id in names
+            )
+            # `resolved = self._resolved()` is the same view, spelled as the
+            # record's own member.
+            member = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "_resolved"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in names
+            )
+            if not (bare or member):
+                continue
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     return names
 
 
@@ -191,11 +224,12 @@ def _late_resolution_fields():
     for name in (
         "server_args.py",
         "arg_groups/overrides.py",
-        "utils/template_detection.py",
+        "parser/template_detection.py",
     ):
         path = _SRT / name
-        if not path.exists():
-            continue
+        # A named file that moved away has to be loud; skipping it silently
+        # leaves the scan believing it read a module it never opened.
+        assert path.exists(), f"{name} is not where this scan looks for it"
         tree = _parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

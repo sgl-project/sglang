@@ -31,7 +31,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
-Spark3Config = None
+Spark2_5Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def _get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-class Spark3MLP(nn.Module):
+class Spark2_5MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -80,7 +80,7 @@ class Spark3MLP(nn.Module):
         return x
 
 
-class Spark3Attention(nn.Module):
+class Spark2_5Attention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -169,7 +169,7 @@ class Spark3Attention(nn.Module):
             is_neox_style=True,
         )
         if layer_type not in ("sliding_attention", "full_attention"):
-            raise ValueError(f"Unsupported Spark3 layer_type: {layer_type}")
+            raise ValueError(f"Unsupported Spark2_5 layer_type: {layer_type}")
         sliding_window_size = (
             sliding_window if layer_type == "sliding_attention" else -1
         )
@@ -209,7 +209,7 @@ class Spark3Attention(nn.Module):
         return output
 
 
-class Spark3DecoderLayer(nn.Module):
+class Spark2_5DecoderLayer(nn.Module):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -218,7 +218,7 @@ class Spark3DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Spark3Config,
+        config: Spark2_5Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -234,7 +234,7 @@ class Spark3DecoderLayer(nn.Module):
         if partial_rotary_factor is None:
             partial_rotary_factor = 1.0
 
-        self.self_attn = Spark3Attention(
+        self.self_attn = Spark2_5Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -253,7 +253,7 @@ class Spark3DecoderLayer(nn.Module):
         )
 
         # MLP
-        self.mlp = Spark3MLP(
+        self.mlp = Spark2_5MLP(
             config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
@@ -290,10 +290,10 @@ class Spark3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Spark3Model(nn.Module):
+class Spark2_5Model(nn.Module):
     def __init__(
         self,
-        config: Spark3Config,
+        config: Spark2_5Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -315,7 +315,7 @@ class Spark3Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Spark3DecoderLayer(
+            lambda idx, prefix: Spark2_5DecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
@@ -377,10 +377,10 @@ class Spark3Model(nn.Module):
         return hidden_states
 
 
-class Spark3ForCausalLM(nn.Module):
+class Spark2_5ForCausalLM(nn.Module):
     def __init__(
         self,
-        config: Spark3Config,
+        config: Spark2_5Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -388,7 +388,7 @@ class Spark3ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Spark3Model(
+        self.model = Spark2_5Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -561,4 +561,4 @@ class Spark3ForCausalLM(nn.Module):
         return _get_attention_sliding_window_size(self.config)
 
 
-EntryClass = [Spark3ForCausalLM]
+EntryClass = [Spark2_5ForCausalLM]
