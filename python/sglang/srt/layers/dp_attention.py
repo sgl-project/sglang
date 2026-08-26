@@ -436,16 +436,31 @@ def get_dp_local_slice_cpu(
     can_run_graph: bool,
     cuda_graph_batch: Optional[int],
 ) -> Tuple[int, int]:
-    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
-    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    # CPU (start, length) slice for this rank's REAL rows in the dp-gathered
+    # buffer, no D2H sync. Layouts (verified against the buffer's zero-routing
+    # regions on a dp2 devbox):
+    #   graph replay (decode or piecewise prefill): uniform segments strided by
+    #     the replayed graph's padded per-rank size -- cuda_graph_batch, which
+    #     ModelRunnerOutput.graph_num_tokens now carries from the runner that
+    #     ran THIS forward. max(global_num_tokens) is NOT the stride there: a
+    #     prefill graph pads 300 real tokens to a 320-token capture size.
+    #   eager: packed by global_num_tokens (under eager MAX_LEN the entries are
+    #     already uniform, so the sum degenerates to rank * max).
+    # The length is the rank's REAL count (original_*): the rows and
+    # out_cache_loc entries past it belong to graph padding -- every pad row
+    # holds the routing of a zero hidden state, and scattering them through the
+    # pad out_cache_loc entries overwrote live tokens' captured rows with that
+    # single row (the R3 repeated-row corruption).
     global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_attention_dp_rank()
-    local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
+        assert cuda_graph_batch is not None, "graph forward without its size"
         local_start_pos = dp_rank * cuda_graph_batch
     else:
         local_start_pos = sum(global_num_tokens[:dp_rank])
-    return local_start_pos, local_num_tokens
+    original = forward_batch.original_global_num_tokens_cpu
+    counts = original if original is not None else global_num_tokens
+    return local_start_pos, counts[dp_rank]
 
 
 from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
