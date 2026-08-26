@@ -628,9 +628,48 @@ def patch_mistral_common_tokenizer(tokenizer):
                 adapted.append(msg)
         return adapted
 
+    def _assistant_content_is_empty(content):
+        if content is None:
+            return True
+        if isinstance(content, str):
+            return not content.strip()
+        if isinstance(content, list):
+            return all(
+                isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+                and not str(part.get("text") or "").strip()
+                for part in content
+            )
+        return False
+
+    def _drop_empty_assistant_messages(messages):
+        """Drop assistant turns with neither content nor tool calls, which
+        mistral_common rejects while other chat templates ignore them. A trailing
+        assistant turn is consumed upstream as the continue_final_message prefix,
+        so this cannot drop a prefill.
+        """
+        if not isinstance(messages, (list, tuple)):
+            return messages
+
+        kept = []
+        for msg in messages:
+            if isinstance(msg, (list, tuple)):
+                kept.append(_drop_empty_assistant_messages(msg))
+                continue
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and not msg.get("tool_calls")
+                and _assistant_content_is_empty(msg.get("content"))
+            ):
+                continue
+            kept.append(msg)
+        return kept
+
     def _safe_apply_chat_template(messages, **kwargs):
         kwargs.pop("add_generation_prompt", None)
         messages = _adapt_placeholder_messages_for_mistral_common(messages)
+        messages = _drop_empty_assistant_messages(messages)
         return tokenizer._orig_apply_chat_template(messages, **kwargs)
 
     tokenizer.apply_chat_template = _safe_apply_chat_template
