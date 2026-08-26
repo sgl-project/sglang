@@ -6308,8 +6308,13 @@ class ServerArgs:
         if not use_mla_backend:
             # MHA architecture
 
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
-                resolved_view(self)
+            if (
+                is_hopper_with_cuda_12_3()
+                and is_no_spec_infer_or_topk_one(resolved_view(self))
+                and (
+                    cfg.speculative_algorithm is None
+                    or cfg.speculative_eagle_topk is not None
+                )
             ):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                 # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
