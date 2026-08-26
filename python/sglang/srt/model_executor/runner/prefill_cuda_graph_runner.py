@@ -814,7 +814,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if max(requested_buckets) > max_context_len:
             raise ValueError(
-                "--context-bucket exceeds the maximum addressable context: "
+                "--cuda-graph-context-bucket-prefill exceeds the maximum "
+                "addressable context: "
                 f"bucket {max(requested_buckets)} > {max_context_len}"
             )
         aligned = tuple(

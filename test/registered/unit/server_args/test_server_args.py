@@ -1730,7 +1730,7 @@ class TestPrefillCudaGraphContextBuckets(CustomTestCase):
         args = ServerArgs(
             model_path="dummy",
             cuda_graph_backend_prefill=Backend.TC_PIECEWISE,
-            context_bucket=[60_000],
+            cuda_graph_context_bucket_prefill=[60_000],
         )
         args._parse_cuda_graph_config()
 

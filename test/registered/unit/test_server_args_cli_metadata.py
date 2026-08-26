@@ -110,7 +110,8 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             "+",
         )
         self.assertIs(
-            self.actions_by_option["--context-bucket"].type, human_readable_int
+            self.actions_by_option["--cuda-graph-context-bucket-prefill"].type,
+            human_readable_int,
         )
         self.assertEqual(self.actions_by_option["--context-bucket"].nargs, "+")
         self.assertEqual(
@@ -136,14 +137,19 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
     def test_context_bucket_accepts_human_readable_values(self):
-        args = self.parser.parse_args(
-            ["--model", "dummy", "--context-bucket", "60k", "200k"]
-        )
+        for option in (
+            "--cuda-graph-context-bucket-prefill",
+            "--context-bucket",
+        ):
+            with self.subTest(option=option):
+                args = self.parser.parse_args(
+                    ["--model", "dummy", option, "60k", "200k"]
+                )
 
-        self.assertEqual(
-            ServerArgs.from_cli_args(args).cuda_graph_context_bucket_prefill,
-            [60_000, 200_000],
-        )
+                self.assertEqual(
+                    ServerArgs.from_cli_args(args).cuda_graph_context_bucket_prefill,
+                    [60_000, 200_000],
+                )
 
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(

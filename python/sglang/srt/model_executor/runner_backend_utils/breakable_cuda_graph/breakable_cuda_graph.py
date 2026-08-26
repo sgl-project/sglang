@@ -22,6 +22,7 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import logging
 import threading
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
@@ -36,9 +37,13 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_bool_env_var, get_device_module, is_hip, is_xpu
 
 _is_xpu = is_xpu()
+logger = logging.getLogger(__name__)
+
+_DEBUG_BCG_MEMORY = get_bool_env_var("SGLANG_DEBUG_BCG_MEMORY")
+_GIB = 1 << 30
 
 __all__ = [
     "eager_on_graph",
@@ -224,7 +229,8 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
                 return inner(*args, **kwargs)
 
             # End the segment that captured up to this break point.
-            capture._end_current_segment()
+            break_name = inner.__qualname__
+            capture._end_current_segment(label=f"before:{break_name}")
 
             # Re-sync ranks after segment teardown (the slow, variable
             # step) before break fns with rank-coupled collectives and hard
@@ -241,6 +247,8 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
                 output = capture_stub(*args, **kwargs)
             else:
                 output = inner(*args, **kwargs)
+
+            capture._debug_log_memory("after_break", break_name)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -279,6 +287,12 @@ class BreakableCUDAGraph:
         self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
+        if _DEBUG_BCG_MEMORY:
+            logger.info(
+                "BCG_REPLAY segments=%d breaks=%d",
+                len(self._segments),
+                len(self._break_fns),
+            )
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
@@ -331,6 +345,7 @@ class BreakableCUDAGraphCapture:
         self._forked_token = None
         self._current_graph = None
         self._current_graph_needs_instantiate = False
+        self._debug_memory_baseline = None
 
     def __enter__(self):
         _install_wait_stream_hook()
@@ -342,12 +357,15 @@ class BreakableCUDAGraphCapture:
             self._stream or get_device_module().current_stream()
         )
         self._forked_token = _forked_streams_var.set(set())
+        if _DEBUG_BCG_MEMORY and torch.cuda.is_available():
+            self._debug_memory_baseline = self._memory_snapshot()
+            self._debug_log_memory("capture_begin", "-")
         self._begin_new_segment()
         return self
 
     def __exit__(self, *args: object):
         try:
-            self._end_current_segment()
+            self._end_current_segment(label="final")
         finally:
             _forked_streams_var.reset(self._forked_token)
             _current_stream_var.reset(self._stream_token)
@@ -382,7 +400,41 @@ class BreakableCUDAGraphCapture:
             )
         self._current_graph = graph
 
-    def _end_current_segment(self) -> None:
+    @staticmethod
+    def _memory_snapshot() -> tuple[int, int, int, int, int]:
+        device = torch.cuda.current_device()
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        stats = torch.cuda.memory_stats(device)
+        return (
+            free_bytes,
+            stats.get("allocated_bytes.all.current", 0),
+            stats.get("reserved_bytes.all.current", 0),
+            stats.get("active_bytes.all.current", 0),
+            stats.get("inactive_split_bytes.all.current", 0),
+        )
+
+    def _debug_log_memory(self, phase: str, label: str) -> None:
+        if self._debug_memory_baseline is None:
+            return
+        free, allocated, reserved, active, inactive_split = self._memory_snapshot()
+        base_free, _, base_reserved, _, _ = self._debug_memory_baseline
+        logger.info(
+            "BCG_MEMORY phase=%s segment=%d label=%s "
+            "driver_delta=%.3fGiB reserved_delta=%.3fGiB "
+            "allocated=%.3fGiB reserved=%.3fGiB active=%.3fGiB "
+            "inactive_split=%.3fGiB",
+            phase,
+            len(self.cuda_graph._segments),
+            label,
+            (base_free - free) / _GIB,
+            (reserved - base_reserved) / _GIB,
+            allocated / _GIB,
+            reserved / _GIB,
+            active / _GIB,
+            inactive_split / _GIB,
+        )
+
+    def _end_current_segment(self, *, label: str) -> None:
         # Auto-join any side streams forked during this segment but not joined.
         main_stream = get_current_stream()
         forked = _forked_streams_var.get()
@@ -396,6 +448,7 @@ class BreakableCUDAGraphCapture:
         assert graph is not None
         graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
+        self._debug_log_memory("segment_end", label)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
 

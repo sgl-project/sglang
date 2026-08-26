@@ -1934,6 +1934,7 @@ class ServerArgs:
             ),
             type_parser=human_readable_int,
             nargs="+",
+            aliases=["--context-bucket"],
         ),
         NS("exec.graph"),
     ] = None
@@ -4829,16 +4830,21 @@ class ServerArgs:
             return
         if prefill_config.backend not in (Backend.BREAKABLE, Backend.FULL):
             raise ValueError(
-                "--context-bucket is only supported by the breakable/full "
+                "--cuda-graph-context-bucket-prefill is only supported by the "
+                "breakable/full "
                 "prefill CUDA graph backends"
             )
         if not isinstance(context_buckets, (list, tuple)) or not context_buckets:
-            raise ValueError("--context-bucket must contain at least one value")
+            raise ValueError(
+                "--cuda-graph-context-bucket-prefill must contain at least one value"
+            )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in context_buckets
         ):
-            raise ValueError("--context-bucket values must be positive integers")
+            raise ValueError(
+                "--cuda-graph-context-bucket-prefill values must be positive integers"
+            )
         prefill_config.context_buckets = sorted(set(context_buckets))
 
     def _handle_multi_item_scoring(self):
