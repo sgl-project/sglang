@@ -65,7 +65,7 @@ async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
-    dp_size = get_parallel().config.dp_size
+    dp_size = get_parallel().dp_size
     base_ids = [0, 1, 2, 3]
     sampling_params = {
         "temperature": 0.0,

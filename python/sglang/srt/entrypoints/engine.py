@@ -344,7 +344,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().config.dp_size
+            dp_size = get_parallel().dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -831,7 +831,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().config.dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -1841,11 +1841,7 @@ def _compute_parallelism_ranks(
     Called while the launcher is deciding what to spawn, so the sizes are the
     configured ones -- the groups this is laying out do not exist yet.
     """
-    attn_dp_size = (
-        get_parallel().config.dp_size
-        if get_parallel().config.enable_dp_attention
-        else 1
-    )
+    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
     tp_size = server_args.tp_size
     attn_cp_size = get_parallel().config.attn_cp_size
     moe_dp_size = get_parallel().config.moe_dp_size
@@ -1859,6 +1855,6 @@ def _compute_parallelism_ranks(
     moe_ep_rank = (
         tp_rank
         % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().config.ep_size)
+        // (tp_size // moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank

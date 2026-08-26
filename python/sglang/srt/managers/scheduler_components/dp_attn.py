@@ -409,7 +409,7 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
@@ -418,7 +418,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
-            dwdp=get_parallel().config.dwdp_size > 1,
+            dwdp=get_parallel().dwdp_size > 1,
         )
 
     def maybe_prepare_mlp_sync_batch(

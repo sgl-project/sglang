@@ -238,7 +238,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().config.enable_dp_attention or self.require_gathered_buffer
+            get_parallel().enable_dp_attention or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
