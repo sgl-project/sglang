@@ -505,8 +505,19 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
 
-        varlen = q_len_uniform > 1 and bs % q_len_uniform == 0 and bs > 0
+        varlen = q_len_uniform > 1
         if varlen:
+            # Uniformity is guaranteed by construction, not assumed: both
+            # verify and draft-extend v2 metadata builders (graph replay AND
+            # eager, see init_forward_metadata_draft_extend call sites) use a
+            # fixed num_tokens_per_req == speculative_num_draft_tokens via
+            # expand_extend_with_same_length, so ragged rows cannot reach
+            # this call. Assert rather than silently falling back to the
+            # one-row-per-request mode.
+            assert bs > 0 and bs % q_len_uniform == 0, (
+                f"non-uniform multi-token batch reached the trtllm decode "
+                f"path: {bs=} {q_len_uniform=}"
+            )
             n_req = bs // q_len_uniform
             # Per-request KV totals = the causal length of each request's
             # LAST token; per-token causality is derived in-kernel from the
