@@ -123,7 +123,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_context,
     get_device,
     get_disagg,
@@ -409,7 +409,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
-        ensure_published(server_args, role="tokenizer")
+        assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().config.dp_size
         self.elastic_pending_ep_size = None
@@ -2040,7 +2040,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return self.resolved_config_dict(dataclasses.asdict(self.server_args))
+            return self.resolved_config_dict(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None

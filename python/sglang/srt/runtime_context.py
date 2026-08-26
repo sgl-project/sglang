@@ -969,11 +969,12 @@ class RuntimeContext:
         in a readback: HiCache attach/detach, the generated forward-pass-metrics
         endpoint, tunables set via ``/set_internal_state``.
 
-        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
-        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first. Override leaves are flat
-        ``ServerArgs`` field names, so overlaying them onto the top level of
-        either base is exact.
+        ``base`` defaults to ``server_args.resolved_dict()`` -- the record's
+        fields as resolution decided them, nested dataclasses expanded. (It used
+        to be ``dict(vars(server_args))``, which carried the private resolution
+        bookkeeping and the ``model_config`` memo into the readback.) Override
+        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
+        top level of the base is exact.
 
         The log is per process: it carries what *this* process overrode. A
         weight reload records ``model_path`` and ``load_format`` from the
@@ -984,7 +985,7 @@ class RuntimeContext:
         The top-level ``/server_info`` fields are the startup record, not this
         dump.
         """
-        d = dict(vars(self.server_args)) if base is None else dict(base)
+        d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
         return d
@@ -1374,29 +1375,38 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     return _CONTEXT
 
 
-def ensure_published(server_args, *, role: str) -> RuntimeContext:
-    """Publish unless this exact record is already published under this role.
+def assert_published(server_args, *, role: str) -> RuntimeContext:
+    """This record, under this role, is already published -- or fail loud.
 
-    Three constructors publish defensively, because each can be built with
-    nothing published before it -- `ModelRunner` (a benchmark harness, the
-    manual runner tests), `TokenizerManager`, and `MMEncoder` (spawned encoder
-    workers). Inside a process that already published the same record,
-    publishing again re-projects the bags: every `override()` taken between the
-    two calls is discarded, and the provenance log with it.
+    Publishing is the process entry's job: `run_scheduler_process`,
+    `init_multi_tokenizer`, a spawned encoder worker, the benchmark work
+    functions. A constructor arriving here unpublished means one of those
+    entries is missing.
 
-    No override sits in one of those windows today, so this removes a hazard
-    rather than a live bug. It is worth removing anyway: the drop is silent, it
-    depends on where a constructor happens to sit relative to the overrides
-    around it, and `publish` now says what a re-projection discarded so the
-    next one is loud.
-
-    So these callers ask for the end state -- this record, this role, published
-    -- and get a no-op when that already holds. An engine rebuild still calls
-    `publish` directly, because there the reset is the point.
+    A `publish` at this point re-projects the bags over a live process,
+    discarding every `override()` taken since and the provenance log with it,
+    so this raises.
     """
     if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
         return _CONTEXT
-    return publish(server_args, role=role)
+    if _CONTEXT._server_args is None:
+        detail = "nothing is published in this process"
+    elif _CONTEXT._server_args is not server_args:
+        detail = (
+            "a different record is published "
+            f"(role={_CONTEXT._publish_role!r}); this constructor was handed "
+            "one the process never published"
+        )
+    else:
+        detail = (
+            f"this record is published under role "
+            f"{_CONTEXT._publish_role!r}, not {role!r}"
+        )
+    raise RuntimeError(
+        f"config not published for role {role!r}: {detail}. The process entry "
+        "publishes -- add publish(server_args, role=...) there rather than "
+        "publishing from a constructor."
+    )
 
 
 def publish_role() -> str | None:

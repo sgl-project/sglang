@@ -232,6 +232,8 @@ async def init_multi_tokenizer() -> ServerArgs:
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
+    publish(server_args, role="tokenizer")
+
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -488,6 +490,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_serving,
+    publish,
 )
 
 elastic_ep_router.route_class = ORJSONRoute
@@ -811,10 +814,9 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **server_args.resolved_dict(),
             **_global_state.scheduler_info,
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,

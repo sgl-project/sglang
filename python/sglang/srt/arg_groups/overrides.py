@@ -29,6 +29,7 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import inspect
 import json
@@ -378,6 +379,41 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     if raw is not None and field in raw:
         return raw[field]
     return getattr(server_args, field, default)
+
+
+def resolution_projection(server_args: Any) -> Dict[str, Any]:
+    """Every field's resolved value, nested dataclasses expanded.
+
+    The whole-object shape of ``resolution_result``, for the exits that hand out
+    the entire configuration (``/server_info``, the gRPC and engine readbacks).
+    They used ``dataclasses.asdict``, which reads the fields -- correct only for
+    as long as declarations materialize onto the record, and the point of
+    declaring is that they will not. Field values only: the private resolution
+    bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
+    the readback are not configuration.
+    """
+    return {
+        field.name: _plain(resolution_result(server_args, field.name))
+        for field in dataclasses.fields(server_args)
+    }
+
+
+def _plain(value: Any) -> Any:
+    """``dataclasses.asdict``'s conversion, applied to one value: dataclasses
+    become dicts, containers recurse, everything else is deep-copied (a caller
+    mutating the dump must not reach the live configuration)."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
 
 
 def resolved_view(server_args: Any) -> ResolvedView:

@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
-    ensure_published,
+    assert_published,
     get_context,
     get_exec,
     get_flags,
@@ -255,35 +255,30 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             get_server_args()
 
 
-class TestEnsurePublished(_IsolatedServerArgs):
-    """A defensive publish must not re-project over a live process.
+class TestAssertPublished(_IsolatedServerArgs):
+    """Publishing is the process entry's job; the constructors only check.
 
-    Three constructors publish because each can be built with nothing published
-    first: `ModelRunner`, `TokenizerManager`, `MMEncoder`. Inside a process that
-    already published the same record, publishing again re-projects the bags --
-    discarding every `override()` taken since, and the provenance log with it.
-
-    No current override sits in one of those windows, so what these assertions
-    protect is the mechanism, not a reproduction: the drop is silent and depends
-    on where a constructor happens to sit relative to the overrides around it.
+    `ModelRunner`, `TokenizerManager` and `MMEncoder` assert. A publish inside
+    a process that has already published re-projects the bags, discarding every
+    `override()` taken since and the provenance log with it, so a constructor
+    that finds nothing published fails loud.
     """
 
     def _record(self, **fields):
         return ServerArgs(model_path="dummy", **fields)
 
-    def test_a_second_publish_of_the_same_record_keeps_the_overrides(self):
+    def test_the_check_leaves_a_live_process_alone(self):
         record = self._record(grammar_backend="xgrammar")
         publish(record, role="scheduler")
         get_context().override("grammar.import_fallback", grammar_backend="none")
 
-        ensure_published(record, role="scheduler")
+        assert_published(record, role="scheduler")
 
         self.assertEqual(
             get_exec().kernel.grammar_backend,
             "none",
-            "the constructor's publish re-projected the bags, so the import "
-            "fallback was discarded and the process reports a backend it is "
-            "not using",
+            "the check re-projected the bags, so the import fallback was "
+            "discarded and the process reports a backend it is not using",
         )
         self.assertEqual(
             len(get_context().overrides_log()),
@@ -291,45 +286,49 @@ class TestEnsurePublished(_IsolatedServerArgs):
             "the provenance of the override went with it",
         )
 
-    def test_a_different_record_is_published(self):
+    def test_a_different_record_fails(self):
         first = self._record(grammar_backend="xgrammar")
         publish(first, role="scheduler")
         second = self._record(grammar_backend="llguidance")
 
-        ensure_published(second, role="scheduler")
+        with self.assertRaisesRegex(RuntimeError, "a different record is published"):
+            assert_published(second, role="scheduler")
 
-        self.assertIs(get_server_args(), second)
-        self.assertEqual(get_exec().kernel.grammar_backend, "llguidance")
+        self.assertIs(
+            get_server_args(),
+            first,
+            "the failing check published anyway",
+        )
 
-    def test_an_empty_slot_is_published(self):
-        """The standalone case the defensive publish exists for."""
+    def test_an_empty_slot_fails(self):
+        """An empty slot fails."""
         reset_context()
         record = self._record(grammar_backend="xgrammar")
 
-        ensure_published(record, role="scheduler")
+        with self.assertRaisesRegex(
+            RuntimeError, "nothing is published in this process"
+        ):
+            assert_published(record, role="scheduler")
 
-        self.assertIs(get_server_args(), record)
-        self.assertEqual(publish_role(), "scheduler")
-
-    def test_the_same_record_under_a_different_role_is_republished(self):
+    def test_the_same_record_under_a_different_role_fails(self):
         """The role decides which namespaces this process may read."""
         record = self._record()
         publish(record, role="tokenizer")
 
-        ensure_published(record, role="scheduler")
+        with self.assertRaisesRegex(RuntimeError, "published under role 'tokenizer'"):
+            assert_published(record, role="scheduler")
 
-        self.assertEqual(publish_role(), "scheduler")
+        self.assertEqual(publish_role(), "tokenizer")
 
-    def test_every_constructor_that_publishes_is_classified(self):
-        """A new constructor publish has to say which of the two it is.
+    def test_no_constructor_publishes_outside_the_two_entries(self):
+        """Publishing from an `__init__` is an entry's job or a bug.
 
-        Publishing in a constructor is right when the constructor *is* the
-        entry -- a spawned worker, the Ray actor that stands in for
-        `run_scheduler_process`, an `Engine` being (re)built, where resetting
-        the bags is the point -- and wrong when the process is already live
-        with the same record, where it silently drops overrides. The
-        difference is not visible in the syntax, so the census is pinned:
-        adding one fails here until it is classified.
+        It is right when the constructor *is* the entry -- an `Engine` being
+        (re)built, the Ray actor that stands in for `run_scheduler_process`,
+        where resetting the bags is the point. It is wrong anywhere else,
+        because the process is already live with a record and re-projecting
+        drops its overrides. The census is pinned, so a new constructor publish
+        fails here until it is one of the two.
 
         Both the publisher set and "which `__init__` reaches one" come from
         `sglang.test.config_publishers`, which derives them from the code --
@@ -347,24 +346,11 @@ class TestEnsurePublished(_IsolatedServerArgs):
         self.assertEqual(
             constructor_publishers(srt),
             {
-                # Entries: nothing published yet, or a rebuild that must not
-                # inherit the previous engine's runtime overrides.
                 ("entrypoints/engine.py", "Engine", "publish"),
                 ("ray/scheduler_actor.py", "SchedulerActor", "publish"),
-                # Defensive: the process is usually already live with this
-                # record, and `launch_server` publishes before building the
-                # in-process encoder.
-                ("disaggregation/encoder/server.py", "MMEncoder", "ensure_published"),
-                (
-                    "managers/tokenizer_manager.py",
-                    "TokenizerManager",
-                    "ensure_published",
-                ),
-                ("model_executor/model_runner.py", "ModelRunner", "ensure_published"),
             },
-            "a constructor publishes and this census does not know which kind "
-            "it is; an entry uses publish(), one that may run inside a live "
-            "process with the same record uses ensure_published()",
+            "a constructor publishes and it is not one of the two entries; "
+            "publish at the process entry and let the constructor assert",
         )
 
 

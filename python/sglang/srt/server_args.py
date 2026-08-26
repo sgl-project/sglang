@@ -3729,6 +3729,21 @@ class ServerArgs:
         # handlers ran, not how far they got.
         self._declarations_materialized = True
 
+    def resolved_dict(self) -> Dict[str, Any]:
+        """This configuration as a plain dict of resolved field values.
+
+        What the whole-object readbacks report (`/server_info` and its gRPC and
+        in-process twins). `dataclasses.asdict(self)` reads the fields, which
+        carry resolution's result only while declarations materialize onto the
+        record; this reads the declarations, so it keeps answering with what
+        resolution decided once they stop. Nested dataclass fields are expanded
+        the way `asdict` expands them; the private resolution bookkeeping and the
+        `model_config` memo are not fields and do not appear.
+        """
+        from sglang.srt.arg_groups.overrides import resolution_projection
+
+        return resolution_projection(self)
+
     def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
         """A copy of this record that stays resolved, and says what it changed.
 
