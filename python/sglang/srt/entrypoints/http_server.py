@@ -228,12 +228,12 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
+    publish(server_args, role="tokenizer")
+
     # API key authentication is not supported in multi-tokenizer mode
     assert (
-        server_args.api_key is None
+        get_serving().api_key is None
     ), "API key is not supported in multi-tokenizer mode"
-
-    publish(server_args, role="tokenizer")
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -2754,7 +2754,7 @@ def _start_native_grpc_server_for_runtime(
         host=get_serving().host,
         port=grpc_port,
         runtime_handle=runtime_handle,
-        worker_threads=server_args.grpc_worker_threads,
+        worker_threads=get_serving().grpc_worker_threads,
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
