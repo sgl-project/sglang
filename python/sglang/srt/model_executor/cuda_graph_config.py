@@ -70,7 +70,8 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # For prefill, bs carries aggregate-token capture buckets for every backend;
 # full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
-# only meaningful when backend == full.
+# only meaningful when backend == full. context_buckets is shared by the
+# breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
     Phase.PREFILL: (
@@ -78,6 +79,7 @@ ALLOWED_KEYS_PER_PHASE = {
         "max_bs",
         "bs",
         "tc_compiler",
+        "context_buckets",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
     ),
@@ -93,6 +95,12 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Only meaningful for prefill body-capture backends (breakable/full):
+    # captured maximum final-context lengths. Replay rounds the largest
+    # seq_len in the batch up to one of these buckets, making context-shaped
+    # metadata and intermediates part of the graph shape rather than padding
+    # every graph to the model's maximum context.
+    context_buckets: Optional[List[int]] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger

@@ -1919,6 +1919,24 @@ class ServerArgs:
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
         NS("exec.graph"),
     ] = None
+    cuda_graph_context_bucket_prefill: A[
+        Optional[List[int]],
+        Arg(
+            help=(
+                "Maximum final-context lengths captured by the breakable/full "
+                "prefill CUDA graph. The largest seq_len in a replay batch is "
+                "rounded up to the nearest bucket; context-shaped attention "
+                "metadata and C4 indexer logits use that bucket instead of the "
+                "model maximum. Values are page-aligned by the runner; replay "
+                "falls back to eager when no bucket fits or padding would "
+                "exceed 2x the live maximum context. "
+                f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+            nargs="+",
+        ),
+        NS("exec.graph"),
+    ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
@@ -4562,6 +4580,10 @@ class ServerArgs:
             _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
         if self.cuda_graph_bs_prefill is not None:
             _set(Phase.PREFILL, "bs", self.cuda_graph_bs_prefill)
+        if self.cuda_graph_context_bucket_prefill is not None:
+            _set(
+                Phase.PREFILL, "context_buckets", self.cuda_graph_context_bucket_prefill
+            )
         if self.cuda_graph_tc_compiler is not None:
             # Written to both phases so the value is in place when TC_PIECEWISE
             # decode is implemented; today decode ignores it.
@@ -4800,6 +4822,24 @@ class ServerArgs:
                     f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                     f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
                 )
+
+        prefill_config = self.cuda_graph_config.prefill
+        context_buckets = prefill_config.context_buckets
+        if context_buckets is None:
+            return
+        if prefill_config.backend not in (Backend.BREAKABLE, Backend.FULL):
+            raise ValueError(
+                "--context-bucket is only supported by the breakable/full "
+                "prefill CUDA graph backends"
+            )
+        if not isinstance(context_buckets, (list, tuple)) or not context_buckets:
+            raise ValueError("--context-bucket must contain at least one value")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in context_buckets
+        ):
+            raise ValueError("--context-bucket values must be positive integers")
+        prefill_config.context_buckets = sorted(set(context_buckets))
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.

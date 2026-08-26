@@ -1708,6 +1708,36 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
+class TestPrefillCudaGraphContextBuckets(CustomTestCase):
+    def test_convenience_flag_folds_and_normalizes(self):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_backend_prefill=Backend.BREAKABLE,
+            cuda_graph_context_bucket_prefill=[200_000, 60_000, 60_000],
+        )
+
+        args._parse_cuda_graph_config()
+        args._validate_cuda_graph_config()
+
+        self.assertEqual(
+            args.cuda_graph_config.prefill.context_buckets, [60_000, 200_000]
+        )
+        self.assertIn(
+            (Phase.PREFILL, "context_buckets"), args._cuda_graph_config_locked
+        )
+
+    def test_context_bucket_rejects_non_body_capture_backend(self):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_backend_prefill=Backend.TC_PIECEWISE,
+            context_bucket=[60_000],
+        )
+        args._parse_cuda_graph_config()
+
+        with self.assertRaisesRegex(ValueError, "breakable/full"):
+            args._validate_cuda_graph_config()
+
+
 class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
     """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
     test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
