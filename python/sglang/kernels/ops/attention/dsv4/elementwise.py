@@ -36,9 +36,11 @@ def _jit_main_q_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
+    fp8_out: bool = False,
 ):
-    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head).
+    fp8_out stores plain e4m3 (uniform-FP8 trtllm backend) instead of dtype."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl(), fp8_out)
     return load_jit(
         make_name("main_q_norm_rope"),
         *args,
@@ -155,11 +157,24 @@ def fused_q_norm_rope(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
+    # An e4m3 q_output selects the fp8-store kernel variant (the trtllm-gen
+    # backend consumes q as fp8; storing it directly removes the separate
+    # per-layer cast pass). Bits match dtype-store -> .to(float8_e4m3fn).
+    fp8_out = q_output.dtype == torch.float8_e4m3fn
     if _is_xpu:
+        assert not fp8_out
         fused_q_norm_rope_xpu(q_input, q_output, freqs_real, positions, eps)
     else:
-        module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
-        module.forward(q_input, q_output, freqs_real, positions, eps)
+        module = _jit_main_q_norm_rope_module(
+            q_input.dtype, head_dim, rope_dim, fp8_out
+        )
+        module.forward(
+            q_input,
+            q_output.view(torch.uint8) if fp8_out else q_output,
+            freqs_real,
+            positions,
+            eps,
+        )
 
 
 def fused_q_indexer_rope_hadamard_quant(

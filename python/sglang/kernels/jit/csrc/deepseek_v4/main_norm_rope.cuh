@@ -78,7 +78,12 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+// kFp8Out: store the normed+roped output as plain e4m3 (per-tensor scale
+// 1.0) instead of DType, bit-identical to a DType store followed by
+// `.to(float8_e4m3fn)` -- the trtllm-gen backend consumes q as fp8, so
+// this removes its separate per-layer cast pass. The caller passes
+// q_output as a uint8 view of the e4m3 tensor.
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kFp8Out = false>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -103,10 +108,11 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   const uint32_t batch_id = work_id / params.num_q_heads;
   const uint32_t head_id = work_id % params.num_q_heads;
+  using OutT = std::conditional_t<kFp8Out, uint8_t, DType>;
   const auto input_ptr =
       static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
   const auto output_ptr =
-      static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
+      static_cast<OutT*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
 
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
@@ -150,12 +156,22 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   // Stash the rope tail (last kRopeSize lanes' last tile) into shared memory;
   // write nope tiles to gmem directly.
+  using OutStorage = AlignedVector<OutT, kVecSize>;
+  const auto gmem_out = tile::Memory<OutStorage>{lane_id, kWarpThreads};
   const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
 #pragma unroll
   for (int i = 0; i < kLocalSize; ++i) {
     if (i == kLocalSize - 1 && is_rope_lane) {
       const auto rope_id = lane_id - (kWarpThreads - kRopeSize);
       s_rope[warp_id][rope_id] = input_vec[i];
+    } else if constexpr (kFp8Out) {
+      OutStorage out_vec;
+#pragma unroll
+      for (int j = 0; j < kVecSize; j += 2) {
+        const auto p = pack_fp8(cast<float>(input_vec[i][j]), cast<float>(input_vec[i][j + 1]));
+        *reinterpret_cast<fp8x2_e4m3_t*>(&out_vec[j]) = p;
+      }
+      gmem_out.store(output_ptr, out_vec, i);
     } else {
       gmem.store(output_ptr, input_vec[i], i);
     }
@@ -174,13 +190,22 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
       x_real * freq_real - x_imag * freq_imag,
       x_real * freq_imag + x_imag * freq_real,
   };
-  mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+  if constexpr (kFp8Out) {
+    // DType round-trip first so the stored bits match the unfused
+    // DType-store -> .to(e4m3) sequence exactly.
+    const auto [bx, by] = cast<fp32x2_t>(cast<DType2>(rotated));
+    tile::Memory<fp8x2_e4m3_t>{lane_id, kWarpThreads}.store(output_ptr + (kHeadDim - kRopeDim), pack_fp8(bx, by));
+  } else {
+    mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+  }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL, bool kFp8Out = false>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kFp8Out>;
+  // e4m3 output is passed as a uint8 view (index_put/FFI have no fp8 dtype).
+  using OutT = std::conditional_t<kFp8Out, uint8_t, DType>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -202,7 +227,7 @@ struct FusedQNormRopeKernel {
         .verify(q_input);
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
-        .with_dtype<DType>()
+        .with_dtype<OutT>()
         .with_device(device_)
         .verify(q_output);
     TensorMatcher({-1, kRopeDim})  //
