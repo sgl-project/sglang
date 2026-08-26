@@ -4,6 +4,7 @@ export const LTXDeployment = () => {
       name: 'hardware',
       title: 'Deployment Target',
       items: [
+        { id: 'xeon', label: 'XEON', subtitle: 'CPU mode', default: false },
         { id: 'h200', label: '1x H200', subtitle: 'resident', default: true },
         { id: 'h200-2gpu', label: '2 GPUs', subtitle: 'CFG parallel', default: false },
         { id: 'h200-4gpu', label: '4 GPUs', subtitle: 'TP2 + CFG', default: false },
@@ -140,6 +141,9 @@ export const LTXDeployment = () => {
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --pipeline-class-name ${pipelineClass}`;
+    if (values.hardware === 'xeon') {
+      command += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
     command += getParallelFlags();
     if (values.model === 'ltx23' && values.pipeline !== 'one-stage') {
       command += ` \\\n  --ltx2-two-stage-device-mode ${getDeviceMode()}`;
