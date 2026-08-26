@@ -477,7 +477,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     cp = max(get_cp_padding_align_size(), 1)
 
     attn_tp_size = get_parallel().attn_tp_size
-    mlp_sync = require_mlp_sync(model_runner.server_args)
+    mlp_sync = require_mlp_sync()
 
     def _align(bs: int) -> int:
         # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
