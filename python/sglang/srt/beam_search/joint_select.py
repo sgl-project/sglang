@@ -5,8 +5,7 @@ shapes for a given (num_rows, num_candidates, beam_width) signature, no D2H
 sync, no data-dependent host branches (the only python branch keys on a
 static tensor shape). The caller owns the single sync point per step.
 
-Selection semantics (ported from the original expansion loop): walk the top
-num_candidates extensions in descending cumulative-logprob order; stop-token
+Selection semantics: walk the top num_candidates extensions in descending cumulative-logprob order; stop-token
 candidates finish, non-stop candidates survive; a candidate is examined only
 while fewer than beam_width survivors precede it in score order.
 """

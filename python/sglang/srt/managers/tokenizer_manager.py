@@ -1746,8 +1746,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 out["text"] = state.get_text()
 
-            # If this is a beam search result, convert it to a regular out dict so
-            # all subsequent finished/logging/metrics logic is shared automatically.
+            # Flattened so the downstream finished/logging/metrics logic is shared.
             if out.get("beam_results"):
                 if not finished:
                     # Intermediate beam output; skip until finished.

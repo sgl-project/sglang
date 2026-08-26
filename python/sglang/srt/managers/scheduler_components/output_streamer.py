@@ -425,8 +425,6 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            # Beam rows never reach here; the gate above admits only finished
-            # leaders.
             if req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval

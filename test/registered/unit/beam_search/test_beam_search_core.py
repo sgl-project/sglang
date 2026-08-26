@@ -1,11 +1,8 @@
 """Golden and differential tests for the beam search core.
 
 Covers the pure selection functions (joint_select / select_final_topk), the
-backpointer history DAG, and the BeamGroup lifecycle. The selection semantics
-are pinned two ways:
-- golden cases with hand-computed candidate walks
-- randomized differential testing against a naive reference implementation of
-  the walk-in-order loop
+backpointer history DAG, and the BeamGroup lifecycle. The differential oracle is
+a naive walk-in-order loop written here, not the implementation under test.
 """
 
 import random
