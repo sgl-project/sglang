@@ -134,13 +134,12 @@ pipeline's registered module name:
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
-For example, pair a replacement text-encoder configuration with a separate
+For example, pair any replacement text-encoder configuration with a separate
 single-file checkpoint as follows:
 
 ```bash
---component-paths.text_encoder Qwen/Qwen3-VL-4B-Instruct \
---component-weights-paths.text_encoder \
-  Comfy-Org/Krea-2/text_encoders/qwen3vl_4b_fp8_scaled.safetensors
+--component-paths.text_encoder COMPONENT_REPO_OR_DIRECTORY \
+--component-weights-paths.text_encoder WEIGHTS_FILE_OR_REPO_FILE
 ```
 
 The transformer-specific `--transformer-weights-path` spelling remains
@@ -162,7 +161,10 @@ while quantized materialization is capability-based. Native auxiliary loaders
 whose current materializer expects plain state dicts reject unsupported
 quantization metadata before model construction. See
 [Quantized Component Repositories](../quantization#quantized-component-repositories)
-for the current component matrix.
+for the current component matrix. A model cookbook is the source of truth for
+published, model-specific checkpoint examples; for example, all H3 sources and
+their exact overlays are kept in one
+[MiniMax-H3 compatibility table](/cookbook/diffusion/MiniMax/MiniMax-H3#checkpoint-and-adapter-formats).
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.
