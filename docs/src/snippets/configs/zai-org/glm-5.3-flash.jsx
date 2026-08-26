@@ -239,7 +239,11 @@ sgl-eval run gsm8k \\
       match: { hw: "gb300", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => config.isRecommendedSelection(s) ? "verified" : "unverified",
+      verificationStatus: (s) =>
+        config.isRecommendedSelection(s) ||
+        (s.kvDsaPair === "fp8-trtllm" && s.mmTransport === "auto" && s.hicache === "off")
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -264,7 +268,11 @@ sgl-eval run gsm8k \\
       match: { hw: "gb300", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
-      verificationStatus: (s) => config.isRecommendedSelection(s) ? "verified" : "unverified",
+      verificationStatus: (s) =>
+        config.isRecommendedSelection(s) ||
+        (s.kvDsaPair === "fp8-trtllm" && s.mmTransport === "auto" && s.hicache === "off")
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
