@@ -899,6 +899,14 @@ def get_perf_baseline_path(platform: str | None = None) -> Path:
     return PERF_BASELINE_DIR / PERF_BASELINE_FILE_BY_PLATFORM[baseline_platform]
 
 
+def get_perf_baseline_update_path() -> Path:
+    if current_platform.is_npu():
+        return Path(__file__).parent / "ascend" / "perf_baselines_npu.json"
+    if current_platform.is_musa():
+        return Path(__file__).parent / "musa" / "perf_baselines_musa.json"
+    return get_perf_baseline_path()
+
+
 def _make_modelopt_ci_case(
     case_id: str,
     *,

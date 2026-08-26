@@ -47,6 +47,7 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+_REFINED_PROMPT_EMBEDS_KEY = "_minimax_h3_refined_prompt_embeds"
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -339,25 +340,28 @@ def _precompute_refined_prompt_embeds(
     positive: Any,
     *,
     device: torch.device,
+    shared_conditioning: dict[str, Any] | None = None,
 ) -> bool:
-    """Move request-static text refinement out of the denoise hot loop."""
+    """Refine text once for outputs that share the encoded presentation."""
     refine = getattr(model, "refine_prompt_embeds", None)
     if not callable(refine):
         return False
 
     static_kwargs = positive.static_kwargs
     prompt_embeds = static_kwargs["prompt_embeds"]
-    refiner_params = static_kwargs["refiner_packed_seq_params"]
-    if isinstance(refiner_params, dict):
-        refiner_cu = refiner_params["cu_seqlens_q"]
-    else:
-        refiner_cu = refiner_params.cu_seqlens_q
-    with torch.inference_mode():
-        refined = refine(
-            prompt_embeds,
-            refiner_cu,
-            device=device,
-        )
+    refined = (
+        shared_conditioning.get(_REFINED_PROMPT_EMBEDS_KEY)
+        if shared_conditioning is not None
+        else None
+    )
+    if refined is None:
+        refiner_params = static_kwargs["refiner_packed_seq_params"]
+        if isinstance(refiner_params, dict):
+            refiner_cu = refiner_params["cu_seqlens_q"]
+        else:
+            refiner_cu = refiner_params.cu_seqlens_q
+        with torch.inference_mode():
+            refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -365,6 +369,8 @@ def _precompute_refined_prompt_embeds(
             "MiniMax H3 refined prompt row count changed: "
             f"{int(prompt_embeds.shape[0])} -> {int(refined.shape[0])}"
         )
+    if shared_conditioning is not None:
+        shared_conditioning.setdefault(_REFINED_PROMPT_EMBEDS_KEY, refined)
     static_kwargs["prompt_embeds"] = refined
     static_kwargs["refined_prompt_embeds_length"] = int(refined.shape[0])
     return True
@@ -609,13 +615,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             MiniMaxH3DenoiseBranch,
+            _minimax_h3_subblock_video_query_indices,
             minimax_h3_denoise_loop,
         )
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not (current_platform.is_cuda() or current_platform.is_mps()):
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_mps()
+            or current_platform.is_npu()
+        ):
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+            )
+
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
@@ -626,11 +640,28 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        packed = _build_packed_layout(ctx, emb)
+        subblock_enabled = server_args.pipeline_config.uses_subblock_attention(
+            server_args
+        )
+        packed = _build_packed_layout(
+            ctx,
+            emb,
+            include_video_pos=subblock_enabled,
+        )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
         )
+        video_query_indices = None
+        if subblock_enabled:
+            text_video_token_mask = emb.get("text_video_token_mask")
+            # Legacy/precomputed presentations may lack this optional
+            # provenance. The helper then keeps their Qwen rows dense while
+            # retaining packed reference/target video rows as sparse.
+            video_query_indices = _minimax_h3_subblock_video_query_indices(
+                packed,
+                text_video_token_mask,
+            )
 
         sampling = batch.sampling_params
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
@@ -654,12 +685,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
+                video_query_indices=video_query_indices,
                 device=device,
             )
             _precompute_refined_prompt_embeds(
                 model,
                 positive,
                 device=device,
+                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,
@@ -878,6 +911,8 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
 def _build_packed_layout(
     ctx: _FullLoopContext,
     emb: Mapping[str, Any],
+    *,
+    include_video_pos: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build the per-task packed layout for the positive branch."""
 
@@ -898,6 +933,7 @@ def _build_packed_layout(
             ref_blocks=ctx.ref2va_positive_blocks,
             keyframe_frame_indices=ctx.keyframe_frame_indices,
             frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     else:
         packed = minimax_h3_packed_sequence(
@@ -911,6 +947,7 @@ def _build_packed_layout(
                 ctx.keyframe_frame_indices if ctx.include_cond else None
             ),
             frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     return packed
 

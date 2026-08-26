@@ -4,12 +4,14 @@ import math
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     get_peft_lora_alpha,
+    load_peft_config,
 )
 
 
@@ -53,3 +55,28 @@ def test_unsupported_peft_runtime_semantics_fail_closed(state_dict, adapter_conf
 def test_invalid_peft_lora_alpha_fails_closed():
     with pytest.raises(ValueError, match="positive integer"):
         get_peft_lora_alpha({"lora_alpha": 8.5})
+
+
+def test_safetensors_alpha_metadata_supplies_peft_config(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {"proj.lora_A.default.weight": torch.ones(4, 8)},
+        weight_path,
+        metadata={"alpha": "128"},
+    )
+
+    assert load_peft_config(str(weight_path))["lora_alpha"] == 128
+
+
+def test_mixed_rank_native_safetensors_does_not_apply_global_alpha(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "gate.lora_A.weight": torch.ones(4, 8),
+            "proj.lora_A.weight": torch.ones(8, 8),
+        },
+        weight_path,
+        metadata={"lora_alpha": "8"},
+    )
+
+    assert "lora_alpha" not in load_peft_config(str(weight_path))
