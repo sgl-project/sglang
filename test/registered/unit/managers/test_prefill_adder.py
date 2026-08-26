@@ -327,6 +327,9 @@ class TestPrefillAdder(CustomTestCase):
             _create_dllm_prefill_adder=MagicMock(),
             _process_dllm_batches=MagicMock(return_value=ForwardMode.DLLM_EXTEND),
         )
+        scheduler._dllm_phase_order = lambda: SchedulerDllmMixin._dllm_phase_order(
+            scheduler
+        )
         adder = SimpleNamespace(can_run_list=[req])
         scheduler._create_dllm_prefill_adder.return_value = adder
         scheduler._update_state_for_batch = MagicMock()
@@ -409,7 +412,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_range, Range(0, 32))
         scheduler._abort_dllm_req_exact.assert_not_called()
 
-    def test_dllm_staging_scans_both_request_orders_before_aborting(self):
+    def test_dllm_staging_admits_retained_in_both_request_orders(self):
         for fresh_first in (True, False):
             with self.subTest(fresh_first=fresh_first):
                 adder = self.create_dllm_adder(is_prefill=False, available_size=0)
@@ -438,15 +441,268 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(retained.extend_range, Range(0, 32))
                 scheduler._abort_dllm_req_exact.assert_not_called()
 
-    def test_dllm_staging_aborts_when_no_batch_can_make_progress(self):
+    def test_dllm_staging_scan_reports_no_token_without_terminal_action(self):
+        # The staging helper only sees one phase, so it must never abort or
+        # retract on its own; get_new_batch_dllm owns that decision.
         adder = self.create_dllm_adder(is_prefill=False, available_size=0)
         req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
-        scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
+        scheduler = SimpleNamespace(
+            _abort_dllm_req_exact=MagicMock(), _retract_dllm_req=MagicMock()
+        )
 
         result = SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, [req])
 
         self.assertEqual(result, AddReqResult.NO_TOKEN)
-        scheduler._abort_dllm_req_exact.assert_called_once_with(req)
+        self.assertEqual(adder.can_run_list, [])
+        scheduler._abort_dllm_req_exact.assert_not_called()
+        scheduler._retract_dllm_req.assert_not_called()
+
+    def test_dllm_phase_continues_to_incoming_while_budget_remains(self):
+        # A staging scan that still returns CONTINUE has budget left, so the
+        # same phase must go on to admit incoming requests. Short-circuiting on
+        # "staging admitted something" would starve every new request for as
+        # long as one FDFO decode stays in flight.
+        staging = SimpleNamespace(rid="staging", dllm_phase=DllmReqPhase.STAGING_DECODE)
+        incoming = SimpleNamespace(
+            rid="incoming", dllm_phase=DllmReqPhase.INCOMING_DECODE
+        )
+        adder = SimpleNamespace(can_run_list=[])
+        adder.add_dllm_staging_req = lambda req: (
+            adder.can_run_list.append(req) or AddReqResult.CONTINUE
+        )
+        scheduler = SimpleNamespace(process_dllm_incoming_reqs=MagicMock())
+        scheduler.process_dllm_staging_reqs = (
+            lambda a, r: SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, a, r)
+        )
+        running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
+
+        SchedulerDllmMixin._process_batch_by_phase(
+            scheduler,
+            adder,
+            [staging, incoming],
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+            running_batch=running_batch,
+        )
+
+        scheduler.process_dllm_incoming_reqs.assert_called_once_with(
+            adder, [incoming], running_batch=running_batch
+        )
+
+    def _make_cross_phase_scheduler(self, manager, dllm_config, running_batch):
+        scheduler = SchedulerDllmMixin()
+        scheduler.enable_priority_preemption = False
+        scheduler.policy = MagicMock()
+        scheduler.waiting_queue = []
+        scheduler.dllm_manager = manager
+        scheduler.dllm_config = dllm_config
+        scheduler.tree_cache = self.mock_tree_cache
+        scheduler._should_skip_prefill = lambda *, running_batch: False
+        scheduler._fetch_waiting_reqs = lambda: None
+        scheduler._abort_dllm_req_exact = MagicMock()
+        scheduler._retract_dllm_req = MagicMock()
+        scheduler._create_dllm_prefill_adder = MagicMock(
+            side_effect=lambda running_bs, *, running_batch, is_prefill: (
+                self.create_adder(
+                    running_batch,
+                    page_size=32,
+                    rem_input_tokens=10000,
+                    dllm_config=dllm_config,
+                    dllm_is_prefill=is_prefill,
+                )
+            )
+        )
+        scheduler._create_dllm_batch = lambda reqs, mode, **kw: SimpleNamespace(
+            reqs=list(reqs),
+            forward_mode=mode,
+            is_dllm_prefill=mode == ForwardMode.EXTEND,
+        )
+        return scheduler
+
+    def _make_retained_decode_req(self, rid):
+        req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
+        req.rid = rid
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+        req.req_pool_idx = 1
+        req.dllm_incomplete_ids = array("q", range(32))
+        req.full_untruncated_fill_ids = list(req.dllm_incomplete_ids)
+        req.kv = SimpleNamespace(kv_allocated_len=32)
+        req.inflight_middle_chunks = 0
+        return req
+
+    def test_dllm_scheduler_runs_retained_decode_when_prefill_is_blocked(self):
+        # Zero fresh aligned KV: the staging prefill cannot extend, but the FDFO
+        # decode reuses its retained block. Selecting prefill by existence alone
+        # would stall the round and retract a request that never needed it.
+        dllm_config = SimpleNamespace(
+            block_size=32, prefill_block_size=128, max_running_requests=2
+        )
+        self.mock_token_allocator.available_size.return_value = 0
+        prefill = self.create_dllm_req(origin_len=256, prefix_len=0, is_prefill=True)
+        prefill.rid = "prefill"
+        prefill.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        prefill.inflight_middle_chunks = 0
+        retained = self._make_retained_decode_req("retained")
+
+        for insertion in ([prefill, retained], [retained, prefill]):
+            with self.subTest(order=[req.rid for req in insertion]):
+                manager = DllmManager(dllm_config)
+                manager.waiting_queue = list(insertion)
+                running_batch = self.create_running_batch()
+                running_batch.batch_is_full = False
+                running_batch.is_empty.return_value = True
+                scheduler = self._make_cross_phase_scheduler(
+                    manager, dllm_config, running_batch
+                )
+
+                with patch("sglang.srt.dllm.mixin.scheduler.set_time_batch"):
+                    batch = scheduler.get_new_batch_dllm(running_batch)
+
+                self.assertIsNotNone(batch)
+                self.assertEqual(batch.reqs, [retained])
+                self.assertEqual(batch.forward_mode, ForwardMode.DLLM_EXTEND)
+                self.assertFalse(batch.is_dllm_prefill)
+                scheduler._retract_dllm_req.assert_not_called()
+                scheduler._abort_dllm_req_exact.assert_not_called()
+                # The blocked prefill stays managed and unmodified.
+                self.assertIn(prefill, manager.waiting_queue)
+                self.assertEqual(prefill.dllm_phase, DllmReqPhase.STAGING_PREFILL)
+                self.assertEqual(manager.staging_queue, [retained])
+                # Each phase gets its own adder, and prefill is still tried first.
+                self.assertEqual(
+                    [
+                        call.kwargs["is_prefill"]
+                        for call in scheduler._create_dllm_prefill_adder.call_args_list
+                    ],
+                    [True, False],
+                )
+
+    def _make_no_progress_scheduler(self, waiting_queue, *, running_batch_empty=True):
+        manager = MagicMock()
+        manager.waiting_queue = waiting_queue
+        running_batch = SimpleNamespace(
+            batch_is_full=False, reqs=[], is_empty=lambda: running_batch_empty
+        )
+        scheduler = SimpleNamespace(
+            dllm_manager=manager,
+            _retract_dllm_req=MagicMock(),
+            _abort_dllm_req_exact=MagicMock(),
+        )
+        return scheduler, running_batch
+
+    def test_dllm_no_progress_retracts_first_staging_req_in_manager_order(self):
+        # The victim follows manager order, not phase priority, so a prefill-first
+        # round cannot turn into a prefill-first retraction policy.
+        decode = SimpleNamespace(
+            rid="decode", dllm_phase=DllmReqPhase.STAGING_DECODE, is_retracted=False
+        )
+        prefill = SimpleNamespace(
+            rid="prefill", dllm_phase=DllmReqPhase.STAGING_PREFILL, is_retracted=False
+        )
+        scheduler, running_batch = self._make_no_progress_scheduler([decode, prefill])
+
+        SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, running_batch)
+
+        scheduler._retract_dllm_req.assert_called_once_with(decode)
+        scheduler._abort_dllm_req_exact.assert_not_called()
+
+    def test_dllm_no_progress_defers_while_external_batch_runs(self):
+        staging = SimpleNamespace(
+            rid="staging", dllm_phase=DllmReqPhase.STAGING_DECODE, is_retracted=False
+        )
+        scheduler, running_batch = self._make_no_progress_scheduler(
+            [staging], running_batch_empty=False
+        )
+
+        SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, running_batch)
+
+        scheduler._retract_dllm_req.assert_not_called()
+        scheduler._abort_dllm_req_exact.assert_not_called()
+
+    def test_dllm_no_progress_keeps_unadmitted_incoming_reqs(self):
+        # Nothing holds reclaimable KV and the request was never retracted, so
+        # this may just be policy deferral. Neither action is justified.
+        incoming = SimpleNamespace(
+            rid="incoming", dllm_phase=DllmReqPhase.INCOMING_DECODE, is_retracted=False
+        )
+        scheduler, running_batch = self._make_no_progress_scheduler([incoming])
+
+        SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, running_batch)
+
+        scheduler._retract_dllm_req.assert_not_called()
+        scheduler._abort_dllm_req_exact.assert_not_called()
+
+    def test_dllm_aborts_lone_request_that_cannot_run_after_retraction(self):
+        # It already gave every byte back and still cannot be admitted with the
+        # pool to itself, so it can never run.
+        lone = SimpleNamespace(
+            rid="lone", dllm_phase=DllmReqPhase.INCOMING_DECODE, is_retracted=True
+        )
+        scheduler, running_batch = self._make_no_progress_scheduler([lone])
+
+        SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, running_batch)
+
+        scheduler._abort_dllm_req_exact.assert_called_once_with(lone)
+        scheduler._retract_dllm_req.assert_not_called()
+
+    def test_dllm_retract_releases_kv_before_resetting_request(self):
+        events = []
+        req = MagicMock(spec=Req)
+        req.rid = "victim"
+        req.reset_for_retract.side_effect = lambda: events.append("reset")
+        req.reset_dllm_for_retract.side_effect = lambda: events.append("reset_dllm")
+        req.time_stats = SimpleNamespace(
+            set_retract_time=lambda: events.append("retract_time")
+        )
+        scheduler = SimpleNamespace(
+            _cleanup_dllm_req=lambda r: events.append("cleanup"),
+            ipc_channels=MagicMock(),
+            dllm_manager=MagicMock(),
+        )
+
+        SchedulerDllmMixin._retract_dllm_req(scheduler, req)
+
+        # KV must be released before reset_for_retract(), which asserts req.kv is None.
+        self.assertEqual(events, ["cleanup", "reset", "reset_dllm", "retract_time"])
+        # Retraction is invisible to the client and keeps the request managed.
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.dllm_manager.pop_aborted_reqs.assert_not_called()
+
+    def test_reset_dllm_for_retract_drops_block_state_and_keeps_output(self):
+        req = SimpleNamespace(
+            origin_input_ids=[1] * 40,
+            output_ids=[2] * 8,
+            dllm_config=SimpleNamespace(block_size=32),
+            dllm_incomplete_ids=array("q", range(32)),
+            dllm_algo_state=object(),
+            dllm_block_offset=64,
+            dllm_phase=DllmReqPhase.STAGING_DECODE,
+        )
+
+        ReqDllmMixin.reset_dllm_for_retract(req)
+
+        # The unresolved block is gone with the KV that backed it, but the
+        # decoded tokens survive: only the prefix KV has to be recomputed.
+        self.assertEqual(len(req.dllm_incomplete_ids), 0)
+        self.assertIsNone(req.dllm_algo_state)
+        self.assertEqual(req.dllm_block_offset, 0)
+        self.assertEqual(req.output_ids, [2] * 8)
+        self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+
+    def test_reset_dllm_for_retract_uses_decode_phase_for_short_context(self):
+        req = SimpleNamespace(
+            origin_input_ids=[1] * 8,
+            output_ids=[],
+            dllm_config=SimpleNamespace(block_size=32),
+            dllm_incomplete_ids=array("q", range(32)),
+            dllm_algo_state=None,
+            dllm_block_offset=32,
+            dllm_phase=DllmReqPhase.STAGING_DECODE,
+        )
+
+        ReqDllmMixin.reset_dllm_for_retract(req)
+
+        self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_DECODE)
 
     def test_dllm_scheduler_uses_normal_extend_only_for_prefill(self):
         scheduler = SimpleNamespace(

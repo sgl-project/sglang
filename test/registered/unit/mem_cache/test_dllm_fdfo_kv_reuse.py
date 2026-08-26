@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache import allocation
@@ -63,6 +64,8 @@ class _SchedulerHarness:
     process_dllm_staging_reqs = SchedulerDllmMixin.process_dllm_staging_reqs
     _cleanup_dllm_req = SchedulerDllmMixin._cleanup_dllm_req
     _abort_dllm_req_exact = SchedulerDllmMixin._abort_dllm_req_exact
+    _retract_dllm_req = SchedulerDllmMixin._retract_dllm_req
+    _retract_or_abort_dllm_req = SchedulerDllmMixin._retract_or_abort_dllm_req
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
@@ -227,12 +230,25 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
 
-    def test_staging_no_token_aborts_only_exact_request_id(self):
+    def test_staging_no_token_retracts_instead_of_aborting(self):
         manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        exact = _make_req("job_1", [1], self.block_size)
+        victim = _make_req("job_1", [1], self.block_size)
         keep = _make_req("job_10", [2], self.block_size)
-        manager.waiting_queue = [exact, keep]
-        manager.staging_queue = [exact]
+        for req in (victim, keep):
+            req.dllm_phase = DllmReqPhase.STAGING_DECODE
+            req.is_retracted = False
+            req.origin_input_ids = [1]
+            req.output_ids = [7, 8]
+            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.dllm_algo_state = object()
+            req.dllm_block_offset = self.block_size
+            req.reset_for_retract = lambda r=req: setattr(r, "is_retracted", True)
+            req.time_stats = SimpleNamespace(set_retract_time=lambda: None)
+            req.reset_dllm_for_retract = (
+                lambda r=req: ReqDllmMixin.reset_dllm_for_retract(r)
+            )
+        manager.waiting_queue = [victim, keep]
+        manager.staging_queue = []
 
         outputs = []
         scheduler = _SchedulerHarness()
@@ -249,14 +265,24 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             add_dllm_staging_req=lambda req: AddReqResult.NO_TOKEN,
         )
 
-        result = scheduler.process_dllm_staging_reqs(adder, [exact])
-
+        result = scheduler.process_dllm_staging_reqs(adder, [victim, keep])
         self.assertEqual(result, AddReqResult.NO_TOKEN)
-        self.assertEqual(manager.waiting_queue, [keep])
-        self.assertEqual(manager.staging_queue, [])
-        self.assertEqual(len(outputs), 1)
-        self.assertEqual(outputs[0][0].rid, "job_1")
-        self.assertIs(outputs[0][1], exact)
+
+        scheduler._retract_or_abort_dllm_req(
+            SimpleNamespace(is_empty=lambda: True),
+        )
+
+        # Retraction reclaims KV without telling the client, and both requests
+        # stay managed so the freed pages can serve them next round.
+        self.assertEqual(outputs, [])
+        self.assertEqual(manager.waiting_queue, [victim, keep])
+        self.assertIsNone(victim.req_pool_idx)
+        self.assertIsNone(victim.kv)
+        self.assertEqual(victim.dllm_phase, DllmReqPhase.INCOMING_DECODE)
+        self.assertEqual(len(victim.dllm_incomplete_ids), 0)
+        self.assertEqual(victim.output_ids, [7, 8])
+        # Only the first blocker in manager order is given up.
+        self.assertEqual(keep.dllm_phase, DllmReqPhase.STAGING_DECODE)
 
     def test_exact_abort_cleans_stashed_fdfo_before_pop_and_response(self):
         events = []
