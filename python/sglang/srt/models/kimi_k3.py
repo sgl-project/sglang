@@ -2371,7 +2371,7 @@ class KimiK3DecoderLayer(nn.Module):
         # D = after MLP. If A already diverges, bug is upstream (PP entry
         # or block_residual sync). If A matches but B/C/D diverge, bug is
         # in attn / attn-reduce / MLP itself.
-        _is_l2 = K3_DBG_ENABLED and K3_DBG_LAYER2 and self.layer_idx == 2
+        _is_l2 = K3_DBG_ENABLED and K3_DBG_LAYER2 and self.layer_idx == 0
         if _is_l2:
             _ps_sh_a = tuple(prefix_sum.shape) if prefix_sum is not None else None
             print(
@@ -2426,9 +2426,25 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Attention ----
+        if _is_l2:
+            print(
+                f"[K3-L2] PRE-ATTN layer={self.layer_idx} pp_rank={get_pp_group().rank_in_group} "
+                f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                f"hidden.shape={tuple(hidden_states.shape)} "
+                f"is_block_write={self.is_block_write_layer}",
+                flush=True,
+            )
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+        if _is_l2:
+            print(
+                f"[K3-L2] POST-ATTN layer={self.layer_idx} pp_rank={get_pp_group().rank_in_group} "
+                f"hidden.sum={hidden_states.float().sum().item():.6f} "
+                f"hidden.shape={tuple(hidden_states.shape)} "
+                f"hidden.edge0={hidden_states.flatten()[0].item():.6f}",
+                flush=True,
+            )
 
         if _is_l2:
             print(
@@ -2676,13 +2692,23 @@ class KimiK3LinearModel(nn.Module):
                 _br_shape = tuple(attn_res.block_residual.shape) if attn_res is not None else None
                 _nvb = attn_res.num_valid_blocks if attn_res is not None else None
                 _bsz = self.config.attn_res_block_size
+                # checksum of the inherited bank (just-received-from-PP for
+                # non-first PP ranks; 0 for PP rank 0). Lets us confirm the
+                # wire is bit-identical to the sender's pre-send rowsum.
+                _in_rowsums = (
+                    attn_res.block_residual.float().sum(dim=-1).sum(dim=0).tolist()
+                    if attn_res is not None
+                    else []
+                )
             except Exception as _e:
                 _br_shape, _nvb, _bsz = f"err:{_e}", None, None
+                _in_rowsums = []
             print(
                 f"[K3-DBG] seg_init pp_rank={get_pp_group().rank_in_group} "
                 f"pp_world={get_pp_group().world_size} attn_res={attn_res is not None} "
                 f"sp_attn_res={sp_attn_res} sp_coll={k3_sp_collective.enabled()} "
                 f"block_size={_bsz} br_shape={_br_shape} nvb={_nvb} "
+                f"in.rowsums={_in_rowsums} "
                 f"end_layer={self.end_layer} start_layer={self.start_layer}",
                 flush=True,
             )
@@ -2815,11 +2841,15 @@ class KimiK3LinearModel(nn.Module):
                     try:
                         _br_full_shape = tuple(attn_res.block_residual.shape)
                         _nvb_send = attn_res.num_valid_blocks
+                        # per-row checksum: lets us verify the wire is bit-clean
+                        _br_rowsums = attn_res.block_residual.float()[:, :_nvb_send, :].sum(dim=-1).sum(dim=0).tolist()
                     except Exception as _e2:
                         _br_full_shape, _nvb_send = f"err:{_e2}", None
+                        _br_rowsums = []
                     print(
                         f"[K3-DBG] pre-send pp_rank={get_pp_group().rank_in_group} "
                         f"br.shape={_br_full_shape} nvb={_nvb_send} "
+                        f"br.rowsums={_br_rowsums} "
                         f"hidden.sum={hidden_states.float().sum().item():.6f} "
                         f"hidden.edge0={hidden_states.flatten()[0].item():.6f}",
                         flush=True,
