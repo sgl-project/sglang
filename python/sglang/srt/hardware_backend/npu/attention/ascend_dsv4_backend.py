@@ -874,6 +874,30 @@ class C4IndexerAscendBackendMixin:
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
+        # §24.44 (Run 28): DP0 CP1's c4topk came back with FLT_MAX/garbage
+        # bit patterns (0x7F7FFFFF / 0x80010000) -- audit this op's INPUTS at
+        # the call site (q/page-table like the swa audit) and register the
+        # OUTPUT buffer into the trap's layout map + gather-sites so a catch
+        # names its physical neighborhood.
+        try:
+            from sglang.srt.layers.cp.layer_trap import (
+                layer_trap_note_gather,
+                layer_trap_register_tensors,
+            )
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                record_oob_extremes,
+            )
+
+            self._audit_block_table(
+                fm.c4_page_table,
+                k.shape[0],
+                k.shape[1],
+                fm.actual_seq_lengths_kv,
+                "lipt",
+            )
+            record_oob_extremes("liq", q_int8)
+        except Exception:
+            pass
         kwargs = dict(
             query=q_int8,
             key=k,
@@ -893,6 +917,15 @@ class C4IndexerAscendBackendMixin:
             metadata=li_quant_metadata,
         )
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
+        try:
+            layer_trap_register_tensors({"c4_topk_buf": topk_idxs})
+            layer_trap_note_gather(
+                "lightning-indexer",
+                out=topk_idxs,
+                query=q_int8,
+            )
+        except Exception:
+            pass
         return topk_idxs.view(-1, self._dsv4_index_topk)
 
     def forward_c4_indexer(
