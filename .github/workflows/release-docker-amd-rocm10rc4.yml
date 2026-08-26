@@ -113,7 +113,7 @@ jobs:
   validate-pr:
     name: Run full AMD PR suite with ROCm 10 RC4
     needs: publish
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     with:
       rocm_version: rocm10rc4
@@ -126,7 +126,7 @@ jobs:
   validate-nightly:
     name: Run full AMD nightly suite with ROCm 10 RC4
     needs: publish
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
       rocm_version: rocm10rc4
