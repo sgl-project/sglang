@@ -6,11 +6,13 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "video", "sound/action", "world model", "policy"]} />
+<DiffusionModelTags tags={["omnimodal", "image + video", "sound + action", "world model", "robot policy"]} />
 
 ## 1. Model Introduction
 
-[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with its native Cosmos3 pipeline.
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family spanning text/image/video generation, optional synchronized sound, and robot action prediction. Its main advantage is breadth: the same native SGLang pipeline can serve media-generation checkpoints and the DROID policy checkpoint without routing through an LLM sampler.
+
+Choose Nano for the broadest modality coverage and lower deployment cost, Super for the larger 64B image/video model, and a specialized checkpoint when only T2I or I2V is needed. Sound and action are checkpoint-specific heads, so they are not available from every Cosmos3 repository.
 
 | Model | Status | Notes |
 | --- | --- | --- |
@@ -44,6 +46,12 @@ pip install "cosmos-guardrail==0.3.1"
 
 `cosmos-guardrail` downloads gated NVIDIA guardrail weights, so pass a Hugging Face token if your environment needs one. If the package is not installed, SGLang skips Cosmos3 guardrails and logs a warning. To disable Cosmos3 guardrails for local experiments, set `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` before starting the server.
 
+There may be problems loading the Cosmos-1.0-Guardrail weights on Ascend NPU. If the *_pickle.UnpicklingError* error occurs during startup, you should change ```weight_only=True``` to ```weights_only=False``` parameter in *cosmos_guardrail/cosmos_utils.py*:
+```
+#!/usr/bin/env bash
+COSMOS_GUARDRAIL_DIR="$(dirname "$(python -c 'import cosmos_guardrail; print(cosmos_guardrail.__file__)')")"
+sed -i 's/weights_only=True/weights_only=False/g' "$COSMOS_GUARDRAIL_DIR/cosmos_utils.py"
+```
 ## 3. Serve Cosmos3
 
 Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
@@ -53,6 +61,14 @@ sglang serve \
   --model-path nvidia/Cosmos3-Nano \
   --num-gpus 1
 ```
+
+With `--performance-mode auto`, a Cosmos3 checkpoint keeps its DiT and VAE
+resident when every selected GPU has at least 120 GiB available at startup.
+Below that threshold, auto mode retains the conservative DiT
+component-offload policy. Cosmos3 runs one DiT per pipeline, so component
+offload above the threshold only pays to copy the weights out to host memory
+and back on every request. Serve `Cosmos3-Super` across multiple GPUs as
+shown below so each rank holds a shard of the weights.
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
 

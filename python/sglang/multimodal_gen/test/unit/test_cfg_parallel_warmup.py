@@ -502,6 +502,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = SimpleNamespace(
             pipeline_config=pipeline_config,
             enable_breakable_cuda_graph=False,
+            pipeline_class_name=None,
         )
 
         num_frames = _resolve_warmup_num_frames(
@@ -563,7 +564,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.vae_scale_factor = 32
-        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+        server_args.pipeline_config.adjust_num_frames.return_value = 25
+        server_args.num_gpus = 2
 
         sampling_defaults = SamplingParams(
             width=1920,
@@ -584,6 +586,23 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual((reqs[0].width, reqs[0].height), (832, 448))
         self.assertEqual(reqs[0].width % 64, 0)
         self.assertEqual(reqs[0].height % 64, 0)
+        self.assertEqual(reqs[0].num_frames, 25)
+        server_args.pipeline_config.adjust_num_frames.assert_called_once_with(25)
+
+    def test_ltx2_two_stage_single_gpu_keeps_generic_frame_cap(self):
+        server_args = MagicMock()
+        server_args.pipeline_class_name = "LTX2TwoStagePipeline"
+        server_args.num_gpus = 1
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args,
+            SamplingParams(num_frames=121),
+            server_based_warmup=True,
+        )
+
+        self.assertEqual(num_frames, 17)
 
     def test_server_based_warmup_uses_representative_image_fallback(self):
         server_args = MagicMock()

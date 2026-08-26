@@ -34,7 +34,8 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica_group
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
 )
@@ -70,6 +71,8 @@ class _AudioVAEDeterminismContext:
     _saved: tuple | None = None
 
     def __enter__(self):
+        if not torch.cuda.is_available():
+            return self
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
             _AudioVAEDeterminismContext._saved = (
@@ -94,6 +97,8 @@ class _AudioVAEDeterminismContext:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if not torch.cuda.is_available():
+            return
         _AudioVAEDeterminismContext._depth -= 1
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
@@ -317,7 +322,10 @@ def minimax_h3_encode_reference_audio_rows(
         waveform = _audio_resampler(int(source_rate))(waveform)
     waveform = waveform.to(device)
 
-    with _AudioVAEDeterminismContext():
+    with (
+        _AudioVAEDeterminismContext(),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
         audio_data = model.preprocess(
             waveform.unsqueeze(1), MINIMAX_H3_AUDIO_SAMPLE_RATE
         )
@@ -483,7 +491,7 @@ def _write_reference_video_to_fd(command: list[str], output_fd: int) -> int:
     return os.lseek(output_fd, 0, os.SEEK_CUR)
 
 
-def _all_gather_world_objects(group: Any, value: Any) -> list[Any]:
+def _all_gather_group_objects(group: Any, value: Any) -> list[Any]:
     values = [None] * group.world_size
     torch.distributed.all_gather_object(
         values,
@@ -495,14 +503,18 @@ def _all_gather_world_objects(group: Any, value: Any) -> list[Any]:
 
 @functools.lru_cache(maxsize=1)
 def _reference_video_host_leader() -> int:
-    group = get_world_group()
-    hostnames = _all_gather_world_objects(group, socket.gethostname())
+    group = get_replica_group()
+    hostnames = _all_gather_group_objects(group, socket.gethostname())
     return hostnames.index(hostnames[group.rank_in_group])
 
 
 def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
-    """Decode once per host and map the same RGB pages on its worker ranks."""
-    group = get_world_group()
+    """Decode once per host per replica; its worker ranks map the same RGB pages.
+
+    Collectives stay inside the request's pipeline replica: the world group
+    spans replicas when dp_size > 1 and only one replica runs this request.
+    """
+    group = get_replica_group()
     if (
         group.world_size <= 1
         or not sys.platform.startswith("linux")
@@ -540,7 +552,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
             owner_exception = exc
             leader_state = (None, 0, f"{type(exc).__name__}: {exc}")
 
-    states = _all_gather_world_objects(group, leader_state)
+    states = _all_gather_group_objects(group, leader_state)
     host_states = [state for state in states if state is not None]
     owner_error = next(
         (state[2] for state in host_states if state[2] is not None),
@@ -585,7 +597,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     except Exception as exc:
         map_error = f"{type(exc).__name__}: {exc}"
 
-    map_errors = _all_gather_world_objects(group, map_error)
+    map_errors = _all_gather_group_objects(group, map_error)
     failed = next((error for error in map_errors if error is not None), None)
     if is_leader:
         os.close(leader_fd)

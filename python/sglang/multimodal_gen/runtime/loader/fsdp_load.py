@@ -63,8 +63,7 @@ _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
     if quant_config is None:
         return False
-    quant_name_getter = getattr(type(quant_config), "get_name", None)
-    return bool(callable(quant_name_getter) and quant_name_getter() == "bitsandbytes")
+    return quant_config.get_name() == "bitsandbytes"
 
 
 def _format_dtype_mismatch_summary(
@@ -238,6 +237,7 @@ def maybe_load_fsdp_model(
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
     checkpoint_key_filter: Callable[[str], bool] | None = None,
+    weights_iterator: Generator[tuple[str, torch.Tensor], None, None] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -255,6 +255,9 @@ def maybe_load_fsdp_model(
             Runtime residency strategies move it to the compute device before use.
         strict: If True, enforce strict state dict loading (all keys must match).
         weight_load_plan: Optional checkpoint/postprocess device plan for this load.
+        weights_iterator: Optional pre-built ``(name, tensor)`` source, used
+            instead of reading ``weight_dir_list`` as safetensors. Set by callers
+            whose checkpoint is not safetensors at all, such as GGUF.
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -295,6 +298,15 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
+    keep_checkpoint_mapping = bool(
+        current_platform.is_mps()
+        and weight_load_plan.mps_layerwise_cpu_staging
+        and weight_load_plan.checkpoint_load_device.type == "cpu"
+    )
+    if keep_checkpoint_mapping:
+        # layerwise offload replaces block parameters with placeholders after
+        # load, so compatible checkpoint tensors stay file-backed on CPU
+        model._keep_checkpoint_mapping = True
     defer_cpu_placement = bool(
         component_starts_on_cpu
         and weight_load_plan.defer_cpu_placement
@@ -345,6 +357,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -360,6 +373,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and not use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -373,7 +387,9 @@ def maybe_load_fsdp_model(
         )
 
     if preconverted_state_dict is None:
-        if weight_load_plan.load_full_state_dict_on_device:
+        if weights_iterator is not None:
+            weight_iterator = weights_iterator
+        elif weight_load_plan.load_full_state_dict_on_device:
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
                 key_filter=checkpoint_key_filter,
@@ -408,6 +424,7 @@ def maybe_load_fsdp_model(
         strict=strict,
         cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
+        keep_checkpoint_mapping=keep_checkpoint_mapping,
         preconverted_state_dict=preconverted_state_dict,
     )
     if bnb_quant_states:
@@ -531,6 +548,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    keep_checkpoint_mapping: bool = False,
     preconverted_state_dict: (
         tuple[
             dict[
@@ -555,6 +573,7 @@ def load_model_from_full_model_state_dict(
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
+        keep_checkpoint_mapping (bool): retain compatible CPU checkpoint tensors instead of copying them
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -696,7 +715,17 @@ def load_model_from_full_model_state_dict(
                 if actual_param is not None
                 else None
             )
-            if weight_loader is not None:
+            use_checkpoint_tensor_directly = bool(
+                keep_checkpoint_mapping
+                and actual_param is not None
+                and not getattr(actual_param, "checkpoint_mapping_unsafe", False)
+                and tuple(meta_sharded_param.shape) == tuple(full_tensor.shape)
+                and full_tensor.device.type == "cpu"
+                and full_tensor.dtype == target_dtype
+            )
+            if use_checkpoint_tensor_directly:
+                sharded_tensor = full_tensor
+            elif weight_loader is not None:
                 assert actual_param is not None
                 if _can_assign_cpu_tensor_without_copy(
                     actual_param,
