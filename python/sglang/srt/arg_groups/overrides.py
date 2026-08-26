@@ -223,10 +223,12 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 
     Evaluates the pass on the resolving state (a read-only view with the
     accumulated declarations overlaid from the stash) and appends its
-    declaration to the stash. During ``__post_init__`` the fields stay
-    untouched: the stash is what the config bags are projected from. A pass
-    invoked after resolution finished (a post-init slot) writes through
-    immediately, because there is no later projection to pick it up.
+    declaration to the stash, which is what the config bags are projected from.
+    The fields stay untouched.
+
+    A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
+    in the same stash, which publish projects from later, so it needs no field
+    write either.
     """
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
@@ -246,19 +248,6 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             stash = server_args._resolved_overrides = []
         stash.append(entry)
         validate_declarations(server_args, [entry])
-        if getattr(server_args, "_resolution_finished", False):
-            _apply_fields(server_args, declared)
-
-
-def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
-    """Write fields on behalf of the pipeline (bypasses the strict bare-
-    assignment guard that protects post-resolution mutation)."""
-    object.__setattr__(server_args, "_internal_write", True)
-    try:
-        for field, value in fields.items():
-            setattr(server_args, field, value)
-    finally:
-        object.__setattr__(server_args, "_internal_write", False)
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
