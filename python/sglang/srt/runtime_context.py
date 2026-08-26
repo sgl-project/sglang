@@ -1019,19 +1019,6 @@ class RuntimeContext:
         return _ServerArgsOverride(self, fields)
 
 
-def _write_fields(server_args: Any, fields: dict) -> None:
-    """Write record fields past the guard that forbids post-resolution writes.
-
-    Only the launch stand-in below needs this: production resolution declares.
-    """
-    object.__setattr__(server_args, "_internal_write", True)
-    try:
-        for field, value in fields.items():
-            setattr(server_args, field, value)
-    finally:
-        object.__setattr__(server_args, "_internal_write", False)
-
-
 class _ServerArgsOverride:
     """Scoped config override (see ``RuntimeContext.override_server_args``).
 
@@ -1072,7 +1059,10 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.arg_groups.overrides import (
+            apply_fields,
+            declare_late_resolution,
+        )
 
         server_args = ServerArgs(model_path="dummy")
         server_args.resolve_once()
@@ -1098,7 +1088,7 @@ class _ServerArgsOverride:
         # the operator passed and what resolution decided, so they go on the
         # record as well as into the stash. Production late resolution declares
         # only -- there the record stays the operator's input.
-        _write_fields(server_args, self._fields)
+        apply_fields(server_args, self._fields)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
