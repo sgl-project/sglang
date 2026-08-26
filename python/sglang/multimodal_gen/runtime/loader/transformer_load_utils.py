@@ -259,7 +259,13 @@ def _enforce_quantized_component_offload_capability(
     component_name: str | None,
     model_cls: type[nn.Module],
 ) -> None:
-    if quant_config is None or model_cls.supports_quantized_component_offload:
+    supports_offload = True
+    for cls in model_cls.__mro__:
+        capability = vars(cls).get("supports_quantized_component_offload")
+        if capability is not None:
+            supports_offload = bool(capability)
+            break
+    if quant_config is None or supports_offload:
         return
     if not _uses_component_offload(
         server_args,
