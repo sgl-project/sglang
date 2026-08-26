@@ -22,6 +22,7 @@ from sglang.srt.layers.cp.padding import (
     pad_logical_token_to_physical,
 )
 from sglang.srt.layers.cp.utils import (
+    can_cp_v2_apply,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
@@ -324,6 +325,42 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_local_prefill_cp_latch_survives_dp_padding(self):
+        forced_on = SimpleNamespace(
+            input_ids=torch.arange(1),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[1],
+            local_prefill_cp_active=True,
+        )
+        forced_off = SimpleNamespace(
+            input_ids=torch.arange(64),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[64],
+            local_prefill_cp_active=False,
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            self.assertTrue(is_cp_v2_active(forced_on))
+            self.assertFalse(is_cp_v2_active(forced_off))
+
+    def test_scheduler_candidate_reads_unpadded_extend_lens(self):
+        schedule_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[8],
+        )
+        short_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[7],
+        )
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            self.assertTrue(can_cp_v2_apply(schedule_batch, num_tokens=8))
+            self.assertFalse(can_cp_v2_apply(short_batch, num_tokens=8))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)

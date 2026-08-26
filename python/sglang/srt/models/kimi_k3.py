@@ -2289,7 +2289,20 @@ class KimiK3DecoderLayer(nn.Module):
         # output back; padded rows are discarded downstream.
         num_padded = hidden_states.shape[0]
         num_real = num_padded
-        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
+        cp_metadata = forward_batch.attn_cp_metadata
+        if cp_metadata is not None:
+            # CP-v2 pads every rank to a common physical row count for its
+            # collectives. KDA/MLA attention metadata, including causal-conv
+            # query_start_loc, covers only this rank's logical zigzag rows.
+            # Never feed the rank-local alignment tail into attention or its
+            # KV/state updates.
+            per_rank_tokens = (
+                cp_metadata.per_rank_logical_token or cp_metadata.per_rank_actual_token
+            )
+            num_real = min(
+                int(per_rank_tokens[get_parallel().attn_cp_rank]), num_padded
+            )
+        elif self._trim_padded_attn and forward_batch.forward_mode.is_extend():
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)

@@ -115,8 +115,16 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
+            # ScheduleBatch exposes the same unpadded request lengths under
+            # ``extend_lens``.  Accept both so DP-attention can decide PCP
+            # before it fabricates idle work or materializes padding.
+            extend_lens = getattr(forward_batch, "extend_lens", None)
+        if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        extend_lens = [int(length) for length in extend_lens]
+        return int(num_tokens) >= sum(extend_lens) and all(
+            length >= self.cp_size * 2 for length in extend_lens
+        )
 
     def build_metadata(
         self,
