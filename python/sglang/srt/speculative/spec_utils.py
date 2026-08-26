@@ -180,6 +180,9 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+SIMULATE_ACC_TOKEN_ID = int(os.environ.get("SGLANG_SIMULATE_ACC_TOKEN_ID", "100"))
+if SIMULATE_ACC_TOKEN_ID < 0:
+    raise ValueError("SGLANG_SIMULATE_ACC_TOKEN_ID must be non-negative")
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -422,7 +425,7 @@ def generate_simulated_accept_index(
     num_correct_drafts.fill_(simulate_acc_len - 1)
 
     if not use_real_draft_tokens:
-        predict.fill_(100)  # some legit token id
+        predict.fill_(SIMULATE_ACC_TOKEN_ID)
         return sim_accept_index
 
     # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
