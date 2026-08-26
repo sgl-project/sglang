@@ -51,6 +51,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class PrefillOOMError(RuntimeError):
+    """Real KV-cache allocation missed for an already-admitted prefill batch.
+
+    Typed so the scheduler can catch this specifically and return the batch
+    to the waiting queue, rather than the exception escaping its event loop
+    and killing the process. See sgl-project/sglang#34676.
+    """
+
+
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -305,6 +314,11 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
+    # Slots this call allocates are ours to release if the KV allocation
+    # below fails; slots a request already held (a chunked-prefill
+    # continuation) belong to that request's own lifecycle.
+    newly_pooled_reqs = [r for r in batch.reqs if r.req_pool_idx is None]
+
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
@@ -312,37 +326,45 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
+    # PrefillAdder admits requests against an estimate of available capacity;
+    # the real allocation here can still miss. Free the req slots taken just
+    # above (otherwise each miss leaks one) and raise a typed error so the
+    # scheduler can requeue instead of dying. See sgl-project/sglang#34676.
     alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
-        out_cache_loc = _alloc_extend_loc_with_kv_reuse(
-            batch,
-            reuse_kv,
-            req_pool_indices_cpu,
-            prefix_lens_cpu,
-            extend_lens_cpu,
-            req_pool_indices_device,
-            alloc_page_size,
-        )
-    elif alloc_page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-            req_pool_indices=req_pool_indices_device,
-            batch=batch,
-        )
+    try:
+        if reuse_kv is not None and any(reuse_kv):
+            out_cache_loc = _alloc_extend_loc_with_kv_reuse(
+                batch,
+                reuse_kv,
+                req_pool_indices_cpu,
+                prefix_lens_cpu,
+                extend_lens_cpu,
+                req_pool_indices_device,
+                alloc_page_size,
+            )
+        elif alloc_page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        else:
+            # Paged allocation - build last_loc
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+                req_pool_indices=req_pool_indices_device,
+                batch=batch,
+            )
+    except RuntimeError as e:
+        for req in newly_pooled_reqs:
+            batch.req_to_token_pool.free(req)
+        raise PrefillOOMError(str(e)) from e
 
     # Write to req_to_token_pool
     write_cache_indices(

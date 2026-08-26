@@ -275,6 +275,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation import PrefillOOMError
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -3508,7 +3509,30 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except PrefillOOMError as e:
+            # can_run_list was admitted against an estimate of available
+            # KV-cache capacity that the real allocation found wrong.
+            # alloc_for_extend() already released the req slots it took, so
+            # return the requests to the waiting queue and skip this round
+            # rather than letting the error escape and kill the scheduler
+            # process. Decode has an equivalent retraction path; this is
+            # prefill's. See sgl-project/sglang#34676.
+            logger.warning(
+                f"Prefill allocation missed after admission for "
+                f"{len(can_run_list)} request(s); returning them to the "
+                f"waiting queue. {e}"
+            )
+            if (
+                self.chunked_req is not None
+                and self.chunked_req is adder.new_chunked_req
+            ):
+                self.chunked_req = None
+            for req in can_run_list:
+                self._add_request_to_queue(req)
+            running_batch.batch_is_full = True
+            return None, running_batch
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
