@@ -25,6 +25,7 @@ struct SetMlaKVBufferParams {
   int64_t stride_rope_bytes;
   int64_t stride_buffer_bytes;
   uint32_t batch_size;
+  int64_t reserved_skip_index;
 };
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, bool kUsePDL, typename TLoc>
@@ -37,15 +38,17 @@ __global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferP
   if (global_warp_id >= params.batch_size) return;
 
   PDLWaitPrimary<kUsePDL>();
-  const auto loc = static_cast<const TLoc*>(params.loc)[global_warp_id];
+  const int64_t loc = static_cast<int64_t>(static_cast<const TLoc*>(params.loc)[global_warp_id]);
   const auto nope = warp::load_bytes<kNopeBytes, WARP_UNIFORM_16B>(input_nope);
   const auto rope = warp::load_bytes<kRopeBytes, WARP_UNIFORM_16B>(input_rope);
 
   PDLTriggerSecondary<kUsePDL>();
-  const auto output_nope = pointer::offset(params.kv_buffer, params.stride_buffer_bytes * loc);
-  const auto output_rope = pointer::offset(output_nope, kNopeBytes);
-  warp::store_bytes<kNopeBytes, WARP_UNIFORM_16B>(output_nope, nope);
-  warp::store_bytes<kRopeBytes, WARP_UNIFORM_16B>(output_rope, rope);
+  if (loc != params.reserved_skip_index) {
+    const auto output_nope = pointer::offset(params.kv_buffer, params.stride_buffer_bytes * loc);
+    const auto output_rope = pointer::offset(output_nope, kNopeBytes);
+    warp::store_bytes<kNopeBytes, WARP_UNIFORM_16B>(output_nope, nope);
+    warp::store_bytes<kRopeBytes, WARP_UNIFORM_16B>(output_rope, rope);
+  }
 }
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, bool kUsePDL>
@@ -58,7 +61,8 @@ struct SetMlaKVBufferKernel {
       tvm::ffi::TensorView loc,
       tvm::ffi::TensorView k_nope,
       tvm::ffi::TensorView k_rope,
-      int64_t) {
+      int64_t,
+      int64_t reserved_skip_index) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -118,6 +122,7 @@ struct SetMlaKVBufferKernel {
         .stride_rope_bytes = k_rope.stride(0) * dtype_size,
         .stride_buffer_bytes = kv_buffer.stride(0) * dtype_size,
         .batch_size = batch_size,
+        .reserved_skip_index = reserved_skip_index,
     };
     const auto device = device_.unwrap();
     const auto kernel = loc_dtype.is_type<int32_t>() ? set_kernel<int32_t> : set_kernel<int64_t>;

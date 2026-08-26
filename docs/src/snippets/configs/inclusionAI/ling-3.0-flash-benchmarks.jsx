@@ -17,6 +17,12 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 96.59 },
   },
   {
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.62%; accept length ~4.5-5.1.",
+  },
+  {
     // Rejected by the full GSM8K gate at request 1319: a no-EOS runaway generated
     // >33k tokens. Recipe stays `verified: false` in ling-3.0-flash.jsx.
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
@@ -36,6 +42,24 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 96.51 },
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.13 },
+    notes: "Full GSM8K stop rate 99.55%; accept length ~3.3-4.4.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.62%; accept length ~4.6-4.9.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.29 },
+    notes: "Full GSM8K stop rate 99.85%; accept length ~3.8-5.9.",
   },
   {
     match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", spec: "off", nodes: "single" },

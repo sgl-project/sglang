@@ -19,6 +19,10 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.weight_versions import (
+    WeightVersionEvent,
+    truncate_weight_version_events,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -105,7 +109,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_backup,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1038,6 +1042,8 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        self.weight_version_events: List[WeightVersionEvent] = []
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
@@ -1716,16 +1722,34 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.weight_version_events = truncate_weight_version_events(
+                self.weight_version_events, num_kept_tokens=self.send_token_offset
+            )
+
+    def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
+        if allocator.get_kvcache().cpu_copy_carries_mamba:
+            return None
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return None
+        return req_to_token_pool.mamba_pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
+        mamba_pool = self._mamba_pool_needing_backup(
+            req_to_token_pool, token_to_kv_pool_allocator
+        )
         self.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
                 token_indices, mamba_indices=self.mamba_pool_idx
-            )
+            ),
+            mamba_cpu=(
+                mamba_pool.get_cpu_copy(self.mamba_pool_idx.unsqueeze(0))
+                if mamba_pool is not None and self.mamba_pool_idx is not None
+                else None
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1734,6 +1758,11 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
+        mamba_cpu = self.retraction_backup.mamba_cpu
+        if mamba_cpu is not None and self.mamba_pool_idx is not None:
+            req_to_token_pool.mamba_pool.load_cpu_copy(
+                mamba_cpu, self.mamba_pool_idx.unsqueeze(0)
+            )
         token_to_kv_pool_allocator.load_cpu_copy(
             self.retraction_backup.cpu_tensors,
             token_indices,
@@ -2132,8 +2161,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    can_run_dp_cuda_graph: bool = False
-    can_run_dp_breakable_cuda_graph: bool = False
+    can_run_decode_cuda_graph: bool = False
+    can_run_dp_prefill_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3326,8 +3355,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
+            can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
