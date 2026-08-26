@@ -47,6 +47,10 @@ _COMPONENT_UUID_COUNTER = 1
 @dataclasses.dataclass
 class ComponentData:
     value: Optional[torch.Tensor] = None
+    # Number of device units from this node currently included in the tree
+    # core's evictable counters. This can differ temporarily from len(value):
+    # Full KV keeps value alive while SWA cascade eviction reads it.
+    device_evictable_size: int = 0
     lock_ref: int = 0
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
