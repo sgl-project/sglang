@@ -783,6 +783,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        # Draft weights can be replaced by the loader after the worker object is
+        # constructed.  Recheck here so graph warmup/capture sees the final
+        # main_proj weight in FRACTAL_NZ rather than the temporary ND tensor.
+        self.prepare_main_proj_weight()
         stage0 = self.stages[0]
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
@@ -797,6 +801,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 tuple(weight.shape),
                 weight.dtype,
             )
+            return
+        import torch_npu
+
+        # ACL format 29 is FRACTAL_NZ.  Checking the live tensor (rather than a
+        # Python ready flag) also handles loaders that replace weight.data after
+        # the early worker initialization hook.
+        if int(torch_npu.get_npu_format(weight)) == 29:
             return
         weight.data = npu_format_cast(weight.data)
         logger.info("Packed DSpark main_proj weight into NPU FRACTAL_NZ format.")
