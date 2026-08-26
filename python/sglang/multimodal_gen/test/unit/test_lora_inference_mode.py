@@ -49,3 +49,24 @@ def test_lora_merge_unmerge_handles_inference_base_weight():
     assert not layer.merged
     assert not layer.base_layer.weight.is_inference()
     assert torch.allclose(layer.base_layer.weight, base_weight)
+
+
+def test_dynamic_lora_reuses_inference_weights_without_autograd_tracking():
+    base_layer = nn.Linear(4, 3, bias=False)
+    layer = LinearWithLoRA(base_layer, lora_rank=2, lora_alpha=2)
+
+    with torch.inference_mode():
+        layer.set_lora_weights(
+            torch.ones(2, 4),
+            torch.ones(3, 2),
+            clear_existing=True,
+            merge_weights=False,
+        )
+
+    assert layer.lora_A.is_inference()
+    assert layer.lora_B.is_inference()
+    assert not layer.lora_A.requires_grad
+    assert not layer.lora_B.requires_grad
+    with torch.no_grad():
+        sharded_view = layer.lora_B[:2, :]
+    assert sharded_view.shape == (2, 2)
