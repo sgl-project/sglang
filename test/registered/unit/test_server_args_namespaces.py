@@ -81,8 +81,11 @@ class TestServerArgsNamespaces(CustomTestCase):
         for path in sorted(srt.rglob("*.py")):
             if path.name == "runtime_context.py":
                 continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "runtime_context" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {path}")
             bindings = collections.defaultdict(set)
@@ -155,8 +158,11 @@ class TestServerArgsNamespaces(CustomTestCase):
         sites = 0
         disagreements = []
         for path in sorted(srt.rglob("*.py")):
+            source = path.read_text(encoding="utf-8-sig")
+            if not any(name in source for name in accessors):
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {path}")
             for node in ast.walk(tree):

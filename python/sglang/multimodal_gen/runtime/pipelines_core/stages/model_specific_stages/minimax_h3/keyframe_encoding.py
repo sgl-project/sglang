@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
     minimax_h3_patchify_video_latent,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_KEYFRAME_PATCH_SIZE = (1, 2, 2)
@@ -37,16 +38,37 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
 
     The encode recipes seed the default torch generators right before a
     posterior-sampled VAE encode. Forking restores the process-global CPU and
-    CUDA generators after the encode while preserving the exact sampled result.
+    device generators after the encode while preserving the exact sampled
+    result.
     """
     devices: list[torch.device] = []
-    if device is not None and device.type == "cuda" and torch.cuda.is_available():
-        devices = [device]
-    with torch.random.fork_rng(devices=devices):
+    device_module = None
+    device_type = None
+    is_supported_backend = (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_npu()
+    )
+    if (
+        device is not None
+        and is_supported_backend
+        and device.type == current_platform.device_type
+    ):
+        device_module = torch.get_device_module(device)
+        if device_module.is_available():
+            devices = [device]
+            device_type = current_platform.device_type
+    fork_rng_context = (
+        torch.random.fork_rng(devices=devices)
+        if device_type is None
+        else torch.random.fork_rng(devices=devices, device_type=device_type)
+    )
+    with fork_rng_context:
         torch.default_generator.manual_seed(int(seed))
         for forked_device in devices:
-            with torch.cuda.device(forked_device):
-                torch.cuda.manual_seed(int(seed))
+            assert device_module is not None
+            with device_module.device(forked_device):
+                device_module.manual_seed(int(seed))
         yield
 
 

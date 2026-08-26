@@ -68,6 +68,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -1455,6 +1456,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1545,6 +1548,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1923,6 +1928,10 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = True
 
 
+class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+    pass
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
@@ -2001,6 +2010,7 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
