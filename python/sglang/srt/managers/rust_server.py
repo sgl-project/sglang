@@ -187,7 +187,7 @@ class NativeMmHost:
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        self._processor = processor or get_processor_wrapper(self.server_args)
+        self._processor = processor or get_processor_wrapper()
 
     def resolve_native_spec(self) -> Optional[NativeMmSpec]:
         """The :class:`NativeMmSpec` for this model, or ``None`` when it has no
