@@ -753,6 +753,40 @@ def _layerwise_pin_targets(
     return list(dict.fromkeys(targets))
 
 
+def _layerwise_resident_targets(managers: Sequence) -> list[tuple[int, ...]]:
+    """All resident-count tuples expressible by the component-level CLI knob.
+
+    ``--layerwise-resident-layers`` accepts either one absolute count or one
+    ratio for a component. Those are different paths when a component owns
+    layer stacks of unequal length: for stacks of 4 and 8 layers, an absolute
+    value of 2 gives ``(2, 2)``, while a ratio of 0.25 gives ``(1, 2)``.
+    Enumerate every interval where the rounded ratio result is constant, plus
+    every absolute count, so auto placement does not silently omit a state the
+    explicit interface can represent.
+    """
+    layer_counts = tuple(manager.num_layers for manager in managers)
+    targets = {tuple(0 for _ in managers)}
+
+    for count in range(1, max(layer_counts) + 1):
+        targets.add(tuple(min(count, num_layers) for num_layers in layer_counts))
+
+    boundaries = {0.0, 1.0}
+    for num_layers in layer_counts:
+        boundaries.update(
+            (count + 0.5) / num_layers
+            for count in range(num_layers)
+            if count + 0.5 < num_layers
+        )
+    ordered_boundaries = sorted(boundaries)
+    for lower, upper in zip(ordered_boundaries, ordered_boundaries[1:]):
+        ratio = (lower + upper) / 2
+        targets.add(
+            tuple(max(1, int(round(ratio * num_layers))) for num_layers in layer_counts)
+        )
+
+    return sorted(targets)
+
+
 def _layerwise_host_transition_bytes(
     *,
     managers: Sequence,
@@ -912,16 +946,7 @@ def collect_residency_targets(
             uses_per_streamed_layer=uses_per_request,
         )
 
-        resident_targets = set()
-        for target in range(
-            0,
-            max(manager.num_layers for manager in managers) + 1,
-        ):
-            resident_targets.add(
-                tuple(min(target, manager.num_layers) for manager in managers)
-            )
-
-        for target_resident_layers in sorted(resident_targets):
+        for target_resident_layers in _layerwise_resident_targets(managers):
             target_resident_bytes = sum(
                 manager.resident_weight_bytes(count)
                 for manager, count in zip(managers, target_resident_layers)

@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     RankResidencyReport,
     ResidencyTarget,
     WarmupMemoryRecord,
+    _layerwise_resident_targets,
     apply_residency_changes,
     collect_residency_targets,
     component_resident_size_bytes,
@@ -1335,6 +1336,21 @@ class TestSizeAccounting:
 class TestCollectResidencyTargets:
     def _modes(self, mapping):
         return lambda name: mapping.get(name, RESIDENT)
+
+    def test_resident_frontier_includes_absolute_and_ratio_cli_states(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"layers.{index}.w": torch.zeros(16) for index in range(4)}
+            ),
+            _FakeLayerwiseManager(
+                {f"layers.{index}.w": torch.zeros(16) for index in range(8)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(managers)
+
+        assert (2, 2) in targets
+        assert (1, 2) in targets
 
     def test_filters_and_sizes(self):
         te = nn.Linear(8, 8)
