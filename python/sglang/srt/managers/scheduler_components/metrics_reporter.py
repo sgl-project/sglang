@@ -126,6 +126,7 @@ class SchedulerMetricsReporter:
     metrics_collector_context: SchedulerMetricsCollectorContext
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
+    num_demoted_reqs: int = 0
     num_paused_reqs: int = 0
 
     def __post_init__(self) -> None:
@@ -720,8 +721,10 @@ class SchedulerMetricsReporter:
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
+            self.stats.num_demoted_reqs = self.num_demoted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
+            self.num_demoted_reqs = 0
 
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -946,8 +949,10 @@ class SchedulerMetricsReporter:
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
+            self.stats.num_demoted_reqs = self.num_demoted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
+            self.num_demoted_reqs = 0
 
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:

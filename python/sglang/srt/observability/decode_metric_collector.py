@@ -88,7 +88,9 @@ class DecodeMetricCollector:
     def observe_batch_output_lengths(self, reqs: Iterable[object]) -> None:
         """Record the current output length of each request in a decode forward."""
         for req in reqs:
-            if getattr(req, "is_retracted", False):
+            if getattr(req, "is_retracted", False) or getattr(
+                req, "is_demoted", False
+            ):
                 continue
             finished_len = getattr(req, "finished_len", None)
             self.observe_output_len(

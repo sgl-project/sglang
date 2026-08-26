@@ -1039,6 +1039,8 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
+        # Indicates if the req has ever been demoted.
+        self.is_demoted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1677,10 +1679,11 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
-    def reset_for_retract(self):
-        # Increment retraction count before resetting other state. We should not reset this
-        # since we are tracking the total number of retractions for each request.
-        self.retraction_count += 1
+    def reset_for_retract(self, *, is_demoted: bool = False):
+        # A proactive demotion shares the resource reset below but remains
+        # distinct from an ordinary retraction in request state and metadata.
+        if not is_demoted:
+            self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -1693,7 +1696,10 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
-        self.is_retracted = True
+        if is_demoted:
+            self.is_demoted = True
+        else:
+            self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
@@ -1949,6 +1955,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    is_demoted: bool = False,
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
@@ -1973,7 +1980,7 @@ def release_req(
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    req.reset_for_retract()
+    req.reset_for_retract(is_demoted=is_demoted)
     return backup_saved
 
 
@@ -2967,6 +2974,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         remaing_req_count: int,
         server_args: ServerArgs,
         offload_kv: bool = True,
+        is_demoted: bool = False,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -2977,6 +2985,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            is_demoted=is_demoted,
         )
 
     def prepare_encoder_info_decode(self):

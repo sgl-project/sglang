@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,10 +8,12 @@ from sglang.srt.disaggregation.decode import (
     DemotedRequest,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.observability.decode_metric_collector import (
     DEFAULT_OUTPUT_LEN_BUCKETS,
     DecodeMetricCollector,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +22,23 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestProactiveDecodeDemotion(CustomTestCase):
+    def test_req_tracks_demote_separately_from_retract(self):
+        demoted_req = Req(
+            "demoted", "", array("q", [1]), SamplingParams(max_new_tokens=8)
+        )
+        demoted_req.reset_for_retract(is_demoted=True)
+        self.assertTrue(demoted_req.is_demoted)
+        self.assertFalse(demoted_req.is_retracted)
+        self.assertEqual(demoted_req.retraction_count, 0)
+
+        retracted_req = Req(
+            "retracted", "", array("q", [1]), SamplingParams(max_new_tokens=8)
+        )
+        retracted_req.reset_for_retract()
+        self.assertFalse(retracted_req.is_demoted)
+        self.assertTrue(retracted_req.is_retracted)
+        self.assertEqual(retracted_req.retraction_count, 1)
+
     def test_collector_uses_generation_metric_buckets(self):
         self.assertEqual(DEFAULT_OUTPUT_LEN_BUCKETS[-1], 1_100_000)
         self.assertEqual(len(DEFAULT_OUTPUT_LEN_BUCKETS), 35)
@@ -77,7 +97,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         return queue
 
     def test_demoted_request_waits_then_restores(self):
-        req = SimpleNamespace(is_retracted=True)
+        req = SimpleNamespace(is_retracted=False, is_demoted=True)
         queue = self._make_demoted_queue(req, recovery_duration=10.0)
         with patch(
             "sglang.srt.disaggregation.decode.time.monotonic", return_value=5.0
@@ -96,6 +116,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             self.assertEqual(queue.resume_demoted_reqs(), [req])
         self.assertEqual(queue.demotion_queue, [])
         self.assertFalse(req.is_retracted)
+        self.assertFalse(req.is_demoted)
         restore.assert_called_once()
 
     def test_proactive_demotion_filters_and_repeats_to_safe_usage(self):
@@ -104,7 +125,9 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 rid=rid,
                 seqlen=seqlen,
                 output_ids=[0] * output_len,
+                origin_input_ids=[0] * (seqlen - output_len),
                 is_retracted=False,
+                is_demoted=False,
                 finished=lambda: False,
                 sampling_params=SimpleNamespace(max_new_tokens=128),
                 time_stats=SimpleNamespace(set_retract_time=MagicMock()),
@@ -114,8 +137,10 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         medium = make_req("medium", 20, 11)
         long = make_req("long", 30, 30)
 
+        release_calls = []
+
         class Batch:
-            reqs = [short, medium, long]
+            reqs = [long, short, medium]
             batch_is_full = True
 
             def is_empty(self):
@@ -124,14 +149,20 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             def batch_size(self):
                 return len(self.reqs)
 
-            def release_req(self, index, _, __):
-                self.reqs[index].is_retracted = True
+            def release_req(self, index, _, __, *, is_demoted=False):
+                victim = self.reqs[index]
+                if is_demoted:
+                    victim.is_demoted = True
+                else:
+                    victim.is_retracted = True
+                release_calls.append((victim.rid, index, is_demoted))
                 return True
 
             def filter_batch(self, keep_indices):
                 self.reqs = [self.reqs[i] for i in keep_indices]
 
         demotion_queue = MagicMock()
+        metrics_collector = MagicMock()
         usages = iter((0.95, 0.88, 0.84))
         scheduler = SimpleNamespace(
             running_batch=Batch(),
@@ -148,6 +179,11 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             ),
             disagg_decode_prealloc_queue=demotion_queue,
             new_token_ratio_tracker=SimpleNamespace(current=0.0),
+            metrics_reporter=SimpleNamespace(
+                num_demoted_reqs=0,
+                enable_metrics=True,
+                metrics_collector=metrics_collector,
+            ),
         )
 
         self.assertTrue(
@@ -159,6 +195,17 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertEqual(
             [call.args[0] for call in demotion_queue.add_demoted_req.call_args_list],
             [long, medium],
+        )
+        self.assertFalse(long.is_retracted)
+        self.assertTrue(long.is_demoted)
+        self.assertFalse(medium.is_retracted)
+        self.assertTrue(medium.is_demoted)
+        self.assertEqual(release_calls, [("long", 0, True), ("medium", 1, True)])
+        self.assertEqual(scheduler.metrics_reporter.num_demoted_reqs, 2)
+        metrics_collector.increment_demoted_reqs.assert_called_once_with(
+            num_demoted_reqs=2,
+            num_demoted_input_tokens=9,
+            num_demoted_output_tokens=41,
         )
 
 

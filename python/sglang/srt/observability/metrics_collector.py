@@ -122,6 +122,7 @@ class SchedulerStats:
 
     # Retract
     num_retracted_reqs: int = 0
+    num_demoted_reqs: int = 0
     num_paused_reqs: int = 0
 
     # PD disaggregation
@@ -478,6 +479,30 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_retracted_output_tokens_total = Counter(
             name="sglang:num_retracted_output_tokens_total",
             documentation="Total number of retracted output tokens.",
+            labelnames=labels.keys(),
+        )
+        self.num_demoted_reqs = Gauge(
+            name="sglang:num_demoted_reqs",
+            documentation="The number of proactively demoted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_demoted_reqs_total = Counter(
+            name="sglang:num_demoted_requests_total",
+            documentation="Total number of proactively demoted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_demoted_input_tokens_total = Counter(
+            name="sglang:num_demoted_input_tokens_total",
+            documentation=(
+                "Total number of input tokens in proactively demoted requests."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.num_demoted_output_tokens_total = Counter(
+            name="sglang:num_demoted_output_tokens_total",
+            documentation=(
+                "Total number of output tokens in proactively demoted requests."
+            ),
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -1232,6 +1257,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             num_retracted_output_tokens
         )
 
+    def increment_demoted_reqs(
+        self,
+        num_demoted_reqs: int,
+        num_demoted_input_tokens: int,
+        num_demoted_output_tokens: int,
+    ) -> None:
+        self.num_demoted_reqs_total.labels(**self.labels).inc(num_demoted_reqs)
+        self.num_demoted_input_tokens_total.labels(**self.labels).inc(
+            num_demoted_input_tokens
+        )
+        self.num_demoted_output_tokens_total.labels(**self.labels).inc(
+            num_demoted_output_tokens
+        )
+
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
@@ -1359,6 +1398,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
+        self._log_gauge(self.num_demoted_reqs, stats.num_demoted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
 
         # PD disaggregation

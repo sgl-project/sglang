@@ -868,6 +868,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def add_demoted_req(
         self, req: Req, demoted_start_time: Optional[float] = None
     ) -> None:
+        req.is_demoted = True
         self.demotion_queue.append(
             DemotedRequest(
                 req=req,
@@ -911,7 +912,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             self._pre_alloc(req)
-            req.is_retracted = False
             retraction_restore(
                 req,
                 self.tree_cache,
@@ -919,6 +919,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            req.is_demoted = False
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             full_allocatable_tokens -= full_required
@@ -2832,12 +2833,15 @@ class SchedulerDisaggregationDecodeMixin:
         )
         demoted_any = False
         candidates = [
-            (index, req)
-            for index, req in enumerate(batch.reqs)
+            req
+            for req in batch.reqs
             if not req.finished()
             and not req.is_retracted
+            and not req.is_demoted
             and len(req.output_ids) > candidate_threshold * p50_output_len
         ]
+        candidates.sort(key=lambda req: req.seqlen, reverse=True)
+        demoted_reqs = []
         while (
             self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             > self.server_args.proactive_decode_safe_cache_usage
@@ -2845,17 +2849,18 @@ class SchedulerDisaggregationDecodeMixin:
             if not candidates:
                 break
 
-            victim_index, victim = max(
-                candidates, key=lambda item: item[1].seqlen
-            )
+            victim = candidates.pop(0)
+            victim_index = batch.reqs.index(victim)
             backup_saved = batch.release_req(
                 victim_index,
                 max(0, batch.batch_size() - 1),
                 self.server_args,
+                is_demoted=True,
             )
             if backup_saved:
                 victim.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.add_demoted_req(victim)
+                demoted_reqs.append(victim)
                 demoted_any = True
             else:
                 victim.to_finish = FINISH_ABORT(
@@ -2880,19 +2885,25 @@ class SchedulerDisaggregationDecodeMixin:
                     batch.reqs
                 )
             )
-            candidates = [
-                (index, req)
-                for index, req in enumerate(batch.reqs)
-                if not req.finished()
-                and not req.is_retracted
-                and len(req.output_ids) > candidate_threshold * p50_output_len
-            ]
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
                 victim.rid,
                 victim.seqlen,
                 len(victim.output_ids),
             )
+
+        if demoted_reqs:
+            self.metrics_reporter.num_demoted_reqs += len(demoted_reqs)
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_reporter.metrics_collector.increment_demoted_reqs(
+                    num_demoted_reqs=len(demoted_reqs),
+                    num_demoted_input_tokens=sum(
+                        len(req.origin_input_ids) for req in demoted_reqs
+                    ),
+                    num_demoted_output_tokens=sum(
+                        len(req.output_ids) for req in demoted_reqs
+                    ),
+                )
 
         return demoted_any
 

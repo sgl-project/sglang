@@ -562,7 +562,9 @@ class _GenerationStreamAccumulator:
 
             if req.return_logprob:
                 logprob_end = (
-                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                    len(output_ids_)
+                    if req.is_retracted or req.is_demoted
+                    else max(len(output_ids_), 1)
                 )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
