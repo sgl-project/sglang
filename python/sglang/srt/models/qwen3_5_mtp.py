@@ -287,8 +287,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             "_input_scale",
         )
 
-        # fused experts: experts.w13_weight / experts.w2_weight
-        is_fused_expert = False
+        # Fused checkpoint tensors: experts.gate_up_proj / experts.down_proj.
+        # Keep this mapping separate from the per-expert mapping below.  The
+        # checkpoint may interleave fused routed-expert tensors with separate
+        # shared-expert tensors, so selecting one mapping must not affect the
+        # next weight.
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -319,6 +322,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
+            loaded_name = None
+
             # The last-stage MTP draft cannot share the target embedding on PP0.
             # Load the checkpoint embedding into its retained local copy instead
             # of leaving the torch.empty() allocation uninitialized.
@@ -335,7 +341,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
                 continue
-
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -360,13 +365,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     f"mlp.experts.{num_experts}.",
                 )
 
+            is_fused_expert = (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
+
             # 1) Process stacked parameters (q_proj/k_proj/v_proj & gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Check if this is a fused expert weight
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 # Skip non-matching weights
                 if weight_name not in name:
                     continue
@@ -391,12 +400,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 name = name_mapped
+                loaded_name = name_mapped
                 break
             else:
                 # 2) Process MoE expert weights (including fused experts)
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
@@ -432,6 +442,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                                 shard_id,
                                 num_experts,
                             )
+                        loaded_name = name_mapped
                     else:
                         # Non-fused expert, load by expert_id/shard
                         if (
@@ -450,6 +461,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
+                        loaded_name = name_mapped
                     name = name_mapped
                     break
                 else:
@@ -467,12 +479,21 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        loaded_name = name
                     else:
                         logger.warning_once(
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
 
-            loaded_params.add(name)
+            if loaded_name is not None:
+                loaded_params.add(loaded_name)
+            elif ".mlp.shared_expert." in checkpoint_name and checkpoint_name.endswith(
+                ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+            ):
+                raise ValueError(
+                    "Required MTP shared-expert parameter could not be loaded: "
+                    f"{checkpoint_name} (resolved as {name})"
+                )
         return loaded_params
 
 
