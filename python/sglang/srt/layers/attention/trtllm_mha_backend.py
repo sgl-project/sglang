@@ -1152,6 +1152,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run decode, optionally sorting and splitting requests by KV length."""
 
         def run_group(group_query, group_block_tables, group_seq_lens, group_mask):
+            if self.is_xqa_impl:
+                # XQA consumes Q as packed rows without stride metadata.
+                group_query = group_query.contiguous()
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
@@ -1214,6 +1217,67 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
             )
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+
+    def _run_ragged_q_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        max_q_len: int,
+        cu_seqlens_q: torch.Tensor,
+        kv_cache_sf=None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run compact variable-length Q with the architecture-specific API."""
+        if self.is_xqa_impl:
+            # q_cu_seq_lens is exposed only by the direct XQA API. The generic
+            # TRTLLM wrapper rejects variable-Q arguments when it selects XQA.
+            return flashinfer.decode.xqa_batch_decode_with_kv_cache(
+                query=query.contiguous(),
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                kv_layout="HND",
+                q_len_per_req=max_q_len,
+                mask=mask,
+                kv_cache_sf=kv_cache_sf,
+                q_cu_seq_lens=cu_seqlens_q,
+            )
+
+        # SM100 uses TRTLLM-GEN, whose generic wrapper exposes variable Q as
+        # max_q_len + cum_seq_lens_q rather than XQA's q_cu_seq_lens.
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            out_dtype=self.q_data_type,
+            backend="trtllm-gen",
+            q_len_per_req=None,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cu_seqlens_q,
+            kv_cache_sf=kv_cache_sf,
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+        )
 
     @staticmethod
     def _build_xqa_causal_mask(
@@ -1523,24 +1587,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.forward_metadata.is_ragged_verify
                 and self.forward_metadata.max_seq_len_q > 1
             ):
-                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q,
-                    kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
-                    seq_lens=self.forward_metadata.cache_seqlens_int32,
-                    max_seq_len=self.max_context_len,
+                o = self._run_ragged_q_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    self.forward_metadata.cache_seqlens_int32,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
-                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                    out_dtype=self.q_data_type,
-                    q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    q_cu_seq_lens=self.forward_metadata.cu_seqlens_q,
+                    max_q_len=self.forward_metadata.max_seq_len_q,
+                    cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
                     mask=self.forward_metadata.xqa_mask,
                     kv_cache_sf=kv_cache_block_scales,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
                 o = self._run_fixed_q_len_decode(

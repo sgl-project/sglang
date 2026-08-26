@@ -24,6 +24,8 @@ def _config(**overrides):
         attention_backend=None,
         prefill_attention_backend="flashinfer",
         decode_attention_backend="trtllm_mha",
+        speculative_draft_attention_backend=None,
+        speculative_draft_kv_cache_dtype=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -52,6 +54,41 @@ class TestNVFP4SpecConfig(CustomTestCase):
                             decode_attention_backend=decode,
                         )
                     )
+
+    def test_rejects_incompatible_explicit_draft_backend(self):
+        with self.assertRaisesRegex(
+            ValueError, "speculative-draft-attention-backend trtllm_mha"
+        ):
+            _nvfp4_speculative_attention_mode(
+                _config(speculative_draft_attention_backend="flashinfer")
+            )
+
+    def test_accepts_explicit_trtllm_mha_draft_backend(self):
+        self.assertEqual(
+            _nvfp4_speculative_attention_mode(
+                _config(speculative_draft_attention_backend="trtllm_mha")
+            ),
+            {"speculative_attention_mode": "decode"},
+        )
+
+    def test_accepts_flashinfer_draft_with_explicit_non_nvfp4_cache(self):
+        for draft_kv_dtype in (
+            "auto",
+            "bf16",
+            "bfloat16",
+            "fp8_e4m3",
+            "fp8_e5m2",
+        ):
+            with self.subTest(draft_kv_dtype=draft_kv_dtype):
+                self.assertEqual(
+                    _nvfp4_speculative_attention_mode(
+                        _config(
+                            speculative_draft_attention_backend="flashinfer",
+                            speculative_draft_kv_cache_dtype=draft_kv_dtype,
+                        )
+                    ),
+                    {"speculative_attention_mode": "decode"},
+                )
 
     def test_ignores_non_speculative_or_non_nvfp4_config(self):
         self.assertEqual(
@@ -281,9 +318,10 @@ class TestTRTLLMMHANVFP4SpecExtend(CustomTestCase):
         self.assertIs(calls[0]["mask"], backend.forward_metadata.xqa_mask)
         self.assertEqual(output.dtype, torch.bfloat16)
 
-    def test_ragged_verify_passes_mask_and_flashinfer_q_indptr(self):
+    def test_xqa_ragged_verify_uses_direct_api_and_packed_q(self):
         calls = []
         backend = self._make_backend([])
+        backend.is_xqa_impl = True
         backend.forward_metadata.is_ragged_verify = True
         backend.forward_metadata.max_seq_len_q = 3
         backend.forward_metadata.cu_seqlens_q = torch.tensor(
@@ -295,6 +333,63 @@ class TestTRTLLMMHANVFP4SpecExtend(CustomTestCase):
             device="cpu",
             cu_seqlens_q=backend.forward_metadata.cu_seqlens_q,
         )
+
+        def run_ragged(**kwargs):
+            calls.append(kwargs)
+            return kwargs["query"].float()
+
+        fake_flashinfer = SimpleNamespace(
+            decode=SimpleNamespace(
+                xqa_batch_decode_with_kv_cache=run_ragged,
+            )
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=2,
+            head_dim=4,
+            scaling=0.5,
+            sliding_window_size=-1,
+            attn_type=None,
+        )
+        q = torch.randn(5, 2, 8)[:, 0]
+        self.assertFalse(q.is_contiguous())
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=torch.arange(5),
+        )
+        with (
+            patch(
+                "sglang.srt.layers.attention.trtllm_mha_backend.is_cp_v2_active",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.attention.trtllm_mha_backend.flashinfer",
+                fake_flashinfer,
+                create=True,
+            ),
+        ):
+            output = backend.forward_extend(q, q, q, layer, batch)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["q_cu_seq_lens"], backend.forward_metadata.cu_seqlens_q)
+        self.assertEqual(calls[0]["q_len_per_req"], 3)
+        self.assertIs(calls[0]["mask"], backend.forward_metadata.xqa_mask)
+        self.assertEqual(calls[0]["kv_layout"], "HND")
+        self.assertTrue(calls[0]["query"].is_contiguous())
+        self.assertNotIn("cum_seq_lens_q", calls[0])
+        self.assertNotIn("max_q_len", calls[0])
+        self.assertNotIn("out_dtype", calls[0])
+        self.assertEqual(output.dtype, torch.bfloat16)
+
+    def test_trtllm_gen_ragged_verify_uses_wrapper_varlen_api(self):
+        calls = []
+        backend = self._make_backend([])
+        backend.is_xqa_impl = False
+        backend.forward_metadata.is_ragged_verify = True
+        backend.forward_metadata.max_seq_len_q = 3
+        backend.forward_metadata.cu_seqlens_q = torch.tensor(
+            [0, 2, 5], dtype=torch.int32
+        )
+        backend.forward_metadata.xqa_mask = None
 
         def run_ragged(**kwargs):
             calls.append(kwargs)
@@ -331,12 +426,55 @@ class TestTRTLLMMHANVFP4SpecExtend(CustomTestCase):
             output = backend.forward_extend(q, q, q, layer, batch)
 
         self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["q_cu_seq_lens"], backend.forward_metadata.cu_seqlens_q)
-        self.assertEqual(calls[0]["q_len_per_req"], 3)
-        self.assertIs(calls[0]["mask"], backend.forward_metadata.xqa_mask)
-        self.assertNotIn("cum_seq_lens_q", calls[0])
-        self.assertNotIn("max_q_len", calls[0])
+        self.assertEqual(calls[0]["backend"], "trtllm-gen")
+        self.assertIsNone(calls[0]["q_len_per_req"])
+        self.assertEqual(calls[0]["max_q_len"], 3)
+        self.assertIs(calls[0]["cum_seq_lens_q"], backend.forward_metadata.cu_seqlens_q)
+        self.assertNotIn("q_cu_seq_lens", calls[0])
+        self.assertNotIn("mask", calls[0])
         self.assertEqual(output.dtype, torch.bfloat16)
+
+    def test_fixed_q_xqa_makes_strided_batch_query_contiguous(self):
+        calls = []
+        backend = self._make_backend([])
+        del backend._run_fixed_q_len_decode
+        backend.is_xqa_impl = True
+        backend.decode_seq_len_splits = 1
+
+        def run_decode(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros_like(kwargs["query"], dtype=backend.q_data_type)
+
+        fake_flashinfer = SimpleNamespace(
+            decode=SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache=run_decode,
+            )
+        )
+        backing = torch.randn(4, 3, 2, 4)
+        query = backing[:, 0]
+        self.assertFalse(query.is_contiguous())
+
+        with patch(
+            "sglang.srt.layers.attention.trtllm_mha_backend.flashinfer",
+            fake_flashinfer,
+            create=True,
+        ):
+            output = backend._run_fixed_q_len_decode(
+                query,
+                "packed-kv",
+                torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+                torch.tensor([19, 11], dtype=torch.int32),
+                bmm1_scale=0.5,
+                bmm2_scale=1.0,
+                window_left=-1,
+                sinks=None,
+                q_len_per_req=2,
+                kv_cache_sf="block-scales",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(all(call["query"].is_contiguous() for call in calls))
+        self.assertEqual(tuple(output.shape), (4, 2, 4))
 
 
 if __name__ == "__main__":

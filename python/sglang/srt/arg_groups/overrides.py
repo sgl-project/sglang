@@ -2648,6 +2648,15 @@ def _nvfp4_speculative_attention_mode(view: Any) -> dict:
             f"prefill={prefill_backend!r}, decode={decode_backend!r}."
         )
 
+    draft_backend = getattr(view, "speculative_draft_attention_backend", None)
+    draft_kv_dtype = getattr(view, "speculative_draft_kv_cache_dtype", None)
+    if draft_kv_dtype is None and draft_backend not in (None, "trtllm_mha"):
+        raise ValueError(
+            "A speculative draft inheriting the target NVFP4 KV cache requires "
+            "--speculative-draft-attention-backend trtllm_mha when explicitly "
+            f"set; got draft={draft_backend!r}."
+        )
+
     if view.speculative_attention_mode != "decode":
         logger.info(
             "NVFP4 KV cache routes speculative verify and draft-extend through "
