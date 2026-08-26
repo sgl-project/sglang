@@ -2,7 +2,7 @@
 
 - Trigger: sampling_params.beam_width = k (> 1); no server-level beam flag.
 - Response: one response per rid; meta_info.beam_results holds the top-n
-  sequences (n <= beam_width, default = beam_width), best score first.
+  sequences (n <= beam_width, default 1 as in HF/OpenAI), best score first.
 - Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
 
 Manual test (GPU host): python3 test_beam_parity.py
@@ -93,7 +93,8 @@ class TestBeamParity(CustomTestCase):
 
     def test_parity_vs_transformers(self):
         for beam_width in [2, 10]:
-            beam_results = self._generate_beams(beam_width)
+            # n=beam_width to compare the whole beam set; the API default is 1.
+            beam_results = self._generate_beams(beam_width, n=beam_width)
             self.assertEqual(len(beam_results), beam_width)
 
             scores = [r["meta_info"]["sequence_score"] for r in beam_results]
@@ -112,6 +113,9 @@ class TestBeamParity(CustomTestCase):
     def test_return_top_n(self):
         beam_results = self._generate_beams(beam_width=10, n=3)
         self.assertEqual(len(beam_results), 3)
+
+    def test_default_returns_one_sequence(self):
+        self.assertEqual(len(self._generate_beams(beam_width=10)), 1)
 
 
 if __name__ == "__main__":

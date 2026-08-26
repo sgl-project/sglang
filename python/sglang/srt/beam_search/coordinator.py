@@ -196,7 +196,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             beam_width=beam_width,
             stop_token_ids=self._collect_stop_token_ids(req, user_params),
             max_new_tokens=max_new_tokens,
-            num_return=user_params.n if user_params.n > 1 else beam_width,
+            num_return=user_params.n,
             # Frontier state lives on device: selection consumes device top-2k
             # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,

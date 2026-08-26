@@ -69,7 +69,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     min_new_tokens: int = 0
     n: int = 1
     # beam_width > 1 turns the request into a beam search request; n then means
-    # "number of returned sequences" (n <= beam_width, default = beam_width).
+    # "number of returned sequences" rather than parallel samples (n <= beam_width).
     beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
