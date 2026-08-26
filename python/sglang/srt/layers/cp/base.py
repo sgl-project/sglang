@@ -283,7 +283,7 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
             server_args = get_server_args()
         except ValueError:
             return None
-        if server_args is not None and get_parallel().enable_prefill_cp:
+        if server_args is not None and get_parallel().config.enable_prefill_cp:
             init_cp_strategy(server_args)
     return _STRATEGY
 
