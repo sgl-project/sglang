@@ -121,7 +121,7 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
         copy_or_rebind_param(
             layer,
             "weight",
-            npu_format_online_weight(quantized_weight),
+            npu_format_online_weight(quantized_weight, self.spec),
         )
         copy_or_rebind_param(layer, "weight_scale", weight_scale.flatten())
 

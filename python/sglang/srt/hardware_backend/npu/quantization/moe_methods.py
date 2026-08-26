@@ -957,7 +957,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             return
 
         quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight.data, spec)
-        quantized_weight = npu_format_online_weight(quantized_weight)
+        quantized_weight = npu_format_online_weight(quantized_weight, spec)
 
         copy_or_rebind_param(layer, weight_name, quantized_weight)
         copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
