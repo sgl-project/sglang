@@ -2815,8 +2815,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             running_out_cache_loc = running_batch.out_cache_loc
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
+        # merge_batch nulls seq_lens_cpu when either side lacks it (the
+        # running side under overlap+spec has none at schedule time), but
+        # extend attention metadata requires it. Rebuild from request state;
+        # running_batch.seq_lens.cpu() would stall the overlap pipeline.
+        running_seq_lens_cpu = torch.tensor(
+            [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+        )
+        if self.seq_lens_cpu is None:
+            merged_seq_lens_cpu = running_seq_lens_cpu
+        else:
+            merged_seq_lens_cpu = torch.cat([self.seq_lens_cpu, running_seq_lens_cpu])
+
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        self.seq_lens_cpu = merged_seq_lens_cpu
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
