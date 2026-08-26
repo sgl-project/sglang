@@ -433,19 +433,13 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        # The five sizes keep a live property shadowing the bare name; the
-        # comparison below reaches them anyway, through `get_parallel().config`.
-        self.assertGreaterEqual(
-            _live_topology_leaves()
-            & {
-                "tp_size",
-                "pp_size",
-                "moe_dp_size",
-                "attn_cp_size",
-                "dcp_size",
-            },
-            {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology",
+        # No parallel leaf is shadowed by a live member any more, so the
+        # comparison below reads every one of them bare.
+        self.assertEqual(
+            set(),
+            _live_topology_leaves() & set(mapping),
+            "a parallel leaf gained a live member of the same name, so the "
+            "comparison below reads the group rather than the published leaf",
         )
 
         compared = 0
@@ -461,10 +455,6 @@ class TestResolutionDeclarations(CustomTestCase):
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
-                if groups[0] == "parallel":
-                    # Bare names there are the live topology; the published
-                    # leaves are one hop down, so the reader takes that hop.
-                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)

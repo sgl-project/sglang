@@ -72,7 +72,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal_breakable_cuda_graph_supported=False,
         )
@@ -101,7 +101,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
         # now serves MLA by falling back to the flashinfer MLA impl for extend.
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal=False,
             is_multimodal_breakable_cuda_graph_supported=False,
@@ -169,7 +169,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
             is_multimodal=False,
             context_len=2048,
@@ -183,7 +183,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.chunked_prefill_size = 2048
 
         with (
-            patch.object(args, "get_model_config", return_value=args.model_config),
+            patch.object(args, "get_model_config", return_value=args._model_config),
             patch("sglang.srt.server_args.is_cuda", return_value=True),
         ):
             args._handle_model_capability_adjustments()
@@ -202,7 +202,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def test_encoder_embedding_model_enables_embedding_mode_without_flag(self):
         args = ServerArgs(model_path="dummy")
         args.is_embedding = False
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             embedding_model_spec=resolve_embedding_model_spec(
                 ["BertModel"],
                 is_embedding_requested=False,
@@ -212,7 +212,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )
 
-        with patch.object(args, "get_model_config", return_value=args.model_config):
+        with patch.object(args, "get_model_config", return_value=args._model_config):
             args._handle_model_capability_adjustments()
 
         self.assertTrue(resolution_result(args, "is_embedding"))
