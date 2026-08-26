@@ -1,9 +1,14 @@
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     LinearWithLoRA,
     _compute_lora_delta,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.upsampling import (
+    LTX2LoRASwitchStage,
 )
 
 
@@ -70,3 +75,26 @@ def test_dynamic_lora_reuses_inference_weights_without_autograd_tracking():
     with torch.no_grad():
         sharded_view = layer.lora_B[:2, :]
     assert sharded_view.shape == (2, 2)
+
+
+def test_ltx2_lora_switch_creates_versioned_adapter_tensors():
+    class _Pipeline:
+        adapter = None
+
+        @staticmethod
+        def should_skip_ltx2_lora_switch_stage():
+            return False
+
+        def switch_lora_phase(self, phase, *, batch):
+            self.adapter = torch.ones(1)
+
+    pipeline = _Pipeline()
+    stage = LTX2LoRASwitchStage(pipeline, "stage2")
+    batch = SimpleNamespace(extra={})
+
+    with torch.inference_mode():
+        stage.forward(batch, SimpleNamespace())
+
+    assert pipeline.adapter is not None
+    assert not pipeline.adapter.is_inference()
+    assert batch.extra["ltx2_phase"] == "stage2"

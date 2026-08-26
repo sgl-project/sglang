@@ -50,7 +50,10 @@ class LTX2LoRASwitchStage(PipelineStage):
         if self.pipeline.should_skip_ltx2_lora_switch_stage():
             batch.extra["ltx2_phase"] = self.phase
             return batch
-        self.pipeline.switch_lora_phase(self.phase, batch=batch)
+        # The installed adapter survives this stage. Give its tensors version
+        # counters for later offload stages, which run outside inference mode.
+        with torch.inference_mode(False), torch.no_grad():
+            self.pipeline.switch_lora_phase(self.phase, batch=batch)
         batch.extra["ltx2_phase"] = self.phase
         return batch
 
