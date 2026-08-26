@@ -48,7 +48,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
-        if getattr(server_args, "enable_mis", False) and not cls.supports_mis:
+        if server_args.enable_mis and not cls.supports_mis:
             raise ValueError(
                 f"{cls.__name__} does not support multi-item scoring. "
                 "Hybrid models require a linear-attention backend that explicitly "

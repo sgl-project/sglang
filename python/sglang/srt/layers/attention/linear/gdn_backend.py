@@ -1,6 +1,6 @@
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -39,8 +39,7 @@ if is_cuda() or is_hip() or is_xpu():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 
-@dataclass(frozen=True)
-class GDNMISMetadata:
+class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
     query_seq_lens_cpu: list[int]
@@ -502,7 +501,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
-        self.enable_mis = getattr(model_runner.server_args, "enable_mis", False)
+        self.enable_mis = model_runner.server_args.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
@@ -530,7 +529,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self.mis_metadata = None
-        if getattr(forward_batch, "multi_item_delimiter_indices", None) is not None:
+        if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
             self.mis_metadata = build_gdn_mis_metadata(forward_batch)
@@ -939,7 +938,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             output[:, metadata.query_token_indices] = query_output
 
         item_ssm_indices = cache_indices[metadata.item_request_indices]
-        item_conv_states = conv_states[item_ssm_indices].contiguous().clone()
+        item_conv_states = conv_states[item_ssm_indices]
         item_conv_indices = torch.arange(
             item_ssm_indices.shape[0],
             dtype=cache_indices.dtype,
