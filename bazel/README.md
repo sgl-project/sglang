@@ -65,6 +65,28 @@ bazel test --config=cuda //bazel/integration:dummy_model_e2e
 bazel test --config=cuda //bazel/integration:qwen2_real_weight_e2e
 ```
 
+## Affected-test reporting
+
+The hosted `bazel-affected-tests` check reports the Bazel-owned part of each
+change without replacing the existing SGLang CI registry or changing which
+registered suites run:
+
+```bash
+python3 bazel/ci/affected_tests.py --base origin/main --head HEAD
+```
+
+Ordinary files become exact Bazel source labels and are followed through
+reverse dependencies to tests. Package BUILD changes seed every target in that
+package, and Starlark changes use Sky Query load edges to seed every loading
+package. Bazel/module configuration and dependency-lock changes conservatively
+select every Bazel test. Files with no direct rule owner are listed under
+`uncovered_files` so migration gaps stay visible.
+
+The JSON and GitHub summary split selected tests into CPU, CUDA, and ROCm
+groups. `manual` is orthogonal: a manual CUDA or ROCm test appears both in its
+backend group and in the manual target list. Pass `--fail-on-uncovered` when a
+fully migrated subtree should enforce graph coverage.
+
 ## Verified migration state
 
 - The Bazel-owned CPU runtime imports the public package, CLI, Engine class,

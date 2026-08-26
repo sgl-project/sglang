@@ -1,0 +1,21 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+py_binary(
+    name = "affected_tests",
+    srcs = ["affected_tests.py"],
+    main = "affected_tests.py",
+    python_version = "PY3",
+)
+
+py_test(
+    name = "affected_tests_test",
+    srcs = [
+        "affected_tests.py",
+        "affected_tests_test.py",
+    ],
+    imports = ["."],
+    main = "affected_tests_test.py",
+    python_version = "PY3",
+)

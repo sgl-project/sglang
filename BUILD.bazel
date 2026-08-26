@@ -11,6 +11,7 @@ filegroup(
 test_suite(
     name = "bazel_smoke",
     tests = [
+        "//bazel/ci:affected_tests_test",
         "//bazel/integration:runtime_import_test",
         "//bazel/python:torch_free_tests",
         "//rust/sglang-mm:rlib_is_single_threaded_test",

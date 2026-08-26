@@ -60,6 +60,34 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  affected-tests:
+    name: bazel-affected-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+
+      - name: Test affected-target selection
+        run: python3 -m unittest discover -s bazel/ci -p '*_test.py'
+
+      - name: Report affected Bazel tests
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 bazel/ci/affected_tests.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --summary-output "$GITHUB_STEP_SUMMARY"
+
   smoke:
     name: bazel-smoke
     runs-on: ubuntu-latest
