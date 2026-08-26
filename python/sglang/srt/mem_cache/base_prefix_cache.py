@@ -17,6 +17,7 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -238,6 +239,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    # Set by caches that publish KV placement events; None means they don't.
+    kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
@@ -321,6 +324,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict cache entries to cover allocator shortfalls.
+
+        The default implementation preserves the component-count semantics of
+        :meth:`evict`. Multi-component caches backed by shared memory can
+        override this entry point to stop once collateral frees make the
+        requested allocation feasible.
+        """
+        return self.evict(params)
+
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
@@ -377,7 +390,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def take_events(self):
-        return []
+        return [] if self.kv_events is None else self.kv_events.take()
 
     def supports_swa(self) -> bool:
         return False

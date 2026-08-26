@@ -31,10 +31,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(
-            enable_metrics=False,
-            enable_hisparse=False,
-        ),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
@@ -132,6 +128,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 result = SimpleNamespace(
                     copy_done=None,
+                    auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
                     logits_output=SimpleNamespace(
@@ -180,6 +177,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return SimpleNamespace(
                 copy_done=None,
+                auxiliary_host_output=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
