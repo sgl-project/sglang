@@ -131,9 +131,14 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
-        # Anchor NodeId of an in-flight H->D load-back reading this node's
-        # host slots; such host copies must not be reclaimed until the ack.
-        self.load_back_pending_id: Optional[int] = None
+        # Anchor NodeIds of in-flight H->D load-backs reading this node's
+        # host slots; such host copies must not be reclaimed until every
+        # anchor has acked. Multiple live anchors can pin one node: a
+        # descendant's Full-KV chain covers this node while another request
+        # anchors here for its independently-evicted aux (e.g. mamba) state.
+        # Overlapping transfers only READ the shared host slots and write
+        # disjoint destinations, so concurrent pins are safe to track.
+        self.load_back_pending_ids: set[int] = set()
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -1081,7 +1086,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
-        new_node.load_back_pending_id = child.load_back_pending_id
+        new_node.load_back_pending_ids = set(child.load_back_pending_ids)
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1192,7 +1197,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and cd.value is not None
             and cd.host_value is not None
             and node.write_through_pending_id is None
-            and node.load_back_pending_id is None
+            and not node.load_back_pending_ids
         )
 
     def _for_each_component_lru(
@@ -1430,7 +1435,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         if (
             node.write_through_pending_id is not None
-            or node.load_back_pending_id is not None
+            or node.load_back_pending_ids
         ):
             return False
         return cd.host_lock_ref == 0
@@ -1988,13 +1993,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 for xfer in xfers:
                     for nid in xfer.nodes_to_load or ():
                         pinned = self.node_by_id(nid)
-                        # One live load-back per node; only the same anchor may
-                        # re-pin (a node can sit in Full and aux transfer lists).
-                        assert pinned.load_back_pending_id in (None, node_id), (
-                            f"node {nid} pinned by load-back "
-                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                        )
-                        pinned.load_back_pending_id = node_id
+                        # Multiple live load-backs may pin one node (set.add is
+                        # also idempotent for a node sitting in both the Full and
+                        # an aux transfer list of the same anchor).
+                        pinned.load_back_pending_ids.add(node_id)
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -2025,10 +2027,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(anchor_node_id)
         while node is not None and node is not self.root_node:
             if self.is_write_back:
-                if node.load_back_pending_id != anchor_node_id:
+                if anchor_node_id not in node.load_back_pending_ids:
                     node = node.parent
                     continue
-                node.load_back_pending_id = None
+                node.load_back_pending_ids.discard(anchor_node_id)
+                # The loaded copies become tracked duplicates only once the
+                # last in-flight load-back on this node acks.
             self._update_duplicate_tracking(node)
             node = node.parent
 
@@ -2314,13 +2318,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # mark would pin the node's host copy against reclaim forever.
         ongoing_load_ids = {node_id for _, node_id in ongoing_load_back}
         for node in all_nodes:
-            if (
-                node.load_back_pending_id is not None
-                and node.load_back_pending_id not in ongoing_load_ids
-            ):
+            stale_pins = node.load_back_pending_ids - ongoing_load_ids
+            if stale_pins:
                 E(
-                    f"[Ongoing] node {node.id} load_back_pending_id="
-                    f"{node.load_back_pending_id} has no live load-back"
+                    f"[Ongoing] node {node.id} load_back_pending_ids="
+                    f"{sorted(stale_pins)} have no live load-back"
                 )
 
         if errors:
