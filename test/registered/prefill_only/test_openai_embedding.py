@@ -3,7 +3,6 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -15,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=91, stage="base-b", runner_config="1-gpu-small")
@@ -42,7 +42,7 @@ class TestOpenAIEmbedding(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_embedding_single(self):
         """Test single embedding request"""
@@ -147,7 +147,7 @@ class TestMatryoshkaEmbeddingModel(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process"):
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_matryoshka_embedding_valid_dimensions(self):
         """Test Matryoshka embedding with valid dimensions."""
