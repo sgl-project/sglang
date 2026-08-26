@@ -529,6 +529,17 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
+        if self._verify_planner.has_fixed_verify_len:
+            from sglang.srt.layers.dp_attention import DpPaddingMode
+
+            fixed_width = self._verify_planner.fixed_verify_len
+            scaled_tokens = [int(n) * fixed_width for n in batch.global_num_tokens]
+            if not DpPaddingMode.get_dp_padding_mode(
+                batch.is_extend_in_batch, scaled_tokens
+            ).is_max_len():
+                # SUM_LEN keeps idle ranks at zero tokens.  Materializing the
+                # graph tier here would make ForwardBatch pad fixed_width -> 0.
+                return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
             return None
@@ -598,7 +609,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch,
+                    idle_layout=self._idle_verify_ragged_layout(batch),
+                    num_tokens_per_req=(
+                        self._verify_planner.fixed_verify_len
+                        if self._verify_planner.has_fixed_verify_len
+                        else None
+                    ),
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -745,6 +762,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
+                    num_tokens_per_req=(
+                        self._verify_planner.fixed_verify_len
+                        if self._verify_planner.has_fixed_verify_len
+                        else None
+                    ),
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(

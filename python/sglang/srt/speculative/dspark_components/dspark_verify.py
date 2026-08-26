@@ -182,6 +182,7 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
+        num_tokens_per_req: Optional[int] = None,
     ) -> None:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
@@ -199,6 +200,11 @@ class TargetVerifyExecutor:
                 (num_dummy_tokens,), dtype=torch.int64, device=device
             ),
             draft_token_num=self.verify_num_draft_tokens,
+            num_tokens_per_req=(
+                int(num_tokens_per_req)
+                if num_tokens_per_req is not None
+                else self.verify_num_draft_tokens
+            ),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=idle_layout,
@@ -352,11 +358,17 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        num_tokens_per_req: Optional[int] = None,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
             positions=ragged_window.positions,
             draft_token_num=self.verify_num_draft_tokens,
+            num_tokens_per_req=(
+                int(num_tokens_per_req)
+                if num_tokens_per_req is not None
+                else self.verify_num_draft_tokens
+            ),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
@@ -394,6 +406,7 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
+        num_tokens_per_req: Optional[int] = None,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -412,6 +425,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            num_tokens_per_req=num_tokens_per_req,
         )
         logits_output = target_verify.logits_output
 
