@@ -44,6 +44,7 @@ def _triton_baseline(kv_buffer, loc, cache_k_nope, cache_k_rope):
         cache_k_nope,
         cache_k_rope,
         loc,
+        0,
         kv_buffer.stride(0),
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
