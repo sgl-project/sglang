@@ -988,10 +988,17 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
         return server_args, recorded
 
     def test_no_entry_changes_after_it_is_recorded(self):
+        # One shape per family of handlers that decides a graph setting. The
+        # disaggregation role and the deterministic mode each reached a handler
+        # the first three shapes never ran, and each had its own drift.
         for label, supplied in (
             ("plain", {}),
             ("cuda_graph_knobs", {"cuda_graph_max_bs_decode": 16}),
             ("chunked_prefill", {"chunked_prefill_size": 1024}),
+            ("explicit_json", {"cuda_graph_config": {"decode": {"max_bs": 12}}}),
+            ("disaggregation", {"disaggregation_mode": "prefill"}),
+            ("deterministic", {"enable_deterministic_inference": True}),
+            ("speculative", {"speculative_algorithm": "EAGLE"}),
         ):
             with self.subTest(shape=label):
                 server_args, recorded = self._resolve_recording_each_entry(**supplied)
