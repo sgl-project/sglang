@@ -22,9 +22,13 @@ class TestTensorTransportMode(CustomTestCase):
 
         for nnodes, dist_init_addr, expected in cases:
             with self.subTest(nnodes=nnodes, dist_init_addr=dist_init_addr):
+                # `nnodes` is a config-only leaf, so the stand-in carries it
+                # under `config`, where the published bag serves it.
                 parallel = SimpleNamespace(
-                    nnodes=nnodes,
-                    dist_init_addr=dist_init_addr,
+                    config=SimpleNamespace(
+                        nnodes=nnodes,
+                        dist_init_addr=dist_init_addr,
+                    ),
                 )
                 with patch(
                     "sglang.srt.multimodal.transport.get_parallel",
