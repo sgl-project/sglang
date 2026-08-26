@@ -763,6 +763,46 @@ class TestPlanAutoResidency:
         assert len(plan.promotions) == 1
         assert plan.promotions[0].target_layerwise_resident_layers == (12,)
 
+    def test_layerwise_release_can_unlock_a_more_valuable_component(self):
+        release_cold_layers = PromotionCandidate(
+            component_name="transformer_2",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=-20 * GIB_BYTES,
+            h2d_bytes_per_request=-20 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=-20 * GIB_BYTES,
+        )
+        keep_hot_encoder = PromotionCandidate(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            promoted_weight_bytes=30 * GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            permanent_residency=True,
+            active_device_delta_bytes=0,
+            inactive_device_delta_bytes=30 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=80,
+                    candidates=[release_cold_layers, keep_hot_encoder],
+                    phase_peaks_gib={"denoise": 80, "encode": 80},
+                    phase_components={
+                        "denoise": ("transformer_2",),
+                        "encode": ("text_encoder",),
+                    },
+                )
+            ]
+        )
+
+        assert {candidate.component_name for candidate in plan.promotions} == {
+            "transformer_2",
+            "text_encoder",
+        }
+
     def test_node_hostpin_is_optimized_with_the_same_selection_vector(self):
         cold_pageable = PromotionCandidate(
             component_name="cold_encoder",
@@ -1092,6 +1132,37 @@ class TestCollectPromotionCandidates:
             num_inference_steps=10,
         )
         assert candidates == []
+
+    def test_layerwise_dit_can_release_existing_resident_layers(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+                "layers.2.w": torch.zeros(16),
+                "layers.3.w": torch.zeros(16),
+            },
+            resident_layers=3,
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_promotion_candidates(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+
+        target = next(
+            candidate
+            for candidate in candidates
+            if not candidate.permanent_residency
+            and candidate.target_layerwise_resident_layers == (1,)
+            and candidate.target_layerwise_pinned_layers == ((),)
+        )
+        assert target.promoted_weight_bytes < 0
+        assert target.active_device_delta_bytes < 0
+        assert target.h2d_bytes_per_request < 0
 
     def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
         manager = _FakeLayerwiseManager(

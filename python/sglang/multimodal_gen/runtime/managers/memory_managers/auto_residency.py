@@ -672,11 +672,12 @@ def _layerwise_pin_targets(
     current_pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
 ) -> list[tuple[tuple[int, ...], ...]]:
-    """Useful HostPin frontiers for one resident-layer placement.
+    """Bounded useful HostPin frontier for one resident-layer placement.
 
-    Streamed layers have the highest pin value because they transfer every
-    denoise step. Prefixes of that deterministic value order cover every
-    capacity breakpoint without enumerating all 2^N layer subsets.
+    Streamed layers have the highest value per byte because they transfer every
+    denoise step. Deterministic prefixes keep candidate generation linear in
+    the layer count; the joint planner still evaluates those targets against
+    rank VRAM, HostPin, and transition headroom together.
     """
     ordered: list[tuple[int, int, int]] = []
     for manager_index, (manager, resident_count) in enumerate(
@@ -818,15 +819,11 @@ def collect_promotion_candidates(
         resident_targets = {current_resident_layers}
         if is_dit_component_name(name) and num_inference_steps > 1:
             for target in range(
-                max(current_resident_layers, default=0),
+                0,
                 max(manager.num_layers for manager in managers) + 1,
             ):
                 counts = tuple(min(target, manager.num_layers) for manager in managers)
-                if all(
-                    count >= current
-                    for count, current in zip(counts, current_resident_layers)
-                ):
-                    resident_targets.add(counts)
+                resident_targets.add(counts)
 
         for target_resident_layers in sorted(resident_targets):
             target_resident_bytes = sum(
@@ -887,8 +884,8 @@ def collect_promotion_candidates(
                         ),
                         host_unpin_scratch_bytes=unpin_scratch,
                         host_pin_scratch_bytes=pin_scratch,
-                        active_device_delta_bytes=max(
-                            0, target_peak_device_bytes - current_peak_device_bytes
+                        active_device_delta_bytes=(
+                            target_peak_device_bytes - current_peak_device_bytes
                         ),
                         inactive_device_delta_bytes=0,
                     )
@@ -1258,7 +1255,14 @@ def apply_promotions(
     try:
         ordered_promotions = sorted(
             plan.promotions,
-            key=lambda candidate: candidate.pinned_host_delta_bytes,
+            key=lambda candidate: (
+                max(
+                    candidate.active_device_delta_bytes,
+                    candidate.inactive_device_delta_bytes,
+                ),
+                candidate.pinned_host_delta_bytes,
+                candidate.option_key(),
+            ),
         )
         promotion_modules: dict[str, nn.Module] = {}
         snapshots: dict[str, AppliedPromotion] = {}
