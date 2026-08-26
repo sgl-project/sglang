@@ -578,8 +578,14 @@ export const Deployment = ({ config, benchmarks }) => {
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
-  const findBenchmark = (list, sel) =>
-    (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
+  // Entries may also key on overlay dims (e.g. kvDsaPair): an entry applies
+  // only when every declared key equals the selection, and the most specific
+  // match wins, so plain hw×strategy entries stay the fallback.
+  const findBenchmark = (list, sel) => {
+    const hits = (list || []).filter((b) =>
+      Object.entries(b.match || {}).every(([k, v]) => sel[k] === v));
+    return hits.sort((a, b) => Object.keys(b.match).length - Object.keys(a.match).length)[0] || null;
+  };
 
   // Accepts a single measurement object or an array; always returns an array.
   const normalizeSpeed = (speed) => {
