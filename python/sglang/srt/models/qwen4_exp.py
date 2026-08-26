@@ -67,6 +67,33 @@ from sglang.srt.utils import logger
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 
+_QWEN4_EXP_FUSED_SHARED_EXPERT_MAPPING = (
+    ("gate_proj", "w13", "w1"),
+    ("up_proj", "w13", "w3"),
+    ("down_proj", "w2", "w2"),
+)
+
+
+def _qwen4_exp_fused_shared_expert_mapping(
+    name: str, params_dict: dict, num_experts: int
+) -> tuple[str, str, int] | None:
+    """Map a separate shared-expert checkpoint tensor to its fused MoE slot."""
+    if ".mlp.shared_expert." not in name or "visual" in name:
+        return None
+
+    for projection, fused_param, shard_id in _QWEN4_EXP_FUSED_SHARED_EXPERT_MAPPING:
+        checkpoint_fragment = f".mlp.shared_expert.{projection}."
+        if checkpoint_fragment not in name:
+            continue
+        target_name = name.replace(
+            checkpoint_fragment,
+            f".mlp.experts.{fused_param}_",
+            1,
+        )
+        if target_name in params_dict:
+            return target_name, shard_id, num_experts
+    return None
+
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch._original_forward_mode is not None:
@@ -1928,9 +1955,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         buffers = dict(self.named_buffers())
 
+        modules_dict = dict(self.named_modules())
         ple_modules = {
             mod_name: mod
-            for mod_name, mod in self.named_modules()
+            for mod_name, mod in modules_dict.items()
             if isinstance(mod, Qwen4ExpNGramEmbedding)
         }
         text_config = getattr(self.config, "text_config", self.config)
@@ -1997,6 +2025,26 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             is_fused_expert = (
                 "experts.gate_up_proj" in name or "experts.down_proj" in name
             )
+
+            mlp_prefix = name.split(".shared_expert.", 1)[0]
+            mlp = modules_dict.get(mlp_prefix)
+            shared_expert_mapping = (
+                _qwen4_exp_fused_shared_expert_mapping(name, params_dict, num_experts)
+                if getattr(mlp, "enable_shared_expert_fusion", False)
+                else None
+            )
+            if shared_expert_mapping is not None:
+                mapped_name, shard_id, expert_id = shared_expert_mapping
+                param = params_dict[mapped_name]
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    mapped_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded_params.add(mapped_name)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

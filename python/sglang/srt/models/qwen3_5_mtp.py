@@ -39,12 +39,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 def _mtp_quant_config(quant_config):
@@ -249,12 +246,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         num_experts = getattr(self.config, "num_experts", None)
         # A fused shared expert lives in routed slot `num_experts`.
         num_fused_shared_experts = 0
-        if _use_aiter:
-            for module in self.modules():
-                fused = getattr(module, "num_fused_shared_experts", 0)
-                if fused:
-                    num_fused_shared_experts = fused
-                    break
+        for module in self.modules():
+            fused = getattr(module, "num_fused_shared_experts", 0)
+            if fused:
+                num_fused_shared_experts = fused
+                break
         if num_experts is not None:
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
@@ -328,11 +324,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            if (
-                _use_aiter
-                and num_fused_shared_experts > 0
-                and "mlp.shared_expert." in name
-            ):
+            if num_fused_shared_experts > 0 and "mlp.shared_expert." in name:
                 # Map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
                 name = name.replace(
                     "mlp.shared_expert.",
