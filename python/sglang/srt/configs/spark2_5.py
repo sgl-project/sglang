@@ -3,9 +3,9 @@ from typing import Any, Optional
 from transformers.configuration_utils import PretrainedConfig
 
 
-class Spark3Config(PretrainedConfig):
-    model_type = "spark3"
-    architectures = ["Spark3ForCausalLM"]
+class Spark2_5Config(PretrainedConfig):
+    model_type = "spark2_5"
+    architectures = ["Spark2_5ForCausalLM"]
 
     def __init__(
         self,
