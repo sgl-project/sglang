@@ -25,7 +25,6 @@ from sglang.srt.utils import is_cuda, is_npu
 _is_npu = is_npu()
 
 from sglang.srt.runtime_context import get_server_args
-
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -185,11 +184,7 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):
-    """FP8 activation-scale layout for DeepEP v2 -> DeepGEMM.
-
-    DeepGEMM JIT selects row-major fp32 on Hopper and column-major packed UE8M0
-    on Blackwell, keeping its configuration out of the dispatcher.
-    """
+    """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
 
     tma_aligned: bool
     ue8m0: bool
@@ -532,11 +527,7 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Return whether the backend belongs to the DeepEP family.
-
-    These backends combine across EP inside the dispatcher, so a caller must
-    take the A2A path and skip post-experts all-reduce.
-    """
+    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
     b = get_moe_a2a_backend()
     return (
         b.is_deepep()

@@ -2820,8 +2820,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
         )
         return {"disable_shared_experts_fusion": True}
     if view.moe_a2a_backend == "deepep_v2":
-        # DeepEP v2 has not validated fused shared experts yet; the handler
-        # rejects an explicit --enforce-shared-experts-fusion.
+        # Fused shared experts are not validated with DeepEP v2.
         return {"disable_shared_experts_fusion": True}
     return {}
 

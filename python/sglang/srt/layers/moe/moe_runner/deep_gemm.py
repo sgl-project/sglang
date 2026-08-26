@@ -1476,8 +1476,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
         running_state["deepep_v2_expanded"] = True
 
         if deepep_v2_use_masked:
-            # Masked-GEMM bridge: see expand_to_masked_slab -- bounds compute by
-            # per-expert masked_m instead of the dispatch capacity, cuda-graph safe.
+            # masked_m bounds each expert independently of buffer capacity.
             from sglang.kernels.ops.moe.ep_moe_kernels import expand_to_masked_slab
 
             num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
@@ -1501,10 +1500,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 expected_m=deepep_v2_expected_m,
             )
 
-        # do_cpu_sync=False -> the recv buffer is worst-case sized. ep_expand_init
-        # labels each expert's rows up to its 128-aligned end (the contiguous layout
-        # needs a whole 128-row tile to share one expert id) but never touches the
-        # tail past the last expert, so pre-fill with -1 to make the GEMM skip it.
+        # Mark aligned expert rows and leave the unused receive tail at -1.
         m_indices = torch.full(
             (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
         )
@@ -1517,7 +1513,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
             hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
         )
 
-    # The handle's psum replaces the legacy adapter's host-side count list.
     all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
     K = hidden_states.shape[1]
     running_state["all_tokens"] = all_tokens
@@ -1527,7 +1522,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    # ep_gather reads only real rows, so activation padding may stay uninitialized.
     input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
@@ -1544,9 +1538,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
-    # ElasticBuffer's non-expand psum includes alignment padding. The dispatcher
-    # pins that alignment to the grouped GEMM's 128 rows, so psum[e-1] is already
-    # a valid group start. Do not align again: that would hide a contract break.
+    # Contiguous psum already includes the 128-row expert alignment.
     expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
     ep_scatter_from_psum(
         hidden_states,
@@ -1586,8 +1578,7 @@ def post_permute_deep_gemm_to_deepep_v2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if running_state.get("deepep_v2_masked", False):
-            # Repack the [E_local, max_m, hidden] slab to expanded order and fold
-            # in top-k weights, which expanded combine does not consume.
+            # Expanded combine does not consume top-k weights.
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(
@@ -1599,9 +1590,7 @@ def post_permute_deep_gemm_to_deepep_v2(
             )
             return DeepEPv2CombineInput(hidden_states, None)
         if topk_weights is not None:
-            # Expanded combine does not consume top-k weights, so apply them to
-            # each expert slot before combine. Keep this out-of-place until the
-            # runner/communication buffer reuse contract is explicitly audited.
+            # Expanded combine does not consume top-k weights.
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)

@@ -50,7 +50,6 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
-        # Backstop for quant methods that resolve the per-layer runner to Triton.
         if get_moe_a2a_backend().is_deepep_v2() and not runner_backend.is_deep_gemm():
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "

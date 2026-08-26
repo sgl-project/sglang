@@ -25,9 +25,7 @@ from sglang.srt.layers.moe.utils import (
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
-# Per-expert row alignment requested from ElasticBuffer. Must equal DeepGEMM's
-# get_m_alignment_for_contiguous_layout() so the non-expand psum doubles as a
-# valid group-start table for the contiguous grouped GEMM.
+# Must match DeepGEMM's contiguous expert alignment.
 _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
 _fp8_quant_import_error: Optional[BaseException] = None
@@ -114,8 +112,6 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # Fixed at server init; standalone tests pass allow_hybrid_mode directly
-    # because they have no process-wide runtime config.
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().moe.deepep_v2_mode == "hybrid"
@@ -167,8 +163,7 @@ class DeepEPv2Buffer:
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
-        # Every key member must change identically on all ranks: rebuilding the
-        # ElasticBuffer enters a collective barrier in its constructor.
+        # A key change rebuilds ElasticBuffer collectively on every rank.
         key = (
             group,
             hidden_size,
@@ -181,13 +176,10 @@ class DeepEPv2Buffer:
         if state.buffer is not None and state.key == key:
             return state.buffer
 
-        # ElasticBuffer self-destructs with its last reference; explicit destroy
-        # requires explicitly_destroy=True.
+        # Native explicit teardown is unavailable unless explicitly_destroy=True.
         cls.destroy()
 
-        # Reusing the process group's NCCL communicator (DeepEP's default) needs a
-        # device-bound group, which SGLang's shared init does not give: it segfaults
-        # in ncclTeamWorld. Let DeepEP create its own; a user value still wins.
+        # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
         buffer = ElasticBuffer(
             group,
@@ -254,7 +246,7 @@ class _DeepEPv2Impl:
             self.hidden_size,
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
-            True,  # deepep_v2 always dispatches FP8 activations + scales
+            True,
         )
 
     def _validate_common(
@@ -286,7 +278,6 @@ class _DeepEPv2Impl:
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DeepEPv2DispatchOutput:
-        # Check state before imports so misuse is reportable without DeepEP installed.
         if self._handle is not None:
             raise RuntimeError(
                 "DeepEP v2 dispatch called while the previous dispatch handle is "
@@ -296,24 +287,15 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Layout follows inference phase, not communication mode: decode takes the
-        # expanded layout (masked GEMM + CUDA graph); extend takes the non-expanded one.
+        # Decode uses expanded/masked layout; extend uses contiguous in both modes.
         use_expand_layout = not get_is_extend_in_batch()
-        # Masked GEMM consumes expanded layout. cpu_sync=False keeps its recv shape
-        # static for capture, while masked_m bounds the compute.
         use_masked = use_expand_layout
 
-        # An idle rank with 0 tokens never fires the dispatch notify warps, so no
-        # rank's recv count becomes ready and the do_cpu_sync readback hangs. Pad to
-        # one dummy token; combine() slices it back off. The masked path does not
-        # read counts back, so it tolerates empty.
+        # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
-            # A token's top-k experts must be DISTINCT valid ids: duplicates (e.g.
-            # all-zero -> expert 0 repeated) fault the dispatch kernel. Route the
-            # dummy to experts [0, 1, ..., topk-1] with zero weights so it
-            # contributes nothing even before combine() slices it off.
+            # Dummy routes need distinct expert ids; zero weights null the result.
             topk_ids = torch.arange(
                 topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
             ).unsqueeze(0)
@@ -321,9 +303,6 @@ class _DeepEPv2Impl:
 
         _ensure_fp8_quant_available()
         if use_masked:
-            # Blackwell emits the col-major UE8M0 layout consumed by masked GEMM.
-            # Hopper emits row-major fp32; _run_masked_gemm performs its own
-            # e8m0/TMA-major alignment.
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -339,12 +318,9 @@ class _DeepEPv2Impl:
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
-        # Collective arg: every rank must pass the same value, so use the fixed cap.
-        # Deriving it from the local batch would disagree across ranks under ragged DP.
+        # This collective argument must not depend on a rank-local batch.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        # The contiguous path reads exact per-expert counts on the CPU and must wait
-        # for the GPU to write them; without this the CPU reads zeros on multi-node
-        # dispatch. The masked path stays async so it can be captured.
+        # Masked dispatch stays asynchronous for CUDA graph capture.
         do_cpu_sync_val = True
         if use_masked:
             do_cpu_sync_val = False
@@ -364,8 +340,6 @@ class _DeepEPv2Impl:
         )
         self._handle = handle
         local_tokens = hidden_states.shape[0]
-        # GPU stream dependency, not a CPU sync; the masked decode path remains
-        # CUDA-graph capturable.
         if event.event is not None:
             event.current_stream_wait()
 
@@ -376,8 +350,7 @@ class _DeepEPv2Impl:
             recv_hidden_states_scale = None
 
         if use_expand_layout:
-            # Native expanded layout has no recv_topk_idx; combine uses handle
-            # metadata and expects top-k weights applied beforehand.
+            # Expanded combine uses handle metadata instead of recv_topk_idx.
             local_topk_ids = None
         else:
             num_recv_tokens = int(
@@ -389,25 +362,20 @@ class _DeepEPv2Impl:
             if recv_hidden_states_scale is not None:
                 recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
-            # Dispatch already maps global expert ids to local ids and marks non-local
-            # choices -1; avoid a max().item() host sync.
             local_topk_ids = recv_topk_idx
 
         expected_m = 0
         masked_max_m = 0
         total_expanded = 0
         if use_masked:
-            # expected_m is a schedule hint, not a bound -- masked_m on the GPU is the
-            # real per-expert bound -- so deriving it from the local batch is safe.
+            # expected_m is only a schedule hint; masked_m is the actual bound.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(
                 1,
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # A local expert receives from every rank and each sends at most `cap`, so
-            # cap * ep_group_size is the worst case. Sizing the slab from the local batch
-            # would overflow under skewed DP.
+            # Account for the worst case where every rank targets one local expert.
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
@@ -439,11 +407,9 @@ class _DeepEPv2Impl:
                 handle=self._handle,
                 topk_weights=combine_input.topk_weights,
             )
-            # Stream dependency, not a CPU sync (graph-safe).
             if event.event is not None:
                 event.current_stream_wait()
             if self._pad_empty_combine:
-                # Drop the dummy token padded onto this idle rank's empty batch.
                 combined_x = combined_x[:0]
             return combined_x
         finally:
@@ -481,7 +447,6 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
 
-    # Single-shot only: TBO/SBO are rejected at server start.
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:

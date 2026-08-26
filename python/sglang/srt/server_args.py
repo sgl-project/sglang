@@ -4041,8 +4041,7 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
-        # Validate DeepEP v2 after all inference-phase and batch-size writers,
-        # while resolved_view can still see unmaterialized declarations.
+        # Validate after all batch-size declarations are visible.
         self._validate_deepep_v2_speculative_draft()
         self._validate_deepep_v2_dispatch_token_budget()
 
@@ -7585,12 +7584,9 @@ class ServerArgs:
                     "Disable --enable-deterministic-inference or use "
                     "--moe-a2a-backend deepep."
                 )
-            # ElasticBuffer needs NCCL symmetric memory; seeding it here avoids
-            # --enable-symm-mem's NVLS and 4GB prealloc. A user value still wins.
+            # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
             os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-            # A model declaration may already have claimed the runner, and a
-            # declaration made here replays last, so resolving auto off the raw
-            # field would silently outrank it. Read the resolving view instead.
+            # Respect model-level runner declarations before resolving auto.
             resolved_runner = resolved_view(self).moe_runner_backend
             if resolved_runner == "auto":
                 self._declare("_handle_a2a_moe", moe_runner_backend="deep_gemm")
@@ -7616,8 +7612,7 @@ class ServerArgs:
                     "Remove --enforce-shared-experts-fusion when using "
                     "--moe-a2a-backend deepep_v2."
                 )
-            # Decode is capturable under either comm mode: the masked layout is
-            # chosen by phase. Prefill reads exact counts back on the host.
+            # Prefill reads host counts and is not graph-capturable.
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."

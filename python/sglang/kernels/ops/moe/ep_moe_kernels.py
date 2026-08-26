@@ -2157,17 +2157,13 @@ def fp8_per_token_to_per_tensor_quant_triton(
     )
 
 
-# psum semantics differ by layout. Expanded: psum[e] = align(psum[e-1], ALIGN)
-# + count_e, so expert e owns rows [align(psum[e-1]) : psum[e]). Contiguous:
-# psum[e] is the prefix sum of alignment-PADDED counts, so psum[e-1] is already
-# expert e's aligned group start.
+# Expanded psum starts each expert at align(psum[e-1]); contiguous psum already
+# includes the alignment padding.
 
 _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT = 64
 
 
-# recv_x_scale_stride1 carries the scale pack-dim stride so the repack reads
-# both row-major (Hopper fp32) and column-major packed UE8M0 (Blackwell int32)
-# dispatch-scale layouts correctly.
+# Scale strides support row-major FP32 and packed column-major UE8M0.
 @triton.jit
 def _fwd_kernel_expand_to_masked_slab(
     psum_ptr,
@@ -2191,8 +2187,7 @@ def _fwd_kernel_expand_to_masked_slab(
     CHECK_OVERFLOW: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
-    # Fixed workers visit only real rows, so a conservative max_m adds no programs
-    # and the grid remains CUDA-graph static.
+    # A fixed worker grid makes conservative max_m values graph-safe.
     e = tl.program_id(0)
     worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
@@ -2203,8 +2198,7 @@ def _fwd_kernel_expand_to_masked_slab(
     if worker == 0:
         tl.store(masked_m_ptr + e, count)
         if CHECK_OVERFLOW:
-            # Eager reports invalid bounds; graph replay relies on the static
-            # cap * ep_size bound and omits this host-visible flag.
+            # Graph capture omits this host-visible overflow flag.
             ovf = tl.arange(0, 1)
             tl.store(overflow_ptr + ovf, 1, mask=raw_count > MAX_M)
     off = tl.arange(0, HIDDEN_PAD)
@@ -2258,9 +2252,7 @@ def expand_to_masked_slab(
     )
     if is_fp8:
         sh = recv_x_scale.shape[1]
-        # Store physical [E, sh, max_m], then return an mn-major [E, max_m, sh]
-        # view. Blackwell consumes it directly; Hopper's TMA alignment helper is
-        # then a no-op.
+        # Store [E, sh, max_m] so the returned transpose is mn-major.
         output_tensor_scale = torch.empty(
             (num_local_experts * sh, max_m),
             device=recv_x.device,
@@ -2299,9 +2291,7 @@ def expand_to_masked_slab(
         NUM_WORKERS=num_workers,
         num_warps=4,
     )
-    # Eager fails on overflow; capture skips the host read. Replay relies on
-    # max_m = cap * ep_group_size: each rank sends at most cap tokens and each token
-    # reaches a local expert at most once. Revalidate if either invariant changes.
+    # Capture relies on max_m = cap * ep_group_size; eager also checks counts.
     if check_overflow and int(overflow.item()) != 0:
         raise RuntimeError(
             f"DeepEP v2 masked slab overflow: an expert received more than max_m="
@@ -2331,7 +2321,6 @@ def _fwd_kernel_masked_slab_to_expand(
     HAS_W: tl.constexpr,
     NUM_WORKERS: tl.constexpr,
 ):
-    # Fixed worker pool; see _fwd_kernel_expand_to_masked_slab. cuda-graph safe.
     e = tl.program_id(0)
     worker = tl.program_id(1)
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
@@ -2375,7 +2364,7 @@ def masked_slab_to_expand(
     if has_w:
         weight_arg = topk_weights.reshape(-1).to(torch.float32).contiguous()
     else:
-        weight_arg = input_tensor2d  # dummy, unused
+        weight_arg = input_tensor2d
     num_workers = min(max_m, _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT)
     _fwd_kernel_masked_slab_to_expand[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
