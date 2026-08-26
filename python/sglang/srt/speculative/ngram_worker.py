@@ -541,9 +541,7 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens = inputs.accept_tokens[
                 req_idx * stride : req_idx * stride + accept_len
             ]
-            output_tail = (
-                list(req.output_ids[-self.max_trie_depth :]) + accept_tokens
-            )
+            output_tail = list(req.output_ids[-self.max_trie_depth :]) + accept_tokens
             req_ids.append(req.rid)
             base_tokens.append(
                 self._efficient_concat_last_n(
@@ -553,9 +551,7 @@ class NGRAMWorker(BaseSpecWorker):
                 )
             )
             base_total_lens.append(
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + len(accept_tokens)
+                len(req.origin_input_ids) + len(req.output_ids) + len(accept_tokens)
             )
         return req_ids, base_tokens, base_total_lens
 

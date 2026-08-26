@@ -8,11 +8,11 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
-from sglang.srt.speculative.ngram_precompute import extract_local_accept_path_nodes
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
+from sglang.srt.speculative.ngram_precompute import extract_local_accept_path_nodes
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
