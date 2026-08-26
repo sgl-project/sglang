@@ -1089,7 +1089,6 @@ class LayerwiseOffloadManager:
                 exc,
             )
             self._mapped_courier = None
-            self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
         return self._mapped_courier
 
     def _collect_mapped_layer(self, layer_idx: int) -> None:
