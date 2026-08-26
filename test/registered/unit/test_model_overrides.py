@@ -1214,26 +1214,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], declared_values[-1]
         )
 
-    def test_post_materialize_pass_writes_through(self):
+    def test_a_pass_after_resolution_declares_without_writing(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
 
-        # A pass invoked after materialization (a post-init slot, like the
-        # legacy runner-side adjustments) declares AND writes through, so
-        # field readers and the publish see the same end state.
+        # `check_server_args` hosts such a slot, so this runs in production.
         sa = self._construct("LlamaForCausalLM", "llama")
-        resolved_before = self._resolved(sa, "attention_backend")
+        raw_before = sa.attention_backend
 
         def _force_triton(view):
-            if view.attention_backend != "triton":
-                return {"attention_backend": "triton"}
-            return {}
+            return {"attention_backend": "triton"}
 
         run_post_process_pass(sa, _force_triton)
-        if resolved_before != "triton":
-            self.assertEqual(self._resolved(sa, "attention_backend"), "triton")
+
+        self.assertEqual("triton", self._resolved(sa, "attention_backend"))
         self.assertEqual(
-            (self._publish(sa), self._leaf("attention_backend"))[1],
-            self._resolved(sa, "attention_backend"),
+            (self._publish(sa), self._leaf("attention_backend"))[1], "triton"
+        )
+        self.assertEqual(
+            raw_before,
+            sa.attention_backend,
+            "the pass wrote the field, so the record stopped answering with the "
+            "operator's input",
         )
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
