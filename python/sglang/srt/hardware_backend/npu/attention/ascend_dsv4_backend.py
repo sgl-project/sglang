@@ -896,6 +896,13 @@ class C4IndexerAscendBackendMixin:
                 "lipt",
             )
             record_oob_extremes("liq", q_int8)
+            # §24.48 q-lens audit: the indexer kernel's whole output-offset
+            # arithmetic is driven by actual_seq_lengths_q/kv prefix sums
+            # (kernel.h:561). Garbage lens -> garbage offsets -> the 4299
+            # proc-junk output signature. Record their device-side min/max
+            # here (zero-sync; polled in [mf-scatter]'s existing D2H).
+            record_oob_extremes("qseq", fm.actual_seq_lengths_q)
+            record_oob_extremes("kseq", fm.actual_seq_lengths_kv)
         except Exception:
             pass
         kwargs = dict(

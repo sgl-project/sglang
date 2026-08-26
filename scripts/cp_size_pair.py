@@ -1649,6 +1649,24 @@ def main():
             "logprob/move_logprobs family (fp32 payload, "
             "glue:entry catch)."
         )
+        print(
+            "      -> VERDICT (§24.48/§24.50 seq-lens audit): "
+            "'qseq:min' < 0 or 'qseq:max'/'kseq:max' beyond the max "
+            "context (or 'kseq:min' < 0) => the HOST-side lens tensor "
+            "was ALREADY dirty at the indexer call -> every "
+            "indiceOutOffset (kernel.h:535-546 prefix-sum arithmetic) "
+            "is garbage, and the proc-junk output is DOWNSTREAM of bad "
+            "lens -> fix the H2D/build path (cumsum(extend_seq_lens)), "
+            "not the kernel. qseq/kseq clean while "
+            "'c4topk:proc-junk' > 0 => lens are innocent: the garbage "
+            "is INTERNAL to the kernel -> §24.50 static-audit reading "
+            "(score-bit pattern -2.0/NaN landing in index slots; prime "
+            "suspect = multi-core LD reduction workspace race, value "
+            "region never initialized) -> convict via single-core A/B "
+            "(force usedCoreNum=1, disables S2 split + LD path: "
+            "garbage vanishes = LD race convicted) + DUMP_OP on the "
+            "catching rank only."
+        )
         if any_pt:
             print(
                 "      -> VERDICT (page tables, §24.43): 'swapt*:neg' > 0 => "

@@ -328,6 +328,21 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
+        # §24.48 q-lens audit (CP split path): the same lens-driven offset
+        # arithmetic as the non-CP indexer; garbage in the prev/next halves
+        # lands in the output offsets. Zero-sync; polled in [mf-scatter].
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                record_oob_extremes,
+            )
+
+            record_oob_extremes("qseq:cp-prev", actual_seq_lengths_q_prev)
+            record_oob_extremes("qseq:cp-next", actual_seq_lengths_q_next)
+            record_oob_extremes("kseq:cp-prev", actual_seq_lengths_kv_prev)
+            record_oob_extremes("kseq:cp-next", actual_seq_lengths_kv_next)
+        except Exception:
+            pass
+
         topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
             key=past_key_states,
