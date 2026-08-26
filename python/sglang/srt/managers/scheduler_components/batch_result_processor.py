@@ -70,7 +70,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +80,6 @@ class SchedulerBatchResultProcessor:
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
-    server_args: ServerArgs
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -280,7 +278,6 @@ class SchedulerBatchResultProcessor:
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
-                self.server_args,
             )
 
             # Check finish conditions
@@ -617,10 +614,7 @@ class SchedulerBatchResultProcessor:
             )
 
     @staticmethod
-    def _get_prefill_hidden_capture_mode(
-        batch: ScheduleBatch,
-        server_args: ServerArgs,
-    ) -> CaptureHiddenMode:
+    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
