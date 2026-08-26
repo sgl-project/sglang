@@ -14,6 +14,14 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.pp_admission import (
+    PPAdmissionMessage,
+    PPAdmissionState,
+    PPAdmissionVerdict,
+    prepare_forward_message,
+    publication_for_stage,
+    route_aborts_to_failed,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -24,6 +32,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -47,6 +56,9 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+_PP_ADMIT_FLOW = envs.SGLANG_PP_PD_ADMIT_FLOW.get()
+_PP_ADMIT_FLOW_MARGIN = envs.SGLANG_PP_PD_ADMIT_FLOW_MARGIN.get()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -253,6 +265,23 @@ class SchedulerPPMixin:
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
+                if _PP_ADMIT_FLOW:
+                    # Apply before batch construction on every rank.
+                    self.pp_retry_deferred_bootstrap()
+                    message = PPAdmissionMessage.from_payload(bootstrapped_rids)
+                    if message is not None:
+                        applied = self._pp_admit_flow_admit(message.verdict)
+                        published = publication_for_stage(
+                            self.pp_group.is_first_rank,
+                            message.verdict,
+                            applied,
+                        )
+                        bootstrapped_rids = prepare_forward_message(
+                            message,
+                            published,
+                            self.pp_admission_state.local_failures,
+                        ).to_payload()
+                        bmbs[mb_id] = bootstrapped_rids
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -317,9 +346,16 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
+                    if _PP_ADMIT_FLOW:
+                        self._pp_admit_flow_apply_uniform_failures(
+                            next_consensus_bootstrapped_rids
+                        )
+                    else:
+                        next_consensus_bootstrapped_rids = (
+                            self.process_bootstrapped_queue(
+                                next_consensus_bootstrapped_rids
+                            )
+                        )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -360,6 +396,8 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
+
+                self.pp_admission_state.step += 1
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -487,7 +525,7 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
@@ -557,7 +595,7 @@ class SchedulerPPMixin:
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
@@ -567,6 +605,7 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             self.ps.pp_size + get_parallel().config.pp_async_batch_depth
         )
+        self.pp_admission_state = PPAdmissionState()
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not get_parallel().config.enable_dsa_prefill_context_parallel
@@ -839,6 +878,17 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
+            if _PP_ADMIT_FLOW:
+                good_bootstrapped_rids = self._pp_admit_flow_apply_margin(
+                    good_bootstrapped_rids
+                )
+        elif _PP_ADMIT_FLOW:
+            # Forward PP0's verdict verbatim; local readiness is handled later.
+            message = PPAdmissionMessage.from_payload(
+                self._pp_recv_pyobj_from_prev_stage()
+            )
+            assert message is not None
+            return message.to_payload()
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -866,10 +916,71 @@ class SchedulerPPMixin:
             for req in self.disagg_prefill_bootstrap_queue.queue
             if isinstance(req.finished_reason, FINISH_ABORT)
         }
-        good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
+        good_bootstrapped_rids, bad_bootstrapped_rids = route_aborts_to_failed(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
+
+    def _pp_admit_flow_apply_margin(self: Scheduler, good_rids: List[str]):
+        """Give other ranks a bounded sender-handshake head start."""
+        return self.pp_admission_state.apply_margin(
+            good_rids,
+            _PP_ADMIT_FLOW_MARGIN,
+            (req.rid for req in self.disagg_prefill_bootstrap_queue.queue),
+        )
+
+    def _pp_admit_flow_admit(
+        self: Scheduler, intended: PPAdmissionVerdict
+    ) -> Optional[PPAdmissionVerdict]:
+        """Apply PP0's verdict and report local queue divergence."""
+        offered = intended.with_deferred(self.pp_admission_state.deferred_rids)
+        applied_payload = self.process_bootstrapped_queue(offered.to_payload())
+        applied = PPAdmissionVerdict.from_payload(applied_payload)
+        if applied is None:
+            return None
+
+        self.pp_admission_state.clear_applied(applied)
+        if self.pp_group.is_first_rank:
+            return applied
+
+        missing = (
+            offered.all_rids
+            - applied.all_rids
+            - set(self.pp_admission_state.deferred_rids)
+        )
+        if missing:
+            logger.warning(
+                "PP admission queue mismatch on rank=%d: %d request(s) are "
+                "not present locally: %s",
+                self.ps.pp_rank,
+                len(missing),
+                sorted(missing)[:8],
+            )
+        return applied
+
+    def _pp_admit_flow_apply_uniform_failures(self: Scheduler, payload: object) -> None:
+        """Abort failures after their report completes the existing PP ring.
+
+        A failure detected after this body's forward message waits for the next
+        body. This keeps the P2P schedule unchanged at the cost of one ring of
+        failure-reporting latency.
+        """
+        message = PPAdmissionMessage.from_payload(payload)
+        if message is None:
+            return
+        failures = self.pp_admission_state.consume_uniform_failures(
+            message.local_failures
+        )
+        for rid in failures:
+            error = "PP admission failed because one pipeline stage lost its sender"
+            logger.warning("%s: rid=%s", error, rid)
+            self.abort_request(
+                AbortReq(
+                    rid=rid,
+                    abort_message=error,
+                    finished_reason=FINISH_ABORT(error).to_json(),
+                )
+            )
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1414,24 +1525,10 @@ class SchedulerPPMixin:
             for decode_req in self.disagg_decode_prealloc_queue.queue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
         }
-        good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
+        good_prealloc_rids, bad_prealloc_rids = route_aborts_to_failed(
             good_prealloc_rids, bad_prealloc_rids, aborted_rids
         )
         return [good_prealloc_rids, bad_prealloc_rids]
-
-    @staticmethod
-    def _route_aborts_to_bad(good_rids, bad_rids, aborted_rids):
-        """Move aborted rids out of the good (intersection) set and into the
-        bad (union) set, so PP consensus fails them uniformly on every rank.
-
-        This also flushes aborted reqs that never reached good/bad consensus
-        (e.g. stuck in Bootstrapping with a sender that has no working abort()).
-        """
-        if not aborted_rids:
-            return good_rids, bad_rids
-        good_rids = [rid for rid in good_rids if rid not in aborted_rids]
-        bad_rids = list(set(bad_rids) | set(aborted_rids))
-        return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # get the current stage transfer success
