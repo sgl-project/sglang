@@ -535,9 +535,9 @@ class TestSuppliedInstanceExposure(CustomTestCase):
 
         ``MODEL_OVERRIDES`` maps arch -> {field: value}, and the
         ``@register_model_override``(-``_predicate``) providers return (or
-        build by subscript) {field: value} dicts; ``materialize_declarations``
-        applies them all via setattr, so no assignment scan sees these writes
-        and a llama-only matrix never triggers them. Keys must be
+        build by subscript) {field: value} dicts, which go straight into the
+        declaration stash, so no assignment scan sees these writes and a
+        llama-only matrix never triggers them. Keys must be
         string literals; anything else fails loudly.
         """
         tree = ast.parse(

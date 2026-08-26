@@ -24,9 +24,10 @@ getters. The resolved parallel **configuration** is the same object's ``config``
 hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
 bag: bare is the live group, ``config`` is what was configured.
 
-``get_server_args()`` returns the process-wide ``ServerArgs``. This is the pristine / resolved-at-startup **read-only** record kept
-for debug and reproduction; business code reads resolved config from the
-namespace bags below, not from this object. The context owns the storage:
+``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
+user's raw input, kept **read-only** for debug and reproduction; what
+resolution decided lives in the declarations (``resolution_result``) and, for
+business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
 ``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
 shims over this slot).
@@ -440,8 +441,8 @@ class DpFlags(_FlagGroupBase):
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
-    Resolved configuration lives on ``server_args`` fields (materialized at
-    the end of ``__post_init__``) — this tier only carries genuine runtime
+    Resolved configuration lives in the config bags below (projected from the
+    declarations at publish) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
     """
@@ -700,8 +701,7 @@ def _build_config_bags(server_args: Any) -> dict:
     """Snapshot the resolution result into the namespace bag tree, driven by
     the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
     ``resolution_result`` -- the declaration if resolution made one, else what
-    the caller supplied -- rather than from the field, which carries the same
-    value only while declarations still materialize. Returns
+    the caller supplied. Returns
     ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
     Only dataclass fields carry ``NS`` markers, so derived properties/methods are
     naturally excluded (they stay on the bag). A name used as both a leaf and a
@@ -783,7 +783,13 @@ class RuntimeContext:
         if stream is None:
             import torch
 
-            device = self._server_args.device if self._server_args else "cuda"
+            from sglang.srt.arg_groups.overrides import resolution_result
+
+            device = (
+                resolution_result(self._server_args, "device")
+                if self._server_args
+                else "cuda"
+            )
             stream = torch.get_device_module(device).Stream()
             self.resources.streams[name] = stream
         return stream
@@ -819,8 +825,8 @@ class RuntimeContext:
         Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
         per test; production ordering discipline lives at the call-sites, e.g.
         the draft-worker guard in ``ModelRunner.__init__``). The published
-        object already carries the resolved configuration (declarations
-        materialize at the end of ``__post_init__``).
+        object is the raw input; the resolution it carries is its declaration
+        stash, which is what the bags are projected from.
         """
         # Seed the capture tier for the new lifecycle (defaults for sentinel
         # and mock publishes, which carry no config).
@@ -1078,10 +1084,11 @@ class _ServerArgsOverride:
         }
         if declared:
             declare_late_resolution(server_args, "override_server_args", **declared)
-        _apply_fields(
-            server_args,
-            {name: value for name, value in self._fields.items() if name[0] == "_"},
-        )
+        # This hook stands in for a launch: the caller's values are both what
+        # the operator passed and what resolution decided, so they go on the
+        # record as well as into the stash. Production late resolution declares
+        # only -- there the record stays the operator's input.
+        _apply_fields(server_args, self._fields)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args

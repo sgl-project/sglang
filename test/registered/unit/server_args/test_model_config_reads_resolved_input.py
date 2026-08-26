@@ -26,8 +26,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
 # Read for what the caller asked for: the constructor passes it through and
-# never stores it, while resolution later overwrites the field with the value
-# the architecture implies. Two quantities sharing one name.
+# never stores it, while resolution declares the value the architecture implies.
+# Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
 # Declared after the first `get_model_config()`, so the cached configuration
