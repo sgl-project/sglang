@@ -317,6 +317,21 @@ def _drain():
                     pass
         except Exception:
             pass
+        # §24.41 Run 26: unclamped-scatter audit snapshot AT CATCH TIME. The
+        # prefill.py [mf-scatter] readout is gated inside the [mf-raw] dirty
+        # branch, which can stay silent while catches fire (Run 25: 10
+        # catches, 0 mf-raw) -- read the counters here instead; _drain has
+        # already synced (.tolist above), so no new D2H is introduced.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                get_scatter_oob_counts as _oob,
+            )
+
+            _c = _oob()
+            if any(_c.values()):
+                logger.error("[mf-scatter] catch-time OOB scatters: %s", _c)
+        except Exception:
+            pass
         _pend["fired"] = True
         # Keep the evidence buffer; no further snapshots this forward.
 

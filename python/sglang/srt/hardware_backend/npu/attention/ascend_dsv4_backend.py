@@ -2036,6 +2036,59 @@ class DeepseekV4AscendAttnBackend(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
+    def _audit_block_table(
+        self,
+        table: Optional[torch.Tensor],
+        num_pages: int,
+        page_size: int,
+        seqused: Optional[torch.Tensor],
+        tag: str,
+    ) -> None:
+        """§24.42/24.43: audit page ids in the region the attention kernel reads.
+
+        ``npu_sparse_attn_sharedkv`` computes KV addresses as
+        ``kv + block_table[b, p] * page_stride`` with no masking, so a -1
+        entry (full_to_swa invalid sentinel / graph tail fill / garbage r2t
+        loc in the block_tables fallback) makes the CANN kernel touch memory
+        *below* the pool base -- the r2t corruption geometry. Records, all
+        device-side (zero-sync): neg/hi counts, valid-region min/max page
+        id, and the first negative (row, col).
+        """
+        try:
+            if table is None or table.numel() == 0 or seqused is None:
+                return
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob,
+                record_oob_extremes,
+                record_oob_first_rc,
+            )
+
+            rows = min(table.shape[0], seqused.shape[0])
+            if rows <= 0:
+                return
+            pages = (
+                seqused[:rows].to(torch.int64) + page_size - 1
+            ) // page_size
+            col = torch.arange(table.shape[1], device=table.device).unsqueeze(0)
+            mask = col < pages.unsqueeze(1)
+            t = table[:rows].to(torch.int64)
+            negm = (t < 0) & mask
+            # NOTE: no boolean-index compression (t[mask]) anywhere -- nonzero
+            # is illegal inside a captured stream (§24.43 Run 27). Fixed-shape
+            # where/min/max/sum only.
+            count_scatter_oob(negm.reshape(-1), f"{tag}:neg")
+            if num_pages > 0:
+                him = (t >= num_pages) & mask
+                count_scatter_oob(him.reshape(-1), f"{tag}:hi")
+            # valid-region min/max via sentinel fill; stack -> record_oob_extremes
+            # takes min/max of its input, giving both extremes.
+            mn = torch.where(mask, t, torch.full_like(t, 1 << 30)).min().reshape(1)
+            mx = torch.where(mask, t, torch.full_like(t, -(1 << 30))).max().reshape(1)
+            record_oob_extremes(tag, torch.cat([mn, mx]))
+            record_oob_first_rc(tag, negm)
+        except Exception:
+            pass
+
     def _forward_swa(
         self,
         q: torch.Tensor,
@@ -2046,6 +2099,24 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        if getattr(fm, "block_tables_swa", None) is None:
+            # eager path: swa_page_table fell back to the FULL-pool
+            # block_tables (page ids in full-pool index space)
+            try:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                    bump_oob_flag,
+                )
+
+                bump_oob_flag("swapt:fulltable-fallback")
+            except Exception:
+                pass
+        self._audit_block_table(
+            fm.swa_page_table,
+            ori_kv.shape[0],
+            ori_kv.shape[1],
+            fm.actual_seq_lengths_kv,
+            "swapt",
+        )
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -2103,10 +2174,24 @@ class DeepseekV4AscendAttnBackend(
             )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        self._audit_block_table(
+            fm.swa_page_table,
+            ori_kv.shape[0],
+            ori_kv.shape[1],
+            fm.actual_seq_lengths_kv,
+            "swapt-c",
+        )
 
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        self._audit_block_table(
+            cmp_block_table,
+            cmp_kv.shape[0],
+            cmp_kv.shape[1],
+            fm.actual_seq_lengths_kv,
+            f"cmp{compress_ratio}pt",
+        )
         expected_cmp_page_size = (
             ori_page_size // 4
             if compress_ratio == 4
@@ -2141,6 +2226,14 @@ class DeepseekV4AscendAttnBackend(
         # c4 attends via indexer topk; c128 reads the full compressed history
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
+            try:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                    record_oob_extremes,
+                )
+
+                record_oob_extremes("c4topk", topk)
+            except Exception:
+                pass
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None

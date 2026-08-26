@@ -22,6 +22,26 @@ if is_npu():
     import torch_npu
 
 
+def _audit_scatter_loc(loc: torch.Tensor, cap: int, slot: str) -> None:
+    """§24.41: device-side negative/OOB counter for UNCLAMPED scatters.
+
+    aclnnScatterNdUpdate has no Python negative-index semantics: a -1 SWA
+    sentinel (full_to_swa_index_mapping tail / masked_fill invalid) reaching
+    one of these call sites writes BELOW the buffer base — exactly the
+    r2t-clobber geometry. Zero-sync; read by [mf-scatter] on the send path.
+    """
+    try:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+            count_scatter_oob,
+        )
+
+        count_scatter_oob(loc.reshape(-1) < 0, f"{slot}:neg")
+        if cap > 0:
+            count_scatter_oob(loc.reshape(-1) >= cap, f"{slot}:hi")
+    except Exception:
+        pass
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
@@ -235,6 +255,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # 3-D view; the underlying KV storage and attention layout stay
             # unchanged.
             loc_indices = loc.contiguous().view(-1, 1)
+            _audit_scatter_loc(loc, k_buffer_layer.shape[0], "npu-fia-kv")
             torch_npu.npu_scatter_nd_update_(
                 k_buffer_layer.view(-1, self.head_num, self.head_dim),
                 loc_indices,
@@ -464,6 +485,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
             -1, self.head_num, self.head_dim
         )
         loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
+        _audit_scatter_loc(loc, k_buffer_layer.shape[0], "npu-kv-k")
         torch_npu.npu_scatter_nd_update_(
             k_buffer_layer,
             loc.view(-1, 1),
@@ -699,6 +721,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
+        _audit_scatter_loc(
+            loc, self.k_buffer[layer_id - self.start_layer].shape[0], "npu-mla-k"
+        )
         torch_npu.npu_scatter_nd_update_(
             self.v_buffer[layer_id - self.start_layer].view(
                 -1, 1, self.qk_rope_head_dim
@@ -725,6 +750,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
+        )
+        _audit_scatter_loc(
+            loc, self.index_k_buffer[layer_id - self.start_layer].shape[0], "npu-idx-k"
         )
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):

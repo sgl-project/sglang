@@ -59,7 +59,65 @@ def count_scatter_oob(mask: torch.Tensor, slot: str) -> None:
 
 
 def get_scatter_oob_counts() -> dict:
-    return {k: int(v.item()) for k, v in _SCATTER_OOB.items()}
+    out = {k: int(v.item()) for k, v in _SCATTER_OOB.items()}
+    for k, v in _OOB_MIN.items():
+        out[f"{k}:min"] = int(v.item())
+    for k, v in _OOB_MAX.items():
+        out[f"{k}:max"] = int(v.item())
+    out.update(_OOB_FLAGS)
+    return out
+
+
+# §24.43: device-side min/max of audited index tensors + host-side path
+# flags. Same zero-sync discipline as _SCATTER_OOB (only read inside an
+# already-synchronized branch). INT_MAX sentinel = "no negative seen".
+_OOB_MIN = {}
+_OOB_MAX = {}
+_OOB_FLAGS = {}
+
+_OOB_SENTINEL = (1 << 31) - 1
+
+
+def record_oob_extremes(slot: str, vals: torch.Tensor) -> None:
+    """Device-side min/max of an index tensor (e.g. block-table page ids)."""
+    if vals is None or vals.numel() == 0:
+        return
+    v = vals.reshape(-1).to(torch.int64)
+    mn = v.min().reshape(1)
+    mx = v.max().reshape(1)
+    if slot not in _OOB_MIN:
+        _OOB_MIN[slot] = mn.clone()
+        _OOB_MAX[slot] = mx.clone()
+    else:
+        torch.minimum(_OOB_MIN[slot], mn, out=_OOB_MIN[slot])
+        torch.maximum(_OOB_MAX[slot], mx, out=_OOB_MAX[slot])
+
+
+def record_oob_first_rc(slot: str, neg2d: torch.Tensor) -> None:
+    """First (row, col) containing a negative entry, INT_MAX when none.
+
+    ``neg2d`` is the 2D negative mask of the audited table; rows map to
+    batch requests, cols to page slots -- the coordinates the attention
+    kernel would use to walk below the pool base.
+    """
+    if neg2d is None or neg2d.numel() == 0:
+        return
+    dev = neg2d.device
+    rows = torch.arange(neg2d.shape[0], device=dev, dtype=torch.int64)
+    cols = torch.arange(neg2d.shape[1], device=dev, dtype=torch.int64)
+    sent = torch.full((), _OOB_SENTINEL, dtype=torch.int64, device=dev)
+    r = torch.where(neg2d.any(dim=1), rows, sent).min().reshape(1)
+    c = torch.where(neg2d.any(dim=0), cols, sent).min().reshape(1)
+    for key, val in ((f"{slot}:negrow", r), (f"{slot}:negcol", c)):
+        if key not in _OOB_MIN:
+            _OOB_MIN[key] = val.clone()
+        else:
+            torch.minimum(_OOB_MIN[key], val, out=_OOB_MIN[key])
+
+
+def bump_oob_flag(flag: str) -> None:
+    """Host-side counter for path/branch markers (e.g. table fallback)."""
+    _OOB_FLAGS[flag] = _OOB_FLAGS.get(flag, 0) + 1
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
