@@ -64,10 +64,14 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             ),
             "Config does not support fused shared expert(s).",
         )
-        self._install()
-        # The decision lands on the ACTIVE flag; the config intent is untouched.
-        self.assertTrue(is_shared_experts_fusion_disabled())
-        self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
+        ):
+            self._install()
+            # The decision lands on the ACTIVE flag; the config intent is untouched.
+            self.assertTrue(is_shared_experts_fusion_disabled())
+            self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)
