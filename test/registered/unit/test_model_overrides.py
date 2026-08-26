@@ -2857,5 +2857,32 @@ class TestDeclarationValidation(CustomTestCase):
             validate_declarations(args, [("src", {"nope": 1})])
 
 
+class TestOverrideArchitecturesAreReal(CustomTestCase):
+    """An override keyed on a name no model reports never runs.
+
+    The registry is keyed by the string an HF config's ``architectures`` entry
+    carries, and nothing checks the spelling: a typo registers fine, resolves
+    nothing, and looks exactly like a model that needs no override.
+    """
+
+    def test_every_keyed_architecture_is_a_known_model(self):
+        from sglang.srt.models.registry import ModelRegistry
+
+        keyed = set(overrides_module._MODEL_OVERRIDE_FNS)
+        self.assertGreater(
+            len(keyed), 20, "the override registry is empty; this is not scanning it"
+        )
+        known = set(ModelRegistry.models)
+        self.assertGreater(
+            len(known), 100, "the model registry is empty; this is not scanning it"
+        )
+        self.assertEqual(
+            set(),
+            keyed - known,
+            "these architectures carry a config override but no model in the "
+            "tree reports them, so the override never fires",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
