@@ -102,7 +102,7 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-The default recipe pairs a BF16 KV cache with TileLang DSA. On Blackwell GPUs, the deployment panel also offers FP8 KV with TRT-LLM DSA as a memory-saving option. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination. FP8 KV with TRT-LLM DSA is disabled on H100 and H200.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.3-5.5% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
 
 ### Extend the cache hierarchy
 
