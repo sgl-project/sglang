@@ -35,6 +35,10 @@ from diffusers.models.normalization import (
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
+    can_use_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
     tensors_equal,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -217,10 +221,20 @@ class _LongCatFFN(nn.Module):
             ]
         )
         self.act = nn.GELU(approximate="tanh")
+        # quality="high" site: up-proj GEMM + tanh-GELU cublasLt epilogue. Off by
+        # default; the denoising stage mounts it per batch. The ModuleDict holds
+        # `proj` in _modules, so getattr resolves it for the fusion helper.
+        mark_fused_gelu_site(self.net[0], "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.net[0]["proj"](hidden_states)
-        hidden_states = self.act(hidden_states)
+        proj = self.net[0]["proj"]
+        if fused_gelu_active(self.net[0]) and can_use_linear_gelu(proj, hidden_states):
+            hidden_states = fused_linear_gelu_tanh(
+                hidden_states, proj.weight, proj.bias
+            )
+        else:
+            hidden_states, _ = proj(hidden_states)
+            hidden_states = self.act(hidden_states)
         hidden_states, _ = self.net[2](hidden_states)
         return hidden_states
 
@@ -443,6 +457,7 @@ class _LongCatSingleAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
         cos_sin_cache: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -464,7 +479,7 @@ class _LongCatSingleAttention(nn.Module):
             positions,
         )
 
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, num_replicated_prefix=num_replicated_prefix)
         return x.flatten(2, 3).to(q.dtype)
 
 
@@ -495,6 +510,9 @@ class _SingleTransformerBlock(nn.Module):
             prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
+        # quality="high" site: proj_mlp GEMM + tanh-GELU cublasLt epilogue,
+        # mounted per batch by the denoising stage; off (bit-exact) by default.
+        mark_fused_gelu_site(self, "proj_mlp")
         # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
         # all-reduce, matching Flux2SingleTransformerBlockAttention.to_out.
         self.proj_out = RowParallelLinear(
@@ -559,11 +577,20 @@ class _SingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-        mlp_hidden_states = self.act_mlp(mlp_hidden_states)
+        if fused_gelu_active(self) and can_use_linear_gelu(
+            self.proj_mlp, norm_hidden_states
+        ):
+            mlp_hidden_states = fused_linear_gelu_tanh(
+                norm_hidden_states, self.proj_mlp.weight, self.proj_mlp.bias
+            )
+        else:
+            mlp_hidden_states, _ = self.proj_mlp(norm_hidden_states)
+            mlp_hidden_states = self.act_mlp(mlp_hidden_states)
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            # Text is replicated per SP rank; keep it out of the all-to-all.
+            num_replicated_prefix=text_seq_len,
             cos_sin_cache=cos_sin_cache,
             positions=positions,
         )
