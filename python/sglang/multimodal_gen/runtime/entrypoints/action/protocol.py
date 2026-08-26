@@ -112,7 +112,12 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         }
     for name in ("image", "image_path", "input_reference"):
         if name in normalized:
-            normalized[name] = _normalize_image_value(normalized[name])
+            value = normalized[name]
+            normalized[name] = (
+                [_normalize_image_value(item) for item in value]
+                if isinstance(value, (list, tuple))
+                else _normalize_image_value(value)
+            )
     state = normalized.get("state")
     if isinstance(state, dict):
         normalized["state"] = _decode_tensor_payload(state)
@@ -149,6 +154,7 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
         defaults = Cosmos3SamplingParams()
+        max_batch_size = max(1, int(getattr(server_args, "batching_max_size", 1)))
         return {
             "object": "action.metadata",
             "model": server_args.served_model_name,
@@ -189,7 +195,9 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
                 "action_modes": ["policy", "inverse_dynamics"],
                 "realtime_websocket": True,
                 "openpi_websocket": False,
-                "batch_inputs": True,
+                "batch_inputs": max_batch_size > 1,
+                "max_batch_size": max_batch_size,
+                "batched_action_modes": ["policy"],
                 "multiple_candidates": False,
             },
         }
@@ -423,7 +431,7 @@ def _build_action_model_sampling_params(
     return sp
 
 
-def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
+def _cosmos3_images_from_observation(observation: dict[str, Any]) -> list[Any]:
     image = None
     for name in ("image", "image_path", "input_reference"):
         if name in observation:
@@ -433,19 +441,23 @@ def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
     if image is None:
         images = observation.get("images")
         if not images:
-            return None
+            return []
         if not isinstance(images, dict) or len(images) != 1:
             raise ValueError(
-                "Cosmos3 policy input requires exactly one observation image"
+                "Cosmos3 action input accepts one image field; use a list or "
+                "a [B, H, W, C] array in that field for batched observations"
             )
         image = next(iter(images.values()))
 
     if isinstance(image, (list, tuple)):
         raw_images = list(image)
-    elif isinstance(image, np.ndarray) and image.ndim >= 4 and image.shape[0] > 1:
-        raw_images = [image[i] for i in range(image.shape[0])]
+    elif isinstance(image, np.ndarray) and image.ndim == 4:
+        raw_images = list(image)
     else:
         raw_images = [image]
+
+    if not raw_images:
+        return []
 
     out: list[Any] = []
     for im in raw_images:
@@ -454,10 +466,33 @@ def _cosmos3_image_from_observation(observation: dict[str, Any]) -> Any:
                 raise ValueError(
                     "Cosmos3 observation image arrays must use uint8 dtype"
                 )
+            if im.ndim not in (2, 3):
+                raise ValueError(
+                    "Cosmos3 observation image arrays must have shape [H, W] "
+                    f"or [H, W, C], got {tuple(im.shape)}"
+                )
             out.append(Image.fromarray(im))
         else:
             out.append(im)
     return out
+
+
+def _cosmos3_action_prompt(prompt: Any, batch_size: int) -> str | list[str]:
+    if isinstance(prompt, str):
+        return prompt if batch_size == 1 else [prompt] * batch_size
+    if not isinstance(prompt, (list, tuple)) or not prompt:
+        raise ValueError("Cosmos3 action prompt must be a string or non-empty list")
+    if not all(isinstance(item, str) for item in prompt):
+        raise ValueError("Cosmos3 action prompt list must contain only strings")
+    prompts = list(prompt)
+    if len(prompts) == 1 and batch_size > 1:
+        prompts *= batch_size
+    if len(prompts) != batch_size:
+        raise ValueError(
+            "Cosmos3 batched action input requires one prompt per image, got "
+            f"{len(prompts)} prompt(s) and {batch_size} image(s)"
+        )
+    return prompts[0] if batch_size == 1 else prompts
 
 
 def _build_cosmos3_action_sampling_params(
@@ -504,14 +539,22 @@ def _build_cosmos3_action_sampling_params(
             "is compatible with the temporal VAE"
         )
 
-    image_path = _cosmos3_image_from_observation(observation)
+    images = _cosmos3_images_from_observation(observation)
     video_path = options.get("video_path") or observation.get("video")
-    if action_mode == "policy" and image_path is None:
+    if action_mode == "policy" and not images:
         raise ValueError("Cosmos3 policy input requires an observation image")
     if action_mode == "inverse_dynamics" and video_path is None:
         raise ValueError("Cosmos3 inverse_dynamics input requires an observation video")
-    if image_path is not None and video_path is not None:
+    if images and video_path is not None:
         raise ValueError("Cosmos3 action requests accept either an image or a video")
+    batch_size = len(images) if images else 1
+    max_batch_size = max(1, int(getattr(server_args, "batching_max_size", 1)))
+    if batch_size > max_batch_size:
+        raise ValueError(
+            f"Cosmos3 action batch size {batch_size} exceeds "
+            f"--batching-max-size={max_batch_size}"
+        )
+    image_path = None if not images else images[0] if batch_size == 1 else images
 
     domain_id = options.get("domain_id")
     domain_name = options.get("domain_name")
@@ -521,7 +564,12 @@ def _build_cosmos3_action_sampling_params(
     if domain_id is not None and not domain_name and raw_action_dim is None:
         raise ValueError("raw_action_dim is required when only domain_id is provided")
 
-    prompt = observation.get("prompt") or observation.get("task") or ""
+    prompt = observation.get("prompt")
+    if prompt is None:
+        prompt = observation.get("task", "")
+    if action_mode != "policy" and not isinstance(prompt, str):
+        raise ValueError("Cosmos3 inverse_dynamics prompt must be a string")
+    prompt = _cosmos3_action_prompt(prompt, batch_size)
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
         "prompt": prompt,
@@ -608,23 +656,44 @@ def action_generation_response(
     preserve_numpy: bool = False,
 ) -> dict[str, Any]:
     actions = output["actions"]
-    if isinstance(actions, np.ndarray):
-        action_shape = list(actions.shape)
-        action_values = actions if preserve_numpy else actions.tolist()
-    else:
-        horizon = len(actions) if isinstance(actions, list) else 0
-        action_dim = len(actions[0]) if horizon and isinstance(actions[0], list) else 0
-        action_shape = [horizon, action_dim]
-        action_values = actions
-    action = {
-        "type": "continuous",
-        "dtype": "float32",
-        "shape": action_shape,
-        "values": action_values,
-    }
-    for name in ("action_mode", "domain_id", "raw_action_dim"):
-        if output.get(name) is not None:
-            action[name] = output[name]
+    action_array = np.asarray(actions)
+    if any(size == 0 for size in action_array.shape):
+        raise ValueError(
+            "action output dimensions must be non-zero, got "
+            f"{tuple(action_array.shape)}"
+        )
+    if action_array.ndim == 2:
+        action_array = action_array[None]
+    elif action_array.ndim != 3:
+        raise ValueError(
+            "action output must have shape [H, D] or [B, H, D], got "
+            f"{tuple(action_array.shape)}"
+        )
+
+    data = []
+    for input_index, action_values in enumerate(action_array):
+        action_shape = list(action_values.shape)
+        if not preserve_numpy:
+            action_values = action_values.tolist()
+        action = {
+            "type": "continuous",
+            "dtype": "float32",
+            "shape": action_shape,
+            "values": action_values,
+        }
+        for name in ("action_mode", "domain_id", "raw_action_dim"):
+            if output.get(name) is not None:
+                action[name] = output[name]
+        data.append(
+            {
+                "index": input_index,
+                "input_index": input_index,
+                "candidate_index": 0,
+                "action": action,
+            }
+        )
+
+    action_shape = data[0]["action"]["shape"]
 
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
@@ -637,15 +706,9 @@ def action_generation_response(
         "object": "action.generation",
         "created": int(time.time()),
         "model": server_args.served_model_name,
-        "data": [
-            {
-                "index": 0,
-                "input_index": 0,
-                "candidate_index": 0,
-                "action": action,
-            }
-        ],
+        "data": data,
         "usage": {
+            "batch_size": len(data),
             "action_horizon": action_shape[0] if action_shape else 0,
             "action_dim": action_shape[1] if len(action_shape) > 1 else 0,
             "denoise_steps": output.get("parameters", {}).get(

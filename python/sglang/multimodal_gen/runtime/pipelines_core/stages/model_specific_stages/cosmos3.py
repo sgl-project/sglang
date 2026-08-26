@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODE_POLICY,
     ACTION_MODES,
     EMBODIMENT_TO_DOMAIN_ID,
     build_action_prompt,
@@ -141,7 +142,9 @@ def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
 class Cosmos3ImagePreprocessStage(PipelineStage):
     """Load, aspect-resize, and center-crop the conditioning input.
 
-    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
+    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``. Batched
+    policy requests write ``[B, 3, H, W]``; regular visual generation remains
+    single-image conditioned.
     For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
     No-op for T2V / T2I.
     """
@@ -154,6 +157,13 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         image_path = batch.image_path
         video_path = batch.video_path
+        is_action_policy = (
+            batch.data_type == DataType.ACTION
+            and getattr(batch.sampling_params, "action_mode", None)
+            == ACTION_MODE_POLICY
+        )
+        if isinstance(image_path, list) and not is_action_policy:
+            image_path = image_path[0] if image_path else None
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
 
@@ -287,6 +297,8 @@ class Cosmos3TokenizationStage(PipelineStage):
         Returns (input_ids, attention_mask, seq_len) as [B, S] tensors.
         """
         texts = text if isinstance(text, (list, tuple)) else [text]
+        if not texts:
+            raise ValueError("Cosmos3 prompt batch must not be empty")
         input_id_lists: list[list[int]] = []
         attention_mask_lists: list[list[int]] = []
         seq_lens: list[int] = []
@@ -337,11 +349,17 @@ class Cosmos3TokenizationStage(PipelineStage):
             attention_mask_lists.append(attention_mask)
             seq_lens.append(seq_len)
 
+        if len(set(seq_lens)) != 1:
+            raise ValueError(
+                "Cosmos3 batched prompts must tokenize to the same length because "
+                "GEN cross-attention does not mask padded text K/V; split prompts "
+                f"into equal-length batches instead (lengths={seq_lens})"
+            )
         input_ids = torch.tensor(input_id_lists, dtype=torch.long, device=device)
         attention_mask = torch.tensor(
             attention_mask_lists, dtype=torch.long, device=device
         )
-        return input_ids, attention_mask, max(seq_lens)
+        return input_ids, attention_mask, seq_lens[0]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Tokenize prompt and negative prompt."""
@@ -1430,7 +1448,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         latents_batched = torch.cat([latents, latents], dim=0)
         text_ids_batched = torch.cat([uncond_text_ids, cond_text_ids], dim=0)
         text_mask_batched = torch.cat([uncond_text_mask, cond_text_mask], dim=0)
-        timestep_batched = timestep.expand(2)
+        timestep_batched = torch.cat([timestep, timestep], dim=0)
         mask_batched = (
             torch.cat([noisy_frame_mask, noisy_frame_mask], dim=0)
             if noisy_frame_mask is not None
@@ -1676,9 +1694,12 @@ class Cosmos3DecodingStage(PipelineStage):
         if batch.data_type == DataType.ACTION:
             if action_pred is None:
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
+            payload_actions = (
+                action_pred[0] if action_pred.shape[0] == 1 else action_pred
+            )
             payload = {
                 "request_id": batch.request_id,
-                "actions": action_pred.numpy(),
+                "actions": payload_actions.numpy(),
                 "action_mode": action_metadata["action_mode"],
                 "domain_id": action_metadata["action_domain_id"],
                 "raw_action_dim": action_metadata["action_raw_action_dim"],
