@@ -2259,6 +2259,7 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    supports_external_trace_header = True
 
     def __init__(
         self,

@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
-import inspect
 import logging
 from array import array
 from collections import deque
@@ -321,9 +320,7 @@ class PrefillBootstrapQueue:
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
         # Link Mooncake transfer spans to the parent request's W3C trace.
-        if "external_trace_header" in inspect.signature(
-            kv_sender_class.__init__
-        ).parameters:
+        if getattr(kv_sender_class, "supports_external_trace_header", False):
             trace_ctx = getattr(req.time_stats, "trace_ctx", None)
             if getattr(trace_ctx, "tracing_enable", False):
                 root = getattr(trace_ctx, "root_span_context", None)
