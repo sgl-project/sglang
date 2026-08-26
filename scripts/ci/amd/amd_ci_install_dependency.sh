@@ -168,6 +168,21 @@ git_clone_with_retry() {
   return 1
 }
 
+# Detect ROCm version inside the CI container to select the correct
+# compressed-tensors extra (rocm_legacy=0.15.0 vs rocm_rock=0.16.0).
+# Same detection pattern used by the AITER and MORI blocks below.
+CI_ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+echo "Detected ROCm version inside container: ${CI_ROCM_VERSION}"
+
+if [[ "${CI_ROCM_VERSION}" != "unknown" ]] && \
+   [[ "$(printf '%s\n' "7.14.0" "${CI_ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+  CT_EXTRA="rocm_rock"
+else
+  CT_EXTRA="rocm_legacy"
+fi
+echo "Using compressed-tensors extra: ${CT_EXTRA}"
+EXTRAS="${EXTRAS},${CT_EXTRA}"
+
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
@@ -259,6 +274,13 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
   MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
+  if [[ -z "${MORI_COMMIT}" ]]; then
+    echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
+    exit 1
+  fi
+
+  ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || echo unknown')
+
   if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     MORI_GPU_ARCHS="gfx950"
   else
@@ -290,12 +312,16 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     fi
     # Same rocm_sysdeps handling as docker/rocm.Dockerfile's MORI step: the pip
     # ROCm SDK used by the rocm10rc4 images vendors NUMA and libdrm there, off
-    # every default search path. Kept scoped to this build rather than exported
-    # image-wide because rocm_sysdeps/include also carries zlib.h / expat.h /
-    # elf.h, which would shadow the system headers for every other component.
+    # every default search path. Putting it on CMAKE_PREFIX_PATH is
+    # what lets hsakmt-config.cmake resolve find_dependency(NUMA), so MORI's own
+    # CMakeLists needs no patching. Kept scoped to this build rather than
+    # exported image-wide because rocm_sysdeps/include also carries zlib.h /
+    # expat.h / elf.h, which would shadow the system headers for every other
+    # component.
     ROCM_SYSDEPS=\"\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps\"
     if [ -d \"\${ROCM_SYSDEPS}\" ]; then
-      export CMAKE_PREFIX_PATH=\"\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}\"
+      export PATH=\"\${ROCM_HOME}/bin:\${PATH}\"
+      export CMAKE_PREFIX_PATH=\"\${ROCM_SYSDEPS}/lib/cmake:\${ROCM_SYSDEPS}:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}\"
       export CPATH=\"\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}\"
       export LIBRARY_PATH=\"\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}\"
       echo \"\${ROCM_SYSDEPS}/lib\" > /etc/ld.so.conf.d/rocm-sysdeps.conf
@@ -328,7 +354,21 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
-# Image owns Triton (pinned in docker/rocm.Dockerfile). Rebuild AITER against it.
+# ROCm 7.0 keeps the Triton its base image ships;
+# ROCm 7.2 images run on the Triton AITER pins, so a rebuilt AITER has to bring its own along.
+# TODO: ROCm 7.14 and later should keep the triton built in the image, but we need
+#       to revisit the effect in CI test time.
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+case "${IMAGE_HIP_VERSION}" in
+    7.0*)  INSTALL_AITER_TRITON="false" ;;
+    7.2*)  INSTALL_AITER_TRITON="true" ;;
+    7.14*) INSTALL_AITER_TRITON="false" ;;
+    *)
+        echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
+        exit 1
+        ;;
+esac
+echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
 
 #############################################
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
@@ -443,11 +483,38 @@ PY
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # The image already has the Dockerfile-pinned Triton; compile against it.
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    # Detect ROCm version for build method selection
+    ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+    echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}"
+
+    # build AITER with ROCm 7.14 awareness
+    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.14.0 detected, using pip install --no-build-isolation"
+        docker exec ci_sglang bash -c "
+            set -euo pipefail
+            cd /sgl-workspace/aiter
+            export AITER_USE_SYSTEM_TRITON=1
+            PATH=\$ROCM_HOME/llvm/bin:\$PATH GPU_ARCHS=${GPU_ARCH_LIST} pip install --no-build-isolation -e .
+        "
+    else
+        # Run the installer here rather than letting setup.py do it: setup.py
+        # swallows its errors, and the AITER_USE_SYSTEM_TRITON=1 below then keeps
+        # whatever Triton is already installed. Doing it up front fails closed.
+        if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
+            docker exec ci_sglang bash -c "
+                set -euo pipefail
+                cd /sgl-workspace/aiter
+                test -f .github/scripts/install_triton.sh
+                bash .github/scripts/install_triton.sh
+            "
+        fi
+
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown, using setup.py develop"
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi

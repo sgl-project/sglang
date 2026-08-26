@@ -6426,10 +6426,23 @@ class ServerArgs:
         # AMD platforms backends
         if resolved_view(self).attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self._declare(
-                    "_handle_attention_backend_compatibility",
-                    mem_fraction_static=self.mem_fraction_static * 0.85,
-                )
+                user_set = (getattr(self, "_raw_input", None) or {}).get(
+                    "mem_fraction_static"
+                ) is not None
+                if user_set:
+                    logger.warning(
+                        "attention_backend=aiter with context_len=%d (>8192) "
+                        "normally scales mem_fraction_static by 0.85, but "
+                        "mem_fraction_static=%.3f was set explicitly and will "
+                        "be used as-is.",
+                        model_config.context_len,
+                        self.mem_fraction_static,
+                    )
+                else:
+                    self._declare(
+                        "_handle_attention_backend_compatibility",
+                        mem_fraction_static=self.mem_fraction_static * 0.85,
+                    )
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
