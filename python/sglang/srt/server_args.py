@@ -6350,9 +6350,16 @@ class ServerArgs:
             # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
             # the hook in DFlashVerifyInput.prepare_for_verify.
         if view.speculative_num_draft_tokens is not None:
-            assert view.mamba_track_interval >= view.speculative_num_draft_tokens
+            assert view.mamba_track_interval >= view.speculative_num_draft_tokens, (
+                f"--mamba-track-interval {view.mamba_track_interval} is below "
+                f"--speculative-num-draft-tokens {view.speculative_num_draft_tokens}; "
+                "a tracked window shorter than one draft cannot hold it"
+            )
         if view.page_size is not None:
-            assert view.mamba_track_interval % view.page_size == 0
+            assert view.mamba_track_interval % view.page_size == 0, (
+                f"--mamba-track-interval {view.mamba_track_interval} is not a "
+                f"multiple of the page size {view.page_size}"
+            )
             assert self.mamba_cache_chunk_size is not None
 
             if (
@@ -7350,7 +7357,11 @@ class ServerArgs:
                 "_handle_data_parallelism",
                 schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
             )
-            assert cfg.tp_size % cfg.dp_size == 0
+            assert cfg.tp_size % cfg.dp_size == 0, (
+                f"--dp-size {cfg.dp_size} does not divide --tp-size {cfg.tp_size}; "
+                "DP attention splits the tensor-parallel group, so every DP rank "
+                "needs the same number of TP ranks"
+            )
             original_chunked_prefill_size = cfg.chunked_prefill_size
             self._declare(
                 "_handle_data_parallelism",
@@ -7762,7 +7773,11 @@ class ServerArgs:
             )
 
         if cfg.enable_eplb and cfg.ep_join_mode != "scale":
-            assert self._resolved().ep_size > 1
+            assert self._resolved().ep_size > 1, (
+                f"expert parallelism resolved to ep_size {self._resolved().ep_size}; "
+                "EPLB needs more than one expert-parallel rank to have anything to "
+                "balance"
+            )
 
     def _handle_elastic_ep(self):
         cfg = resolving_view(self)
@@ -7889,7 +7904,10 @@ class ServerArgs:
                     "The primary --elastic-ep-initial-size must equal its "
                     f"launch-time TP size ({cfg.tp_size})."
                 )
-            assert cfg.elastic_ep_initial_size > 0
+            assert cfg.elastic_ep_initial_size > 0, (
+                f"--elastic-ep-initial-size is {cfg.elastic_ep_initial_size}; elastic "
+                "EP starts from at least one rank"
+            )
             assert cfg.load_balance_method == "round_robin", (
                 "Elastic EP scale-up requires --load-balance-method round_robin; "
                 "load-aware methods "
