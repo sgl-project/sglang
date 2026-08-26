@@ -114,6 +114,21 @@ def npu_format_online_weight(
     return _convert_packed_int4_weight(weight)
 
 
+def npu_format_online_moe_scale(
+    scale: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
+) -> torch.Tensor:
+    if spec.weight_dtype == torch.int8:
+        return scale
+    if scale.dtype != torch.float32:
+        raise TypeError(
+            "Ascend INT4 grouped matmul requires FP32 source scales, got "
+            f"{scale.dtype}."
+        )
+
+    # GMM consumes each FP32 scale bit pattern in the low half of an INT64 slot.
+    return scale.contiguous().view(torch.int32).to(torch.int64)
+
+
 class NPUOnlineDenseWeightLoader:
     def __init__(
         self,

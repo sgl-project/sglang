@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
     NPUOnlineIntegerQuantSpec,
     get_npu_online_integer_quant_spec,
     npu_dynamic_quantize_weight,
+    npu_format_online_moe_scale,
     npu_format_online_weight,
 )
 
@@ -958,6 +959,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight.data, spec)
         quantized_weight = npu_format_online_weight(quantized_weight, spec)
+        weight_scale = npu_format_online_moe_scale(weight_scale, spec)
 
         copy_or_rebind_param(layer, weight_name, quantized_weight)
         copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
