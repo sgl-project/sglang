@@ -22,12 +22,15 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+import torch
+
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
 )
@@ -40,6 +43,48 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# Widest decode graph, in tokens, that any rank in this job will replay.
+_MAX_DECODE_GRAPH_TOKENS = 0
+
+
+def get_max_decode_graph_tokens() -> int:
+    """Widest decode graph any rank will replay, in tokens; 0 before capture setup."""
+    return _MAX_DECODE_GRAPH_TOKENS
+
+
+def _publish_decode_graph_tokens(max_bs: int, captured_req_width: int) -> None:
+    """Record the widest decode graph, maxed across ranks.
+
+    A consumer that bakes this into a captured graph (the mori receive bound in
+    moe_runner/aiter.py) needs a value that holds for every *peer's* replay, not
+    just this rank's, since ranks can replay different tiers. capture_bs is
+    clamped by req_to_token_pool.size, which is sized from measured free memory
+    and so is not guaranteed identical across ranks -- hence an explicit
+    reduction rather than an assumption of symmetry. Runner init is outside
+    capture, so the collective is safe here.
+    """
+    global _MAX_DECODE_GRAPH_TOKENS
+
+    from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+
+    # Several callers take the default width of 1 and then capture wider graphs
+    # off their own captured_req_width, so widen to the most any decode-family
+    # graph can use rather than trusting the width in hand.
+    spec = get_spec()
+    width = max(
+        captured_req_width,
+        max_speculative_num_draft_tokens() or 1,
+        (spec.speculative_eagle_topk or 1) if spec.speculative_algorithm else 1,
+    )
+    width *= max_bs
+
+    if torch.distributed.is_initialized():
+        # Max over the whole job: a superset of the mori senders still bounds them.
+        scratch = torch.tensor([width], dtype=torch.int64, device="cuda")
+        torch.distributed.all_reduce(scratch, op=torch.distributed.ReduceOp.MAX)
+        width = int(scratch.item())
+    _MAX_DECODE_GRAPH_TOKENS = max(_MAX_DECODE_GRAPH_TOKENS, width)
 
 
 @contextmanager
@@ -94,6 +139,8 @@ def get_batch_sizes_to_capture(
     capture_bs = list(sorted(set(capture_bs)))
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+    if get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
+        _publish_decode_graph_tokens(max(capture_bs), captured_req_width)
     compile_bs = (
         [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
         if get_flags().capture.enable_torch_compile

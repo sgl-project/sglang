@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AiterQuantType(str, Enum):
@@ -123,43 +127,65 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+_RECV_BOUND_LOGGED = False
+
+
 def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
 
-    Worst case fan-in is every rank routing all of its tokens here, so
-    sum(per-rank tokens) * topk, where topk already includes the fused shared
-    expert. Summing the actual per-rank counts rather than assuming they are
-    equal keeps this a bound even when the ranks are not carrying the same batch.
+    This value is baked into a cuda graph, so it has to hold for every later
+    replay of that graph -- including replays where a peer carries a wider batch
+    than the one being captured here. It is therefore derived from the widest
+    decode graph *any* rank will replay rather than from the batch in hand: the
+    worst case is every rank routing a full graph's worth of tokens to this one,
+    max_tokens * world_size * topk, where topk already includes the fused shared
+    expert. That quantity is reduced across ranks when it is published, so it
+    needs no assumption that the ranks share a batch size or a graph tier.
 
-    Two cases must stay unbounded, because a bound below the real fan-in silently
+    Two cases stay unbounded, because a bound below the real fan-in silently
     drops rows from the all-to-all -- wrong output, not an error:
 
-    * Prefill. Per-rank counts are uneven and not knowable here.
-    * DP without max-length padding. This runs while a cuda graph is *captured*,
-      so the value is frozen into the graph and has to hold for every later
-      replay. Only max-length padding makes the ranks share one padded length,
-      and therefore one graph tier; without it a peer can replay a wider tier
-      than the one seen at capture and overrun the bound recorded here.
+    * Prefill, whose per-rank counts are uneven and not knowable here.
+    * Anything outside capture. Eager decode runs when the batch is wider than
+      every captured tier, so the published width does not bound it, and there
+      is no graph to bake a saving into anyway.
     """
     if not get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
         return 0
 
-    from sglang.srt.layers.dp_attention import (
-        get_dp_global_num_tokens,
-        get_is_extend_in_batch,
-        is_dp_max_padding,
+    from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        get_max_decode_graph_tokens,
     )
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+    from sglang.srt.runtime_context import get_parallel
 
-    if get_is_extend_in_batch() or not is_dp_max_padding():
+    if get_is_extend_in_batch() or not get_is_capture_mode():
         return 0
 
-    global_num_tokens = get_dp_global_num_tokens()
-    if not global_num_tokens:
+    max_tokens = get_max_decode_graph_tokens()
+    if max_tokens <= 0:
         return 0
 
-    bound = sum(global_num_tokens) * topk
+    bound = max_tokens * get_parallel().moe_ep_size * topk
     # Never grow the tensor, and nothing to do when there is nothing to trim.
-    return bound if 0 < bound < recv_rows else 0
+    if not 0 < bound < recv_rows:
+        return 0
+
+    global _RECV_BOUND_LOGGED
+    if not _RECV_BOUND_LOGGED:
+        _RECV_BOUND_LOGGED = True
+        # A bound that never engages is indistinguishable from an unpatched run in
+        # the results, so say so once rather than let a no-op look like a win.
+        logger.info(
+            "mori recv bound active: %d rows -> %d (graph_tokens=%d ep=%d topk=%d)",
+            recv_rows,
+            bound,
+            max_tokens,
+            get_parallel().moe_ep_size,
+            topk,
+        )
+    return bound
 
 
 class AiterRunnerCore(MoeRunnerCore):
