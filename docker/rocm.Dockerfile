@@ -324,7 +324,8 @@ RUN ln -s ${ROCM_HOME} /opt/rocm
 # ===============================
 # Base image 942 with ROCm 10 RC4 and args (Python 3.12 + torch 2.11)
 # BUILD_TRITON=0 keeps the Triton installed above, which is the build AMD ships
-# with this SDK; the BUILD_TRITON=1 path installs a ROCm 7.2 wheel instead.
+# with this SDK; BUILD_TRITON=1 builds the upstream revision from source instead,
+# which only the gfx1250-rocm10rc4_build_triton flavor below does.
 FROM $BASE_IMAGE_942_ROCM10RC4 AS gfx942-rocm10rc4
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
@@ -365,10 +366,33 @@ ENV BUILD_MOONCAKE="1"
 # plus the four reverts applied at clone time are what the gfx1250 kernels were
 # brought up against.
 ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
-# Unused while BUILD_TRITON=0. Recorded because gfx1250 is the arch most likely
-# to need it: the 7.14 flavor deliberately overrides AMD's Triton with this
-# upstream revision, so this is the known-good fallback if the SDK's Triton
-# turns out to miscompile a gfx1250 kernel.
+# Unused while BUILD_TRITON=0, and kept in sync with the value the
+# gfx1250-rocm10rc4_build_triton flavor below actually builds: this stage stays
+# on AMD's SDK Triton, that one overrides it with this upstream revision.
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 1250 with ROCm 10 RC4, built against the upstream Triton the 7.14
+# flavor uses instead of the one AMD ships in the SDK. The SDK's Triton
+# (3.8.0+git4cff872c) and this revision differ enough to matter on gfx1250: the
+# SDK build also omits triton_kernels, which the MXFP4 MoE paths import. Keep
+# this as a separate flavor rather than a build arg so the image self-reports
+# which Triton it carries via GPU_ARCH, the same way every other flavor does.
+#
+# The flavor suffix uses underscores, not hyphens: GPU_ARCH_LIST is derived by
+# stripping at the last hyphen, so a second hyphen here would yield
+# GPU_ARCH_LIST=gfx1250-rocm10rc4_build and silently disable every
+# gfx1250-conditional build path. gfx1250-rocm7_14 spells its flavor the same
+# way for the same reason.
+FROM $BASE_IMAGE_1250_ROCM10RC4 AS gfx1250-rocm10rc4_build_triton
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
@@ -582,7 +606,7 @@ RUN case "${GPU_ARCH}" in \
 # Triton is left out: on rocm724 the BUILD_TRITON step installs it later, and on
 # rocm10rc4 it came from the ROCm SDK alongside torch.
 RUN case "${GPU_ARCH}" in \
-      *-rocm724|*-rocm10rc4) \
+      *-rocm724|*-rocm10rc4*) \
         python3 -m pip freeze \
           | grep -E '^(torch|torchvision|torchaudio)(==| @ )' \
           > /etc/sglang/constraints/torch-rocm.txt \
@@ -752,7 +776,7 @@ RUN cd sglang \
                      all_extras="all_hip_torch2_11" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm10rc4) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
+         *-rocm10rc4*) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
                       all_extras="all_hip_torch2_11" ; \
                       CONS="-c /tmp/constraints.txt" ; \
                       ;; \
@@ -783,7 +807,7 @@ RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \
       rocm724) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
-      rocm10rc4) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
+      rocm10rc4|rocm10rc4_build_triton) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
       *) exit 0 ;; \
     esac \
     && python3 -m pip check \
@@ -1160,6 +1184,17 @@ RUN case "${GPU_ARCH}" in \
       *rocm7_14*) \
         echo "[torch patch] ROCm 7.14 (${GPU_ARCH}): relax triton pin in installed torch"; \
         python3 /tmp/relax_triton_meta.py ;; \
+      *rocm10rc4*) \
+        # RC4's torch pins the SDK's Triton exactly (triton==3.8.0+git<sha>.rocm10.0.0rc4).
+        # Only the _build_triton flavor replaces it, so only that one may relax the
+        # pin; leaving it in place elsewhere is what stops a later pip install from
+        # resolving torch away to a CUDA build.
+        if [ "$BUILD_TRITON" = "1" ]; then \
+          echo "[torch patch] ROCm 10 RC4 (${GPU_ARCH}): relax triton pin in installed torch"; \
+          python3 /tmp/relax_triton_meta.py; \
+        else \
+          echo "[torch patch] rocm10rc4: keep the SDK triton pin (${GPU_ARCH})"; \
+        fi ;; \
       *) echo "[torch patch] rocm7_14: skip (${GPU_ARCH})" ;; \
     esac \
     && rm -f /tmp/relax_triton_meta.py
@@ -1181,8 +1216,8 @@ RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_uti
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         case "${GPU_ARCH}" in \
-          *rocm7_14*) \
-            echo "[Triton] ROCm 7.14: building from source (${TRITON_COMMIT})"; \
+          *rocm7_14*|*rocm10rc4*) \
+            echo "[Triton] ${GPU_ARCH}: building from source (${TRITON_COMMIT})"; \
             pip uninstall -y triton \
             && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
             && git clone ${TRITON_REPO} triton-custom \
