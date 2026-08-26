@@ -128,7 +128,7 @@ python -m sglang.bench_serving \
     --port 6688 \
     --max-concurrency 120 \
     --num-prompts 120 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 120 \
     --random-input-len 30 \
     --random-output-len 1024 \
     --random-range-ratio 1 \
@@ -229,8 +229,8 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 42 \
-    --num-prompts max_concurrency * 1 \
-    --warmup-requests max_concurrency \
+    --num-prompts 42 \
+    --warmup-requests 42 \
     --random-input-len 30 \
     --random-output-len 256 \
     --random-range-ratio 1 \
@@ -332,7 +332,7 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 3 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 3 \
     --num-prompts 3 \
     --random-input-len 128000 \
     --random-output-len 1000 \
@@ -531,7 +531,7 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 1 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 1 \
     --num-prompts 1 \
     --random-input-len 254000 \
     --random-output-len 1000 \
@@ -630,7 +630,7 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 122 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 122 \
     --num-prompts 122 \
     --random-input-len 3500 \
     --random-output-len 1500 \
@@ -729,7 +729,7 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 10 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 10 \
     --num-prompts 40 \
     --random-input-len 64000 \
     --random-output-len 1000 \
@@ -931,7 +931,7 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 1 \
-    --warmup-requests max_concurrency \
+    --warmup-requests 1 \
     --num-prompts 1 \
     --random-input-len 984000 \
     --random-output-len 1000 \
