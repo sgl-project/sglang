@@ -1,15 +1,26 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_sampling.py
-# and /sgl-workspace/sglang/sgl-kernel/tests/test_sampling.py
+# and /sgl-workspace/sglang/python/sglang/kernels/aot/tests/test_sampling.py
 
 import sys
 
 import pytest
-import sgl_kernel
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+if is_hip():
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton as top_k_renorm_prob,
+    )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+else:
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -37,7 +48,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, k)
+    renorm_prob = top_k_renorm_prob(normalized_prob, k)
     for i in range(batch_size):
         torch.testing.assert_close(
             renorm_prob_ground_truth[i],
@@ -72,7 +83,7 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = sgl_kernel.top_p_renorm_prob(normalized_prob, p)
+    renorm_prob = top_p_renorm_prob(normalized_prob, p)
     torch.testing.assert_close(
         renorm_prob_ground_truth,
         renorm_prob,

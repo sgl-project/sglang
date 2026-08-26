@@ -8,7 +8,6 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import get_compiler_backend
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -20,9 +19,26 @@ def maybe_enable_inductor_compute_comm_overlap() -> None:
         pass
 
 
-def build_torch_compile_kwargs(*, mode: str | None) -> dict[str, object]:
+def build_torch_compile_kwargs(
+    *, mode: str | None, module: nn.Module | None = None
+) -> dict[str, object]:
     compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-    if current_platform.is_npu():
+    if current_platform.is_out_of_tree():
+        backend = current_platform.get_compile_backend(mode)
+        compile_kwargs["backend"] = backend
+        if module is not None:
+            options = current_platform.get_compile_options(module)
+            if options is not None:
+                compile_kwargs["options"] = options
+        if (
+            "options" not in compile_kwargs
+            and backend == "inductor"
+            and mode is not None
+        ):
+            compile_kwargs["mode"] = mode
+    elif current_platform.is_npu():
+        from sglang.srt.utils.common import get_compiler_backend
+
         compile_kwargs["backend"] = get_compiler_backend()
         compile_kwargs["dynamic"] = False
     elif mode is not None:
@@ -45,6 +61,28 @@ def resolve_torch_compile_mode(
     return default
 
 
+def compile_matching_submodules(
+    module: nn.Module,
+    *,
+    compile_kwargs: dict[str, object],
+) -> int:
+    conditions = getattr(module, "_compile_conditions", ())
+    matches = [
+        submodule
+        for name, submodule in module.named_modules()
+        if name and any(condition(name, submodule) for condition in conditions)
+    ]
+    if not matches:
+        raise ValueError(
+            "regional compile found no matching submodules; "
+            f"check {type(module).__name__}._compile_conditions"
+        )
+
+    for submodule in matches:
+        submodule.compile(**compile_kwargs)
+    return len(matches)
+
+
 @dataclass
 class CompiledModuleRegistry:
     module_ids: set[int] = field(default_factory=set)
@@ -64,6 +102,22 @@ class CompiledModuleRegistry:
         module.compile(**compile_kwargs)
         self.module_ids.add(module_id)
         return True
+
+    def compile_regions_once(
+        self,
+        module: nn.Module,
+        *,
+        compile_kwargs: dict[str, object],
+    ) -> int:
+        module_id = id(module)
+        if module_id in self.module_ids:
+            return 0
+        compiled_count = compile_matching_submodules(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
+        self.module_ids.add(module_id)
+        return compiled_count
 
 
 class CallableModule(nn.Module):

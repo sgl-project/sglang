@@ -9,7 +9,7 @@ flags expected by that path.
 Note: the prefill-tc_piecewise path (``TcPiecewiseCudaGraphBackend``) does NOT
 use ``patch_model`` — it goes through ``compilation/compile.py``'s
 ``install_torch_compiled``. ``_to_torch`` here is duplicated by
-tc_piecewise's local ``_toggle_multi_platform_ops``; the duplication is kept
+tc_piecewise's local ``_toggle_fused_ops``; the duplication is kept
 because the two paths have different lifecycle requirements.
 """
 
@@ -20,8 +20,8 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
@@ -30,7 +30,7 @@ _is_hip = is_hip()
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int) -> None:
     for sub in model._modules.values():
-        if isinstance(sub, MultiPlatformOp):
+        if isinstance(sub, BaseFusedOp):
             if reverse:
                 sub.leave_torch_compile()
             else:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Check if sglang-kernel version from sgl-kernel/pyproject.toml matches the versions
-used in SGLang files (python/pyproject.toml, engine.py, and Dockerfile).
+Check whether SGLang's kernel dependencies match the AOT source pyproject.
+
+The dependent versions are read from python/pyproject.toml, engine.py, and
+Dockerfile.
 Sets GitHub Actions output variables to indicate if sync is needed.
 """
 
@@ -17,8 +19,8 @@ except ImportError:
 
 
 def get_kernel_version_from_source() -> str:
-    """Extract version from sgl-kernel/pyproject.toml (line 11)"""
-    pyproject_path = Path("sgl-kernel/pyproject.toml")
+    """Extract the version from the AOT source pyproject."""
+    pyproject_path = Path("python/sglang/kernels/aot/pyproject.toml")
 
     if not pyproject_path.exists():
         print(f"Error: {pyproject_path} not found")
@@ -29,7 +31,9 @@ def get_kernel_version_from_source() -> str:
 
     version = data.get("project", {}).get("version")
     if not version:
-        print("Error: Could not find version in sgl-kernel/pyproject.toml")
+        print(
+            "Error: Could not find version in python/sglang/kernels/aot/pyproject.toml"
+        )
         sys.exit(1)
 
     return version
@@ -101,7 +105,9 @@ def main():
     engine_version = get_kernel_version_from_engine()
     dockerfile_version = get_kernel_version_from_dockerfile()
 
-    print(f"Kernel version in sgl-kernel/pyproject.toml: {kernel_version}")
+    print(
+        f"Kernel version in python/sglang/kernels/aot/pyproject.toml: {kernel_version}"
+    )
     print(
         f"SGLang kernel dependency version in python/pyproject.toml: {pyproject_version}"
     )

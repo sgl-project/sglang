@@ -12,9 +12,9 @@
 #include "canary_common.cuh"
 #include <cstdint>
 
-namespace canary {
+namespace sglang {
 
-namespace {
+namespace canary {
 
 constexpr uint32_t kVerifyBlockSize = 512;
 constexpr uint32_t kPersistentBlocks = 64;
@@ -136,8 +136,6 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
         reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(warp_active_count));
   }
 }
-
-}  // namespace
 
 // API source of truth: docstring of canary_verify_step in python/sglang/kernels/ops/kv_canary/verify.py.
 //
@@ -287,3 +285,5 @@ struct CanaryVerifyKernel {
 };
 
 }  // namespace canary
+
+}  // namespace sglang

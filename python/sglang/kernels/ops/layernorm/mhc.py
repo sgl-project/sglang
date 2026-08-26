@@ -543,7 +543,9 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
+
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
@@ -579,10 +581,10 @@ def prewarm_mhc_pre(
     the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
     cache; later server runs hit the cache. Driven once per process from load_weights.
     """
-    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_server_args().chunked_prefill_size
+    max_num_tokens = get_schedule().chunked_prefill_size
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )

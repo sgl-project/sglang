@@ -16,8 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
-from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -465,9 +464,11 @@ class TestMamba(unittest.TestCase):
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 3)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [1, 2, 3])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [1, 2, 3])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 3, 4, 5]))
@@ -480,9 +481,11 @@ class TestMamba(unittest.TestCase):
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 2)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [4, 5])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [4, 5])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         # Evicting an internal mamba state creates a tombstone but does not
         # remove full-attention KV blocks, so it must not emit BlockRemoved.
@@ -518,8 +521,8 @@ class TestMamba(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        split_parent_hash = first_insert_events[1].block_hashes[0]
+        self.assertEqual(len(first_insert_events), 1)
+        split_parent_hash = first_insert_events[0].block_hashes[1]
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 5, 6]))
@@ -533,8 +536,8 @@ class TestMamba(unittest.TestCase):
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
@@ -627,53 +630,6 @@ class TestMamba(unittest.TestCase):
             return req
 
         return tree, allocator, req_to_token_pool, make_dummy_req
-
-    def test_hi_mamba_tombstone_cleanup_respects_host_ref(self):
-        tree = object.__new__(HiMambaRadixCache)
-        root = TreeNode()
-        parent = TreeNode()
-        deleted = TreeNode()
-
-        root.key = RadixKey(array("q", []))
-        parent.key = RadixKey(array("q", [1]))
-        deleted.key = RadixKey(array("q", [2]))
-        parent.parent = root
-        deleted.parent = parent
-        parent.value = torch.tensor([1], dtype=torch.int64)
-        parent.protect_host()
-        root.children[parent.key.child_key(1)] = parent
-
-        class RecordingCacheController:
-            def __init__(self):
-                self.device_evictions = []
-                self.host_evictions = []
-
-            def evict_device(self, value):
-                self.device_evictions.append(value)
-
-            def evict_host(self, value):
-                self.host_evictions.append(value)
-
-        tree.root_node = root
-        tree.page_size = 1
-        tree.full_lru_list = LRUList(mamba=False)
-        tree.full_lru_list.insert_mru(parent)
-        tree.cache_controller = RecordingCacheController()
-        tree.full_evictable_size_ = len(parent.value)
-        tree.evictable_full_device_leaves = {parent}
-        tree.evictable_full_host_leaves = set()
-
-        result_node, full_evicted, mamba_evicted = (
-            tree._iteratively_delete_tombstone_leaf(deleted)
-        )
-
-        self.assertIs(result_node, deleted)
-        self.assertEqual(full_evicted, 0)
-        self.assertEqual(mamba_evicted, 0)
-        self.assertIs(root.children[parent.key.child_key(1)], parent)
-        self.assertTrue(tree.full_lru_list.in_list(parent))
-        self.assertEqual(tree.cache_controller.device_evictions, [])
-        self.assertEqual(tree.cache_controller.host_evictions, [])
 
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""

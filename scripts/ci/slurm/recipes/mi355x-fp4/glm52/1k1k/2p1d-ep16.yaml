@@ -1,0 +1,82 @@
+# MI355X GLM-5.2 (MXFP4) 4-node 2P1D disaggregation recipe -- narrow-prefill EP8
+# + wide-decode EP16 (mirrors the DSV4-Pro / Kimi Oren config: wide EP only helps decode).
+#
+# Two prefill engines (EP8, one node each) + one decode engine (EP16) spanning 2
+# nodes, 4 nodes total. Prefill EP8 keeps MoE all-to-all INTRA-node (XGMI); decode
+# gets wide EP16 across nodes over mori. KV (prefill TP8 -> decode TP16) over mori.
+#
+# GLM-specific bits vs the Kimi EP16 recipe: DSA attention is auto-selected for
+# GlmMoeDsaForCausalLM (no explicit --attention-backend), GLM parsers (glm45),
+# and --disable-shared-experts-fusion (GLM has a shared expert).
+
+resources:
+  prefill_workers: 2
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+    decode:
+      tensor-parallel-size: 16
+      expert-parallel-size: 16
+      data-parallel-size: 16
+
+model:
+  env:
+    SGLANG_USE_AITER: 1
+  server_args:
+    - --reasoning-parser
+    - glm45
+    - --tool-call-parser
+    - glm45
+    - --disable-shared-experts-fusion
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260810
+  # DSA attention auto-selected for GlmMoeDsaForCausalLM (no --attention-backend).
+  ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+  moe_a2a_backend: mori
+  kv_transfer_backend: mori
+  dist_socket_ifname: eno0
+  rocm700a: 0
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 131072
+  swa_full_tokens_ratio: 0.1
+  wide_ep:
+    kv_cache_dtype: fp8_e4m3
+    prefill_mem_fraction_static: 0.8
+    decode_mem_fraction_static: 0.85
+    prefill_chunked_prefill_size: 131072
+    prefill_max_running_requests: 1024
+    decode_max_running_requests: 1024
+    common_extra_flags: "--moe-dense-tp-size 1 --enable-dp-lm-head --decode-log-interval 100 --watchdog-timeout 3600 --load-balance-method round_robin --dist-timeout 3600"
+    prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144"
+    decode_extra_flags: "--disable-cuda-graph --prefill-round-robin-balance"
+    prefill_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 256
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 16384
+    decode_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 64
+      MORI_MOE_MAX_INPUT_TOKENS_DECODE: 332
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
+
+bench:
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4
+  random_range_ratio: 1.0
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319
+    threshold: 0.91

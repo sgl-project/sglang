@@ -4,10 +4,10 @@ import torch
 import triton.testing
 
 from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.kernels.ops.diffusion.triton.norm import norm_infer
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
+from sglang.kernels.ops.diffusion import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
+    norm_infer,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
