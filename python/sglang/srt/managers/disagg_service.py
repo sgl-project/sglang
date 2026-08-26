@@ -49,7 +49,8 @@ def maybe_create_ascend_config_store(
     which the rust registry ports verbatim), leaving this store as the only
     ``start_disagg_service`` duty left to perform."""
     if not (
-        get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
+        get_parallel().config.node_rank == 0
+        and transfer_backend == TransferBackend.ASCEND
     ):
         return
     try:

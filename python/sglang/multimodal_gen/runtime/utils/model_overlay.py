@@ -17,6 +17,7 @@ from huggingface_hub.errors import (
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.utils import load_diffusion_overlay_registry_from_env
@@ -106,9 +107,7 @@ def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
 
 
 def get_diffusion_cache_root() -> str:
-    return os.path.expanduser(
-        os.getenv("SGLANG_DIFFUSION_CACHE_ROOT", "~/.cache/sgl_diffusion")
-    )
+    return envs.SGLANG_DIFFUSION_CACHE_ROOT
 
 
 def clear_model_overlay_registry_cache() -> None:

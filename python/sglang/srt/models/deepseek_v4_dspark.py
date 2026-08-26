@@ -52,6 +52,7 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -691,6 +692,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)
@@ -754,7 +756,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
             )
         else:
             self.embed_tokens: Optional[nn.Module] = None

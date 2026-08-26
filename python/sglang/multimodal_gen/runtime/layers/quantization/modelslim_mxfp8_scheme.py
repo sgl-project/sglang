@@ -53,7 +53,8 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
 
         # msmodelslim exports weight_scale as uint8, shape [out, in/32].
         # NOTE: This parameter is intentionally named "weight_scale" (not
-        # "weight_scale_inv" as used in mxfp8_npu.py) because the weight loader
+        # "weight_scale_inv" as used by SRT's NPUMXFP8LinearMethod) because the
+        # weight loader
         # matches parameter names to checkpoint keys, and msmodelslim checkpoints
         # store this tensor under the key "<layer>.weight_scale".
         scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE
