@@ -298,6 +298,9 @@ class BenchArgs:
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
+    initialize_moe_config(server_args)
+    initialize_fp8_gemm_config(server_args)
+    initialize_fp4_gemm_config(server_args)
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
@@ -881,10 +884,6 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
-    initialize_moe_config(server_args)
-    initialize_fp8_gemm_config(server_args)
-    initialize_fp4_gemm_config(server_args)
-
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(
