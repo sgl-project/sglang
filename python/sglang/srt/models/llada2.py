@@ -65,6 +65,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
     TritonKernelTopKOutput,
+    apply_simulated_expert_routing,
     capture_routed_experts_if_allowed,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -667,6 +668,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
@@ -769,7 +771,14 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
     ):
         """Convert block-routing results to the selected MoE runner format."""
         # Block routing computes its own top-k and therefore bypasses TopK.forward,
-        # which normally invokes these diagnostics before producing runner output.
+        # which normally applies benchmark routing overrides and invokes these
+        # diagnostics before producing runner output.
+        topk_weights, topk_ids = apply_simulated_expert_routing(
+            topk_weights,
+            topk_ids,
+            router_logits,
+            layer_id=self.layer_id,
+        )
         capture_routed_experts_if_allowed(
             self.topk.topk_config, self.layer_id, topk_ids
         )
