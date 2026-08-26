@@ -53,6 +53,9 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
+from sglang.srt.utils.hf_transformers.processor import (
+    resolve_image_processor_backend,
+)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -227,9 +230,7 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.image_processor_backend = get_mm().image_processor_backend
-        if get_mm().disable_fast_image_processor:
-            self.image_processor_backend = "pil"
+        self.image_processor_backend = resolve_image_processor_backend(get_mm())
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
