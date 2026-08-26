@@ -39,8 +39,11 @@ from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
+if is_npu():
+    FLA_CHUNK_SIZE_NPU = 64
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -325,6 +328,8 @@ class MambaAttnBackendBase(AttentionBackend):
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
         chunk_size = mamba_cache_chunk_size()
+        if is_npu():
+            h_chunk_size = FLA_CHUNK_SIZE_NPU
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -337,6 +342,8 @@ class MambaAttnBackendBase(AttentionBackend):
             num_h_states = extend_seq_lens // chunk_size
         else:
             num_h_states = (extend_seq_lens - 1) // chunk_size + 1
+            if is_npu():
+                num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -358,6 +365,12 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_src = offset_masked[not_aligned] + (
             lens_masked[not_aligned] // chunk_size
         )
+        if is_npu():
+            track_ssm_h_src = (
+                offset_masked[not_aligned]
+                + ((lens_masked[not_aligned] // chunk_size) * chunk_size)
+                // h_chunk_size
+            )
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
