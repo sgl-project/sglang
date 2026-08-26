@@ -132,7 +132,10 @@ def is_deepseek_dsa(config) -> bool:
 
 
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+    return _hf_arch(config) in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
 
 
 def is_dspark_draft(config) -> bool:
@@ -586,46 +589,46 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        cfg = resolving_view(server_args)
         quantization = (
-            server_args.speculative_draft_model_quantization
+            cfg.speculative_draft_model_quantization
             if is_draft_model
-            else server_args.quantization
+            else cfg.quantization
         )
         override_config_file = (
-            server_args.decrypted_draft_config_file
+            cfg.decrypted_draft_config_file
             if is_draft_model
-            else server_args.decrypted_config_file
+            else cfg.decrypted_config_file
         )
         return ModelConfig(
-            model_path=model_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=model_revision or server_args.revision,
+            model_path=model_path or cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=model_revision or cfg.revision,
             context_length=(
-                context_length
-                if context_length is not None
-                else server_args.context_length
+                context_length if context_length is not None else cfg.context_length
             ),
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
+            model_override_args=cfg.json_model_override_args,
+            is_embedding=cfg.is_embedding,
+            enable_multimodal=cfg.enable_multimodal,
+            dtype=cfg.dtype,
             quantization=quantization,
-            model_impl=server_args.model_impl,
-            sampling_defaults=server_args.sampling_defaults,
-            quantize_and_serve=server_args.quantize_and_serve,
+            model_impl=cfg.model_impl,
+            sampling_defaults=cfg.sampling_defaults,
+            quantize_and_serve=cfg.quantize_and_serve,
             override_config_file=override_config_file,
-            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
-            language_only=server_args.language_only,
-            language_model_only=server_args.language_model_only,
-            encoder_only=server_args.encoder_only,
+            is_multi_layer_eagle=cfg.enable_multi_layer_eagle,
+            language_only=cfg.language_only,
+            language_model_only=cfg.language_model_only,
+            encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
-                is_draft_model
-                and server_args._speculative_draft_quantization_explicitly_set
+                is_draft_model and cfg._speculative_draft_quantization_explicitly_set
             ),
-            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
-            model_config_parser=server_args.model_config_parser,
-            speculative_algorithm=server_args.speculative_algorithm,
+            disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
+            model_config_parser=cfg.model_config_parser,
+            speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
         )
 
@@ -990,6 +993,7 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif (
             "KimiLinearForCausalLM" in self.hf_config.architectures
+            or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
