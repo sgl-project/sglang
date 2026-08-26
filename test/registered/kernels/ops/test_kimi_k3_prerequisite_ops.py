@@ -103,9 +103,10 @@ def _make_mla_inputs(batch_size, num_heads, seed):
     pool = randn(MLA_PAGES, MLA_DIM)
     latent = randn(batch_size, MLA_DIM)
     query = randn(batch_size, num_heads, MLA_DIM)
-    loc = torch.randperm(MLA_PAGES, generator=generator, device="cuda")[:batch_size].to(
-        torch.int64
-    )
+    loc = (
+        torch.randperm(MLA_PAGES - 1, generator=generator, device="cuda")[:batch_size]
+        + 1
+    ).to(torch.int64)
     return (
         pool,
         loc,
