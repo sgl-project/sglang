@@ -289,6 +289,12 @@ class ReqTimeStatsBase:
                 stage.stage_name, latency
             )
 
+    def observe_kv_transfer_bootstrap(self, bootstrap_ms: float, alloc_ms: float):
+        if self.enable_metrics:
+            self.metrics_collector.observe_kv_transfer_bootstrap(
+                bootstrap_ms=bootstrap_ms, alloc_ms=alloc_ms
+            )
+
     def init_trace_ctx(
         self,
         rid: str,
@@ -973,11 +979,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             result["bootstrap_ms"] = bootstrap_ms
             result["alloc_ms"] = alloc_ms
 
-            if self.enable_metrics:
-                self.metrics_collector.observe_kv_transfer_bootstrap(
-                    bootstrap_ms=bootstrap_ms,
-                    alloc_ms=alloc_ms,
-                )
+            self.observe_kv_transfer_bootstrap(
+                bootstrap_ms=bootstrap_ms,
+                alloc_ms=alloc_ms,
+            )
 
         return result if result else None
 
@@ -1039,15 +1044,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.bootstrap_done_time,
                 ts,
             )
-            if self.enable_metrics:
-                bootstrap_ms = (
-                    self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
-                ) * 1000
-                alloc_ms = (ts - self.bootstrap_done_time) * 1000
-                self.metrics_collector.observe_kv_transfer_bootstrap(
-                    bootstrap_ms=bootstrap_ms,
-                    alloc_ms=alloc_ms,
-                )
+            bootstrap_ms = (
+                self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+            ) * 1000
+            alloc_ms = (ts - self.bootstrap_done_time) * 1000
+            self.observe_kv_transfer_bootstrap(
+                bootstrap_ms=bootstrap_ms,
+                alloc_ms=alloc_ms,
+            )
         else:
             self.observe_per_stage_req_latency(
                 RequestStage.DECODE_KV_ALLOCATION_WAIT,
