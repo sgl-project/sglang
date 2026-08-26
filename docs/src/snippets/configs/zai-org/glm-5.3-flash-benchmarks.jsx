@@ -22,6 +22,27 @@ export const benchmarks = [
       "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) at the rc2 cut (f13cb6f6a7), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept length confirmed 3.00 in the bench summary and server log): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,821.97 aggregate output tok/s after two discarded warmups. Simulated accept length makes this a throughput-mechanism number. Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems.",
   },
   {
+    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm" },
+    sglang_version: "f13cb6f6a7",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 16,
+          num_prompts: 80,
+        },
+        ttft_ms: 583.36,
+        tpot_ms: 6.21,
+        tokens_per_sec_per_gpu: 2357.1,
+      },
+    ],
+    notes:
+      "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) at rc2 (f13cb6f6a7), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,885.68 aggregate output tok/s — 3.5% above the BF16 + TileLang Low Latency row, with mean TPOT 6.21 ms vs 6.48 ms. Draft and target full-graph capture succeeded for this combination.",
+  },
+  {
     match: { hw: "gb300", strategy: "high-throughput" },
     sglang_version: "f13cb6f6a7",
     latencyPercentile: "Mean",
