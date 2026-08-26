@@ -2375,7 +2375,7 @@ class KimiK3DecoderLayer(nn.Module):
         if _is_l2:
             _ps_sh_a = tuple(prefix_sum.shape) if prefix_sum is not None else None
             print(
-                f"[K3-L2] A-ENTRY layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"[K3-L2] A-ENTRY layer={self.layer_idx} pp_rank={self.pp_group.rank_in_group} "
                 f"hidden.sum={hidden_states.float().sum().item():.6f} "
                 f"hidden.shape={tuple(hidden_states.shape)} "
                 f"ps.shape={_ps_sh_a} input_sharded={input_sharded} "
@@ -2432,7 +2432,7 @@ class KimiK3DecoderLayer(nn.Module):
 
         if _is_l2:
             print(
-                f"[K3-L2] B-AFTER-ATTN layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"[K3-L2] B-AFTER-ATTN layer={self.layer_idx} pp_rank={self.pp_group.rank_in_group} "
                 f"hidden.sum={hidden_states.float().sum().item():.6f} "
                 f"hidden.shape={tuple(hidden_states.shape)} "
                 f"prefix_sum.shape={tuple(prefix_sum.shape) if prefix_sum is not None else None}",
@@ -2495,7 +2495,7 @@ class KimiK3DecoderLayer(nn.Module):
 
         if _is_l2:
             print(
-                f"[K3-L2] C-AFTER-ATTNREDUCE layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"[K3-L2] C-AFTER-ATTNREDUCE layer={self.layer_idx} pp_rank={self.pp_group.rank_in_group} "
                 f"hidden.sum={hidden_states.float().sum().item():.6f} "
                 f"hidden.shape={tuple(hidden_states.shape)} "
                 f"sp_moe={self._sp_moe} ar_fusion={self.all_reduce_fusion} "
@@ -2522,7 +2522,7 @@ class KimiK3DecoderLayer(nn.Module):
 
         if _is_l2:
             print(
-                f"[K3-L2] D-AFTER-MLP layer={self.layer_idx} pp_rank={self.pp_rank} "
+                f"[K3-L2] D-AFTER-MLP layer={self.layer_idx} pp_rank={self.pp_group.rank_in_group} "
                 f"out.sum={out.float().sum().item():.6f} "
                 f"out.shape={tuple(out.shape)} "
                 f"shard_lo={shard_lo} keep_sharded={keep_sharded}",
@@ -2679,7 +2679,7 @@ class KimiK3LinearModel(nn.Module):
             except Exception as _e:
                 _br_shape, _nvb, _bsz = f"err:{_e}", None, None
             print(
-                f"[K3-DBG] seg_init pp_rank={self.pp_rank} "
+                f"[K3-DBG] seg_init pp_rank={self.pp_group.rank_in_group} "
                 f"pp_world={self.pp_group.world_size} attn_res={attn_res is not None} "
                 f"sp_attn_res={sp_attn_res} sp_coll={k3_sp_collective.enabled()} "
                 f"block_size={_bsz} br_shape={_br_shape} nvb={_nvb} "
@@ -2818,7 +2818,7 @@ class KimiK3LinearModel(nn.Module):
                     except Exception as _e2:
                         _br_full_shape, _nvb_send = f"err:{_e2}", None
                     print(
-                        f"[K3-DBG] pre-send pp_rank={self.pp_rank} "
+                        f"[K3-DBG] pre-send pp_rank={self.pp_group.rank_in_group} "
                         f"br.shape={_br_full_shape} nvb={_nvb_send} "
                         f"hidden.sum={hidden_states.float().sum().item():.6f} "
                         f"hidden.edge0={hidden_states.flatten()[0].item():.6f}",
