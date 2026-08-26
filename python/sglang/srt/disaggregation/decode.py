@@ -2880,7 +2880,13 @@ class SchedulerDisaggregationDecodeMixin:
                     batch.reqs
                 )
             )
-            candidates = [(index, req) for index, req in candidates if index != victim_index]
+            candidates = [
+                (index, req)
+                for index, req in enumerate(batch.reqs)
+                if not req.finished()
+                and not req.is_retracted
+                and len(req.output_ids) > candidate_threshold * p50_output_len
+            ]
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
                 victim.rid,
