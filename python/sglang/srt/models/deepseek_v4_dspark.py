@@ -47,10 +47,12 @@ from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
     gather_and_crop_vocab,
+    project_through_lm_head,
     run_markov_block,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -690,6 +692,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)
@@ -753,7 +756,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
             )
         else:
             self.embed_tokens: Optional[nn.Module] = None
@@ -868,10 +871,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
-        if self._use_fp32_lm_head:
+        if self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = F.linear(x.float(), weight.float())
         else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+            local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)

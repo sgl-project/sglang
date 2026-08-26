@@ -42,6 +42,12 @@ PAGE_SIZE = 64
 BYTES_PER_TOKEN = HEAD_DIM + 4  # 128 fp8 + 4-byte fp32 scale
 EPS = 1e-6
 MAX_POS = 8192
+# The K kernel accumulates in fp32 and rounds once to bf16, so it may differ
+# from an fp32 reference by half a bf16 ulp -- a *relative* bound (bf16 keeps 8
+# significand bits), not an absolute one. The randn cos/sin here are unbounded,
+# so outputs reach magnitudes where half an ulp is well over 0.05.
+BF16_RTOL = 2**-7
+BF16_ATOL = 1e-3
 
 
 def _skip_if_unavailable():
@@ -78,10 +84,11 @@ def test_k_norm_rope_matches_reference():
     _skip_if_unavailable()
     dev = "cuda"
     B = 37
+    g = torch.Generator(device=dev).manual_seed(1)
     cos, sin, cos_sin_cache, positions = _make_inputs(B)
-    key = torch.randn(B, HEAD_DIM, dtype=torch.bfloat16, device=dev)
-    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
-    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
+    key = torch.randn(B, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g)
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
 
     out = fused_k_indexer_norm_rope(key, weight, bias, EPS, cos_sin_cache, positions)
     torch.cuda.synchronize()
@@ -92,7 +99,7 @@ def test_k_norm_rope_matches_reference():
     cp, sp = cos[positions.long()], sin[positions.long()]
     ref = _rope_first(normed, cp, sp)
 
-    torch.testing.assert_close(out.float(), ref, atol=0.06, rtol=0.0)
+    torch.testing.assert_close(out.float(), ref, atol=BF16_ATOL, rtol=BF16_RTOL)
 
 
 # ----------------------------------------------------------------------------
@@ -240,7 +247,7 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
         key.float(), (HEAD_DIM,), weight=k_weight, bias=k_bias, eps=EPS
     )
     k_ref = _rope_first(normed, cos[positions.long()], sin[positions.long()])
-    torch.testing.assert_close(k_out.float(), k_ref, atol=0.06, rtol=0.0)
+    torch.testing.assert_close(k_out.float(), k_ref, atol=BF16_ATOL, rtol=BF16_RTOL)
 
     q = torch.randn(B, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g)
     q_weight = torch.randn(B, n_heads, dtype=torch.bfloat16, device=dev, generator=g)

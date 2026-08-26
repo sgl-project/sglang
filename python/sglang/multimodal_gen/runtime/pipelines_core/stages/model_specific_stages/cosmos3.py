@@ -56,6 +56,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    prepare_rollout_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -478,6 +484,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
+            # The rollout SDE step draws its variance noise from this generator.
+            batch.generator = generator
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
@@ -763,9 +771,10 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             return batch
 
         num_inference_steps = batch.num_inference_steps
-        flow_shift = getattr(batch, "flow_shift", None)
-        if flow_shift is None:
-            flow_shift = pipeline_config.flow_shift
+        explicit_flow_shift = getattr(batch, "flow_shift", None)
+        if explicit_flow_shift is None:
+            explicit_flow_shift = pipeline_config.flow_shift
+        flow_shift = explicit_flow_shift
         if flow_shift is None:
             flow_shift = self._default_flow_shift_for_mode(
                 batch, bool(pipeline_config.is_edge)
@@ -776,13 +785,22 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         batch.timesteps = self.scheduler.timesteps
 
+        if batch.rollout:
+            prepare_rollout_request_scheduler(
+                batch,
+                self.scheduler,
+                explicit_shift=explicit_flow_shift,
+                num_inference_steps=num_inference_steps,
+                device=device,
+            )
+
         self.log_info(
             f"Prepared {len(batch.timesteps)} timesteps (flow_shift={flow_shift})"
         )
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage):
+class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -985,6 +1003,37 @@ class Cosmos3DenoisingStage(PipelineStage):
         condition_latents = batch.extra.get("condition_latents")
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
 
+        # Rollout requests carry a per-request scheduler bound by the timestep stage.
+        scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
+        if batch.rollout:
+            if velocity_mask is not None or condition_latents is not None:
+                raise ValueError(
+                    "Cosmos3 rollout supports T2V/T2I only; I2V/V2V "
+                    "conditioned-frame re-blending breaks the Gaussian "
+                    "transition assumption of the SDE log-prob math."
+                )
+            if action_latents is not None or sound_latents is not None:
+                raise ValueError(
+                    "Cosmos3 rollout does not support action/sound modalities."
+                )
+            self._maybe_prepare_rollout(batch)
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "text_ids": cond_text_ids,
+                    "text_mask": cond_text_mask,
+                    "fps": fps,
+                },
+                neg_cond_kwargs={
+                    "text_ids": uncond_text_ids,
+                    "text_mask": uncond_text_mask,
+                    "fps": fps,
+                },
+                guidance=None,
+            )
+
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
@@ -1154,13 +1203,31 @@ class Cosmos3DenoisingStage(PipelineStage):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            latents = self.scheduler.step(
-                noise_pred,
-                t,
-                latents,
-                generator=generator,
-                return_dict=False,
-            )[0]
+            if batch.rollout:
+                # Capture the pre-step x_{t_i} before the scheduler advances it.
+                batch._rollout_loop_step_index = i
+                self._maybe_append_dit_trajectory_step(
+                    batch=batch,
+                    latents=latents,
+                    timestep_value=t,
+                    step_index=i,
+                )
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    generator=batch.generator,
+                    batch=batch,
+                    return_dict=False,
+                )[0]
+            else:
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    generator=generator,
+                    return_dict=False,
+                )[0]
 
             if action_noise_pred is not None:
                 # Zero the velocity at conditioned (clean) action tokens and at
@@ -1203,6 +1270,15 @@ class Cosmos3DenoisingStage(PipelineStage):
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
+
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=latents,
+                num_inference_steps=len(timesteps),
+                final_timestep=timesteps.new_zeros(()).cpu(),
+                server_args=server_args,
+            )
 
         batch.latents = latents
         if action_latents is not None:
@@ -1641,6 +1717,7 @@ class Cosmos3DecodingStage(PipelineStage):
             audio_sample_rate=audio_sample_rate,
             action_pred=action_pred,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
             **action_metadata,
         )
 

@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -144,6 +145,9 @@ class LogitsProcessorOutput:
     # workaround since ForwardBatch is local to forward_batch_generation().
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Scheduler-local output copied alongside the ordinary generation result.
+    auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
 
 @dataclasses.dataclass
@@ -292,8 +296,10 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
-        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
+        self.use_attn_tp_group = get_parallel().config.enable_dp_lm_head
+        self.use_tp_lm_head_all_to_all = (
+            get_parallel().config.enable_tp_lm_head_all_to_all
+        )
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size

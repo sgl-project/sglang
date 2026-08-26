@@ -3,22 +3,9 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils.common import torch_release
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -28,12 +15,18 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -51,14 +44,17 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     offloader,
 )
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
@@ -115,10 +111,21 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Expose AITER fused-RMS ``transpose_scale=True`` storage logically.
+    """Zero-copy view of a ``transpose_scale=True`` fp8 group scale.
 
-    The fused-RMS op returns transposed physical bytes through a row-major-looking
-    view. Restore logical ``[M, G]`` indexing without copying those bytes.
+    Producer-neutral counterpart of ``materialize_bpreshuffle_fp8_scale``. When an
+    AITER quant/fused-RMS kernel is asked for ``transpose_scale=True`` it writes the
+    per-token group scale directly in physical ``[num_groups, tokens]`` byte order
+    behind a row-major-looking ``[tokens, num_groups]`` tensor. Swapping the strides
+    restores logical ``[M, G]`` indexing over those same bytes -- i.e. the
+    column-major layout the gfx95 bpreshuffle GEMM consumes -- with no copy. Callers
+    that instead take the row-major (``transpose_scale=False``) path relayout via
+    ``materialize_bpreshuffle_fp8_scale``; this is the bit-identical no-copy path.
+
+    Only valid for M(tokens) >= 2. At M == 1 the ``[1, G]`` and ``[G, 1]`` byte
+    orders coincide, so producers keep ``transpose_scale=False`` and materialize;
+    the stride swap here would be a no-op on shape but is never taken at M == 1.
+    Non-2-D scales (e.g. per-tensor) pass through unchanged.
     """
     if scale.dim() != 2:
         return scale
@@ -134,6 +141,28 @@ def materialize_bpreshuffle_fp8_scale_tuple(
         materialize_bpreshuffle_fp8_scale(value[1]),
         *value[2:],
     )
+
+
+def view_aiter_fused_rms_transposed_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Zero-copy scale reinterpret for FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (value[0], view_aiter_fused_rms_transposed_fp8_scale(value[1]), *value[2:])
+
+
+def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> bool:
+    """Whether a producer should emit its fp8 scale already transposed.
+
+    Producer sites choose between two equivalent gfx95 bpreshuffle scale layouts:
+    ``transpose_scale=True`` + zero-copy ``view_aiter_fused_rms_transposed_fp8_scale`` (this
+    predicate True), or row-major ``transpose_scale=False`` +
+    ``materialize_bpreshuffle_fp8_scale`` (this predicate False). The transposed
+    zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
+    at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
+    emit buys nothing and the materialize path is used. Centralizes the gate shared
+    by the MoE-down and MLA o_proj producer sites.
+    """
+    return on_bpreshuffle_gfx95 and m >= 2
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -385,6 +414,26 @@ if flashinfer_per_tensor_fp8_supported():
         ).view(m, n)
 
 
+def _fake_flashinfer_mxfp8_quantize(
+    input: torch.Tensor,
+    _is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    m = input.numel() // input.shape[-1]
+    k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
+    q_input = input.new_empty((m, k_aligned), dtype=torch.float8_e4m3fn)
+    sf_columns = k_aligned // 32
+    if _is_sf_swizzled_layout:
+        padded_rows = ((m + 127) // 128) * 128
+        padded_sf_columns = ((sf_columns + 3) // 4) * 4
+        scale_size = padded_rows * padded_sf_columns
+    else:
+        scale_size = m * sf_columns
+    scale = input.new_empty((scale_size,), dtype=torch.uint8)
+    return q_input, scale
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -446,21 +495,6 @@ if is_blackwell_supported() and is_flashinfer_available():
 
     # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
     # flashinfer's JIT compilation path (filesystem checks/cubin loader).
-    def _fake_flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        _is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-        backend: str = "cute-dsl",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode only needs dtypes and output rank to propagate compile graph.
-        # The scale tensor shape is not consumed before the following fake mm op.
-        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-        q_input = input.new_empty(
-            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-        )
-        scale = input.new_empty((1,), dtype=torch.uint8)
-        return q_input, scale
-
     @register_custom_op(
         op_name="flashinfer_mxfp8_quantize",
         mutates_args=[],
@@ -759,11 +793,11 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+def initialize_fp8_gemm_config() -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp8_gemm_runner_backend
+    backend = get_exec().kernel.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
         backend = "cutlass"
 
@@ -1163,15 +1197,24 @@ def aiter_w8a8_block_fp8_linear(
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # No-copy bpreshuffle scale: emit it already transposed and stride-reinterpret
+        # to the column-major bpreshuffle layout, instead of a .t().contiguous().t()
+        # copy. Bit-identical for M>=2; M==1 keeps materialize (there the [1,G] and
+        # [G,1] byte orders coincide, so materialize is a no-op view anyway).
+        emit_bpreshuffle_scale = (
+            materialize_bpreshuffle_scale and input_2d.shape[0] >= 2
+        )
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=emit_bpreshuffle_scale,
         )
-        if materialize_bpreshuffle_scale:
+        if emit_bpreshuffle_scale:
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+        elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
@@ -1811,7 +1854,9 @@ def apply_fp8_linear(
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
-        if channelwise_cutlass:
+        if channelwise_cutlass or (_is_xpu and weight_scale.numel() == weight.shape[1]):
+            # On XPU, sgl-kernel-xpu's native quant kernels require output_q
+            # to exactly match input's shape; padded output isn't supported.
             num_token_padding = None
         # For static per-tensor activation scales when using inductor compiler,
         # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.

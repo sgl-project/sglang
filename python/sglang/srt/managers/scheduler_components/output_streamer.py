@@ -6,6 +6,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     List,
     Optional,
 )
@@ -30,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.rust_server import RustServer
@@ -43,6 +45,8 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
+    has_additional_customized_info: ClassVar[bool] = False
+
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
     ps: ParallelState
@@ -56,6 +60,13 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.has_additional_customized_info and self.rust_server is not None:
+            raise ValueError(
+                "additional customized generation output is not supported by "
+                "Rust egress"
+            )
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -158,6 +169,7 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
             rust_server_mode=self.rust_server is not None,
+            current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
             if req is skip_req:
@@ -170,6 +182,23 @@ class SchedulerOutputStreamer:
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 
+        if (
+            self.has_additional_customized_info
+            and self.should_build_additional_customized_info()
+        ):
+            additional_customized_info = self.build_additional_customized_info(
+                acc.output_reqs
+            )
+            for key, values in additional_customized_info.items():
+                if key in acc.customized_info:
+                    raise ValueError(f"duplicate customized_info key: {key}")
+                if len(values) != len(acc.output_reqs):
+                    raise ValueError(
+                        f"customized_info key {key!r} returned {len(values)} values "
+                        f"for {len(acc.output_reqs)} requests"
+                    )
+                acc.customized_info[key] = values
+
         # Send to detokenizer
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
@@ -180,6 +209,21 @@ class SchedulerOutputStreamer:
                 self.rust_server.push_generation(payload)
             else:
                 self.send_to_detokenizer.send_output(payload)
+
+    def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
+        """Return fields aligned with the emitted requests in ``reqs``.
+
+        Subclasses must set ``has_additional_customized_info`` to opt in. Each
+        returned value must have one entry per request. A matching
+        ``HostAuxiliaryOutput.consume`` call has already observed the tokens
+        committed in this scheduler step, so implementations can read buffered
+        per-request state here.
+        """
+        return {}
+
+    def should_build_additional_customized_info(self) -> bool:
+        """Return whether this invocation needs subclass-provided output fields."""
+        return True
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
@@ -274,7 +318,9 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
+    output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
     decoded_texts: list = field(default_factory=list)
@@ -301,6 +347,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -393,6 +440,7 @@ class _GenerationStreamAccumulator:
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
+        self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
@@ -445,6 +493,16 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+        else:
+            self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -503,7 +561,9 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = (
+                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
@@ -679,5 +739,8 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
             dp_ranks=dp_ranks,
         )
