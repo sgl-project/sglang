@@ -197,4 +197,37 @@ def _build_lock(scope: pathlib.Path):
 def _load(library: pathlib.Path) -> Module:
     from tvm_ffi import load_module
 
-    return load_module(str(library))
+    return _StreamBoundModule(load_module(str(library)))
+
+
+# kDLROCM / kDLCUDA
+_DLPACK_DEVICE_TYPE = 10 if is_hip_runtime() else 2
+
+
+class _StreamBoundModule:
+    """Launch every exported kernel on torch's current stream.
+
+    The tvm-ffi launcher resolves its stream from the FFI env stream, which
+    torch stream contexts do not update; without this binding the kernels
+    land on the default stream while callers' events record on the context
+    stream and cover nothing.
+    """
+
+    def __init__(self, module: Module):
+        self._module = module
+
+    def __getattr__(self, name: str):
+        fn = getattr(self._module, name)
+        if not callable(fn):
+            return fn
+        from tvm_ffi.core import _env_set_current_stream
+
+        def bound(*args, _fn=fn, **kwargs):
+            device_index = torch.cuda.current_device()
+            stream = torch._C._cuda_getCurrentRawStream(device_index)
+            _env_set_current_stream(_DLPACK_DEVICE_TYPE, device_index, stream)
+            return _fn(*args, **kwargs)
+
+        # Memoize: the instance attribute shadows __getattr__ on later lookups.
+        setattr(self, name, bound)
+        return bound
