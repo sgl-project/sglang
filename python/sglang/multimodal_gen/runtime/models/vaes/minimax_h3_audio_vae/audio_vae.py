@@ -140,7 +140,10 @@ def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
 
 
-@torch.jit.script
+# Not @torch.jit.script on purpose: the profiling executor runs the first
+# call per shape unfused and later calls through a fused kernel with
+# different rounding, so the same input encodes differently on a server
+# process's first request than on every later one.
 def snake(x, alpha):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
