@@ -343,6 +343,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
+    def recover_swa_with_locked_full(
+        self, kept_full: torch.Tensor, incoming_full: torch.Tensor
+    ) -> torch.Tensor:
+        """Keep locked FULL slots and transfer the incoming SWA slots to them."""
+        swa_value = self.translate_loc_from_full_to_swa(incoming_full)
+        self.set_full_to_swa_mapping(kept_full, swa_value)
+        self.clear_full_to_swa_mapping(incoming_full)
+        self.full_attn_allocator.free(incoming_full)
+        return swa_value
+
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return

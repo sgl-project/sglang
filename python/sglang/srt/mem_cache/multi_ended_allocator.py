@@ -269,6 +269,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
         kernel_page_multiplier: Optional[int] = None,
+        virtual_num_pages: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -323,15 +324,28 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = max_slots // self.pool_page_size
         # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
         # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
+        assert (
+            virtual_num_pages is None or not is_id_owner
+        ), "only a non-owner allocator may use another pool's virtual-id space"
+        # An ID owner has one virtual page per physical page. A non-owner may
+        # deliberately have a different physical capacity while indexing the
+        # owner's virtual page space (the unified SWA allocator does this).
+        self.num_virtual_ids = (
+            virtual_num_pages if virtual_num_pages is not None else self.num_pages
+        )
+        if is_id_owner:
+            assert self.num_virtual_ids == self.num_pages
+        assert self.num_virtual_ids > 0, "virtual page count must be positive"
         self.min_page_index = (
             self.min_slot_index + self.pool_page_size - 1
         ) // self.pool_page_size
         self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
-        # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
-        # the -1 sentinel.
+        # v2p follows the shared virtual-id owner; p2v follows this pool's
+        # physical capacity. Page 0 is the padding anchor; the last row is a
+        # sentinel.
         self.virtual_to_physical = torch.full(
-            (self.num_pages + 1,),
+            (self.num_virtual_ids + 1,),
             -1,
             dtype=torch.int64,
             device=device,
@@ -342,8 +356,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
-        self.num_virtual_ids = self.num_pages
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
@@ -536,7 +548,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
         virt_page = slot // self.page_size
-        if virt_page < 0 or virt_page >= self.num_pages:
+        if virt_page < 0 or virt_page >= self.num_virtual_ids:
             return False
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
@@ -546,6 +558,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
             f"min_page_index={self.min_page_index}, "
             f"num_pages={self.num_pages}, "
+            f"num_virtual_ids={self.num_virtual_ids}, "
             f"watermark_physical={self.watermark_physical}, "
             f"allocated_pages={self._allocated_pages()}"
         )
@@ -2891,6 +2904,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (self.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     @property
+    def draft_virtual_id_space(self) -> int:
+        return self.size_full
+
+    @property
     def size_mamba(self) -> int:
         return self.mamba_allocator.max_slots - 1
 
@@ -3208,6 +3225,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
         )
         self._wire_peers()
 
@@ -3389,6 +3407,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
     # (set to the static caps). We do NOT report `max_slots - 1`: under unified
     # memory pool that ~= full_max + swa_max and would over-promise.
+
+    @property
+    def draft_virtual_id_space(self) -> int:
+        return self.full_attn_allocator.max_slots - 1
 
     def debug_print(self) -> str:
         return (
