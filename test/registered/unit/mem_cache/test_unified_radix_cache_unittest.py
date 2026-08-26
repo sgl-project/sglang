@@ -6459,13 +6459,14 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             indices
         )
 
-    def test_apply_component_action_device_kv_swa_uses_free_swa(self):
+    def test_apply_component_action_device_kv_swa_uses_exact_free(self):
         cache = mock.MagicMock()
         indices = torch.tensor([4, 5])
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
         )
-        cache.token_to_kv_pool_allocator.free_swa.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa_exact.assert_called_once_with(indices)
+        cache.token_to_kv_pool_allocator.free_swa.assert_not_called()
 
     def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
         cache = mock.MagicMock()

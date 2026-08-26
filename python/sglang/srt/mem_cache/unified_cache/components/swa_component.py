@@ -484,12 +484,16 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
-            device_frees[self.component_type].append(
-                node.component_data[BASE_COMPONENT_TYPE].value
+            # Pass the node's exact FULL indices. The Controller resolves only
+            # those mapping entries: widening to FULL pages can erase a sibling
+            # node's mapping when a radix split shares a boundary page.
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None and len(full_value) == len(cd.value), (
+                f"SWA/FULL eviction length mismatch on node {node.id}: "
+                f"swa={len(cd.value)}, full="
+                f"{None if full_value is None else len(full_value)}"
             )
+            device_frees[self.component_type].append(full_value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
@@ -1128,7 +1132,7 @@ class SWAComponent(TreeComponent):
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
-                alloc.free_swa(indices)
+                alloc.free_swa_exact(indices)
             return
         if isinstance(action, FreeComponentHostSlot):
             for host_indices in action.host_indices:

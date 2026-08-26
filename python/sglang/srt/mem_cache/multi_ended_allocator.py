@@ -2478,6 +2478,24 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_swa_exact(self, full_indices: torch.Tensor) -> int:
+        """Shared-pool mapping is page-granular, so exact tree frees are
+        page-exact virtual-id frees."""
+        if full_indices is None or full_indices.numel() == 0:
+            return 0
+        v = full_indices.detach().to(torch.int64)
+        v_pages = torch.unique(v // self.page_size)
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+        live_pages = swa_v2p_pages[swa_v2p_pages > 0]
+        freed_tokens = live_pages.numel() * self.page_size
+        expected_tokens = full_indices.numel()
+        assert freed_tokens == expected_tokens, (
+            "tree SWA free accounting mismatch: "
+            f"credited={expected_tokens}, physically_freed={freed_tokens}"
+        )
+        self.free_swa(v)
+        return freed_tokens
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:

@@ -742,6 +742,93 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(freed_lens, [4, 1])
 
 
+class TestSWATreeFreeContract(CustomTestCase):
+    def test_exact_free_preserves_neighbor_mapping_on_shared_full_pages(self):
+        """A tree free must not clear another node's FULL-to-SWA entries.
+
+        This reproduces the observed 64-token discrepancy: node A touches two
+        FULL pages while owning one SWA page. Node B owns the complementary FULL
+        entries and nine SWA pages. Whole-FULL-page cleanup for A would erase one
+        of B's mappings, so B's later 576-token eviction would release only 512.
+        """
+        page_size = 64
+        for grouped in (False, True):
+            with self.subTest(grouped=grouped):
+                _, allocator, _ = _build_swa_tree(
+                    is_eagle=False,
+                    page_size=page_size,
+                    kv_size=12 * page_size,
+                    kv_size_swa=12 * page_size,
+                    sliding_window_size=page_size,
+                )
+                full_indices = _swa_alloc(allocator, 10 * page_size)
+                self.assertIsNotNone(full_indices)
+                swa_indices = allocator.translate_loc_from_full_to_swa(
+                    full_indices
+                ).clone()
+
+                node_a_full = torch.cat((full_indices[:32], full_indices[64:96]))
+                node_b_full = torch.cat(
+                    (
+                        full_indices[32:64],
+                        full_indices[96:128],
+                        full_indices[128:],
+                    )
+                )
+                node_a_swa = swa_indices[:page_size]
+                node_b_swa = swa_indices[page_size:]
+
+                allocator.clear_full_to_swa_mapping(full_indices)
+                allocator.set_full_to_swa_mapping(node_a_full, node_a_swa)
+                allocator.set_full_to_swa_mapping(node_b_full, node_b_swa)
+
+                available_before = allocator.swa_available_size()
+                if grouped:
+                    allocator.free_group_begin()
+                self.assertEqual(allocator.free_swa_exact(node_a_full), page_size)
+                torch.testing.assert_close(
+                    allocator.full_to_swa_index_mapping[node_b_full], node_b_swa
+                )
+                self.assertEqual(allocator.free_swa_exact(node_b_full), 9 * page_size)
+                if grouped:
+                    self.assertEqual(allocator.swa_available_size(), available_before)
+                    allocator.free_group_end()
+
+                self.assertEqual(
+                    allocator.swa_available_size() - available_before,
+                    10 * page_size,
+                )
+                self.assertTrue(
+                    torch.all(allocator.full_to_swa_index_mapping[full_indices] == 0)
+                )
+
+    def test_exact_free_rejects_missing_mapping_before_mutation(self):
+        page_size = 64
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=4 * page_size,
+            kv_size_swa=4 * page_size,
+            sliding_window_size=page_size,
+        )
+        full_indices = _swa_alloc(allocator, 2 * page_size)
+        self.assertIsNotNone(full_indices)
+        allocator.clear_full_to_swa_mapping(full_indices[:page_size])
+        mapping_before = allocator.full_to_swa_index_mapping[full_indices].clone()
+        available_before = allocator.swa_available_size()
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"credited=128.*physically_freed=64",
+        ):
+            allocator.free_swa_exact(full_indices)
+
+        self.assertEqual(allocator.swa_available_size(), available_before)
+        torch.testing.assert_close(
+            allocator.full_to_swa_index_mapping[full_indices], mapping_before
+        )
+
+
 # Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.
 # Splits a freshly-inserted leaf at the (page-aligned) sliding-window
 # boundary so a future inc_lock_ref protects only ~sliding_window_size SWA
