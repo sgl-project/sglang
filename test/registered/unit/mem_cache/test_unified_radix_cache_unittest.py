@@ -5518,7 +5518,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(xfer.nodes_to_load, [n.id for n in loaded_nodes])
 
         # Allocate SWA device slots from the inner allocator (mirrors how
-        # _resolve_pool_transfers_allocation routes via device_alloc_fn ->
+        # _resolve_device_transfers routes via device_alloc_fn ->
         # swa_attn_allocator.alloc on the load-back path).
         n_swa = int(xfer.host_indices.numel())
         new_swa = allocator.swa_attn_allocator.alloc(n_swa)
