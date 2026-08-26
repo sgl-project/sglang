@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.mem_cache.utils import log_hicache_event
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
@@ -1280,12 +1281,30 @@ class UnifiedRadixCache(BasePrefixCache):
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
+                log_hicache_event(
+                    event="backup",
+                    tier="l1_to_l2",
+                    result="failed",
+                    reason="host_mem_capacity_insufficient",
+                    node_id=node_id,
+                    tokens=len(device_value),
+                )
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        return self.cache_controller.write(
+        host_indices = self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
+        if host_indices is None:
+            log_hicache_event(
+                event="backup",
+                tier="l1_to_l2",
+                result="failed",
+                reason="host_mem_alloc_failed",
+                node_id=node_id,
+                tokens=len(device_value),
+            )
+        return host_indices
 
     def _track_write_through_node(
         self,
@@ -1400,6 +1419,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
+            log_hicache_event(
+                event="load_back",
+                tier="l2_to_l1",
+                result="skipped",
+                reason="below_threshold",
+                rid=req.rid,
+                tokens=kv_tokens,
+                extra=f"load_back_threshold={self.load_back_threshold},mem_quota={mem_quota}",
+            )
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -1414,6 +1442,15 @@ class UnifiedRadixCache(BasePrefixCache):
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
+                log_hicache_event(
+                    event="load_back",
+                    tier="l2_to_l1",
+                    result="failed",
+                    reason="mem_capacity_insufficient",
+                    rid=req.rid,
+                    tokens=kv_tokens,
+                    extra=f"avail={avail},num_tokens_evicted={result.num_tokens_evicted}",
+                )
                 return False
 
         # Load H→D
@@ -1427,6 +1464,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
+            log_hicache_event(
+                event="load_back",
+                tier="l2_to_l1",
+                result="failed",
+                reason="mem_alloc_failed",
+                rid=req.rid,
+                tokens=kv_tokens,
+            )
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
@@ -1611,9 +1656,27 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
+            log_hicache_event(
+                event="prefetch",
+                tier="l3_to_l2",
+                result="skipped",
+                reason="below_threshold",
+                rid=req_id,
+                tokens=prefetch_length,
+                extra=f"threshold={self.prefetch_threshold}",
+            )
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            log_hicache_event(
+                event="prefetch",
+                tier="l3_to_l2",
+                result="skipped",
+                reason="rate_limited",
+                rid=req_id,
+                tokens=prefetch_length,
+                extra=f"occupied={self.cache_controller.prefetch_tokens_occupied},capacity_limit={self.cache_controller.prefetch_capacity_limit}",
+            )
             return
         if req_id in self.ongoing_prefetch or (
             buffer_mode and self.buffer_pipeline.has_staged(req_id)
@@ -1674,6 +1737,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if anchor_lock_params is not None:
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            log_hicache_event(
+                event="prefetch",
+                tier="l3_to_l2",
+                result="failed",
+                reason="aux_alloc_failed",
+                rid=req_id,
+                tokens=prefetch_length,
+            )
             return
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1728,9 +1799,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or self._prefetch_timeout_check_linear_func(
-                operation
-            )
+            is_timeout = self._prefetch_timeout_check_linear_func(operation)
+            if is_timeout:
+                log_hicache_event(
+                    event="prefetch",
+                    tier="l3_to_l2",
+                    result="failed",
+                    reason="timeout",
+                    rid=operation.request_id,
+                )
+            can_terminate = completed or is_timeout
         else:
             return True
         if (
@@ -2151,6 +2229,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 if alloc_len >= self.prefetch_threshold:
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
+                log_hicache_event(
+                    event="prefetch",
+                    tier="l3_to_l2",
+                    result="revoke",
+                    reason="host_mem_alloc_failed",
+                    rid=req_id,
+                    tokens=operation.storage_hit_count,
+                    extra=f"Revoking prefetch for request due to host memory allocation failure. available={cc.mem_pool_host.available_size()}",
+                )
                 if buffer_mode:
                     return False
                 self.revoke_pending_prefetch(req_id)
@@ -2192,6 +2279,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 if operation.storage_hit_count < self.prefetch_threshold:
                     # Below-threshold hit: classify + feed the L3 miss
                     # accounting, then revoke (not enough benefit).
+                    log_hicache_event(
+                        event="prefetch",
+                        tier="l3_to_l2",
+                        result="revoke",
+                        reason="insufficient_hit",
+                        rid=req_id,
+                        tokens=operation.storage_hit_count,
+                        extra=f"storage_hit_count={operation.storage_hit_count}, prefetch_threshold={self.prefetch_threshold}",
+                    )
                     self._account_prefetch_outcome(operation, revoked=True)
                     self.revoke_pending_prefetch(req_id)
                     continue

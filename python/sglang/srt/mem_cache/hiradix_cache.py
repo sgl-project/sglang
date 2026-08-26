@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
+    log_hicache_event,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -630,8 +631,14 @@ class HiRadixCache(RadixCache):
                 if operation.storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {req_id} due to insufficient hits ({operation.storage_hit_count})."
+                    log_hicache_event(
+                        event="prefetch",
+                        tier="l3_to_l2",
+                        result="revoke",
+                        reason="insufficient_hit",
+                        rid=req_id,
+                        tokens=operation.storage_hit_count,
+                        extra=f"storage_hit_count={operation.storage_hit_count}, prefetch_threshold={self.prefetch_threshold}",
                     )
                     continue
 
@@ -651,8 +658,14 @@ class HiRadixCache(RadixCache):
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {req_id} due to host memory allocation failure."
+                    log_hicache_event(
+                        event="prefetch",
+                        tier="l3_to_l2",
+                        result="revoke",
+                        reason="host_mem_alloc_failed",
+                        rid=req_id,
+                        tokens=operation.storage_hit_count,
+                        extra=f"Revoking prefetch for request due to host memory allocation failure. available={cc.mem_pool_host.available_size()}",
                     )
                     continue
 
@@ -870,6 +883,14 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            log_hicache_event(
+                event="backup",
+                tier="l1_to_l2",
+                result="failed",
+                reason="host_mem_alloc_failed",
+                node_id=node.id,
+                tokens=len(node.value),
+            )
             return 0
 
         return len(host_indices)
@@ -1601,7 +1622,16 @@ class HiRadixCache(RadixCache):
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or self.is_prefetch_timeout(operation)
+            is_timeout = self.is_prefetch_timeout(operation)
+            if is_timeout:
+                log_hicache_event(
+                    event="prefetch",
+                    tier="l3_to_l2",
+                    result="failed",
+                    reason="timeout",
+                    rid=operation.request_id,
+                )
+            can_terminate = completed or is_timeout
         else:
             # unknown prefetch stop policy, just return True
             return True
@@ -1791,11 +1821,29 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage:
+            return
+        if prefetch_length < self.prefetch_threshold:
+            log_hicache_event(
+                event="prefetch",
+                tier="l3_to_l2",
+                result="skipped",
+                reason="below_threshold",
+                rid=req_id,
+                tokens=prefetch_length,
+                extra=f"threshold={self.prefetch_threshold}",
+            )
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            log_hicache_event(
+                event="prefetch",
+                tier="l3_to_l2",
+                result="skipped",
+                reason="rate_limited",
+                rid=req_id,
+                tokens=prefetch_length,
+                extra=f"occupied={self.cache_controller.prefetch_tokens_occupied},capacity_limit={self.cache_controller.prefetch_capacity_limit}",
+            )
             return
 
         last_host_node.protect_host()

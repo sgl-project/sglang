@@ -732,7 +732,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                self._safe_page_backup(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
