@@ -51,9 +51,9 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
             call.args[0].stage_name: (call.args[1], call.args[2])
             for call in trace_slice.call_args_list
         }
-        self.assertEqual(slices["decode_bootstrap"], (10.0, 15.0))
         self.assertEqual(slices["decode_bootstrap_handshake"], (10.0, 12.0))
         self.assertEqual(slices["decode_kv_allocation_wait"], (12.0, 15.0))
+        self.assertNotIn("decode_bootstrap", slices)
 
     def test_decode_preallocation_without_bootstrap_timestamp(self):
         stats = rts.SchedulerReqTimeStats()
@@ -63,7 +63,7 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
             stats.set_decode_transfer_queue_entry_time(ts=15.0)
 
         slices = [call.args[0].stage_name for call in trace_slice.call_args_list]
-        self.assertEqual(slices, ["decode_bootstrap"])
+        self.assertEqual(slices, ["decode_kv_allocation_wait"])
 
     def test_decode_preallocation_with_tracing_disabled(self):
         stats = rts.SchedulerReqTimeStats()

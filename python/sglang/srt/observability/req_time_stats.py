@@ -178,18 +178,15 @@ class RequestStage:
         level=1,
         metrics_is_observed=True,
     )
-    DECODE_BOOTSTRAP = RequestStageConfig(
-        "decode_bootstrap",
-        level=1,
-        metrics_is_observed=True,
-    )
     DECODE_BOOTSTRAP_HANDSHAKE = RequestStageConfig(
         "decode_bootstrap_handshake",
         level=1,
+        metrics_is_observed=True,
     )
     DECODE_KV_ALLOCATION_WAIT = RequestStageConfig(
         "decode_kv_allocation_wait",
         level=1,
+        metrics_is_observed=True,
     )
     DECODE_WAITING = RequestStageConfig(
         "decode_waiting",
@@ -1023,17 +1020,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.decode_transfer_queue_entry_time = ts
 
-        stage = RequestStage.DECODE_BOOTSTRAP
-        self.observe_per_stage_req_latency(
-            stage, ts - self.decode_prealloc_queue_entry_time
-        )
-        self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
-
         if self.bootstrap_done_time > 0:
+            self.observe_per_stage_req_latency(
+                RequestStage.DECODE_BOOTSTRAP_HANDSHAKE,
+                self.bootstrap_done_time - self.decode_prealloc_queue_entry_time,
+            )
             self.trace_slice(
                 RequestStage.DECODE_BOOTSTRAP_HANDSHAKE,
                 self.decode_prealloc_queue_entry_time,
                 self.bootstrap_done_time,
+            )
+            self.observe_per_stage_req_latency(
+                RequestStage.DECODE_KV_ALLOCATION_WAIT,
+                ts - self.bootstrap_done_time,
             )
             self.trace_slice(
                 RequestStage.DECODE_KV_ALLOCATION_WAIT,
@@ -1049,6 +1048,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     bootstrap_ms=bootstrap_ms,
                     alloc_ms=alloc_ms,
                 )
+        else:
+            self.observe_per_stage_req_latency(
+                RequestStage.DECODE_KV_ALLOCATION_WAIT,
+                ts - self.decode_prealloc_queue_entry_time,
+            )
+            self.trace_slice(
+                RequestStage.DECODE_KV_ALLOCATION_WAIT,
+                self.decode_prealloc_queue_entry_time,
+                ts,
+            )
 
     def set_bootstrap_done_time(self, ts=None):
         ts = ts or time.perf_counter()
