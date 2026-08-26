@@ -40,7 +40,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_exec,
     get_flags,
     get_lora,
@@ -611,8 +610,8 @@ class CPUGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.dp_size = get_parallel().config.dp_size
+        self.pp_size = get_parallel().config.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode

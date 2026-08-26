@@ -48,6 +48,26 @@ def _get_allocator_type(server_args: ServerArgs) -> str:
     return get_allocator_type(server_args)
 
 
+def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
+    shortfall = max(0, required_size - available_size)
+    if shortfall > 0:
+        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+
+
+def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    available_size = (
+        cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
+    )
+    shortfall = max(0, required_size - available_size)
+    if shortfall > 0:
+        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -1210,8 +1230,6 @@ class _DeepSeekV4Strategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
             server_args=server_args,
@@ -1219,7 +1237,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
-            device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -1286,8 +1304,6 @@ class _MambaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
@@ -1301,7 +1317,7 @@ class _MambaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=kvcache.use_mla,
             host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
-            device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -1355,8 +1371,6 @@ class _SwaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
         host_pool_group, cache_controller = build_hybrid_swa_stack(
             params=params,
@@ -1369,7 +1383,7 @@ class _SwaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=False,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
-            device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -1417,8 +1431,6 @@ class _MambaSwaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
         host_pool_group, cache_controller = build_hybrid_mamba_swa_stack(
@@ -1438,9 +1450,9 @@ class _MambaSwaStrategy(StackStrategy):
             pp_group=params.pp_cache_group,
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
-            device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
             host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
-            device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
