@@ -428,7 +428,7 @@ class Platform:
 
     def tensor_on_device(self, t: torch.nn.Modulee) -> bool:
         """Check if a tensor is on the current platform's device."""
-        raise t.is_npu or t.is_cuda
+        return t.is_npu or t.is_cuda
 
 
 class UnspecifiedPlatform(Platform):
