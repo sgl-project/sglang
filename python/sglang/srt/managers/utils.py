@@ -270,9 +270,6 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "sampling_mask_token_ids": (
             None if sampling_mask_output is None else sampling_mask_output.token_ids
         ),
-        "sampling_mask_support_bits": (
-            None if sampling_mask_output is None else sampling_mask_output.support_bits
-        ),
         "sampling_mask_lengths": (
             None if sampling_mask_output is None else sampling_mask_output.lengths
         ),
@@ -301,7 +298,6 @@ def get_logprob_from_pp_outputs(
             batch_indices=next_pp_outputs["sampling_mask_batch_indices"],
             batch_size=next_pp_outputs["sampling_mask_batch_size"],
             token_ids=next_pp_outputs["sampling_mask_token_ids"],
-            support_bits=next_pp_outputs["sampling_mask_support_bits"],
             lengths=next_pp_outputs["sampling_mask_lengths"],
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             valid=next_pp_outputs["sampling_mask_valid"],

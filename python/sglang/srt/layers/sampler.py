@@ -69,6 +69,7 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_MASK_TIE_BUFFER = 128
 
 
 class _SamplingMaskCapture(NamedTuple):
@@ -413,7 +414,6 @@ class Sampler(nn.Module):
                 device=batch_next_token_ids.device,
             ),
             token_ids=token_ids.view(-1, 1),
-            support_bits=None,
             lengths=torch.ones(
                 num_requested, dtype=torch.int32, device=batch_next_token_ids.device
             ),
@@ -487,42 +487,28 @@ class Sampler(nn.Module):
         )
         mask_lengths = support.sum(dim=-1, dtype=torch.int32)
 
+        max_top_k = getattr(sampling_info, "sampling_mask_max_top_k", weights.shape[-1])
+        packed_width = min(
+            max_top_k + SAMPLING_MASK_TIE_BUFFER,
+            weights.shape[-1],
+        )
+        _, packed_positions = torch.topk(weights, k=packed_width, dim=-1)
         if token_ids is None:
-            padding = (-support.shape[-1]) % 8
-            if padding:
-                support = torch.cat(
-                    (
-                        support,
-                        torch.zeros(
-                            (support.shape[0], padding),
-                            dtype=torch.bool,
-                            device=support.device,
-                        ),
-                    ),
-                    dim=-1,
-                )
-            bit_weights = (
-                1 << torch.arange(8, device=support.device, dtype=torch.int16)
-            ).view(1, 1, 8)
-            support_bits = (
-                (support.view(support.shape[0], -1, 8).to(torch.int16) * bit_weights)
-                .sum(dim=-1, dtype=torch.int16)
-                .to(torch.uint8)
-            )
-            packed_token_ids = None
+            packed_token_ids = packed_positions.to(torch.int32)
         else:
-            packed_width = min(
-                getattr(
-                    sampling_info,
-                    "sampling_mask_max_top_k",
-                    token_ids.shape[-1],
-                ),
-                token_ids.shape[-1],
+            packed_token_ids = torch.gather(token_ids, 1, packed_positions).to(
+                torch.int32
             )
-            packed_token_ids = token_ids[:, :packed_width].contiguous()
-            support_bits = None
-            valid &= mask_lengths <= packed_width
+        packed_token_ids = packed_token_ids.contiguous()
+        sampled_in_packed_support = (
+            packed_token_ids == sampled_tokens.to(torch.int32)
+        ).any(dim=-1)
+        valid &= sampled_in_packed_support
 
+        # The fixed-width tensor avoids the synchronization required by
+        # nonzero(), while leaving room for FlashInfer's cutoff-tie semantics.
+        # Materialization rejects the unbounded overflow case instead of
+        # silently returning incomplete support.
         logits_output.sampling_mask_output = SamplingMaskOutput(
             batch_indices=requested_rows,
             batch_size=torch.tensor(
@@ -531,7 +517,6 @@ class Sampler(nn.Module):
                 device=weights.device,
             ),
             token_ids=packed_token_ids,
-            support_bits=support_bits,
             lengths=mask_lengths,
             selected_logprobs=selected_logprobs,
             valid=valid,

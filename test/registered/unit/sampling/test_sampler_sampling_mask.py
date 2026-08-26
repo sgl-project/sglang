@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import (
+    SAMPLING_MASK_TIE_BUFFER,
     Sampler,
     _SamplingMaskCapture,
     top_k_top_p_min_p_sampling_from_probs_torch,
@@ -270,6 +271,46 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.assertIsNone(no_capture)
         self.assertIsNotNone(capture)
         self.assertTrue(torch.equal(without_mask, with_mask))
+
+    def test_sampling_mask_reserves_space_for_cutoff_ties(self):
+        top_k = 2
+        capacity = top_k + SAMPLING_MASK_TIE_BUFFER
+        weights = torch.zeros((1, capacity + 2), device="cuda")
+        weights[0, :capacity] = 1.0
+        sampling_info = SimpleNamespace(
+            return_sampling_masks=[True], sampling_mask_max_top_k=top_k
+        )
+        output = LogitsProcessorOutput(next_token_logits=None)
+
+        self.sampler._attach_sampling_mask_to_output(
+            output,
+            sampling_info,
+            torch.tensor([capacity - 1], device="cuda"),
+            _SamplingMaskCapture(weights, None, None),
+        )
+
+        self.assertEqual(output.sampling_mask_output.token_ids.shape, (1, capacity))
+        masks, _ = output.sampling_mask_output.materialize()
+        self.assertEqual(set(masks[0]), set(range(capacity)))
+
+    def test_sampling_mask_rejects_tie_buffer_overflow(self):
+        top_k = 2
+        capacity = top_k + SAMPLING_MASK_TIE_BUFFER
+        weights = torch.ones((1, capacity + 1), device="cuda")
+        sampling_info = SimpleNamespace(
+            return_sampling_masks=[True], sampling_mask_max_top_k=top_k
+        )
+        output = LogitsProcessorOutput(next_token_logits=None)
+
+        self.sampler._attach_sampling_mask_to_output(
+            output,
+            sampling_info,
+            torch.tensor([0], device="cuda"),
+            _SamplingMaskCapture(weights, None, None),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds its packed token storage"):
+            output.sampling_mask_output.materialize()
 
 
 if __name__ == "__main__":

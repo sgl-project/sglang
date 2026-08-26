@@ -100,8 +100,7 @@ class SamplingMaskOutput:
 
     batch_indices: torch.Tensor
     batch_size: torch.Tensor
-    token_ids: Optional[torch.Tensor]
-    support_bits: Optional[torch.Tensor]
+    token_ids: torch.Tensor
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
     valid: torch.Tensor
@@ -109,18 +108,28 @@ class SamplingMaskOutput:
     def map_device_tensors(self, fn) -> None:
         self.batch_indices = fn(self.batch_indices)
         self.batch_size = fn(self.batch_size)
-        if self.token_ids is not None:
-            self.token_ids = fn(self.token_ids)
-        if self.support_bits is not None:
-            self.support_bits = fn(self.support_bits)
+        self.token_ids = fn(self.token_ids)
         self.lengths = fn(self.lengths)
         self.selected_logprobs = fn(self.selected_logprobs)
         self.valid = fn(self.valid)
 
     def materialize(self) -> Tuple[List[Optional[List[int]]], List[Optional[float]]]:
         """Convert copied tensors into batch-aligned Python values."""
-        batch_indices = self.batch_indices.cpu().tolist()
-        valid = self.valid.cpu().tolist()
+        batch_indices = self.batch_indices.tolist()
+        lengths = self.lengths.tolist()
+        packed_width = self.token_ids.shape[1]
+        overflow_rows = [
+            batch_row
+            for batch_row, length in zip(batch_indices, lengths)
+            if length > packed_width
+        ]
+        if overflow_rows:
+            raise RuntimeError(
+                "Captured sampling support exceeds its packed token storage "
+                f"for batch rows {overflow_rows}."
+            )
+
+        valid = self.valid.tolist()
         invalid_rows = [
             batch_row
             for batch_row, is_valid in zip(batch_indices, valid)
@@ -132,38 +141,15 @@ class SamplingMaskOutput:
                 f"for batch rows {invalid_rows}."
             )
 
-        lengths = self.lengths.cpu().tolist()
-        selected_logprobs = self.selected_logprobs.cpu().tolist()
-        batch_size = int(self.batch_size.cpu().item())
+        selected_logprobs = self.selected_logprobs.tolist()
+        batch_size = int(self.batch_size.item())
         masks: List[Optional[List[int]]] = [None] * batch_size
         logprobs: List[Optional[float]] = [None] * batch_size
 
-        if self.support_bits is not None:
-            support_bits = self.support_bits.cpu().tolist()
-            row_token_ids = []
-            for row_bytes, length in zip(support_bits, lengths):
-                token_ids = []
-                for byte_index, byte_value in enumerate(row_bytes):
-                    while byte_value:
-                        bit_index = (byte_value & -byte_value).bit_length() - 1
-                        token_ids.append(byte_index * 8 + bit_index)
-                        byte_value &= byte_value - 1
-                if len(token_ids) != length:
-                    raise RuntimeError(
-                        "Captured sampling support length does not match its bitset."
-                    )
-                row_token_ids.append(token_ids)
-        else:
-            assert self.token_ids is not None
-            token_ids = self.token_ids.cpu()
-            packed_width = token_ids.shape[1]
-            row_token_ids = []
-            for row, length in enumerate(lengths):
-                if not 0 <= length <= packed_width:
-                    raise RuntimeError(
-                        "Captured sampling support exceeds its packed token storage."
-                    )
-                row_token_ids.append(token_ids[row, :length].tolist())
+        token_ids = self.token_ids
+        row_token_ids = [
+            token_ids[row, :length].tolist() for row, length in enumerate(lengths)
+        ]
 
         for row, batch_index in enumerate(batch_indices):
             masks[batch_index] = row_token_ids[row]
