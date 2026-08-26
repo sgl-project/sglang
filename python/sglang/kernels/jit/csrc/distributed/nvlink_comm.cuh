@@ -18,6 +18,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <cuda.h>
 
 namespace sglang {
 
@@ -608,6 +609,126 @@ void all_gather_copy_engine(
       /*kind=*/cudaMemcpyDeviceToDevice,
       /*stream=*/stream));
   launch_barrier();
+}
+
+/// Stream memory ops, resolved through the runtime so the module does not have
+/// to link the driver library.
+inline auto cu_stream_batch_mem_op() {
+  using Fn = CUresult (*)(CUstream, unsigned int, CUstreamBatchMemOpParams*, unsigned int);
+  static Fn fn = [] {
+    void* sym = nullptr;
+    cudaDriverEntryPointQueryResult found{};
+    CHECK_CUDA(cudaGetDriverEntryPointByVersion("cuStreamBatchMemOp", &sym, 12030, cudaEnableDefault, &found));
+    CHECK_HOST(found == cudaDriverEntryPointSuccess && sym != nullptr)
+        << "cuStreamBatchMemOp is unavailable; the copy-engine collectives need CUDA 12.3 or newer";
+    return reinterpret_cast<Fn>(sym);
+  }();
+  return fn;
+}
+
+/// Arrive-and-wait across the plane without launching anything.
+///
+/// The arrive is a four-byte host-to-device copy to the flag array's multicast
+/// alias, so one operation lands in every rank's array; the waits and the reset
+/// writes go down as a single batched stream memory op, which the stream itself
+/// blocks on. Nothing here occupies an SM.
+///
+/// A sequence number would be baked into a graph at capture time and every
+/// replay would then wait on a stale value, so the flag is a constant and the
+/// same batch clears it again: each barrier walks its slots 0 -> 1 -> 0. That
+/// makes graph and eager identical, at the cost of `world_size` extra writes.
+///
+/// `slot` picks one of the two flag arrays. Consecutive barriers must alternate,
+/// which is what keeps one round's arrive from being erased by the previous
+/// round's reset: between two barriers on the same array there is always a
+/// complete barrier on the other one. Callers therefore need an even number of
+/// barriers per collective -- entry and exit.
+inline void ce_barrier(
+    cudaStream_t stream, uint32_t* flag_local, uint32_t* flag_mc, uint32_t rank, uint32_t world_size, uint32_t slot) {
+  // A graph node keeps the source pointer, not the value, so this has to outlive
+  // the capture; pinned, because the copy engine stages a pageable source and
+  // that shows up as several microseconds on a four-byte transfer.
+  static const uint32_t* arrived = [] {
+    void* p = nullptr;
+    CHECK_CUDA(cudaHostAlloc(&p, sizeof(uint32_t), cudaHostAllocDefault));
+    *static_cast<uint32_t*>(p) = 1;
+    return static_cast<const uint32_t*>(p);
+  }();
+
+  const auto base = slot * world_size;
+  CHECK_CUDA(cudaMemcpyAsync(flag_mc + base + rank, arrived, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+
+  std::vector<CUstreamBatchMemOpParams> ops;
+  ops.reserve(2 * world_size - 1);
+  for (uint32_t r = 0; r < world_size; ++r) {
+    if (r == rank) continue;
+    auto& op = ops.emplace_back();
+    op.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    op.waitValue.address = std::bit_cast<CUdeviceptr>(flag_local + base + r);
+    op.waitValue.value = 1;
+    op.waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+  }
+  // Clearing only touches this rank's copy, so it cannot erase an arrival a
+  // peer has yet to observe. Ordered after the waits within the batch.
+  for (uint32_t i = 0; i < world_size; ++i) {
+    auto& op = ops.emplace_back();
+    op.writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
+    op.writeValue.address = std::bit_cast<CUdeviceptr>(flag_local + base + i);
+    op.writeValue.value = 0;
+    op.writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
+  }
+  const auto rc =
+      cu_stream_batch_mem_op()(std::bit_cast<CUstream>(stream), static_cast<unsigned int>(ops.size()), ops.data(), 0);
+  CHECK_HOST(rc == CUDA_SUCCESS) << "cuStreamBatchMemOp failed with " << static_cast<int>(rc);
+}
+
+/// All-gather with no kernel at all: the copy engine writes this rank's shard
+/// straight into every peer's output, and the two barriers are stream memory
+/// ops. The walk starts at this rank so that at any step the senders are spread
+/// across distinct destinations instead of converging on one.
+///
+/// Unlike the multicast copy-engine gather, this injects `world_size` times the
+/// payload but rides the unicast links, which is the better trade once the
+/// multicast injection rate -- flat at roughly 100 GB/s regardless of fan-out --
+/// stops being amortised by a wide enough world.
+inline void all_gather_copy_engine_unicast(
+    const host::distributed::CommunicatorRef comm,
+    const tvm::ffi::TensorView in,
+    const tvm::ffi::TensorView out,
+    const tvm::ffi::Array<int64_t> peer_out_ptrs,
+    const int64_t flag_ptr,
+    const int64_t flag_mc_ptr,
+    const int64_t stream_id) {
+  using Impl = NVLinkComm<void, false>;
+  const auto& pull = comm->get_pull_obj();
+  const auto [hidden_size, device] = Impl::check_params(in, out);
+  const auto world_size = pull.world_size;
+  const auto rank = pull.rank;
+  CHECK_HOST(static_cast<uint32_t>(peer_out_ptrs.size()) == world_size)
+      << "need one output pointer per rank, got " << peer_out_ptrs.size();
+  const auto routing = Impl::get_routing(static_cast<uint32_t>(out.size(0)), rank, world_size);
+  CHECK_HOST(static_cast<uint32_t>(in.size(0)) == routing.num_rank_tokens)
+      << "all_gather takes this rank's shard of " << out.size(0) << ", which is " << routing.num_rank_tokens
+      << " tokens, got " << in.size(0);
+
+  const auto element_bytes = host::dtype_bytes(in.dtype());
+  const auto shard_bytes = static_cast<std::size_t>(in.numel()) * element_bytes;
+  const auto prefix_bytes = static_cast<int64_t>(routing.prefix_tokens) * hidden_size * element_bytes;
+  const auto stream = std::bit_cast<cudaStream_t>(stream_id);
+  const auto flag_local = std::bit_cast<uint32_t*>(flag_ptr);
+  const auto flag_mc = std::bit_cast<uint32_t*>(flag_mc_ptr);
+
+  ce_barrier(stream, flag_local, flag_mc, rank, world_size, /*slot=*/0);
+  for (uint32_t step = 0; step < world_size; ++step) {
+    const auto dst_rank = (rank + step) % world_size;
+    CHECK_CUDA(cudaMemcpyAsync(
+        /*dst=*/std::bit_cast<void*>(peer_out_ptrs[dst_rank] + prefix_bytes),
+        /*src=*/in.data_ptr(),
+        /*count=*/shard_bytes,
+        /*kind=*/cudaMemcpyDeviceToDevice,
+        /*stream=*/stream));
+  }
+  ce_barrier(stream, flag_local, flag_mc, rank, world_size, /*slot=*/1);
 }
 
 }  // namespace sglang

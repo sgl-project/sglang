@@ -55,6 +55,7 @@ PROVIDERS = [
     "nvlink-push",
     "nvlink-pull",
     "copy-engine",
+    "copy-engine-unicast",
 ]
 OPS = nvl.SUPPORTED_OPS
 
@@ -177,8 +178,8 @@ def benchmark(op: str, tokens: int, provider: str):
 
     if provider == "v2" and op != "all_reduce":
         marker.skip("v2 is an all-reduce baseline only")
-    if provider == "copy-engine" and op != "all_gather":
-        marker.skip("the copy-engine path only implements all_gather")
+    if provider.startswith("copy-engine") and op != "all_gather":
+        marker.skip("the copy-engine paths only implement all_gather")
     if provider.startswith("nvlink-push"):
         # Only the gather spans the plane; all-reduce and the scatter each put a
         # sender's whole contribution into a single slot.
@@ -196,6 +197,12 @@ def benchmark(op: str, tokens: int, provider: str):
         # The copy engine moves the payload and the collective launches only its
         # two barriers, so this cell runs the all-gather with zero SM occupancy.
         fn = lambda: nvl.all_gather_copy_engine(nvlink.obj, sym_in, sym_out)
+
+    elif provider == "copy-engine-unicast":
+        # Same shape, but the payload rides the unicast links: one peer copy per
+        # rank instead of a single write to the multicast alias.
+        nvl.all_gather_copy_engine_unicast(nvlink.obj, sym_in, sym_out, group=cpu_group)
+        fn = lambda: nvl.all_gather_copy_engine_unicast(nvlink.obj, sym_in, sym_out)
 
     elif provider == "nccl":
         plain_in = torch.randn(in_shape, dtype=DTYPE, device=device)
