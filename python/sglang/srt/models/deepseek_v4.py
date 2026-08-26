@@ -1437,7 +1437,10 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
+        # attn_tp_size, not tp_size: MqaAttentionBase only sets the attention-TP
+        # pair, and the padded/local head counts this block indexes with
+        # (padded_num_heads, n_local_heads) are both derived from it.
+        if self.attn_tp_size > 1:
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
