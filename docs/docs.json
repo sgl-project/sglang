@@ -1111,6 +1111,7 @@
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
