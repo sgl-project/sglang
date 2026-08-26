@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, NamedTuple
+from typing import TYPE_CHECKING, Dict, Final, List, NamedTuple, Tuple
 
 import torch
 from tvm_ffi import Module
@@ -59,8 +59,32 @@ def _jit_misc_module() -> Module:
         cuda_wrappers=[
             ("barrier", f"nvlink_barrier<{args}>"),
             ("all_gather_copy_engine", f"all_gather_copy_engine<{args}>"),
+            ("all_gather_copy_engine_unicast", "all_gather_copy_engine_unicast"),
         ],
     )
+
+
+# Two arrays of `world_size` words, plus their multicast alias. The copy-engine
+# barrier signals through the alias and waits on the local copy, so these have to
+# live in symmetric memory. One set per communicator, allocated on first use.
+_CE_FLAGS: Dict[int, Tuple[torch.Tensor, int, int]] = {}
+
+
+def make_ce_flags(group, world_size: int) -> Tuple[torch.Tensor, int, int]:
+    """Allocate the flag array the copy-engine barrier waits on."""
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    flags = _SymmetricMemory.empty_strided_p2p(
+        (2 * world_size,),
+        [1],
+        torch.int32,
+        torch.device("cuda", torch.cuda.current_device()),
+        group.group_name,
+    )
+    flags.zero_()
+    mc_ptr = get_multicast_ptr(flags)
+    torch.cuda.synchronize()
+    return flags, flags.data_ptr(), mc_ptr
 
 
 @cache_once
@@ -165,6 +189,43 @@ def all_gather_copy_engine(
         input,
         output,
         out_mc_ptr or get_multicast_ptr(output),
+    )
+
+
+def all_gather_copy_engine_unicast(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    group=None,
+    peer_out_ptrs: List[int] | None = None,
+    stream: int | None = None,
+) -> None:
+    """All-gather that launches no kernel at all.
+
+    The copy engine moves the payload -- one peer-to-peer copy per rank, started
+    at this rank so the links are not all driven in the same order -- and the two
+    barriers around it are stream memory ops. `output` must be symmetric memory,
+    since this rank writes its shard straight into every peer's copy; `input` is
+    read locally and can be an ordinary tensor. `group` is only needed on the
+    first call for a given communicator, to allocate the barrier flags.
+    """
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    flags = _CE_FLAGS.get(id(comm))
+    if flags is None:
+        assert group is not None, "pass `group` on the first call to allocate the flags"
+        flags = _CE_FLAGS[id(comm)] = make_ce_flags(group, comm.world_size)
+    if peer_out_ptrs is None:
+        base = _SymmetricMemory.rendezvous(output).buffer_ptrs
+        # `output` may be a view into the middle of the allocation, and the peer
+        # pointers address its base; the same shift applies on every rank.
+        shift = output.data_ptr() - int(base[comm.rank])
+        peer_out_ptrs = [int(p) + shift for p in base]
+    if stream is None:
+        stream = torch.cuda.current_stream().cuda_stream
+    _jit_misc_module().all_gather_copy_engine_unicast(
+        comm, input, output, peer_out_ptrs, flags[1], flags[2], stream
     )
 
 
