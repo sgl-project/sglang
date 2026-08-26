@@ -43,6 +43,13 @@ class Qwen3_5ForCausalLM(nn.Module):
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The body decides; it is handed this config and quantization verbatim.
+        return cls.body_cls.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config,
@@ -110,6 +117,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layers_to_capture is None:
+            raise ValueError(
+                "DFLASH requires explicit layer ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture(layers_to_capture)
 
     @torch.no_grad()
     def forward(

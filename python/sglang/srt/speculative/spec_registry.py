@@ -152,10 +152,14 @@ class CustomSpecAlgo:
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
+        """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        The speculative config comes from ``runtime_context.get_spec()``, which
+        follows a runtime override where the startup record does not.
+        """
         return None
 
 

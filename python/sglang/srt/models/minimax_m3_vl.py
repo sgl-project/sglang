@@ -10,7 +10,10 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
@@ -43,7 +46,7 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -132,52 +135,43 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
-    def _determine_num_fused_shared_experts(self) -> None:
-        text_config = self.config.text_config
-        server_args = get_server_args()
-        if get_exec().moe.disable_shared_experts_fusion:
-            return
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
-        disable_reason = None
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built; the experts live on the text
+        config."""
+        text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "modelopt_mixed"
-        ):
-            disable_reason = (
+            return "No shared experts are defined in the config."
+        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+            return (
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_parallel().moe_ep_size > 1:
-            disable_reason = (
+        if not _is_cuda:
+            return "Shared experts fusion currently requires CUDA devices."
+        if (_device_sm is not None) and (_device_sm < 80):
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        if get_parallel().moe_ep_size > 1:
+            return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = (
+        if get_moe_a2a_backend().is_deepep():
+            return (
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
             )
+        return None
 
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "MiniMaxM3VLForCausalLM._determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
+    def _determine_num_fused_shared_experts(self) -> None:
+        # The decision was installed by the loader; this only reads it.
+        if is_shared_experts_fusion_disabled():
             return
-
-        self.num_fused_shared_experts = text_config.n_shared_experts
+        self.num_fused_shared_experts = self.config.text_config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1
         ), "Only 1 fused shared expert is supported"
@@ -206,6 +200,36 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_embed_and_head(self):
+        # EAGLE3 target interface: share the text embed + lm_head with the draft.
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        # EAGLE3 target interface: select which decoder layers' hidden states the
+        # draft consumes. Mirrors MiniMaxM3SparseForCausalLM; operates on the inner
+        # MiniMaxM3Model (self.model), whose forward returns (hidden, aux) once set.
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
+        # output), so to capture layer L's output we must mark layer L+1. Apply
+        # +1 on both paths so EAGLE3 works out-of-the-box even when the draft
+        # config omits ``eagle_aux_hidden_state_layer_ids`` (the upstream
+        # Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it); otherwise the
+        # default-path layers are off by one and draft accept collapses.
+        if layer_ids is None:
+            num_layers = self.config.text_config.num_hidden_layers
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
+        # attribute (not ``i in layers_to_capture``); set it explicitly so the
+        # (hidden, aux) tuple is actually returned during capture-enabled forwards.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -226,12 +250,20 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # EAGLE3: when layers_to_capture is set, MiniMaxM3Model.forward returns
+        # (hidden_states, aux_hidden_states) once aux is non-empty; on idle/warmup
+        # forwards with no captured tokens it returns a bare hidden tensor.
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 

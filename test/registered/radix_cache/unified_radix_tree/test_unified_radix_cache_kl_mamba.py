@@ -3,10 +3,11 @@ import shutil
 import tempfile
 import unittest
 
-from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
-
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kits.unified_radix_cache_kit import (
+    AccuracyTwoPassMixin,
+    UnifiedRadixTreeTestMixin,
+)
 from sglang.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,
@@ -110,9 +111,9 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--max-total-tokens",
                 "12000",
                 "--max-mamba-cache-size",
@@ -171,14 +172,22 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
                 "--max-mamba-cache-size",
                 "500",
                 "--weight-loader-prefetch-checkpoints",
+                "--speculative-algorithm",
+                "NEXTN",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
             ],
             env={
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",

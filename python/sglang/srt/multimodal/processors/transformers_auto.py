@@ -59,7 +59,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             ),
             audio_token_id=_first_attr(
                 hf_config,
-                ("audio_token_id",),
+                ("audio_token_id", "audio_token_index"),
             ),
         ).build(_processor)
 
@@ -141,6 +141,40 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
 
         return items
 
+    def _build_audio_prompt(self, input_text) -> str:
+        """Ensure the prompt carries the model's audio placeholder token.
+
+        Audio-only entrypoints (``/v1/audio/transcriptions``) send empty text,
+        which would otherwise make the HF processor crash (empty ``text`` list)
+        and leave no ``<|audio|>`` placeholder for the encoder features to fill.
+        Build a minimal chat prompt with one audio token per clip.
+        """
+        if isinstance(input_text, list):
+            input_text = (
+                self._processor.tokenizer.decode(input_text) if input_text else ""
+            )
+        if (
+            input_text
+            and input_text.strip()
+            and self.mm_tokens.audio_token in input_text
+        ):
+            return input_text
+
+        audio_token = self.mm_tokens.audio_token
+        content = (
+            f"{audio_token}Transcribe the speech into written text. "
+            f"Output only the exact transcription, with no preamble, commentary, "
+            f"quotation marks, or explanation."
+        )
+        tokenizer = self._processor.tokenizer
+        if hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return content
+
     async def process_mm_data_async(
         self,
         image_data,
@@ -153,9 +187,32 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         if video_data is not None and not isinstance(video_data, list):
             video_data = [video_data]
 
+        # Audio path: load clips and run the shared token-expansion machinery,
+        # which passes ``audio=`` to the HF processor and packs audio features
+        # into MultimodalDataItem objects with the right token offsets.
+        if audio_data:
+            prompt = self._build_audio_prompt(input_text)
+            base_output = await self.load_mm_data(
+                prompt=prompt,
+                audio_data=audio_data,
+                multimodal_tokens=self.mm_tokens,
+            )
+            if base_output is None:
+                return None
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
+            ret = MultimodalProcessorOutput(
+                input_ids=input_ids.tolist(),
+                mm_items=mm_items,
+            )
+            if self.mm_tokens.audio_token_id is not None:
+                ret.audio_token_id = self.mm_tokens.audio_token_id
+            return ret
+
         # Load raw media
         images = self._load_images(image_data)
-        # TODO: video / audio loading when needed
+        # TODO: video loading when needed
 
         # Apply HF processor — handles token expansion internally
         processor_output = self._apply_hf_processor(
@@ -181,7 +238,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             else "token_type_ids"
         )
         if token_type_key in processor_output:
-            ret.token_type_ids = processor_output[token_type_key].flatten().tolist()
+            ret.token_type_ids = processor_output[token_type_key].flatten()
 
         if self.mm_tokens.image_token_id is not None:
             ret.im_token_id = self.mm_tokens.image_token_id

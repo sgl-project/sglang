@@ -54,7 +54,7 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          TAG=$(python3 ../python/tools/get_version_tag.py)
+          TAG=$(python3 ../scripts/release/get_version_tag.py)
           HASH="g$(git rev-parse --short HEAD)"
           BUILD_DATE=$(date -u +%Y%m%d)
 

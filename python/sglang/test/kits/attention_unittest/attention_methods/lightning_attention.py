@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
 )
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -206,9 +206,10 @@ class TinyLightningModelConfig:
     def get_max_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockLightningModelRunner(ModelRunner):
@@ -230,6 +231,11 @@ class MockLightningModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.ps = ParallelState.trivial()
         self.canary_manager = None
@@ -575,7 +581,9 @@ def build_lightning_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     backend = LightningAttentionBackend(runner)
     actual_module = ProjectedLightningAttention(
         num_heads=case.num_heads,

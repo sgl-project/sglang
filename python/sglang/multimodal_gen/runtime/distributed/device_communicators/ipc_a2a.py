@@ -15,6 +15,7 @@ read of that slot.
 
 import logging
 import os
+import socket
 from collections import OrderedDict
 
 import torch
@@ -84,6 +85,38 @@ class _Unsupported(RuntimeError):
     """This topology cannot run the transport -- an expected outcome, not a bug."""
 
 
+def _peer_cuda_device(group, rank: int, device: int) -> int:
+    """Return the peer's local CUDA ordinal for a two-rank same-host group."""
+    world_size = dist.get_world_size(group=group)
+    if world_size != 2:
+        raise _Unsupported(
+            f"requires a two-rank Ulysses group, got world size {world_size}"
+        )
+
+    members: list[tuple[str, int] | None] = [None] * world_size
+    dist.all_gather_object(
+        members,
+        (socket.gethostname(), device),
+        group=group,
+    )
+    local = members[rank]
+    peer = members[1 - rank]
+    if local is None or peer is None:
+        raise _Unsupported("could not discover both Ulysses group members")
+    if local[0] != peer[0]:
+        raise _Unsupported(
+            "requires both Ulysses ranks on the same host "
+            f"(got {local[0]!r} and {peer[0]!r})"
+        )
+    if local[1] != device:
+        raise _Unsupported(
+            f"group rank {rank} reported CUDA device {local[1]}, expected {device}"
+        )
+    if peer[1] == device:
+        raise _Unsupported(f"both Ulysses ranks are assigned CUDA device {device}")
+    return peer[1]
+
+
 class IpcA2AState:
     def __init__(self):
         self.ops = None
@@ -143,10 +176,19 @@ class IpcA2AState:
         self.rank = dist.get_rank(group=group)
         self.group = group
         dev = torch.cuda.current_device()
-        if not torch.cuda.can_device_access_peer(dev, 1 - dev):
-            raise _Unsupported("no peer-to-peer access between the two devices")
+        peer_dev = _peer_cuda_device(group, self.rank, dev)
+        try:
+            has_peer_access = torch.cuda.can_device_access_peer(dev, peer_dev)
+        except RuntimeError as e:
+            raise _Unsupported(
+                f"could not query peer access between CUDA devices {dev} and {peer_dev}: {e}"
+            ) from e
+        if not has_peer_access:
+            raise _Unsupported(
+                f"no peer-to-peer access between CUDA devices {dev} and {peer_dev}"
+            )
         # kernel-level dereference of peer mappings needs explicit peer access
-        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(1 - dev, 0)
+        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
         build_dir = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, f"ipc_a2a_sync_r{dev}"
         )
@@ -272,10 +314,9 @@ def ipc_a2a_ready(group) -> bool:
         IPC_A2A.reset()
     if IPC_A2A.failed:
         return False
-    # TP+Ulysses groups are strided in global-rank order, while this transport
-    # supports the adjacent two-device topology used by TP1+U2. Reject the
-    # transport consistently before lazy initialization so no rank enters IPC
-    # while its peer falls back to NCCL.
+    # CUDA-IPC is only implemented for TP1 two-rank Ulysses groups. The
+    # initializer resolves the actual local device ordinals of both members,
+    # so CFG replicas can use independent GPU pairs on the same host.
     if not current_platform.is_cuda() or get_tp_world_size() > 1:
         return False
     if IPC_A2A.inited:
@@ -289,7 +330,8 @@ def ipc_a2a_ready(group) -> bool:
         logger.info("IPC all-to-all unavailable (%s); using NCCL", e)
         IPC_A2A.failed = True
         return False
-    except Exception:
-        logger.exception("IPC all-to-all init failed; falling back to NCCL")
+    except Exception as e:
+        logger.debug("IPC all-to-all initialization failed", exc_info=True)
+        logger.warning("IPC all-to-all unavailable (%s); using NCCL", e)
         IPC_A2A.failed = True
         return False

@@ -27,7 +27,7 @@ class _Eagle3ParityBase(Eagle3Base):
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")
 class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
-    """EAGLE3 spec v2 (flashinfer, overlap) greedy output == non-spec reference.
+    """EAGLE3 (flashinfer, overlap) greedy output == non-spec reference.
 
     SpecParityKit is first so its setUpClass runs the reference server (and tears
     it down) before the fixture launches the spec server -- sequential, one model

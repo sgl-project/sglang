@@ -13,14 +13,19 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_kv_host_pool,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_schedule,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -43,8 +48,7 @@ class DecodeKVCacheOffloadManager:
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = server_args.page_size
-        self.server_args = server_args
+        self.page_size = get_schedule().page_size
         self.request_counter = 0
         self.tree_cache = tree_cache
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
@@ -55,37 +59,23 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        allocator_type = get_allocator_type(server_args)
-
-        if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=allocator_type,
-            )
-        elif isinstance(kv_cache, MLATokenToKVPool):
-            self.decode_host_mem_pool = MLATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=allocator_type,
-            )
-        else:
+        if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
             raise ValueError("Unsupported KV cache type for decode offload")
+        self.decode_host_mem_pool = build_kv_host_pool(
+            kv_pool=kv_cache,
+            page_size=self.page_size,
+            server_args=server_args,
+            use_mla=isinstance(kv_cache, MLATokenToKVPool),
+        )
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
+        if get_memory().hicache_storage_backend_extra_config:
             try:
                 hicache_storage_backend_extra_config = json.loads(
-                    server_args.hicache_storage_backend_extra_config
+                    get_memory().hicache_storage_backend_extra_config
                 )
             except json.JSONDecodeError as e:
                 raise ValueError(
@@ -97,10 +87,10 @@ class DecodeKVCacheOffloadManager:
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
             tp_group=tp_group,
-            io_backend=server_args.hicache_io_backend,
+            io_backend=get_memory().hicache_io_backend,
             load_cache_event=threading.Event(),
-            storage_backend=server_args.hicache_storage_backend,
-            model_name=server_args.served_model_name,
+            storage_backend=get_memory().hicache_storage_backend,
+            model_name=get_serving().served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
 

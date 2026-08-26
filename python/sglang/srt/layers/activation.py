@@ -22,18 +22,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -127,10 +127,13 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
-class SiluAndMul(MultiPlatformOp):
+class SiluAndMul(BaseFusedOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            publish_role() is not None
+            and get_exec().deterministic.rl_on_policy_target is not None
+        ):
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
@@ -181,7 +184,7 @@ class SiluAndMul(MultiPlatformOp):
         return self._musa_swish_glu(x)
 
 
-class SituAndMul(MultiPlatformOp):
+class SituAndMul(BaseFusedOp):
     """SituGLU activation used by Kimi K3.
 
     Computes beta * tanh(gate / beta) * sigmoid(gate) * up.
@@ -208,11 +211,16 @@ class SituAndMul(MultiPlatformOp):
 
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        from sgl_kernel_npu.activation.situ import situ_and_mul
+
+        return situ_and_mul(x)
+
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
 
 
-class GeluAndMul(MultiPlatformOp):
+class GeluAndMul(BaseFusedOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
@@ -259,7 +267,7 @@ class GeluAndMul(MultiPlatformOp):
         return y_npu
 
 
-class NewGELU(MultiPlatformOp):
+class NewGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
@@ -269,7 +277,7 @@ class NewGELU(MultiPlatformOp):
         return self.forward_native(x)
 
 
-class ReLU2(MultiPlatformOp):
+class ReLU2(BaseFusedOp):
     """
     Applies the squared Rectified Linear Unit function.
     y = max(0, x)^2
@@ -283,7 +291,7 @@ class ReLU2(MultiPlatformOp):
         return relu2(x)
 
 
-class QuickGELU(MultiPlatformOp):
+class QuickGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
@@ -299,7 +307,7 @@ class QuickGELU(MultiPlatformOp):
         return torch_npu.npu_fast_gelu(x)
 
 
-class XIELU(MultiPlatformOp):
+class XIELU(BaseFusedOp):
     """
     Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
     If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
@@ -362,6 +370,9 @@ class XIELU(MultiPlatformOp):
             alpha_p * x * x + self.beta * x,
             (torch.expm1(torch.min(x, self.eps)) - x) * alpha_n + self.beta * x,
         )
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return self._xielu_python(x)
 
     def _xielu_cuda(self, x: torch.Tensor) -> torch.Tensor:
         """Firewall function to prevent torch.compile from seeing .item()"""

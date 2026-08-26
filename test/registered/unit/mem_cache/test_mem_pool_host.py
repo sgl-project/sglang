@@ -2,15 +2,20 @@
 
 import threading
 import unittest
+import unittest.mock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
-    MambaPoolHost,
+    LogicalHostPool,
 )
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -127,6 +132,10 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool.clear()
         return pool
 
+    @staticmethod
+    def _make_logical_pool():
+        return LogicalHostPool(size=8, page_size=2)
+
     def _assert_lazy_release(self, pool):
         self.assertEqual(pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(pool.num_release_slots, 0)
@@ -180,6 +189,103 @@ class TestLazyHostPoolRelease(CustomTestCase):
         # Preserve the pool's page-aligned allocation behavior.
         pool.clear()
         self.assertEqual(len(pool.alloc(1)), 2)
+
+    def test_logical_pool_lazy_release(self):
+        pool = self._make_logical_pool()
+        self._assert_lazy_release(pool)
+
+        # Preserve the logical pool's strict page-alignment checks.
+        pool.clear()
+        with self.assertRaises(ValueError):
+            pool.alloc(1)
+        with self.assertRaises(ValueError):
+            pool.free(torch.tensor([0]))
+
+
+class TestHostMemoryBudget(CustomTestCase):
+    # Pinned so the two budget reads below see identical free memory; the real
+    # psutil value drifts between calls and would flake the equality checks.
+    _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
+
+    def _budget_with_ranks(self, ranks):
+        # Deliberate single-accessor stub: isolates the budget math from the
+        # topology derivation, which the ranks_per_host case below covers.
+        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
+        with unittest.mock.patch.object(
+            base, "ranks_per_host", return_value=ranks
+        ), unittest.mock.patch.object(
+            base.psutil, "virtual_memory", return_value=fake_mem
+        ):
+            return base.host_memory_budget_bytes()
+
+    def test_budget_is_split_across_co_located_ranks(self):
+        solo = self._budget_with_ranks(1)
+        self.assertEqual(self._budget_with_ranks(4), solo // 4)
+
+    def test_reserve_is_taken_before_the_split(self):
+        # Each rank must not get its own copy of the reserve.
+        budget = self._budget_with_ranks(8)
+        self.assertLessEqual(
+            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
+
+    def test_ranks_per_host_divides_world_size_by_nodes(self):
+        # The launcher slices ranks uniformly across nodes, so the co-located
+        # rank count is world_size // nnodes — no hostname collective.
+        fake_group = unittest.mock.Mock(world_size=16)
+        with get_context().override_server_args(nnodes=2), unittest.mock.patch.object(
+            torch.distributed, "is_initialized", return_value=True
+        ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
+            self.assertEqual(base.ranks_per_host(), 8)
+
+
+class TestHostPoolGroup(CustomTestCase):
+    @staticmethod
+    def _group(**sizes):
+        return HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName(name),
+                    host_pool=LogicalHostPool(size=size, page_size=1),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=name == PoolName.KV.value,
+                )
+                for name, size in sizes.items()
+            ]
+        )
+
+    def test_resolve_and_release_multi_pool_allocation(self):
+        group = self._group(kv=4, swa=2)
+        primary = group.alloc(2)
+        transfers = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.SWA),
+        ]
+
+        self.assertIsNotNone(
+            group.resolve_host_transfers(
+                transfers,
+                primary_device_indices=torch.arange(2),
+                primary_host_indices=primary,
+            )
+        )
+        self.assertIs(transfers[1].host_indices, transfers[0].host_indices)
+        group.free(primary)
+        group.release_transfers(transfers)
+        self.assertEqual(group.available_size(), 4)
+        self.assertEqual(group.available_size(PoolName.SWA), 2)
+
+    def test_resolve_rolls_back_partial_allocation(self):
+        group = self._group(kv=4, swa=2, mamba=1)
+        transfers = [
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+        ]
+
+        self.assertIsNone(group.resolve_host_transfers(transfers))
+        self.assertIsNone(transfers[0].host_indices)
+        self.assertEqual(group.available_size(PoolName.SWA), 2)
 
 
 if __name__ == "__main__":

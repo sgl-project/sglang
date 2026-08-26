@@ -4,6 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
@@ -17,11 +20,16 @@ from sglang.multimodal_gen.configs.sample.flux import (
     Flux2SamplingParams,
     FluxSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GlmImageSamplingParams,
+    align_glm_image_dimension,
+)
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     _json_safe,
 )
+from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -92,8 +100,99 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
+    def test_teacache_and_spectrum_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(
+            ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
+        ):
+            SamplingParams(enable_teacache=True, enable_spectrum=True)
+
+    def test_spectrum_params_reject_invalid_controls(self):
+        invalid_controls = (
+            {"window_size": 0},
+            {"flex_window": -0.1},
+            {"w": 1.1},
+            {"lam": -0.1},
+            {"warmup_steps": -1},
+            {"m": 0},
+            {"history_size": 0},
+            {"tau_num_steps": 0},
+            {"taylor_order": 4},
+        )
+        for kwargs in invalid_controls:
+            with self.assertRaises(ValueError):
+                SpectrumParams(**kwargs)
+
+    def test_spectrum_dict_is_validated_when_sampling_params_constructs_it(self):
+        with self.assertRaisesRegex(ValueError, "history_size"):
+            SamplingParams(
+                enable_spectrum=True,
+                spectrum_params={"history_size": 0},
+            )
+
 
 class TestSamplingParamsSubclass(unittest.TestCase):
+    def test_glm_image_rounds_resolution_up_to_multiple_of_32(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        cases = [
+            ((500, 500), (512, 512)),
+            ((1024, 600), (1024, 608)),
+            ((500, 600), (512, 608)),
+            ((550, 1009), (576, 1024)),
+            ((1280, 720), (1280, 736)),
+        ]
+
+        for requested, expected in cases:
+            with self.subTest(requested=requested):
+                params = GlmImageSamplingParams(
+                    width=requested[0],
+                    height=requested[1],
+                )
+
+                with patch(
+                    "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+                ) as mock_warning:
+                    params._adjust(server_args)
+
+                self.assertEqual((params.width, params.height), expected)
+                self.assertEqual(
+                    (params.requested_width, params.requested_height), requested
+                )
+                mock_warning.assert_called_once_with(
+                    "GLM-Image requires dimensions divisible by %s; adjusted "
+                    "requested resolution from %sx%s to %sx%s",
+                    32,
+                    requested[0],
+                    requested[1],
+                    expected[0],
+                    expected[1],
+                )
+
+    def test_glm_image_resolution_rounds_up(self):
+        self.assertEqual(align_glm_image_dimension(560), 576)
+
+    def test_glm_image_resolution_keeps_minimum_alignment(self):
+        self.assertEqual(align_glm_image_dimension(0), 32)
+        self.assertEqual(align_glm_image_dimension(-1), 32)
+
+    def test_glm_image_does_not_warn_for_aligned_resolution(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        params = GlmImageSamplingParams(width=1024, height=1024)
+
+        with patch(
+            "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+        ) as mock_warning:
+            params._adjust(server_args)
+
+        mock_warning.assert_not_called()
+
     def test_flux_defaults_resolution_when_not_provided(self):
         params = FluxSamplingParams()
 
@@ -243,6 +342,38 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
         )
 
+    def test_get_cli_args_maps_spectrum_prefixed_flags(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--enable-spectrum",
+                "--spectrum-window-size",
+                "2.5",
+                "--spectrum-flex-window",
+                "0.9",
+                "--spectrum-warmup-steps",
+                "6",
+                "--spectrum-m",
+                "3",
+                "--spectrum-lam",
+                "0.2",
+                "--spectrum-tau-num-steps",
+                "42",
+            ]
+        )
+
+        self.assertTrue(kwargs["enable_spectrum"])
+        self.assertEqual(
+            kwargs["spectrum_params"],
+            {
+                "window_size": 2.5,
+                "flex_window": 0.9,
+                "warmup_steps": 6,
+                "m": 3,
+                "lam": 0.2,
+                "tau_num_steps": 42,
+            },
+        )
+
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])
 
@@ -331,8 +462,10 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         )
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
-        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
-        import dataclasses
+        """Per-prompt clones retain explicit and model-internal fields."""
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
 
         server_args = MagicMock()
         server_args.backend = "sglang"
@@ -356,24 +489,41 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", sampling_params_orig._explicit_fields)
         self.assertIn("height", sampling_params_orig._explicit_fields)
 
-        cloned = dataclasses.replace(
+        cloned = _replace_sampling_params_for_prompt(
             sampling_params_orig,
             prompt="new",
             output_file_name=None,
             image_path="/tmp/in2.png",
         )
-        self.assertFalse(hasattr(cloned, "_explicit_fields"))
-
-        # Mirror the restore done in DiffGenerator.generate().
-        cloned._explicit_fields = getattr(
-            sampling_params_orig, "_explicit_fields", set()
-        ) | {"prompt", "output_file_name", "image_path"}
 
         explicit = set(cloned.build_request_extra()["explicit_fields"])
         self.assertIn("width", explicit)
         self.assertIn("height", explicit)
         self.assertIn("prompt", explicit)
         self.assertIn("image_path", explicit)
+
+    def test_per_prompt_clone_preserves_glm_image_crop_size(self):
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
+
+        sampling_params_orig = GlmImageSamplingParams(
+            prompt="orig",
+            width=1024,
+            height=1024,
+        )
+        sampling_params_orig.requested_width = 1000
+        sampling_params_orig.requested_height = 999
+
+        cloned = _replace_sampling_params_for_prompt(
+            sampling_params_orig,
+            prompt="new",
+            output_file_name=None,
+            image_path=None,
+        )
+
+        self.assertEqual((cloned.width, cloned.height), (1024, 1024))
+        self.assertEqual((cloned.requested_width, cloned.requested_height), (1000, 999))
 
 
 if __name__ == "__main__":

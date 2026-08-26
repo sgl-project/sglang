@@ -25,7 +25,7 @@ from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 

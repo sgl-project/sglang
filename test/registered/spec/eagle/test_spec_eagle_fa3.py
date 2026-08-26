@@ -10,7 +10,6 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
-    SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
@@ -18,11 +17,16 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=250, stage="base-b", runner_config="1-gpu-large")
 
 
-class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
-    """EAGLE3 spec v2 topk=1 on fa3 (the H200 default backend)."""
+class TestEagle3Fa3(Eagle3Base, SpecAccuracyKit, SpecLogprobKit):
+    """EAGLE3 topk=1 on fa3 (the H200 default backend), overlap on.
+
+    No SpecCorrectnessKit: those checks are scheduler/sampling behaviour, which
+    the 5090 runs already cover. Logprob losslessness stays -- it reads through
+    the verify output, which the attention unit cases do not reach.
+    """
 
     attention_backend = "fa3"
     disable_overlap = False
@@ -37,7 +41,7 @@ class TestEagleLlama2Fa3Page256(
     SpecPerfKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1)."""
+    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256, overlap off."""
 
     spec_topk = 5
     spec_steps = 8
