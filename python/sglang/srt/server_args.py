@@ -2249,7 +2249,10 @@ class ServerArgs:
     ] = "prefill"
     speculative_draft_attention_backend: A[
         Optional[str],
-        "Attention backend for speculative decoding drafting.",
+        Arg(
+            help="Attention backend for speculative decoding drafting.",
+            resolvable=True,
+        ),
         NS("spec"),
     ] = None
     speculative_draft_kv_cache_dtype: A[
@@ -6068,14 +6071,6 @@ class ServerArgs:
 
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
-            )
-        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            # Quantization / MoE runner / attention backend defaults moved to
-            # the override registry (arg_groups/overrides.py:
-            # _nemotron_h_overrides).
-            assert resolved_view(self).attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
             )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
