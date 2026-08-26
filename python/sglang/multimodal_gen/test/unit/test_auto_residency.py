@@ -563,6 +563,43 @@ class TestPlanAutoResidency:
             "transformer"
         ]
 
+    def test_output_rank_timing_applies_to_untimed_peer_ranks(self):
+        transformer = _candidate(
+            "transformer",
+            mode=LAYERWISE_OFFLOAD,
+            weight_gib=40,
+            h2d_gib=40 * 40,
+        )
+        text_encoder = _candidate("text_encoder", weight_gib=8, h2d_gib=8)
+        candidates = [transformer, text_encoder]
+        timing = {
+            transformer.option_key(): 10_000_000_000,
+            text_encoder.option_key(): 83_000_000,
+        }
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    budget_gib=80,
+                    estimated_gib=20,
+                    candidates=candidates,
+                    estimated_request_duration_ns=66_000_000_000,
+                    candidate_latency_savings_ns=timing,
+                ),
+                _report(
+                    rank=1,
+                    budget_gib=80,
+                    estimated_gib=20,
+                    candidates=candidates,
+                ),
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "transformer"
+        ]
+
     def test_smaller_component_still_fits_after_skipping_a_big_one(self):
         candidates = [
             _candidate("text_encoder", weight_gib=45, h2d_gib=100),

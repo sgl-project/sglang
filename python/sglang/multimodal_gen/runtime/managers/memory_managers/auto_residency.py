@@ -1151,15 +1151,22 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         for report in reports
     ]
 
-    use_latency_utility = all(
-        report.estimated_request_duration_ns > 0 and report.candidate_latency_savings_ns
+    # Request timing is produced by the output rank. Other SPMD ranks still
+    # contribute their VRAM and HostPin constraints, but their empty metrics
+    # must not discard the replica's measured latency utility and fall back to
+    # the much more aggressive transfer-byte ordering.
+    timed_reports = [
+        report
         for report in reports
-    )
+        if report.estimated_request_duration_ns > 0
+        and report.candidate_latency_savings_ns
+    ]
+    use_latency_utility = bool(timed_reports)
     placement_latency_risk_ns = (
         max(
             MIN_PLACEMENT_LATENCY_RISK_NS,
             int(
-                max(report.estimated_request_duration_ns for report in reports)
+                max(report.estimated_request_duration_ns for report in timed_reports)
                 * PLACEMENT_LATENCY_RISK_FRACTION
             ),
         )
@@ -1202,7 +1209,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                         report.candidate_latency_savings_ns.get(
                             candidate.option_key(), 0
                         )
-                        for report in reports
+                        for report in timed_reports
                     )
                     - placement_latency_risk_ns
                     if use_latency_utility
