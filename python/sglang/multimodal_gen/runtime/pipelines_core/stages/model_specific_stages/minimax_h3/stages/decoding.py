@@ -425,10 +425,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     canonical_frames.copy_(visual_frames)
                     visual_frames = canonical_frames
 
-        # Decode the non-sharded audio VAE once per request and distribute its
-        # output to the ranks that decoded video. The request lives in one
-        # pipeline replica; the world group spans replicas when dp_size > 1,
-        # so a world-group collective would wait on idle replicas forever.
+        # Audio VAE weights are replicated. Decode on replica rank 0 and broadcast
+        # only within the request's replica, excluding independent DP replicas.
         replica_group = get_replica_group() if model_parallel_is_initialized() else None
         is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
         owner_exception = None
