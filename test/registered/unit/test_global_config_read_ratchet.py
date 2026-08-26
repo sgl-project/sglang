@@ -13,9 +13,6 @@ slot.
 The reads that remain live in ``runtime_context.py`` (exempt by module): the
 ``@property`` / method members computed from several fields plus the HF config,
 which are not namespace leaves and have no home but ``ServerArgs``.
-Separately, ``_CONFIGURED_SIZE_CALL_SITES`` registers every business read of
-``get_parallel().config.<size>`` — the config tier of a size whose bare name is
-the live topology — with the reason the live property cannot serve it.
 
 What the scan sees: ``get_server_args().field``, an alias (``sa =
 get_server_args()`` then ``sa.field`` -- function-local, module-level, or parked
@@ -348,17 +345,6 @@ class TestGlobalConfigReadRatchet(CustomTestCase):
         direct, alias = _field_reads()
         self._check("direct", direct, _DIRECT_BASELINE)
         self._check("alias-form", alias, _ALIAS_BASELINE)
-
-
-_READ_SPELLINGS = (
-    "from sglang.srt.runtime_context import get_parallel\nx = get_parallel().config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel as gp\nx = gp().config.tp_size",
-    "from sglang.srt import runtime_context as rc\nx = rc.get_parallel().config.tp_size",
-    "import sglang.srt.runtime_context\nx = sglang.srt.runtime_context.get_parallel().config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel\np = get_parallel()\nx = p.config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel\nc = get_parallel().config\nx = c.tp_size",
-    'from sglang.srt.runtime_context import get_parallel\nx = getattr(get_parallel().config, "tp_size")',
-)
 
 
 class TestNoRenamedAccessorImports(CustomTestCase):

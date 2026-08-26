@@ -20,9 +20,10 @@ live to the canonical getter in ``distributed.parallel_state`` /
 this is a read-through wrapper, not a cache. It gives call-sites one import and
 one naming scheme in place of a dozen free functions, plus a test-only
 ``override()`` hook to force a topology without monkeypatching the underlying
-getters. The resolved parallel **configuration** is the same object's ``config``
-hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
-bag: bare is the live group, ``config`` is what was configured.
+getters. Every other name on it -- the sizes among them -- answers from the
+published ``parallel`` bag, so a size reads the same bare before and after the
+groups exist. The one member that genuinely disagrees with the configuration is
+``moe_dp_group_size``, named apart for that reason.
 
 ``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
 user's raw input, kept **read-only** for debug and reproduction; what
@@ -140,10 +141,10 @@ class ParallelContext:
 
     ``get_parallel().tp_size`` and its size / rank / group siblings are
     read-through ``@property`` over the canonical getters, so they answer with
-    the **live** process groups and raise before distributed init. The resolved
-    parallel **configuration** is one hop away, on the published bag:
-    ``get_parallel().config.tp_size``, ``.config.nccl_port``. It answers in any
-    process at any point after publish, and follows a post-publish ``override``.
+    the **live** process groups and raise before distributed init. Every other
+    name -- the sizes among them -- answers from the published ``parallel``
+    configuration in any process at any point after publish, and follows a
+    post-publish ``override``.
 
     The two disagree by design, so which one a call site wants is spelled at the
     call site — no ``config`` means live. Elastic EP scales the live world away
@@ -1146,8 +1147,8 @@ def get_forward() -> ForwardFlags:
 # --- Resolved config namespaces -------------------------
 # Each returns the top-level snapshot bag; reads are `get_exec().moe.field` etc.
 # All fail with ValueError("... not published") until publish has projected them.
-# ``parallel`` has no getter of its own: its bag is reached as
-# ``get_parallel().config``, alongside the live topology it belongs to.
+# ``parallel`` has no getter of its own: its leaves are read off
+# ``get_parallel()``, alongside the live topology they belong to.
 def get_device() -> _ConfigBag:
     return _CONTEXT.config_bag("device")
 
@@ -1198,8 +1199,8 @@ def get_observability() -> _ConfigBag:
 # table declares which top-level config namespaces each role reads. ``None``
 # means the full tree — either the role genuinely needs everything (scheduler)
 # or its deployment shape has not been audited yet (restrict only what smoke
-# coverage can verify). ``parallel`` is served by ``get_parallel().config`` and
-# every process legitimately reads topology config, so it is not in this table.
+# coverage can verify). ``parallel`` is served by ``get_parallel()`` and every
+# process legitimately reads topology config, so it is not in this table.
 #
 # ``SGLANG_ROLE_NAMESPACES`` selects the mode (read once at import):
 #   off      (default) no bookkeeping, zero overhead;
