@@ -67,6 +67,51 @@ export const benchmarks = [
     notes:
       "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) at the rc2 cut (f13cb6f6a7), speculative decoding off, after two discarded warmups per row: 1,128.32 / 2,418.65 / 3,884.95 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens; the high-concurrency rows with --max-running-requests 256 and decode graph batch 256). Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is the full GSM8K gate on the same server: 97.50% with a 100% stop rate over all 1,319 problems.",
   },
+  {
+    match: { hw: "gb300", strategy: "high-throughput", kvDsaPair: "fp8-trtllm" },
+    sglang_version: "f13cb6f6a7",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 16,
+          num_prompts: 80,
+        },
+        ttft_ms: 681.3,
+        tpot_ms: 10.81,
+        tokens_per_sec_per_gpu: 1487.45,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 64,
+          num_prompts: 320,
+        },
+        ttft_ms: 1693.9,
+        tpot_ms: 19.25,
+        tokens_per_sec_per_gpu: 3096.09,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 256,
+          num_prompts: 1280,
+        },
+        ttft_ms: 5208.7,
+        tpot_ms: 41.96,
+        tokens_per_sec_per_gpu: 4965.65,
+      },
+    ],
+    notes:
+      "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) at rc2 (f13cb6f6a7), same protocol as the BF16 rows: 1,189.96 / 2,476.87 / 3,972.52 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.3–5.5% above BF16 + TileLang across the curve, and the FP8 pool holds 13.5M tokens per rank vs 7.5M at BF16 (1.8x capacity at identical pool bytes). Sanity requests answered correctly and stopped cleanly; accuracy was not re-run for this variant (the 97.50% GSM8K gate used BF16 KV).",
+  },
   { match: { hw: "h100", strategy: "low-latency" } },
   { match: { hw: "h100", strategy: "high-throughput" } },
   { match: { hw: "h200", strategy: "low-latency" } },
