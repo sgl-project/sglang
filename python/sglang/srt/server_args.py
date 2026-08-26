@@ -7369,6 +7369,7 @@ class ServerArgs:
             )
 
     def _handle_flashinfer_a2a_dispatch_type(self):
+        view = resolved_view(self)
         cli_dispatch_type = self.flashinfer_a2a_dispatch_type
         nvfp4_dispatch_env_is_set = envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
 
@@ -7381,11 +7382,11 @@ class ServerArgs:
         dispatch_type = cli_dispatch_type or "auto"
 
         supports_nvfp4_dispatch = (
-            self.quantization == "modelopt_fp4"
+            view.quantization == "modelopt_fp4"
             or self.get_model_config().nvfp4_moe_meta is not None
         )
         if dispatch_type == "auto":
-            if self.quantization == "mxfp8":
+            if view.quantization == "mxfp8":
                 dispatch_type = "mxfp8"
             elif supports_nvfp4_dispatch:
                 dispatch_type = "nvfp4"
@@ -7393,12 +7394,12 @@ class ServerArgs:
                 dispatch_type = "bf16"
 
         if dispatch_type == "mxfp8":
-            if self.quantization != "mxfp8":
+            if view.quantization != "mxfp8":
                 raise ValueError(
                     "--flashinfer-a2a-dispatch-type mxfp8 requires "
                     "--quantization mxfp8."
                 )
-            if self.moe_runner_backend != "flashinfer_trtllm_routed":
+            if view.moe_runner_backend != "flashinfer_trtllm_routed":
                 raise ValueError(
                     "--flashinfer-a2a-dispatch-type mxfp8 requires "
                     "--moe-runner-backend flashinfer_trtllm_routed."
@@ -7409,7 +7410,10 @@ class ServerArgs:
                 "modelopt-FP4 quantization or hybrid NVFP4 MoE metadata."
             )
 
-        self.flashinfer_a2a_dispatch_type = dispatch_type
+        self._declare(
+            "_handle_flashinfer_a2a_dispatch_type",
+            flashinfer_a2a_dispatch_type=dispatch_type,
+        )
 
     def _validate_flashinfer_megamoe_envs(self):
         combine_dtype = (
@@ -7497,10 +7501,12 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
             ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
-            if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "flashinfer_megamoe"
+            if resolved_view(self).moe_runner_backend == "auto":
+                self._declare(
+                    "_handle_a2a_moe", moe_runner_backend="flashinfer_megamoe"
+               )
             assert (
-                self.moe_runner_backend == "flashinfer_megamoe"
+                resolved_view(self).moe_runner_backend == "flashinfer_megamoe"
             ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
             if not is_sm100_supported():
                 raise ValueError(
@@ -7547,7 +7553,7 @@ class ServerArgs:
                 moe_a2a_backend="none",
             )
 
-        if self.moe_a2a_backend == "flashinfer":
+        if a2a_now == "flashinfer":
             assert (
                 resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
@@ -7564,8 +7570,11 @@ class ServerArgs:
                         "Flashinfer MoE A2A"
                     )
             else:
-                if self.moe_runner_backend == "flashinfer_trtllm":
-                    self.moe_runner_backend = "flashinfer_trtllm_routed"
+                if resolved_view(self).moe_runner_backend == "flashinfer_trtllm":
+                    self._declare(
+                        "_handle_a2a_moe",
+                        moe_runner_backend="flashinfer_trtllm_routed",
+                    )
                     logger.warning(
                         "Flashinfer MoE A2A is enabled with flashinfer_trtllm. "
                         "Using flashinfer_trtllm_routed because A2A dispatch "
