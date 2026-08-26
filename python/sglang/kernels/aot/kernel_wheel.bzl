@@ -1,8 +1,12 @@
 """Transitional local actions for the existing sgl-kernel wheel builders."""
 
+load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
+load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load("//bazel/rocm:toolchain.bzl", "AmdgpuTargetInfo")
 
 _CUDA_TOOLCHAIN_TYPE = "//bazel/cuda:kernel_toolchain_type"
+_PYTHON_TOOLCHAIN_TYPE = "@rules_python//python:toolchain_type"
 _ROCM_TOOLCHAIN_TYPE = "//bazel/rocm:toolchain_type"
 _UV_TOOLCHAIN_TYPE = "@rules_python//python/uv:uv_toolchain_type"
 
@@ -19,18 +23,61 @@ def _dependency_root(dep):
             fail("{} contains a file outside {}: {}".format(dep.label, root, file.path))
     return root
 
+def _cxx_driver(compiler):
+    if compiler.endswith("gcc"):
+        return compiler[:-3] + "g++"
+    if compiler.endswith("clang"):
+        return compiler + "++"
+    return compiler
+
 def _kernel_wheel_impl(ctx):
     wheel_dir = ctx.actions.declare_directory(ctx.label.name)
     configuration_args = []
+    action_env = {}
+    toolchain_inputs = []
     if ctx.attr.backend == "cuda":
         cuda_toolchain = ctx.toolchains[_CUDA_TOOLCHAIN_TYPE]
         if not cuda_toolchain:
             fail("CUDA wheel requires a registered {}".format(_CUDA_TOOLCHAIN_TYPE))
         cuda = cuda_toolchain.kernel_cuda
+
+        python_runtime = ctx.toolchains[_PYTHON_TOOLCHAIN_TYPE].py3_runtime
+        if not python_runtime.interpreter:
+            fail("CUDA wheel requires a hermetic Python runtime, not interpreter_path")
+
+        cc_toolchain = find_cpp_toolchain(ctx)
+        feature_configuration = cc_common.configure_features(
+            ctx = ctx,
+            cc_toolchain = cc_toolchain,
+            requested_features = ctx.features,
+            unsupported_features = ctx.disabled_features,
+        )
+        action_env = {
+            "CC": cc_common.get_tool_for_action(
+                action_name = ACTION_NAMES.c_compile,
+                feature_configuration = feature_configuration,
+            ),
+            "CXX": _cxx_driver(cc_common.get_tool_for_action(
+                action_name = ACTION_NAMES.cpp_compile,
+                feature_configuration = feature_configuration,
+            )),
+            "PYTHONPATH": ":".join([cuda.torch_root] + cuda.build_python_paths),
+            "PYTHON_BIN_PATH": python_runtime.interpreter.path,
+        }
+        toolchain_inputs = [
+            cuda.inputs,
+            python_runtime.files,
+            cc_toolchain.all_files,
+        ]
         configuration_args = [
             "--cuda-version={}".format(cuda.cuda_version),
             "--cuda-architectures={}".format(",".join(cuda.cuda_architectures)),
+            "--cuda-root={}".format(cuda.cuda_root),
+            "--pep517-builder={}".format(ctx.file._pep517_builder.path),
+            "--python-abi={}".format(cuda.python_abi),
             "--torch-cxx11-abi={}".format(cuda.torch_cxx11_abi),
+            "--torch-root={}".format(cuda.torch_root),
+            "--torch-version={}".format(cuda.torch_version),
         ]
     elif ctx.attr.cmake_source_dirs:
         fail("cmake_source_dirs are only supported by the CUDA wheel builder")
@@ -43,8 +90,6 @@ def _kernel_wheel_impl(ctx):
         dep[DefaultInfo].files
         for dep in ctx.attr.cmake_source_dirs.keys()
     ]
-    action_env = {}
-    toolchain_inputs = []
     if ctx.attr.backend == "rocm":
         amdgpu_target = ctx.attr._amdgpu_target[AmdgpuTargetInfo].value
         rocm_toolchain = ctx.toolchains[_ROCM_TOOLCHAIN_TYPE]
@@ -72,7 +117,10 @@ def _kernel_wheel_impl(ctx):
             ctx.attr.source_root,
         ] + configuration_args + dependency_args,
         inputs = depset(
-            direct = ctx.files.srcs + [ctx.file._builder],
+            direct = ctx.files.srcs + [
+                ctx.file._builder,
+                ctx.file._pep517_builder,
+            ],
             transitive = dependency_inputs + toolchain_inputs,
         ),
         outputs = [wheel_dir],
@@ -105,14 +153,26 @@ _kernel_wheel_attrs = {
         default = Label("//python/sglang/kernels/aot:bazel_build_wheel.sh"),
         cfg = "exec",
     ),
+    "_pep517_builder": attr.label(
+        allow_single_file = True,
+        default = Label("//python/sglang/kernels/aot:bazel_pep517_build.py"),
+        cfg = "exec",
+    ),
 }
 
 _kernel_wheel = rule(
     implementation = _kernel_wheel_impl,
     attrs = _kernel_wheel_attrs,
+)
+
+_cuda_kernel_wheel = rule(
+    implementation = _kernel_wheel_impl,
+    attrs = _kernel_wheel_attrs,
+    fragments = ["cpp"],
     toolchains = [
-        config_common.toolchain_type(_CUDA_TOOLCHAIN_TYPE, mandatory = False),
-    ],
+        _CUDA_TOOLCHAIN_TYPE,
+        _PYTHON_TOOLCHAIN_TYPE,
+    ] + use_cc_toolchain(),
 )
 
 _rocm_kernel_wheel_attrs = dict(_kernel_wheel_attrs)
@@ -133,6 +193,12 @@ _rocm_kernel_wheel = rule(
 def kernel_wheel(name, backend, **kwargs):
     if backend == "rocm":
         _rocm_kernel_wheel(
+            name = name,
+            backend = backend,
+            **kwargs
+        )
+    elif backend == "cuda":
+        _cuda_kernel_wheel(
             name = name,
             backend = backend,
             **kwargs

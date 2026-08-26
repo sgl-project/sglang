@@ -124,6 +124,62 @@ sgl_kernel_source(
     urls = ["https://github.com/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz"],
 )
 
+cuda_redistributable = use_repo_rule(
+    "//bazel/cuda:repositories.bzl",
+    "cuda_redistributable_repository",
+)
+
+cuda_redistributable(name = "cuda_13_0_linux_x86_64")
+
+cuda_python_wheel_build_file = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "files",
+    srcs = glob(["**"]),
+)
+"""
+
+sgl_kernel_source(
+    name = "cuda_torch_2_13_cp312_linux_x86_64",
+    build_file_content = cuda_python_wheel_build_file,
+    sha256 = "8db7338e6895c3d4bd89a02ff4209507d1f0cf2ffeb3b898538b5a07d1ea8c1e",
+    type = "zip",
+    urls = ["https://download-r2.pytorch.org/whl/cu130/torch-2.13.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl"],
+)
+
+sgl_kernel_source(
+    name = "cuda_scikit_build_core",
+    build_file_content = cuda_python_wheel_build_file,
+    sha256 = "ae95427b7d3c14a6cf8bbfd4d901f6138ab64c99e20cbe8ea7d75cd26093f085",
+    type = "zip",
+    urls = ["https://files.pythonhosted.org/packages/b7/b0/7ad8fa9aebb0835b2e20afebf1483cbe175d1612fe01e85042ce9ced8755/scikit_build_core-1.0.3-py3-none-any.whl"],
+)
+
+sgl_kernel_source(
+    name = "cuda_packaging",
+    build_file_content = cuda_python_wheel_build_file,
+    sha256 = "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+    type = "zip",
+    urls = ["https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl"],
+)
+
+sgl_kernel_source(
+    name = "cuda_pathspec",
+    build_file_content = cuda_python_wheel_build_file,
+    sha256 = "a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189",
+    type = "zip",
+    urls = ["https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl"],
+)
+
+sgl_kernel_source(
+    name = "cuda_wheel",
+    build_file_content = cuda_python_wheel_build_file,
+    sha256 = "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab",
+    type = "zip",
+    urls = ["https://files.pythonhosted.org/packages/2e/29/69cfbb602cd91690c55d38ba9fe53e6a7e76a6fa647bf38f19c138d25449/wheel-0.48.0-py3-none-any.whl"],
+)
+
 rules_rust_pyo3_crates = use_extension(
     "@rules_rust_pyo3//private:internal_extensions.bzl",
     "rust_ext",
@@ -142,7 +198,7 @@ register_execution_platforms(
     "//bazel/platforms:linux_x86_64_rocm",
 )
 
-register_toolchains("//bazel/cuda:local_cuda_13_0_abi1_toolchain")
+register_toolchains("//bazel/cuda:cuda_13_0_torch_2_13_cp312_abi1_toolchain")
 
 # Use a content-addressed Debian Stretch sysroot as the oldest supported Linux
 # ABI boundary. Its glibc 2.24 floor is below SGLang's MAX_GLIBC=2.35 policy.

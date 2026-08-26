@@ -18,7 +18,7 @@ detect_cuda_suffix() {
     fi
 }
 
-CUDA_SUFFIX=$(detect_cuda_suffix)
+CUDA_SUFFIX="${SGL_KERNEL_CUDA_SUFFIX:-$(detect_cuda_suffix)}"
 
 patch_wheel_platform_tags() {
     local wheel_file="$1"

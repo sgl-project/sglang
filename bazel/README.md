@@ -131,7 +131,7 @@ fully migrated subtree should enforce graph coverage.
 | Torch-free SRT bootstrap | `//python/sglang/srt:environ` | setuptools |
 | Kernel metadata/dispatch | `//python/sglang/kernels:metadata` | setuptools |
 | Kernel JIT sources | `//python/sglang/kernels:ngram_corpus_ffi.so` compiles and links the host TVM-FFI adapter; device JIT remains intentional | setuptools + Ninja/tvm-ffi |
-| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA configuration enters through `//bazel/cuda:kernel_toolchain_type`; ROCm configuration enters through `//bazel/rocm:toolchain_type` | scikit-build/CMake and platform setup scripts |
+| AOT CUDA/ROCm/CPU kernels | `cpu_wheel`, `cuda_wheel`, and `rocm_wheel` wrap existing builders; CUDA 13.0 redists, cp312 PyTorch, Python, and the PEP 517 frontend enter through `//bazel/cuda:kernel_toolchain_type`; ROCm configuration enters through `//bazel/rocm:toolchain_type` | scikit-build/CMake and platform setup scripts |
 | Main Rust extensions | one crate-universe closure builds `_multimodal`, `_grpc`, `_server`, and the pure Rust libraries | Cargo + setuptools-rust |
 | Rust gRPC | `//rust/sglang-grpc:sglang_grpc_core` runs the existing tonic build script with Bazel's declared protoc and proto input | Cargo/tonic-build |
 | Model gateway/router | separate 838-package crate universe builds the gateway binary and abi3 shared library while preserving dual tonic versions | Cargo + maturin |
@@ -190,14 +190,18 @@ complete. Bazel must not become the release authority yet:
 
 - The CPU wrapper still consumes ambient PyTorch, Python development files,
   NUMA, and the host compiler.
-- CUDA validates declared toolkit/architecture/ABI values through
-  `//bazel/cuda:kernel_toolchain_type`, but toolkit files, PyTorch libraries,
-  Python headers, compiler, and sysroot still come from the runner.
+- CUDA consumes SHA-pinned CUDA 13.0 redistributables and a cp312/cu130 PyTorch
+  wheel plus the registered Python runtime and pinned PEP 517 packages. The
+  selected Bazel C++ toolchain is wired into CMake, but its default
+  implementation still resolves GCC, system headers, and the sysroot from the
+  runner; CMake, Make, Bash, and coreutils also remain ambient.
 - ROCm isolates `/opt/rocm`, Python, PyTorch, the compiler, and wheel frontend
   behind `//bazel/rocm:toolchain_type`, but its default local implementation
-  still resolves those tools from the runner. Pinned CUDA/ROCm/PyTorch
-  repositories must populate toolchain `inputs` before wheel actions can become
-  sandboxed, cacheable, and remotely executable.
+  still resolves those tools from the runner. A pinned ROCm/PyTorch repository
+  must populate its toolchain `inputs`.
+- CUDA and ROCm wheel actions remain local, unsandboxed, and uncacheable until
+  the remaining host tools and sysroot are supplied by pinned toolchains or a
+  digest-pinned execution platform.
 - Vendored OpenSSL still consumes runner-provided Perl and Make during its
   build; a pinned execution image must provide those tools.
 - The OCI target is a CPU metadata/version smoke. A runnable CUDA server image

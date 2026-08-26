@@ -20,6 +20,15 @@ resolve_executable() {
   fi
 }
 
+resolve_file() {
+  local file="$1"
+  if [[ "${file}" != /* ]]; then
+    file="${exec_root}/${file}"
+  fi
+  [[ -f "${file}" ]] || return 1
+  printf '%s\n' "${file}"
+}
+
 if ! python_bin="$(resolve_executable "${PYTHON_BIN_PATH:-python3}")"; then
   echo "Python toolchain executable not found: ${PYTHON_BIN_PATH:-python3}" >&2
   exit 2
@@ -28,6 +37,11 @@ fi
 cuda_version=""
 cuda_architectures=""
 torch_cxx11_abi=""
+cuda_root=""
+pep517_builder=""
+python_abi=""
+torch_root=""
+torch_version=""
 dependency_specs=()
 for argument in "$@"; do
   case "${argument}" in
@@ -51,6 +65,41 @@ for argument in "$@"; do
         exit 2
       }
       torch_cxx11_abi="${argument#*=}"
+      ;;
+    --cuda-root=*)
+      [[ -z "${cuda_root}" ]] || {
+        echo "duplicate --cuda-root" >&2
+        exit 2
+      }
+      cuda_root="${argument#*=}"
+      ;;
+    --pep517-builder=*)
+      [[ -z "${pep517_builder}" ]] || {
+        echo "duplicate --pep517-builder" >&2
+        exit 2
+      }
+      pep517_builder="${argument#*=}"
+      ;;
+    --python-abi=*)
+      [[ -z "${python_abi}" ]] || {
+        echo "duplicate --python-abi" >&2
+        exit 2
+      }
+      python_abi="${argument#*=}"
+      ;;
+    --torch-root=*)
+      [[ -z "${torch_root}" ]] || {
+        echo "duplicate --torch-root" >&2
+        exit 2
+      }
+      torch_root="${argument#*=}"
+      ;;
+    --torch-version=*)
+      [[ -z "${torch_version}" ]] || {
+        echo "duplicate --torch-version" >&2
+        exit 2
+      }
+      torch_version="${argument#*=}"
       ;;
     *=*) dependency_specs+=("${argument}") ;;
     *)
@@ -98,6 +147,26 @@ if [[ "${backend}" == "cuda" ]]; then
     exit 2
   fi
 
+  declared_input_values=(
+    "${cuda_root}"
+    "${pep517_builder}"
+    "${python_abi}"
+    "${torch_root}"
+    "${torch_version}"
+  )
+  declared_input_count=0
+  for value in "${declared_input_values[@]}"; do
+    [[ -z "${value}" ]] || ((declared_input_count += 1))
+  done
+  if [[ "${declared_input_count}" -ne 0 && "${declared_input_count}" -ne 5 ]]; then
+    echo "CUDA, PyTorch, Python ABI, and PEP 517 inputs must be configured together" >&2
+    exit 2
+  fi
+  if [[ "${declared_input_count}" -eq 5 && "${configured_values}" -ne 3 ]]; then
+    echo "declared CUDA inputs require the CUDA version, architectures, and C++ ABI contract" >&2
+    exit 2
+  fi
+
   cmake_configuration_args=()
   if [[ "${configured_values}" -eq 3 ]]; then
     if [[ ! "${cuda_version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -113,7 +182,36 @@ if [[ "${backend}" == "cuda" ]]; then
       exit 2
     fi
 
-    cuda_compiler="${CUDACXX:-nvcc}"
+    if [[ "${declared_input_count}" -eq 5 ]]; then
+      case "${cuda_root}" in
+        /*) ;;
+        *) cuda_root="${exec_root}/${cuda_root}" ;;
+      esac
+      case "${torch_root}" in
+        /*) ;;
+        *) torch_root="${exec_root}/${torch_root}" ;;
+      esac
+      declared_python_paths=()
+      IFS=: read -r -a configured_python_paths <<<"${PYTHONPATH:-}"
+      for python_path in "${configured_python_paths[@]}"; do
+        case "${python_path}" in
+          "") ;;
+          /*) declared_python_paths+=("${python_path}") ;;
+          *) declared_python_paths+=("${exec_root}/${python_path}") ;;
+        esac
+      done
+      export PYTHONPATH="$(
+        IFS=:
+        printf '%s' "${declared_python_paths[*]}"
+      )"
+      if ! pep517_builder="$(resolve_file "${pep517_builder}")"; then
+        echo "declared PEP 517 builder was not found: ${pep517_builder}" >&2
+        exit 1
+      fi
+      cuda_compiler="${cuda_root}/bin/nvcc"
+    else
+      cuda_compiler="${CUDACXX:-nvcc}"
+    fi
     if ! cuda_compiler="$(command -v "${cuda_compiler}")"; then
       echo "declared CUDA ${cuda_version}, but ${CUDACXX:-nvcc} was not found" >&2
       exit 1
@@ -129,17 +227,94 @@ if [[ "${backend}" == "cuda" ]]; then
     fi
     export CUDACXX="${cuda_compiler}"
 
-    python_executable="${PYTHON:-${python_bin}}"
+    python_executable="${python_bin}"
     if ! python_executable="$(resolve_executable "${python_executable}")"; then
-      echo "cannot validate declared PyTorch C++ ABI: ${PYTHON:-${python_bin}} was not found" >&2
+      echo "cannot validate declared Python toolchain: ${python_bin} was not found" >&2
       exit 1
     fi
-    if ! detected_torch_cxx11_abi="$(
-      "${python_executable}" -c \
-        'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))'
-    )"; then
-      echo "cannot validate declared PyTorch C++ ABI with ${python_executable}" >&2
-      exit 1
+    if [[ "${declared_input_count}" -eq 5 ]]; then
+      detected_python_abi="$(
+        "${python_executable}" -c \
+          'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")'
+      )"
+      if [[ "${detected_python_abi}" != "${python_abi}" ]]; then
+        echo "declared Python ABI ${python_abi}, but ${python_executable} reports ${detected_python_abi}" >&2
+        exit 1
+      fi
+      python_include="$(
+        "${python_executable}" -c \
+          'import sysconfig; print(sysconfig.get_path("include"))'
+      )"
+      if [[ ! -f "${python_include}/Python.h" ]]; then
+        echo "declared Python runtime does not contain development headers: ${python_include}/Python.h" >&2
+        exit 1
+      fi
+
+      torch_config="${torch_root}/torch/share/cmake/Torch/TorchConfig.cmake"
+      torch_c10_library="${torch_root}/torch/lib/libc10.so"
+      torch_version_file="${torch_root}/torch/version.py"
+      if [[ ! -f "${torch_config}" || ! -f "${torch_c10_library}" || ! -f "${torch_version_file}" ]]; then
+        echo "declared PyTorch wheel is incomplete under ${torch_root}" >&2
+        exit 1
+      fi
+      detected_torch_version="$(
+        "${python_executable}" -c \
+          'import runpy, sys; print(runpy.run_path(sys.argv[1])["__version__"])' \
+          "${torch_version_file}"
+      )"
+      if [[ "${detected_torch_version}" != "${torch_version}" ]]; then
+        echo "declared PyTorch ${torch_version}, but wheel reports ${detected_torch_version}" >&2
+        exit 1
+      fi
+      if ! detected_torch_cxx11_abi="$(
+        "${python_executable}" -c '
+import pathlib
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+abi1 = b"_ZN3c1010IndexErrorC1ENS_14SourceLocationENSt7__cxx1112basic_string"
+abi0 = b"_ZN3c1010IndexErrorC1ENS_14SourceLocationESs"
+matches = [value for value, marker in ((1, abi1), (0, abi0)) if marker in data]
+if len(matches) != 1:
+    raise SystemExit("could not identify exactly one C++ ABI marker")
+print(matches[0])
+' "${torch_c10_library}"
+      )"; then
+        echo "cannot determine PyTorch C++ ABI from ${torch_c10_library}" >&2
+        exit 1
+      fi
+
+      : "${CC:?CC must be provided by Bazel's C++ toolchain}"
+      : "${CXX:?CXX must be provided by Bazel's C++ toolchain}"
+      if ! cc_bin="$(resolve_executable "${CC}")"; then
+        echo "C toolchain executable not found: ${CC}" >&2
+        exit 2
+      fi
+      if ! cxx_bin="$(resolve_executable "${CXX}")"; then
+        echo "C++ toolchain executable not found: ${CXX}" >&2
+        exit 2
+      fi
+      export CC="${cc_bin}"
+      export CXX="${cxx_bin}"
+      export CUDAHOSTCXX="${cxx_bin}"
+      export CUDA_HOME="${cuda_root}"
+      export CUDAToolkit_ROOT="${cuda_root}"
+      export PATH="${cuda_root}/bin:${PATH}"
+      export CMAKE_PREFIX_PATH="${torch_root}/torch/share/cmake"
+      export LIBRARY_PATH="${cuda_root}/lib:${cuda_root}/lib/stubs"
+      export LD_LIBRARY_PATH="${torch_root}/torch/lib:${cuda_root}/lib"
+      export SGL_KERNEL_CUDA_SUFFIX="+cu${cuda_version//./}"
+      # TorchConfig.cmake probes a local GPU when this is unset. Its flags are
+      # cleared by CMakeLists.txt; the declared SGL matrix remains authoritative.
+      export TORCH_CUDA_ARCH_LIST="9.0"
+    else
+      if ! detected_torch_cxx11_abi="$(
+        "${python_executable}" -c \
+          'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))'
+      )"; then
+        echo "cannot validate declared PyTorch C++ ABI with ${python_executable}" >&2
+        exit 1
+      fi
     fi
     if [[ "${detected_torch_cxx11_abi}" != "${torch_cxx11_abi}" ]]; then
       echo "declared PyTorch C++ ABI ${torch_cxx11_abi}, but ${python_executable} reports ${detected_torch_cxx11_abi}" >&2
@@ -151,6 +326,15 @@ if [[ "${backend}" == "cuda" ]]; then
       "-DSGL_KERNEL_EXPECTED_CUDA_ARCHITECTURES=${cuda_architectures//,/;}"
       "-DSGL_KERNEL_TORCH_CXX11_ABI=${torch_cxx11_abi}"
     )
+    if [[ "${declared_input_count}" -eq 5 ]]; then
+      cmake_configuration_args+=(
+        "-DCMAKE_C_COMPILER=${CC}"
+        "-DCMAKE_CUDA_HOST_COMPILER=${CXX}"
+        "-DCMAKE_CXX_COMPILER=${CXX}"
+        "-DCUDAToolkit_ROOT=${cuda_root}"
+        "-DTorch_DIR=${torch_root}/torch/share/cmake/Torch"
+      )
+    fi
   fi
 
   declare -A dependency_roots=()
@@ -185,7 +369,7 @@ if [[ "${backend}" == "cuda" ]]; then
     )
   done
   export CMAKE_ARGS="${CMAKE_ARGS:-} ${cmake_source_args[*]}"
-elif [[ -n "${cuda_version}${cuda_architectures}${torch_cxx11_abi}" ]]; then
+elif [[ -n "${cuda_version}${cuda_architectures}${torch_cxx11_abi}${cuda_root}${pep517_builder}${python_abi}${torch_root}${torch_version}" ]]; then
   echo "CUDA toolchain configuration is only valid for the CUDA backend" >&2
   exit 2
 elif [[ "${#dependency_specs[@]}" -ne 0 ]]; then
@@ -238,7 +422,9 @@ case "${backend}" in
 esac
 
 rm -rf build dist
-if [[ -n "${SGL_KERNEL_BUILD_FRONTEND:-}" ]]; then
+if [[ -n "${pep517_builder}" ]]; then
+  "${python_bin}" "${pep517_builder}" dist build
+elif [[ -n "${SGL_KERNEL_BUILD_FRONTEND:-}" ]]; then
   if ! build_frontend="$(resolve_executable "${SGL_KERNEL_BUILD_FRONTEND}")"; then
     echo "wheel build frontend not found: ${SGL_KERNEL_BUILD_FRONTEND}" >&2
     exit 2
