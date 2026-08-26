@@ -67,8 +67,8 @@ def npu_dynamic_quantize_weight(
     return torch.ops.npu.npu_dynamic_quant(weight, **kwargs)
 
 
-def _transpose_packed_int4(weight: torch.Tensor) -> torch.Tensor:
-    """Move INT4 packing from K to N while transposing an online weight."""
+def _convert_packed_int4_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Convert dynamic-quant INT4 output to the matmul weight layout."""
     if weight.dtype != torch.int32:
         raise TypeError(
             "Ascend INT4 dynamic quantization must return torch.int32, got "
@@ -80,21 +80,26 @@ def _transpose_packed_int4(weight: torch.Tensor) -> torch.Tensor:
             f"by 8, got {weight.shape[-2]}."
         )
 
-    source_shifts = range(0, 32, 4)
-    destination_shifts = torch.arange(
-        0, 32, 4, dtype=torch.int32, device=weight.device
-    )
     output_size = weight.shape[-2]
-    output_shape = (*weight.shape[:-2], weight.shape[-1] * 8, output_size // 8)
-    transposed = torch.empty(output_shape, dtype=torch.int32, device=weight.device)
-    for row_offset, source_shift in enumerate(source_shifts):
-        values = ((weight >> source_shift) & 0xF).transpose(-2, -1)
-        values = values.reshape(*values.shape[:-1], output_size // 8, 8)
-        transposed[..., row_offset::8, :] = (values << destination_shifts).sum(
-            dim=-1, dtype=torch.int32
+    input_size = weight.shape[-1] * 8
+    matrices = weight.reshape(-1, output_size, weight.shape[-1])
+    converted = torch.empty(
+        (matrices.shape[0], input_size, output_size // 8),
+        dtype=torch.int32,
+        device=weight.device,
+    )
+    for matrix_index, matrix in enumerate(matrices):
+        unpacked = torch.empty(
+            (input_size, output_size), dtype=torch.int32, device=weight.device
+        )
+        for row_offset, source_shift in enumerate(range(0, 32, 4)):
+            values = ((matrix >> source_shift) & 0xF).transpose(0, 1)
+            unpacked[row_offset::8] = torch.where(values < 8, values, values - 16)
+        converted[matrix_index] = torch.ops.npu.npu_convert_weight_to_int4pack(
+            unpacked
         )
 
-    return transposed
+    return converted.reshape(*weight.shape[:-2], input_size, output_size // 8)
 
 
 def npu_format_online_weight(
@@ -102,12 +107,11 @@ def npu_format_online_weight(
 ) -> torch.Tensor:
     if spec.weight_dtype == torch.int8:
         weight = weight.transpose(-2, -1).contiguous()
-    else:
-        # npu_dynamic_quant packs K: [N, K / 8]. QuantMatmul and GMM consume
-        # packed N after transpose: [K, N / 8]. A plain transpose incorrectly
-        # exposes K / 8 as the reduction dimension.
-        weight = _transpose_packed_int4(weight)
-    return npu_format_cast(weight)
+        return npu_format_cast(weight)
+
+    # npu_dynamic_quant packs K as raw nibbles in [N, K / 8]. QuantMatmul and
+    # GMM require the interleaved weight layout produced from logical [K, N].
+    return _convert_packed_int4_weight(weight)
 
 
 class NPUOnlineDenseWeightLoader:
