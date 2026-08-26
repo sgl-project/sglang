@@ -100,14 +100,22 @@ PullPlaneObj::PullPlaneObj(
   this->mc_workspace = reinterpret_cast<uint8_t*>(mc_workspace_ptr);
 }
 
-CommunicatorObj::CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull)
-    : m_push(std::move(push)), m_pull(std::move(pull)) {
+CommunicatorObj::CommunicatorObj(
+    Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull, Optional<PushPlaneRef> gather)
+    : m_push(std::move(push)), m_pull(std::move(pull)), m_gather(std::move(gather)) {
   CHECK_HOST(m_push.has_value() || m_pull.has_value()) << "A communicator needs at least one plane";
+  const auto identity = [](uint32_t rank, uint32_t world_size, const BasePlane& other, const char* what) {
+    CHECK_HOST(rank == other.rank && world_size == other.world_size) << what << " disagree on (rank, world_size)";
+  };
   if (m_push.has_value() && m_pull.has_value()) {
     const auto& push_obj = *m_push.value().get();
-    const auto& pull_obj = *m_pull.value().get();
-    CHECK_HOST(push_obj.rank == pull_obj.rank && push_obj.world_size == pull_obj.world_size)
-        << "Push and pull planes disagree on (rank, world_size)";
+    identity(push_obj.rank, push_obj.world_size, *m_pull.value().get(), "Push and pull planes");
+  }
+  if (m_gather.has_value()) {
+    // The gather plane rides on the pull plane's barrier, so it needs one.
+    CHECK_HOST(m_pull.has_value()) << "A gather plane is useless without a pull plane to barrier on";
+    const auto& gather_obj = *m_gather.value().get();
+    identity(gather_obj.rank, gather_obj.world_size, *m_pull.value().get(), "Gather and pull planes");
   }
 }
 
@@ -134,11 +142,17 @@ inline void register_communicator() {
       .def_ro("num_bytes", &dist::PullPlaneObj::num_bytes);
 
   refl::ObjectDef<dist::CommunicatorObj>()
-      .def(refl::init<dist::Optional<dist::PushPlaneRef>, dist::Optional<dist::PullPlaneRef>>(), "__init__")
+      .def(
+          refl::init<
+              dist::Optional<dist::PushPlaneRef>,
+              dist::Optional<dist::PullPlaneRef>,
+              dist::Optional<dist::PushPlaneRef>>(),
+          "__init__")
       .def("get_rank", &dist::CommunicatorObj::get_rank)
       .def("get_world_size", &dist::CommunicatorObj::get_world_size)
       .def("get_push", &dist::CommunicatorObj::get_push)
       .def("get_pull", &dist::CommunicatorObj::get_pull)
+      .def("get_gather", &dist::CommunicatorObj::get_gather)
       .def("set_pull_blocks", &dist::CommunicatorObj::set_pull_blocks)
       .def("set_pull_multicast_blocks", &dist::CommunicatorObj::set_pull_multicast_blocks);
 }

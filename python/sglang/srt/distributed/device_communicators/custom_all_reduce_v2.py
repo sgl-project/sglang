@@ -9,12 +9,15 @@ The CUDA side is split into independent pieces:
   all-reduce tensors that are not symmetric memory, so it stages them
   through; the K3 fused collectives bring their own symmetric input and
   borrow the semaphores alone.
-- ``Communicator``: the two planes above (either may be absent), the handle
-  every kernel takes, plus the pull launch widths.
+- the gather plane: a second ``PushPlane``, used by ``2shot_lamport`` for
+  the all-gather half of its reduce-scatter. It cannot share the push plane,
+  whose epoch ``1shot_push`` advances on its own schedule.
+- ``Communicator``: the planes above (any may be absent), the handle every
+  kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
-  graph_params, use_multicast)`` with three algorithms (1shot_push /
-  1shot_pull / 2shot_pull) and three pull data sources (eager pull buffer /
-  CUDA-graph pointer table / multicast address).
+  graph_params, use_multicast)`` with four algorithms (1shot_push /
+  1shot_pull / 2shot_pull / 2shot_lamport) and three pull data sources (eager
+  pull buffer / CUDA-graph pointer table / multicast address).
 
 All storage is allocated and owned here, in Python.
 
@@ -80,6 +83,10 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
+def _div_ceil(nbytes: int, div: int) -> int:
+    return (nbytes + div - 1) // div
+
+
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
     from torch._C._distributed_c10d import _SymmetricMemory
 
@@ -113,6 +120,7 @@ class CustomAllReduceV2:
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
+        max_lamport_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
@@ -126,6 +134,10 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
+        :param max_lamport_size: explicit ``2shot_lamport`` message ceiling,
+                                 which sizes the gather plane; overrides both
+                                 the tuned size and ``max_size``. ``0``
+                                 disables the algo and its plane.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
 
@@ -146,6 +158,8 @@ class CustomAllReduceV2:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
             max_push_size = min(base_config.max_push_bytes, max_size)
+        if max_lamport_size is None:
+            max_lamport_size = min(base_config.max_lamport_bytes, max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -177,15 +191,29 @@ class CustomAllReduceV2:
             else 0
         )
         self.max_push_size = _ceil_align(max(max_push_size, _ALIGN_BYTES), _ALIGN_BYTES)
-        self.max_size = max(self.max_pull_size, self.max_push_size)
         num_pull_blocks = base_config.num_pull_blocks
         num_push_blocks = base_config.num_push_blocks
         if max_pull_blocks:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
+        self.lamport_enabled = self.pull_enabled and max_lamport_size > 0
+        self.gather_slot_size = (
+            _ceil_align(
+                _div_ceil(max_lamport_size, self.world_size),
+                _ALIGN_BYTES,
+            )
+            if self.lamport_enabled
+            else 0
+        )
+        self.max_lamport_size = min(
+            self.gather_slot_size * self.world_size, self.max_pull_size
+        )
+        self.max_size = max(self.max_pull_size, self.max_push_size)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            max_lamport_bytes=self.max_lamport_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
@@ -218,18 +246,21 @@ class CustomAllReduceV2:
         """Slice one symmetric-memory allocation into every shared buffer.
 
         Layout per rank: ``[2 * world_size push slots | pull buffer | pull
-        semaphores]``. One allocation rather than three keeps it to a single
-        rendezvous and a single multicast base to offset from. The push
-        counter is rank-local, so it lives in a plain CUDA tensor.
+        semaphores | 2 * world_size gather slots]``. One allocation rather
+        than four keeps it to a single rendezvous and a single multicast base
+        to offset from. The push and gather counters are rank-local, so they
+        live in plain CUDA tensors.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.max_push_size
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
         sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks if self.pull_enabled else 0
-        total_bytes = push_bytes + pull_bytes + sem_bytes
+        gather_bytes = push_num_slots * self.gather_slot_size  # 0 when disabled
+        total_bytes = push_bytes + pull_bytes + sem_bytes + gather_bytes
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
+        gather_offset = sem_offset + sem_bytes
 
         self._symm_tensor, symm_mem = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
@@ -238,9 +269,9 @@ class CustomAllReduceV2:
             symm_mem.get_buffer(i, [total_bytes], torch.uint8)
             for i in range(self.world_size)
         ]
-        # The push slots (lamport pos-zero markers) and the semaphores must
-        # start zeroed; the pull buffer need not, but it rides along in the
-        # one-shot memset.
+        # The push and gather slots (lamport pos-zero markers) and the
+        # semaphores must start zeroed; the pull buffer need not, but it rides
+        # along in the one-shot memset.
         slabs[self.rank].zero_()
         torch.cuda.synchronize()
         dist.barrier(group=self.group)
@@ -269,6 +300,19 @@ class CustomAllReduceV2:
             counter=self._push_counter.view(-1, 1).view(torch.uint8),
             mc_workspace=mc_at(0),
         )
+        gather_plane = None
+        if self.lamport_enabled:
+            self._gather_counter = torch.zeros(
+                (cfg.num_pull_blocks,), dtype=torch.uint32, device=self.device
+            )
+            gather_plane = PushPlane(
+                self.rank,
+                self.world_size,
+                workspaces=slice_all(
+                    [push_num_slots, self.gather_slot_size], gather_offset
+                ),
+                counter=self._gather_counter.view(-1, 1).view(torch.uint8),
+            )
         pull_plane = None
         if self.pull_enabled:
             pull_plane = PullPlane(
@@ -284,17 +328,18 @@ class CustomAllReduceV2:
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
 
-        self.obj = Communicator(push=push_plane, pull=pull_plane)
+        self.obj = Communicator(push=push_plane, pull=pull_plane, gather=gather_plane)
         if self.config.num_mc_blocks is not None:
             self.obj.set_pull_multicast_blocks(self.config.num_mc_blocks)
         if self.rank == 0:
             logger.info(
                 "All Reduce config: symmetric_memory = %.2f MB, "
-                "local_buffer = %.2f MB, multicast = %s, pull = %s",
+                "local_buffer = %.2f MB, multicast = %s, pull = %s, lamport = %s",
                 total_bytes / MB,
                 (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
                 self.config.num_mc_blocks is not None,
                 self.pull_enabled,
+                self.lamport_enabled,
             )
         dist.barrier(group=self.group)
 
@@ -336,6 +381,11 @@ class CustomAllReduceV2:
         # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
         can_use_multicast = self.config.num_mc_blocks is not None
+        # tried first so its band may start below one_shot_push_threshold
+        if heuristic.lamport.contains(nbytes):
+            return AllReduceConfig(
+                AllReduceAlgo.TWO_SHOT_LAMPORT, use_graph=can_use_graph
+            )
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:

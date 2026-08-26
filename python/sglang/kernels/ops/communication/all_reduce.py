@@ -22,6 +22,7 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
+    TWO_SHOT_LAMPORT = enum.auto()
 
     def is_push(self) -> bool:
         return self == AllReduceAlgo.ONE_SHOT_PUSH
@@ -35,6 +36,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+    AllReduceAlgo.TWO_SHOT_LAMPORT: "2shot_lamport",
 }
 
 if TYPE_CHECKING:
@@ -150,6 +152,7 @@ class Communicator(tvm_ffi.Object):
         def get_world_size(self) -> int: ...
         def get_push(self) -> PushPlane | None: ...
         def get_pull(self) -> PullPlane | None: ...
+        def get_gather(self) -> PushPlane | None: ...
         def set_pull_blocks(self, num_blocks: int | None) -> None: ...
         def set_pull_multicast_blocks(self, num_blocks: int | None) -> None: ...
 
@@ -157,8 +160,9 @@ class Communicator(tvm_ffi.Object):
         self,
         push: PushPlane | None = None,
         pull: PullPlane | None = None,
+        gather: PushPlane | None = None,
     ) -> None:
-        self.__ffi_init__(push, pull)
+        self.__ffi_init__(push, pull, gather)
 
     @property
     def rank(self) -> int:
@@ -177,6 +181,11 @@ class Communicator(tvm_ffi.Object):
     def pull(self) -> PullPlane | None:
         """The pull plane, or None for a push-only communicator."""
         return self.get_pull()
+
+    @property
+    def gather(self) -> PushPlane | None:
+        """The 2shot_lamport gather plane, or None when that algo is off."""
+        return self.get_gather()
 
 
 def _init_ipc_manager() -> None:

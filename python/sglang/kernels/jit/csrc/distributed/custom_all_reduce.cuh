@@ -7,6 +7,10 @@
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
+//   - 2shot_lamport: the same reduce-scatter, but the all-gather pushes each
+//     reduced shard into a separate lamport plane instead of the peers' pull
+//     workspaces. Readiness then rides in the data, so the exit barrier goes
+//     away: a rank copies each peer's shard out the moment it lands.
 //
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
@@ -61,6 +65,16 @@ struct AllReducePullParams {
   PullWorkSpace<kWorldSize> ws;
 };
 
+template <uint32_t kWorldSize>
+struct AllReduceLamportParams {
+  void* __restrict__ output;
+  uint32_t num_vecs;
+  uint32_t rank;
+  void* const* __restrict__ graph_params;
+  PullWorkSpace<kWorldSize> ws;
+  PushWorkSpace<kWorldSize> gather;
+};
+
 /// `vec_offset` is a *vector index* and must stay folded into the base pointers
 /// here: a typed 32-bit bias becomes one widening multiply-add off a
 /// constant-bank base, which ptxas keeps on the uniform datapath, so the whole
@@ -74,7 +88,10 @@ struct LoadStoreImpl {
   static constexpr uint32_t size() {
     return kWorldSize;
   }
-  SGL_DEVICE LoadStoreImpl(const AllReducePullParams<kWorldSize>& params, uint32_t vec_offset = 0) {
+  /// Templated on the params struct so the lamport kernel, whose params carry
+  /// a gather plane as well, reuses the same peer table.
+  template <typename Params>
+  SGL_DEVICE LoadStoreImpl(const Params& params, uint32_t vec_offset = 0) {
     if constexpr (kUseGraph) {
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -261,6 +278,76 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   barrier.arrive_rel_acq(/*n=*/1);
 }
 
+template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
+ALL_REDUCE_KERNEL void all_reduce_2shot_lamport_kernel(
+    const __grid_constant__ AllReduceLamportParams<kWorldSize> params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
+  const auto num_total_vecs = params.num_vecs;
+  const auto avg_vecs = num_total_vecs / kWorldSize;
+  const auto rem_vecs = num_total_vecs % kWorldSize;
+  const auto num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
+  const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
+  const auto impl = Impl{params, vec_offset};
+  PDLWaitPrimary<kUsePDL>();
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.gather};
+  const auto barrier = distributed::Barrier<kWorldSize>{
+      params.ws.semaphores.data(),
+      params.rank,
+      /*num_arrives=*/1,
+  };
+  barrier.arrive_relaxed(/*n=*/0);
+  __syncthreads();
+
+  // One slot per peer, so the epoch's half of the plane holds a whole message.
+  void* gather_ptrs[kWorldSize];
+#pragma unroll
+  for (uint32_t i = 0; i < kWorldSize; ++i) {
+    gather_ptrs[i] = epoch.slot_ptr(/*dst=*/i);
+  }
+
+  const auto num_threads = blockDim.x * gridDim.x;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // shot 1: reduce our own shard from every peer, write it straight to our
+  // output, and push it into every peer's gather plane.
+  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
+    vec_t vec;
+    impl.load_reduce(vec, vid);
+    Lamport::clear_pos_zero(vec.data());
+    const auto out_vid = vec_offset + vid;
+    vec.store(params.output, out_vid);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != params.rank) ptx::st_relaxed_16B(vec, gather_ptrs[i], out_vid);
+    }
+  }
+
+  // shot 2: poll the peers' shards out of our own gather region, restoring the
+  // marker behind us so this epoch comes back around empty.
+  vec_t pos_zero_vec;
+  Lamport::fill_pos_zero(pos_zero_vec.data());
+  const auto local_gather = gather_ptrs[params.rank];
+  const auto num_remote_vecs = num_total_vecs - num_vecs;
+  for (auto rid = global_tid; rid < num_remote_vecs; rid += num_threads) {
+    // compact the two remote ranges around our own, already-written shard
+    const auto vid = rid < vec_offset ? rid : rid + num_vecs;
+    vec_t vec;
+    do {
+      ptx::ld_relaxed_16B(vec, local_gather, vid);
+      if (!Lamport::has_pos_zero(vec.data())) break;
+    } while (true);
+    vec.store(params.output, vid);
+    ptx::st_global_16B(pos_zero_vec, local_gather, vid);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  epoch.flip();
+}
+
 template <uint32_t N>
 __global__ void memcpy_kernel(void* __restrict__ dst, const void* __restrict__ src, uint32_t num_vecs) {
   static_assert(N % 4 == 0, "at least 4-bytes aligned for uint32_t load/store");
@@ -305,7 +392,8 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
+    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_lamport")
+        << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
     const auto num_elems_int64 = in.numel();
@@ -339,6 +427,8 @@ struct AllReduceKernel {
     const auto& pull = comm.get_pull_obj();
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
     // only 2shot pull + graph mode forces inplace implementation
+    // (2shot_lamport gathers through its own plane, so it never writes over
+    // an input a peer may still be reducing)
     const auto is_inplace = use_graph && algo == "2shot_pull";
     Tensor out = is_inplace ? in : ffi::empty_like(in);
     const auto params = PullParams{
@@ -376,6 +466,28 @@ struct AllReduceKernel {
     using LS = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
     using LS_GRAPH = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/true>;
     using MC = MultiCastImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
+    if (algo == "2shot_lamport") {
+      CHECK_HOST(!use_multicast) << "2shot_lamport gathers through its own plane, not multimem";
+      const auto& gather = comm.get_gather_obj();
+      const uint32_t lamport_blocks = gather.num_blocks;
+      CHECK_HOST(lamport_blocks <= pull.num_blocks)
+          << "gather plane is " << lamport_blocks << " blocks wide but only " << pull.num_blocks
+          << " pull semaphores back it";
+      const auto lamport_params = AllReduceLamportParams<kWorldSize>{
+          .output = out.data_ptr(),
+          .num_vecs = num_vecs,
+          .rank = pull.rank,
+          .graph_params = static_cast<void* const*>(graph_params),
+          .ws = ws,
+          .gather = gather.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
+      };
+      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
+      const auto kernel = use_graph ? all_reduce_2shot_lamport_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
+                                    : all_reduce_2shot_lamport_kernel<LS, T, kWorldSize, kUsePDL>;
+      LaunchKernel(lamport_blocks, choose_block_size(num_vecs), stream)  //
+          .enable_pdl(kUsePDL)(kernel, lamport_params);
+      return out;
+    }
     if (algo == "1shot_pull") {
       // first copy to the workspace
       CHECK_HOST(!use_multicast);
