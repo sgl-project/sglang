@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from xgrammar import StructuralTag
 from xgrammar.structural_tag import (
@@ -29,7 +29,6 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
-from sglang.srt.function_call.utils import resolve_local_json_schema_refs
 
 _JSON_TYPES = (
     "string",
@@ -109,15 +108,40 @@ def _matches_json_type(value: Any, json_type: str) -> bool:
     )
 
 
+def _resolve_local_ref(
+    ref: str, root_schema: Dict[str, Any]
+) -> Optional[Union[bool, Dict[str, Any]]]:
+    if not ref.startswith("#/"):
+        return None
+    value: Any = root_schema
+    for part in ref[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    if isinstance(value, (bool, dict)):
+        return value
+    return None
+
+
 def _schema_types(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
+    seen_refs: Optional[Set[str]] = None,
 ) -> List[str]:
-    schema = resolve_local_json_schema_refs(schema, root_schema)
     if schema is False:
         return []
     if schema is True:
         return list(_JSON_TYPES)
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        seen_refs = set() if seen_refs is None else set(seen_refs)
+        if ref not in seen_refs:
+            target = _resolve_local_ref(ref, root_schema)
+            if target is not None:
+                seen_refs.add(ref)
+                return _schema_types(target, root_schema, seen_refs)
 
     schema_type = schema.get("type")
     if isinstance(schema_type, str):
@@ -132,14 +156,14 @@ def _schema_types(
                 item
                 for option in options
                 if isinstance(option, (bool, dict))
-                for item in _schema_types(option, root_schema)
+                for item in _schema_types(option, root_schema, seen_refs)
             }
             return [item for item in _JSON_TYPES if item in option_types]
 
     options = schema.get("allOf")
     if isinstance(options, list):
         type_sets = [
-            set(_schema_types(option, root_schema))
+            set(_schema_types(option, root_schema, seen_refs))
             for option in options
             if isinstance(option, (bool, dict))
         ]
@@ -190,9 +214,16 @@ def _restrict_schema_type(
     json_type: str,
     root_schema: Dict[str, Any],
 ) -> Union[bool, Dict[str, Any]]:
-    schema = resolve_local_json_schema_refs(schema, root_schema)
     if not isinstance(schema, dict):
         return {"type": json_type} if schema else False
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        target = _resolve_local_ref(ref, root_schema)
+        if target is not None:
+            return _with_root_definitions(
+                _restrict_schema_type(target, json_type, root_schema), root_schema
+            )
 
     result = dict(schema)
     schema_type = result.get("type")

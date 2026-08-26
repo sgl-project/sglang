@@ -341,49 +341,69 @@ def resolve_local_json_schema_refs(
     }
 
 
-def get_json_schema_properties(
+_ROOT_COMBINATORS = ("allOf", "anyOf", "oneOf")
+_MISSING = object()
+
+
+def get_tool_parser_property_hints(
     schema: Any,
     root_schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Collect properties declared directly or in root schema combinators."""
+    """Return a lossy property map for tool-format detectors.
+
+    This exposes properties hidden below root-level schema combinators.
+
+    Direct properties are authoritative. Identical branch declarations are
+    retained. Incompatible declarations collapse to an unconstrained mapping,
+    causing detectors to use their existing conservative string behavior.
+
+    This result must not be used for validation or constrained decoding.
+    """
+    if not isinstance(schema, dict):
+        return {}
+
     if root_schema is None:
-        if not isinstance(schema, dict):
-            return {}
         root_schema = schema
+
     schema = resolve_local_json_schema_refs(schema, root_schema)
     if not isinstance(schema, dict):
         return {}
 
-    direct_properties = {
-        name: resolve_local_json_schema_refs(property_schema, root_schema)
-        for name, property_schema in schema.get("properties", {}).items()
-    }
+    raw_direct = schema.get("properties", {})
+    if not isinstance(raw_direct, dict):
+        raw_direct = {}
+
+    direct_properties: Dict[str, Any] = {}
+    for name, property_schema in raw_direct.items():
+        property_schema = resolve_local_json_schema_refs(property_schema, root_schema)
+        # Several detectors assume property schemas are mappings.
+        direct_properties[name] = (
+            property_schema if isinstance(property_schema, dict) else {}
+        )
+
     properties = direct_properties.copy()
 
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        branch_properties = [
-            get_json_schema_properties(branch, root_schema)
-            for branch in schema.get(keyword, [])
-        ]
-        for name in dict.fromkeys(
-            name for branch in branch_properties for name in branch
-        ):
-            choices = [branch[name] for branch in branch_properties if name in branch]
-            if keyword in ("anyOf", "oneOf") and len(choices) < len(branch_properties):
-                # The missing branch leaves this property unconstrained, so preserve
-                # its raw spelling until sibling arguments select a branch.
-                property_schema = {"type": "string"}
-            else:
-                property_schema = (
-                    choices[0] if len(choices) == 1 else {keyword: choices}
-                )
-            current_schema = properties.get(name, {})
-            if current_schema in ({}, True):
-                properties[name] = property_schema
-            elif (
-                property_schema not in ({}, True) and current_schema != property_schema
-            ):
-                properties[name] = {"allOf": [current_schema, property_schema]}
+    for keyword in _ROOT_COMBINATORS:
+        branches = schema.get(keyword)
+        if not isinstance(branches, list):
+            continue
+
+        for branch in branches:
+            branch_properties = get_tool_parser_property_hints(
+                branch,
+                root_schema=root_schema,
+            )
+
+            for name, candidate_schema in branch_properties.items():
+                if name in direct_properties:
+                    continue
+
+                current_schema = properties.get(name, _MISSING)
+                if current_schema is _MISSING:
+                    properties[name] = candidate_schema
+                elif current_schema != candidate_schema:
+                    properties[name] = {}
+
     return properties
 
 

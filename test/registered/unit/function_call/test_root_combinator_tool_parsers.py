@@ -1,147 +1,157 @@
+import copy
 import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN
-from sglang.srt.function_call.utils import get_json_schema_properties
+from sglang.srt.function_call.utils import get_tool_parser_property_hints
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+PROPERTY_SCHEMAS = {
+    "number": {"type": "number"},
+    "stringList": {
+        "type": "array",
+        "items": {"type": "string"},
+    },
+    "numberList": {
+        "type": "array",
+        "items": {"type": "number"},
+    },
+}
+ARGUMENT_CASES = (
+    ("number", "1.5", 1.5),
+    ("stringList", '["alpha","beta"]', ["alpha", "beta"]),
+    ("numberList", "[1,2.5]", [1, 2.5]),
+)
+
+
+def disjoint_schema(keyword: str = "oneOf") -> dict:
+    return {
+        "type": "object",
+        keyword: [
+            {
+                "type": "object",
+                "properties": {name: property_schema},
+                "required": [name],
+                "additionalProperties": False,
+            }
+            for name, property_schema in PROPERTY_SCHEMAS.items()
+        ],
+    }
+
+
+class TestToolParserPropertyHints(unittest.TestCase):
+    def test_disjoint_combinator_properties_are_projected(self):
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            with self.subTest(keyword=keyword):
+                schema = disjoint_schema(keyword)
+                if keyword == "allOf":
+                    for branch in schema[keyword]:
+                        branch.pop("additionalProperties")
+
+                self.assertEqual(
+                    get_tool_parser_property_hints(schema),
+                    PROPERTY_SCHEMAS,
+                )
+
+    def test_direct_property_is_authoritative(self):
+        direct_schema = {"type": "object"}
+        schema = {
+            "properties": {"payload": direct_schema},
+            "oneOf": [
+                {"properties": {"payload": {"type": "string"}}},
+                {"properties": {"payload": {"type": "array"}}},
+            ],
+        }
+
+        self.assertEqual(
+            get_tool_parser_property_hints(schema),
+            {"payload": direct_schema},
+        )
+
+    def test_identical_branch_property_is_retained(self):
+        property_schema = {"type": "object"}
+        schema = {
+            "anyOf": [
+                {"properties": {"payload": property_schema}},
+                {"properties": {"payload": copy.deepcopy(property_schema)}},
+            ]
+        }
+
+        self.assertEqual(
+            get_tool_parser_property_hints(schema),
+            {"payload": property_schema},
+        )
+
+    def test_conflicting_branch_property_is_unconstrained(self):
+        schema = {
+            "oneOf": [
+                {"properties": {"payload": {"type": "object"}}},
+                {"properties": {"payload": {"type": "string"}}},
+            ]
+        }
+
+        self.assertEqual(
+            get_tool_parser_property_hints(schema),
+            {"payload": {}},
+        )
+
+    def test_local_refs_are_resolved(self):
+        schema = {
+            "$defs": {
+                "Arguments": {
+                    "oneOf": [{"properties": {"payload": {"$ref": "#/$defs/Payload"}}}]
+                },
+                "Payload": {"type": "object"},
+            },
+            "$ref": "#/$defs/Arguments",
+        }
+
+        self.assertEqual(
+            get_tool_parser_property_hints(schema),
+            {"payload": {"type": "object"}},
+        )
+
+    def test_original_schema_is_not_modified(self):
+        schema = disjoint_schema()
+        original = copy.deepcopy(schema)
+
+        get_tool_parser_property_hints(schema)
+
+        self.assertEqual(schema, original)
+
+
 class TestRootCombinatorToolParsers(unittest.TestCase):
     def setUp(self):
+        parameters = disjoint_schema()
+        self.original_parameters = copy.deepcopy(parameters)
         self.tools = [
             Tool(
                 type="function",
-                function=Function(
-                    name="acme",
-                    parameters={
-                        "type": "object",
-                        "$defs": {
-                            "Payload": {
-                                "type": "object",
-                                "properties": {"value": {"type": "string"}},
-                                "required": ["value"],
-                            },
-                            "AcmeRequest": {
-                                "type": "object",
-                                "properties": {
-                                    "kind": {"const": "acme"},
-                                    "payload": {"$ref": "#/$defs/Payload"},
-                                },
-                                "required": ["kind", "payload"],
-                            },
-                        },
-                        "oneOf": [
-                            {"$ref": "#/$defs/AcmeRequest"},
-                            {
-                                "type": "object",
-                                "properties": {"kind": {"const": "other"}},
-                                "required": ["kind"],
-                            },
-                        ],
-                    },
-                ),
+                function=Function(name="convert", parameters=parameters),
             )
         ]
-        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
 
-    def test_property_lookup_supports_root_combinators(self):
-        payload_schema = {
-            "type": "object",
-            "properties": {"value": {"type": "string"}},
-        }
-        for keyword in ("anyOf", "oneOf", "allOf"):
-            with self.subTest(keyword=keyword):
-                schema = {
-                    keyword: [
-                        {
-                            "type": "object",
-                            "properties": {"payload": payload_schema},
-                        }
-                    ]
-                }
-                self.assertEqual(
-                    get_json_schema_properties(schema), {"payload": payload_schema}
-                )
-                schema["properties"] = {"payload": {}}
-                self.assertEqual(
-                    get_json_schema_properties(schema), {"payload": payload_schema}
-                )
-
-        self.assertEqual(
-            get_json_schema_properties(self.tools[0].function.parameters)["kind"],
-            {"oneOf": [{"const": "acme"}, {"const": "other"}]},
-        )
-        self.assertEqual(
-            get_json_schema_properties(self.tools[0].function.parameters)["payload"],
-            {"type": "string"},
-        )
-
-        parser = FunctionCallParser(self.tools, "qwen3_coder")
-        self.assertNotIn("properties", self.tools[0].function.parameters)
-        self.assertIn(
-            "payload", parser.detector_tools[0].function.parameters["properties"]
-        )
-
-    def test_branch_selection_descends_through_all_of(self):
-        parameters = self.tools[0].function.parameters
-        variants = {
-            "explicit": {
-                "type": "object",
-                "$defs": parameters["$defs"],
-                "allOf": [{"oneOf": parameters["oneOf"]}],
-            },
-            "root_ref": {
-                "$ref": "#/$defs/Root",
-                "$defs": parameters["$defs"]
-                | {
-                    "Root": {
-                        "type": "object",
-                        "oneOf": parameters["oneOf"],
-                    }
-                },
-            },
-        }
-        chunks = [
-            "<tool_call>",
-            "<function=acme>",
-            "<parameter=kind>acme</parameter>",
-            '<parameter=payload>{"value":"hello"}</parameter>',
-            "</function>",
-            "</tool_call>",
-        ]
-
-        for name, parameters in variants.items():
-            with self.subTest(name=name):
-                function = self.tools[0].function.model_copy(
-                    update={"parameters": parameters}
-                )
-                tool = self.tools[0].model_copy(update={"function": function})
-
-                parser = FunctionCallParser([tool], "qwen3_coder")
-                _, calls = parser.parse_non_stream("".join(chunks))
-                self.assertEqual(json.loads(calls[0].parameters), self.expected)
-
-                parser = FunctionCallParser([tool], "qwen3_coder")
-                streamed = ""
-                for chunk in chunks:
-                    _, calls = parser.parse_stream_chunk(chunk)
-                    streamed += "".join(call.parameters for call in calls)
-                self.assertEqual(json.loads(streamed), self.expected)
-
-    def test_parsers(self):
+    def parser_cases(self, argument: str, raw_value: str):
         ns = MINIMAX_NS_TOKEN
-        cases = [
+        minimax_value = [f"<{argument}>{raw_value}", f"</{argument}>"]
+        if argument.endswith("List"):
+            minimax_value = [f"<{argument}>"]
+            for item in json.loads(raw_value):
+                minimax_value.extend((f"<item>{item}", "</item>"))
+            minimax_value.append(f"</{argument}>")
+
+        return [
             (
                 "qwen3_coder",
                 [
                     "<tool_call>",
-                    "<function=acme>",
-                    "<parameter=kind>acme</parameter>",
-                    '<parameter=payload>{"value":"hello"}</parameter>',
+                    "<function=convert>",
+                    f"<parameter={argument}>{raw_value}</parameter>",
                     "</function>",
                     "</tool_call>",
                 ],
@@ -149,11 +159,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             (
                 "glm",
                 [
-                    "<tool_call>acme\n",
-                    "<arg_key>kind</arg_key>\n<arg_value>acme</arg_value>\n",
+                    "<tool_call>convert\n",
                     (
-                        '<arg_key>payload</arg_key>\n<arg_value>{"value":"hello"}'
-                        "</arg_value>\n"
+                        f"<arg_key>{argument}</arg_key>\n"
+                        f"<arg_value>{raw_value}</arg_value>\n"
                     ),
                     "</tool_call>",
                 ],
@@ -161,11 +170,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             (
                 "glm47",
                 [
-                    "<tool_call>acme",
-                    "<arg_key>kind</arg_key><arg_value>acme</arg_value>",
+                    "<tool_call>convert",
                     (
-                        '<arg_key>payload</arg_key><arg_value>{"value":"hello"}'
-                        "</arg_value>"
+                        f"<arg_key>{argument}</arg_key>"
+                        f"<arg_value>{raw_value}</arg_value>"
                     ),
                     "</tool_call>",
                 ],
@@ -173,20 +181,18 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             (
                 "dots",
                 [
-                    '<dots_function_call><invoke name="acme">',
-                    '<parameter name="kind">acme</parameter>',
-                    '<parameter name="payload">{"value":"hello"}</parameter>',
+                    '<dots_function_call><invoke name="convert">',
+                    f'<parameter name="{argument}">{raw_value}</parameter>',
                     "</invoke></dots_function_call>",
                 ],
             ),
             (
                 "hunyuan",
                 [
-                    "<tool_calls><tool_call>acme<tool_sep>",
-                    "<arg_key>kind</arg_key><arg_value>acme</arg_value>",
+                    "<tool_calls><tool_call>convert<tool_sep>",
                     (
-                        '<arg_key>payload</arg_key><arg_value>{"value":"hello"}'
-                        "</arg_value>"
+                        f"<arg_key>{argument}</arg_key>"
+                        f"<arg_value>{raw_value}</arg_value>"
                     ),
                     "</tool_call></tool_calls>",
                 ],
@@ -194,27 +200,24 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             (
                 "mimo",
                 [
-                    "<tool_call><function=acme>",
-                    "<parameter=kind>acme</parameter>",
-                    '<parameter=payload>{"value":"hello"}</parameter>',
+                    "<tool_call><function=convert>",
+                    f"<parameter={argument}>{raw_value}</parameter>",
                     "</function></tool_call>",
                 ],
             ),
             (
                 "minicpm5",
                 [
-                    '<function name="acme">',
-                    '<param name="kind">acme</param>',
-                    '<param name="payload">{"value":"hello"}</param>',
+                    '<function name="convert">',
+                    f'<param name="{argument}">{raw_value}</param>',
                     "</function>",
                 ],
             ),
             (
                 "minimax-m2",
                 [
-                    '<minimax:tool_call><invoke name="acme">',
-                    '<parameter name="kind">acme</parameter>',
-                    '<parameter name="payload">{"value":"hello"}</parameter>',
+                    '<minimax:tool_call><invoke name="convert">',
+                    f'<parameter name="{argument}">{raw_value}</parameter>',
                     "</invoke></minimax:tool_call>",
                 ],
             ),
@@ -224,13 +227,8 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                     ns + segment
                     for segment in (
                         "<tool_call>",
-                        '<invoke name="acme">',
-                        "<kind>acme",
-                        "</kind>",
-                        "<payload>",
-                        "<value>hello",
-                        "</value>",
-                        "</payload>",
+                        '<invoke name="convert">',
+                        *minimax_value,
                         "</invoke>",
                         "</tool_call>",
                     )
@@ -239,11 +237,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             (
                 "poolside_v1",
                 [
-                    "<tool_call>acme\n",
-                    "<arg_key>kind</arg_key>\n<arg_value>acme</arg_value>\n",
+                    "<tool_call>convert\n",
                     (
-                        '<arg_key>payload</arg_key>\n<arg_value>{"value":"hello"}'
-                        "</arg_value>\n"
+                        f"<arg_key>{argument}</arg_key>\n"
+                        f"<arg_value>{raw_value}</arg_value>\n"
                     ),
                     "</tool_call>",
                 ],
@@ -252,10 +249,9 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                 "step3",
                 [
                     "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>",
-                    '<steptml:invoke name="acme">',
-                    '<steptml:parameter name="kind">acme</steptml:parameter>',
+                    '<steptml:invoke name="convert">',
                     (
-                        '<steptml:parameter name="payload">{"value":"hello"}'
+                        f'<steptml:parameter name="{argument}">{raw_value}'
                         "</steptml:parameter>"
                     ),
                     "</steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>",
@@ -263,84 +259,83 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             ),
         ]
 
-        for parser_name, chunks in cases:
-            with self.subTest(parser=parser_name):
-                parser = FunctionCallParser(self.tools, parser_name)
-                _, calls = parser.parse_non_stream("".join(chunks))
-                self.assertEqual(json.loads(calls[0].parameters), self.expected)
+    def assert_arguments(self, serialized: str, expected: dict):
+        self.assertNotIn("<", serialized)
+        self.assertEqual(json.loads(serialized), expected)
 
-                parser = FunctionCallParser(self.tools, parser_name)
-                parameters = ""
-                for chunk in chunks:
-                    _, calls = parser.parse_stream_chunk(chunk)
+    def test_streaming_and_non_streaming_parsers(self):
+        parser_names = [
+            parser_name for parser_name, _ in self.parser_cases("number", "1.5")
+        ]
+        for parser_name in parser_names:
+            non_streaming_parser = FunctionCallParser(self.tools, parser_name)
+
+            for argument, raw_value, expected_value in ARGUMENT_CASES:
+                chunks = dict(self.parser_cases(argument, raw_value))[parser_name]
+                expected = {argument: expected_value}
+
+                with self.subTest(
+                    parser=parser_name,
+                    argument=argument,
+                    mode="non_streaming",
+                ):
+                    _, calls = non_streaming_parser.parse_non_stream("".join(chunks))
+                    self.assertEqual(len(calls), 1)
+                    self.assert_arguments(calls[0].parameters, expected)
+
+                with self.subTest(
+                    parser=parser_name,
+                    argument=argument,
+                    mode="streaming",
+                ):
+                    streaming_parser = FunctionCallParser(self.tools, parser_name)
+                    parameters = ""
+                    for chunk in chunks:
+                        _, calls = streaming_parser.parse_stream_chunk(chunk)
+                        parameters += "".join(call.parameters for call in calls)
+                    _, calls = streaming_parser.parse_stream_end()
                     parameters += "".join(call.parameters for call in calls)
-                self.assertEqual(json.loads(parameters), self.expected)
+                    self.assert_arguments(parameters, expected)
 
-                other_chunks = [
-                    chunk.replace(">acme</", ">other</").replace(
-                        '{"value":"hello"}', '{ "x": 1.00 }'
-                    )
-                    for chunk in chunks
-                ]
-                if parser_name == "minimax-m3":
-                    other_chunks = [
-                        ns + segment
-                        for segment in (
-                            "<tool_call>",
-                            '<invoke name="acme">',
-                            "<kind>other",
-                            "</kind>",
-                            '<payload>{ "x": 1.00 }',
-                            "</payload>",
-                            "</invoke>",
-                            "</tool_call>",
-                        )
-                    ]
-                expected = {"kind": "other", "payload": '{ "x": 1.00 }'}
+            self.assertEqual(
+                self.tools[0].function.parameters,
+                self.original_parameters,
+            )
 
-                parser = FunctionCallParser(self.tools, parser_name)
-                _, calls = parser.parse_non_stream("".join(other_chunks))
-                self.assertEqual(json.loads(calls[0].parameters), expected)
-
-                parser = FunctionCallParser(self.tools, parser_name)
-                parameters = ""
-                for chunk in other_chunks:
-                    _, calls = parser.parse_stream_chunk(chunk)
-                    parameters += "".join(call.parameters for call in calls)
-                self.assertEqual(json.loads(parameters), expected)
-
-    def test_other_schema_consumers(self):
-        other_tool = Tool(
-            type="function",
-            function=Function(
-                name="search",
-                parameters={
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                },
-            ),
-        )
-        parser = FunctionCallParser([self.tools[0], other_tool], "kimi_k2")
-        _, calls = parser.parse_non_stream(
-            "<|tool_calls_section_begin|>"
-            "<|tool_call_begin|>0"
-            f"<|tool_call_argument_begin|>{json.dumps(self.expected)}"
-            "<|tool_call_end|>"
-            "<|tool_calls_section_end|>"
-        )
-        self.assertEqual(calls[0].name, "acme")
-
-    def test_streaming_arguments_are_not_buffered(self):
+    def test_detector_tools_use_projected_properties(self):
         parser = FunctionCallParser(self.tools, "qwen3_coder")
-        parameters = ""
-        for chunk in (
-            "<tool_call>",
-            "<function=acme>",
-            "<parameter=kind>acme</parameter>",
-        ):
-            _, calls = parser.parse_stream_chunk(chunk)
-            parameters += "".join(call.parameters for call in calls)
-        self.assertIn('"kind": "acme"', parameters)
+
+        self.assertNotIn("properties", self.tools[0].function.parameters)
+        self.assertEqual(
+            parser.detector_tools[0].function.parameters["properties"],
+            PROPERTY_SCHEMAS,
+        )
+
+    def test_conflicting_property_uses_conservative_string_fallback(self):
+        parameters = {
+            "oneOf": [
+                {"properties": {"payload": {"type": "object"}}},
+                {"properties": {"payload": {"type": "string"}}},
+            ]
+        }
+        tools = [
+            Tool(
+                type="function",
+                function=Function(name="convert", parameters=parameters),
+            )
+        ]
+        parser = FunctionCallParser(tools, "qwen3_coder")
+
+        _, calls = parser.parse_non_stream(
+            "<tool_call><function=convert>"
+            '<parameter=payload>{"value":1}</parameter>'
+            "</function></tool_call>"
+        )
+
+        self.assertEqual(
+            json.loads(calls[0].parameters),
+            {"payload": '{"value":1}'},
+        )
 
 
 if __name__ == "__main__":

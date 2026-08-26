@@ -125,22 +125,6 @@ def parse_arguments(
     Returns:
         Tuple of (parsed_value, is_valid_json)
     """
-    if arg_type == "string":
-        try:
-            parsed_value = json.loads(json_value)
-            return (
-                parsed_value if isinstance(parsed_value, str) else json_value,
-                True,
-            )
-        except (json.JSONDecodeError, ValueError):
-            if (
-                len(json_value) >= 2
-                and json_value[0] == json_value[-1]
-                and json_value[0] in {'"', "'"}
-            ):
-                return json_value[1:-1], True
-            return json_value, True
-
     # Strategy 1: Direct JSON parsing
     try:
         parsed_value = json.loads(json_value)
@@ -164,6 +148,18 @@ def parse_arguments(
         return parsed_value, True
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
+
+    # Strategy 2.5: string-typed values that are not valid JSON (S1/S2 failed) —
+    # strip the wrapping quotes and keep the raw bytes, backslashes included.
+    # Avoids ast.literal_eval so invalid escapes neither warn nor get reinterpreted.
+    if arg_type == "string":
+        if (
+            len(json_value) >= 2
+            and json_value[0] == json_value[-1]
+            and json_value[0] in {'"', "'"}
+        ):
+            return json_value[1:-1], True
+        return json_value, True
 
     # Strategy 3: ast.literal_eval
     try:
@@ -617,7 +613,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._sent_empty_object:
+        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
             # Need to close brace
             calls.append(
                 ToolCallItem(
