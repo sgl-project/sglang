@@ -1610,7 +1610,6 @@ class KVCacheConfigurator:
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        server_args=self.server_args,
                     ),
                     index_kpool=dsa_index_kpool,
                     index_kpool_compress=get_dsa_index_kpool_compress(
