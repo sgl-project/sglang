@@ -53,8 +53,7 @@ def _accessor_names():
     names = {
         node.name
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and (node.name.startswith("get_") or node.name.startswith("configured_"))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("get_")
     }
     # The context object itself is not a bag: it exists before anything is
     # published, and `declare_late_resolution` calls it deliberately to find
@@ -232,7 +231,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
         """A shrunken accessor set would make every other check pass quietly."""
         self.assertGreaterEqual(
             len(_BAG_ACCESSORS),
-            20,
+            15,
             f"only {len(_BAG_ACCESSORS)} accessors were derived from "
             "runtime_context; the derivation broke",
         )

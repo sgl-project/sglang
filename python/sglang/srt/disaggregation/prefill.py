@@ -180,7 +180,7 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
                     "supported by Mooncake."
                 )
-            if get_parallel().enable_prefill_context_parallel:
+            if get_parallel().config.enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support "

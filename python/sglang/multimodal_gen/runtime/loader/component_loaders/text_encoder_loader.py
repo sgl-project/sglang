@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
+    ComfyNvfp4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -414,7 +417,13 @@ def _require_quantized_encoder_layers(
         )
     if isinstance(
         quant_config,
-        (ComfyFp8Config, KitchenInt8Config, KitchenW4A4Config, KitchenW4A8Config),
+        (
+            ComfyFp8Config,
+            ComfyNvfp4Config,
+            KitchenInt8Config,
+            KitchenW4A4Config,
+            KitchenW4A8Config,
+        ),
     ):
         expected = set(quant_config.layer_markers)
         selected = set(quant_config.selected)
@@ -932,7 +941,7 @@ class TextEncoderLoader(ComponentLoader):
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
-                if isinstance(quant_config, QuantoInt8Config) or (
+                if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
                     isinstance(quant_config, KitchenInt8Config)
                     and quant_config.is_checkpoint_int8_serialized
                 ):

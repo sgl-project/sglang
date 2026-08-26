@@ -12,7 +12,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -33,7 +32,6 @@ class NgramEmbeddingManager:
         model: torch.nn.Module,
         model_config: ModelConfig,
         req_to_token_pool: ReqToTokenPool,
-        server_args: ServerArgs,
         max_running_requests: int,
         device: str,
     ):

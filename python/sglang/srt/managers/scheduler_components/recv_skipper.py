@@ -34,7 +34,7 @@ class SchedulerRecvSkipper:
         return ForwardMode.DECODE
 
     def __init__(self):
-        self._use_synced_mode = get_parallel().enable_dp_attention
+        self._use_synced_mode = get_parallel().config.enable_dp_attention
         self._counter = 0
         self._threshold = get_schedule().scheduler_recv_interval
         # All can be tuned if needed

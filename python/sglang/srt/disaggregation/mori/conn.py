@@ -1683,8 +1683,8 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
                         [
@@ -1737,13 +1737,13 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info.get("is_dummy", False)
             if not is_dummy and normalized_state is not None:
                 state_bytes = _pack_state_indices(normalized_state)
             else:
                 state_bytes = b""
             try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
                         [
@@ -1760,6 +1760,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
+                self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",

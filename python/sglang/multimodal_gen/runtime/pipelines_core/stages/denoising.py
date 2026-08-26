@@ -508,7 +508,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 config=dit_config,
                 default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):

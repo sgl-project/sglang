@@ -46,9 +46,9 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_mm,
+    get_parallel,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -733,7 +733,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().config.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

@@ -1224,7 +1224,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """Return the next device leaf to evict for a component, or None when done."""
+        """Advance one component eviction step and report whether it progressed."""
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
@@ -1236,6 +1236,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
+        result.made_progress = result.node_id is not None or bool(result.tracker)
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:

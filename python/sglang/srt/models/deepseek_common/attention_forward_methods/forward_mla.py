@@ -148,6 +148,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return False
         # Shared activation surface with the DSA indexer graph dispatch
         # (in piecewise/breakable graph + non-speculative extend). Like the indexer
         # dispatch, this fusion is on by default on that surface.
@@ -297,7 +299,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_parallel().dcp_replicate_q_proj
+            get_parallel().config.dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
@@ -476,6 +478,17 @@ class DeepseekMLAForwardMixin:
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
                 .contiguous()
+            )
+        elif getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            k_type = int(self.k_b_qweight_type.weight_type)
+            q_nope_out = torch.stack(
+                [
+                    fused_mul_mat_gguf(q_nope[:, head], self.k_b_qweight[head], k_type)
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
             )
         elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
@@ -765,7 +778,7 @@ class DeepseekMLAForwardMixin:
                     attn_output, self.num_local_heads
                 )
             else:
-                dcp_comm_backend = get_parallel().dcp_comm_backend
+                dcp_comm_backend = get_parallel().config.dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
@@ -797,7 +810,20 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if self.use_deep_gemm_bmm:
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            v_type = int(self.v_b_qweight_type.weight_type)
+            attn_bmm_output = torch.stack(
+                [
+                    fused_mul_mat_gguf(
+                        attn_output[:, head], self.v_b_qweight[head], v_type
+                    )
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
+            ).flatten(1, 2)
+        elif self.use_deep_gemm_bmm:
             (
                 attn_output_val,
                 attn_output_scale,

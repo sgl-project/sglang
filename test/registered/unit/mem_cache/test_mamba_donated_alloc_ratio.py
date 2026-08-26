@@ -55,10 +55,10 @@ class _RatioCache:
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
+        self.alloc_evict_params = []
 
-    def evict(self, params: EvictParams):
-        # Reclaim up to mamba_num evictable (unlocked) prefix snapshots, mirroring
-        # what the real tree eviction can hand back under mamba pressure.
+    def evict_for_alloc(self, params: EvictParams):
+        self.alloc_evict_params.append(params)
         need = params.mamba_num
         for node in list(self.prefix_nodes):
             if need <= 0:
@@ -130,7 +130,9 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
     def test_flag_off_restores_original_ratios(self):
-        r = lambda **kw: self._ratio(skip=False, **kw)
+        def r(**kwargs):
+            return self._ratio(skip=False, **kwargs)
+
         self.assertEqual(
             r(extra_buffer=False, lazy=False, disable_overlap=True), 3
         )  # no_buffer
@@ -142,7 +144,9 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         )  # overlap
 
     def test_flag_on_drops_base_but_keeps_no_buffer(self):
-        r = lambda **kw: self._ratio(skip=True, **kw)
+        def r(**kwargs):
+            return self._ratio(skip=True, **kwargs)
+
         self.assertEqual(
             r(extra_buffer=False, lazy=False, disable_overlap=True), 3
         )  # no_buffer
@@ -212,9 +216,12 @@ class TestDecSwaLockSkip(unittest.TestCase):
 class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
-        component, _, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
+        self.assertEqual(
+            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+        )
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
@@ -230,6 +237,9 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         slot = component._alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
+        self.assertEqual(
+            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+        )
 
 
 class TestPPMambaPoolSizing(unittest.TestCase):

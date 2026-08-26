@@ -178,6 +178,17 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _resolve_dflash_embedding_module(draft_model, target_model):
+    if getattr(draft_model, "is_nemotron_35_draft", False):
+        embed_module = draft_model.get_input_embeddings()
+        if embed_module is None:
+            raise RuntimeError(
+                "Nemotron 3.5 DFLASH draft requires its checkpoint embedding."
+            )
+        return embed_module
+    return target_model.get_input_embeddings()
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -1753,7 +1764,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+        embed_module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")

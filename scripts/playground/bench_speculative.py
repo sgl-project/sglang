@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 from sglang.bench_serving import benchmark, set_global_args
 from sglang.benchmark.datasets import DatasetRow
 from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
+from sglang.srt.arg_groups.overrides import resolution_projection
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -135,6 +136,9 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
 
 
 def main(args, server_args):
+    from sglang.srt.arg_groups.overrides import resolution_projection
+
+    server_args = SimpleNamespace(**resolution_projection(server_args))
     base_url = "http://127.0.0.1:20000"
 
     configs = []

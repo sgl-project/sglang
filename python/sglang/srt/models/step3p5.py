@@ -816,7 +816,7 @@ class Step3p5ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

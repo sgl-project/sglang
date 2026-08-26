@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -79,7 +81,8 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
-    if not server_args.enable_hisparse:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_hisparse:
         return
 
     from sglang.srt.configs.model_config import (
@@ -96,7 +99,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     assert (
-        server_args.disable_radix_cache
+        cfg.disable_radix_cache
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-

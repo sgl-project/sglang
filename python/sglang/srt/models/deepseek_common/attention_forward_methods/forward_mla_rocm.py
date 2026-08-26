@@ -331,7 +331,7 @@ class DeepseekMLARocmForwardMixin:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         q_replicate_active = (
-            get_parallel().dcp_replicate_q_proj
+            get_parallel().config.dcp_replicate_q_proj
             and is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
@@ -778,7 +778,7 @@ class DeepseekMLARocmForwardMixin:
                     attn_output, self.num_local_heads
                 )
             else:
-                dcp_comm_backend = get_parallel().dcp_comm_backend
+                dcp_comm_backend = get_parallel().config.dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )

@@ -736,8 +736,8 @@ class TboForwardBatchPreparer:
             "forward_mode",
             "is_extend_in_batch",
             "return_logprob",
-            "can_run_dp_cuda_graph",
-            "can_run_dp_breakable_cuda_graph",
+            "can_run_decode_cuda_graph",
+            "can_run_dp_prefill_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
@@ -769,7 +769,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_parallel().moe_dense_tp_size == 1
+            get_parallel().config.moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index

@@ -11,6 +11,7 @@ from unittest import mock
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.arg_groups.arg_utils import NS, A
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,16 +97,15 @@ class TestConfigBags(CustomTestCase):
         none-flags) the first resolution may have written -- so the assertion
         is "bag == what resolution produces", not "bag == the instance publish
         copied from". Reproducibility (`test_resolution_is_reproducible`)
-        licenses the sibling as a stand-in for the pipeline's output. The
-        raw-differs guard keeps the comparison meaningful: every sampled leaf
-        must have moved off its dataclass default, so each equality compares a
-        value resolution demonstrably wrote. Supplied construction inputs
-        (`model_path`, `device`, `random_seed`) and leaves resolution leaves
-        alone never enter the sample -- projection coverage for those lives in
-        `test_passthrough_leaves_project_into_their_namespaces`. Step 12 keeps
-        records at the user's raw input; then the sibling goes raw and this
-        assertion starts failing for every sampled leaf, which is the signal
-        the bags became the only home of the effective value.
+        licenses the sibling as a stand-in for the pipeline's output.
+
+        The reference's resolved values are read through `resolution_result`,
+        because a record holds the user's raw input: the decision lives in the
+        declarations, and the bags are where a process reads it. The
+        raw-differs guard keeps the comparison meaningful -- every sampled leaf
+        must have moved off its dataclass default -- and the last assertion is
+        the other half of that invariant: the record still answers the raw
+        input for a leaf resolution decided.
         """
         import dataclasses
 
@@ -124,12 +124,13 @@ class TestConfigBags(CustomTestCase):
                 # The raw-differs guard: a sampled leaf that still sits on its
                 # default (or has none to differ from) proves nothing.
                 self.assertIsNot(defaults[leaf], dataclasses.MISSING)
-                self.assertNotEqual(getattr(reference, leaf), defaults[leaf])
-                self.assertEqual(accessor(), getattr(reference, leaf))
-        # And the record agrees today, which is what step 12 changes: when this
-        # assertion starts failing for a resolution-written leaf, the flip
-        # landed and the bag is the only place the effective value lives.
-        self.assertEqual(rc.get_schedule().page_size, sa.page_size)
+                resolved = resolution_result(reference, leaf)
+                self.assertNotEqual(resolved, defaults[leaf])
+                self.assertEqual(accessor(), resolved)
+        # The record is the raw input, so the field still reads as the default
+        # for a leaf the bag now answers for.
+        self.assertEqual(sa.page_size, defaults["page_size"])
+        self.assertNotEqual(rc.get_schedule().page_size, sa.page_size)
 
     def test_passthrough_leaves_project_into_their_namespaces(self):
         """Thin projection smoke over leaves resolution does not move.
@@ -141,7 +142,7 @@ class TestConfigBags(CustomTestCase):
         sa = self._publish()
         sampled = (
             (lambda: rc.get_serving().host, "host"),
-            (lambda: rc.get_memory().hicache_ratio, "hicache_ratio"),
+            (lambda: rc.get_memory().hicache_write_policy, "hicache_write_policy"),
             (lambda: rc.get_exec().moe.moe_runner_backend, "moe_runner_backend"),
             (lambda: rc.get_model().model_path, "model_path"),
         )
@@ -230,8 +231,8 @@ class TestConfigBags(CustomTestCase):
             rc.get_memory().hicache_ratio = 9.0
 
     def test_scoped_override_restores(self):
-        sa = self._publish()
-        original = sa.hicache_ratio
+        self._publish()
+        original = rc.get_memory().hicache_ratio
         with rc.get_memory().override(hicache_ratio=original + 1.0):
             self.assertEqual(rc.get_memory().hicache_ratio, original + 1.0)
         self.assertEqual(rc.get_memory().hicache_ratio, original)

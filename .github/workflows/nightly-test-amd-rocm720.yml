@@ -98,7 +98,7 @@ on:
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
           - nightly-4-gpu-mi35x-minimax-m25-rocm720
-          # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+          # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
           - nightly-4-gpu-mi35x-minimax-m3-rocm720
           # 8-GPU MiniMax-M2.7 (MI30x only)
           - nightly-8-gpu-minimax-m27-rocm720
@@ -2208,7 +2208,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+  # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m3-rocm720:
@@ -2247,6 +2247,20 @@ jobs:
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m3-tp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      # Run perf only after correctness passes. Keeping both steps in this job
+      # reuses the cached checkpoint and one scarce MI35x slot.
+      - name: Performance Test MI35x ROCm 7.2 (4-GPU MiniMax-M3 MXFP8)
+        timeout-minutes: 120
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-minimax-m3 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2417,7 +2431,7 @@ jobs:
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
       - nightly-4-gpu-mi35x-minimax-m25-rocm720
-      # 4-GPU MiniMax-M3 MXFP8 (MI35x)
+      # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
       - nightly-4-gpu-mi35x-minimax-m3-rocm720
       # 8-GPU MiniMax-M2.7 (MI30x only)
       - nightly-8-gpu-minimax-m27-rocm720

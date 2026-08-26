@@ -29,7 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution
+from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -666,11 +666,12 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
     """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.utils.hf_transformers_utils import get_config
 
+    cfg = resolving_view(server_args)
     config = get_config(
-        server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=getattr(server_args, "revision", None),
-        model_config_parser=getattr(server_args, "model_config_parser", "auto"),
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=getattr(cfg, "revision", None),
+        model_config_parser=getattr(cfg, "model_config_parser", "auto"),
     )
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
@@ -701,24 +702,26 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 def resolve_auto_parsers(server_args) -> None:
     """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, in place, before anything publishes ``server_args``.
+    chat template, before anything publishes ``server_args``.
 
-    Performs a lightweight tokenizer load, so it runs once in engine init. In
-    place because everyone who holds this instance must see the resolved value:
-    the schedulers it forks, the HTTP server, and the tokenizer workers it is
-    serialized for.
+    Performs a lightweight tokenizer load, so it runs once in engine init. The
+    decision goes to this instance's declaration stash, so every holder of it
+    carries it -- the schedulers it forks, the HTTP server, the tokenizer
+    workers it is serialized for -- and each publishes bags projected from it.
+    The fields stay what the operator passed.
     """
+    cfg = resolving_view(server_args)
     needs = tuple(
         attr
         for attr in ("reasoning_parser", "tool_call_parser")
-        if getattr(server_args, attr) == "auto"
+        if getattr(cfg, attr) == "auto"
     )
     if not needs:
         return
 
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    chat_template_arg = getattr(server_args, "chat_template", None)
+    chat_template_arg = getattr(cfg, "chat_template", None)
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
     except Exception as e:
@@ -731,8 +734,8 @@ def resolve_auto_parsers(server_args) -> None:
     tokenizer = None
     try:
         tokenizer = get_tokenizer(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")

@@ -6,6 +6,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 if TYPE_CHECKING:
     from sglang.srt.load_reporter.snapshot_source import LoadSnapshotSource
 
@@ -50,13 +52,14 @@ async def start_load_reporter(
     snapshot_source: Optional[LoadSnapshotSource],
 ) -> Optional[LoadReporterHandle]:
     """Start the reporter and return its handle when enabled."""
-    if getattr(server_args, "load_reporter_port", None) is None:
+    cfg = resolving_view(server_args)
+    if cfg.load_reporter_port is None:
         return None
 
     if snapshot_source is None:
         raise ValueError("snapshot_source is required when load reporter is enabled")
 
-    return await _start_owner(server_args, snapshot_source)
+    return await _start_owner(cfg, snapshot_source)
 
 
 async def _start_owner(

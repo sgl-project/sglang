@@ -7,6 +7,8 @@ device has to come from what the worker was handed.
 """
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -75,6 +77,84 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
+
+
+class TestFastImageProcessorMemoryPool(CustomTestCase):
+    def _processor(self, *, transport="cpu", precompute_hash=False):
+        processor = _make(base_gpu_id=0)
+        processor.mm_feature_transport = transport
+        processor.precompute_hash_before_cpu_transfer = precompute_hash
+        return processor
+
+    def test_pool_is_limited_to_immediate_cpu_transport(self):
+        cases = (
+            (self._processor(), "cuda:0", True),
+            (self._processor(transport="cuda_ipc"), "cuda:0", False),
+            (self._processor(transport="cuda_vmm"), "cuda:0", False),
+            (self._processor(precompute_hash=True), "cuda:0", False),
+            (self._processor(), "cpu", False),
+            (self._processor(), None, False),
+        )
+        for processor, device, expected in cases:
+            with (
+                self.subTest(device=device, transport=processor.mm_feature_transport),
+                patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
+                patch(f"{BASE}.torch.cuda.MemPool", return_value="pool") as mem_pool,
+                patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
+            ):
+                with processor._temporary_fast_processor_cuda_pool(device):
+                    pass
+                self.assertEqual(mem_pool.called, expected)
+
+    def test_processor_call_uses_private_pool_until_cpu_copy_finishes(self):
+        class ImageProcessor:
+            pass
+
+        class Feature:
+            def to(self, device):
+                events.append(("copy", device))
+
+        feature = Feature()
+
+        class Processor:
+            image_processor = ImageProcessor()
+            tokenizer = SimpleNamespace(bos_token=None)
+
+            def __call__(self, **kwargs):
+                events.append(("call", kwargs["device"]))
+                return {"pixel_values": feature}
+
+        events = []
+        processor = self._processor()
+        processor._processor = Processor()
+        processor._tokenizer = processor._processor.tokenizer
+        processor._tokenizer_auto_adds_specials = False
+        processor.disable_fast_image_processor = False
+        processor.image_config = {}
+        processor.video_config = {}
+        processor.audio_config = {}
+        processor.FEATURE_NAMES = ["pixel_values"]
+
+        class PoolContext:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *args):
+                events.append("exit")
+
+        with (
+            patch(f"{BASE}.BaseImageProcessor", ImageProcessor),
+            patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
+            patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),
+            patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=PoolContext()),
+            patch(f"{BASE}.torch.Tensor", Feature),
+        ):
+            processor.process_mm_data("test", images=["image"])
+
+        self.assertEqual(
+            events,
+            ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
+        )
 
 
 if __name__ == "__main__":

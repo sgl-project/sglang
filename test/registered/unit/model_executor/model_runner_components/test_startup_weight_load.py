@@ -209,8 +209,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         # The parallel sizes come from the bags, so the config has to be published.
         publish(server_args, role="test")
         self.addCleanup(reset_context)
-        options = StartupWeightLoadOptions.from_server_args(
-            server_args=server_args,
+        options = StartupWeightLoadOptions.from_published_config(
             is_draft_worker=False,
         )
 

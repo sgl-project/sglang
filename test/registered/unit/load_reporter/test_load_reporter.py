@@ -1550,6 +1550,53 @@ class TestDisabled:
         assert "OK" in result.stdout, result.stderr
 
 
+class TestResolvedLifecycleConfig:
+    @pytest.mark.asyncio
+    async def test_start_uses_live_resolution_view(self, monkeypatch):
+        """Reporter startup must consume declarations, not raw arguments."""
+        from sglang.srt.load_reporter import lifecycle
+
+        args = types.SimpleNamespace(
+            host="raw-host",
+            load_reporter_port=None,
+            disaggregation_mode="null",
+            served_model_name="raw-model",
+        )
+        args._resolved_overrides = [
+            (
+                "test-resolution",
+                {
+                    "host": "resolved-host",
+                    "load_reporter_port": 30123,
+                    "disaggregation_mode": "decode",
+                    "served_model_name": "resolved-model",
+                },
+            )
+        ]
+        source = SnapshotSource()
+        captured = {}
+        sentinel = object()
+
+        async def fake_start_owner(cfg, received_source):
+            captured.update(
+                host=cfg.host,
+                load_reporter_port=cfg.load_reporter_port,
+                disaggregation_mode=cfg.disaggregation_mode,
+                served_model_name=cfg.served_model_name,
+            )
+            assert received_source is source
+            return sentinel
+
+        monkeypatch.setattr(lifecycle, "_start_owner", fake_start_owner)
+        assert await start_load_reporter(args, source) is sentinel
+        assert captured == {
+            "host": "resolved-host",
+            "load_reporter_port": 30123,
+            "disaggregation_mode": "decode",
+            "served_model_name": "resolved-model",
+        }
+
+
 # ---------------------------------------------------------------------------
 # Group 2: owner path — real listener, real grpc client
 # ---------------------------------------------------------------------------
@@ -1776,12 +1823,16 @@ def install_fake_smg(capability: bool):
         request_manager=None,
         stop_event=None,  # set per-test to control server lifetime
     )
+    from sglang.srt.runtime_context import publish
 
     if capability:
 
         async def fake_serve_grpc(
             server_args, model_info, on_request_manager_ready=None
         ):
+            # Production smg builds and publishes its Engine before invoking
+            # the readiness hook; mirror that boundary in the fake.
+            publish(server_args, role="tokenizer")
             rm = FakeRequestManager(server_args)
             holder.request_manager = rm
             if on_request_manager_ready is not None:
@@ -1792,6 +1843,7 @@ def install_fake_smg(capability: bool):
     else:
 
         async def fake_serve_grpc(server_args, model_info):
+            publish(server_args, role="tokenizer")
             rm = FakeRequestManager(server_args)
             holder.request_manager = rm
             if holder.stop_event is not None:

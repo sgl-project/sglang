@@ -78,15 +78,22 @@ _KNOWN_ENTRIES = frozenset(
             "run_data_parallel_controller_process",
         ),
         ("srt/ray/scheduler_actor.py", "__init__"),
-        ("srt/disaggregation/encoder/server.py", "__init__"),
         ("srt/disaggregation/encoder/http_server.py", "launch_server"),
-        ("srt/managers/tokenizer_manager.py", "__init__"),
         ("srt/entrypoints/engine.py", "_launch_subprocesses"),
         (
             "srt/elastic_ep/expert_backup_manager.py",
             "run_expert_backup_manager_process",
         ),
         ("srt/weight_cache/daemon.py", "load"),
+        # The multi-tokenizer worker, the benchmark work functions (run
+        # inline or spawned per rank), and the encoder's gRPC / spawned-TP /
+        # spawned-DP entries.
+        ("srt/entrypoints/http_server.py", "init_multi_tokenizer"),
+        ("benchmark/one_batch.py", "latency_test"),
+        ("benchmark/one_batch.py", "correctness_test"),
+        ("srt/disaggregation/encoder/grpc_server.py", "serve_grpc_encoder"),
+        ("srt/disaggregation/encoder/server.py", "launch_encoder"),
+        ("srt/disaggregation/encoder/runtime.py", "launch_dp_worker"),
     }
 )
 

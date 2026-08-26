@@ -40,6 +40,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -342,6 +343,7 @@ class Compressor(BaseFusedOp):
         head_dim: int,
         rotate: bool = False,
         prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
     ) -> None:
         super().__init__()
@@ -365,7 +367,7 @@ class Compressor(BaseFusedOp):
             self.dim,
             2 * coff * self.head_dim,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
@@ -425,7 +427,7 @@ class Compressor(BaseFusedOp):
         comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
         if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
             return
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_wkv_gate(x)
         # Keyed by forward_batch: each TBO ubatch carries its own, so the two
         # ubatches cannot collect each other's gather.
         pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
@@ -440,7 +442,7 @@ class Compressor(BaseFusedOp):
             if handle is not None:
                 return cp_all_gather_rerange_finish(handle)
 
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -450,6 +452,19 @@ class Compressor(BaseFusedOp):
                 torch.cuda.current_stream(),
             )
         return kv_score
+
+    def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.wkv_gate, "weight", None)
+        if weight is not None:
+            return linear_bf16_fp32(x, weight)
+
+        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+        return fused_mul_mat_gguf(
+            x,
+            self.wkv_gate.qweight,
+            self.wkv_gate.qweight_type.weight_type,
+        )
 
     def forward_native(
         self,

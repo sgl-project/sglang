@@ -292,7 +292,7 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
             tokenizer_manager.record_config_updates("test", weight_version="v2")
             self.assertEqual(tokenizer_manager.config_value("weight_version"), "v2")
             overlaid = tokenizer_manager.resolved_config_dict(
-                dataclasses.asdict(server_args)
+                server_args.resolved_dict()
             )
             self.assertEqual(overlaid["weight_version"], "v2")
         finally:
@@ -313,9 +313,9 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
     """
 
     def test_every_server_args_field_appears_in_response(self):
-        # `dataclasses.asdict(server_args)` is spread into the response;
-        # asserting every dataclass field surfaces is the strongest
-        # backward-compat guarantee that's still implementation-agnostic.
+        # `server_args.resolved_dict()` is spread into the response; asserting
+        # every dataclass field surfaces is the strongest backward-compat
+        # guarantee that's still implementation-agnostic.
         args = ServerArgs(model_path="dummy")
 
         info = _call_server_info_with(args)

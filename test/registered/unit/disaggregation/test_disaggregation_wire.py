@@ -158,8 +158,12 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
+                # The policy reads the configured tier, so the stand-in
+                # carries the leaf under `config`, where the bag serves it.
                 parallel = SimpleNamespace(
-                    enable_dsa_cache_layer_split=layer_split,
+                    config=SimpleNamespace(
+                        enable_dsa_cache_layer_split=layer_split,
+                    ),
                 )
                 with patch(
                     "sglang.srt.disaggregation.common.conn.get_parallel",
@@ -178,7 +182,9 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
         with patch(
             "sglang.srt.disaggregation.common.conn.get_parallel",
-            return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
+            return_value=SimpleNamespace(
+                config=SimpleNamespace(enable_dsa_cache_layer_split=False)
+            ),
         ):
             self.assertEqual(
                 manager._get_dsa_cache_transfer_skip_flags(None),

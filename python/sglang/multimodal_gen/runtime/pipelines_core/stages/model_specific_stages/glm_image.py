@@ -21,11 +21,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -140,6 +141,32 @@ def _validate_glm_image_resolution_alignment(width: int, height: int) -> None:
             "GLM-Image dimensions must be aligned before AR token generation, "
             f"got {width}x{height}"
         )
+
+
+def center_crop_glm_image_output(
+    frames: torch.Tensor,
+    target_width: int | None,
+    target_height: int | None,
+) -> torch.Tensor:
+    """Center-crop decoded GLM-Image pixels back to the requested canvas."""
+    if None in (target_width, target_height):
+        return frames
+
+    decoded_height, decoded_width = frames.shape[-2:]
+    if target_width > decoded_width or target_height > decoded_height:
+        raise ValueError(
+            "Cannot crop GLM-Image output to a canvas larger than the decoded "
+            f"image: requested {target_width}x{target_height}, decoded "
+            f"{decoded_width}x{decoded_height}"
+        )
+    if (target_width, target_height) == (decoded_width, decoded_height):
+        return frames
+
+    left = (decoded_width - target_width) // 2
+    top = (decoded_height - target_height) // 2
+    return frames[
+        ..., top : top + target_height, left : left + target_width
+    ].contiguous()
 
 
 def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
@@ -681,7 +708,7 @@ class GlmImageAR(PipelineStage):
         width = batch.width
         if batch.image_path is not None:
             ar_condition_images = [
-                resize_glm_image_to_alignment(load_image(img_path))
+                load_image(img_path)
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -692,6 +719,11 @@ class GlmImageAR(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        if getattr(batch, "requested_width", None) is None:
+            batch.requested_width = width
+        if getattr(batch, "requested_height", None) is None:
+            batch.requested_height = height
 
         requested_width = width
         requested_height = height
@@ -706,6 +738,11 @@ class GlmImageAR(PipelineStage):
                 width,
                 height,
             )
+
+        if ar_condition_images is not None:
+            ar_condition_images = [
+                resize_glm_image_to_alignment(image) for image in ar_condition_images
+            ]
 
         time_start = time.time()
         num_outputs = _num_outputs_per_prompt(batch)
@@ -784,6 +821,34 @@ class GlmImageAR(PipelineStage):
             batch.usage = usage
 
         return batch
+
+
+class GlmImageDecodingStage(DecodingStage):
+    """Decode on the D32 canvas, then restore the user-requested dimensions."""
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        output_batch = super().forward(batch, server_args)
+        if output_batch.output is not None:
+            output_batch.output = center_crop_glm_image_output(
+                output_batch.output,
+                batch.requested_width,
+                batch.requested_height,
+            )
+        if output_batch.trajectory_decoded is not None:
+            output_batch.trajectory_decoded = [
+                center_crop_glm_image_output(
+                    decoded,
+                    batch.requested_width,
+                    batch.requested_height,
+                )
+                for decoded in output_batch.trajectory_decoded
+            ]
+        return output_batch
 
 
 class GlmImageBeforeDenoisingStage(PipelineStage):

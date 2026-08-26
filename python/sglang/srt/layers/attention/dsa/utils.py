@@ -106,7 +106,7 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 def is_dsa_enable_prefill_cp():
     if not envs.SGLANG_ENABLE_CP_V2.get():
-        return get_parallel().enable_dsa_prefill_context_parallel
+        return get_parallel().config.enable_dsa_prefill_context_parallel
 
     # Derive from the runtime CP topology + model arch rather than the legacy
     # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
@@ -122,14 +122,14 @@ def is_dsa_enable_prefill_cp():
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().config.dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().config.dsa_prefill_cp_mode == "round-robin-split"
     )
 
 

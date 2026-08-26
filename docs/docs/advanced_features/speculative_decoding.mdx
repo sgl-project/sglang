@@ -203,6 +203,11 @@ To enable EAGLE speculative decoding the following parameters are relevant:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (same as target)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dsa-topk-backend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the DSA indexer top-k backend for speculative draft workers independently of <code>--dsa-topk-backend</code>. Options are <code>sgl-kernel</code>, <code>torch</code>, and <code>flashinfer</code>; <code>torch</code> requires <code>SGLANG_DSA_FUSE_TOPK=false</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sgl-kernel</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-quantization</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization method for the draft model. Use <code>"unquant"</code> to force no quantization even when the target model is quantized.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same as target model</td>
@@ -408,6 +413,8 @@ python3 -m sglang.launch_server \
     --cuda-graph-max-bs-decode 8 \
     --log-level warning
 ```
+
+For DSA-based MTP, draft workers default to the `sgl-kernel` top-k backend. Use `--speculative-dsa-topk-backend` to override the draft independently of `--dsa-topk-backend` for the target model.
 
 **Send a request:**
 
@@ -825,6 +832,12 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override attention backend for the draft model</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dsa-topk-backend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sgl-kernel</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA indexer top-k backend for speculative draft workers, independent of <code>--dsa-topk-backend</code> (<code>sgl-kernel</code>, <code>torch</code>, or <code>flashinfer</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-moe-runner-backend</code></td>

@@ -64,8 +64,9 @@ from sglang.srt.managers.load_snapshot import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_disagg,
+    get_observability,
     get_parallel,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -449,7 +450,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
-        ensure_published(server_args, role="tokenizer")
+        assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -478,7 +479,7 @@ class MultiTokenizerRouter:
         # polling on a timer.
         owns_zmq_reader = zmq_reader_owner("MultiTokenizerRouter")
         self.load_snapshot_reader = None
-        if owns_zmq_reader or server_args.load_reporter_port is not None:
+        if owns_zmq_reader or get_observability().load_reporter_port is not None:
             self.load_snapshot_reader = create_load_snapshot_reader(
                 port_args, caller="MultiTokenizerRouter"
             )
@@ -486,7 +487,7 @@ class MultiTokenizerRouter:
         if owns_zmq_reader:
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
@@ -517,7 +518,7 @@ class MultiTokenizerRouter:
 
     def _start_load_reporter_owner(self) -> Optional[Any]:
         """Start the router-owned reporter; block until the listener binds so an occupied port fails construction."""
-        if self.server_args.load_reporter_port is None:
+        if get_observability().load_reporter_port is None:
             return None
 
         assert self.load_snapshot_reader is not None
@@ -526,7 +527,7 @@ class MultiTokenizerRouter:
         from sglang.srt.load_reporter.snapshot_source import RouterLoadSnapshotSource
 
         source = RouterLoadSnapshotSource(
-            self.load_snapshot_reader, range(get_parallel().dp_size)
+            self.load_snapshot_reader, range(get_parallel().config.dp_size)
         )
         future = asyncio.run_coroutine_threadsafe(
             start_load_reporter(self.server_args, source),

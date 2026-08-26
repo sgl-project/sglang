@@ -298,6 +298,38 @@ class TestSWA(unittest.TestCase):
             available_before_free + original_indices.numel(),
         )
 
+    def test_free_swa_group_owns_mapping_at_enqueue_time(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=8,
+            kv_size_swa=8,
+        )
+        old_full = _swa_alloc(allocator, 1)
+        new_full = _swa_alloc(allocator, 1)
+        assert old_full is not None and new_full is not None
+        old_swa = allocator.full_to_swa_index_mapping[old_full].clone()
+        new_swa = allocator.full_to_swa_index_mapping[new_full].clone()
+
+        allocator.free_group_begin()
+        allocator.free_swa(old_full)
+
+        # Cache reconciliation can transfer a different SWA slot onto the same
+        # full slot before the group flushes. The deferred free still owns the
+        # mapping observed above, not this replacement mapping.
+        allocator.set_full_to_swa_mapping(old_full, new_swa)
+        allocator.clear_full_to_swa_mapping(new_full)
+        allocator.free_group_end()
+
+        torch.testing.assert_close(
+            allocator.full_to_swa_index_mapping[old_full], new_swa
+        )
+        self.assertTrue(
+            torch.isin(old_swa, allocator.swa_attn_allocator.free_pages).item()
+        )
+        self.assertFalse(
+            torch.isin(new_swa, allocator.swa_attn_allocator.free_pages).item()
+        )
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10

@@ -113,11 +113,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     instead of serialising sleeps in a single thread.
     """
 
-    host = server_args.host
+    host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
-        host = get_local_ip_auto(server_args.host)
+        host = get_local_ip_auto(get_serving().host)
     scheme = "https" if server_args.ssl_certfile else "http"
-    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
     bootstrap_urls = list(server_args.encoder_register_urls)
     if not bootstrap_urls:
@@ -174,11 +174,11 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
 
 
 def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
-    host = server_args.host
+    host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
-        host = get_local_ip_auto(server_args.host)
+        host = get_local_ip_auto(get_serving().host)
     scheme = "https" if server_args.ssl_certfile else "http"
-    encoder_url = NetworkAddress(host, server_args.port).to_url(scheme)
+    encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
 
     for bootstrap_url in server_args.encoder_register_urls:
@@ -207,7 +207,7 @@ def launch_server(server_args: ServerArgs):
 
     configure_logger(server_args, prefix=" encode_server")
     publish(server_args, role="encoder")
-    if get_parallel().dp_size > 1:
+    if get_parallel().config.dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # runtime initializes multiprocess metrics before spawning;
         # HTTP only exposes their endpoint.

@@ -417,6 +417,9 @@ class StreamingSession(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        return self.inner.evict_for_alloc(params)
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)
         if result is not None:

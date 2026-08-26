@@ -227,10 +227,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_mlp_tp_gather = require_mlp_tp_gather(
-            model_runner.server_args
-        ) and not self._forward_is_dp_local(model_runner)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_mlp_tp_gather = (
+            require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
+        )
+        self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
         # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
@@ -238,7 +238,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.require_mlp_tp_gather or self.require_attn_tp_gather
         )
         self.require_mlp_sync = (
-            get_parallel().enable_dp_attention or self.require_gathered_buffer
+            get_parallel().config.enable_dp_attention or self.require_gathered_buffer
         )
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
@@ -597,7 +597,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             draft_is_deepseek_v4,
         )
 
-        return not draft_is_deepseek_v4(server_args=model_runner.server_args)
+        return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
@@ -694,7 +694,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
@@ -735,7 +737,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
 
         is_dp_supported = (
-            forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
+            forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
         )
 
         is_encoder_lens_supported = (

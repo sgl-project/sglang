@@ -99,14 +99,15 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def get_allocator_type(server_args) -> str:
-    backend = getattr(server_args, "hicache_storage_backend", None)
+def get_allocator_type() -> str:
+    """The host-allocator kind the published HiCache configuration asks for."""
+    from sglang.srt.runtime_context import get_memory
+
+    backend = get_memory().hicache_storage_backend
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
-        extra_config_str = getattr(
-            server_args, "hicache_storage_backend_extra_config", None
-        )
+        extra_config_str = get_memory().hicache_storage_backend_extra_config
         if extra_config_str:
             try:
                 config = json.loads(extra_config_str)

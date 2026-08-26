@@ -535,10 +535,14 @@ class SWAComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
-        """Return the next device-leaf node for the driver to evict, or None.
-        Internal nodes are tombstoned inline (no IO). If the previous node's
-        eviction removed the cursor, the walk resumes from the partition
-        sentinel with session refs on, else it restarts at the LRU tail."""
+        """Advance one device-eviction step and return a leaf, if selected.
+
+        An internal tombstone is one complete step so the caller can apply its
+        pending frees and recheck allocator capacity before the next mutation.
+        If the previous node's eviction removed the cursor, the walk resumes
+        from the partition sentinel with session refs on, else it restarts at
+        the LRU tail.
+        """
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -548,34 +552,36 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_lru_no_lock()
             )
-        while (
-            tracker[ct] < self._evict_device_request_cnt
-            and self._evict_device_cursor is not None
-            and lru.in_list(self._evict_device_cursor)
+        if (
+            tracker[ct] >= self._evict_device_request_cnt
+            or self._evict_device_cursor is None
+            or not lru.in_list(self._evict_device_cursor)
         ):
-            x = self._evict_device_cursor
-            assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
-            ):
-                self._evict_device_cursor = (
-                    lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
-                )
-                return x.id
-            if not enabled:
-                x_next = lru.get_prev_no_lock(x)
-            self.tree_core._evict_component_and_detach_lru(
-                x,
-                self,
-                target=EvictLayer.DEVICE,
-                tracker=tracker,
-                device_frees=device_frees,
-                host_frees=host_frees,
+            return None
+
+        x = self._evict_device_cursor
+        assert x.component_data[ct].value is not None
+        if x in self.tree_core.evictable_device_leaves and (
+            not enabled or self._can_evict_leaf_atomically(x)
+        ):
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
-            self.tree_core._cascade_evict(
-                x, self, tracker, device_frees=device_frees, host_frees=host_frees
-            )
-            self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+            return x.id
+        if not enabled:
+            x_next = lru.get_prev_no_lock(x)
+        self.tree_core._evict_component_and_detach_lru(
+            x,
+            self,
+            target=EvictLayer.DEVICE,
+            tracker=tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+        )
+        self.tree_core._cascade_evict(
+            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+        )
+        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
     def _evict_device_end(self) -> None:
@@ -794,10 +800,11 @@ class SWAComponent(TreeComponent):
             # device-guaranteed, require a full window.
             return PreparePrefetchResult()
         num_tokens = num_pages * self.cache.page_size
-        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        host_indices = self.cache.host_pool_group.alloc(
+            num_tokens,
+            pool=PoolName.SWA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -1121,7 +1128,7 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._swa_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator

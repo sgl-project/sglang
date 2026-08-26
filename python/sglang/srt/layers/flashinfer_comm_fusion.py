@@ -13,7 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -75,12 +75,16 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
-def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
-    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
+    """The fusion backend for this process, or None when fusion is off.
+
+    Reads the published leaves (`exec.comm`, `parallel`): the backend is a
+    resolution decision, and the node count is launch topology.
+    """
+    backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
-    return _resolve_backend(backend, is_multi_node)
+    return _resolve_backend(backend, get_parallel().config.nnodes > 1)
 
 
 if is_flashinfer_available():
@@ -716,8 +720,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = resolve_flashinfer_allreduce_fusion_backend()
     if backend is None:
         return False
 

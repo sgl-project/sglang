@@ -507,8 +507,11 @@ class TreeComponent(ABC):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
-        """Return the next device-leaf node for the driver to evict, or None.
-        Internal nodes are tombstoned inline (no IO)."""
+        """Advance one eviction step and return a device leaf, if selected.
+
+        Implementations must return after one allocator-relevant internal
+        mutation so the caller can drain pending frees before continuing.
+        """
         assert (
             self.is_evict_device_ongoing
         ), f"{self.component_type} device eviction not started"
@@ -534,7 +537,7 @@ class TreeComponent(ABC):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
-        """Advance the walk; return the next device leaf or None."""
+        """Advance the walk by at most one allocator-relevant mutation."""
         ...
 
     @abstractmethod
