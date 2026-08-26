@@ -976,7 +976,7 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         self.attn_cp_size = get_parallel().attn_cp_size
         self.attn_cp_rank = get_parallel().attn_cp_rank
-        self.moe_dp_size = get_parallel().moe_dp_size
+        self.moe_dp_group_size = get_parallel().moe_dp_group_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
             f"attn_cp_size ({self.attn_cp_size}) must be divisible by "

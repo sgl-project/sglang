@@ -179,8 +179,8 @@ class TokenizerControlMixin:
         )
         if primary_group_control:
             control_fan_out = (
-                worker_count + get_parallel().config.tp_size - 1
-            ) // get_parallel().config.tp_size
+                worker_count + get_parallel().tp_size - 1
+            ) // get_parallel().tp_size
         else:
             control_fan_out = worker_count
 

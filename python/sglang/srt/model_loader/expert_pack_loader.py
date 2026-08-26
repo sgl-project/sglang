@@ -180,7 +180,7 @@ class ExpertPackModelLoader(BaseModelLoader):
         exec_config = get_exec()
         if (
             parallel.tp_size != 1
-            or parallel.moe_dp_size != 1
+            or parallel.moe_dp_group_size != 1
             or parallel.moe_ep_size != 1
             or not exec_config.graph.disable_cuda_graph
             or not exec_config.moe.disable_shared_experts_fusion

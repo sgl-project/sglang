@@ -941,7 +941,7 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        self.moe_dp_size = get_parallel().moe_dp_size
+        self.moe_dp_group_size = get_parallel().moe_dp_group_size
         self.attn_cp_size = get_parallel().attn_cp_size
 
         if self.pp_group.is_first_rank:

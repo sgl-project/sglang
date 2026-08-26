@@ -61,7 +61,7 @@ class TestRayDriverReadsTheBags(CustomTestCase):
         self._publish(tp_size=2, pp_size=1, dp_size=1, enable_dp_attention=False)
         self.assertEqual(_compute_world_size(), 2)
         get_context().override("test.ray_driver", tp_size=8)
-        self.assertEqual(get_parallel().config.tp_size, 8)
+        self.assertEqual(get_parallel().tp_size, 8)
         self.assertEqual(_compute_world_size(), 8)
 
     def test_the_driver_modules_read_no_field_off_a_record(self):
