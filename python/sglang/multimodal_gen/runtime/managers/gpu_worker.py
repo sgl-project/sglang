@@ -562,11 +562,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         warmup_baseline_allocated_bytes = 0
         try:
             if measure_server_warmup:
-                # Drop the previous request's allocator pool so max_memory
-                # _reserved measures THIS workload's peak. Without this, a
-                # later warmup shape that fits in the cached pool reports the
-                # same peak as the earlier one and the calibration slope
-                # collapses to zero.
+                # Drop the previous request's allocator pool so each probe
+                # starts from the same placement and can return released
+                # component storage before its allocated peak is measured.
                 torch.get_device_module().empty_cache()
             if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
@@ -700,24 +698,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_server_warmup_memory(
         self, *, req: Req, baseline_allocated_bytes: int, succeeded: bool
     ) -> None:
-        phase_peaks: dict[str, int] = {}
+        phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
         residency_manager = peek_global_component_residency_manager()
         if residency_manager is not None:
-            for phase_name, (
-                components,
-                peak_bytes,
-            ) in residency_manager.take_warmup_phase_peaks().items():
-                phase_peaks[phase_name] = peak_bytes
-                phase_components[phase_name] = components
-        request_peak = max(
-            int(torch.get_device_module().max_memory_reserved()),
-            max(phase_peaks.values(), default=0),
+            for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
+                phase_allocated_peaks[phase_name] = peak.allocated_bytes
+                phase_components[phase_name] = peak.active_components
+        request_allocated_peak = max(
+            int(torch.get_device_module().max_memory_allocated()),
+            max(phase_allocated_peaks.values(), default=0),
         )
-        if request_peak > max(phase_peaks.values(), default=0):
+        if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
             # Work after the residency-managed stage timeline (for example,
             # output materialization) must remain a placement constraint.
-            phase_peaks["request:untracked"] = request_peak
+            # A reserved-only increase is reclaimable allocator cache, not a
+            # second live placement, and is covered by the explicit reserve.
+            phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = ()
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
@@ -725,9 +722,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 height=int(req.height or 0),
                 num_frames=int(req.num_frames or 1),
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
-                peak_reserved_bytes=request_peak,
+                peak_allocated_bytes=request_allocated_peak,
                 succeeded=succeeded,
-                phase_peak_reserved_bytes=phase_peaks,
+                phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
             )
         )

@@ -7,6 +7,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
     ResidencyState,
+    WarmupPhasePeak,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
@@ -163,8 +164,8 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,
         reset_peak_memory_stats=Mock(),
-        max_memory_reserved=lambda: 11,
-        memory_reserved=lambda: 3,
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
     )
     monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
@@ -189,30 +190,29 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
     manager.finish_request()
 
     peaks = manager.take_warmup_phase_peaks()
-    assert peaks["request:before-stage"] == ((), 11)
-    assert peaks["0:denoise:setup"] == ((), 11)
-    assert peaks["0:denoise:transition:idle->transformer"] == (
-        ("transformer",),
-        11,
-    )
-    assert peaks["0:denoise:use:transformer"] == (("transformer",), 11)
-    assert peaks["0:denoise:transition:transformer->idle"] == (
-        ("transformer",),
-        11,
-    )
-    assert peaks["0:denoise:between"] == ((), 11)
+    inactive_peak = WarmupPhasePeak((), 7)
+    transformer_peak = WarmupPhasePeak(("transformer",), 7)
+    assert peaks["request:before-stage"] == inactive_peak
+    assert peaks["0:denoise:setup"] == inactive_peak
+    assert peaks["0:denoise:transition:idle->transformer"] == transformer_peak
+    assert peaks["0:denoise:use:transformer"] == transformer_peak
+    assert peaks["0:denoise:transition:transformer->idle"] == transformer_peak
+    assert peaks["0:denoise:between"] == inactive_peak
     # A non-preferred component is being released during cleanup, so it is no
     # longer part of the placement that follows this transition.
-    assert peaks["request:cleanup:transformer"] == ((), 11)
-    assert peaks["idle"] == ((), 3)
+    assert peaks["request:cleanup:transformer"] == inactive_peak
+    assert peaks["idle"] == WarmupPhasePeak(
+        active_components=(),
+        allocated_bytes=2,
+    )
 
 
 def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,
         reset_peak_memory_stats=Mock(),
-        max_memory_reserved=lambda: 11,
-        memory_reserved=lambda: 3,
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
     )
     monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
@@ -240,7 +240,7 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     manager._record_warmup_phase_peak()
     assert manager._warmup_phase_peaks[
         "0:stage:transition:transformer->transformer"
-    ] == (("transformer",), 11)
+    ] == WarmupPhasePeak(("transformer",), 7)
     assert strategy.prepare_for_use.call_count == 2
 
 
@@ -248,8 +248,8 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,
         reset_peak_memory_stats=Mock(),
-        max_memory_reserved=lambda: 11,
-        memory_reserved=lambda: 3,
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
     )
     monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
@@ -278,12 +278,10 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
     manager._record_warmup_phase_peak()
 
     assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == (
-        ("text_encoder",),
-        11,
+        WarmupPhasePeak(("text_encoder",), 7)
     )
     assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == (
-        ("transformer",),
-        11,
+        WarmupPhasePeak(("transformer",), 7)
     )
 
 

@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     DefaultWorkload,
     WarmupMemoryRecord,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    WarmupPhasePeak,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -99,9 +102,10 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     worker._auto_residency_warmup_records = []
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": (("transformer",), 10)
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
     device_module = Mock()
+    device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
     req = SimpleNamespace(width=64, height=64, num_frames=1)
 
@@ -120,9 +124,39 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         )
 
     record = worker._auto_residency_warmup_records[0]
-    assert record.peak_reserved_bytes == 12
-    assert record.phase_peak_reserved_bytes["request:untracked"] == 12
+    assert record.peak_allocated_bytes == 9
+    assert record.phase_peak_allocated_bytes["request:untracked"] == 9
     assert record.phase_active_components["request:untracked"] == ()
+
+
+def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+    }
+    device_module = Mock()
+    device_module.max_memory_allocated.return_value = 8
+    device_module.max_memory_reserved.return_value = 12
+    req = SimpleNamespace(width=64, height=64, num_frames=1)
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            baseline_allocated_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert "request:untracked" not in record.phase_peak_allocated_bytes
 
 
 def test_loaded_prequantized_checkpoint_can_use_auto_residency():
@@ -161,7 +195,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
                     height=64,
                     num_frames=1,
                     baseline_allocated_bytes=1,
-                    peak_reserved_bytes=2,
+                    peak_allocated_bytes=2,
                     succeeded=True,
                 )
             ],

@@ -61,7 +61,7 @@ def _record(
         height=height,
         num_frames=num_frames,
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
-        peak_reserved_bytes=peak_gib * GIB_BYTES,
+        peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
     )
 
@@ -72,7 +72,7 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[record], target_units=record.workload_units()
         )
-        assert estimate == record.peak_reserved_bytes
+        assert estimate == record.peak_allocated_bytes
 
     def test_unknown_target_disables_estimation(self):
         # An unknown target would silently equate the capped warmup peak with
@@ -93,14 +93,14 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[record], target_units=target_units
         )
-        activation = record.peak_reserved_bytes - record.baseline_allocated_bytes
+        activation = record.peak_allocated_bytes - record.baseline_allocated_bytes
         expected = record.baseline_allocated_bytes + int(
             activation * ratio * ACTIVATION_EXTRAPOLATION_MARGIN
         )
         assert estimate == expected
         # Scaling the whole peak would inflate the estimate by the resident
         # weights times the cap ratio and promotion would never trigger.
-        naive = int(record.peak_reserved_bytes * ratio)
+        naive = int(record.peak_allocated_bytes * ratio)
         assert estimate < naive
 
     def test_two_point_fit_separates_constant_from_linear(self):
@@ -116,10 +116,10 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[small, large], target_units=target_units
         )
-        slope = (large.peak_reserved_bytes - small.peak_reserved_bytes) / (
+        slope = (large.peak_allocated_bytes - small.peak_allocated_bytes) / (
             large.workload_units() - small.workload_units()
         )
-        constant = large.peak_reserved_bytes - slope * large.workload_units()
+        constant = large.peak_allocated_bytes - slope * large.workload_units()
         expected = int(
             constant + slope * target_units * ACTIVATION_EXTRAPOLATION_MARGIN
         )
@@ -150,7 +150,7 @@ class TestEstimateDefaultWorkloadPeak:
             height=480,
             num_frames=9,
             baseline_allocated_bytes=GIB_BYTES,
-            peak_reserved_bytes=int(29.5 * GIB_BYTES),
+            peak_allocated_bytes=int(29.5 * GIB_BYTES),
             succeeded=True,
         )
         large = WarmupMemoryRecord(
@@ -158,7 +158,7 @@ class TestEstimateDefaultWorkloadPeak:
             height=480,
             num_frames=17,
             baseline_allocated_bytes=GIB_BYTES,
-            peak_reserved_bytes=int(29.4 * GIB_BYTES),
+            peak_allocated_bytes=int(29.4 * GIB_BYTES),
             succeeded=True,
         )
         target_units = 1024 * 1024 * 81
@@ -181,7 +181,7 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[capped, full], target_units=1280 * 720 * 81
         )
-        assert estimate == full.peak_reserved_bytes
+        assert estimate == full.peak_allocated_bytes
 
     def test_multiple_records_take_the_max(self):
         low = _record(peak_gib=12)
@@ -189,7 +189,7 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[low, high], target_units=low.workload_units()
         )
-        assert estimate == high.peak_reserved_bytes
+        assert estimate == high.peak_allocated_bytes
 
     def test_failure_at_the_target_size_disables_estimation(self):
         good = _record(num_frames=9, peak_gib=8)
@@ -217,7 +217,7 @@ class TestEstimateDefaultWorkloadPeak:
         estimate = estimate_default_workload_peak_bytes(
             records=[good, failed], target_units=good.workload_units()
         )
-        assert estimate == good.peak_reserved_bytes
+        assert estimate == good.peak_allocated_bytes
 
     def test_unknown_target_disables_estimation(self):
         assert (
@@ -238,9 +238,9 @@ class TestEstimateDefaultWorkloadPeak:
             height=small.height,
             num_frames=small.num_frames,
             baseline_allocated_bytes=small.baseline_allocated_bytes,
-            peak_reserved_bytes=small.peak_reserved_bytes,
+            peak_allocated_bytes=small.peak_allocated_bytes,
             succeeded=small.succeeded,
-            phase_peak_reserved_bytes={"denoise": 30 * GIB_BYTES},
+            phase_peak_allocated_bytes={"denoise": 30 * GIB_BYTES},
             phase_active_components={"denoise": ("transformer",)},
         )
         large = WarmupMemoryRecord(
@@ -248,9 +248,9 @@ class TestEstimateDefaultWorkloadPeak:
             height=large.height,
             num_frames=large.num_frames,
             baseline_allocated_bytes=large.baseline_allocated_bytes,
-            peak_reserved_bytes=large.peak_reserved_bytes,
+            peak_allocated_bytes=large.peak_allocated_bytes,
             succeeded=large.succeeded,
-            phase_peak_reserved_bytes={"denoise": 32 * GIB_BYTES},
+            phase_peak_allocated_bytes={"denoise": 32 * GIB_BYTES},
             phase_active_components={"denoise": ("transformer",)},
         )
 
@@ -262,6 +262,26 @@ class TestEstimateDefaultWorkloadPeak:
 
         assert peaks["denoise"] >= 32 * GIB_BYTES
         assert active == {"denoise": ("transformer",)}
+
+    def test_phase_estimation_uses_allocated_peak(self):
+        record = WarmupMemoryRecord(
+            width=1024,
+            height=1024,
+            num_frames=1,
+            baseline_allocated_bytes=5 * GIB_BYTES,
+            peak_allocated_bytes=12 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"denoise": 11 * GIB_BYTES},
+            phase_active_components={"denoise": ("transformer",)},
+        )
+
+        peaks, _ = estimate_workload_phase_peaks(
+            records=[record],
+            target_units=record.workload_units(),
+            component_weight_bytes={"transformer": 10 * GIB_BYTES},
+        )
+
+        assert peaks["denoise"] == 11 * GIB_BYTES
 
 
 def _candidate(

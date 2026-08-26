@@ -58,6 +58,12 @@ class ResidencyState:
     batch_is_warmup: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class WarmupPhasePeak:
+    active_components: tuple[str, ...]
+    allocated_bytes: int
+
+
 class ResidencyBatch(Protocol):
     is_warmup: bool
 
@@ -132,8 +138,8 @@ class ComponentResidencyManager:
         self._track_warmup_memory = False
         self._warmup_phase_key: str | None = None
         self._warmup_phase_components: tuple[str, ...] = ()
-        self._warmup_phase_peaks: dict[str, tuple[tuple[str, ...], int]] = {}
-        self._completed_warmup_phase_peaks: dict[str, tuple[tuple[str, ...], int]] = {}
+        self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
+        self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -569,9 +575,9 @@ class ComponentResidencyManager:
             )
         if self._track_warmup_memory:
             self._record_warmup_phase_peak()
-            self._warmup_phase_peaks["idle"] = (
-                self._warmup_active_components(),
-                int(torch.get_device_module().memory_reserved()),
+            self._warmup_phase_peaks["idle"] = WarmupPhasePeak(
+                active_components=self._warmup_active_components(),
+                allocated_bytes=int(torch.get_device_module().memory_allocated()),
             )
             self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
         self._track_warmup_memory = False
@@ -630,17 +636,26 @@ class ComponentResidencyManager:
     def _record_warmup_phase_peak(self) -> None:
         if not self._track_warmup_memory or self._warmup_phase_key is None:
             return
-        peak = int(torch.get_device_module().max_memory_reserved())
+        peak = WarmupPhasePeak(
+            active_components=self._warmup_phase_components,
+            allocated_bytes=int(torch.get_device_module().max_memory_allocated()),
+        )
         previous = self._warmup_phase_peaks.get(self._warmup_phase_key)
-        if previous is None or peak > previous[1]:
-            self._warmup_phase_peaks[self._warmup_phase_key] = (
-                self._warmup_phase_components,
-                peak,
+        if previous is None:
+            self._warmup_phase_peaks[self._warmup_phase_key] = peak
+        else:
+            self._warmup_phase_peaks[self._warmup_phase_key] = WarmupPhasePeak(
+                active_components=tuple(
+                    sorted(
+                        set(previous.active_components) & set(peak.active_components)
+                    )
+                ),
+                allocated_bytes=max(previous.allocated_bytes, peak.allocated_bytes),
             )
 
     def take_warmup_phase_peaks(
         self,
-    ) -> dict[str, tuple[tuple[str, ...], int]]:
+    ) -> dict[str, WarmupPhasePeak]:
         """Return and clear the most recently completed warmup phase peaks."""
         peaks = self._completed_warmup_phase_peaks
         self._completed_warmup_phase_peaks = {}

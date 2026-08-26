@@ -109,9 +109,9 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     height: int
     num_frames: int
     baseline_allocated_bytes: int
-    peak_reserved_bytes: int
+    peak_allocated_bytes: int
     succeeded: bool
-    phase_peak_reserved_bytes: dict[str, int] = {}
+    phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
 
     def workload_units(self) -> int:
@@ -261,7 +261,12 @@ def estimate_default_workload_peak_bytes(
     target_units: int | None,
     constant_weight_bytes: int = 0,
 ) -> int | None:
-    """Extrapolate warmup peaks to the default workload.
+    """Extrapolate live warmup memory to the default workload.
+
+    Real measurements use allocated bytes. Cached allocator blocks are
+    reclaimable and are covered by the explicit VRAM reserve; treating them as
+    live memory would charge the same storage again when adding resident
+    weights.
 
     Preference order:
     1. A measurement at or above the target workload bounds the peak directly.
@@ -299,9 +304,8 @@ def estimate_default_workload_peak_bytes(
     peak_by_units: dict[int, int] = {}
     for record in records:
         units = record.workload_units()
-        peak_by_units[units] = max(
-            peak_by_units.get(units, 0), record.peak_reserved_bytes
-        )
+        peak = record.peak_allocated_bytes
+        peak_by_units[units] = max(peak_by_units.get(units, 0), peak)
 
     covering_peaks = [
         peak for units, peak in peak_by_units.items() if units >= target_units
@@ -328,7 +332,7 @@ def estimate_default_workload_peak_bytes(
 
     estimates = []
     for record in records:
-        peak = record.peak_reserved_bytes
+        peak = record.peak_allocated_bytes
         baseline = min(
             max(record.baseline_allocated_bytes, constant_weight_bytes), peak
         )
@@ -360,7 +364,7 @@ def estimate_workload_phase_peaks(
         {
             phase_name
             for record in successful
-            for phase_name in record.phase_peak_reserved_bytes
+            for phase_name in record.phase_peak_allocated_bytes
         }
     )
     estimated_peaks: dict[str, int] = {}
@@ -369,7 +373,7 @@ def estimate_workload_phase_peaks(
         phase_records = [
             record
             for record in successful
-            if phase_name in record.phase_peak_reserved_bytes
+            if phase_name in record.phase_peak_allocated_bytes
         ]
         if not phase_records:
             continue
@@ -386,9 +390,9 @@ def estimate_workload_phase_peaks(
                 num_frames=record.num_frames,
                 baseline_allocated_bytes=min(
                     record.baseline_allocated_bytes,
-                    record.phase_peak_reserved_bytes[phase_name],
+                    record.phase_peak_allocated_bytes[phase_name],
                 ),
-                peak_reserved_bytes=record.phase_peak_reserved_bytes[phase_name],
+                peak_allocated_bytes=record.phase_peak_allocated_bytes[phase_name],
                 succeeded=True,
             )
             for record in phase_records
@@ -1319,11 +1323,11 @@ def format_plan_summary(
     )
     measured = ", ".join(
         f"{record.width}x{record.height}x{record.num_frames}f="
-        f"{record.peak_reserved_bytes / GIB_BYTES:.1f}GiB"
+        f"{record.peak_allocated_bytes / GIB_BYTES:.1f}GiB"
         for record in records
         if record.succeeded
     )
-    measured_part = f"measured=[{measured}], " if measured else ""
+    measured_part = f"measured_allocated=[{measured}], " if measured else ""
     return (
         f"Auto residency: target={workload.describe()} "
         f"steps={workload.num_inference_steps}, "
