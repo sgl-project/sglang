@@ -4,14 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_zero_bubble import pad_zero_bubble_seed
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -27,6 +25,16 @@ def build_eagle_disagg_draft_input(
 ) -> EagleDraftInput:
     num_states = server_args.speculative_eagle_topk
     if server_args.enable_multi_layer_eagle:
+        num_states *= server_args.speculative_num_steps
+    elif (
+        server_args.enable_draft_prefetch and server_args.speculative_num_steps > 1
+    ):
+        # Draft-prefetch: the prefill engine pre-concatenated the seed to the
+        # candidate width (steps * topk) and normalized it to target-vocab ids
+        # (see _pad_topk_for_draft_prefetch). Keep the full width here -- the
+        # first decode round's prepare_verify_fully_async_decoding runs
+        # torch.topk(num_draft_tokens - 1) over it, which crashes on a
+        # width-1 seed and merge_batch needs matching widths anyway.
         num_states *= server_args.speculative_num_steps
 
     topk_p = torch.stack(
@@ -51,13 +59,6 @@ def build_eagle_disagg_draft_input(
         ],
         dim=0,
     )
-    if envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get():
-        topk_p, topk_index = pad_zero_bubble_seed(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            num_steps=server_args.speculative_num_steps,
-            topk=server_args.speculative_eagle_topk,
-        )
 
     hidden_states = torch.stack(
         [req.hidden_states_tensor for req in batch.reqs], dim=0

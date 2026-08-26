@@ -2234,7 +2234,17 @@ class ServerArgs:
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
         NS("spec"),
     ] = None
-
+    enable_draft_prefetch: A[
+        bool,
+        "pre-run the next round's draft after draft_extend (EAGLE3, topk=1 only).",
+        NS("spec"),
+    ] = False
+    skip_draft_prefetch_seq_lens_cpu_sync: A[
+        bool,
+        "seq_lens must be synced between host and device; "
+        "models that never read the CPU mirror can skip this sync to improve performance.",
+        NS("spec"),
+    ] = False
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
     decoupled_spec_bind_endpoint: A[
