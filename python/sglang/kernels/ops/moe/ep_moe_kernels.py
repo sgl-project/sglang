@@ -897,9 +897,37 @@ def post_reorder_for_cutlass_moe(
     )
 
 
+def _out_or_empty(tensor, shape, dtype, device, name: str):
+    """The caller's buffer if it satisfies the contract, else a fresh one."""
+    if tensor is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    _check_out_buffer(tensor, shape, dtype, device, name)
+    return tensor
+
+
+def _check_out_buffer(tensor, shape, dtype, device, name: str) -> None:
+    """Validate a caller-owned output buffer against its expected contract.
+
+    Callers pass their own buffers when the addresses must stay stable across
+    CUDA-graph replay (see sglang/srt/lora/moe/workspace.py); a mismatch
+    is a caller bug, so fail loudly instead of silently allocating.
+    """
+    if (
+        tuple(tensor.shape) != tuple(shape)
+        or tensor.dtype != dtype
+        or tensor.device != device
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError(
+            f"{name} must be contiguous {dtype} {tuple(shape)} on {device}; got "
+            f"{tensor.dtype} {tuple(tensor.shape)} on {tensor.device}"
+        )
+
+
 @triton.jit
 def post_reorder_deepgemm_triton_kernel(
     down_output_ptr,
+    lora_delta_ptr,
     output_ptr,
     src2dst_ptr,
     topk_ids_ptr,
@@ -908,11 +936,17 @@ def post_reorder_deepgemm_triton_kernel(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    HAS_LORA_DELTA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
     """`expert_id >= 0` includes the shared expert at num_experts (padding=-1); don't
     switch to the cutlass `!= num_local_experts` gate. routed_scaling_factor is folded into the store.
+
+    ``lora_delta``, when given, is an unweighted LoRA contribution per
+    (token, top-k) slot, added to the expert output before this kernel applies
+    the route weight and the routed scaling, so both are applied exactly once
+    over base + LoRA.
     """
     OutDtype = output_ptr.dtype.element_ty
 
@@ -941,6 +975,10 @@ def post_reorder_deepgemm_triton_kernel(
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
+                if HAS_LORA_DELTA:
+                    slot_idx = src_idx * topk + idx
+                    delta_ptr_offs = lora_delta_ptr + slot_idx * hidden_size + offset
+                    in_data += tl.load(delta_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
         sum_vec *= routed_scaling_factor
         store_ptr_offs = output_ptr_offs + src_idx * hidden_size
@@ -957,10 +995,22 @@ def post_reorder_deepgemm(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    lora_delta=None,
 ):
+    if lora_delta is not None:
+        _check_out_buffer(
+            lora_delta,
+            (num_tokens, topk, hidden_size),
+            lora_delta.dtype,
+            down_output.device,
+            "lora_delta",
+        )
     grid, block_dim = _get_launch_config_2d(down_output.device, num_tokens, hidden_size)
     post_reorder_deepgemm_triton_kernel[grid](
         down_output,
+        # Unused-but-typed pointer when there is no delta; the load is
+        # compiled out with HAS_LORA_DELTA.
+        down_output if lora_delta is None else lora_delta,
         output,
         src2dst,
         topk_ids,
@@ -969,6 +1019,7 @@ def post_reorder_deepgemm(
         num_tokens,
         hidden_size,
         float(routed_scaling_factor),
+        HAS_LORA_DELTA=lora_delta is not None,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
     )
@@ -1440,22 +1491,26 @@ def fused_moe_dispatch_index(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     m_max: int,
+    *,
+    masked_m_out: Optional[torch.Tensor] = None,
+    src2dst_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_toks = topk_ids.numel()
-    src2dst = torch.empty(num_toks, device=topk_ids.device, dtype=torch.int32)
+    device = topk_ids.device
+    src2dst = _out_or_empty(
+        src2dst_out, (num_toks,), torch.int32, device, "src2dst_out"
+    )
     # masked_m doubles as the atomic cursor and the final per-expert count; must be zeroed before any atomic_add.
+    masked_m = _out_or_empty(
+        masked_m_out, (num_local_experts,), torch.int32, device, "masked_m_out"
+    )
     single_block = max(num_toks, num_local_experts) <= 1024
     if single_block:
         BLOCK_SIZE = triton.next_power_of_2(max(num_toks, num_local_experts))
-        masked_m = torch.empty(
-            num_local_experts, device=topk_ids.device, dtype=torch.int32
-        )
         grid = (1,)
     else:
         BLOCK_SIZE = 256
-        masked_m = torch.zeros(
-            num_local_experts, device=topk_ids.device, dtype=torch.int32
-        )
+        masked_m.zero_()
         grid = (triton.cdiv(num_toks, BLOCK_SIZE),)
     fused_moe_dispatch_index_triton_kernel[grid](
         topk_ids.view(-1),
@@ -1543,6 +1598,10 @@ def moe_ep_deepgemm_preprocess(
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
+    *,
+    masked_m_out: Optional[torch.Tensor] = None,
+    src2dst_out: Optional[torch.Tensor] = None,
+    gateup_input_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -1567,12 +1626,20 @@ def moe_ep_deepgemm_preprocess(
         m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
-    masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+    masked_m, src2dst = fused_moe_dispatch_index(
+        topk_ids,
+        num_local_experts,
+        m_max,
+        masked_m_out=masked_m_out,
+        src2dst_out=src2dst_out,
+    )
 
-    gateup_input = torch.empty(
+    gateup_input = _out_or_empty(
+        gateup_input_out,
         (num_local_experts, m_max, hidden_states.size(1)),
-        device=hidden_states.device,
-        dtype=output_dtype,
+        output_dtype,
+        hidden_states.device,
+        "gateup_input_out",
     )
 
     if block_shape is None:
