@@ -32,7 +32,8 @@ Run a ShareGPT workload with at least four output tokens so decode and TPOT are
 measured:
 
 ```bash
-python3 -m sglang_simulator.simulation.bench_serving \
+cd /path/to/sglang
+python3 benchmark/simulator/bench_serving.py \
   --simulator-mode=offline \
   --backend=sglang \
   --base-url=http://127.0.0.1:30000 \

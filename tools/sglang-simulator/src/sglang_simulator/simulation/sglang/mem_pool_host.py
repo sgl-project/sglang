@@ -71,6 +71,7 @@ def allocate_meta_tensor(
     device: str,
     pin_memory: bool,
     allocator=None,
+    registration_granularity_bytes=None,
 ) -> torch.Tensor:
     """Allocate metadata-only host cache payload for simulation."""
     return torch.empty(dims, dtype=dtype, device="meta")

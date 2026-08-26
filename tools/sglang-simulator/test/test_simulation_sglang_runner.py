@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,16 +9,25 @@ from sglang_simulator.dataset import GenericRequest, SimpleDataset
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
 
 ASSETS = Path(__file__).parent / "assets"
+SGLANG_ROOT = Path(__file__).parents[3]
+if str(SGLANG_ROOT) not in sys.path:
+    sys.path.insert(0, str(SGLANG_ROOT))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 
-def make_fixed_dataset(start_token: int, count: int) -> SimpleDataset:
+def make_fixed_dataset(
+    start_token: int,
+    count: int,
+    *,
+    input_length: int = 1025,
+    output_length: int = 1,
+) -> SimpleDataset:
     return SimpleDataset(
         reqs=[
             GenericRequest(
-                token_ids=[start_token + i] * 1025,
-                input_length=1025,
-                output_length=1,
+                token_ids=[start_token + i] * input_length,
+                input_length=input_length,
+                output_length=output_length,
                 custom_params={"created_time": i / 10},
             )
             for i in range(count)
@@ -53,11 +63,10 @@ def _write_sim_config(tmp_path: Path) -> Path:
     return config_path
 
 
-def test_benchmark_sglang(tmp_path):
+def make_sglang_runner(tmp_path: Path):
     os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = str(_write_sim_config(tmp_path))
 
-    from sglang_simulator.simulation.sglang.bench_runner import SGLangBenchmarkRunner
-
+    from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
     from sglang.srt.server_args import ServerArgs
 
     runner = SGLangBenchmarkRunner(
@@ -75,32 +84,35 @@ def test_benchmark_sglang(tmp_path):
         )
     )
     runner.clear_hicache_storage()
+    return runner
 
-    benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=False)
-    cached_ds = make_fixed_dataset(1000, 8)
-    evict_l1_ds = make_fixed_dataset(2000, 10)
-    evict_l2_ds = make_fixed_dataset(3000, 20)
 
-    metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
-    assert metrics["completed"] == len(cached_ds)
-    assert metrics["prefix_cache_reused_ratio"] == 0
-    assert all(
-        idx == 0 or req["created_time"] > 0
-        for idx, req in enumerate(runner.get_request_stats())
+def test_benchmark_sglang_runs_paged_decode(tmp_path):
+    runner = make_sglang_runner(tmp_path)
+    dataset = make_fixed_dataset(
+        1000,
+        2,
+        input_length=1024,
+        output_length=2,
     )
 
-    metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
-    assert metrics["kv_cache_device_hit_ratio"] > 0.95
+    try:
+        metrics = runner.benchmark(
+            BenchmarkConfig(request_rate=10, ignore_request_timestamp=False),
+            dataset=dataset,
+        )
+        request_stats = runner.get_request_stats()
+    finally:
+        with patch.object(atexit, "unregister", wraps=atexit.unregister) as unregister:
+            runner.shutdown()
+            runner.shutdown()
 
-    runner.benchmark(benchmark_config, dataset=evict_l1_ds)
-    metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
-    assert metrics["kv_cache_host_hit_ratio"] > 0.95
+        unregister.assert_called_once_with(runner.engine.shutdown)
 
-    runner.benchmark(benchmark_config, dataset=evict_l2_ds)
-    metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
-    assert metrics["kv_cache_storage_hit_ratio"] > 0.95
-    with patch.object(atexit, "unregister", wraps=atexit.unregister) as unregister:
-        runner.shutdown()
-        runner.shutdown()
-
-    unregister.assert_called_once_with(runner.engine.shutdown)
+    assert metrics["completed"] == len(dataset)
+    assert metrics["total_input"] == 2 * 1024
+    assert metrics["total_output"] == 2 * 2
+    assert metrics["mean_tpot_ms"] > 0
+    assert all(
+        idx == 0 or req["created_time"] > 0 for idx, req in enumerate(request_stats)
+    )

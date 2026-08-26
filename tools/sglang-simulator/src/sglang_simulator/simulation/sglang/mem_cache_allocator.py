@@ -66,14 +66,14 @@ def _alloc_decode_cpu(
     if num_new_pages > len(self.free_pages):
         return None
 
-    out_indices = last_loc + 1
+    out_indices = (last_loc + 1).to(dtype=self.free_pages.dtype)
     need_new_page = seq_lens % self.page_size == 1
     if num_new_pages:
         out_indices = out_indices.clone()
         out_indices[need_new_page] = self.free_pages[:num_new_pages] * self.page_size
 
     self.free_pages = self.free_pages[num_new_pages:]
-    return out_indices.to(self.free_pages.dtype)
+    return out_indices
 
 
 def alloc_extend_cpu(*args, **kwargs):

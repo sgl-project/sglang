@@ -1,6 +1,6 @@
 """SGLang serving benchmark adapter for simulator traffic.
 
-This module deliberately reuses SGLang's benchmark implementation and dataset
+This script deliberately reuses SGLang's benchmark implementation and dataset
 loaders.  It only owns the simulator-specific parts of the protocol:
 
 * convert request-rate or trace timestamps into logical arrival timestamps;
@@ -199,7 +199,7 @@ def simulator_run_benchmark(args: argparse.Namespace):
     global _USE_TRACE_TIMESTAMPS
     if args.backend != "sglang":
         raise ValueError(
-            "sglang_simulator.simulation.bench_serving requires --backend sglang"
+            "benchmark/simulator/bench_serving.py requires --backend sglang"
         )
     if args.dataset_name == "mooncake":
         raise ValueError(

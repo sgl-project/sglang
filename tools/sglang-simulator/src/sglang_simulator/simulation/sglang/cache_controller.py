@@ -240,9 +240,10 @@ class C_HiCacheController(BaseHook):
         def override_generic_page_set(
             self, hash_values, host_indices, extra_info=None
         ) -> bool:
+            host_pool = getattr(self, "storage_host_pool", self.mem_pool_host)
             # Always pass extra_info to storage_backend.
             data = [
-                self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+                host_pool.get_data_page(host_indices[i * self.page_size])
                 for i in range(len(hash_values))
             ]
             return self.storage_backend.batch_set(hash_values, data, extra_info)

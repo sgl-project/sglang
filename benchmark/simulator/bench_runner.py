@@ -1,3 +1,5 @@
+"""In-process benchmark runner for SGLang Simulator."""
+
 import asyncio
 import atexit
 import json
@@ -7,20 +9,9 @@ from typing import Iterator
 
 import numpy as np
 from sglang_simulator.compat import apply_simulator_server_args
-from sglang_simulator.dataset import (
-    BaseDataset,
-    GenericRequest,
-)
+from sglang_simulator.dataset import BaseDataset, GenericRequest
 from sglang_simulator.simulation.benchmark import BaseBenchmarkRunner, BenchmarkConfig
-from sglang_simulator.simulation.sglang.hook_bootstrap import (
-    install_simulator_hooks,
-    run_simulator_detokenizer_process,
-    run_simulator_scheduler_process,
-)
 from sglang_simulator.utils.logger import get_logger
-
-install_simulator_hooks()
-
 
 SGLANG_SIMULATOR_OUTPUT_DIR = os.getenv(
     "SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sglang_simulator/output"
@@ -31,25 +22,22 @@ os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = SGLANG_SIMULATOR_OUTPUT_DIR
 if os.getenv("SGLANG_SIMULATOR_OUTPUT_MODE") is None:
     os.environ["SGLANG_SIMULATOR_OUTPUT_MODE"] = "OFFLINE"
 
-from transformers import AutoTokenizer  # noqa
+# Import the simulator engine only after configuring its worker environment.
+from sglang_simulator.simulation.sglang.engine import (  # noqa: E402
+    SGLangSimulationEngine,
+)
 
-# The sglang must be imported after the hook installer
-from sglang.srt.entrypoints.engine import Engine  # noqa
-from sglang.srt.server_args import ServerArgs  # noqa
+# SGLang must be imported after the simulator hooks are installed by engine.py.
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 logger = get_logger("sglang_simulator")
 
 
-class SGLangSimulationEngine(Engine):
-    """Engine whose spawned workers install SGLang Simulator hooks explicitly."""
-
-    run_scheduler_process_func = staticmethod(run_simulator_scheduler_process)
-    run_detokenizer_process_func = staticmethod(run_simulator_detokenizer_process)
-
-
 class SGLangBenchmarkRunner(BaseBenchmarkRunner):
+    """Run a simulator workload directly through SGLang's in-process Engine."""
+
     def __init__(self, server_args: ServerArgs):
-        # disable some features which is not necessary for simulation.
+        # Disable features that are unnecessary for simulation.
         server_args_kwargs = asdict(server_args)
         apply_simulator_server_args(server_args_kwargs)
         self.engine = SGLangSimulationEngine(**server_args_kwargs)
@@ -79,7 +67,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                 created_time = req.custom_params.get("created_time", 0)
 
             simulation_params = {
-                "total_request": len(dataset),  # include the warmup requests.
+                "total_request": len(dataset),  # Include the warmup requests.
                 "created_time": created_time,
             }
 
@@ -93,8 +81,8 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         await self.engine.tokenizer_manager.start_profile()
 
         if os.path.exists(SIMULATION_METRICS_PATH):
-            with open(SIMULATION_METRICS_PATH, "w") as f:
-                # clear data
+            with open(SIMULATION_METRICS_PATH, "w") as metrics_file:
+                # Clear data from a previous benchmark in the same process.
                 pass
 
         tasks = []
@@ -112,7 +100,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                         "ignore_eos": True,
                         "max_new_tokens": req.output_length,
                         "custom_params": {
-                            # (tmp) Transfer simulation arguments to the scheduler through the custom_params in sampling_params
+                            # Transfer simulation arguments through sampling params.
                             "simulation": simulation_params
                         },
                     },
@@ -122,15 +110,16 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
 
         _ = await asyncio.gather(*tasks)
 
-        # dump result
+        # Trigger the simulator's profile handler to flush final metrics.
         await self.engine.tokenizer_manager.start_profile()
 
         if os.path.exists(SIMULATION_METRICS_PATH):
-            with open(SIMULATION_METRICS_PATH, "r") as f:
-                metrics = json.load(f)
+            with open(SIMULATION_METRICS_PATH) as metrics_file:
+                metrics = json.load(metrics_file)
         else:
             logger.error(
-                f"Failed to load metrics from serving backend. The metrics file should be loaded from {SIMULATION_METRICS_PATH}."
+                f"Failed to load metrics from serving backend. The metrics file "
+                f"should be loaded from {SIMULATION_METRICS_PATH}."
             )
             return None
 
@@ -145,11 +134,11 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         data = []
         file_path = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/iteration.jsonl"
         if os.path.exists(file_path):
-            with open(file_path) as f:
-                line = f.readline()
+            with open(file_path) as stats_file:
+                line = stats_file.readline()
                 while line:
                     data.append(json.loads(line))
-                    line = f.readline()
+                    line = stats_file.readline()
         else:
             logger.error(f"The iteration statistics data({file_path}) does not exist.")
         return data
@@ -158,11 +147,11 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         data = []
         file_path = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/request.jsonl"
         if os.path.exists(file_path):
-            with open(file_path) as f:
-                line = f.readline()
+            with open(file_path) as stats_file:
+                line = stats_file.readline()
                 while line:
                     data.append(json.loads(line))
-                    line = f.readline()
+                    line = stats_file.readline()
         else:
             logger.error(f"The request statistics data({file_path}) does not exist.")
         return data
@@ -176,7 +165,4 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
             return self.engine.shutdown()
         finally:
             self._shutdown = True
-            # Engine registers this bound method with atexit. Once the runner has
-            # shut it down explicitly, remove that callback to avoid a second
-            # teardown after test/output streams have already been closed.
             atexit.unregister(self.engine.shutdown)

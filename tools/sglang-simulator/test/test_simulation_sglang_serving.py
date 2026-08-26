@@ -11,6 +11,8 @@ import pytest
 import requests
 
 ASSETS = Path(__file__).parent / "assets"
+SGLANG_ROOT = Path(__file__).parents[3]
+BENCH_SERVING = SGLANG_ROOT / "benchmark" / "simulator" / "bench_serving.py"
 EXAMPLES = Path(__file__).parent.parent / "examples"
 SIM_CONFIGS = {
     "aic_sol": EXAMPLES / "sim_configs" / "aic_sol.json",
@@ -80,8 +82,7 @@ class SGLangServingRunner:
     ) -> dict:
         cmd = [
             sys.executable,
-            "-m",
-            "sglang_simulator.simulation.bench_serving",
+            str(BENCH_SERVING),
             f"--simulator-mode={self.mode}",
             "--backend=sglang",
             f"--base-url={self.base_url}",

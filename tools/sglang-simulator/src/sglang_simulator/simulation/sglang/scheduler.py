@@ -319,6 +319,7 @@ class C_SchedulerHook(BaseHook):
                 if ConfigManager.get_scheduler_config() is None:
                     sched_config = resolve_scheduler_config(
                         server_args=self.server_args,
+                        model_config=self.model_config,
                     )
                     ConfigManager.set_scheduler_config(sched_config)
                 sched_config = ConfigManager.get_scheduler_config()

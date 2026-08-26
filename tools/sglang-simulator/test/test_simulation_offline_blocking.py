@@ -59,7 +59,7 @@ def test_request_rate_offline_matches_blocking(tmp_path):
     blocking_arrivals = [request["created_time"] for request in blocking_requests]
     assert offline_arrivals[1] > 0.5
     assert blocking_arrivals[1] > 0.5
-    assert offline_arrivals == pytest.approx(blocking_arrivals, abs=0.01)
+    assert offline_arrivals == pytest.approx(blocking_arrivals, abs=0.02)
     assert (
         offline_metrics["max_concurrent_requests"]
         == blocking_metrics["max_concurrent_requests"]

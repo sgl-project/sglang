@@ -15,6 +15,26 @@ class _MockModel(torch.nn.Module):
         return None
 
 
+class _MockModelLoader:
+    """Minimal loader state for upstream resident-weight accounting."""
+
+    preloaded_weights_bytes = 0
+
+
+def _make_mock_model_loader(model_runner_type):
+    if hasattr(model_runner_type, "preloaded_weights_bytes"):
+        return _MockModelLoader()
+    return None
+
+
+def _resolve_kv_page_size(configurator):
+    return (
+        getattr(configurator, "page_size", None)
+        or getattr(configurator.server_args, "page_size", None)
+        or 1
+    )
+
+
 class C_ModelRunnerHook(BaseHook):
     HOOK_CLASS_NAME = "ModelRunner"
     HOOK_MODULE_NAME = "sglang.srt.model_executor.model_runner"
@@ -34,7 +54,7 @@ class C_ModelRunnerHook(BaseHook):
             self.prefill_aware_swa = False
             self.weight_load_mem_usage = 0
             self.load_config = None
-            self.loader = None
+            self.loader = _make_mock_model_loader(type(self))
 
             if ConfigManager.get_model_info() is None:
                 ConfigManager.set_model_info(resolve_model_info(self.model_config))
@@ -112,7 +132,31 @@ class C_KVCacheConfiguratorHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        original_configure = target.configure
         original_init_pools = target._init_pools
+        supports_cpu_fp8_quant_method = hasattr(target, "_build_mha_quant_method")
+
+        def wrapped_configure(self, *args, **kwargs):
+            if not (
+                supports_cpu_fp8_quant_method
+                and getattr(self, "device", None) == "cpu"
+                and getattr(self, "kv_cache_dtype", None) == torch.float8_e4m3fn
+            ):
+                return original_configure(self, *args, **kwargs)
+
+            # Newer SGLang runtimes validate CPU FP8 KV-cache support and select
+            # an AMX-only quant method. The simulator executes scheduler state on
+            # CPU while modeling the target accelerator's FP8 cache. Suppress the
+            # physical-CPU predicate only while native compact pools are built;
+            # all other platform capabilities and the logical dtype stay intact.
+            from sglang.srt.mem_cache.kv_cache_configurator import current_platform
+
+            original_is_cpu = current_platform.is_cpu
+            current_platform.is_cpu = lambda: False
+            try:
+                return original_configure(self, *args, **kwargs)
+            finally:
+                current_platform.is_cpu = original_is_cpu
 
         def override_profile_available_bytes(self, pre_model_load_memory):
             if self.server_args.max_total_tokens is not None:
@@ -123,10 +167,12 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 configurator = create_memory_pool_configurator(self)
                 target_tokens = self.server_args.max_total_tokens
 
+                page_size = _resolve_kv_page_size(self)
+
                 def resolved_tokens(budget_bytes):
                     try:
                         config = configurator.calculate_pool_sizes(
-                            budget_bytes, self.server_args.page_size
+                            budget_bytes, page_size
                         )
                     except RuntimeError:
                         return 0
@@ -148,7 +194,10 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 model = resolve_model_info(self.model_config)
                 ConfigManager.set_model_info(model)
             hardware = ConfigManager.get_accelerator_info()
-            scheduler_config = resolve_scheduler_config(server_args=self.server_args)
+            scheduler_config = resolve_scheduler_config(
+                server_args=self.server_args,
+                model_config=self.model_config,
+            )
             if hardware is None or scheduler_config is None:
                 raise RuntimeError(
                     "Simulator model, accelerator, and scheduler configuration "
@@ -211,5 +260,6 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 )
             return pools
 
+        target.configure = wrapped_configure
         target._profile_available_bytes = override_profile_available_bytes
         target._init_pools = wrapped_init_pools

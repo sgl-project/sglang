@@ -5,13 +5,15 @@ replacing model forward execution with a latency predictor. It supports
 timestamped trace replay, synthetic workloads, hierarchical cache simulation,
 and serving-compatible metrics without loading model weights.
 
+See the [SGLang Simulator advanced-feature guide](../../docs/docs/advanced_features/sglang_simulator.mdx)
+for the user-facing setup and serving workflow.
+
 ## Compatibility
 
-SGLang Simulator tracks the current SGLang `main` branch and maintains
-compatibility with the two most recent SGLang releases. For the current
-integration, the maintained release pair is `v0.5.16` and `v0.5.17`.
-Compatibility code uses API and capability checks instead of branching on
-version numbers.
+SGLang Simulator tracks the current SGLang `main` branch and maintains compatibility
+with recent SGLang releases. The current integration is validated with `v0.5.16`,
+`v0.5.17`, `v0.5.18`, and `main`. Compatibility code uses API and capability
+checks instead of branching on version numbers.
 
 ## Requirements
 
@@ -59,7 +61,8 @@ Upgrade this pin only after rerunning the AIC predictor and compatibility tests.
 The maintained tests define the supported first-version scope:
 
 - [`test/test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py):
-  direct Python use of `SGLangBenchmarkRunner` in the current process;
+  direct Python use of the repository-level
+  [`SGLangBenchmarkRunner`](../../benchmark/simulator/bench_runner.py);
 - [`test/test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py):
   server plus benchmark-client use through the HTTP serving path with AIC, ML,
   and replay predictors and ShareGPT or timestamped traffic;
@@ -103,10 +106,11 @@ In the benchmark terminal, export the same output directory before sending
 timestamped traffic with the simulator-aware benchmark adapter:
 
 ```bash
+cd /path/to/sglang
 export SIMULATOR_OUTPUT_DIR=/tmp/sglang-simulator-serving-001
 export SGLANG_SIMULATOR_OUTPUT_DIR="$SIMULATOR_OUTPUT_DIR"
 
-python3 -m sglang_simulator.simulation.bench_serving \
+python3 benchmark/simulator/bench_serving.py \
   --simulator-mode offline \
   --backend sglang \
   --base-url http://127.0.0.1:30000 \

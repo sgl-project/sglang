@@ -8,36 +8,67 @@ if typing.TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def _resolve_model_config(server_args: "ServerArgs", model_config=None):
+    if model_config is not None:
+        return model_config
+
+    get_model_config = getattr(server_args, "get_model_config", None)
+    if callable(get_model_config):
+        return get_model_config()
+
+    return server_args.model_config
+
+
+def _resolved_server_args(server_args: "ServerArgs") -> dict:
+    """Return effective ServerArgs values when the runtime exposes them."""
+    resolved_dict = getattr(server_args, "resolved_dict", None)
+    if not callable(resolved_dict):
+        return {}
+
+    try:
+        values = resolved_dict()
+    except (AttributeError, RuntimeError, TypeError):
+        return {}
+
+    return values if isinstance(values, dict) else {}
+
+
 def resolve_scheduler_config(
     server_args: "ServerArgs",
+    model_config: typing.Optional["ModelConfig"] = None,
 ) -> SchedulerConfig:
     from sglang.version import __version__
 
-    dtype = server_args.dtype
+    resolved = _resolved_server_args(server_args)
+
+    def get_arg(name: str, default=None):
+        value = resolved.get(name)
+        if value is None:
+            value = getattr(server_args, name, None)
+        return default if value is None else value
+
+    dtype = get_arg("dtype", "auto")
     if dtype == "auto":
-        dtype = str(server_args.model_config.dtype).strip("torch.")
+        model_config = _resolve_model_config(server_args, model_config)
+        dtype = str(model_config.dtype).strip("torch.")
     data_type = DataType.from_torch_dtype(dtype)
     return SchedulerConfig(
         data_type=data_type,
-        kv_cache_data_type=DataType.from_torch_dtype(server_args.kv_cache_dtype)
+        kv_cache_data_type=DataType.from_torch_dtype(get_arg("kv_cache_dtype"))
         or data_type,
-        mem_fraction_static=server_args.mem_fraction_static,
-        max_total_tokens=server_args.max_total_tokens,
-        tp_size=server_args.tp_size,
-        ep_size=server_args.ep_size,
-        dp_size=server_args.dp_size,
-        pp_size=server_args.pp_size,
-        cp_size=getattr(server_args, "attn_cp_size", 1),
-        cp_style=getattr(server_args, "cp_style", "none"),
-        page_size=getattr(server_args, "page_size", None),
-        swa_full_tokens_ratio=getattr(server_args, "swa_full_tokens_ratio", None),
-        kv_bytes_per_token_per_gpu=getattr(
-            server_args, "kv_bytes_per_token_per_gpu", None
-        ),
-        hicache_ratio=getattr(server_args, "hicache_ratio", None),
-        enable_hierarchical_cache=getattr(
-            server_args, "enable_hierarchical_cache", None
-        ),
+        mem_fraction_static=get_arg("mem_fraction_static"),
+        max_total_tokens=get_arg("max_total_tokens"),
+        tp_size=get_arg("tp_size"),
+        ep_size=get_arg("ep_size"),
+        dp_size=get_arg("dp_size"),
+        pp_size=get_arg("pp_size"),
+        cp_size=get_arg("attn_cp_size", 1),
+        cp_style=get_arg("cp_style", "none"),
+        page_size=get_arg("page_size"),
+        swa_full_tokens_ratio=get_arg("swa_full_tokens_ratio"),
+        kv_bytes_per_token_per_gpu=get_arg("kv_bytes_per_token_per_gpu"),
+        hicache_ratio=get_arg("hicache_ratio"),
+        enable_hierarchical_cache=get_arg("enable_hierarchical_cache"),
         backend_name="sglang",
         backend_version=__version__,
     )
