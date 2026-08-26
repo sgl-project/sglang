@@ -97,6 +97,10 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
         server_args.media_url_max_file_size_mb = 64
+        # A bare MagicMock makes every attribute truthy, which silently sends
+        # the worker-count decision down the CPU branch. Pin what it reads.
+        server_args.disable_fast_image_processor = False
+        server_args.rl_on_policy_target = None
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
