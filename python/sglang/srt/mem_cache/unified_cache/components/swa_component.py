@@ -794,10 +794,11 @@ class SWAComponent(TreeComponent):
             # device-guaranteed, require a full window.
             return PreparePrefetchResult()
         num_tokens = num_pages * self.cache.page_size
-        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        host_indices = self.cache.host_pool_group.alloc(
+            num_tokens,
+            pool=PoolName.SWA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -1121,7 +1122,7 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._swa_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
@@ -1148,7 +1149,7 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
