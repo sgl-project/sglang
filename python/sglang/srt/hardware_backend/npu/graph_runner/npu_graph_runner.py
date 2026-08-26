@@ -233,7 +233,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        graph_key = self._make_graph_key(self.bs)
+        # load_batch selects token-keyed tiers for compact DSpark verify.  The
+        # NPU replay path must preserve that key instead of rebuilding the
+        # legacy batch-size key (which happens to match only non-ragged graphs).
+        graph_key = self._replay_graph_key
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
