@@ -214,8 +214,11 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_processor_worker_num, 2)
         self.assertIsNotNone(proc.mm_processor_executor)
 
-    def test_model_declared_count_beats_the_path_default(self):
-        """A model that measured its own optimum declares it on the class."""
+    def test_gpu_path_caps_a_count_the_model_declared(self):
+        """Contending for the scheduler's device is a property of the path, so a
+        subclass asking for concurrency does not exempt it. Qwen-VL declares two
+        and is the model that measures 9.30 -> 4.02 req/s on GB300 full-page
+        images."""
         from transformers import BaseImageProcessor
 
         from sglang.srt.multimodal.processors.base_processor import (
@@ -226,6 +229,17 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             proc = self._make_processor(
                 {}, image_processor=MagicMock(spec=BaseImageProcessor)
             )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+
+    def test_cpu_path_honours_a_count_the_model_declared(self):
+        """On the CPU path the extra threads are real parallelism, so a model's
+        own measured count stands."""
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor({})
         self.assertEqual(proc.mm_processor_worker_num, 3)
 
     def test_clone_resolves_tokenizer_like_init(self):

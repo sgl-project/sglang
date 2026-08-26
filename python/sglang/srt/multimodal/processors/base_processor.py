@@ -634,14 +634,21 @@ class BaseMultimodalProcessor(ABC):
         Two workers overlap preprocessing that runs on the CPU, where the second
         thread is real parallelism: measured on Qwen2.5-VL with full-page images
         at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-        GB300. On the GPU path the same second worker only contends for the
-        scheduler's device -- flat on H200, and 9.30 -> 4.02 req/s on GB300 --
-        so that path stays at one.
+        GB300.
+
+        The GPU path is capped at one worker even when a model declares more.
+        A declaration records what its author measured on one platform and one
+        image shape; contending for the device the scheduler is serving from is a
+        property of the path itself, and it does not go away because a subclass
+        asked for concurrency. Qwen-VL declares two and is the model that
+        measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
+        declaration here would exempt exactly the case that regresses.
+        `--mm-processor-worker-num` still overrides this.
         """
+        if self._preprocessing_competes_with_the_scheduler():
+            return 1
         declared = self.auto_mm_processor_worker_num
-        if declared is not None:
-            return declared
-        return 1 if self._preprocessing_competes_with_the_scheduler() else 2
+        return 2 if declared is None else declared
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
         """The device for the fast image processor, or None to leave it unset.
