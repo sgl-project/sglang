@@ -17,10 +17,7 @@ def get_padding(kernel_size, dilation=1):
 
 
 # Adapted from https://github.com/EdwardDixon/snake under the MIT license.
-# Not @torch.jit.script on purpose: the profiling executor runs the first
-# call per shape unfused and later calls through a fused kernel with
-# different rounding, so the same input encodes differently on a server
-# process's first request than on every later one.
+@torch.jit.script
 def snakebeta(x, alpha, beta):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
