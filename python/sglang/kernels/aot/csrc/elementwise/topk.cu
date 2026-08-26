@@ -144,7 +144,8 @@ __device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
   __syncthreads();
 
   int above = 0;
-  for (int w = wave + 1; w < kWaves; ++w) above += s_wave_total[w];
+  for (int w = wave + 1; w < kWaves; ++w)
+    above += s_wave_total[w];
   const int excl = (suf - total) + above;
 #pragma unroll
   for (int k = 0; k < kPerLane; ++k)
@@ -189,7 +190,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   int* const s_coarse = reinterpret_cast<int*>(s_input_idx);
 
   // stage 1: coarse histogram
-  for (int i = tx; i <= kCoarseBins; i += BLOCK_SIZE) s_coarse[i] = 0;
+  for (int i = tx; i <= kCoarseBins; i += BLOCK_SIZE)
+    s_coarse[i] = 0;
   __syncthreads();
 
 #ifndef USE_ROCM
