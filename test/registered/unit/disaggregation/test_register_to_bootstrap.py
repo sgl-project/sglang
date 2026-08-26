@@ -249,8 +249,7 @@ class TestRegisterToBootstrap(CustomTestCase):
                 (payload["attn_dp_rank"], payload["attn_tp_rank"])
             ] = (payload["rank_ip"], payload["rank_port"])
         complete_topology = {
-            (dp, tp): (host, rank_port)
-            for dp, tp, host, rank_port, _ in schedulers
+            (dp, tp): (host, rank_port) for dp, tp, host, rank_port, _ in schedulers
         }
         self.assertEqual(
             topology_by_registry,
