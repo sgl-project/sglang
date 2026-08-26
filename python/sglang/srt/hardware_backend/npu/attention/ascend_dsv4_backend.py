@@ -2110,6 +2110,20 @@ class DeepseekV4AscendAttnBackend(
             # is illegal inside a captured stream (§24.43 Run 27). Fixed-shape
             # where/min/max/sum only.
             count_scatter_oob(negm.reshape(-1), f"{tag}:neg")
+            # §24.45 (Run 29): full-width negative count, NO mask. The graph
+            # path pre-fills its page tables with -1 across max_pages
+            # (_init_dsv4_graph_buffers) and the replay copy only fills the
+            # valid prefix, so the masked :neg above never sees the tail. If
+            # the CANN kernel's metadata (seqused-derived width, possibly
+            # rounded up by tiling or draft-augmented) walks past the valid
+            # width, it steps into the -1 tail -> kv_base + (-1)*stride BELOW
+            # the pool base -- the r2t-corruption geometry. Discriminator:
+            #   tailneg - neg  = negatives OUTSIDE the valid region = exposed
+            #                    -1 tail mass (graph tables: expected large;
+            #                    eager sliced tables: ~0 -> mechanism off)
+            # Cumulative counters are bumped together per call, so the
+            # difference stays meaningful at any readout.
+            count_scatter_oob((t < 0).reshape(-1), f"{tag}:tailneg")
             if num_pages > 0:
                 him = (t >= num_pages) & mask
                 count_scatter_oob(him.reshape(-1), f"{tag}:hi")
