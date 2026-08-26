@@ -60,6 +60,7 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = runner.model_runner.tp_group
+    backend._use_symmetric_memory_graph_pool = False
     return backend
 
 
