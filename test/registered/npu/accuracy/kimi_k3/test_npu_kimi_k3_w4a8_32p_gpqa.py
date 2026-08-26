@@ -113,7 +113,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    accuracy = 0.9
+    accuracy = 0.935
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 32
