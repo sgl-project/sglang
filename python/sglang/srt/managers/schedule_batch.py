@@ -2802,7 +2802,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        if not self.spec_algorithm.is_none():
+            # Spec decode keeps no per-step out_cache_loc on the running batch
+            # (eagle_prepare_for_decode reserves slots inside req_to_token);
+            # gather each request's pending bonus-token slot at position
+            # seq_lens, where this mixed step writes its KV.
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                running_batch.seq_lens.long(),
+            ].to(self.out_cache_loc.dtype)
+        else:
+            running_out_cache_loc = running_batch.out_cache_loc
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc

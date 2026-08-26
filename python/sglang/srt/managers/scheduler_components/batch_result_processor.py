@@ -319,6 +319,17 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
+                    # A spec decoding request in the mixed tail committed its
+                    # pending bonus token this step (the mixed forward wrote
+                    # its KV); advance so the next eagle_prepare_for_decode
+                    # reserves from the right base.
+                    if (
+                        not req.finished()
+                        and batch.decoding_reqs
+                        and req in batch.decoding_reqs
+                        and not batch.spec_algorithm.is_none()
+                    ):
+                        req.kv_committed_len += 1
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)

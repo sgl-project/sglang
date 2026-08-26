@@ -695,7 +695,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if cfg.enable_mixed_chunk:
+    # EAGLE/EAGLE3 support mixed chunk: running requests degrade to a plain
+    # 1-token decode inside a mixed step (no draft/verify that step).
+    if cfg.enable_mixed_chunk and (cfg.speculative_algorithm or "").upper() not in (
+        "EAGLE",
+        "EAGLE3",
+    ):
         declare_resolution(
             server_args,
             "_handle_eagle_family",
@@ -703,7 +708,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "non-EAGLE speculative decoding."
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
