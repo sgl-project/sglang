@@ -81,7 +81,7 @@ async def warm_up_compile(
         )
         generate_req_input.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * dp_size
         generate_req_input.bootstrap_room = [
-            i * (2**63 // dp_size) + (i % get_parallel().config.tp_size)
+            i * (2**63 // dp_size) + (i % get_parallel().tp_size)
             for i in range(dp_size)
         ]
     else:

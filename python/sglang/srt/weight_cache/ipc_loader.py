@@ -494,6 +494,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
+            from sglang.srt.layers.dp_attention import get_moe_cp_size
             from sglang.srt.runtime_context import get_exec, get_parallel
 
             ps = get_parallel()
@@ -504,7 +505,7 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
-            moe_dp_size = ps.moe_dp_size
+            moe_dp_size = get_moe_cp_size()
             moe_dp_rank = ps.moe_dp_rank
             moe_ep_rank = ps.moe_ep_rank
 

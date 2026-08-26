@@ -245,7 +245,7 @@ class ExpertLocationMetadata:
             if get_exec().moe.ep_join_mode == "scale":
                 ep_size = max(
                     ep_size,
-                    get_parallel().ep_join_rank_offset + get_parallel().config.tp_size,
+                    get_parallel().ep_join_rank_offset + get_parallel().tp_size,
                 )
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
