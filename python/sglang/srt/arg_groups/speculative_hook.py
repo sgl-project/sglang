@@ -180,6 +180,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
+    if server_args.disaggregation_mode != "null":
+        raise ValueError(
+            "DFLASH speculative decoding is not supported with PD "
+            "disaggregation yet because the current PD transfer protocol does "
+            "not transfer DFLASH draft state. Use --disaggregation-mode null "
+            "or select a PD-supported speculative algorithm such as EAGLE or DSPARK."
+        )
+
     from sglang.srt.arg_groups.overrides import resolved_view
 
     if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
