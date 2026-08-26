@@ -19,7 +19,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.utils import is_ppu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 
 class MixedPrecisionW4Config(QuantizationConfig):
@@ -105,6 +109,18 @@ class MixedPrecisionW4Config(QuantizationConfig):
             int8_channelwise_layers=int8_channelwise_layers,
         )
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        if self.ignored_layers:
+            self.ignored_layers = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
+        if self.int8_channelwise_layers:
+            self.int8_channelwise_layers = list(
+                dict.fromkeys(
+                    hf_to_sglang_mapper.apply_list(self.int8_channelwise_layers)
+                )
+            )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -136,6 +152,12 @@ class MixedPrecisionW4Config(QuantizationConfig):
             else:
                 return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod()
             return W4AInt8MoEMethod(self)
         return None
 
