@@ -2021,7 +2021,11 @@ class DeepseekV4AttnBackend(
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+            # Attention emits bf16 regardless of q's dtype (q may be e4m3 on
+            # the trtllm fused-q path); don't derive the output dtype from q.
+            return q.new_empty(
+                q.shape[0], q.shape[1], layer.v_head_dim, dtype=torch.bfloat16
+            )
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k

@@ -492,9 +492,10 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             layer.layer_id, compress_ratio
         )
 
-        # RoPE is already applied upstream; at per-tensor scale 1.0 the FP8
-        # quantization is a plain e4m3 cast.
-        q_fp8 = q.to(torch.float8_e4m3fn)
+        # RoPE is already applied upstream; the fused q norm+rope kernel
+        # usually stores e4m3 directly (see _compute_q_b), otherwise the
+        # per-tensor-scale-1.0 FP8 quantization is a plain e4m3 cast.
+        q_fp8 = q if q.dtype == torch.float8_e4m3fn else q.to(torch.float8_e4m3fn)
 
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
 
@@ -690,9 +691,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                 src=extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW,
             )
 
-        # FP8 query: RoPE already applied upstream; per-tensor scale 1.0 makes
-        # quantization a plain e4m3 cast (same recipe as the decode branch).
-        q_fp8 = q[:sum_q].to(torch.float8_e4m3fn)
+        # FP8 query: RoPE already applied upstream; the fused q norm+rope
+        # kernel usually stores e4m3 directly (see _compute_q_b), otherwise
+        # the per-tensor-scale-1.0 quantization is a plain e4m3 cast.
+        q_fp8 = q[:sum_q]
+        if q_fp8.dtype != torch.float8_e4m3fn:
+            q_fp8 = q_fp8.to(torch.float8_e4m3fn)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio

@@ -966,7 +966,20 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
-            q_out = torch.empty_like(q)
+            # The trtllm-gen backend consumes q as e4m3: have the fused
+            # kernel store fp8 directly (bit-identical to a bf16 store
+            # followed by .to(float8_e4m3fn)) instead of paying a separate
+            # per-layer cast pass. Paths that pass a preallocated bf16
+            # q_out (TP head padding) keep the backend-side cast.
+            fp8_out = getattr(self, "_q_fp8_out", None)
+            if fp8_out is None:
+                fp8_out = bool(getattr(get_attn_backend(), "trtllm_attn", False))
+                self._q_fp8_out = fp8_out
+            q_out = torch.empty(
+                q.shape,
+                dtype=torch.float8_e4m3fn if fp8_out else q.dtype,
+                device=q.device,
+            )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -1693,8 +1706,11 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                # Attention emits bf16 regardless of q's dtype (q may be e4m3
+                # on the trtllm fused-q path); don't derive o's dtype from q.
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    dtype=torch.bfloat16,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
