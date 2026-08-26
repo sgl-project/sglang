@@ -18,7 +18,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_disagg,
     get_exec,
     get_model,
@@ -51,8 +50,8 @@ class ExpertBackupManager:
         self.weight_pointer_map = {}
         self.transfer_engine = None
         self.session_id = None
-        self.engine_num = get_parallel().nnodes
-        self.engine_rank = get_parallel().node_rank
+        self.engine_num = get_parallel().config.nnodes
+        self.engine_rank = get_parallel().config.node_rank
         self.expert_num = self.model_config.hf_config.n_routed_experts
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
@@ -60,11 +59,11 @@ class ExpertBackupManager:
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
         self.recv_from_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().node_rank * 2}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().config.node_rank * 2}"
         )
         self.send_to_expert_backup_client = context.socket(zmq.PUB)
         self.send_to_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().node_rank * 2 + 1}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().config.node_rank * 2 + 1}"
         )
         self.backup_weights_from_disk()
         self.start_transfer_server()
@@ -73,7 +72,7 @@ class ExpertBackupManager:
         # losing the initial PUB message due to slow joiners.
         num_ready_clients = 0
 
-        while num_ready_clients < configured_tp_size():
+        while num_ready_clients < get_parallel().config.tp_size:
             sock_recv(self.recv_from_expert_backup_client)
             num_ready_clients += 1
 

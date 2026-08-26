@@ -23,10 +23,10 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
@@ -1117,7 +1117,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if configured_pp_size() > 1:
+            if get_parallel().config.pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

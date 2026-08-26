@@ -1291,6 +1291,47 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
 
+def biased_topk_xpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_rows, _ = gating_output.shape
+    device = gating_output.device
+
+    output = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
+    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
+
+    from sgl_kernel import biased_topk
+
+    biased_topk(
+        gating_output,
+        correction_bias,
+        output,
+        indices,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor=(routed_scaling_factor if routed_scaling_factor else 1.0),
+        apply_routed_scaling_factor_on_output=bool(
+            apply_routed_scaling_factor_on_output
+        ),
+    )
+
+    return output, indices
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
@@ -2212,7 +2253,8 @@ def select_experts(
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
         if scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid":
-            topk_weights, topk_ids = biased_topk_jit_kernel_impl(
+            _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
+            topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,

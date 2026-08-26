@@ -6,7 +6,9 @@ Usage:
     # Per-job reports (original mode)
     python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x"
     python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --hours 48
-    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x-rocm720" --workflow "pr-test-amd-rocm720.yml" --input-data-file actions-job-snapshot.json --summary
+    # A stem matches every ROCm flavor; use the full display name to pin one
+    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --workflow "pr-test-amd-rocm720.yml" --input-data-file actions-job-snapshot.json --summary
+    python scripts/ci/utils/query_job_status.py --job "nightly-test-1-gpu-unit (rocm724, linux-mi300-1gpu-sglang)" --workflow "nightly-test-amd-rocm720.yml" --input-data-file actions-job-snapshot.json --summary
 
     # Runner fleet report (cross-workflow runner analytics)
     python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --hours 24

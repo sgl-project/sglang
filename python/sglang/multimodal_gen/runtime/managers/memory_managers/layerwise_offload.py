@@ -711,7 +711,14 @@ class LayerwiseOffloadManager:
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
-                    if hosting == "mapped" and self._mapped_regions.holds(local_weight):
+                    if (
+                        hosting == "mapped"
+                        and local_weight.is_contiguous()
+                        and self._mapped_regions.holds(local_weight)
+                    ):
+                        # Only a contiguous view can stay mapped: the reload
+                        # path allocates contiguous and would drop any other
+                        # layout without saying so.
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
@@ -727,7 +734,6 @@ class LayerwiseOffloadManager:
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
-                            "stride": local_weight.stride(),
                             "preserve_strides": False,
                             "mapped": True,
                         }
@@ -1298,7 +1304,17 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            if meta.get("preserve_strides", False):
+            if meta.get("mapped", False):
+                # The mapping is a read-only view of the checkpoint, so the new
+                # values cannot be written into it. Own the storage from here
+                # on; every reader of this store copies out of whatever tensor
+                # it holds. This trades mapped bytes for anonymous ones on the
+                # configuration that chose mapping because host memory was
+                # short, so it costs the updated weight's bytes.
+                self._mapped_cpu_weights[layer_idx][name] = (
+                    local_loaded_weight.detach().to(dtype=dtype).contiguous()
+                )
+            elif meta.get("preserve_strides", False):
                 self._strided_cpu_weights[layer_idx][name].copy_(
                     local_loaded_weight.to(dtype=dtype)
                 )

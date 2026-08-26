@@ -484,7 +484,7 @@ class MultimemAllGatherer:
             if (
                 tp_group.world_size > 1
                 and not envs.SGLANG_MULTIMEM_AG_CROSS_NODE.get()
-                and get_parallel().nnodes > 1
+                and get_parallel().config.nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
                 logger.warning(

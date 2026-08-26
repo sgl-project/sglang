@@ -607,7 +607,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_parallel().dwdp_size > 1:
+    if get_parallel().config.dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
