@@ -598,10 +598,12 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
         is_per_channel_weight: bool = False,
         activation_use_clip: bool = False,
+        is_compressed_tensors: bool = False,
     ):
         super().__init__(quant_config)
         self.is_per_channel_weight = is_per_channel_weight
         self.activation_use_clip = activation_use_clip
+        self.is_compressed_tensors = is_compressed_tensors
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
 
@@ -609,6 +611,9 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
+
+        if self.is_compressed_tensors:
+            self._process_compressed_tensors_bias(layer, weight_prefix)
 
         # Process scale (and bias if needed)
         scale = getattr(layer, f"{weight_prefix}_weight_scale")
@@ -623,15 +628,18 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                 scale_second,
                 self.is_per_channel_weight,
             )
+            if self.is_per_channel_weight and weight_prefix == "w13":
+                processed_scale = processed_scale.squeeze(1)
             setattr(
                 layer,
                 f"{weight_prefix}_weight_scale",
-                torch.nn.Parameter(processed_scale.squeeze(-1), requires_grad=False),
+                torch.nn.Parameter(processed_scale, requires_grad=False),
             )
             if scale_second is not None:
                 delattr(layer, f"{weight_prefix}_weight_scale_second")
                 delattr(layer, f"{weight_prefix}_weight_offset_second")
-            self._update_bias(layer, weight_prefix)
+            if not self.is_compressed_tensors:
+                self._update_bias(layer, weight_prefix)
         else:
             # With clip: simple squeeze + unsqueeze
             processed_scale = scale.data.squeeze(-1).unsqueeze(1).contiguous()
@@ -653,6 +661,8 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
         weight.data = weight.data.transpose(1, 2).contiguous()
+        if self.is_compressed_tensors:
+            weight.data = self._pack_int4_to_int8(weight.data)
         weight.data = npu_format_cast(weight.data)
         weight.data = self._pack_to_int32(weight.data)
 
@@ -669,6 +679,31 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
             scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+
+    @staticmethod
+    def _process_compressed_tensors_bias(
+        layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        weight = getattr(layer, f"{weight_prefix}_weight").data
+        weight = weight.transpose(1, 2).contiguous()
+        scale = getattr(layer, f"{weight_prefix}_weight_scale").data
+        scale = scale.transpose(1, 2).contiguous()
+        bias = 8 * (weight.to(torch.float32) * scale.to(torch.float32)).sum(dim=1)
+        setattr(
+            layer,
+            f"{weight_prefix}_scale_bias",
+            torch.nn.Parameter(bias, requires_grad=False),
+        )
+
+    @staticmethod
+    def _pack_int4_to_int8(weight: torch.Tensor) -> torch.Tensor:
+        if weight.shape[-1] % 2:
+            raise ValueError(
+                "Compressed-tensors W4A8 output dimension must be even, got "
+                f"{weight.shape[-1]}."
+            )
+        values = weight.reshape(*weight.shape[:-1], -1, 2)
+        return ((values[..., 1] << 4) | (values[..., 0] & 0xF)).contiguous()
 
     def _process_scale(
         self,
@@ -959,7 +994,11 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight.data, spec)
         quantized_weight = npu_format_online_weight(quantized_weight, spec)
-        weight_scale = npu_format_online_moe_scale(weight_scale, spec)
+        weight_scale = npu_format_online_moe_scale(
+            scale=weight_scale,
+            spec=spec,
+            weight_prefix=weight_prefix,
+        )
 
         copy_or_rebind_param(layer, weight_name, quantized_weight)
         copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)

@@ -132,18 +132,25 @@ def npu_format_online_dense_scale(
     scale = scale.flatten()
     if spec.weight_dtype == torch.int8:
         return scale
-    return _encode_online_int4_scale(scale)
+
+    # Match torch_npu.npu_trans_quant_param for FP16 output. QuantMatmul's
+    # INT64 carrier includes output-dequant metadata; GMM uses the raw carrier.
+    encoded = scale.contiguous().view(torch.int32).to(torch.int64)
+    return (encoded & 0xFFFFE000) | (1 << 46)
 
 
 def npu_format_online_moe_scale(
-    scale: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
+    scale: torch.Tensor,
+    spec: NPUOnlineIntegerQuantSpec,
+    weight_prefix: str,
 ) -> torch.Tensor:
     if spec.weight_dtype == torch.int8:
         return scale
 
-    # GMM uses the middle dimension as quantGroupNum. Preserve a singleton
-    # group axis so DynamicQuant's [E, N, 1] scale stays per-channel.
     scale = scale.transpose(-1, -2).contiguous()
+    # GMM1 expects per-channel [E, N], while GMM2 retains [E, 1, N].
+    if weight_prefix == "w13":
+        scale = scale.squeeze(1)
     return _encode_online_int4_scale(scale)
 
 
