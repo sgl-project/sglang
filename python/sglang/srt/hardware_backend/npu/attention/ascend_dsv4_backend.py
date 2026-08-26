@@ -955,6 +955,20 @@ class C4IndexerAscendBackendMixin:
             _pjunk = (_p64 < 0) & (_p64 != -1)
             _pjunk |= _p64 >= (1 << 31) - 2
             count_scatter_oob(_pjunk, "c4topk:proc-junk")
+            # §24.51 (scheme A): record the op geometry of THIS call so the
+            # catch-time [mf-scatter] readout names the victim batch's indexer
+            # shapes -- shape-trigger vs data-trigger without any dump.
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                record_op_shape,
+            )
+
+            _bt = fm.c4_page_table
+            record_op_shape("qli:q_rows", int(q_int8.shape[0]), q_int8)
+            record_op_shape("qli:k_rows", int(k.shape[0]), q_int8)
+            record_op_shape(
+                "qli:bt_cols", int(_bt.shape[1]) if _bt is not None and _bt.ndim == 2 else 0, q_int8
+            )
+            record_op_shape("qli:out_cols", int(topk_idxs.shape[-1]), q_int8)
         except Exception:
             pass
         return topk_idxs.view(-1, self._dsv4_index_topk)

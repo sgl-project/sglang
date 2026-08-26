@@ -93,6 +93,23 @@ def record_oob_extremes(slot: str, vals: torch.Tensor) -> None:
         torch.maximum(_OOB_MAX[slot], mx, out=_OOB_MAX[slot])
 
 
+def record_op_shape(slot: str, val: int, ref: torch.Tensor) -> None:
+    """Device-side record of one scalar (op shape dim); last call wins.
+
+    §24.51 (scheme A): the indexer's input shapes are recorded at the op
+    entry so the [mf-scatter] piggyback readout at catch time carries the
+    victim batch's op geometry -- shape-trigger vs data-trigger
+    discrimination without any dump. Same zero-sync discipline as
+    _SCATTER_OOB (only read inside the already-synchronized branch).
+    """
+    try:
+        if slot not in _SCATTER_OOB:
+            _SCATTER_OOB[slot] = torch.zeros(1, dtype=torch.int64, device=ref.device)
+        _SCATTER_OOB[slot].fill_(int(val))
+    except Exception:
+        pass
+
+
 def record_oob_first_rc(slot: str, neg2d: torch.Tensor) -> None:
     """First (row, col) containing a negative entry, INT_MAX when none.
 
