@@ -1,0 +1,469 @@
+import os
+import sys
+import unittest
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
+
+import sglang.srt.utils as srt_utils
+
+fake_aiter_for_import = ModuleType("aiter")
+fake_aiter_for_import.__path__ = []
+fake_aiter_ops = ModuleType("aiter.ops")
+fake_aiter_ops.__path__ = []
+fake_aiter_triton = ModuleType("aiter.ops.triton")
+fake_aiter_triton.__path__ = []
+fake_aiter_quant = ModuleType("aiter.ops.triton.quant")
+fake_aiter_quant.dynamic_mxfp4_quant = Mock()
+
+fake_aiter_modules = {
+    "aiter": fake_aiter_for_import,
+    "aiter.ops": fake_aiter_ops,
+    "aiter.ops.triton": fake_aiter_triton,
+    "aiter.ops.triton.quant": fake_aiter_quant,
+}
+missing_module = object()
+previous_aiter_modules = {
+    name: sys.modules.get(name, missing_module) for name in fake_aiter_modules
+}
+sys.modules.update(fake_aiter_modules)
+try:
+    with (
+        patch.dict(os.environ, {"SGLANG_USE_AITER": "0"}),
+        patch.object(srt_utils, "is_hip", return_value=False),
+        patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=SimpleNamespace(gcnArchName="gfx950", major=9, minor=5),
+        ),
+    ):
+        import sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer as aiter_fp4_indexer
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.indexer import (
+            C4IndexerBackendMixin,
+            topk_transform_512_pytorch_vectorized,
+        )
+        from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.test.ci.ci_register import register_cpu_ci
+finally:
+    for module_name, previous_module in previous_aiter_modules.items():
+        if previous_module is missing_module:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _fake_flydsl():
+    flydsl = ModuleType("aiter.ops.flydsl")
+    flydsl.flydsl_pa_mqa_logits_fp4 = Mock()
+    flydsl.flydsl_pa_mqa_logits_fp4_prefill = Mock()
+    aiter = ModuleType("aiter")
+    aiter.__path__ = []
+    ops = ModuleType("aiter.ops")
+    ops.__path__ = []
+    aiter.ops = ops
+    ops.flydsl = flydsl
+    return flydsl, {
+        "aiter": aiter,
+        "aiter.ops": ops,
+        "aiter.ops.flydsl": flydsl,
+    }
+
+
+class TestAITERFP4IndexerLogits(unittest.TestCase):
+    def _make_dispatch(self, *, mode, num_tokens, metadata_rows, batch_size):
+        page_table = torch.arange(metadata_rows * 2, dtype=torch.int32).reshape(
+            metadata_rows, 2
+        )
+        c4_seq_lens = torch.arange(11, 11 + metadata_rows, dtype=torch.int32)
+        with envs.SGLANG_OPT_USE_TOPK_V2.override(False):
+            indexer_metadata = PagedIndexerMetadata(
+                page_size=256,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                uses_aiter_fp4_layout=True,
+            )
+        core_metadata = SimpleNamespace(
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            page_table=page_table,
+            c4_sparse_page_indices=torch.full(
+                (metadata_rows, 512), -1, dtype=torch.int32
+            ),
+        )
+
+        q_fp4 = torch.empty((num_tokens, 64, 64), dtype=torch.float4_e2m1fn_x2)
+        q_scale = torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8)
+        weight_storage = torch.arange(num_tokens * 64 * 2, dtype=torch.float32).to(
+            torch.bfloat16
+        )
+        raw_weights = weight_storage.reshape(num_tokens, 128)[:, ::2]
+        self.assertEqual(raw_weights.shape, (num_tokens, 64))
+        self.assertFalse(raw_weights.is_contiguous())
+
+        num_pages = metadata_rows * page_table.shape[1]
+        k_payload = torch.empty((num_pages, 1, 4, 64, 16), dtype=torch.float4_e2m1fn_x2)
+        k_scale = torch.empty((num_pages, 1, 4, 64), dtype=torch.uint8)
+        token_pool = SimpleNamespace(
+            get_index_k_fp4_payload_buffer=Mock(return_value=k_payload),
+            get_index_k_fp4_scale_buffer=Mock(return_value=k_scale),
+            get_index_k_with_scale_buffer=Mock(
+                side_effect=AssertionError("combined accessor must not be used")
+            ),
+        )
+        backend = C4IndexerBackendMixin.__new__(C4IndexerBackendMixin)
+        backend.token_to_kv_pool = token_pool
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=indexer_metadata,
+            core_metadata=core_metadata,
+        )
+        backend.debug_use_external_c4_sparse_indices = True
+        backend._forward_prepare_normal = Mock(
+            return_value=((q_fp4, q_scale), raw_weights)
+        )
+        backend._get_nonpaged_indexer_plan = Mock(
+            side_effect=AssertionError("AITER FP4 must not use nonpaged DeepGEMM")
+        )
+        c4_indexer = SimpleNamespace(
+            use_fp4_indexer=True,
+            layer_id=7,
+            weight_scale=0.03125,
+        )
+        forward_batch = SimpleNamespace(forward_mode=mode, batch_size=batch_size)
+        return SimpleNamespace(
+            backend=backend,
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            token_pool=token_pool,
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            raw_weights=raw_weights,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            page_table=page_table,
+            c4_seq_lens=c4_seq_lens,
+        )
+
+    def _run_dispatch(self, case):
+        flydsl, modules = _fake_flydsl()
+        padded_width = max(4, (case.page_table.shape[1] + 3) // 4 * 4)
+        output = torch.full(
+            (case.q_fp4.shape[0], padded_width * 64),
+            float("-inf"),
+        )
+        for row, seq_len in enumerate(case.c4_seq_lens[: case.q_fp4.shape[0]].tolist()):
+            output[row, :seq_len] = row
+        flydsl.flydsl_pa_mqa_logits_fp4.return_value = output
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = output
+
+        with patch.dict(sys.modules, modules):
+            case.backend.forward_c4_indexer(
+                x=torch.empty(case.q_fp4.shape[0], 1),
+                q_lora=torch.empty(case.q_fp4.shape[0], 1),
+                c4_indexer=case.c4_indexer,
+                forward_batch=case.forward_batch,
+            )
+
+        case.token_pool.get_index_k_fp4_payload_buffer.assert_called_once_with(
+            layer_id=7
+        )
+        case.token_pool.get_index_k_fp4_scale_buffer.assert_called_once_with(layer_id=7)
+        case.token_pool.get_index_k_with_scale_buffer.assert_not_called()
+        case.backend._get_nonpaged_indexer_plan.assert_not_called()
+        return flydsl
+
+    def _assert_common_call(self, call_args, case):
+        args = call_args.args
+        self.assertEqual(args[2].dtype, torch.uint8)
+        self.assertEqual(args[2].data_ptr(), case.k_payload.data_ptr())
+        self.assertEqual(args[2].shape, case.k_payload.shape)
+        self.assertIs(args[3], case.k_scale)
+        self.assertEqual(args[4].dtype, torch.int32)
+        self.assertTrue(args[4].is_contiguous())
+        self.assertEqual(args[5].dtype, torch.bfloat16)
+        self.assertTrue(args[5].is_contiguous())
+        torch.testing.assert_close(args[5], case.raw_weights)
+        padded_width = max(4, (case.page_table.shape[1] + 3) // 4 * 4)
+        self.assertEqual(args[4].shape, (case.q_fp4.shape[0], padded_width))
+        self.assertEqual(args[-1], padded_width * 64)
+        self.assertEqual(
+            call_args.kwargs,
+            {
+                "weight_scale": case.c4_indexer.weight_scale,
+                "block_k": 256,
+                "kv_block_size": 64,
+                "num_warps": 4,
+                **(
+                    {"next_n": 1, "parallel_unit_num": None}
+                    if case.forward_batch.forward_mode.is_decode()
+                    else {"parallel_unit_num": 512}
+                ),
+            },
+        )
+
+    def test_decode_uses_exact_flydsl_call_and_split_cache(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.DECODE,
+            num_tokens=2,
+            metadata_rows=3,
+            batch_size=2,
+        )
+        flydsl = self._run_dispatch(case)
+
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_not_called()
+        flydsl.flydsl_pa_mqa_logits_fp4.assert_called_once()
+        call_args = flydsl.flydsl_pa_mqa_logits_fp4.call_args
+        self._assert_common_call(call_args, case)
+        args = call_args.args
+        self.assertEqual(args[0].shape, (2, 1, 64, 64))
+        self.assertEqual(args[0].dtype, torch.uint8)
+        self.assertEqual(args[0].data_ptr(), case.q_fp4.data_ptr())
+        self.assertEqual(args[1].shape, (2, 1, 1, 4, 16, 4))
+        self.assertEqual(args[1].dtype, torch.uint8)
+        expected_page_table = torch.zeros((2, 4), dtype=torch.int32)
+        expected_page_table[:, :2] = case.page_table[:2]
+        torch.testing.assert_close(args[4], expected_page_table)
+        torch.testing.assert_close(args[6], case.c4_seq_lens[:2])
+
+    def test_extend_and_target_verify_use_exact_prefill_call(self):
+        for mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                case = self._make_dispatch(
+                    mode=mode,
+                    num_tokens=3,
+                    metadata_rows=2,
+                    batch_size=1,
+                )
+                flydsl = self._run_dispatch(case)
+
+                flydsl.flydsl_pa_mqa_logits_fp4.assert_not_called()
+                flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_called_once()
+                call_args = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args
+                self._assert_common_call(call_args, case)
+                args = call_args.args
+                self.assertEqual(args[0].dtype, torch.uint8)
+                self.assertEqual(args[0].data_ptr(), case.q_fp4.data_ptr())
+                self.assertEqual(args[0].shape, case.q_fp4.shape)
+                self.assertIs(args[1], case.q_scale)
+                self.assertEqual(args[0].shape, (3, 64, 64))
+                self.assertEqual(args[1].shape, (3, 1, 4, 16, 4))
+                expected_page_table = torch.zeros((3, 4), dtype=torch.int32)
+                expected_page_table[:2, :2] = case.page_table
+                torch.testing.assert_close(args[4], expected_page_table)
+                torch.testing.assert_close(args[6], torch.arange(3, dtype=torch.int32))
+                torch.testing.assert_close(args[7], torch.zeros(3, dtype=torch.int32))
+                torch.testing.assert_close(
+                    args[8],
+                    torch.cat((case.c4_seq_lens, torch.zeros(1, dtype=torch.int32))),
+                )
+                logits = flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value
+                self.assertTrue(torch.isneginf(logits[-1]).all())
+                topk_output = torch.zeros((3, 512), dtype=torch.int32)
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    args[8],
+                    args[4],
+                    topk_output,
+                    page_size=64,
+                )
+                torch.testing.assert_close(
+                    topk_output[-1], torch.full((512,), -1, dtype=torch.int32)
+                )
+
+    def test_page_table_padding_preserves_rows_and_logical_output_width(self):
+        num_tokens = 3
+        q_fp4 = torch.empty((num_tokens, 64, 64), dtype=torch.float4_e2m1fn_x2)
+        q_scale = torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8)
+        weights = torch.empty((num_tokens, 64), dtype=torch.bfloat16)
+
+        for is_decode in (True, False):
+            for page_table_width in (1, 2, 3, 4, 5):
+                with self.subTest(
+                    is_decode=is_decode, page_table_width=page_table_width
+                ):
+                    page_table = torch.arange(
+                        1,
+                        num_tokens * page_table_width + 1,
+                        dtype=torch.int32,
+                    ).reshape(num_tokens, page_table_width)
+                    original_page_table = page_table.clone()
+                    num_pages = int(page_table.max()) + 1
+                    k_payload = torch.empty(
+                        (num_pages, 1, 4, 64, 16),
+                        dtype=torch.float4_e2m1fn_x2,
+                    )
+                    k_scale = torch.empty((num_pages, 1, 4, 64), dtype=torch.uint8)
+                    c4_seq_lens = torch.full(
+                        (num_tokens,), page_table_width * 64, dtype=torch.int32
+                    )
+                    padded_width = max(4, (page_table_width + 3) // 4 * 4)
+                    padded_logits = torch.arange(
+                        num_tokens * padded_width * 64, dtype=torch.float32
+                    ).reshape(num_tokens, padded_width * 64)
+                    flydsl, modules = _fake_flydsl()
+                    selected_kernel = (
+                        flydsl.flydsl_pa_mqa_logits_fp4
+                        if is_decode
+                        else flydsl.flydsl_pa_mqa_logits_fp4_prefill
+                    )
+                    selected_kernel.return_value = padded_logits
+
+                    with patch.dict(sys.modules, modules):
+                        logits = aiter_fp4_indexer.aiter_fp4_paged_mqa_logits(
+                            q_fp4=q_fp4,
+                            q_scale=q_scale,
+                            k_payload=k_payload,
+                            k_scale=k_scale,
+                            weights=weights,
+                            page_table=page_table,
+                            c4_seq_lens=c4_seq_lens,
+                            weight_scale=0.03125,
+                            is_decode=is_decode,
+                        )
+
+                    padded_page_table = selected_kernel.call_args.args[4]
+                    expected_page_table = torch.zeros(
+                        (num_tokens, padded_width), dtype=torch.int32
+                    )
+                    expected_page_table[:, :page_table_width] = page_table
+                    self.assertEqual(
+                        padded_page_table.shape, (num_tokens, padded_width)
+                    )
+                    self.assertEqual(padded_page_table.dtype, torch.int32)
+                    self.assertTrue(padded_page_table.is_contiguous())
+                    torch.testing.assert_close(padded_page_table, expected_page_table)
+                    self.assertEqual(
+                        selected_kernel.call_args.args[-1], padded_width * 64
+                    )
+                    self.assertEqual(logits.shape, (num_tokens, page_table_width * 64))
+                    self.assertTrue(logits.is_contiguous())
+                    torch.testing.assert_close(
+                        logits, padded_logits[:, : page_table_width * 64]
+                    )
+                    torch.testing.assert_close(page_table, original_page_table)
+
+    def test_prefill_dispatch_uses_call_local_graph_pool_temporaries(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.EXTEND,
+            num_tokens=2,
+            metadata_rows=2,
+            batch_size=1,
+        )
+        flydsl, modules = _fake_flydsl()
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.return_value = torch.empty(
+            (2, 256), dtype=torch.float32
+        )
+        real_arange = torch.arange
+        real_zeros = torch.zeros
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(
+                aiter_fp4_indexer.torch, "arange", wraps=real_arange
+            ) as arange,
+            patch.object(aiter_fp4_indexer.torch, "zeros", wraps=real_zeros) as zeros,
+        ):
+            case.backend.forward_c4_indexer(
+                x=torch.empty(case.q_fp4.shape[0], 1),
+                q_lora=torch.empty(case.q_fp4.shape[0], 1),
+                c4_indexer=case.c4_indexer,
+                forward_batch=case.forward_batch,
+            )
+
+        case.backend._forward_prepare_normal.assert_called_once()
+        case.token_pool.get_index_k_fp4_payload_buffer.assert_called_once_with(
+            layer_id=7
+        )
+        case.token_pool.get_index_k_fp4_scale_buffer.assert_called_once_with(layer_id=7)
+        flydsl.flydsl_pa_mqa_logits_fp4.assert_not_called()
+        flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_called_once()
+        args = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args.args
+        torch.testing.assert_close(
+            args[4], torch.tensor([[0, 1, 0, 0], [2, 3, 0, 0]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(args[6], torch.arange(2, dtype=torch.int32))
+        torch.testing.assert_close(args[7], torch.zeros(2, dtype=torch.int32))
+        torch.testing.assert_close(args[8], case.c4_seq_lens)
+        arange.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
+        zeros.assert_called_once_with(2, device=case.q_fp4.device, dtype=torch.int32)
+
+    def test_cuda_fp4_dispatch_remains_deep_gemm_combined(self):
+        num_tokens = 3
+        page_table = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+        indexer_metadata = PagedIndexerMetadata.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.page_table = page_table
+        indexer_metadata.c4_seq_lens = torch.tensor([11, 12], dtype=torch.int32)
+        indexer_metadata.force_deep_gemm_metadata = False
+        indexer_metadata.use_prefill_cuda_graph = False
+        indexer_metadata.uses_aiter_fp4_layout = False
+        indexer_metadata.deep_gemm_metadata = object()
+        indexer_metadata.topk_metadata = torch.empty(0)
+        indexer_metadata.nonpaged_plan = None
+        core_metadata = SimpleNamespace(
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            page_table=page_table,
+            c4_sparse_page_indices=torch.full((num_tokens, 512), -1, dtype=torch.int32),
+        )
+        q_fp4 = torch.empty((num_tokens, 64, 64), dtype=torch.float4_e2m1fn_x2)
+        q_scale = torch.empty((num_tokens, 4), dtype=torch.uint8)
+        raw_weights = torch.randn(num_tokens, 64, 1, dtype=torch.bfloat16)
+        combined = torch.empty((3, 64 * 68), dtype=torch.uint8)
+        token_pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=Mock(return_value=combined),
+            get_index_k_fp4_payload_buffer=Mock(),
+            get_index_k_fp4_scale_buffer=Mock(),
+        )
+        backend = C4IndexerBackendMixin.__new__(C4IndexerBackendMixin)
+        backend.token_to_kv_pool = token_pool
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=indexer_metadata,
+            core_metadata=core_metadata,
+        )
+        backend.debug_use_external_c4_sparse_indices = True
+        backend._forward_prepare_normal = Mock(
+            return_value=((q_fp4, q_scale), raw_weights)
+        )
+        backend._get_nonpaged_indexer_plan = Mock(return_value=None)
+        c4_indexer = SimpleNamespace(
+            use_fp4_indexer=True, layer_id=7, weight_scale=0.03125, index_topk=512
+        )
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_paged_mqa_logits = Mock(
+            return_value=torch.empty((num_tokens, 128))
+        )
+
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            backend.forward_c4_indexer(
+                x=torch.empty(num_tokens, 1),
+                q_lora=torch.empty(num_tokens, 1),
+                c4_indexer=c4_indexer,
+                forward_batch=SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND, batch_size=1
+                ),
+            )
+
+        token_pool.get_index_k_with_scale_buffer.assert_called_once_with(layer_id=7)
+        token_pool.get_index_k_fp4_payload_buffer.assert_not_called()
+        token_pool.get_index_k_fp4_scale_buffer.assert_not_called()
+        deep_gemm.fp8_fp4_paged_mqa_logits.assert_called_once()
+        args = deep_gemm.fp8_fp4_paged_mqa_logits.call_args.args
+        self.assertEqual(args[0][0].shape, (num_tokens, 1, 64, 64))
+        self.assertEqual(args[0][1].shape, (num_tokens, 1, 4))
+        self.assertEqual(args[1].shape, (3, 64, 1, 68))
+        self.assertEqual(args[2].dtype, torch.float32)
+        torch.testing.assert_close(
+            args[3], torch.tensor([[11], [12], [1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            args[4], torch.tensor([[0, 1], [1, 0], [0, 0]], dtype=torch.int32)
+        )
+        self.assertIs(args[5], indexer_metadata.deep_gemm_metadata)
+        self.assertEqual(args[6:], (128, False))
+
+
+if __name__ == "__main__":
+    unittest.main()

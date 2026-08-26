@@ -114,6 +114,7 @@ class PagedIndexerMetadata:
     c4_seq_lens: torch.Tensor
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    uses_aiter_fp4_layout: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -121,11 +122,14 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or is_xpu()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ) and not self.force_deep_gemm_metadata:
+        if self.uses_aiter_fp4_layout or (
+            (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                or is_xpu()
+                or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            )
+            and not self.force_deep_gemm_metadata
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -188,6 +192,7 @@ class PagedIndexerMetadata:
                 "page_size",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
+                "uses_aiter_fp4_layout",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

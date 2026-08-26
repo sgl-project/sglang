@@ -22,6 +22,11 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_512,
     topk_transform_512_v2,
 )
+from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
+    aiter_fp4_paged_mqa_logits,
+    aiter_q_indexer_rope_hadamard_fp4_quant,
+    prepare_aiter_fp4_indexer_cos_sin,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -661,6 +666,9 @@ class C4IndexerBackendMixin:
         core_metadata = metadata.core_metadata
 
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
+        use_aiter_fp4_indexer = (
+            c4_indexer.use_fp4_indexer and indexer_metadata.uses_aiter_fp4_layout
+        )
 
         positions = core_metadata.positions
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
@@ -694,7 +702,10 @@ class C4IndexerBackendMixin:
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
-        if use_fp4_indexer:
+        if use_aiter_fp4_indexer:
+            q_fp4, q_sf = q_indexer
+            q = (q_fp4, q_sf)
+        elif use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
             assert len(q_sf.shape) == 2
@@ -703,13 +714,28 @@ class C4IndexerBackendMixin:
             assert len(q_indexer.shape) == 3
             q = q_indexer.unsqueeze(1)
 
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
-        if use_fp4_indexer:
+        if use_aiter_fp4_indexer:
+            if weights.shape != q_indexer[0].shape[:2]:
+                raise ValueError(
+                    "AITER FP4 indexer requires raw weights shape [T, 64]; "
+                    f"got {tuple(weights.shape)}"
+                )
+            if weights.dtype != torch.bfloat16:
+                raise ValueError(
+                    "AITER FP4 indexer requires raw bfloat16 weights from "
+                    "compute_weights(skip_scale=True)"
+                )
+            weights = weights.contiguous()
+        else:
+            assert len(weights.shape) == 3
+            weights = weights.squeeze(2)
+        if use_fp4_indexer and not use_aiter_fp4_indexer:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+        elif use_aiter_fp4_indexer:
+            fn = None
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -731,6 +757,15 @@ class C4IndexerBackendMixin:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+        if (
+            use_aiter_fp4_indexer
+            and forward_batch.forward_mode.is_decode()
+            and query_rows != forward_batch.batch_size
+        ):
+            raise ValueError(
+                "AITER FP4 indexer decode requires one query row per batch "
+                f"entry; got T={query_rows}, batch_size={forward_batch.batch_size}"
+            )
 
         def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
             if tensor.shape[0] == query_rows:
@@ -740,7 +775,10 @@ class C4IndexerBackendMixin:
             pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
             return F.pad(tensor, pad, value=value)
 
-        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        c4_seq_lens = match_num_queries(
+            indexer_metadata.c4_seq_lens,
+            value=0 if use_aiter_fp4_indexer else 1,
+        )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
         c4_sparse_page_indices = match_num_queries(
@@ -758,17 +796,37 @@ class C4IndexerBackendMixin:
             and not _use_tilelang
             and not _use_aiter
             and not _use_torch_fn
+            and not use_aiter_fp4_indexer
         ):
             _c4sl = _c4sl.unsqueeze(-1)
-        nonpaged_plan = self._get_nonpaged_indexer_plan(
-            c4_indexer=c4_indexer,
-            forward_batch=forward_batch,
-            indexer_metadata=indexer_metadata,
-            page_table=page_table,
-            c4_seq_lens=c4_seq_lens,
-            query_rows=query_rows,
-        )
-        if nonpaged_plan is not None:
+        nonpaged_plan = None
+        if not use_aiter_fp4_indexer:
+            nonpaged_plan = self._get_nonpaged_indexer_plan(
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+                indexer_metadata=indexer_metadata,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                query_rows=query_rows,
+            )
+        if use_aiter_fp4_indexer:
+            q_fp4, q_scale = q
+            logits = aiter_fp4_paged_mqa_logits(
+                q_fp4=q_fp4,
+                q_scale=q_scale,
+                k_payload=token_to_kv_pool.get_index_k_fp4_payload_buffer(
+                    layer_id=c4_indexer.layer_id
+                ),
+                k_scale=token_to_kv_pool.get_index_k_fp4_scale_buffer(
+                    layer_id=c4_indexer.layer_id
+                ),
+                weights=weights,
+                page_table=page_table,
+                c4_seq_lens=c4_seq_lens,
+                weight_scale=c4_indexer.weight_scale,
+                is_decode=forward_batch.forward_mode.is_decode(),
+            )
+        elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
@@ -893,6 +951,8 @@ class C4Indexer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         rotary_emb=None,
+        aiter_fp4_cos: Optional[torch.Tensor] = None,
+        aiter_fp4_sin: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -904,6 +964,23 @@ class C4Indexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        if self.use_fp4_indexer and is_hip():
+            if aiter_fp4_cos is None or aiter_fp4_sin is None:
+                if aiter_fp4_cos is not None or aiter_fp4_sin is not None:
+                    raise ValueError(
+                        "AITER FP4 C4Indexer requires both shared cos and sin tables"
+                    )
+                aiter_fp4_cos, aiter_fp4_sin = prepare_aiter_fp4_indexer_cos_sin(
+                    freqs_cis
+                )
+                owns_aiter_fp4_rope = True
+            else:
+                owns_aiter_fp4_rope = False
+        else:
+            aiter_fp4_cos = None
+            aiter_fp4_sin = None
+            owns_aiter_fp4_rope = False
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -937,11 +1014,22 @@ class C4Indexer(nn.Module):
             quant_config=expert_pack_quant_config,
             rotary_emb=rotary_emb,
         )
+        if aiter_fp4_cos is not None:
+            assert aiter_fp4_sin is not None
+            if owns_aiter_fp4_rope:
+                self.compressor.register_buffer(
+                    "aiter_fp4_cos", aiter_fp4_cos, persistent=False
+                )
+                self.compressor.register_buffer(
+                    "aiter_fp4_sin", aiter_fp4_sin, persistent=False
+                )
+            else:
+                self.compressor.aiter_fp4_cos = aiter_fp4_cos
+                self.compressor.aiter_fp4_sin = aiter_fp4_sin
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
 
-        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
 
     def compute_q(
@@ -952,6 +1040,16 @@ class C4Indexer(nn.Module):
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_fp4_indexer and is_hip():
+            cos = getattr(self.compressor, "aiter_fp4_cos")
+            sin = getattr(self.compressor, "aiter_fp4_sin")
+            q_fp4, q_scale = aiter_q_indexer_rope_hadamard_fp4_quant(
+                q.contiguous(),
+                cos,
+                sin,
+                positions,
+            )
+            return (q_fp4, q_scale), weight
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions

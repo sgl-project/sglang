@@ -156,6 +156,10 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        kv_scale_cache: Optional[torch.Tensor] = None,
+        use_aiter_fp4_indexer: bool = False,
+        aiter_fp4_cos: Optional[torch.Tensor] = None,
+        aiter_fp4_sin: Optional[torch.Tensor] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -163,6 +167,12 @@ class CompressorBackendMixin:
             assert is_indexer
             assert compress_ratio == 4
             assert head_dim == 128
+        if use_aiter_fp4_indexer:
+            assert use_fp4_indexer
+            assert page_size == 64
+            assert kv_scale_cache is not None
+            assert aiter_fp4_cos is not None
+            assert aiter_fp4_sin is not None
 
         plan = self._get_paged_compress_metadata(compress_ratio)
         is_online = _use_online_compress(compress_ratio)
@@ -184,6 +194,24 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=is_online,
         )
+
+        if use_aiter_fp4_indexer:
+            from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
+                aiter_k_indexer_fp4_cache_write,
+            )
+
+            aiter_k_indexer_fp4_cache_write(
+                k=kv_compressed,
+                norm_weight=norm.weight,
+                norm_epsilon=norm.variance_epsilon,
+                cos=aiter_fp4_cos,
+                sin=aiter_fp4_sin,
+                plan=plan,
+                out_loc=out_loc,
+                k_payload=kv_cache,
+                k_scale=kv_scale_cache,
+            )
+            return
 
         # Step 2: norm + rope + store
         compress_norm_rope_store(
@@ -222,10 +250,17 @@ class CompressorBackendMixin:
         use_fp4_indexer = (
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
         )
+        use_aiter_fp4_indexer = _is_hip and use_fp4_indexer
         bf16_store = False
+        kv_scale_cache = None
         if compressor.is_in_indexer:
-            kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
+            if use_aiter_fp4_indexer:
+                assert page_size == 64
+                kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
+                kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)
+            else:
+                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
         elif is_unified_kv_triton():
             kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
             page_size = 1
@@ -248,7 +283,9 @@ class CompressorBackendMixin:
             head_dim=compressor.head_dim,
             norm=compressor.norm,
             freqs_cis_cache=compressor.freqs_cis,
-            kv_cache=kv_cache.view(dtype=torch.uint8),
+            kv_cache=(
+                kv_cache if use_aiter_fp4_indexer else kv_cache.view(dtype=torch.uint8)
+            ),
             is_indexer=compressor.is_in_indexer,
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
@@ -256,6 +293,14 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
+            kv_scale_cache=kv_scale_cache,
+            use_aiter_fp4_indexer=use_aiter_fp4_indexer,
+            aiter_fp4_cos=(
+                getattr(compressor, "aiter_fp4_cos") if use_aiter_fp4_indexer else None
+            ),
+            aiter_fp4_sin=(
+                getattr(compressor, "aiter_fp4_sin") if use_aiter_fp4_indexer else None
+            ),
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
 )
@@ -457,7 +458,7 @@ class DeepseekV4HipRadixBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
-            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+            get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -492,6 +493,7 @@ class DeepseekV4HipRadixBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            uses_aiter_fp4_layout=self.enable_deepseek_v4_fp4_indexer,
         )
 
     def init_forward_metadata_decode(
