@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 
 import torch
 
@@ -331,6 +332,60 @@ class TestNixlUnified(CustomTestCase):
             fds_before,
             "fd leak after register_memory failure mid-storage",
         )
+
+    def test_path_mode_dev_ids_are_disjoint_across_overlapping_contexts(self):
+        registry = self.hicache.registry
+        if not registry.path_mode:
+            self.skipTest("installed NIXL does not support path-mode FILE registration")
+
+        captured = []
+        original_registered = registry._registered
+
+        class _FakeRegistration:
+            def trim(self):
+                return self
+
+        @contextmanager
+        def capture_registered(items, mem_type):
+            captured.append([item[2] for item in items])
+            yield _FakeRegistration()
+
+        registry._registered = capture_registered
+        try:
+            with registry.storage([(0, 64), (0, 64)], ["first-a", "first-b"], "WRITE"):
+                with registry.storage(
+                    [(0, 64), (0, 64)], ["second-a", "second-b"], "WRITE"
+                ):
+                    pass
+        finally:
+            registry._registered = original_registered
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(len(captured[0]), len(set(captured[0])))
+        self.assertEqual(len(captured[1]), len(set(captured[1])))
+        self.assertTrue(set(captured[0]).isdisjoint(captured[1]))
+
+    def test_overlapping_path_mode_registrations_succeed(self):
+        registry = self.hicache.registry
+        if not registry.path_mode:
+            self.skipTest("installed NIXL does not support path-mode FILE registration")
+
+        first_paths = [
+            os.path.join(self.test_dir, "first-a"),
+            os.path.join(self.test_dir, "first-b"),
+        ]
+        second_paths = [
+            os.path.join(self.test_dir, "second-a"),
+            os.path.join(self.test_dir, "second-b"),
+        ]
+
+        # Keep the first registration active while opening the second one.
+        # Newer NIXL rejects active devId collisions; older supported versions
+        # accept them but cannot unambiguously associate both paths with one ID.
+        with registry.storage([(0, 64), (0, 64)], first_paths, "WRITE") as first:
+            self.assertIsNotNone(first)
+            with registry.storage([(0, 64), (0, 64)], second_paths, "WRITE") as second:
+                self.assertIsNotNone(second)
 
     def _assert_host_addrs_pre_registered(
         self, is_zero_copy_mode: bool, hicache: HiCacheNixl = None
