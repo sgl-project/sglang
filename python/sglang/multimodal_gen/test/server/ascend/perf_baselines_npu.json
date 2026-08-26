@@ -398,7 +398,7 @@
                 "GlmImageAR": 69033.12,
                 "GlmImageBeforeDenoisingStage": 46.04,
                 "DenoisingStage": 18392.5,
-                "DecodingStage": 153.7
+                "GlmImageDecodingStage": 153.7
             },
             "denoise_step_ms": {
                 "0": 479.04,
