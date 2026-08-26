@@ -64,7 +64,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **Mamba backend**:
 
-    The Mamba layers use the Triton SSM kernels by default. For better performance, set `--mamba-backend flashinfer` to use the FlashInfer Mamba kernels instead.
+    The deployment generator uses the FlashInfer Mamba kernels for higher decode throughput. Select Triton to use the runtime-default SSM kernels instead.
 
 - **Mamba SSM precision**:
 
@@ -72,7 +72,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **Mamba SSM stochastic rounding**:
 
-    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with the default `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
+    When storing the Mamba states in FP16, add `--enable-mamba-cache-stochastic-rounding` to round SSM cache writes stochastically and reduce accumulation bias. It requires `--mamba-ssm-dtype float16` and CUDA; with `--mamba-backend triton` it additionally requires SM100. Use `--mamba-cache-philox-rounds` to control the number of Philox rounds (`0` uses the backend default).
 
 - **TP support**:
 
