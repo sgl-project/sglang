@@ -102,32 +102,21 @@ def _convert_packed_int4_weight(weight: torch.Tensor) -> torch.Tensor:
     return converted.reshape(*weight.shape[:-2], input_size, output_size // 8)
 
 
-def _convert_packed_int4_dense_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Convert dynamic-quant INT4 output to the offline dense layout."""
-    if weight.dtype != torch.int32:
-        raise TypeError(
-            "Ascend INT4 dynamic quantization must return torch.int32, got "
-            f"{weight.dtype}."
-        )
+def npu_quantize_w4a4_dense_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply ModelSlim-compatible symmetric per-channel INT4 quantization."""
     if weight.dim() != 2:
         raise ValueError(
-            "Ascend INT4 dense weights must be two-dimensional, got "
+            "Ascend W4A4 dense weights must be two-dimensional, got "
             f"shape {tuple(weight.shape)}."
         )
 
-    output_size, packed_input_size = weight.shape
-    input_size = packed_input_size * 8
-    unpacked = torch.empty(
-        (output_size, input_size), dtype=torch.int32, device=weight.device
-    )
-    for column_offset, source_shift in enumerate(range(0, 32, 4)):
-        values = (weight >> source_shift) & 0xF
-        unpacked[:, column_offset::8] = torch.where(
-            values < 8, values, values - 16
-        )
-
-    packed = torch.ops.npu.npu_convert_weight_to_int4pack(unpacked)
-    return packed.transpose(-1, -2)
+    scale = weight.abs().amax(dim=-1) / 7.0
+    scale = scale.clamp_min(torch.finfo(weight.dtype).eps)
+    quantized = torch.round(weight / scale.unsqueeze(-1))
+    quantized = quantized.clamp_(-8, 7).to(torch.int32)
+    return quantized, scale.to(torch.float32)
 
 
 def npu_format_online_weight(
@@ -146,9 +135,19 @@ def npu_format_online_dense_weight(
     weight: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
     if spec.mode == "w4a4_int4":
-        # Match the established offline LAOS contract: pack logical [N, K],
-        # then expose the transposed [K / 8, N] view to QuantMatmul.
-        return _convert_packed_int4_dense_weight(weight)
+        if weight.dtype != torch.int32:
+            raise TypeError(
+                "Ascend W4A4 dense quantization must produce torch.int32, got "
+                f"{weight.dtype}."
+            )
+        if weight.shape[-2] % 8:
+            raise ValueError(
+                "Ascend W4A4 dense output size must be divisible by 8, got "
+                f"{weight.shape[-2]}."
+            )
+        # Match SGLang's working offline ModelSlim path exactly.
+        weight = weight.transpose(-2, -1).contiguous()
+        return torch.ops.npu.npu_convert_weight_to_int4pack(weight)
     return npu_format_online_weight(weight, spec)
 
 
