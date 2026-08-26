@@ -380,10 +380,10 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     an FP8 linear using static per-tensor activation scaling that can consume a
     pre-quantized ``(fp8, scale)`` input; otherwise ``None``.
 
-    Recognizes both the native ``Fp8LinearMethod`` (non block/mxfp8/marlin) and
-    the compressed-tensors W8A8-FP8 scheme with a static per-tensor input scale
-    (e.g. RedHatAI ``*-FP8`` checkpoints). The flashinfer fused kernel only
-    supports per-tensor quant, hence the ``numel() == 1`` requirement.
+    Recognizes native and ModelOpt FP8 linears (excluding block/mxfp8/marlin)
+    plus the compressed-tensors W8A8-FP8 scheme with a static per-tensor input
+    scale. The FlashInfer fused kernel only supports per-tensor quant, hence the
+    ``numel() == 1`` requirement.
     """
     if linear is None:
         return None
@@ -398,6 +398,46 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     return input_scale
 
 
+def _forward_with_allreduce_fusion_static_fp8_quant(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    quant_linear,
+    use_attn_tp_group: bool,
+    keep_bf16: bool,
+):
+    if residual is None:
+        return None
+    scale = _fp8_static_input_scale(quant_linear)
+    if scale is None:
+        return None
+
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant,
+    )
+
+    max_token_num = 2048
+    if not torch.compiler.is_compiling():
+        max_token_num = max(x.shape[0], max_token_num)
+    quant_out, residual_out, norm_out = (
+        try_flashinfer_allreduce_residual_rmsnorm_static_fp8_quant(
+            x,
+            residual,
+            weight,
+            scale,
+            eps=norm_module.variance_epsilon,
+            max_token_num=max_token_num,
+            use_attn_tp_group=use_attn_tp_group,
+            keep_bf16=keep_bf16,
+        )
+    )
+    if quant_out is None:
+        return None
+    hidden_states = (norm_out, quant_out, scale) if keep_bf16 else (quant_out, scale)
+    return hidden_states, residual_out
+
+
 def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     try:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -409,6 +449,14 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
             or getattr(quant_method, "use_mxfp8", False)
             or getattr(quant_method, "use_marlin", False)
         )
+    try:
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+    except ImportError:
+        ModelOptFp8LinearMethod = ()
+    if isinstance(quant_method, ModelOptFp8LinearMethod):
+        return not getattr(quant_method, "use_marlin", False)
     try:
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsLinearMethod,
@@ -911,6 +959,24 @@ class RMSNorm(BaseFusedOp):
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
         )
 
+    def forward_with_allreduce_fusion_static_fp8_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        quant_linear: nn.Module,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        return _forward_with_allreduce_fusion_static_fp8_quant(
+            self,
+            x,
+            residual,
+            self.weight,
+            quant_linear,
+            use_attn_tp_group,
+            keep_bf16,
+        )
+
     def forward_with_per_tensor_quant_fusion(
         self,
         x: torch.Tensor,
@@ -1263,6 +1329,24 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             self.gemma_weight,
             group_size,
+            use_attn_tp_group,
+            keep_bf16,
+        )
+
+    def forward_with_allreduce_fusion_static_fp8_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        quant_linear: nn.Module,
+        use_attn_tp_group: bool = True,
+        keep_bf16: bool = False,
+    ):
+        return _forward_with_allreduce_fusion_static_fp8_quant(
+            self,
+            x,
+            residual,
+            self.gemma_weight,
+            quant_linear,
             use_attn_tp_group,
             keep_bf16,
         )

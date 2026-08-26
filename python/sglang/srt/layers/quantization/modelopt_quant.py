@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import regex as re
 import torch
@@ -604,10 +604,54 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: Union[
+            torch.Tensor,
+            Tuple[torch.Tensor, torch.Tensor],
+            Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        ],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        input_scale = layer.input_scale if not self.use_marlin else None
+        output_dtype = None
+        input_prequantized = isinstance(x, tuple)
+        if isinstance(x, tuple):
+            if self.use_marlin:
+                raise TypeError("FP8 Marlin cannot consume pre-quantized input")
+            if len(x) not in (2, 3):
+                raise ValueError(
+                    "Pre-quantized FP8 input must be (input, scale[, output_dtype])"
+                )
+            prequantized = x
+            x, input_scale = prequantized[:2]
+            output_dtype = (
+                prequantized[2] if len(prequantized) == 3 else layer.orig_dtype
+            )
+            if not isinstance(x, torch.Tensor) or x.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "Pre-quantized input must contain an FP8 tensor (E4M3FN)"
+                )
+            if input_scale is not layer.input_scale:
+                raise ValueError(
+                    "Pre-quantized input must reuse the layer's input_scale"
+                )
+            if input_scale.numel() != 1 or input_scale.device != x.device:
+                raise ValueError(
+                    "Pre-quantized input scale must be a scalar on the input device"
+                )
+            if output_dtype != layer.orig_dtype:
+                raise ValueError(
+                    "Pre-quantized input must preserve the layer's original dtype"
+                )
+        if (
+            not input_prequantized
+            and isinstance(x, torch.Tensor)
+            and x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            raise TypeError(
+                "Pre-quantized FP8 input requires the (input, scale[, dtype]) "
+                "tuple contract"
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -624,6 +668,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             and x.dim() == 2
             and x.shape[0] == 1
             and hasattr(layer, "sm120_gemv_alpha")
+            and (not input_prequantized or output_dtype == torch.bfloat16)
         ):
             from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
                 sm120_fp8_gemv,
@@ -634,25 +679,34 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             # buffer, so .t() recovers the row-major weight the GEMV streams.
             w = layer.weight.t()
             if use_sm120_fp8_gemv(1, w.shape[0], w.shape[1]) and w.is_contiguous():
-                from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+                if input_prequantized:
+                    qinput = x
+                else:
+                    from sglang.kernels.ops.quantization.fp8_kernel import (
+                        static_quant_fp8,
+                    )
 
-                qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
+                    qinput, _ = static_quant_fp8(
+                        x, layer.input_scale, repeat_scale=False
+                    )
                 return sm120_fp8_gemv(qinput, w, layer.sm120_gemv_alpha)
         if layer.use_flashinfer_bmm:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
+                input_scale=input_scale,
                 bias=bias,
+                output_dtype=output_dtype,
             )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
+            input_scale=input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=output_dtype,
         )
 
 
