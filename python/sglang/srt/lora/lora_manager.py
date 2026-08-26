@@ -585,6 +585,7 @@ class LoRAManager:
             self.lora_backend.batch_info.has_active_lora = any(
                 lora_ranks[wi] > 0 for wi in weight_indices
             )
+
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
@@ -1175,6 +1176,7 @@ class LoRAManager:
                     )
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
 
 def init_lora_cuda_graph_moe_buffers(
     *,

@@ -63,7 +63,6 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
