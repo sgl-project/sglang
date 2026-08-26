@@ -1,7 +1,9 @@
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
@@ -302,6 +304,30 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     else self.FP8_PREFILL_PAGED_CASE
                 )
                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
+
+    def test_sparse_fp8_prefill_dense_epoch_selective_kv(self):
+        # This is the full integration gate for #36338: FP8 DSA cache,
+        # RAGGED logical top-k, physical-slot dedup/remap, device-side active
+        # extent, BF16 FlashMLA sparse prefill, and the independent attention
+        # reference all run through the real backend.
+        # The standard correctness fixture intentionally uses a small prefix.
+        # Policy crossover is covered separately with H20-calibrated unit and
+        # benchmark cases; force only the policy decision here so this test
+        # exercises the real backend wiring without allocating a 40K fixture.
+        policy = (
+            "sglang.srt.layers.attention.dsa.selective_kv_dequant."
+            "should_use_dense_epoch_kv_dequant"
+        )
+        with envs.SGLANG_EXPERIMENTAL_DSA_SELECTIVE_KV_DENSE_EPOCH.override(
+            True
+        ), mock.patch(policy, return_value=True):
+            fixture = run_dsa_sparse_fp8_prefill_case(
+                self,
+                self.FP8_PREFILL_RAGGED_CASE,
+                dsa_prefill_backend="flashmla_sparse",
+            )
+        self.assertEqual(fixture.backend._selective_kv_mode, "dense_epoch")
+        self.assertGreater(fixture.backend._selective_kv_workspace.bf16_capacity, 0)
 
     def test_sparse_fp8_decode_cases(self):
         for impl in DSA_DECODE_IMPL_VARIANTS:

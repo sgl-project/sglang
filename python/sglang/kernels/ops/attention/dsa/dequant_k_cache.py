@@ -4,6 +4,25 @@ import torch
 import triton
 import triton.language as tl
 
+# A device-side active-row count is deliberately not copied to the host: that
+# would make the selective path uncapturable by CUDA Graphs.  Bound the launch
+# to a small multiple of the GPU's SM count and let each program consume a
+# strided sequence of valid rows instead of materializing one masked program
+# per row of the conservative workspace capacity.
+_DEVICE_EXTENT_CTA_ROWS_PER_SM = 16
+
+
+def _device_extent_grid_rows(capacity: int, sm_count: Optional[int] = None) -> int:
+    if capacity <= 0:
+        raise ValueError(f"capacity must be positive, got {capacity}")
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    return min(capacity, sm_count * _DEVICE_EXTENT_CTA_ROWS_PER_SM)
+
 
 def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
@@ -171,12 +190,22 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    out: Optional[torch.Tensor] = None,
+    num_valid_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
     Args:
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+        out: optional preallocated contiguous BF16 destination with shape
+            [num_tokens, 1, dim_nope + dim_rope]. Without ``num_valid_rows``
+            the kernel overwrites every element. With it, only the valid
+            compact prefix is overwritten and the ignored tail may stay dirty.
+        num_valid_rows: optional one-element int32 device tensor. When set,
+            only rows ``[0, num_valid_rows)`` are read/written even though the
+            page table and output keep a fixed capacity. This avoids a host
+            sync when a device-side dedup kernel determines the active extent.
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
@@ -194,10 +223,46 @@ def dequantize_k_cache_paged(
     dim_rope = 64
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
-    output = torch.empty(
-        (num_tokens, 1, dim_nope + dim_rope),
-        dtype=torch.bfloat16,
-        device=quant_k_cache.device,
+    expected_shape = (num_tokens, 1, dim_nope + dim_rope)
+    if out is None:
+        output = torch.empty(
+            expected_shape,
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+    else:
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"out shape must be {expected_shape}, got {tuple(out.shape)}"
+            )
+        if out.dtype != torch.bfloat16:
+            raise ValueError(f"out dtype must be torch.bfloat16, got {out.dtype}")
+        if out.device != quant_k_cache.device:
+            raise ValueError(
+                "out device must match quant_k_cache: "
+                f"{out.device} != {quant_k_cache.device}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        output = out
+
+    if num_valid_rows is not None:
+        if num_valid_rows.dtype != torch.int32:
+            raise ValueError(
+                f"num_valid_rows dtype must be torch.int32, got {num_valid_rows.dtype}"
+            )
+        if num_valid_rows.numel() != 1:
+            raise ValueError("num_valid_rows must contain exactly one element")
+        if num_valid_rows.device != quant_k_cache.device:
+            raise ValueError(
+                "num_valid_rows device must match quant_k_cache: "
+                f"{num_valid_rows.device} != {quant_k_cache.device}"
+            )
+        if not num_valid_rows.is_contiguous():
+            raise ValueError("num_valid_rows must be contiguous")
+
+    valid_rows_ptr = (
+        num_valid_rows if num_valid_rows is not None else page_table_1_flattened
     )
 
     # cdiv(512 + 64, 128) = 5
@@ -214,12 +279,46 @@ def dequantize_k_cache_paged(
     # [:, 528:]
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
+    if num_valid_rows is not None:
+        if quant_k_cache.device.type == "cuda":
+            grid_rows = _device_extent_grid_rows(
+                num_tokens,
+                torch.cuda.get_device_properties(
+                    quant_k_cache.device
+                ).multi_processor_count,
+            )
+        else:
+            # CPU unit tests replace the Triton launcher with a contract stub.
+            # Preserve that test seam without querying unavailable CUDA state.
+            grid_rows = num_tokens
+        _dequantize_k_cache_paged_device_extent_kernel[
+            (grid_rows, num_blocks_per_token)
+        ](
+            output,
+            input_nope_q,
+            input_nope_s,
+            input_rope,
+            page_table_1_flattened,
+            num_valid_rows,
+            output.stride(0),
+            input_nope_q.stride(0),
+            input_nope_s.stride(0),
+            input_rope.stride(0),
+            NUM_NOPE_BLOCKS=num_tiles,
+            GROUP_SIZE=group_size,
+            DIM_NOPE=dim_nope,
+            DIM_ROPE=dim_rope,
+            GRID_ROWS=grid_rows,
+        )
+        return output
+
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,
         input_nope_q,
         input_nope_s,
         input_rope,
         page_table_1_flattened,
+        valid_rows_ptr,
         output.stride(0),
         input_nope_q.stride(0),
         input_nope_s.stride(0),
@@ -228,9 +327,65 @@ def dequantize_k_cache_paged(
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
+        HAS_VALID_ROWS=num_valid_rows is not None,
     )
 
     return output
+
+
+@triton.jit
+def _dequantize_k_cache_paged_device_extent_kernel(
+    output_ptr,
+    input_nope_q_ptr,
+    input_nope_s_ptr,
+    input_rope_ptr,
+    page_table_1_ptr,
+    num_valid_rows_ptr,
+    output_stride_0: int,
+    input_nope_q_stride_0: int,
+    input_nope_s_stride_0: int,
+    input_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    GRID_ROWS: tl.constexpr,
+):
+    """Gather/dequantize a device-sized prefix with a bounded static grid.
+
+    ``num_valid_rows`` remains on device for CUDA Graph replay.  Each program
+    owns one feature block and walks rows separated by ``GRID_ROWS``; therefore
+    launch work depends on SM count rather than the worst-case output capacity.
+    """
+    token_id = tl.program_id(0)
+    raw_block_id = tl.program_id(1)
+    num_valid_rows = tl.load(num_valid_rows_ptr)
+
+    while token_id < num_valid_rows:
+        token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+
+        if raw_block_id < NUM_NOPE_BLOCKS:
+            offs_q = raw_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            mask = offs_q < DIM_NOPE
+            ptr_q = input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + offs_q
+            ptr_s = (
+                input_nope_s_ptr + token_id_paged * input_nope_s_stride_0 + raw_block_id
+            )
+            y_q = tl.load(ptr_q, mask=mask, other=0.0).to(tl.float32)
+            y_s = tl.load(ptr_s)
+            y = (y_q * y_s).to(output_ptr.dtype.element_ty)
+            dst_ptr = output_ptr + token_id * output_stride_0 + offs_q
+            tl.store(dst_ptr, y, mask=mask)
+        else:
+            rope_block_id = raw_block_id - NUM_NOPE_BLOCKS
+            offs = rope_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            mask = offs < DIM_ROPE
+            src_ptr = input_rope_ptr + token_id_paged * input_rope_stride_0 + offs
+            dst_ptr = output_ptr + token_id * output_stride_0 + DIM_NOPE + offs
+            data = tl.load(src_ptr, mask=mask).to(tl.bfloat16)
+            tl.store(dst_ptr, data, mask=mask)
+
+        token_id += GRID_ROWS
 
 
 @triton.jit
@@ -240,6 +395,7 @@ def _dequantize_k_cache_paged_kernel(
     input_nope_s_ptr,
     input_rope_ptr,
     page_table_1_ptr,
+    num_valid_rows_ptr,
     output_stride_0: int,
     input_nope_q_stride_0: int,
     input_nope_s_stride_0: int,
@@ -248,9 +404,18 @@ def _dequantize_k_cache_paged_kernel(
     GROUP_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
+    HAS_VALID_ROWS: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    if HAS_VALID_ROWS:
+        token_is_valid = token_id < tl.load(num_valid_rows_ptr)
+    else:
+        token_is_valid = True
+    token_id_paged = tl.load(
+        page_table_1_ptr + token_id,
+        mask=token_is_valid,
+        other=0,
+    ).to(tl.int32)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
@@ -258,7 +423,7 @@ def _dequantize_k_cache_paged_kernel(
         effective_block_id = raw_block_id
 
         offs_q = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        mask = offs_q < DIM_NOPE
+        mask = (offs_q < DIM_NOPE) & token_is_valid
         ptr_q = input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + offs_q
         ptr_s = (
             input_nope_s_ptr
@@ -267,7 +432,7 @@ def _dequantize_k_cache_paged_kernel(
         )
 
         y_q = tl.load(ptr_q, mask=mask, other=0.0).to(tl.float32)
-        y_s = tl.load(ptr_s)
+        y_s = tl.load(ptr_s, mask=token_is_valid, other=0.0)
 
         y = (y_q * y_s).to(output_ptr.dtype.element_ty)
 
@@ -278,7 +443,7 @@ def _dequantize_k_cache_paged_kernel(
         effective_block_id = raw_block_id - NUM_NOPE_BLOCKS
 
         offs = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        mask = offs < DIM_ROPE
+        mask = (offs < DIM_ROPE) & token_is_valid
 
         src_ptr = input_rope_ptr + token_id_paged * input_rope_stride_0 + offs
         dst_ptr = output_ptr + token_id * output_stride_0 + DIM_NOPE + offs
