@@ -128,9 +128,11 @@ __device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
   const int base_i = tx * kPerLane;
   int v[kPerLane];
 #pragma unroll
-  for (int k = 0; k < kPerLane; ++k) v[k] = h[base_i + k];
+  for (int k = 0; k < kPerLane; ++k)
+    v[k] = h[base_i + k];
 #pragma unroll
-  for (int k = kPerLane - 2; k >= 0; --k) v[k] += v[k + 1];
+  for (int k = kPerLane - 2; k >= 0; --k)
+    v[k] += v[k + 1];
   const int total = v[0];
   int suf = total;
 #pragma unroll
@@ -145,7 +147,8 @@ __device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
   for (int w = wave + 1; w < kWaves; ++w) above += s_wave_total[w];
   const int excl = (suf - total) + above;
 #pragma unroll
-  for (int k = 0; k < kPerLane; ++k) h[base_i + k] = v[k] + excl;
+  for (int k = 0; k < kPerLane; ++k)
+    h[base_i + k] = v[k] + excl;
   __syncthreads();
 }
 
