@@ -2207,7 +2207,6 @@ class Scheduler(
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
-            server_args=self.server_args,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
             dllm_enabled=self.dllm_config is not None,

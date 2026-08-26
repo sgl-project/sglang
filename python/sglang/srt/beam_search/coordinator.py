@@ -54,6 +54,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -62,6 +63,12 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -69,7 +76,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -93,7 +99,6 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
 
 
 class BeamCoordinator(msgspec.Struct, kw_only=True):
-    server_args: ServerArgs
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm
     dllm_enabled: bool
@@ -119,21 +124,21 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
 
         if not self.spec_algorithm.is_none():
             return "Beam search is not supported with speculative decoding."
-        if self.server_args.disaggregation_mode != "null":
+        if get_disagg().disaggregation_mode != "null":
             return "Beam search is not supported with PD disaggregation."
-        if self.server_args.page_size > 1:
+        if get_schedule().page_size > 1:
             return "Beam search currently requires --page-size 1."
         if self.dllm_enabled:
             return "Beam search is not supported with diffusion LLM."
-        if getattr(self.server_args, "enable_hisparse", False):
+        if get_memory().enable_hisparse:
             return "Beam search is not supported with hisparse."
-        if self.server_args.pp_size > 1:
+        if get_parallel().pp_size > 1:
             return "Beam search is not supported with pipeline parallelism."
-        if self.server_args.enable_dp_attention:
+        if is_dp_attention_enabled():
             # The cross-rank token sync reads batch_size() (== len(reqs)), which
             # excludes the member rows the forward actually runs.
             return "Beam search is not supported with dp attention."
-        if self.server_args.enable_hierarchical_cache:
+        if get_memory().enable_hierarchical_cache:
             return "Beam search is not supported with hierarchical cache."
         if self.model_config.is_encoder_decoder:
             return "Beam search is not supported with encoder-decoder models."
