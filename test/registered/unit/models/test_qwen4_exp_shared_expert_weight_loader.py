@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -12,6 +13,7 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _qwen4_exp_fused_shared_expert_mapping,
 )
+from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 
 
 class _RecordingParameter:
@@ -31,6 +33,24 @@ class _RecordingStackedParameter:
     def weight_loader(self, param, loaded_weight, shard_id=None):
         assert param is self
         self.calls.append((self.name, shard_id, loaded_weight.item()))
+
+
+class _RecordingMTPExpertParameter:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def weight_loader(
+        self,
+        param,
+        loaded_weight,
+        mapped_name,
+        shard_id=None,
+        expert_id=None,
+    ):
+        assert param is self
+        self.calls.append(
+            (mapped_name, shard_id, expert_id, loaded_weight.flatten().tolist())
+        )
 
 
 def _make_fused_model(num_layers=48):
@@ -94,6 +114,20 @@ def _make_unfused_model():
         ),
         modules=lambda: (),
         _load_qwen4_exp_ple_buffer=lambda *args: False,
+    )
+    return model, calls
+
+
+def _make_fused_mtp_model(num_experts=2):
+    calls = []
+    params = {
+        "model.layers.0.mlp.experts.w13_weight": _RecordingMTPExpertParameter(calls),
+        "model.layers.0.mlp.experts.w2_weight": _RecordingMTPExpertParameter(calls),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_experts=num_experts),
+        named_parameters=lambda: params.items(),
+        modules=lambda: (SimpleNamespace(num_fused_shared_experts=1),),
     )
     return model, calls
 
@@ -211,3 +245,63 @@ def test_mapping_does_not_capture_routed_visual_or_nonfused_weights():
         )
         is None
     )
+
+
+def test_mtp_shared_expert_loads_after_fused_routed_expert_weights():
+    model, calls = _make_fused_mtp_model()
+    weights = [
+        (
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]]),
+        ),
+        (
+            "mtp.layers.0.mlp.experts.down_proj",
+            torch.tensor([[[5.0]], [[6.0]]]),
+        ),
+        ("mtp.layers.0.mlp.shared_expert.gate_proj.weight", torch.tensor(7.0)),
+        ("mtp.layers.0.mlp.shared_expert.up_proj.weight", torch.tensor(8.0)),
+        ("mtp.layers.0.mlp.shared_expert.down_proj.weight", torch.tensor(9.0)),
+    ]
+
+    loaded = Qwen4ExpForCausalLMMTP.load_weights(model, weights)
+
+    shared_expert_calls = [call for call in calls if call[2] == 2]
+    assert shared_expert_calls == [
+        ("model.layers.0.mlp.experts.w13_weight", "w1", 2, [7.0]),
+        ("model.layers.0.mlp.experts.w13_weight", "w3", 2, [8.0]),
+        ("model.layers.0.mlp.experts.w2_weight", "w2", 2, [9.0]),
+    ]
+    assert loaded == {
+        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.w2_weight",
+    }
+
+
+def test_mtp_missing_parameter_is_not_reported_as_loaded():
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_experts=None),
+        named_parameters=lambda: (),
+        modules=lambda: (),
+    )
+
+    loaded = Qwen4ExpForCausalLMMTP.load_weights(
+        model, [("mtp.required.weight", torch.tensor(1.0))]
+    )
+
+    assert loaded == set()
+
+
+def test_mtp_required_shared_expert_missing_fails_closed():
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_experts=512),
+        named_parameters=lambda: (),
+        modules=lambda: (SimpleNamespace(num_fused_shared_experts=1),),
+    )
+
+    with pytest.raises(
+        ValueError, match="Required MTP shared-expert parameter could not be loaded"
+    ):
+        Qwen4ExpForCausalLMMTP.load_weights(
+            model,
+            [("mtp.layers.0.mlp.shared_expert.gate_proj.weight", torch.tensor(1.0))],
+        )
