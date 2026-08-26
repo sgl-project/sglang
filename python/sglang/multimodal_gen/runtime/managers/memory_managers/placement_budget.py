@@ -34,20 +34,29 @@ class PlacementOption(msgspec.Struct, frozen=True):
     option_key: str
     resource_delta_bytes: dict[str, int]
     estimated_latency_savings: int
+    # Lexicographic soft cost used only after latency-equivalent placements
+    # have been identified. Resource budgets remain the hard safety limits.
+    placement_cost_bytes: tuple[int, ...] = ()
 
 
 class PlacementPlan(msgspec.Struct, frozen=True):
     resource_delta_bytes: dict[str, int] = {}
     estimated_latency_savings: int = 0
+    placement_cost_bytes: tuple[int, ...] = ()
     selections: list[PlacementOption] = []
 
 
-# Resource deltas, utility, selected options.
-_State = tuple[tuple[int, ...], int, tuple[PlacementOption, ...]]
+# Resource deltas, utility, soft placement cost, selected options.
+_State = tuple[
+    tuple[int, ...],
+    int,
+    tuple[int, ...],
+    tuple[PlacementOption, ...],
+]
 
 
 def _selection_key(state: _State) -> tuple[str, ...]:
-    return tuple(option.option_key for option in state[2])
+    return tuple(option.option_key for option in state[3])
 
 
 def _better_same_cost(candidate: _State, incumbent: _State) -> bool:
@@ -58,24 +67,28 @@ def _better_same_cost(candidate: _State, incumbent: _State) -> bool:
 
 def _dominates(candidate: _State, other: _State) -> bool:
     """Whether candidate is at least as useful and no more expensive."""
-    return candidate[1] >= other[1] and all(
-        left <= right for left, right in zip(candidate[0], other[0])
+    return (
+        candidate[1] >= other[1]
+        and all(left <= right for left, right in zip(candidate[0], other[0]))
+        and all(left <= right for left, right in zip(candidate[2], other[2]))
     )
 
 
 def _pareto_prune(states: Iterable[_State]) -> list[_State]:
     """Drop states dominated across every constrained resource."""
-    best_at_cost: dict[tuple[int, ...], _State] = {}
+    best_at_cost: dict[tuple[tuple[int, ...], tuple[int, ...]], _State] = {}
     for state in states:
-        incumbent = best_at_cost.get(state[0])
+        cost_key = (state[0], state[2])
+        incumbent = best_at_cost.get(cost_key)
         if incumbent is None or _better_same_cost(state, incumbent):
-            best_at_cost[state[0]] = state
+            best_at_cost[cost_key] = state
 
     ordered = sorted(
         best_at_cost.values(),
         key=lambda state: (
             sum(state[0]),
             state[0],
+            state[2],
             -state[1],
             _selection_key(state),
         ),
@@ -95,10 +108,15 @@ def optimize_placement(
     options: Iterable[PlacementOption],
     *,
     resource_budget_bytes: Mapping[str, int],
+    estimated_latency_tolerance: int = 0,
+    require_selection_from_every_group: bool = False,
 ) -> PlacementPlan:
     """Choose at most one alternative per group under every resource budget.
 
     Not selecting an alternative keeps that group at its current placement.
+    Callers that provide complete target states may instead require exactly
+    one option per group, allowing the solver to replace or demote a current
+    placement rather than only add to it.
     All alternatives are evaluated with the same selection vector, so every
     constraint describing this placement state sees the same decision. A
     choice may trade one resource for another by using a negative delta. The
@@ -107,6 +125,21 @@ def optimize_placement(
     option, but the result does not imply that the supplied frontier contains
     every physically possible lifecycle plan.
     """
+    if estimated_latency_tolerance < 0:
+        raise ValueError("estimated_latency_tolerance must be non-negative")
+
+    options = list(options)
+    placement_cost_dimensions = max(
+        (len(option.placement_cost_bytes) for option in options), default=0
+    )
+    for option in options:
+        if option.placement_cost_bytes and (
+            len(option.placement_cost_bytes) != placement_cost_dimensions
+        ):
+            raise ValueError(
+                "all non-empty placement costs must have the same dimensions"
+            )
+
     grouped: dict[str, list[PlacementOption]] = {}
     option_keys: set[str] = set()
     all_resource_names = tuple(sorted(resource_budget_bytes))
@@ -149,7 +182,16 @@ def optimize_placement(
     ordered_groups = []
     for group_key in sorted(grouped):
         group_options = sorted(grouped[group_key], key=lambda option: option.option_key)
-        local_states = [((0,) * len(resource_names), 0, ())]
+        local_states = []
+        if not require_selection_from_every_group:
+            local_states.append(
+                (
+                    (0,) * len(resource_names),
+                    0,
+                    (0,) * placement_cost_dimensions,
+                    (),
+                )
+            )
         local_states.extend(
             (
                 tuple(
@@ -157,12 +199,13 @@ def optimize_placement(
                     for resource_name in resource_names
                 ),
                 option.estimated_latency_savings,
+                option.placement_cost_bytes or (0,) * placement_cost_dimensions,
                 (option,),
             )
             for option in group_options
         )
         ordered_groups.append(
-            [state[2][0] for state in _pareto_prune(local_states) if state[2]]
+            [state[3][0] for state in _pareto_prune(local_states) if state[3]]
         )
     minimum_remaining: list[tuple[int, ...]] = [
         (0,) * len(resource_names) for _ in range(len(ordered_groups) + 1)
@@ -172,19 +215,33 @@ def optimize_placement(
         next_minimum = minimum_remaining[group_index + 1]
         minimum_remaining[group_index] = tuple(
             next_delta
-            + min(
-                0,
-                *(
+            + (
+                min(
                     option.resource_delta_bytes.get(resource_name, 0)
                     for option in group_options
-                ),
+                )
+                if require_selection_from_every_group
+                else min(
+                    0,
+                    *(
+                        option.resource_delta_bytes.get(resource_name, 0)
+                        for option in group_options
+                    ),
+                )
             )
             for next_delta, resource_name in zip(next_minimum, resource_names)
         )
 
-    frontier: list[_State] = [((0,) * len(resource_names), 0, ())]
+    frontier: list[_State] = [
+        (
+            (0,) * len(resource_names),
+            0,
+            (0,) * placement_cost_dimensions,
+            (),
+        )
+    ]
     for group_index, group_options in enumerate(ordered_groups):
-        candidates = list(frontier)
+        candidates = [] if require_selection_from_every_group else list(frontier)
         for state in frontier:
             for option in group_options:
                 resource_deltas = tuple(
@@ -195,7 +252,15 @@ def optimize_placement(
                     (
                         resource_deltas,
                         state[1] + option.estimated_latency_savings,
-                        state[2] + (option,),
+                        tuple(
+                            current + delta
+                            for current, delta in zip(
+                                state[2],
+                                option.placement_cost_bytes
+                                or (0,) * placement_cost_dimensions,
+                            )
+                        ),
+                        state[3] + (option,),
                     )
                 )
         remaining = minimum_remaining[group_index + 1]
@@ -219,23 +284,31 @@ def optimize_placement(
     if not frontier:
         raise NoFeasiblePlacementError("no placement satisfies all resource budgets")
 
+    best_utility = max(state[1] for state in frontier)
+    latency_equivalent = [
+        state
+        for state in frontier
+        if state[1] >= best_utility - estimated_latency_tolerance
+    ]
     best = min(
-        frontier,
+        latency_equivalent,
         key=lambda state: (
-            -state[1],
+            state[2],
             sum(state[0]),
             state[0],
+            -state[1],
             _selection_key(state),
         ),
     )
     full_resource_deltas = {
         resource_name: sum(
-            option.resource_delta_bytes.get(resource_name, 0) for option in best[2]
+            option.resource_delta_bytes.get(resource_name, 0) for option in best[3]
         )
         for resource_name in all_resource_names
     }
     return PlacementPlan(
         resource_delta_bytes=full_resource_deltas,
         estimated_latency_savings=best[1],
-        selections=list(best[2]),
+        placement_cost_bytes=best[2],
+        selections=list(best[3]),
     )

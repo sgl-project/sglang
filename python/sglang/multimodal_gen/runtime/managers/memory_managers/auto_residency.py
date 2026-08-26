@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup-calibrated automatic component residency promotion.
+"""Warmup-calibrated automatic component residency placement.
 
 Under ``--performance-mode auto`` with server warmup, each rank measures the
 peak GPU memory of bounded synthetic warmup requests and a low-step probe at
-the complete default serving shape, then promotes implicitly offloaded components
-(component offload -> resident, layerwise offload -> fully loaded) when the
-estimate plus the promoted weights still fits under a safety reserve.
+the complete default serving shape, then selects a complete serving placement
+for every eligible component under the measured memory constraints.
 
 When no full-shape measurement is available, the fallback estimate splits the
 measured peak into persistent weights and workload-scaled activations. Scaling
 the whole peak would multiply resident weights by the video frame/area cap
-ratio (~16x for Wan-class defaults) and promotion would never trigger.
+ratio (~16x for Wan-class defaults) and residency adjustment would never trigger.
 
-Promotion targets the model default workload only (default resolution,
+The planner targets the model default workload only (default resolution,
 default frames, batch=1). Larger shapes, batches, or multi-image inputs need
 explicit ``--component-residency``.
 
@@ -35,6 +34,7 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
@@ -70,34 +70,36 @@ GIB_BYTES = 1024**3
 # Activation memory rarely scales perfectly linearly with workload units;
 # pad the extrapolated activation part before checking the budget.
 ACTIVATION_EXTRAPOLATION_MARGIN = 1.2
-# Always keep this much VRAM free after promotion for allocator slack,
-# shape variance, and CUDA graph or compile pools.
-VRAM_RESERVE_FRACTION = 0.10
+# A target-shape measurement plus the mandatory post-placement warmup justifies
+# a tighter reserve than an extrapolated estimate. Both retain an absolute
+# floor for allocator slack, shape variance, and CUDA graph or compile pools.
+MEASURED_VRAM_RESERVE_FRACTION = 0.05
+EXTRAPOLATED_VRAM_RESERVE_FRACTION = 0.10
 MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
-# The absolute floor is sized for datacenter cards, where the fraction dominates
-# anyway (10% of 80 GiB is 8 GiB). Below ~40 GiB the floor takes over, and on a
-# 12 GiB card a flat 4 GiB would fence off a third of the device, so cap it as a
-# share of what is actually there.
+# The absolute floor is sized for datacenter cards, where either fraction can
+# dominate. On a 12 GiB card a flat 4 GiB would fence off a third of the device,
+# so cap the floor as a share of what is actually there.
 MAX_VRAM_RESERVE_FRACTION = 0.20
 
-# A feasible placement is not automatically useful. Charge every placement a
-# latency-risk cost before joint optimization so small, noisy predicted gains
-# do not spend memory. The raw estimate is already an upper bound: transfer
-# time is capped by the measured stage that can possibly wait for it.
+# A feasible placement is not automatically useful. Predictions inside this
+# interval are treated as latency-equivalent, then the joint optimizer chooses
+# the option with the lowest additional VRAM and HostPin use. The raw estimate
+# is already an upper bound: transfer time is capped by the measured request.
 ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
-MIN_PLACEMENT_LATENCY_RISK_NS = 50_000_000
-PLACEMENT_LATENCY_RISK_FRACTION = 0.005
+MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
+MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
+LATENCY_EQUIVALENCE_FRACTION = 0.01
 
-AUTO_RESIDENCY_FEATURE_NAME = "auto residency promotion"
+AUTO_RESIDENCY_FEATURE_NAME = "auto residency"
 
-PROMOTION_STATUS_SKIPPED = "skipped"
-PROMOTION_STATUS_PROMOTED = "promoted"
-PROMOTION_STATUS_ROLLED_BACK = "rolled_back"
-PROMOTION_STATUS_ROLLBACK_FAILED = "rollback_failed"
+PLACEMENT_STATUS_SKIPPED = "skipped"
+PLACEMENT_STATUS_ADJUSTED = "adjusted"
+PLACEMENT_STATUS_ROLLED_BACK = "rolled_back"
+PLACEMENT_STATUS_ROLLBACK_FAILED = "rollback_failed"
 
 
 class AutoResidencyRollbackError(RuntimeError):
-    """A promotion failed AND undoing the already-applied part also failed.
+    """An adjustment failed and undoing its applied part also failed.
 
     The rank is in a mixed residency state that only a restart fixes; callers
     must abort startup instead of continuing on a half-rolled-back replica.
@@ -122,6 +124,7 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     succeeded: bool
     phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
+    phase_used_components: dict[str, tuple[str, ...]] = {}
     num_inference_steps: int = 1
     total_duration_ms: float = 0.0
     stage_duration_ms: dict[str, float] = {}
@@ -131,16 +134,16 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
         return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)
 
 
-class PromotionCandidate(msgspec.Struct, frozen=True):
-    """An implicitly offloaded component that could become resident."""
+class ResidencyTarget(msgspec.Struct, frozen=True):
+    """One complete target state for an auto-managed component."""
 
     component_name: str
     residency_mode: str
-    promoted_weight_bytes: int
-    # Estimated per-request host-to-device traffic this promotion removes.
+    target_resident_weight_bytes: int
+    # Estimated per-request host-to-device traffic this target removes.
     h2d_bytes_per_request: int
     # Layerwise candidates jointly choose stage-scoped GPU residency and host
-    # pinning. None is used by ordinary component-offload promotion.
+    # pinning. None is used by ordinary component placement.
     target_layerwise_resident_layers: tuple[int, ...] | None = None
     target_layerwise_pinned_layers: tuple[tuple[int, ...], ...] | None = None
     pinned_host_delta_bytes: int = 0
@@ -151,9 +154,32 @@ class PromotionCandidate(msgspec.Struct, frozen=True):
     # already loaded for its own phase has a different delta from phases where
     # it is absent; keeping both avoids adding the same weights twice.
     active_device_delta_bytes: int = 0
+    # Delta when the component is already present because of async prefetch,
+    # but is not the semantic owner of this phase.
+    present_device_delta_bytes: int = 0
     inactive_device_delta_bytes: int = 0
+    # None preserves the historical derived target for hand-built callers:
+    # partial layerwise targets remain layerwise, every other option is
+    # resident. Generated complete-state frontiers set this explicitly.
+    target_residency_mode: str | None = None
+    current_placement: bool = False
+    target_device_weight_bytes: int = 0
+    target_pinned_host_bytes: int = 0
+
+    def target_mode(self) -> str:
+        if self.target_residency_mode is not None:
+            return self.target_residency_mode
+        if (
+            self.target_layerwise_resident_layers is not None
+            and not self.permanent_residency
+        ):
+            return LAYERWISE_OFFLOAD
+        return RESIDENT
 
     def option_key(self) -> str:
+        target_mode = self.target_mode()
+        if target_mode == COMPONENT_OFFLOAD:
+            return f"{self.component_name}:component-offload"
         if self.target_layerwise_resident_layers is None:
             return f"{self.component_name}:resident"
         layer_counts = ",".join(
@@ -168,7 +194,7 @@ class PromotionCandidate(msgspec.Struct, frozen=True):
 
 
 class DefaultWorkload(msgspec.Struct, frozen=True):
-    """The model-default request shape the promotion is calibrated for."""
+    """The model-default request shape the planner is calibrated for."""
 
     width: int | None
     height: int | None
@@ -187,45 +213,48 @@ class DefaultWorkload(msgspec.Struct, frozen=True):
 
 
 class RankResidencyReport(msgspec.Struct, frozen=True):
-    """One rank's inputs to the replica-wide promotion decision."""
+    """One rank's inputs to the replica-wide placement decision."""
 
     rank: int
     budget_bytes: int
     estimated_peak_bytes: int | None
+    target_workload_measured: bool = False
     estimated_peak_bytes_by_phase: dict[str, int] = {}
     active_components_by_phase: dict[str, tuple[str, ...]] = {}
+    used_components_by_phase: dict[str, tuple[str, ...]] = {}
     node_rank: int = 0
     pinned_host_bytes: int = 0
     host_pin_capacity_bytes: int = 0
     host_transition_headroom_bytes: int = 0
     estimated_request_duration_ns: int = 0
     candidate_latency_savings_ns: dict[str, int] = {}
-    candidates: list[PromotionCandidate] = []
+    candidates: list[ResidencyTarget] = []
     skip_reason: str | None = None
 
 
 class AutoResidencyPlan(msgspec.Struct, frozen=True):
-    """Deterministic promotion decision shared by every rank."""
+    """Deterministic placement changes shared by every rank."""
 
     estimated_peak_bytes: int = 0
     reserve_bytes: int = 0
     budget_bytes: int = 0
     resource_budget_bytes: dict[str, int] = {}
-    promotions: list[PromotionCandidate] = []
+    changes: list[ResidencyTarget] = []
     skip_reason: str | None = None
 
 
-class AppliedPromotion(msgspec.Struct, frozen=True):
+class AppliedResidencyChange(msgspec.Struct, frozen=True):
     component_name: str
     residency_mode: str
     previous_layerwise_resident_layers: tuple[int, ...] | None = None
     previous_layerwise_pinned_layers: tuple[tuple[int, ...], ...] | None = None
-    layerwise_offload_disabled: bool = False
+    previous_layerwise_offload_enabled: bool = True
+    previous_required_resident: bool = False
     pinned_host_changed: bool = False
 
 
 def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
-    """Resolve the default request shape promotion is optimized for."""
+    """Resolve the default request shape the planner is optimized for."""
     from sglang.multimodal_gen.runtime.warmup_request_builder import (
         get_model_sampling_defaults,
         resolve_default_workload_shape,
@@ -303,7 +332,10 @@ def estimate_default_workload_timing(
         return 0, {}, {}
 
     component_stages: dict[str, set[str]] = {}
-    for phase_name, components in representative.phase_active_components.items():
+    phase_components = (
+        representative.phase_used_components or representative.phase_active_components
+    )
+    for phase_name, components in phase_components.items():
         fields = phase_name.split(":", 2)
         if len(fields) < 2 or not fields[0].isdigit():
             continue
@@ -370,12 +402,15 @@ def estimate_default_workload_timing(
 
 def estimate_candidate_latency_savings_ns(
     *,
-    candidates: Iterable[PromotionCandidate],
+    candidates: Iterable[ResidencyTarget],
     request_duration_ns: int,
-    stage_duration_ns: Mapping[str, int],
-    component_stages: Mapping[str, tuple[str, ...]],
 ) -> dict[str, int]:
-    """Upper-bound blocking H2D time removed by each placement option."""
+    """Upper-bound H2D time removed by each complete placement option.
+
+    An async prefetch can consume copy-engine and memory bandwidth outside the
+    component's own stage, so that stage is not a sound cap. The complete
+    request duration is the only generally valid upper bound.
+    """
     estimates: dict[str, int] = {}
     for candidate in candidates:
         transfer_ns = int(
@@ -383,12 +418,10 @@ def estimate_candidate_latency_savings_ns(
             / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
             * 1_000_000_000
         )
-        stages = component_stages.get(candidate.component_name, ())
-        stage_cap_ns = sum(stage_duration_ns.get(stage, 0) for stage in stages)
-        if stage_cap_ns <= 0:
-            stage_cap_ns = request_duration_ns
         estimates[candidate.option_key()] = (
-            min(transfer_ns, stage_cap_ns) if transfer_ns > 0 else transfer_ns
+            min(transfer_ns, request_duration_ns)
+            if transfer_ns > 0 and request_duration_ns > 0
+            else transfer_ns
         )
     return estimates
 
@@ -416,7 +449,7 @@ def estimate_default_workload_peak_bytes(
        activations -- measured on Wan2.1-14B, single-point scaling
        overestimated a ~30 GiB peak as ~183 GiB.
     3. One usable size: scale everything above the pre-forward allocated
-       baseline (conservative; may block promotion but never over-promotes).
+       baseline (conservative; may block adjustment but never over-allocates).
 
     Returns None when the estimate cannot be trusted: no successful records,
     the target workload is unknown (an unknown target would silently equate the
@@ -487,39 +520,52 @@ def estimate_workload_phase_peaks(
     records: Iterable[WarmupMemoryRecord],
     target_units: int | None,
     component_weight_bytes: Mapping[str, int],
-) -> tuple[dict[str, int], dict[str, tuple[str, ...]]]:
+) -> tuple[
+    dict[str, int],
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+]:
     """Estimate each measured execution phase at the target workload.
 
     A component already active in a phase is part of that phase's measured
     peak. Keeping a component resident therefore adds no weight bytes to its
     own component-offload phase, while it adds the full footprint to phases
-    where the component was absent. Returning both the estimated peaks and the
-    conservative intersection of active components preserves that distinction.
+    where the component was absent. Measurements with different active layouts
+    remain separate constraints; combining one layout's peak with another
+    layout's component set would describe a state that never occurred.
     """
-    records = list(records)
     successful = [record for record in records if record.succeeded]
-    phase_names = sorted(
-        {
-            phase_name
-            for record in successful
-            for phase_name in record.phase_peak_allocated_bytes
-        }
-    )
+    if target_units is not None:
+        covering = [
+            record for record in successful if record.workload_units() >= target_units
+        ]
+        if covering:
+            successful = covering
+
+    grouped: dict[
+        tuple[str, tuple[str, ...], tuple[str, ...]], list[WarmupMemoryRecord]
+    ] = {}
+    for record in successful:
+        used_by_phase = record.phase_used_components or record.phase_active_components
+        for phase_name in record.phase_peak_allocated_bytes:
+            active = tuple(sorted(record.phase_active_components.get(phase_name, ())))
+            used = tuple(sorted(used_by_phase.get(phase_name, ())))
+            grouped.setdefault((phase_name, active, used), []).append(record)
+
+    layouts_per_phase: dict[str, int] = {}
+    for phase_name, _, _ in grouped:
+        layouts_per_phase[phase_name] = layouts_per_phase.get(phase_name, 0) + 1
+
     estimated_peaks: dict[str, int] = {}
     active_components: dict[str, tuple[str, ...]] = {}
-    for phase_name in phase_names:
-        phase_records = [
-            record
-            for record in successful
-            if phase_name in record.phase_peak_allocated_bytes
-        ]
-        if not phase_records:
-            continue
-        active_sets = [
-            set(record.phase_active_components.get(phase_name, ()))
-            for record in phase_records
-        ]
-        active = set.intersection(*active_sets) if active_sets else set()
+    used_components: dict[str, tuple[str, ...]] = {}
+    layout_indices: dict[str, int] = {}
+    for (phase_name, active, used), phase_records in sorted(grouped.items()):
+        output_name = phase_name
+        if layouts_per_phase[phase_name] > 1:
+            index = layout_indices.get(phase_name, 0)
+            layout_indices[phase_name] = index + 1
+            output_name = f"{phase_name}:layout:{index}"
         weight_floor = sum(component_weight_bytes.get(name, 0) for name in active)
         phase_measurements = [
             WarmupMemoryRecord(
@@ -542,9 +588,10 @@ def estimate_workload_phase_peaks(
         )
         if estimate is None:
             continue
-        estimated_peaks[phase_name] = estimate
-        active_components[phase_name] = tuple(sorted(active))
-    return estimated_peaks, active_components
+        estimated_peaks[output_name] = estimate
+        active_components[output_name] = active
+        used_components[output_name] = used
+    return estimated_peaks, active_components, used_components
 
 
 def _module_weight_bytes(module: nn.Module) -> int:
@@ -625,7 +672,7 @@ def _layerwise_offloaded_bytes(module: LayerwiseOffloadableModuleMixin) -> int:
 
 
 def component_resident_size_bytes(module: nn.Module, residency_mode: str) -> int:
-    """Extra GPU bytes a promotion of this component would pin resident."""
+    """GPU weight bytes used by a resident version of this component."""
     if residency_mode == LAYERWISE_OFFLOAD:
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return 0
@@ -726,24 +773,30 @@ def _layerwise_host_transition_bytes(
     return unpin_bytes, pin_bytes
 
 
-def collect_promotion_candidates(
+def collect_residency_targets(
     *,
     modules: Mapping[str, object],
     residency_mode_of: Callable[[str], str],
+    baseline_residency_mode_of: Callable[[str], str] | None = None,
     explicit_residency_mode_of: Callable[[str], str | None],
     custom_strategy_names: Iterable[str],
     num_inference_steps: int,
     allow_host_pin_reallocation: bool = True,
     mixed_dtype_components: Iterable[str] = (),
-) -> list[PromotionCandidate]:
-    """List implicitly offloaded native components eligible for promotion.
+    auto_resident_components: Iterable[str] = (),
+) -> list[ResidencyTarget]:
+    """Build complete target-state frontiers for auto-managed components.
 
-    Only components whose residency was chosen by the auto policy qualify:
-    explicit placements, FSDP-managed modules, and components driven by a
-    pipeline-custom residency strategy are never touched.
+    Every option is expressed relative to the currently measured placement,
+    but its transfer utility is absolute within the component's frontier.
+    Including the current and lower-memory states lets later calibration rounds
+    replace an earlier choice instead of being limited to monotonic upgrades.
     """
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
+    auto_resident_names = set(auto_resident_components)
+    if baseline_residency_mode_of is None:
+        baseline_residency_mode_of = residency_mode_of
     candidates = []
     for name in sorted(modules):
         module = modules[name]
@@ -751,79 +804,122 @@ def collect_promotion_candidates(
             continue
         if name in custom_names:
             continue
-        mode = residency_mode_of(name)
-        if mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
+        baseline_mode = baseline_residency_mode_of(name)
+        if baseline_mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
             continue
         if explicit_residency_mode_of(name) is not None:
             continue
         if is_fsdp_managed_module(module):
             continue
-        if mode == COMPONENT_OFFLOAD and is_layerwise_offloaded_module(module):
-            # The module is layerwise-managed despite its configured mode
-            # (e.g. the offload_during_compile window); flipping the flag
-            # would be a silent no-op while the manager keeps streaming.
+        current_mode = residency_mode_of(name)
+        if current_mode == RESIDENT and name not in auto_resident_names:
+            # A loader or another runtime feature owns this hard requirement.
             continue
-        if mode == LAYERWISE_OFFLOAD and not is_layerwise_offloaded_module(module):
-            continue
-        promoted_bytes = component_resident_size_bytes(module, mode)
-        if promoted_bytes <= 0:
-            continue
-        # A layerwise DiT re-streams its layers once per denoise forward;
-        # every other offloaded component transfers once per request.
-        uses_per_request = (
-            max(1, num_inference_steps)
-            if mode == LAYERWISE_OFFLOAD and is_dit_component_name(name)
-            else 1
-        )
-        if mode == COMPONENT_OFFLOAD:
-            candidates.append(
-                PromotionCandidate(
-                    component_name=name,
-                    residency_mode=mode,
-                    promoted_weight_bytes=promoted_bytes,
-                    h2d_bytes_per_request=promoted_bytes,
-                    permanent_residency=True,
-                    active_device_delta_bytes=0,
-                    inactive_device_delta_bytes=promoted_bytes,
-                )
+
+        if baseline_mode == COMPONENT_OFFLOAD:
+            if current_mode not in (COMPONENT_OFFLOAD, RESIDENT):
+                continue
+            if is_layerwise_offloaded_module(module):
+                # The module is layerwise-managed despite its configured mode
+                # (e.g. the offload_during_compile window). Moving it behind
+                # the manager would strand its bookkeeping.
+                continue
+            weight_bytes = _module_weight_bytes(module)
+            if weight_bytes <= 0:
+                continue
+            current_resident = current_mode == RESIDENT
+            candidates.extend(
+                [
+                    ResidencyTarget(
+                        component_name=name,
+                        residency_mode=baseline_mode,
+                        target_residency_mode=COMPONENT_OFFLOAD,
+                        target_resident_weight_bytes=0,
+                        h2d_bytes_per_request=0,
+                        active_device_delta_bytes=0,
+                        inactive_device_delta_bytes=(
+                            -weight_bytes if current_resident else 0
+                        ),
+                        present_device_delta_bytes=(
+                            -weight_bytes if current_resident else 0
+                        ),
+                        current_placement=not current_resident,
+                    ),
+                    ResidencyTarget(
+                        component_name=name,
+                        residency_mode=baseline_mode,
+                        target_residency_mode=RESIDENT,
+                        target_resident_weight_bytes=weight_bytes,
+                        h2d_bytes_per_request=weight_bytes,
+                        permanent_residency=True,
+                        active_device_delta_bytes=0,
+                        inactive_device_delta_bytes=(
+                            0 if current_resident else weight_bytes
+                        ),
+                        present_device_delta_bytes=0,
+                        current_placement=current_resident,
+                        target_device_weight_bytes=weight_bytes,
+                    ),
+                ]
             )
             continue
 
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             continue
-        managers = [
-            manager for manager in module.layerwise_offload_managers if manager.enabled
-        ]
+        managers = list(module.layerwise_offload_managers)
         if not managers:
             continue
+        enabled = {manager.enabled for manager in managers}
+        if len(enabled) != 1:
+            logger.warning(
+                "Skipping auto residency for %s: layerwise groups disagree on "
+                "whether offload is enabled",
+                name,
+            )
+            continue
+        current_permanent = not enabled.pop()
+        if current_permanent != (current_mode == RESIDENT):
+            # The module is layerwise-managed despite its configured mode
+            # or is hard-required resident by a different owner.
+            continue
+        managed_weight_bytes = sum(
+            sum(manager.layer_weight_bytes().values()) for manager in managers
+        )
+        if managed_weight_bytes <= 0:
+            continue
+        # A layerwise DiT re-streams its layers once per denoise forward;
+        # every other offloaded component transfers once per request.
+        uses_per_request = (
+            max(1, num_inference_steps) if is_dit_component_name(name) else 1
+        )
         current_resident_layers = tuple(manager.resident_layers for manager in managers)
         current_pinned_layers = tuple(
             manager.pinned_layer_indices() for manager in managers
         )
-        current_resident_bytes = sum(
-            manager.resident_weight_bytes() for manager in managers
+        current_peak_device_bytes = (
+            managed_weight_bytes
+            if current_permanent
+            else sum(manager.peak_managed_device_weight_bytes() for manager in managers)
         )
-        current_peak_device_bytes = sum(
-            manager.peak_managed_device_weight_bytes() for manager in managers
-        )
+        current_inactive_device_bytes = managed_weight_bytes if current_permanent else 0
         current_pinned_bytes = sum(
             manager.pinned_host_weight_bytes() for manager in managers
         )
-        current_transfer_work = _layerwise_transfer_work_bytes(
+        maximum_transfer_work = _layerwise_transfer_work_bytes(
             managers=managers,
-            resident_layers=current_resident_layers,
-            pinned_layers=current_pinned_layers,
+            resident_layers=tuple(0 for _ in managers),
+            pinned_layers=tuple(() for _ in managers),
             uses_per_streamed_layer=uses_per_request,
         )
 
-        resident_targets = {current_resident_layers}
-        if is_dit_component_name(name) and num_inference_steps > 1:
-            for target in range(
-                0,
-                max(manager.num_layers for manager in managers) + 1,
-            ):
-                counts = tuple(min(target, manager.num_layers) for manager in managers)
-                resident_targets.add(counts)
+        resident_targets = set()
+        for target in range(
+            0,
+            max(manager.num_layers for manager in managers) + 1,
+        ):
+            resident_targets.add(
+                tuple(min(target, manager.num_layers) for manager in managers)
+            )
 
         for target_resident_layers in sorted(resident_targets):
             target_resident_bytes = sum(
@@ -834,7 +930,6 @@ def collect_promotion_candidates(
                 manager.peak_managed_device_weight_bytes(count)
                 for manager, count in zip(managers, target_resident_layers)
             )
-            incremental_bytes = target_resident_bytes - current_resident_bytes
             pin_targets = (
                 _layerwise_pin_targets(
                     managers=managers,
@@ -846,11 +941,6 @@ def collect_promotion_candidates(
                 else [current_pinned_layers]
             )
             for target_pinned_layers in pin_targets:
-                if (
-                    target_resident_layers == current_resident_layers
-                    and target_pinned_layers == current_pinned_layers
-                ):
-                    continue
                 target_pinned_bytes = sum(
                     sum(
                         manager.layer_host_store_bytes().get(layer_idx, 0)
@@ -870,12 +960,13 @@ def collect_promotion_candidates(
                     target_pinned_layers=target_pinned_layers,
                 )
                 candidates.append(
-                    PromotionCandidate(
+                    ResidencyTarget(
                         component_name=name,
-                        residency_mode=mode,
-                        promoted_weight_bytes=incremental_bytes,
+                        residency_mode=baseline_mode,
+                        target_residency_mode=LAYERWISE_OFFLOAD,
+                        target_resident_weight_bytes=target_resident_bytes,
                         h2d_bytes_per_request=(
-                            current_transfer_work - target_transfer_work
+                            maximum_transfer_work - target_transfer_work
                         ),
                         target_layerwise_resident_layers=target_resident_layers,
                         target_layerwise_pinned_layers=target_pinned_layers,
@@ -887,7 +978,15 @@ def collect_promotion_candidates(
                         active_device_delta_bytes=(
                             target_peak_device_bytes - current_peak_device_bytes
                         ),
-                        inactive_device_delta_bytes=0,
+                        inactive_device_delta_bytes=-current_inactive_device_bytes,
+                        present_device_delta_bytes=-current_inactive_device_bytes,
+                        current_placement=(
+                            not current_permanent
+                            and target_resident_layers == current_resident_layers
+                            and target_pinned_layers == current_pinned_layers
+                        ),
+                        target_device_weight_bytes=target_resident_bytes,
+                        target_pinned_host_bytes=target_pinned_bytes,
                     )
                 )
 
@@ -920,11 +1019,12 @@ def collect_promotion_candidates(
                 target_pinned_layers=permanent_pins,
             )
             candidates.append(
-                PromotionCandidate(
+                ResidencyTarget(
                     component_name=name,
-                    residency_mode=mode,
-                    promoted_weight_bytes=promoted_bytes - current_resident_bytes,
-                    h2d_bytes_per_request=current_transfer_work,
+                    residency_mode=baseline_mode,
+                    target_residency_mode=RESIDENT,
+                    target_resident_weight_bytes=managed_weight_bytes,
+                    h2d_bytes_per_request=maximum_transfer_work,
                     target_layerwise_resident_layers=full_resident_layers,
                     target_layerwise_pinned_layers=permanent_pins,
                     pinned_host_delta_bytes=(
@@ -933,24 +1033,34 @@ def collect_promotion_candidates(
                     host_unpin_scratch_bytes=unpin_scratch,
                     host_pin_scratch_bytes=pin_scratch,
                     permanent_residency=True,
-                    active_device_delta_bytes=max(
-                        0, promoted_bytes - current_peak_device_bytes
+                    active_device_delta_bytes=(
+                        managed_weight_bytes - current_peak_device_bytes
                     ),
                     # Stage-scoped resident layers are released after the use,
                     # so the complete managed footprint is new elsewhere.
-                    inactive_device_delta_bytes=promoted_bytes,
+                    inactive_device_delta_bytes=(
+                        managed_weight_bytes - current_inactive_device_bytes
+                    ),
+                    present_device_delta_bytes=(
+                        managed_weight_bytes - current_inactive_device_bytes
+                    ),
+                    current_placement=(
+                        current_permanent and permanent_pins == current_pinned_layers
+                    ),
+                    target_device_weight_bytes=managed_weight_bytes,
+                    target_pinned_host_bytes=permanent_pinned_bytes,
                 )
             )
     return candidates
 
 
 def rank_candidates_by_h2d_savings(
-    candidates: Iterable[PromotionCandidate],
-) -> list[PromotionCandidate]:
+    candidates: Iterable[ResidencyTarget],
+) -> list[ResidencyTarget]:
     """Biggest per-request H2D savings first; name breaks ties deterministically.
 
-    Shared by the promotion plan and the post-request residency hint so the
-    hint always lists components in the order auto mode would promote them.
+    Shared by the placement plan and the post-request residency hint so both
+    use the same benefit ordering.
     """
     return sorted(
         candidates,
@@ -966,9 +1076,14 @@ def _skip_plan(reason: str) -> AutoResidencyPlan:
     return AutoResidencyPlan(skip_reason=reason)
 
 
-def _vram_reserve_bytes(budget_bytes: int) -> int:
+def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) -> int:
+    reserve_fraction = (
+        MEASURED_VRAM_RESERVE_FRACTION
+        if target_workload_measured
+        else EXTRAPOLATED_VRAM_RESERVE_FRACTION
+    )
     return max(
-        int(budget_bytes * VRAM_RESERVE_FRACTION),
+        int(budget_bytes * reserve_fraction),
         min(
             MIN_VRAM_RESERVE_BYTES,
             int(budget_bytes * MAX_VRAM_RESERVE_FRACTION),
@@ -979,7 +1094,7 @@ def _vram_reserve_bytes(budget_bytes: int) -> int:
 def _binding_phase_constraints(
     report: RankResidencyReport,
     candidate_component_names: set[str],
-) -> list[tuple[str, int, tuple[str, ...]]]:
+) -> list[tuple[str, int, tuple[str, ...], tuple[str, ...]]]:
     """Keep the binding measured and conservative unobserved phases.
 
     Every candidate has the same device delta in phases with the same active
@@ -1001,23 +1116,30 @@ def _binding_phase_constraints(
         if report.estimated_peak_bytes is not None
         else max(phase_peaks.values())
     )
-    binding: dict[tuple[str, ...], tuple[str, int]] = {}
+    binding: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[str, int]] = {}
     for phase_name, phase_peak in phase_peaks.items():
-        active = tuple(sorted(report.active_components_by_phase.get(phase_name, ())))
-        current = binding.get(active)
+        present = tuple(
+            sorted(
+                set(report.active_components_by_phase.get(phase_name, ()))
+                & candidate_component_names
+            )
+        )
+        used = tuple(sorted(report.used_components_by_phase.get(phase_name, ())))
+        layout = (present, used)
+        current = binding.get(layout)
         if current is None or (phase_peak, phase_name) > (current[1], current[0]):
-            binding[active] = (phase_name, phase_peak)
+            binding[layout] = (phase_name, phase_peak)
     observed_components = {
-        component_name for active in binding for component_name in active
+        component_name for (_, used) in binding for component_name in used
     }
     for component_name in sorted(candidate_component_names - observed_components):
-        binding[(component_name,)] = (
+        binding[((component_name,), (component_name,))] = (
             f"unobserved:{component_name}",
             request_peak,
         )
     return [
-        (f"gpu:rank{report.rank}:{phase_name}", phase_peak, active)
-        for active, (phase_name, phase_peak) in sorted(
+        (f"gpu:rank{report.rank}:{phase_name}", phase_peak, present, used)
+        for (present, used), (phase_name, phase_peak) in sorted(
             binding.items(), key=lambda item: item[1][0]
         )
     ]
@@ -1025,10 +1147,10 @@ def _binding_phase_constraints(
 
 def _consensus_candidates(
     reports: list[RankResidencyReport],
-) -> list[PromotionCandidate]:
+) -> list[ResidencyTarget]:
     """Merge per-rank candidates: keep components every rank agrees on.
 
-    Sizes are worst-cased with the per-rank maximum so a promotion never
+    Sizes are worst-cased with the per-rank maximum so an adjustment never
     fits on one rank but overflows another.
     """
     per_rank_maps = [
@@ -1053,19 +1175,26 @@ def _consensus_candidates(
             candidate.target_layerwise_pinned_layers for candidate in rank_candidates
         }
         permanent = {candidate.permanent_residency for candidate in rank_candidates}
+        target_modes = {
+            candidate.target_residency_mode for candidate in rank_candidates
+        }
+        current = {candidate.current_placement for candidate in rank_candidates}
         if (
             len(component_names) != 1
             or len(targets) != 1
             or len(pinned_targets) != 1
             or len(permanent) != 1
+            or len(target_modes) != 1
+            or len(current) != 1
         ):
             continue
         merged.append(
-            PromotionCandidate(
+            ResidencyTarget(
                 component_name=component_names.pop(),
                 residency_mode=modes.pop(),
-                promoted_weight_bytes=max(
-                    candidate.promoted_weight_bytes for candidate in rank_candidates
+                target_resident_weight_bytes=max(
+                    candidate.target_resident_weight_bytes
+                    for candidate in rank_candidates
                 ),
                 h2d_bytes_per_request=min(
                     candidate.h2d_bytes_per_request for candidate in rank_candidates
@@ -1085,9 +1214,22 @@ def _consensus_candidates(
                 active_device_delta_bytes=max(
                     candidate.active_device_delta_bytes for candidate in rank_candidates
                 ),
+                present_device_delta_bytes=max(
+                    candidate.present_device_delta_bytes
+                    for candidate in rank_candidates
+                ),
                 inactive_device_delta_bytes=max(
                     candidate.inactive_device_delta_bytes
                     for candidate in rank_candidates
+                ),
+                target_residency_mode=target_modes.pop(),
+                current_placement=current.pop(),
+                target_device_weight_bytes=max(
+                    candidate.target_device_weight_bytes
+                    for candidate in rank_candidates
+                ),
+                target_pinned_host_bytes=max(
+                    candidate.target_pinned_host_bytes for candidate in rank_candidates
                 ),
             )
         )
@@ -1095,7 +1237,7 @@ def _consensus_candidates(
 
 
 def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyPlan:
-    """Turn the gathered rank reports into one deterministic promotion plan."""
+    """Turn gathered rank reports into one deterministic placement plan."""
     if not reports:
         return _skip_plan("no rank reports")
     for report in reports:
@@ -1106,14 +1248,24 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
 
     estimated_peak = max(report.estimated_peak_bytes for report in reports)
     budget = min(report.budget_bytes for report in reports)
+    # The warmup request is executed collectively. Some non-output ranks may
+    # not retain the effective request shape in their local Req, but one rank's
+    # covering measurement proves that the replica executed the target shape.
+    target_workload_measured = any(
+        report.target_workload_measured for report in reports
+    )
     reserves_by_rank = {
-        report.rank: _vram_reserve_bytes(report.budget_bytes) for report in reports
+        report.rank: _vram_reserve_bytes(
+            report.budget_bytes,
+            target_workload_measured=target_workload_measured,
+        )
+        for report in reports
     }
     reserve = max(reserves_by_rank.values())
 
     candidates = _consensus_candidates(reports)
     if not candidates:
-        return _skip_plan("no implicitly offloaded components to promote")
+        return _skip_plan("no eligible residency alternatives")
 
     candidate_component_names = {candidate.component_name for candidate in candidates}
     phase_constraints = {
@@ -1122,9 +1274,13 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     }
     resource_budgets: dict[str, int] = {}
     for report in reports:
-        for resource_name, phase_peak, _ in phase_constraints[report.rank]:
-            resource_budgets[resource_name] = (
-                report.budget_bytes - phase_peak - reserves_by_rank[report.rank]
+        for resource_name, phase_peak, _, _ in phase_constraints[report.rank]:
+            # The measured placement has already completed warmup. A negative
+            # reserve headroom therefore means "do not grow this phase", not
+            # that the current zero-delta placement is infeasible.
+            resource_budgets[resource_name] = max(
+                0,
+                report.budget_bytes - phase_peak - reserves_by_rank[report.rank],
             )
     has_hostpin_options = any(
         candidate.pinned_host_delta_bytes != 0
@@ -1135,8 +1291,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     if has_hostpin_options:
         for report in reports:
             prefix = f"node{report.node_rank}:rank{report.rank}"
-            resource_budgets[f"hostpin:{prefix}"] = (
-                report.host_pin_capacity_bytes - report.pinned_host_bytes
+            resource_budgets[f"hostpin:{prefix}"] = max(
+                0,
+                report.host_pin_capacity_bytes - report.pinned_host_bytes,
             )
             resource_budgets[f"hostram:{prefix}:unpin"] = (
                 report.host_transition_headroom_bytes
@@ -1162,12 +1319,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         and report.candidate_latency_savings_ns
     ]
     use_latency_utility = bool(timed_reports)
-    placement_latency_risk_ns = (
+    latency_equivalence_ns = (
         max(
-            MIN_PLACEMENT_LATENCY_RISK_NS,
-            int(
-                max(report.estimated_request_duration_ns for report in timed_reports)
-                * PLACEMENT_LATENCY_RISK_FRACTION
+            MIN_LATENCY_EQUIVALENCE_NS,
+            min(
+                MAX_LATENCY_EQUIVALENCE_NS,
+                int(
+                    max(
+                        report.estimated_request_duration_ns for report in timed_reports
+                    )
+                    * LATENCY_EQUIVALENCE_FRACTION
+                ),
             ),
         )
         if use_latency_utility
@@ -1178,13 +1340,18 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         resource_deltas: dict[str, int] = {}
         for report, rank_candidates in zip(reports, report_candidates):
             rank_candidate = rank_candidates[candidate.option_key()]
-            for resource_name, _, active_components in phase_constraints[report.rank]:
-                component_is_active = candidate.component_name in active_components
-                phase_cost = (
-                    rank_candidate.active_device_delta_bytes
-                    if component_is_active
-                    else rank_candidate.inactive_device_delta_bytes
-                )
+            for (
+                resource_name,
+                _,
+                present_components,
+                used_components,
+            ) in phase_constraints[report.rank]:
+                if candidate.component_name in used_components:
+                    phase_cost = rank_candidate.active_device_delta_bytes
+                elif candidate.component_name in present_components:
+                    phase_cost = rank_candidate.present_device_delta_bytes
+                else:
+                    phase_cost = rank_candidate.inactive_device_delta_bytes
                 resource_deltas[resource_name] = phase_cost
             if has_hostpin_options:
                 prefix = f"node{report.node_rank}:rank{report.rank}"
@@ -1211,57 +1378,78 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                         )
                         for report in timed_reports
                     )
-                    - placement_latency_risk_ns
                     if use_latency_utility
                     else candidate.h2d_bytes_per_request
+                ),
+                placement_cost_bytes=(
+                    candidate.target_device_weight_bytes
+                    or max(0, candidate.target_resident_weight_bytes),
+                    candidate.target_pinned_host_bytes
+                    or max(0, candidate.pinned_host_delta_bytes),
                 ),
             )
         )
 
+    candidates_by_component: dict[str, list[ResidencyTarget]] = {}
+    for candidate in candidates:
+        candidates_by_component.setdefault(candidate.component_name, []).append(
+            candidate
+        )
+    complete_state_frontier = all(
+        any(candidate.current_placement for candidate in component_candidates)
+        for component_candidates in candidates_by_component.values()
+    )
     try:
         placement = optimize_placement(
             options,
             resource_budget_bytes=resource_budgets,
+            estimated_latency_tolerance=(
+                latency_equivalence_ns if use_latency_utility else 0
+            ),
+            require_selection_from_every_group=complete_state_frontier,
         )
     except NoFeasiblePlacementError as error:
         return _skip_plan(str(error))
-    promotions = rank_candidates_by_h2d_savings(
-        candidate_by_key[selection.option_key] for selection in placement.selections
-    )
+    changed_candidates = []
+    for selection in placement.selections:
+        candidate = candidate_by_key[selection.option_key]
+        if not candidate.current_placement:
+            changed_candidates.append(candidate)
+    changes = rank_candidates_by_h2d_savings(changed_candidates)
 
     return AutoResidencyPlan(
         estimated_peak_bytes=estimated_peak,
         reserve_bytes=reserve,
         budget_bytes=budget,
         resource_budget_bytes=resource_budgets,
-        promotions=promotions,
+        changes=changes,
     )
 
 
-def apply_promotions(
+def apply_residency_changes(
     *,
     plan: AutoResidencyPlan,
     modules: Mapping[str, object],
     server_args: ServerArgs,
-) -> list[AppliedPromotion]:
-    """Flip the planned components to resident on this rank.
+) -> list[AppliedResidencyChange]:
+    """Apply complete target states transactionally on this rank.
 
-    Component-offload modules are only re-marked resident; the physical move
-    happens on their next use (the post-promotion re-warmup) through
-    ``ResidentStrategy``, which also applies any per-use target dtype.
-    Layerwise options either retain a planned number of layers during the
-    denoise stage or load the whole component and drop its hooks.
+    Component-offload targets move back to CPU immediately; resident targets
+    are materialized on their next use by ``ResidentStrategy``. Layerwise
+    targets may change resident counts and HostPin placement or disable the
+    streaming hooks entirely. Because targets can move in either direction,
+    a later calibration round can replace an earlier placement.
 
-    Raises on failure after undoing the promotions already applied, so a
+    Raises on failure after undoing the changes already applied, so a
     caller observing an exception knows this rank is back on the original
     strategy -- unless the undo itself fails, which raises
     ``AutoResidencyRollbackError`` (the rank is in a mixed state and startup
     must abort).
     """
-    applied: list[AppliedPromotion] = []
+    applied: list[AppliedResidencyChange] = []
     try:
-        ordered_promotions = sorted(
-            plan.promotions,
+        ordered_changes = sorted(
+            plan.changes,
             key=lambda candidate: (
                 max(
                     candidate.active_device_delta_bytes,
@@ -1271,11 +1459,11 @@ def apply_promotions(
                 candidate.option_key(),
             ),
         )
-        promotion_modules: dict[str, nn.Module] = {}
-        snapshots: dict[str, AppliedPromotion] = {}
+        target_modules: dict[str, nn.Module] = {}
+        snapshots: dict[str, AppliedResidencyChange] = {}
         previous_pins_by_component: dict[str, tuple[tuple[int, ...], ...]] = {}
-        for candidate in ordered_promotions:
-            if candidate.component_name in promotion_modules:
+        for candidate in ordered_changes:
+            if candidate.component_name in target_modules:
                 raise RuntimeError(
                     f"multiple placement options selected for "
                     f"{candidate.component_name!r}"
@@ -1283,27 +1471,31 @@ def apply_promotions(
             module = modules.get(candidate.component_name)
             if not isinstance(module, nn.Module):
                 raise RuntimeError(
-                    f"promotion target {candidate.component_name!r} is missing"
+                    f"residency target {candidate.component_name!r} is missing"
                 )
             if candidate.residency_mode == LAYERWISE_OFFLOAD and not isinstance(
                 module, LayerwiseOffloadableModuleMixin
             ):
                 raise RuntimeError(
-                    f"promotion target {candidate.component_name!r} lost its "
+                    f"residency target {candidate.component_name!r} lost its "
                     "layerwise offload capability between planning and apply"
                 )
             if candidate.residency_mode == COMPONENT_OFFLOAD and (
                 is_layerwise_offloaded_module(module)
             ):
                 raise RuntimeError(
-                    f"promotion target {candidate.component_name!r} became "
+                    f"residency target {candidate.component_name!r} became "
                     "layerwise-managed between planning and apply"
                 )
-            promotion_modules[candidate.component_name] = module
-            if candidate.target_layerwise_resident_layers is not None:
+            target_modules[candidate.component_name] = module
+            previous_required_resident = (
+                server_args.component_residency_requirement(candidate.component_name)
+                == AUTO_RESIDENCY_FEATURE_NAME
+            )
+            if candidate.residency_mode == LAYERWISE_OFFLOAD:
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError(
-                        f"partial promotion target {candidate.component_name!r} "
+                        f"partial residency target {candidate.component_name!r} "
                         "lost its layerwise offload capability"
                     )
                 previous = tuple(
@@ -1311,13 +1503,22 @@ def apply_promotions(
                     for manager in module.layerwise_offload_managers
                 )
                 previous_pinned = module.layerwise_pinned_layers()
+                enabled = {
+                    manager.enabled for manager in module.layerwise_offload_managers
+                }
+                if len(enabled) != 1:
+                    raise RuntimeError(
+                        f"placement target {candidate.component_name!r} has mixed "
+                        "layerwise manager states"
+                    )
                 previous_pins_by_component[candidate.component_name] = previous_pinned
-                snapshots[candidate.component_name] = AppliedPromotion(
+                snapshots[candidate.component_name] = AppliedResidencyChange(
                     component_name=candidate.component_name,
                     residency_mode=candidate.residency_mode,
                     previous_layerwise_resident_layers=previous,
                     previous_layerwise_pinned_layers=previous_pinned,
-                    layerwise_offload_disabled=candidate.permanent_residency,
+                    previous_layerwise_offload_enabled=enabled.pop(),
+                    previous_required_resident=previous_required_resident,
                     pinned_host_changed=(
                         candidate.target_layerwise_pinned_layers != previous_pinned
                     ),
@@ -1329,13 +1530,14 @@ def apply_promotions(
                     )
                 continue
 
-            snapshots[candidate.component_name] = AppliedPromotion(
+            snapshots[candidate.component_name] = AppliedResidencyChange(
                 component_name=candidate.component_name,
                 residency_mode=candidate.residency_mode,
+                previous_required_resident=previous_required_resident,
             )
         pinning_changes = [
             candidate
-            for candidate in ordered_promotions
+            for candidate in ordered_changes
             if candidate.target_layerwise_pinned_layers is not None
             and candidate.target_layerwise_pinned_layers
             != previous_pins_by_component[candidate.component_name]
@@ -1365,126 +1567,161 @@ def apply_promotions(
         for candidate in pinning_changes:
             applied.append(snapshots[candidate.component_name])
             applied_names.add(candidate.component_name)
-            module = promotion_modules[candidate.component_name]
+            module = target_modules[candidate.component_name]
             assert isinstance(module, LayerwiseOffloadableModuleMixin)
             module.release_layerwise_pins_outside(
                 candidate.target_layerwise_pinned_layers or ()
             )
         if pinning_changes:
             release_unused_pinned_memory()
-        for candidate in ordered_promotions:
+        for candidate in ordered_changes:
             if candidate.component_name not in applied_names:
                 applied.append(snapshots[candidate.component_name])
                 applied_names.add(candidate.component_name)
-            module = promotion_modules[candidate.component_name]
-            if candidate.target_layerwise_resident_layers is not None:
+            module = target_modules[candidate.component_name]
+            target_mode = candidate.target_mode()
+            if candidate.residency_mode == LAYERWISE_OFFLOAD:
                 assert isinstance(module, LayerwiseOffloadableModuleMixin)
                 module.set_layerwise_pinned_layers(
                     candidate.target_layerwise_pinned_layers or ()
                 )
-                if candidate.permanent_residency:
+                if target_mode == RESIDENT:
                     server_args.require_component_resident(
                         candidate.component_name,
                         feature_name=AUTO_RESIDENCY_FEATURE_NAME,
                     )
-                    module.disable_offload()
+                    if is_layerwise_offloaded_module(module):
+                        module.disable_offload()
                 else:
+                    if not is_layerwise_offloaded_module(module):
+                        module.enable_offload()
+                    server_args.release_required_component_residency(
+                        candidate.component_name,
+                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                    )
                     module.set_layerwise_resident_layer_counts(
                         candidate.target_layerwise_resident_layers
                     )
                 continue
-            server_args.require_component_resident(
-                candidate.component_name, feature_name=AUTO_RESIDENCY_FEATURE_NAME
-            )
-            if candidate.residency_mode == LAYERWISE_OFFLOAD:
-                assert isinstance(module, LayerwiseOffloadableModuleMixin)
-                module.disable_offload()
+            if target_mode == RESIDENT:
+                server_args.require_component_resident(
+                    candidate.component_name,
+                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                )
+            elif target_mode == COMPONENT_OFFLOAD:
+                server_args.release_required_component_residency(
+                    candidate.component_name,
+                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                )
+                module.to("cpu")
+            else:
+                raise RuntimeError(
+                    f"unsupported target mode {target_mode!r} for "
+                    f"{candidate.component_name!r}"
+                )
     except Exception as apply_error:
         try:
-            rollback_promotions(
+            rollback_residency_changes(
                 applied=applied, modules=modules, server_args=server_args
             )
         except Exception as rollback_error:
             raise AutoResidencyRollbackError(
-                f"promotion failed ({describe_error(apply_error)}) and rollback "
+                f"residency adjustment failed ({describe_error(apply_error)}) and rollback "
                 f"failed ({describe_error(rollback_error)})"
             ) from apply_error
         raise
     return applied
 
 
-def rollback_promotions(
+def rollback_residency_changes(
     *,
-    applied: Iterable[AppliedPromotion],
+    applied: Iterable[AppliedResidencyChange],
     modules: Mapping[str, object],
     server_args: ServerArgs,
 ) -> None:
-    """Restore the original residency for previously applied promotions.
+    """Restore the exact placement that preceded a target-state change.
 
-    Every promotion is undone even when one of them fails; the collected
+    Every change is undone even when one of them fails; the collected
     failures are re-raised at the end so one broken component cannot leave
-    the later (earlier-applied) ones promoted.
+    the later (earlier-applied) ones adjusted.
     """
     applied = list(applied)
     errors: list[str] = []
     pinning_changes = [
-        promotion
-        for promotion in applied
-        if promotion.pinned_host_changed
-        and promotion.previous_layerwise_pinned_layers is not None
+        adjustment
+        for adjustment in applied
+        if adjustment.pinned_host_changed
+        and adjustment.previous_layerwise_pinned_layers is not None
     ]
-    for promotion in pinning_changes:
+    for adjustment in pinning_changes:
         try:
-            module = modules.get(promotion.component_name)
+            module = modules.get(adjustment.component_name)
             if not isinstance(module, LayerwiseOffloadableModuleMixin):
                 raise RuntimeError("lost layerwise offload capability")
             module.release_layerwise_pins_outside(
-                promotion.previous_layerwise_pinned_layers or ()
+                adjustment.previous_layerwise_pinned_layers or ()
             )
         except Exception as e:
-            errors.append(f"{promotion.component_name}: {describe_error(e)}")
+            errors.append(f"{adjustment.component_name}: {describe_error(e)}")
     if pinning_changes:
         release_unused_pinned_memory()
-    for promotion in reversed(applied):
+    for adjustment in reversed(applied):
         try:
-            module = modules.get(promotion.component_name)
-            if promotion.previous_layerwise_resident_layers is not None:
+            module = modules.get(adjustment.component_name)
+            if adjustment.previous_layerwise_resident_layers is not None:
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError("lost layerwise offload capability")
-                if promotion.layerwise_offload_disabled:
+                currently_enabled = {
+                    manager.enabled for manager in module.layerwise_offload_managers
+                }
+                if len(currently_enabled) != 1:
+                    raise RuntimeError("layerwise managers have mixed enabled states")
+                current_enabled = currently_enabled.pop()
+                previous_enabled = adjustment.previous_layerwise_offload_enabled
+                if previous_enabled and not current_enabled:
                     module.enable_offload()
+                elif not previous_enabled and current_enabled:
+                    module.disable_offload()
+                if adjustment.previous_required_resident:
+                    server_args.require_component_resident(
+                        adjustment.component_name,
+                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                    )
+                else:
                     server_args.release_required_component_residency(
-                        promotion.component_name,
+                        adjustment.component_name,
                         feature_name=AUTO_RESIDENCY_FEATURE_NAME,
                     )
                 module.restore_layerwise_resident_layers(
-                    promotion.previous_layerwise_resident_layers
+                    adjustment.previous_layerwise_resident_layers
                 )
-                if promotion.previous_layerwise_pinned_layers is None:
+                if adjustment.previous_layerwise_pinned_layers is None:
                     raise RuntimeError("lost previous layerwise host placement")
                 module.restore_layerwise_pinned_layers(
-                    promotion.previous_layerwise_pinned_layers
+                    adjustment.previous_layerwise_pinned_layers
                 )
                 continue
-            server_args.release_required_component_residency(
-                promotion.component_name,
-                feature_name=AUTO_RESIDENCY_FEATURE_NAME,
-            )
+            if adjustment.previous_required_resident:
+                server_args.require_component_resident(
+                    adjustment.component_name,
+                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                )
+            else:
+                server_args.release_required_component_residency(
+                    adjustment.component_name,
+                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                )
             if not isinstance(module, nn.Module):
                 continue
-            if promotion.residency_mode == LAYERWISE_OFFLOAD:
-                if not isinstance(module, LayerwiseOffloadableModuleMixin):
-                    raise RuntimeError("lost layerwise offload capability")
-                module.enable_offload()
-            elif is_layerwise_offloaded_module(module):
+            if is_layerwise_offloaded_module(module):
                 # A layerwise manager owns this module's placement (e.g. the
                 # offload_during_compile window); moving it to CPU behind the
                 # manager would strand its bookkeeping.
                 pass
-            else:
+            elif not adjustment.previous_required_resident:
                 module.to("cpu")
         except Exception as e:
-            errors.append(f"{promotion.component_name}: {describe_error(e)}")
+            errors.append(f"{adjustment.component_name}: {describe_error(e)}")
     if torch.get_device_module().is_available():
         torch.get_device_module().empty_cache()
     if errors:
@@ -1500,8 +1737,8 @@ def format_plan_summary(
     """One-line decision summary for the startup log."""
     if plan.skip_reason is not None:
         return f"Auto residency: skipped ({plan.skip_reason})"
-    promoted = (
-        ", ".join(_format_candidate_summary(candidate) for candidate in plan.promotions)
+    changes = (
+        ", ".join(_format_candidate_summary(candidate) for candidate in plan.changes)
         or "none"
     )
     measured = ", ".join(
@@ -1518,7 +1755,7 @@ def format_plan_summary(
         f"estimated_peak={plan.estimated_peak_bytes / GIB_BYTES:.1f} GiB, "
         f"reserve={plan.reserve_bytes / GIB_BYTES:.1f} GiB, "
         f"budget={plan.budget_bytes / GIB_BYTES:.1f} GiB, "
-        f"promoted=[{promoted}]"
+        f"changes=[{changes}]"
     )
 
 
@@ -1529,18 +1766,23 @@ def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
     placement, or disable the adjustment entirely with the kill switch.
     """
     changes = "; ".join(
-        _format_promotion_change(candidate) for candidate in plan.promotions
+        _format_residency_change(candidate) for candidate in plan.changes
     )
-    component_args = [
-        f"{candidate.component_name}=resident"
-        for candidate in plan.promotions
-        if candidate.permanent_residency
-    ]
+    component_args = []
+    has_auto_only_change = False
+    for candidate in plan.changes:
+        target_mode = candidate.target_mode()
+        if target_mode in (COMPONENT_OFFLOAD, RESIDENT):
+            component_args.append(f"{candidate.component_name}={target_mode}")
+        else:
+            has_auto_only_change = True
     equivalent = (
         "--component-residency " + " ".join(component_args)
         if component_args
-        else "none (the selected partial layer/HostPin placement is auto-only)"
+        else "none"
     )
+    if has_auto_only_change:
+        equivalent += " (partial layer/HostPin placement remains auto-only)"
     return (
         f"Auto residency: adjusted {changes}. "
         f"Equivalent server args: {equivalent}. "
@@ -1549,31 +1791,34 @@ def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
     )
 
 
-def _format_promotion_change(candidate: PromotionCandidate) -> str:
-    if candidate.target_layerwise_resident_layers is not None:
+def _format_residency_change(candidate: ResidencyTarget) -> str:
+    target_mode = candidate.target_mode()
+    if (
+        target_mode == LAYERWISE_OFFLOAD
+        and candidate.target_layerwise_resident_layers is not None
+    ):
         pin_counts = tuple(
             len(indices) for indices in candidate.target_layerwise_pinned_layers or ()
         )
-        scope = "permanent" if candidate.permanent_residency else "stage-scoped"
         return (
-            f"{candidate.component_name}: {scope} resident layers="
+            f"{candidate.component_name}: layerwise resident layers="
             f"{candidate.target_layerwise_resident_layers}, pinned layers="
             f"{pin_counts}"
         )
-    return f"{candidate.component_name}: {candidate.residency_mode} -> resident"
+    return (
+        f"{candidate.component_name}: {candidate.residency_mode} -> " f"{target_mode}"
+    )
 
 
-def _format_candidate_summary(candidate: PromotionCandidate) -> str:
-    target = ""
-    if candidate.target_layerwise_resident_layers is not None:
-        target = (
+def _format_candidate_summary(candidate: ResidencyTarget) -> str:
+    target_mode = candidate.target_mode()
+    details = ""
+    if target_mode == LAYERWISE_OFFLOAD:
+        details = (
             f", layers={candidate.target_layerwise_resident_layers}, "
             f"pins={tuple(len(indices) for indices in candidate.target_layerwise_pinned_layers or ())}"
         )
-    return (
-        f"{candidate.component_name}({candidate.residency_mode}{target}, "
-        f"{candidate.promoted_weight_bytes / GIB_BYTES:.1f} GiB)"
-    )
+    return f"{candidate.component_name}({target_mode}{details})"
 
 
 def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
@@ -1584,5 +1829,5 @@ def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
     """
     return {
         "status": status,
-        "promoted": [candidate.component_name for candidate in plan.promotions],
+        "changed": [candidate.component_name for candidate in plan.changes],
     }

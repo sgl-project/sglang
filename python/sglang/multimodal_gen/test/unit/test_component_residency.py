@@ -216,7 +216,9 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
 
     peaks = manager.take_warmup_phase_peaks()
     inactive_peak = WarmupPhasePeak((), 7)
-    transformer_peak = WarmupPhasePeak(("transformer",), 7)
+    transformer_peak = WarmupPhasePeak(
+        ("transformer",), 7, used_components=("transformer",)
+    )
     assert peaks["request:before-stage"] == inactive_peak
     assert peaks["0:denoise:setup"] == inactive_peak
     assert peaks["0:denoise:transition:idle->transformer"] == transformer_peak
@@ -265,7 +267,7 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     manager._record_warmup_phase_peak()
     assert manager._warmup_phase_peaks[
         "0:stage:transition:transformer->transformer"
-    ] == WarmupPhasePeak(("transformer",), 7)
+    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
     assert strategy.prepare_for_use.call_count == 2
 
 
@@ -314,7 +316,7 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
 
     assert manager._warmup_phase_peaks[
         "0:encode:prefetch:transformer"
-    ] == WarmupPhasePeak(("transformer",), 7)
+    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
     assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
 
 
@@ -352,10 +354,10 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
     manager._record_warmup_phase_peak()
 
     assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == (
-        WarmupPhasePeak(("text_encoder",), 7)
+        WarmupPhasePeak(("text_encoder",), 7, used_components=("text_encoder",))
     )
     assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == (
-        WarmupPhasePeak(("transformer",), 7)
+        WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
     )
 
 

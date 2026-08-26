@@ -127,12 +127,15 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     ):
         worker._record_server_warmup_memory(
             req=req,
+            workload=(128, 96, 9, 2),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
+    assert (record.width, record.height, record.num_frames) == (128, 96, 9)
+    assert record.num_inference_steps == 2
     assert record.phase_peak_allocated_bytes["request:untracked"] == 9
     assert record.phase_active_components["request:untracked"] == ("transformer",)
 
@@ -166,6 +169,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     ):
         worker._record_server_warmup_memory(
             req=req,
+            workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
@@ -191,7 +195,9 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         nnodes=1,
         node_rank=0,
         residency_mode=lambda _name: "resident",
+        configured_residency_mode=lambda _name: "resident",
         explicit_residency_mode=lambda _name: None,
+        component_residency_requirement=lambda _name: None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100, 100)
@@ -232,7 +238,9 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         nnodes=1,
         node_rank=0,
         residency_mode=lambda _name: "resident",
+        configured_residency_mode=lambda _name: "resident",
         explicit_residency_mode=lambda _name: None,
+        component_residency_requirement=lambda _name: None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)

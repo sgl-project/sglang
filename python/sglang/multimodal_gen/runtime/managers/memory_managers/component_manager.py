@@ -62,6 +62,7 @@ class ResidencyState:
 class WarmupPhasePeak:
     active_components: tuple[str, ...]
     allocated_bytes: int
+    used_components: tuple[str, ...] = ()
 
 
 class ResidencyBatch(Protocol):
@@ -138,6 +139,7 @@ class ComponentResidencyManager:
         self._track_warmup_memory = False
         self._warmup_phase_key: str | None = None
         self._warmup_phase_components: tuple[str, ...] = ()
+        self._warmup_phase_used_components: tuple[str, ...] = ()
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
@@ -225,6 +227,7 @@ class ComponentResidencyManager:
         )
         self._warmup_phase_key = None
         self._warmup_phase_components = ()
+        self._warmup_phase_used_components = ()
         self._warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         if self._track_warmup_memory:
@@ -254,6 +257,7 @@ class ComponentResidencyManager:
             self._begin_warmup_phase(
                 key=f"{stage_index}:{self.state.stage_name}:setup",
                 components=self._warmup_active_components(),
+                used_components=(),
             )
 
     def begin_stage(self) -> None:
@@ -589,6 +593,7 @@ class ComponentResidencyManager:
                     components=self._warmup_active_components(
                         (use,) if will_prepare else ()
                     ),
+                    used_components=(component_name,) if will_prepare else (),
                 )
             was_on_supported_device = self._module_on_supported_device(module)
             strategy.finish_request(module, use, self.state, preferred=preferred)
@@ -600,16 +605,24 @@ class ComponentResidencyManager:
             self._warmup_phase_peaks["idle"] = WarmupPhasePeak(
                 active_components=self._warmup_active_components(),
                 allocated_bytes=int(torch.get_device_module().memory_allocated()),
+                used_components=(),
             )
             self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
         self._track_warmup_memory = False
 
-    def _begin_warmup_phase(self, *, key: str, components: tuple[str, ...]) -> None:
+    def _begin_warmup_phase(
+        self,
+        *,
+        key: str,
+        components: tuple[str, ...],
+        used_components: tuple[str, ...],
+    ) -> None:
         if not self._track_warmup_memory:
             return
         self._record_warmup_phase_peak()
         self._warmup_phase_key = key
         self._warmup_phase_components = tuple(sorted(set(components)))
+        self._warmup_phase_used_components = tuple(sorted(set(used_components)))
         torch.get_device_module().reset_peak_memory_stats()
 
     def _begin_warmup_transition(
@@ -627,6 +640,9 @@ class ComponentResidencyManager:
             components=self._warmup_active_components(
                 tuple(use for use in (previous, upcoming) if use is not None)
             ),
+            used_components=tuple(
+                use.component_name for use in (previous, upcoming) if use is not None
+            ),
         )
 
     def _begin_warmup_use(self, use: ComponentUse) -> None:
@@ -634,12 +650,14 @@ class ComponentResidencyManager:
         self._begin_warmup_phase(
             key=f"{self.state.stage_index}:{self.state.stage_name}:use:{phase}",
             components=self._warmup_active_components((use,)),
+            used_components=(use.component_name,),
         )
 
     def _begin_warmup_between_uses(self) -> None:
         self._begin_warmup_phase(
             key=f"{self.state.stage_index}:{self.state.stage_name}:between",
             components=self._warmup_active_components(),
+            used_components=(),
         )
 
     def _begin_warmup_prefetch(self, use: ComponentUse) -> None:
@@ -647,6 +665,7 @@ class ComponentResidencyManager:
         self._begin_warmup_phase(
             key=f"{self.state.stage_index}:{self.state.stage_name}:prefetch:{phase}",
             components=self._warmup_active_components((use,)),
+            used_components=(use.component_name,),
         )
 
     def _warmup_active_components(
@@ -668,6 +687,7 @@ class ComponentResidencyManager:
         peak = WarmupPhasePeak(
             active_components=self._warmup_phase_components,
             allocated_bytes=int(torch.get_device_module().max_memory_allocated()),
+            used_components=self._warmup_phase_used_components,
         )
         previous = self._warmup_phase_peaks.get(self._warmup_phase_key)
         if previous is None:
@@ -680,6 +700,9 @@ class ComponentResidencyManager:
                     )
                 ),
                 allocated_bytes=max(previous.allocated_bytes, peak.allocated_bytes),
+                used_components=tuple(
+                    sorted(set(previous.used_components) & set(peak.used_components))
+                ),
             )
 
     def take_warmup_phase_peaks(

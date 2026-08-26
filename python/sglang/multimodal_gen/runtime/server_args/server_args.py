@@ -1494,6 +1494,19 @@ class ServerArgs(DisaggServerArgsMixin):
         if component_name in self._required_resident_components:
             return RESIDENT
 
+        return self.configured_residency_mode(component_name)
+
+    def configured_residency_mode(self, component_name: str) -> str:
+        """Return placement from user controls and startup auto tuning.
+
+        Unlike :meth:`residency_mode`, this excludes runtime requirements such
+        as warmup-calibrated auto residency. A runtime planner can therefore
+        recover and reconsider the load-safe baseline without overriding an
+        explicit user choice.
+        """
+        if current_platform.is_cpu():
+            return RESIDENT
+
         explicit_mode = self.explicit_residency_mode(component_name)
         if explicit_mode is not None:
             return explicit_mode
@@ -1528,6 +1541,10 @@ class ServerArgs(DisaggServerArgsMixin):
         if is_vae_component_name(component_name):
             return COMPONENT_OFFLOAD if self.vae_cpu_offload else RESIDENT
         return RESIDENT
+
+    def component_residency_requirement(self, component_name: str) -> str | None:
+        """Return the feature that currently hard-requires GPU residency."""
+        return self._required_resident_components.get(component_name)
 
     def should_cpu_offload_component(self, component_name: str) -> bool:
         return self.residency_mode(component_name) == COMPONENT_OFFLOAD

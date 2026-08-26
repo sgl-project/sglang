@@ -103,6 +103,100 @@ def test_ties_prefer_lower_resource_cost_then_stable_key():
     }
 
 
+def test_complete_state_selection_can_replace_current_placement():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer:resident",
+                resource_delta_bytes={"vram": 0},
+                estimated_latency_savings=100,
+            ),
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer:offload",
+                resource_delta_bytes={"vram": -40},
+                estimated_latency_savings=0,
+            ),
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text_encoder:resident",
+                resource_delta_bytes={"vram": 30},
+                estimated_latency_savings=200,
+            ),
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text_encoder:offload",
+                resource_delta_bytes={"vram": 0},
+                estimated_latency_savings=0,
+            ),
+        ],
+        resource_budget_bytes={"vram": 0},
+        require_selection_from_every_group=True,
+    )
+
+    assert {option.option_key for option in plan.selections} == {
+        "transformer:offload",
+        "text_encoder:resident",
+    }
+
+
+def test_latency_equivalent_plan_prefers_lower_soft_memory_cost():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="transformer",
+                option_key="transformer-resident",
+                resource_delta_bytes={"gpu:rank0:runtime": 40},
+                estimated_latency_savings=1_000,
+                placement_cost_bytes=(40, 0),
+            ),
+            PlacementOption(
+                group_key="text_encoder",
+                option_key="text-encoder-resident",
+                resource_delta_bytes={"gpu:rank0:runtime": 10},
+                estimated_latency_savings=60,
+                placement_cost_bytes=(10, 0),
+            ),
+        ],
+        resource_budget_bytes={"gpu:rank0:runtime": 100},
+        estimated_latency_tolerance=100,
+    )
+
+    assert [option.option_key for option in plan.selections] == ["transformer-resident"]
+    assert plan.estimated_latency_savings == 1_000
+    assert plan.placement_cost_bytes == (40, 0)
+
+
+def test_latency_tolerance_is_global_not_per_option():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="a",
+                option_key="a-resident",
+                resource_delta_bytes={},
+                estimated_latency_savings=60,
+                placement_cost_bytes=(1,),
+            ),
+            PlacementOption(
+                group_key="b",
+                option_key="b-resident",
+                resource_delta_bytes={},
+                estimated_latency_savings=60,
+                placement_cost_bytes=(1,),
+            ),
+        ],
+        resource_budget_bytes={},
+        estimated_latency_tolerance=100,
+    )
+
+    # Neither 60-unit option would survive a per-option 100-unit cutoff. Their
+    # combined benefit first establishes a non-zero global utility floor; the
+    # least costly placement within that floor then keeps one of them.
+    assert [option.option_key for option in plan.selections] == ["a-resident"]
+    assert plan.estimated_latency_savings == 60
+
+
 def test_one_static_placement_satisfies_all_observed_phase_constraints():
     plan = optimize_placement(
         [

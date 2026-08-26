@@ -10,11 +10,11 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    PROMOTION_STATUS_PROMOTED,
-    PROMOTION_STATUS_ROLLBACK_FAILED,
-    PROMOTION_STATUS_ROLLED_BACK,
-    PROMOTION_STATUS_SKIPPED,
-    AppliedPromotion,
+    PLACEMENT_STATUS_ADJUSTED,
+    PLACEMENT_STATUS_ROLLBACK_FAILED,
+    PLACEMENT_STATUS_ROLLED_BACK,
+    PLACEMENT_STATUS_SKIPPED,
+    AppliedResidencyChange,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -30,8 +30,8 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             self.assertIsInstance(req, AutoResidencyReq)
             actions.append(req.action)
             return OutputBatch(
-                error="post-promotion warmup output changed",
-                output={"status": PROMOTION_STATUS_ROLLED_BACK},
+                error="post-adjustment warmup output changed",
+                output={"status": PLACEMENT_STATUS_ROLLED_BACK},
             )
 
         rewarm = mock.AsyncMock()
@@ -58,9 +58,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
     def test_replans_until_the_calibrated_layout_reaches_a_fixed_point(self):
         responses = iter(
             [
-                OutputBatch(output={"status": PROMOTION_STATUS_PROMOTED}),
-                OutputBatch(output={"status": PROMOTION_STATUS_PROMOTED}),
-                OutputBatch(output={"status": PROMOTION_STATUS_SKIPPED}),
+                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
+                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
+                OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED}),
             ]
         )
         actions = []
@@ -93,9 +93,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             self.assertIsInstance(req, AutoResidencyReq)
             actions.append(req.action)
             status = (
-                PROMOTION_STATUS_PROMOTED
+                PLACEMENT_STATUS_ADJUSTED
                 if req.action == "apply"
-                else PROMOTION_STATUS_ROLLED_BACK
+                else PLACEMENT_STATUS_ROLLED_BACK
             )
             return OutputBatch(output={"status": status})
 
@@ -119,10 +119,10 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         async def forward(req):
             self.assertIsInstance(req, AutoResidencyReq)
             if req.action == "apply":
-                return OutputBatch(output={"status": PROMOTION_STATUS_PROMOTED})
+                return OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED})
             return OutputBatch(
                 error="rollback failed",
-                output={"status": PROMOTION_STATUS_ROLLBACK_FAILED},
+                output={"status": PLACEMENT_STATUS_ROLLBACK_FAILED},
             )
 
         rewarm = mock.AsyncMock(side_effect=RuntimeError("oom"))
@@ -143,7 +143,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         actions = []
         responses = iter(
             [
-                OutputBatch(output={"status": PROMOTION_STATUS_PROMOTED}),
+                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
                 RuntimeError("rpc failed"),
             ]
         )
@@ -168,7 +168,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
             self.assertRaisesRegex(
                 RuntimeError,
-                "auto residency apply failed after a calibrated promotion",
+                "auto residency apply failed after a calibrated adjustment",
             ),
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
@@ -177,10 +177,10 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         self.assertEqual(rewarm.await_count, 1)
 
     def test_failed_later_round_keeps_earlier_calibrated_promotions(self):
-        first_round = AppliedPromotion("transformer", COMPONENT_OFFLOAD)
+        first_round = AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
         latest_round = [
-            AppliedPromotion("text_encoder", COMPONENT_OFFLOAD),
-            AppliedPromotion("vae", COMPONENT_OFFLOAD),
+            AppliedResidencyChange("text_encoder", COMPONENT_OFFLOAD),
+            AppliedResidencyChange("vae", COMPONENT_OFFLOAD),
         ]
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
@@ -192,7 +192,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_all_gather = lambda value: [value]
         worker._invalidate_component_strategies = mock.Mock()
 
-        with mock.patch.object(gpu_worker_module, "rollback_promotions") as rollback:
+        with mock.patch.object(
+            gpu_worker_module, "rollback_residency_changes"
+        ) as rollback:
             response = worker.rollback_auto_residency()
 
         rollback.assert_called_once_with(
@@ -200,12 +202,12 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             modules={},
             server_args=worker.server_args,
         )
-        self.assertEqual(response.output["status"], PROMOTION_STATUS_ROLLED_BACK)
+        self.assertEqual(response.output["status"], PLACEMENT_STATUS_ROLLED_BACK)
         self.assertEqual(worker._auto_residency_applied, [first_round])
         self.assertEqual(worker._auto_residency_round_sizes, [1])
 
     def test_failed_apply_round_does_not_rollback_prior_round(self):
-        first_round = AppliedPromotion("transformer", COMPONENT_OFFLOAD)
+        first_round = AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.pipeline = SimpleNamespace(modules={})
@@ -214,8 +216,10 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_round_sizes = [1, 0]
         worker._invalidate_component_strategies = mock.Mock()
 
-        with mock.patch.object(gpu_worker_module, "rollback_promotions") as rollback:
-            error = worker._rollback_applied_promotions(latest_round_only=True)
+        with mock.patch.object(
+            gpu_worker_module, "rollback_residency_changes"
+        ) as rollback:
+            error = worker._rollback_applied_residency_changes(latest_round_only=True)
 
         self.assertIsNone(error)
         rollback.assert_not_called()

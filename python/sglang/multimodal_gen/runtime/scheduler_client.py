@@ -160,7 +160,7 @@ def _merge_auto_residency_results(results: list[Any]) -> Any:
     """Preserve the strongest replica-wide auto-residency outcome.
 
     Replicas plan against their own measured headroom, so one may keep the
-    original placement while another promotes. If any replica promoted, the
+    original placement while another adjusts. If any replica changed, the
     orchestrator must still run the validation warmup everywhere. A failed
     local rollback remains fatal and takes precedence over that success.
     """
@@ -175,11 +175,11 @@ def _merge_auto_residency_results(results: list[Any]) -> Any:
     if rollback_failed is not None:
         return rollback_failed
 
-    promoted = next(
-        (result for result in results if _auto_residency_status(result) == "promoted"),
+    adjusted = next(
+        (result for result in results if _auto_residency_status(result) == "adjusted"),
         None,
     )
-    if promoted is not None:
+    if adjusted is not None:
         replica_errors = [
             result.error
             for result in results
@@ -191,7 +191,7 @@ def _merge_auto_residency_results(results: list[Any]) -> Any:
                 len(replica_errors),
                 replica_errors[0],
             )
-        return promoted
+        return adjusted
 
     rolled_back = next(
         (

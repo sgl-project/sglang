@@ -69,24 +69,24 @@ def test_fanout_merge_surfaces_the_failing_replica():
     assert _merge_fanout_results([ok, OutputBatch(output=None)]) is ok
 
 
-def test_auto_residency_fanout_rewarms_when_any_replica_promotes():
+def test_auto_residency_fanout_rewarms_when_any_replica_adjusts():
     skipped = OutputBatch(output={"status": "skipped"})
-    promoted = OutputBatch(output={"status": "promoted"})
-    assert _merge_auto_residency_results([skipped, promoted]) is promoted
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([skipped, adjusted]) is adjusted
 
 
 def test_auto_residency_fanout_tolerates_a_locally_rolled_back_replica():
     restored = OutputBatch(
         output={"status": "rolled_back"}, error="original placement restored"
     )
-    promoted = OutputBatch(output={"status": "promoted"})
-    assert _merge_auto_residency_results([restored, promoted]) is promoted
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([restored, adjusted]) is adjusted
 
 
 def test_auto_residency_fanout_never_hides_failed_rollback():
     failed = OutputBatch(output={"status": "rollback_failed"}, error="restart required")
-    promoted = OutputBatch(output={"status": "promoted"})
-    assert _merge_auto_residency_results([promoted, failed]) is failed
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([adjusted, failed]) is failed
 
 
 def test_auto_residency_fanout_reports_successful_rollback():
