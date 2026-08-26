@@ -109,7 +109,13 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(width=64, height=64, num_frames=1)
+    req = SimpleNamespace(
+        width=64,
+        height=64,
+        num_frames=1,
+        num_inference_steps=1,
+        metrics=None,
+    )
 
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
@@ -142,7 +148,13 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(width=64, height=64, num_frames=1)
+    req = SimpleNamespace(
+        width=64,
+        height=64,
+        num_frames=1,
+        num_inference_steps=1,
+        metrics=None,
+    )
 
     with (
         patch.object(torch, "get_device_module", return_value=device_module),

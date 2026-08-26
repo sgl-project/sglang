@@ -23,6 +23,38 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_worker_rollback_response_rewarms_the_restored_layout(self):
+        actions = []
+
+        async def forward(req):
+            self.assertIsInstance(req, AutoResidencyReq)
+            actions.append(req.action)
+            return OutputBatch(
+                error="post-promotion warmup output changed",
+                output={"status": PROMOTION_STATUS_ROLLED_BACK},
+            )
+
+        rewarm = mock.AsyncMock()
+        server_args = SimpleNamespace(
+            performance_mode="auto",
+            warmup_resolutions=None,
+        )
+        with (
+            mock.patch.object(
+                server_warmup, "auto_residency_skip_reason", return_value=None
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
+        ):
+            asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
+
+        self.assertEqual(actions, ["apply"])
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=True,
+            rewarm=True,
+        )
+
     def test_replans_until_the_calibrated_layout_reaches_a_fixed_point(self):
         responses = iter(
             [

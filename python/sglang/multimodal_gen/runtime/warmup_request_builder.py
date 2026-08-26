@@ -555,6 +555,11 @@ def build_warmup_reqs(
         if warmup_resolutions is None
         else None
     )
+    collect_auto_residency_metrics = (
+        warmup_resolutions is None
+        and server_based_warmup
+        and auto_residency_args_skip_reason(server_args) is None
+    )
     if auto_residency_warmup_shape is not None:
         width, height, warmup_num_frames = auto_residency_warmup_shape
         resolutions[0] = (width, height)
@@ -618,6 +623,11 @@ def build_warmup_reqs(
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:
                 req.extra["server_based_warmup"] = True
+            if collect_auto_residency_metrics:
+                # Stage timers already synchronize around warmup stages. Keep
+                # their values for residency planning instead of discarding
+                # the measurements after paying that cost.
+                req.metrics.suppress_stage_breakdown = False
             if auto_residency_warmup_shape is not None:
                 req.extra["auto_residency_full_shape_probe"] = True
             warmup_reqs.append(req)

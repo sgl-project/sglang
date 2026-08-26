@@ -19,9 +19,11 @@ class PlacementOption(msgspec.Struct, frozen=True):
     normalized form of absolute placement costs: the current placement is the
     implicit zero option, positive values consume headroom, and negative values
     release a resource. Keeping one resource map lets a single decision satisfy
-    rank/phase VRAM and node-scoped pinned-host constraints for one placement
-    state. A lifecycle with different load and serving placements must solve
-    those states separately and validate the transition between them.
+    rank/phase VRAM and node-scoped pinned-host constraints. A lifecycle option
+    may describe different load and serving placements by including load,
+    transition, and runtime resource dimensions in this same vector. The caller
+    must construct only compatible lifecycle combinations; independently solved
+    load and serving choices cannot be composed safely after the fact.
 
     ``estimated_latency_savings`` is an integer supplied by the caller. It can
     be transfer nanoseconds when measured bandwidth is available, or avoided
@@ -101,9 +103,9 @@ def optimize_placement(
     constraint describing this placement state sees the same decision. A
     choice may trade one resource for another by using a negative delta. The
     result is exact for the supplied option frontier, resource model and
-    utility values; it does not imply that distinct load and serving states
-    should share one selection vector, or that the supplied frontier contains
-    every physically possible placement.
+    utility values. Distinct load and serving states may be encoded in one
+    option, but the result does not imply that the supplied frontier contains
+    every physically possible lifecycle plan.
     """
     grouped: dict[str, list[PlacementOption]] = {}
     option_keys: set[str] = set()

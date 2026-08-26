@@ -25,6 +25,7 @@ single placement to serve two different lifecycle objectives.
 
 from __future__ import annotations
 
+import statistics
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 import msgspec
@@ -79,6 +80,14 @@ MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
 # share of what is actually there.
 MAX_VRAM_RESERVE_FRACTION = 0.20
 
+# A feasible placement is not automatically useful. Charge every placement a
+# latency-risk cost before joint optimization so small, noisy predicted gains
+# do not spend memory. The raw estimate is already an upper bound: transfer
+# time is capped by the measured stage that can possibly wait for it.
+ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
+MIN_PLACEMENT_LATENCY_RISK_NS = 50_000_000
+PLACEMENT_LATENCY_RISK_FRACTION = 0.005
+
 AUTO_RESIDENCY_FEATURE_NAME = "auto residency promotion"
 
 PROMOTION_STATUS_SKIPPED = "skipped"
@@ -113,6 +122,10 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     succeeded: bool
     phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
+    num_inference_steps: int = 1
+    total_duration_ms: float = 0.0
+    stage_duration_ms: dict[str, float] = {}
+    step_duration_ms: tuple[float, ...] = ()
 
     def workload_units(self) -> int:
         return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)
@@ -185,6 +198,8 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     pinned_host_bytes: int = 0
     host_pin_capacity_bytes: int = 0
     host_transition_headroom_bytes: int = 0
+    estimated_request_duration_ns: int = 0
+    candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[PromotionCandidate] = []
     skip_reason: str | None = None
 
@@ -253,6 +268,129 @@ def resolve_measured_default_workload(
         num_frames=workload.num_frames,
         num_inference_steps=workload.num_inference_steps,
     )
+
+
+def estimate_default_workload_timing(
+    *,
+    records: Iterable[WarmupMemoryRecord],
+    target_units: int | None,
+    target_num_inference_steps: int,
+) -> tuple[int, dict[str, int], dict[str, tuple[str, ...]]]:
+    """Estimate full-request and stage durations from the warmup workload.
+
+    Non-denoise stages run once. Denoising time scales with the requested step
+    count; the full-shape probe intentionally executes only a few steps, so
+    using its raw total would make every one-shot encoder transfer look
+    important relative to a long video request.
+    """
+    successful = [record for record in records if record.succeeded]
+    if not successful:
+        return 0, {}, {}
+    if target_units is not None:
+        at_target = [
+            record for record in successful if record.workload_units() >= target_units
+        ]
+        if at_target:
+            successful = at_target
+    representative = max(
+        successful,
+        key=lambda record: (
+            record.workload_units(),
+            record.total_duration_ms,
+        ),
+    )
+    if representative.total_duration_ms <= 0 or not representative.stage_duration_ms:
+        return 0, {}, {}
+
+    component_stages: dict[str, set[str]] = {}
+    for phase_name, components in representative.phase_active_components.items():
+        fields = phase_name.split(":", 2)
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        stage_name = fields[1]
+        if stage_name not in representative.stage_duration_ms:
+            continue
+        for component_name in components:
+            component_stages.setdefault(component_name, set()).add(stage_name)
+
+    denoising_stages = {
+        stage_name
+        for component_name, stage_names in component_stages.items()
+        if is_dit_component_name(component_name)
+        for stage_name in stage_names
+    }
+    if not denoising_stages:
+        denoising_stages = {
+            stage_name
+            for stage_name in representative.stage_duration_ms
+            if stage_name.endswith("DenoisingStage")
+            and not stage_name.endswith("BeforeDenoisingStage")
+        }
+
+    measured_steps = max(1, representative.num_inference_steps)
+    target_steps = max(1, target_num_inference_steps)
+    denoising_scale = target_steps / measured_steps
+    measured_denoising_ms = sum(
+        representative.stage_duration_ms[stage_name] for stage_name in denoising_stages
+    )
+    if measured_denoising_ms > 0 and representative.step_duration_ms:
+        steady_steps = (
+            representative.step_duration_ms[1:]
+            if len(representative.step_duration_ms) > 1
+            else representative.step_duration_ms
+        )
+        steady_step_ms = statistics.median(steady_steps)
+        non_step_denoising_ms = max(
+            0.0,
+            measured_denoising_ms - sum(representative.step_duration_ms),
+        )
+        target_denoising_ms = non_step_denoising_ms + steady_step_ms * target_steps
+        denoising_scale = target_denoising_ms / measured_denoising_ms
+
+    stage_duration_ns: dict[str, int] = {}
+    for stage_name, duration_ms in representative.stage_duration_ms.items():
+        scale = denoising_scale if stage_name in denoising_stages else 1.0
+        stage_duration_ns[stage_name] = max(0, int(duration_ms * scale * 1_000_000))
+
+    measured_stage_ms = sum(representative.stage_duration_ms.values())
+    untracked_ms = max(0.0, representative.total_duration_ms - measured_stage_ms)
+    request_duration_ns = sum(stage_duration_ns.values()) + int(
+        untracked_ms * 1_000_000
+    )
+
+    return (
+        request_duration_ns,
+        stage_duration_ns,
+        {
+            component_name: tuple(sorted(stage_names))
+            for component_name, stage_names in component_stages.items()
+        },
+    )
+
+
+def estimate_candidate_latency_savings_ns(
+    *,
+    candidates: Iterable[PromotionCandidate],
+    request_duration_ns: int,
+    stage_duration_ns: Mapping[str, int],
+    component_stages: Mapping[str, tuple[str, ...]],
+) -> dict[str, int]:
+    """Upper-bound blocking H2D time removed by each placement option."""
+    estimates: dict[str, int] = {}
+    for candidate in candidates:
+        transfer_ns = int(
+            candidate.h2d_bytes_per_request
+            / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+            * 1_000_000_000
+        )
+        stages = component_stages.get(candidate.component_name, ())
+        stage_cap_ns = sum(stage_duration_ns.get(stage, 0) for stage in stages)
+        if stage_cap_ns <= 0:
+            stage_cap_ns = request_duration_ns
+        estimates[candidate.option_key()] = (
+            min(transfer_ns, stage_cap_ns) if transfer_ns > 0 else transfer_ns
+        )
+    return estimates
 
 
 def estimate_default_workload_peak_bytes(
@@ -595,6 +733,7 @@ def collect_promotion_candidates(
     custom_strategy_names: Iterable[str],
     num_inference_steps: int,
     allow_host_pin_reallocation: bool = True,
+    mixed_dtype_components: Iterable[str] = (),
 ) -> list[PromotionCandidate]:
     """List implicitly offloaded native components eligible for promotion.
 
@@ -603,6 +742,7 @@ def collect_promotion_candidates(
     pipeline-custom residency strategy are never touched.
     """
     custom_names = set(custom_strategy_names)
+    mixed_dtype_names = set(mixed_dtype_components)
     candidates = []
     for name in sorted(modules):
         module = modules[name]
@@ -753,6 +893,14 @@ def collect_promotion_candidates(
                         inactive_device_delta_bytes=0,
                     )
                 )
+
+        # Layerwise stores have one fixed dtype. ResidentStrategy instead casts
+        # at every declared use, so a component with mixed use dtypes cannot be
+        # switched permanently without changing its numerical path. HostPin
+        # repacking and stage-scoped layer residency keep the layerwise strategy
+        # active and remain valid candidates.
+        if name in mixed_dtype_names:
+            continue
 
         full_resident_layers = tuple(manager.num_layers for manager in managers)
         # Fully resident layers never read their host stores, so their pins can
@@ -1006,6 +1154,21 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         for report in reports
     ]
 
+    use_latency_utility = all(
+        report.estimated_request_duration_ns > 0 and report.candidate_latency_savings_ns
+        for report in reports
+    )
+    placement_latency_risk_ns = (
+        max(
+            MIN_PLACEMENT_LATENCY_RISK_NS,
+            int(
+                max(report.estimated_request_duration_ns for report in reports)
+                * PLACEMENT_LATENCY_RISK_FRACTION
+            ),
+        )
+        if use_latency_utility
+        else 0
+    )
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
@@ -1037,7 +1200,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 group_key=candidate.component_name,
                 option_key=candidate.option_key(),
                 resource_delta_bytes=resource_deltas,
-                estimated_latency_savings=candidate.h2d_bytes_per_request,
+                estimated_latency_savings=(
+                    min(
+                        report.candidate_latency_savings_ns.get(
+                            candidate.option_key(), 0
+                        )
+                        for report in reports
+                    )
+                    - placement_latency_risk_ns
+                    if use_latency_utility
+                    else candidate.h2d_bytes_per_request
+                ),
             )
         )
 

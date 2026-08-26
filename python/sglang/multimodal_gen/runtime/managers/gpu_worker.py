@@ -64,7 +64,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     collect_promotion_candidates,
     component_runtime_weight_bytes,
     describe_error,
+    estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
+    estimate_default_workload_timing,
     estimate_workload_phase_peaks,
     format_applied_changes,
     format_plan_summary,
@@ -697,7 +699,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return output_batch
 
     def _record_server_warmup_memory(
-        self, *, req: Req, baseline_allocated_bytes: int, succeeded: bool
+        self,
+        *,
+        req: Req,
+        baseline_allocated_bytes: int,
+        succeeded: bool,
     ) -> None:
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
@@ -719,6 +725,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # second live placement, and is covered by the explicit reserve.
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = untracked_active_components
+        metrics = req.metrics
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
                 width=int(req.width or 0),
@@ -729,6 +736,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 succeeded=succeeded,
                 phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
+                num_inference_steps=max(1, int(req.num_inference_steps or 1)),
+                total_duration_ms=(
+                    float(metrics.total_duration_ms) if metrics is not None else 0.0
+                ),
+                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
+                step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
             )
         )
 
@@ -1165,6 +1178,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 workload.num_inference_steps if workload is not None else 1
             ),
             allow_host_pin_reallocation=self.server_args.num_gpus == 1,
+            mixed_dtype_components=self._mixed_dtype_residency_components(),
         )
 
         can_stay_resident = []
@@ -1421,6 +1435,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             custom_strategy_names=self.pipeline.component_residency_strategies,
             num_inference_steps=workload.num_inference_steps,
             allow_host_pin_reallocation=True,
+            mixed_dtype_components=self._mixed_dtype_residency_components(),
+        )
+        (
+            estimated_request_duration_ns,
+            stage_duration_ns,
+            component_stages,
+        ) = estimate_default_workload_timing(
+            records=records,
+            target_units=workload.workload_units(),
+            target_num_inference_steps=workload.num_inference_steps,
+        )
+        candidate_latency_savings_ns = estimate_candidate_latency_savings_ns(
+            candidates=candidates,
+            request_duration_ns=estimated_request_duration_ns,
+            stage_duration_ns=stage_duration_ns,
+            component_stages=component_stages,
         )
         local_worker_count = max(
             1, self.server_args.num_gpus // self.server_args.nnodes
@@ -1440,6 +1470,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
             )
             // local_worker_count,
+            estimated_request_duration_ns=estimated_request_duration_ns,
+            candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,
             skip_reason=skip_reason,
         )
@@ -1453,6 +1485,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             gathered, obj, group=replica_group.cpu_group
         )
         return gathered
+
+    @staticmethod
+    def _mixed_dtype_residency_components() -> set[str]:
+        manager = peek_global_component_residency_manager()
+        if manager is None:
+            return set()
+        return manager.components_with_mixed_use_dtypes()
 
     def _rollback_applied_promotions(
         self, *, latest_round_only: bool = False

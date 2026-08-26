@@ -24,7 +24,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     collect_promotion_candidates,
     component_resident_size_bytes,
     component_runtime_weight_bytes,
+    estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
+    estimate_default_workload_timing,
     estimate_workload_phase_peaks,
     format_applied_changes,
     plan_auto_residency,
@@ -55,6 +57,11 @@ def _record(
     baseline_gib=10,
     peak_gib=12,
     succeeded=True,
+    num_inference_steps=1,
+    total_duration_ms=0.0,
+    stage_duration_ms=None,
+    step_duration_ms=(),
+    phase_active_components=None,
 ) -> WarmupMemoryRecord:
     return WarmupMemoryRecord(
         width=width,
@@ -63,7 +70,92 @@ def _record(
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
         peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
+        num_inference_steps=num_inference_steps,
+        total_duration_ms=total_duration_ms,
+        stage_duration_ms=stage_duration_ms or {},
+        step_duration_ms=step_duration_ms,
+        phase_active_components=phase_active_components or {},
     )
+
+
+class TestEstimateDefaultWorkloadTiming:
+    def test_scales_only_denoising_with_target_steps(self):
+        record = _record(
+            num_inference_steps=2,
+            total_duration_ms=1_200,
+            stage_duration_ms={
+                "TextEncodingStage": 100,
+                "DenoisingStage": 1_000,
+            },
+            phase_active_components={
+                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
+                "1:DenoisingStage:use:transformer": ("transformer",),
+            },
+        )
+
+        request_ns, stage_ns, component_stages = estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=40,
+        )
+
+        assert stage_ns == {
+            "TextEncodingStage": 100_000_000,
+            "DenoisingStage": 20_000_000_000,
+        }
+        assert request_ns == 20_200_000_000
+        assert component_stages == {
+            "text_encoder": ("TextEncodingStage",),
+            "transformer": ("DenoisingStage",),
+        }
+
+    def test_uses_steady_step_instead_of_scaling_first_step_setup(self):
+        record = _record(
+            num_inference_steps=2,
+            total_duration_ms=720,
+            stage_duration_ms={
+                "TextEncodingStage": 100,
+                "DenoisingStage": 620,
+            },
+            step_duration_ms=(500, 100),
+            phase_active_components={
+                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
+                "1:DenoisingStage:use:transformer": ("transformer",),
+            },
+        )
+
+        request_ns, stage_ns, _ = estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=10,
+        )
+
+        assert stage_ns["DenoisingStage"] == 1_020_000_000
+        assert request_ns == 1_120_000_000
+
+    def test_transfer_savings_is_capped_by_own_stage(self):
+        candidates = [
+            _candidate("text_encoder", weight_gib=10, h2d_gib=10),
+            _candidate("transformer", weight_gib=10, h2d_gib=10),
+            _candidate("cold_encoder", weight_gib=10, h2d_gib=-1),
+        ]
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=candidates,
+            request_duration_ns=10_000_000_000,
+            stage_duration_ns={
+                "TextEncodingStage": 80_000_000,
+                "DenoisingStage": 5_000_000_000,
+            },
+            component_stages={
+                "text_encoder": ("TextEncodingStage",),
+                "transformer": ("DenoisingStage",),
+            },
+        )
+
+        assert savings[candidates[0].option_key()] == 80_000_000
+        assert savings[candidates[1].option_key()] > 400_000_000
+        assert savings[candidates[2].option_key()] < 0
 
 
 class TestEstimateDefaultWorkloadPeak:
@@ -319,6 +411,8 @@ def _report(
     pinned_host_gib: int = 0,
     host_pin_capacity_gib: int = 0,
     host_transition_headroom_gib: int = 0,
+    estimated_request_duration_ns: int = 0,
+    candidate_latency_savings_ns: dict[str, int] | None = None,
 ) -> RankResidencyReport:
     return RankResidencyReport(
         rank=rank,
@@ -334,6 +428,8 @@ def _report(
         pinned_host_bytes=pinned_host_gib * GIB_BYTES,
         host_pin_capacity_bytes=host_pin_capacity_gib * GIB_BYTES,
         host_transition_headroom_bytes=(host_transition_headroom_gib * GIB_BYTES),
+        estimated_request_duration_ns=estimated_request_duration_ns,
+        candidate_latency_savings_ns=candidate_latency_savings_ns or {},
         candidates=candidates if candidates is not None else [_candidate("vae")],
         skip_reason=skip_reason,
     )
@@ -426,7 +522,7 @@ class TestPlanAutoResidency:
         plan = plan_auto_residency(reports=[_report(budget_gib=10, estimated_gib=4)])
         assert plan.reserve_bytes == 2 * GIB_BYTES
 
-    def test_greedy_promotion_by_h2d_savings(self):
+    def test_optimizes_promotion_by_h2d_savings(self):
         # dit saves 25 GiB x 50 steps per request; text_encoder saves 30 GiB
         # once. dit must be promoted first, after which the text encoder no
         # longer fits (50 + 25 + 30 + 10 > 100).
@@ -438,6 +534,34 @@ class TestPlanAutoResidency:
             reports=[_report(budget_gib=100, estimated_gib=50, candidates=candidates)]
         )
         assert [c.component_name for c in plan.promotions] == ["dit"]
+
+    def test_long_request_does_not_spend_vram_on_tiny_encoder_gain(self):
+        transformer = _candidate(
+            "transformer",
+            mode=LAYERWISE_OFFLOAD,
+            weight_gib=40,
+            h2d_gib=40 * 40,
+        )
+        text_encoder = _candidate("text_encoder", weight_gib=8, h2d_gib=8)
+        candidates = [transformer, text_encoder]
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=80,
+                    estimated_gib=20,
+                    candidates=candidates,
+                    estimated_request_duration_ns=66_000_000_000,
+                    candidate_latency_savings_ns={
+                        transformer.option_key(): 10_000_000_000,
+                        text_encoder.option_key(): 83_000_000,
+                    },
+                )
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "transformer"
+        ]
 
     def test_smaller_component_still_fits_after_skipping_a_big_one(self):
         candidates = [
@@ -664,12 +788,18 @@ class TestPlanAutoResidency:
                     pinned_host_gib=10,
                     host_pin_capacity_gib=10,
                     candidates=[cold_pageable, hot_pinned],
+                    estimated_request_duration_ns=1_000_000_000,
+                    candidate_latency_savings_ns={
+                        cold_pageable.option_key(): 10_000_000,
+                        hot_pinned.option_key(): 500_000_000,
+                    },
                 )
             ]
         )
 
-        # Plans are reported by benefit. apply_promotions independently sorts
-        # pin changes so the release still happens before the acquisition.
+        # The encoder's gain is below the risk floor, but its hostpin release
+        # makes the valuable DiT placement feasible. A joint solver must keep
+        # this cross-component trade instead of filtering it locally.
         assert [candidate.component_name for candidate in plan.promotions] == [
             "hot_dit",
             "cold_encoder",
@@ -1012,6 +1142,26 @@ class TestCollectPromotionCandidates:
 
         assert permanent.target_layerwise_pinned_layers == ((0, 1),)
         assert permanent.pinned_host_delta_bytes == 0
+
+    def test_mixed_dtype_layerwise_component_is_not_permanently_promoted(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            }
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_promotion_candidates(
+            modules={"vae": module},
+            residency_mode_of=self._modes({"vae": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            mixed_dtype_components={"vae"},
+        )
+
+        assert not any(candidate.permanent_residency for candidate in candidates)
 
 
 class TestApplyAndRollback:

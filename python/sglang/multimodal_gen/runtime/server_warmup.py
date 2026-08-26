@@ -202,6 +202,10 @@ async def maybe_apply_auto_residency(
         if status == PROMOTION_STATUS_ROLLBACK_FAILED:
             raise RuntimeError(f"auto residency rollback failed: {response.error}")
         if response.error is not None:
+            if status == PROMOTION_STATUS_ROLLED_BACK:
+                await run_async_client_warmup(
+                    server_args, forward, fail_open=fail_open, rewarm=True
+                )
             retained = (
                 "the last calibrated placement"
                 if promoted_any

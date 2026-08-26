@@ -429,6 +429,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             (1280, 720, 81),
         )
         self.assertTrue(reqs[0].extra["auto_residency_full_shape_probe"])
+        self.assertFalse(reqs[0].metrics.suppress_stage_breakdown)
         self.assertEqual(reqs[0].num_inference_steps, 2)
         self.assertIn(
             "auto residency probe (1280x720x81f, 2/35 steps)",

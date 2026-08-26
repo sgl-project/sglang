@@ -165,6 +165,76 @@ def test_one_static_placement_satisfies_all_observed_phase_constraints():
     }
 
 
+def test_lifecycle_plan_jointly_constrains_load_transition_runtime_and_hostpin():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="dit-lifecycle",
+                option_key="dit-gpu-load-to-resident",
+                resource_delta_bytes={
+                    "gpu:rank0:load": 8,
+                    "gpu:rank0:transition": 8,
+                    "gpu:rank0:runtime": 6,
+                    "hostpin:node0": 0,
+                },
+                estimated_latency_savings=100,
+            ),
+            PlacementOption(
+                group_key="dit-lifecycle",
+                option_key="dit-sharded-load-to-layerwise",
+                resource_delta_bytes={
+                    "gpu:rank0:load": 4,
+                    "gpu:rank0:transition": 3,
+                    "gpu:rank0:runtime": 3,
+                    "hostpin:node0": 8,
+                },
+                estimated_latency_savings=80,
+            ),
+            PlacementOption(
+                group_key="encoder-lifecycle",
+                option_key="encoder-gpu-load-to-resident",
+                resource_delta_bytes={
+                    "gpu:rank0:load": 2,
+                    "gpu:rank0:transition": 4,
+                    "gpu:rank0:runtime": 4,
+                    "hostpin:node0": 0,
+                },
+                estimated_latency_savings=50,
+            ),
+            PlacementOption(
+                group_key="encoder-lifecycle",
+                option_key="encoder-cpu-load-to-pinned",
+                resource_delta_bytes={
+                    "gpu:rank0:load": 0,
+                    "gpu:rank0:transition": 1,
+                    "gpu:rank0:runtime": 1,
+                    "hostpin:node0": 4,
+                },
+                estimated_latency_savings=20,
+            ),
+        ],
+        resource_budget_bytes={
+            "gpu:rank0:load": 10,
+            "gpu:rank0:transition": 10,
+            "gpu:rank0:runtime": 10,
+            "hostpin:node0": 8,
+        },
+    )
+
+    # Independently optimizing load and runtime would pick both resident
+    # choices, but their transition uses 12 bytes and is infeasible.
+    assert [option.option_key for option in plan.selections] == [
+        "dit-sharded-load-to-layerwise",
+        "encoder-gpu-load-to-resident",
+    ]
+    assert plan.resource_delta_bytes == {
+        "gpu:rank0:load": 6,
+        "gpu:rank0:transition": 7,
+        "gpu:rank0:runtime": 7,
+        "hostpin:node0": 8,
+    }
+
+
 def test_negative_headroom_forces_the_plan_to_release_a_resource():
     plan = optimize_placement(
         [
