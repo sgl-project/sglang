@@ -1,7 +1,7 @@
 export const benchmarks = [
   {
     match: { hw: "gb300", strategy: "low-latency" },
-    sglang_version: "f13cb6f6a7",  // release image: glm-5.3-flash gf13cb6f6a7.fix1
+    sglang_version: "f13cb6f6a7",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -23,7 +23,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm" },
-    sglang_version: "f13cb6f6a7",  // release image: glm-5.3-flash gf13cb6f6a7.fix1
+    sglang_version: "f13cb6f6a7",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -44,7 +44,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", strategy: "high-throughput" },
-    sglang_version: "f13cb6f6a7",  // release image: glm-5.3-flash gf13cb6f6a7.fix1
+    sglang_version: "f13cb6f6a7",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -90,7 +90,7 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", kvDsaPair: "fp8-trtllm" },
-    sglang_version: "f13cb6f6a7",  // release image: glm-5.3-flash gf13cb6f6a7.fix1
+    sglang_version: "f13cb6f6a7",
     latencyPercentile: "Mean",
     speed: [
       {
