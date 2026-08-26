@@ -1669,6 +1669,35 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
+    def test_disable_piecewise_cuda_graph_python_kwarg_compatibility(self):
+        cases = [
+            (
+                {"disable_piecewise_cuda_graph": True},
+                Backend.DISABLED,
+            ),
+            (
+                {
+                    "disable_piecewise_cuda_graph": True,
+                    "cuda_graph_backend_prefill": Backend.BREAKABLE,
+                },
+                Backend.BREAKABLE,
+            ),
+            (
+                {
+                    "disable_piecewise_cuda_graph": True,
+                    "cuda_graph_config": {"prefill": {"backend": Backend.TC_PIECEWISE}},
+                },
+                Backend.TC_PIECEWISE,
+            ),
+        ]
+
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                args = ServerArgs(model_path="dummy", **kwargs)
+                args._parse_cuda_graph_config()
+
+                self.assertEqual(args.cuda_graph_config.prefill.backend, expected)
+
     @patch(
         "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"

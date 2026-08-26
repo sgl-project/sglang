@@ -1989,6 +1989,7 @@ class ServerArgs:
         NS("exec.graph"),
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True), NS("exec.graph")] = False
+    disable_piecewise_cuda_graph: A[bool, Arg(no_cli=True), NS("exec.graph")] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -4853,6 +4854,8 @@ class ServerArgs:
         # ---- Legacy global flags (lowest precedence above defaults) ----
         if self.disable_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
+            _set(Phase.PREFILL, "backend", Backend.DISABLED)
+        if self.disable_piecewise_cuda_graph:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
 
         # ---- Boolean per-phase off-switches ----
