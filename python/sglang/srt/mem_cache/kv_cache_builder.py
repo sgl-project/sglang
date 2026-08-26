@@ -65,7 +65,6 @@ def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
-    server_args: ServerArgs,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -84,7 +83,6 @@ def maybe_register_hicache_draft(
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
@@ -318,7 +316,6 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
-            server_args=server_args,
         )
 
     if retraction_backup == "host_pool":

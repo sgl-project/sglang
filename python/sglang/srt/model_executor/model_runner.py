@@ -648,7 +648,6 @@ class ModelRunner:
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
-            server_args=self.server_args,
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
@@ -1148,7 +1147,6 @@ class ModelRunner:
         # before configure_kv_cache_dtype.)
         load_kv_cache_scales(
             model=self.model,
-            server_args=self.server_args,
             kv_cache_dtype=get_model().kv_cache_dtype,
         )
 

@@ -132,7 +132,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1943,7 +1942,6 @@ def release_req(
     *,
     req: Req,
     remaing_req_count: int,
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -1980,7 +1978,6 @@ def release_req(
 def retract_all(
     *,
     reqs: List[Req],
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -1991,7 +1988,6 @@ def retract_all(
         release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -2857,9 +2853,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_decode(
-        self, server_args: ServerArgs
-    ) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
 
@@ -2877,7 +2871,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), server_args):
+            if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
                 # The retraction host pool could not hold the backup and the
@@ -2906,7 +2900,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args, offload_kv=False)
+            self.release_req(last_idx, 0, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2965,13 +2959,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         idx: int,
         remaing_req_count: int,
-        server_args: ServerArgs,
         offload_kv: bool = True,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
-            server_args=server_args,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
