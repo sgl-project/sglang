@@ -59,7 +59,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -91,6 +91,9 @@ LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+block_topk_npu = None
+if _is_npu:
+    from sglang.kernels.ops.llada2.block_topk_npu import block_topk_npu
 
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
@@ -162,6 +165,9 @@ class LLaDA2MoeGate(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.preserve_output_dtype = (
+            getattr(config, "expert_capacity", None) is not None
+        )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
@@ -180,7 +186,7 @@ class LLaDA2MoeGate(nn.Module):
 
     def forward(self, hidden_states):
         logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
+            self.weight.dtype if self.preserve_output_dtype else hidden_states.dtype
         )
         return logits
 
@@ -209,6 +215,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
         if _is_npu:
             self.norm_topk_prob = False
+
+        self.use_block_routing = getattr(config, "expert_capacity", None) is not None
+        if self.use_block_routing:
+            if not _is_npu:
+                raise ValueError("LLaDA2 block routing is only supported on NPU")
+            self.block_size = config.block_size
+            self.expert_capacity = config.expert_capacity
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -251,6 +264,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.gate.expert_bias.data if self.gate.expert_bias is not None else None
         )
 
+        if self.use_block_routing:
+            if get_moe_a2a_backend().is_deepep():
+                raise ValueError("LLaDA2 block routing does not support DeepEP")
+            if self.score_function != "sigmoid" or self.correction_bias is None:
+                raise ValueError(
+                    "LLaDA2 block routing requires sigmoid scores with expert bias"
+                )
         if self.score_function is not None:
             assert (
                 self.score_function == "softmax" and self.correction_bias is None
@@ -342,10 +362,32 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         return shared_output
 
+    def _block_topk(self, router_logits: torch.Tensor):
+        topk_weights, topk_ids = block_topk_npu(
+            router_logits,
+            self.correction_bias,
+            self.block_size,
+            self.expert_capacity,
+            self.top_k,
+        )
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_weights, topk_ids
+
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+
+        if self.use_block_routing:
+            topk_weights, topk_ids = self._block_topk(router_logits)
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+            )
+        else:
+            topk_output = self.topk(hidden_states, router_logits)
+
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
