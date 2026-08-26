@@ -16,7 +16,7 @@ on:
   push:
     branches:
       - codex/rocm10-rc4-gfx942-950
-      - codex/rocm10-rc4-gfx1250
+      - rocm10-gfx1250
 
 concurrency:
   # Tags are date-based, so only the newest build for a ref may publish them.
@@ -36,8 +36,13 @@ env:
   IMAGE_REPO: bingxche/sgl-test
 
 jobs:
+  # Each branch trigger drives only its own images. A push to the gfx1250
+  # branch must not rebuild gfx942/gfx950, and skipping this job also skips
+  # validate-pr and validate-nightly through their `needs`, which is the point:
+  # those suites exercise the MI300/MI35x images, so running them for a gfx1250
+  # change would occupy both runner pools to test something that did not change.
   publish:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'push' || github.ref != 'refs/heads/rocm10-gfx1250') && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -116,7 +121,7 @@ jobs:
   # there is no MI450 runner pool, so nothing below consumes this image, and a
   # gfx1250-only build failure must not gate the gfx942/gfx950 validation chain.
   publish-gfx1250:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'push' || github.ref == 'refs/heads/rocm10-gfx1250') && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
