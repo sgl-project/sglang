@@ -275,21 +275,38 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # Skip the all-gather when there is no cached prefix: an empty one launches
+    # a 0-sized kernel (HIP invalid configuration). The copy below still runs.
+    if dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # Model-runner warmup and DP-attention sync may pad the in-hand Q/K/V token
+    # dimension beyond the logical extend lengths used to size this metadata.
+    # Copy only the leading logical rows; any extra rows are trailing padding
+    # and do not belong to a request.
+    extend_token_count = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
+    if k_nope.shape[0] < extend_token_count or k_pe.shape[0] < extend_token_count:
+        raise RuntimeError(
+            "DCP prefill metadata expects more extend tokens than the model produced: "
+            f"expected={extend_token_count}, k_nope={k_nope.shape[0]}, "
+            f"k_pe={k_pe.shape[0]}"
+        )
+    k_nope = k_nope[:extend_token_count]
+    k_pe = k_pe[:extend_token_count]
+
+    # copy local (in-hand) new-token kv cache into dcp_kv_buffer
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,

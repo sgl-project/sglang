@@ -17,6 +17,7 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+from sglang.srt.attn_parallel import AttnParallelMode
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -137,7 +138,16 @@ def enable_cp_v2() -> bool:
 
 
 def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
+    """Return whether the current forward batch is running through CP-v2.
+
+    Scheduler-produced batches carry an immutable decision.  The legacy
+    derivation remains for isolated unit tests and worker-created batches that
+    do not pass through the scheduler.
+    """
+    stamped_mode = getattr(forward_batch, "attn_parallel_mode", None)
+    if stamped_mode is not None:
+        return AttnParallelMode(stamped_mode).is_cp
+
     if not enable_cp_v2():
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
@@ -183,8 +193,14 @@ def prepare_cp_forward(forward_batch) -> None:
             sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
         )
 
-    if getattr(forward_batch, "out_cache_loc", None) is not None:
-        forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+    if out_cache_loc is not None and out_cache_loc.shape[0] != num_tokens:
+        if out_cache_loc.shape[0] < num_tokens:
+            raise RuntimeError(
+                "CP-v2 received fewer cache locations than logical tokens: "
+                f"cache_locs={out_cache_loc.shape[0]}, tokens={num_tokens}"
+            )
+        forward_batch.out_cache_loc = out_cache_loc[:num_tokens]
 
 
 def cp_split_before_forward(

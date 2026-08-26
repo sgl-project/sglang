@@ -1570,6 +1570,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
+            attn_parallel_mode=forward_batch.attn_parallel_mode,
+            kv_residency=forward_batch.kv_residency,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,

@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.attn_parallel import AttnParallelMode
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -94,11 +95,33 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
+    stamped_mode = getattr(forward_batch, "attn_parallel_mode", None)
+    if stamped_mode is not None:
+        if AttnParallelMode(stamped_mode) is not AttnParallelMode.DCP:
+            return False
+    elif not get_parallel().dcp_enabled:
         return False
     return (
         forward_batch.forward_mode.is_decode()
         or forward_batch.forward_mode.is_target_verify()
+    )
+
+
+def is_dcp_mla_attention_phase(forward_batch: ForwardBatch) -> bool:
+    if is_dcp_mla_decode_phase(forward_batch):
+        return True
+    stamped_mode = getattr(forward_batch, "attn_parallel_mode", None)
+    if (
+        stamped_mode is not None
+        and AttnParallelMode(stamped_mode) is AttnParallelMode.DCP
+    ):
+        return forward_batch.forward_mode.is_draft_extend_v2()
+    # Static DCP supports draft-extend-v2. Dynamically stamped speculative
+    # batches remain TP until a separate residency/graph policy is validated.
+    return (
+        getattr(forward_batch, "attn_parallel_mode", None) is None
+        and get_parallel().dcp_enabled
+        and forward_batch.forward_mode.is_draft_extend_v2()
     )
 
 

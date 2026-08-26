@@ -301,6 +301,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.dynamic_attn_parallel_batches_total = Counter(
+            name="sglang:dynamic_attn_parallel_batches_total",
+            documentation="Finalized scheduler batches by attention-parallel mode.",
+            labelnames=[*labels.keys(), "mode"],
+        )
+        self.dynamic_attn_parallel_veto_total = Counter(
+            name="sglang:dynamic_attn_parallel_veto_total",
+            documentation="Batches that did not select CP, grouped by stable reason.",
+            labelnames=[*labels.keys(), "reason"],
+        )
+        self.dynamic_attn_parallel_vote_mismatch_total = Counter(
+            name="sglang:dynamic_attn_parallel_vote_mismatch_total",
+            documentation="Batches whose local CP votes differed across ranks.",
+            labelnames=labels.keys(),
+        )
         self.decode_sum_seq_lens = Gauge(
             name="sglang:decode_sum_seq_lens",
             documentation="The sum of all sequence lengths in decode.",
@@ -1235,6 +1250,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_dynamic_attn_parallel_batch(
+        self, *, mode: str, veto_reason: Optional[str], vote_mismatch: bool = False
+    ) -> None:
+        self.dynamic_attn_parallel_batches_total.labels(**self.labels, mode=mode).inc(1)
+        if veto_reason is not None:
+            self.dynamic_attn_parallel_veto_total.labels(
+                **self.labels, reason=veto_reason
+            ).inc(1)
+        if vote_mismatch:
+            self.dynamic_attn_parallel_vote_mismatch_total.labels(**self.labels).inc(1)
 
     def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
         mode = "prefill_cuda_graph" if value else "prefill_none"

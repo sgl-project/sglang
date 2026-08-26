@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.attn_parallel import kv_storage_dcp_size
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -11,7 +12,7 @@ from sglang.srt.runtime_context import (
 def get_alloc_page_size() -> int:
     # Mirrors _build_token_to_kv_pool_allocator's DCP branch; the platform
     # allocators that skip it page smaller, so this is an upper bound for them.
-    return get_schedule().page_size * get_parallel().attn_dcp_size
+    return get_schedule().page_size * kv_storage_dcp_size(get_parallel())
 
 
 def get_alloc_len_per_decode() -> int:

@@ -26,6 +26,20 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.kvcache.kv_indices import (
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
+from sglang.srt.utils import is_hip
+
+# tl.constexpr, not a plain float: a @triton.jit body cannot read a non-constexpr
+# global. Use _LOG2E.value where the host side needs the number.
+_LOG2E = tl.constexpr(1.4426950408889634)
+
+# waves_per_eu keeps more wavefronts resident on the tiny grids these DCP
+# kernels launch; matrix_instr_nonkdim matches the convention in verify_splitkv.
+_AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if is_hip() else {}
+
 
 # ---------------------------------------------------------------------------
 # KV-index build (PR #25090, Triton/MHA): per-rank local KV indices.
@@ -87,6 +101,7 @@ def create_mla_kv_page_table_for_dcp(
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
+    KV_LOC_SCALE: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -102,7 +117,7 @@ def create_mla_kv_page_table_for_dcp(
         mask=mask,
         other=0,
     )
-    physical_pages = virtual_locs // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    physical_pages = virtual_locs // KV_LOC_SCALE // PHYSICAL_PAGE_SIZE
     tl.store(
         block_kv_indices_ptr + req * block_table_stride + page_offsets,
         physical_pages,
@@ -664,3 +679,577 @@ def _lse_weighted_combine_cpu(
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# aiter MLA DCP: page-table build, KV page packing, and the split-KV reduce.
+# ---------------------------------------------------------------------------
+
+
+def build_dcp_page_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    local_kv_lens: torch.Tensor,
+    bs: int,
+    max_pages: int,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    kv_loc_scale: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+):
+    """Build this rank's PAGE table for aiter's ``mla_decode_fwd``.
+
+    Args:
+        req_to_token:     [max_reqs, max_context_len] virtual token locations
+        req_pool_indices: [B] row of req_to_token per request
+        local_kv_lens:    [B] this rank's shard length per request, in TOKENS
+                          (the kernel's ``seqused_k``); the table itself is
+                          indexed in PAGES
+        bs:               number of requests
+        max_pages:        columns to allocate, i.e. the per-graph page bound
+        page_size:        PHYSICAL page size; the allocator's virtual page is
+                          ``page_size * dcp_size``
+        dcp_size:         DCP world size
+        dcp_rank:         this rank
+        out:              [B, max_pages] int32 to fill, allocated if None
+
+    Returns:
+        [B, max_pages] int32 page table (``out`` when provided)
+    """
+    if out is None:
+        out = torch.zeros(bs, max_pages, dtype=torch.int32, device=req_to_token.device)
+    if max_pages == 0:
+        return out
+    pages_per_block = get_num_page_per_block_flashmla(page_size)
+    kv_loc_scale = dcp_size if kv_loc_scale is None else kv_loc_scale
+    create_mla_kv_page_table_for_dcp[
+        (bs, get_num_kv_index_blocks_flashmla(max_pages, page_size))
+    ](
+        req_to_token,
+        req_pool_indices,
+        local_kv_lens,
+        out,
+        req_to_token.stride(0),
+        out.stride(0),
+        PHYSICAL_PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        KV_LOC_SCALE=kv_loc_scale,
+        PAGES_PER_BLOCK=pages_per_block,
+    )
+    return out
+
+
+@triton.jit
+def _pack_dcp_kv_pages_kernel(
+    src_ptr,  # [n_src, 1, D] assembled dcp_kv_buffer
+    dst_ptr,  # [n_pages * PAGE, 1, D] paged staging buffer
+    src_idx_ptr,  # [total] dcp_kv_indices: sequence position -> src row
+    dst_idx_ptr,  # [total] sequence position -> padded/paged dst row
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    src = tl.load(src_idx_ptr + row).to(tl.int64)
+    dst = tl.load(dst_idx_ptr + row).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < D
+    tl.store(
+        dst_ptr + dst * D + offs,
+        tl.load(src_ptr + src * D + offs, mask=mask),
+        mask=mask,
+    )
+
+
+def pack_dcp_kv_into_pages(
+    kv_buffer: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    bs: int,
+    page_size: int,
+):
+    """Repack the assembled ``dcp_kv_buffer`` into pages for ``mla_prefill_fwd``.
+
+    Args:
+        kv_buffer:  [total_tokens, 1, D] the all-gathered full-sequence latent KV
+        kv_indptr:  [bs + 1] per-request boundaries into ``kv_indices``
+        kv_indices: [total_tokens] sequence position -> row of ``kv_buffer``
+        bs:         number of requests
+        page_size:  staging page size (``_DCP_PREFILL_PAGE_SIZE``, independent of
+                    the KV pool's --page-size)
+
+    Returns:
+        paged_kv:     [n_pages, page_size, 1, D] page-aligned per request
+        block_tables: [bs, max_pages] int32
+    """
+    total, _, dim = kv_buffer.shape[0], kv_buffer.shape[1], kv_buffer.shape[-1]
+    device = kv_buffer.device
+    lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
+    pages = (lens + page_size - 1) // page_size
+    page_start = torch.cumsum(pages, dim=0) - pages
+    # sequence position -> row in the padded buffer
+    shift = page_start * page_size - kv_indptr[:bs].to(torch.int64)
+    n_tokens = int(kv_indptr[bs].item())
+    dst_idx = torch.repeat_interleave(shift, lens) + torch.arange(
+        n_tokens, device=device, dtype=torch.int64
+    )
+
+    n_pages = int(pages.sum().item())
+    # zeros, not empty: the kernel reads the whole last page of a sequence and masks
+    # by seqused_k, so uninitialized tail rows could feed NaNs into the QK GEMM.
+    paged = torch.zeros(
+        (n_pages * page_size, 1, dim), dtype=kv_buffer.dtype, device=device
+    )
+    if n_tokens > 0:
+        _pack_dcp_kv_pages_kernel[(n_tokens,)](
+            kv_buffer,
+            paged,
+            kv_indices,
+            dst_idx,
+            D=dim,
+            BLOCK=triton.next_power_of_2(dim),
+        )
+    max_pages = int(pages.max().item()) if bs > 0 else 0
+    block_tables = page_start[:, None] + torch.arange(
+        max_pages, device=device, dtype=torch.int64
+    )
+    return paged.view(-1, page_size, 1, dim), block_tables.to(torch.int32)
+
+
+@triton.jit
+def _dcp_reduce_kv_segments_kernel(
+    out_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
+    lse_ptr,  # [num_tokens, num_query_heads] (base-2)
+    segm_output_ptr,  # [num_tokens, num_query_heads, NUM_SEGMENTS, KV_LORA_RANK]
+    segm_max_ptr,  # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    segm_expsum_ptr,  # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    seq_lens_ptr,  # [num_tokens] local (this-rank shard) kv length per token
+    num_query_heads: tl.constexpr,
+    out_stride0: tl.int64,
+    out_stride1: tl.int64,
+    lse_stride0: tl.int64,
+    TILE_SIZE: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens_ptr + tok)
+
+    # A rank owns no committed KV for a request whose prefix is shorter than the
+    # rank index, so an all-zero shard length is a normal input here (the planner
+    # clamps local_kv_lens to min 0, not min 1). Emit the identity element of the
+    # LSE merge -- out = 0 with lse = -inf, which dcp_lse_combine_base2 and
+    # cp_lse_ag_out_rs_mla both weight to zero.
+    #
+    # This has to be an early return, not a mask on the result: with seq_len 0
+    # tiles_per_segment below is 0, so act_num_segments divides by zero, and the
+    # NaNs that follow cannot be cleaned up downstream -- the merge zeroes the
+    # WEIGHT via nan_to_num, but NaN * 0 is still NaN, so a single empty shard
+    # poisons the merged output of an otherwise healthy batch.
+    if seq_len == 0:
+        tl.store(
+            out_ptr
+            + tok * out_stride0
+            + head * out_stride1
+            + tl.arange(0, KV_LORA_RANK),
+            tl.zeros([KV_LORA_RANK], dtype=out_ptr.type.element_ty),
+        )
+        tl.store(lse_ptr + tok * lse_stride0 + head, float("-inf"))
+        return
+
+    # aiter picks the same segment count regardless of seq_len; only the first
+    # act_num_segments hold valid data (the rest of the empty() buffer is garbage).
+    tiles_per_segment = tl.cdiv(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+    act_num_segments = tl.cdiv(seq_len, tiles_per_segment * TILE_SIZE)
+    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < act_num_segments
+
+    seg_off = (
+        tok.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + head * NUM_SEGMENTS_PER_SEQ
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+    )
+    segm_max = tl.load(segm_max_ptr + seg_off, mask=segm_mask, other=float("-inf"))
+    overall_max = tl.max(segm_max)
+
+    segm_expsum = tl.load(segm_expsum_ptr + seg_off, mask=segm_mask, other=0.0)
+    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+    overall_expsum = tl.sum(segm_expsum)
+
+    out_off = (
+        tok.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+        + head * (NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * KV_LORA_RANK
+        + tl.arange(0, KV_LORA_RANK)[None, :]
+    )
+    segm_output = tl.load(segm_output_ptr + out_off, mask=segm_mask[:, None], other=0.0)
+    segm_output = segm_output * tl.math.exp2(segm_max - overall_max)[:, None]
+    acc = tl.sum(segm_output, axis=0)
+    acc = tl.where(overall_expsum == 0.0, 0.0, acc / overall_expsum)
+
+    # base-2 LSE, matching correct_attn_out / cp_lse_ag_out_rs_mla.
+    lse = tl.where(
+        overall_expsum == 0.0, float("-inf"), overall_max + tl.log2(overall_expsum)
+    )
+
+    tl.store(
+        out_ptr + tok * out_stride0 + head * out_stride1 + tl.arange(0, KV_LORA_RANK),
+        acc.to(out_ptr.type.element_ty),
+    )
+    tl.store(lse_ptr + tok * lse_stride0 + head, lse)
+
+
+def dcp_reduce_kv_segments(
+    segm_output: torch.Tensor,
+    segm_max: torch.Tensor,
+    segm_expsum: torch.Tensor,
+    seq_lens: torch.Tensor,
+    tile_size: int,
+    out_dtype: torch.dtype,
+):
+    """Reduce ``mla_decode_fwd(skip_reduce=True)`` partials to (out, base-2 lse).
+
+    Args:
+        segm_output: [num_tokens, H, NUM_SEGMENTS, KV_LORA_RANK] unnormalized
+                     per-segment output
+        segm_max:    [num_tokens, H, NUM_SEGMENTS] per-segment score max
+        segm_expsum: [num_tokens, H, NUM_SEGMENTS] per-segment softmax denominator
+        seq_lens:    [num_tokens] this rank's shard length per token; 0 is legal
+                     and yields the merge identity (out 0, lse -inf)
+        tile_size:   kernel TILE_SIZE (== the paged block_size handed to
+                     mla_decode_fwd), which sets how segments were sized
+        out_dtype:   dtype of the returned output
+
+    Returns:
+        out: [num_tokens, H, KV_LORA_RANK] in ``out_dtype``
+        lse: [num_tokens, H] float32, base-2
+
+    The segments are a split-KV device INSIDE one rank, not the cross-rank DCP
+    shards -- see the section header above. aiter's own reduce writes only the
+    merged output, so this one exists to additionally emit the LSE that the
+    cross-rank merge needs as a weight.
+    """
+    num_tokens, num_heads, num_segments, kv_lora_rank = segm_output.shape
+    out = torch.empty(
+        num_tokens, num_heads, kv_lora_rank, dtype=out_dtype, device=segm_output.device
+    )
+    lse = torch.empty(
+        num_tokens, num_heads, dtype=torch.float32, device=segm_output.device
+    )
+    _dcp_reduce_kv_segments_kernel[(num_tokens, num_heads)](
+        out,
+        lse,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        seq_lens,
+        num_query_heads=num_heads,
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+        lse_stride0=lse.stride(0),
+        TILE_SIZE=tile_size,
+        KV_LORA_RANK=kv_lora_rank,
+        NUM_SEGMENTS_PER_SEQ=num_segments,
+    )
+    return out, lse
+
+
+@triton.jit
+def _dense_causal_mla_window_kernel(
+    q_ptr,  # [bs * q_len, H, NOPE + PE]
+    k_ptr,  # [bs * q_len, 1, NOPE + PE] latent KV; v aliases its first NOPE cols
+    out_ptr,  # [bs * q_len, H, NOPE]
+    lse_ptr,  # [bs * q_len, H] fp32, base-2
+    scaling,
+    q_stride_t: tl.int64,
+    q_stride_h: tl.int64,
+    k_stride_t: tl.int64,
+    out_stride_t: tl.int64,
+    out_stride_h: tl.int64,
+    lse_stride_t: tl.int64,
+    lse_stride_h: tl.int64,
+    Q_LEN: tl.constexpr,
+    L_EXT: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    PE_DIM: tl.constexpr,
+    BLOCK_PE: tl.constexpr,
+):
+    """Dense causal attention over one request's in-hand window, one program
+    per (request, head).
+
+    The latent KV is read once as nope+rope: the rope half only feeds the QK
+    dot, and the nope half is BOTH the QK nope term and V (the MLA absorb
+    form), so there is no separate V load.
+    """
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+
+    offs_l = tl.arange(0, L_EXT)
+    mask_l = offs_l < Q_LEN
+    offs_n = tl.arange(0, BLOCK_NOPE)
+    mask_n = offs_n < NOPE_DIM
+    offs_p = tl.arange(0, BLOCK_PE)
+    mask_p = offs_p < PE_DIM
+
+    # Window position i of request b is row b * Q_LEN + i.
+    row = b * Q_LEN + offs_l
+
+    q_nope = tl.load(
+        q_ptr + row[:, None] * q_stride_t + h * q_stride_h + offs_n[None, :],
+        mask=mask_l[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_ptr + row[:, None] * q_stride_t + h * q_stride_h + NOPE_DIM + offs_p[None, :],
+        mask=mask_l[:, None] & mask_p[None, :],
+        other=0.0,
+    )
+    k_nope = tl.load(
+        k_ptr + row[:, None] * k_stride_t + offs_n[None, :],
+        mask=mask_l[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    k_rope = tl.load(
+        k_ptr + row[:, None] * k_stride_t + NOPE_DIM + offs_p[None, :],
+        mask=mask_l[:, None] & mask_p[None, :],
+        other=0.0,
+    )
+
+    # scores[i, j] = q_i . k_j, split nope + rope so nothing is padded (both
+    # halves are powers of two for MLA).
+    #
+    # tl.dot, NOT an elementwise mul-reduce over [L_EXT, L_EXT, D]: that form
+    # reads better and verify_mla uses it for the same block, but its live set
+    # grows as L_EXT^2 * D and spills hard once L_EXT passes 8. Measured on
+    # gfx950 at bs 64: 78 us at q_len 8 but 1925 us at q_len 16, against 233 us
+    # for the torch version. tl.dot is flat across the same range.
+    qk = tl.dot(q_nope, tl.trans(k_nope), out_dtype=tl.float32)
+    qk += tl.dot(q_rope, tl.trans(k_rope), out_dtype=tl.float32)
+    qk *= scaling
+
+    # Causal within the window: query i sees key j iff j <= i.
+    causal = (offs_l[None, :] <= offs_l[:, None]) & mask_l[None, :] & mask_l[:, None]
+    qk = tl.where(causal, qk, float("-inf"))
+
+    m = tl.max(qk, 1)
+    p = tl.exp(qk - m[:, None])
+    denom = tl.sum(p, 1)
+    # PV in fp32. Casting p down to bf16 for an MFMA dot is the usual trick, but
+    # it costs real accuracy at short prefixes here (max_abs over the unit-test
+    # grid rises 1.95e-3 -> 2.91e-3 at prefix 0), eating most of the margin the
+    # tolerance tiers were calibrated with. The window is a handful of rows, so
+    # the slower fp32 path is affordable.
+    acc = tl.dot(p, k_nope.to(tl.float32), out_dtype=tl.float32) / denom[:, None]
+
+    tl.store(
+        out_ptr + row[:, None] * out_stride_t + h * out_stride_h + offs_n[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask_l[:, None] & mask_n[None, :],
+    )
+    # Natural-log LSE rebased to base-2, which is what the DCP merges consume.
+    tl.store(
+        lse_ptr + row * lse_stride_t + h * lse_stride_h,
+        (m + tl.log(denom)) * _LOG2E,
+        mask=mask_l,
+    )
+
+
+def dense_causal_mla_attn_base2(
+    q: torch.Tensor,
+    k_window: torch.Tensor,
+    scaling: float,
+    bs: int,
+    q_len: int,
+    kv_lora_rank: int,
+):
+    """Dense causal MLA attention over one in-hand ``q_len``-token window.
+
+    Args:
+        q:            [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        k_window:     [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV
+                      of the window tokens, in query order; ``v`` is its first
+                      ``kv_lora_rank`` columns (MLA absorb form), not a separate
+                      tensor
+        scaling:      softmax scale
+        bs:           number of requests
+        q_len:        window length per request (``gamma + 1``)
+        kv_lora_rank: nope width, i.e. where the rope half starts
+
+    Returns:
+        out: [bs * q_len, num_heads, kv_lora_rank] float32
+        lse: [bs * q_len, num_heads] float32, base-2
+    """
+    n_rows, num_heads, head_dim = q.shape
+    pe_dim = head_dim - kv_lora_rank
+    out = torch.empty(
+        (n_rows, num_heads, kv_lora_rank), dtype=torch.float32, device=q.device
+    )
+    lse = torch.empty((n_rows, num_heads), dtype=torch.float32, device=q.device)
+    if n_rows == 0:
+        return out, lse
+
+    k2 = k_window.view(n_rows, -1)
+    _dense_causal_mla_window_kernel[(bs, num_heads)](
+        q,
+        k2,
+        out,
+        lse,
+        scaling,
+        q.stride(0),
+        q.stride(1),
+        k2.stride(0),
+        out.stride(0),
+        out.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        Q_LEN=q_len,
+        # tl.dot needs at least 16 rows/cols; rows past q_len are masked off.
+        L_EXT=max(16, triton.next_power_of_2(q_len)),
+        NOPE_DIM=kv_lora_rank,
+        BLOCK_NOPE=triton.next_power_of_2(kv_lora_rank),
+        PE_DIM=pe_dim,
+        BLOCK_PE=triton.next_power_of_2(pe_dim),
+        **_AMD_LAUNCH_KWARGS,
+    )
+    return out, lse
+
+
+@triton.jit
+def _dcp_lse_combine_pair_kernel(
+    out_ptr,  # [tokens, heads, DIM]
+    out_lse_ptr,  # [tokens, heads] fp32, base-2
+    a_out_ptr,
+    a_lse_ptr,
+    b_out_ptr,
+    b_lse_ptr,
+    out_stride_t: tl.int64,
+    out_stride_h: tl.int64,
+    a_out_stride_t: tl.int64,
+    a_out_stride_h: tl.int64,
+    b_out_stride_t: tl.int64,
+    b_out_stride_h: tl.int64,
+    out_lse_stride_t: tl.int64,
+    out_lse_stride_h: tl.int64,
+    a_lse_stride_t: tl.int64,
+    a_lse_stride_h: tl.int64,
+    b_lse_stride_t: tl.int64,
+    b_lse_stride_h: tl.int64,
+    DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+
+    Grid: (tokens, heads), one program per output row.
+    """
+    tok = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+
+    lse_a = tl.load(a_lse_ptr + tok * a_lse_stride_t + head * a_lse_stride_h).to(
+        tl.float32
+    )
+    lse_b = tl.load(b_lse_ptr + tok * b_lse_stride_t + head * b_lse_stride_h).to(
+        tl.float32
+    )
+    # A partial that saw no keys carries -inf. Fold NaN and +inf in with it
+    # rather than letting either reach the weights.
+    lse_a = tl.where((lse_a != lse_a) | (lse_a == float("inf")), float("-inf"), lse_a)
+    lse_b = tl.where((lse_b != lse_b) | (lse_b == float("inf")), float("-inf"), lse_b)
+
+    m = tl.maximum(lse_a, lse_b)
+    # Both partials empty: m is -inf and (-inf) - (-inf) would be NaN. Re-centre
+    # on 0 so both weights come out exp2(-inf) == 0, and let the guards below
+    # turn that into out 0 / lse -inf. The two comparable kernels in this repo
+    # (merge_state_kernel, _dcp_lse_combine_kernel) both return NaN here.
+    m_safe = tl.where(m == float("-inf"), 0.0, m)
+    w_a = tl.math.exp2(lse_a - m_safe)
+    w_b = tl.math.exp2(lse_b - m_safe)
+    denom = w_a + w_b
+
+    offs = tl.arange(0, BLOCK_DIM)
+    mask = offs < DIM
+    o_a = tl.load(
+        a_out_ptr + tok * a_out_stride_t + head * a_out_stride_h + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    o_b = tl.load(
+        b_out_ptr + tok * b_out_stride_t + head * b_out_stride_h + offs,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    acc = o_a * w_a + o_b * w_b
+    # Guard the divisor as well as the result: both branches of a tl.where are
+    # evaluated, so dividing by a zero denominator would still produce NaN.
+    acc = tl.where(denom == 0.0, 0.0, acc / tl.where(denom == 0.0, 1.0, denom))
+
+    tl.store(
+        out_ptr + tok * out_stride_t + head * out_stride_h + offs,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    lse = tl.where(denom == 0.0, float("-inf"), m_safe + tl.log2(denom))
+    tl.store(out_lse_ptr + tok * out_lse_stride_t + head * out_lse_stride_h, lse)
+
+
+def dcp_lse_combine_base2(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+):
+    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+
+    Args:
+        out_a:     [tokens, heads, dim] first partial's output
+        lse_a:     [tokens, heads] its base-2 LSE; ``-inf`` means it saw no keys
+                   (what dcp_reduce_kv_segments writes for an empty shard), and
+                   weights it to 0
+        out_b:     [tokens, heads, dim] second partial's output
+        lse_b:     [tokens, heads] its base-2 LSE
+        out_dtype: dtype of the returned output
+
+    Returns:
+        out: [tokens, heads, dim] in ``out_dtype``; 0 where both partials are
+             empty, rather than NaN
+        lse: [tokens, heads] float32, base-2; ``-inf`` where both are empty
+
+    This is the two-input case of ``dcp_lse_combine_triton`` above. It is a
+    separate kernel because that one takes a stacked ``[N, B, H, D]`` tensor,
+    so reusing it here would mean a ``torch.stack`` copy of both partials on
+    every call.
+    """
+    n_tokens, n_heads, dim = out_a.shape
+    out = torch.empty((n_tokens, n_heads, dim), dtype=out_dtype, device=out_a.device)
+    lse = torch.empty((n_tokens, n_heads), dtype=torch.float32, device=out_a.device)
+    if n_tokens == 0:
+        return out, lse
+
+    _dcp_lse_combine_pair_kernel[(n_tokens, n_heads)](
+        out,
+        lse,
+        out_a,
+        lse_a,
+        out_b,
+        lse_b,
+        out.stride(0),
+        out.stride(1),
+        out_a.stride(0),
+        out_a.stride(1),
+        out_b.stride(0),
+        out_b.stride(1),
+        lse.stride(0),
+        lse.stride(1),
+        lse_a.stride(0),
+        lse_a.stride(1),
+        lse_b.stride(0),
+        lse_b.stride(1),
+        DIM=dim,
+        BLOCK_DIM=triton.next_power_of_2(dim),
+        **_AMD_LAUNCH_KWARGS,
+    )
+    return out, lse

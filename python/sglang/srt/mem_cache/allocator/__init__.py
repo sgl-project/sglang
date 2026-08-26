@@ -5,11 +5,15 @@ from sglang.srt.mem_cache.allocator.paged import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
+from sglang.srt.mem_cache.allocator.residency import (
+    ResidencyAwarePagedTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
 __all__ = [
     "BaseTokenToKVPoolAllocator",
     "PagedTokenToKVPoolAllocator",
+    "ResidencyAwarePagedTokenToKVPoolAllocator",
     "TokenToKVPoolAllocator",
     "alloc_extend_naive",
 ]

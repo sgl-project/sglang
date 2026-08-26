@@ -64,6 +64,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():
             return False
+        if getattr(forward_batch.forward_mode, "name", None) == "MIXED":
+            return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
         return seq_len > 0 and seq_len >= cp_size and cp_size > 1

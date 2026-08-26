@@ -740,6 +740,8 @@ class TboForwardBatchPreparer:
             "can_run_dp_breakable_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
+            "attn_parallel_mode",
+            "kv_residency",
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",

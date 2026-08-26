@@ -50,8 +50,7 @@ class ContextParallelStrategyKind(IntEnum):
         if value == "interleave":
             return cls.INTERLEAVE
         raise ValueError(
-            f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            f"Unknown cp_strategy={value!r}; expected one of {{'zigzag', 'interleave'}}"
         )
 
     @property
@@ -69,6 +68,7 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     DSA = 1
     TRTLLM_MHA = 2
+    AITER = 3
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
@@ -78,9 +78,11 @@ class CPAttentionBackendKind(IntEnum):
             return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
+        if value == "aiter":
+            return cls.AITER
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha', 'aiter'}"
         )
 
 

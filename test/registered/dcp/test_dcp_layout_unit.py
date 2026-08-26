@@ -22,14 +22,16 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_mla_extend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -142,6 +144,65 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestGetDcpLens(CustomTestCase):
+    def test_mla_prefill_ignores_padded_in_hand_kv_rows(self):
+        k_nope = torch.arange(16, dtype=torch.float32).view(8, 1, 2)
+        k_pe = (torch.arange(8, dtype=torch.float32) + 100).view(8, 1, 1)
+        dcp_kv_buffer = torch.empty((7, 1, 3), dtype=torch.float32)
+
+        all_gather_kv_cache_for_mla_extend(
+            token_to_kv_pool=None,
+            attn_mqa=None,
+            extend_prefix_lens_cpu=[0],
+            dcp_local_prefix_kv_indices=torch.empty(0, dtype=torch.int64),
+            dcp_extend_prefix_lens_sum=0,
+            dcp_kv_buffer=dcp_kv_buffer,
+            kv_lora_rank=2,
+            k_nope=k_nope,
+            k_pe=k_pe,
+        )
+
+        self.assertTrue(torch.equal(dcp_kv_buffer[..., :2], k_nope[:7]))
+        self.assertTrue(torch.equal(dcp_kv_buffer[..., 2:], k_pe[:7]))
+
+    def test_prefill_metadata_uses_prefix_plus_extend_not_stale_seq_sum(self):
+        class FakeKernel:
+            def __getitem__(self, _grid):
+                return lambda *_args, **_kwargs: None
+
+        parallel = SimpleNamespace(dcp_enabled=True, dcp_size=8, dcp_rank=0)
+        device = SimpleNamespace(device=torch.device("cpu"))
+        with (
+            patch(
+                "sglang.srt.layers.dcp.planner.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_device",
+                return_value=device,
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.create_dcp_kv_indices",
+                FakeKernel(),
+            ),
+        ):
+            metadata = prepare_decode_context_parallel_metadata(
+                seq_lens=torch.tensor([7], dtype=torch.int32),
+                extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+                extend_prefix_lens_cpu=[0],
+                extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0]),
+                req_to_token=torch.zeros((1, 16), dtype=torch.int32),
+                seq_lens_sum=7,
+                kv_buffer_shape=torch.Size([16, 1, 576]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device=torch.device("cpu"),
+                create_chunked_prefix_cache_kv_indices_fn=FakeKernel(),
+            )
+
+        self.assertEqual(metadata.dcp_kv_indptr.tolist(), [0, 8])
+        self.assertEqual(metadata.dcp_kv_indices.numel(), 8)
+        self.assertEqual(metadata.dcp_kv_buffer.shape[0], 8)
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):
@@ -191,6 +252,82 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
+    @staticmethod
+    def _fake_mla_pool(size=8):
+        pool = object.__new__(MLATokenToKVPool)
+        pool.size = size
+        pool.page_size = 1
+        pool.start_layer = 0
+        pool.layer_transfer_counter = None
+        pool.dtype = torch.float32
+        pool.store_dtype = torch.float32
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.kv_buffer = [torch.zeros(size, 1, dtype=torch.float32)]
+        return pool
+
+    def test_mla_generic_write_translates_striped_locs(self):
+        pool = self._fake_mla_pool()
+        parallel = SimpleNamespace(
+            dcp_enabled=True,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+            dynamic_attn_parallel_enable_dcp=False,
+        )
+        with patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=parallel,
+        ):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=0),
+                torch.tensor([1, 3, 5]),
+                torch.tensor([[10.0], [20.0], [30.0]]),
+                None,
+            )
+        self.assertEqual(pool.kv_buffer[0][:3, 0].tolist(), [10.0, 20.0, 30.0])
+
+    def test_mla_generic_write_keeps_replicated_locs(self):
+        pool = self._fake_mla_pool()
+        parallel = SimpleNamespace(
+            dcp_enabled=True,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+            dynamic_attn_parallel_enable_dcp=True,
+        )
+        with patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=parallel,
+        ):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=0),
+                torch.tensor([1, 3, 5]),
+                torch.tensor([[10.0], [20.0], [30.0]]),
+                None,
+            )
+        self.assertEqual(
+            pool.kv_buffer[0][[1, 3, 5], 0].tolist(),
+            [10.0, 20.0, 30.0],
+        )
+
+    def test_mla_move_translates_striped_locs(self):
+        pool = self._fake_mla_pool()
+        pool.kv_buffer[0][0, 0] = 10
+        pool.kv_buffer[0][1, 0] = 20
+        parallel = SimpleNamespace(
+            dcp_enabled=True,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+            dynamic_attn_parallel_enable_dcp=False,
+        )
+        with patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=parallel,
+        ):
+            pool.move_kv_cache(
+                tgt_loc=torch.tensor([5, 7]),
+                src_loc=torch.tensor([1, 3]),
+            )
+        self.assertEqual(pool.kv_buffer[0][[2, 3], 0].tolist(), [10.0, 20.0])
+
     def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
         """A local Q shard must not restart GQA mapping at KV head zero."""
 
@@ -207,6 +344,9 @@ class TestGetDcpLens(CustomTestCase):
 
         group = FakeDcpGroup()
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        # GQA, not MLA: the K/V heads reaching the kernel are the DCP-replicated
+        # set, so this rank has to pick the slice its Q shard maps to.
+        backend.use_mla = False
         backend.forward_metadata = SimpleNamespace(
             custom_mask=None,
             kv_indptr=torch.zeros(2, dtype=torch.int32),
@@ -395,6 +535,7 @@ class TestGetDcpLens(CustomTestCase):
             disaggregation_mode="null",
             page_size=physical_page_size,
             enable_hisparse=False,
+            dynamic_attn_parallel_enable_dcp=False,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -412,7 +553,10 @@ class TestGetDcpLens(CustomTestCase):
             with patch(
                 "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
                 return_value=False,
-            ), rc.get_parallel().override(attn_dcp_size=dcp_size):
+            ), rc.get_parallel().override(
+                attn_dcp_size=dcp_size,
+                dcp_enabled=dcp_size > 1,
+            ):
                 allocators[dcp_size] = (
                     KVCacheConfigurator._build_token_to_kv_pool_allocator(
                         configurator,

@@ -28,9 +28,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
+from sglang.srt.attn_parallel import AttnParallelMode, KvResidency
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+    build_replay_fb_view,
 )
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +54,44 @@ def _make_fake_self(capture_bs):
         DecodeCudaGraphRunner._graph_batch_capture_active.__get__(fake_self)
     )
     return fake_self
+
+
+class TestReplayForwardBatchView(CustomTestCase):
+    def test_preserves_dynamic_attention_mode_and_residency(self):
+        mode = SimpleNamespace()
+        forward_batch = SimpleNamespace(
+            forward_mode=mode,
+            seq_lens_sum=1,
+            seq_lens_cpu=torch.tensor([1]),
+            out_cache_loc=torch.tensor([1]),
+            out_cache_loc_dsv4=None,
+            spec_info=None,
+            attn_parallel_mode=AttnParallelMode.DCP,
+            kv_residency=KvResidency.STRIPED,
+        )
+        buffers = SimpleNamespace(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            seq_lens_cpu=torch.tensor([1]),
+            encoder_lens=None,
+            mamba_track_indices=None,
+        )
+
+        replay = build_replay_fb_view(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            bs=1,
+            raw_bs=1,
+            num_tokens=1,
+            seq_len_fill_value=1,
+            capture_forward_mode=mode,
+            is_encoder_decoder=False,
+        )
+
+        self.assertEqual(replay.attn_parallel_mode, AttnParallelMode.DCP)
+        self.assertEqual(replay.kv_residency, KvResidency.STRIPED)
 
 
 class TestInitProfileBatchMode(CustomTestCase):

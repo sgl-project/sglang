@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
+from sglang.srt.attn_parallel import kv_storage_dcp_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -281,10 +282,15 @@ class EagerRunner(BaseRunner):
             or cp_v2_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                kv_storage_dcp_size(get_parallel(), forward_batch) > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                and forward_batch.extend_prefix_lens is not None
+                and not forward_batch.forward_mode.is_target_verify()
             ):
-                # prepare kv cache buffer for dcp to gather kv cache
+                # prepare kv cache buffer for dcp to gather kv cache. Skip for target verify
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,

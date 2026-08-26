@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.attn_parallel import kv_storage_dcp_size
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -92,6 +93,8 @@ def set_mla_kv_buffer_triton(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    dcp_world_size: int | None = None,
+    dcp_rank: int | None = None,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -124,13 +127,18 @@ def set_mla_kv_buffer_triton(
     )
 
     n_loc = loc.numel()
+    parallel = get_parallel()
+    storage_dcp_size = (
+        kv_storage_dcp_size(parallel) if dcp_world_size is None else dcp_world_size
+    )
+    storage_dcp_rank = parallel.attn_dcp_rank if dcp_rank is None else dcp_rank
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
     if (
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and storage_dcp_size == 1
     ):
         jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return
@@ -157,8 +165,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=(storage_dcp_rank if storage_dcp_size > 1 else 0),
+        DCP_WORLD_SIZE=storage_dcp_size,
         **pdl_kwargs,
     )
 
