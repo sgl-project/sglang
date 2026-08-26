@@ -158,21 +158,6 @@ class ParallelContext:
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
 
-    @property
-    def config(self) -> _ConfigBag:
-        """The published ``parallel`` config bag.
-
-        Reads the slot directly: ``parallel`` sits outside the per-role
-        namespace table (every process reads topology config), so no role check
-        applies here. The body stays
-        dynamo-traceable — ``get_parallel().config.moe_dense_tp_size`` and the
-        gate helpers over it run inside compiled model forwards.
-        """
-        config = self._config
-        if config is None:
-            raise ValueError("config namespace 'parallel' not published")
-        return config
-
     def __getattr__(self, name):
         # Reached only for names that are neither a live @property nor a slot:
         # the config leaves that have no live counterpart. They read bare.
@@ -181,6 +166,9 @@ class ParallelContext:
             # still unset (pickle/copy protocols probe attributes before
             # __init__ runs).
             raise AttributeError(name)
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
         config = self._config
         if config is not None:
             if name in config._fields:
@@ -216,16 +204,8 @@ class ParallelContext:
         return self._v("world_rank", _ps().get_world_rank)
 
     @property
-    def tp_size(self) -> int:
-        return self._v("tp_size", _ps().get_tensor_model_parallel_world_size)
-
-    @property
     def tp_rank(self) -> int:
         return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
-
-    @property
-    def pp_size(self) -> int:
-        return self._v("pp_size", _ps().get_pipeline_model_parallel_world_size)
 
     @property
     def pp_rank(self) -> int:
@@ -240,8 +220,14 @@ class ParallelContext:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
 
     @property
-    def moe_dp_size(self) -> int:
-        return self._v("moe_dp_size", _ps().get_moe_data_parallel_world_size)
+    def moe_dp_group_size(self) -> int:
+        """Width of the group the MoE all-gather actually runs over.
+
+        Not ``moe_dp_size``: ``initialize_model_parallel`` aliases this group to
+        the attention-CP one when ``attn_cp_size > moe_dp_size``, so the two are
+        different numbers in exactly the configuration that needs the alias.
+        """
+        return self._v("moe_dp_group_size", _ps().get_moe_data_parallel_world_size)
 
     @property
     def moe_dp_rank(self) -> int:
@@ -264,16 +250,8 @@ class ParallelContext:
         return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
 
     @property
-    def attn_cp_size(self) -> int:
-        return self._v("attn_cp_size", _ps().get_attn_context_model_parallel_world_size)
-
-    @property
     def attn_cp_rank(self) -> int:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
-
-    @property
-    def dcp_size(self) -> int:
-        return self._v("dcp_size", _ps().get_dcp_world_size)
 
     @property
     def dcp_rank(self) -> int:
@@ -284,14 +262,18 @@ class ParallelContext:
         def getter():
             if _ps().get_dcp_group_no_assert() is None:
                 return False
-            return self.dcp_size > 1
+            # The group's own width: this asks whether the group installed here
+            # is wider than one rank, which the configuration cannot answer for
+            # a process that has not published.
+            return _ps().get_dcp_world_size() > 1
 
         return self._v("dcp_enabled", getter)
 
     @property
     def attn_dcp_size(self) -> int:
         return self._v(
-            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+            "attn_dcp_size",
+            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
         )
 
     @property
@@ -1609,11 +1591,7 @@ def max_prefill_buffer_tokens() -> int:
         else 0
     )
     tokens = chunked
-    if (
-        schedule.enable_dynamic_chunking
-        and get_parallel().config.pp_size > 1
-        and chunked
-    ):
+    if schedule.enable_dynamic_chunking and get_parallel().pp_size > 1 and chunked:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
         )
@@ -1643,7 +1621,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
         activation_tokens = max(schedule.chunked_prefill_size, 2048)
     else:
         activation_tokens = max(schedule.max_prefill_tokens, 2048)
-    parallel = get_parallel().config
+    parallel = get_parallel()
     reserved_mem = (
         512 + activation_tokens * 1.5 + parallel.tp_size * parallel.pp_size / 8 * 1024
     )

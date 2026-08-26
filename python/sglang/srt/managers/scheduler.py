@@ -465,30 +465,30 @@ class Scheduler(
             compute_dp_attention_world_info(
                 get_parallel().enable_dp_attention,
                 tp_rank,
-                get_parallel().config.tp_size,
+                get_parallel().tp_size,
                 get_parallel().dp_size,
-                get_parallel().config.attn_cp_size,
+                get_parallel().attn_cp_size,
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=get_parallel().config.tp_size,
+            tp_size=get_parallel().tp_size,
             pp_rank=pp_rank,
-            pp_size=get_parallel().config.pp_size,
+            pp_size=get_parallel().pp_size,
             dp_rank=dp_rank,
             dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=get_parallel().config.attn_cp_size,
-            attn_dcp_rank=tp_rank % get_parallel().config.dcp_size,
-            attn_dcp_size=get_parallel().config.dcp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
+            attn_dcp_rank=tp_rank % get_parallel().dcp_size,
+            attn_dcp_size=get_parallel().dcp_size,
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=get_parallel().config.moe_dp_size,
+            moe_dp_size=get_parallel().moe_dp_size,
             gpu_id=gpu_id,
         )
 
@@ -4411,7 +4411,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
-        ret["world_size"] = compute_world_size(get_parallel().config)
+        ret["world_size"] = compute_world_size(get_parallel())
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
@@ -5086,7 +5086,7 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif get_parallel().config.pp_size > 1:
+        elif get_parallel().pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -5095,14 +5095,14 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
@@ -5143,13 +5143,13 @@ def configure_scheduler_process(
     prefix = ""
     if shown_dp is not None:
         prefix += f" DP{shown_dp}"
-    if get_parallel().config.pp_size > 1:
+    if get_parallel().pp_size > 1:
         prefix += f" PP{pp_rank}"
-    if get_parallel().config.attn_cp_size > 1:
+    if get_parallel().attn_cp_size > 1:
         prefix += f" ATTN_CP{attn_cp_rank}"
-    if get_parallel().config.moe_dp_size > 1:
+    if get_parallel().moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
-    if get_parallel().config.tp_size > 1:
+    if get_parallel().tp_size > 1:
         prefix += f" TP{shown_tp}"
     if get_parallel().ep_size > 1:
         prefix += f" EP{shown_moe_ep}"
@@ -5165,8 +5165,8 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
-            get_parallel().config.pp_size,
-            get_parallel().config.tp_size,
+            get_parallel().pp_size,
+            get_parallel().tp_size,
             get_parallel().nnodes,
             gpu_id,
         )

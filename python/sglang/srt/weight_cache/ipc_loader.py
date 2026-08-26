@@ -488,7 +488,7 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
-            moe_dp_size = ps.moe_dp_size
+            moe_dp_size = ps.moe_dp_group_size
             moe_dp_rank = ps.moe_dp_rank
             moe_ep_rank = ps.moe_ep_rank
 

@@ -3757,7 +3757,7 @@ def require_mlp_tp_gather():
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().config.tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3783,7 +3783,7 @@ def require_attn_tp_gather():
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().config.tp_size
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:

@@ -283,7 +283,7 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
 
     if _STRATEGY is None:
         try:
-            parallel = get_parallel().config
+            parallel = get_parallel()
         except ValueError:
             return None
         if parallel.enable_prefill_cp:
