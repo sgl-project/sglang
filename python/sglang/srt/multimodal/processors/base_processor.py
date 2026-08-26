@@ -209,15 +209,10 @@ class BaseMultimodalProcessor(ABC):
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
-    # Two preprocessing workers, because image preprocessing releases the GIL
-    # (numpy / torch / PIL underneath) and a single worker caps request
-    # throughput at 1 / preprocess_time however much GPU is left idle. Two and
-    # not more: past that, spreading request arrivals fragments the GPU prefill
-    # batches faster than the extra overlap pays for itself. Measured at 32-way
-    # concurrency on an H200 for one / two / four workers -- PaddleOCR-VL 1080p
-    # pages 6.72 / 9.55 / 8.92 req/s, Qwen2.5-VL small images with 512-token
-    # outputs 12.54 / 12.60 / 12.25 req/s.
-    auto_mm_processor_worker_num = 2
+    # None lets the worker count follow where preprocessing actually runs; a
+    # model that measured its own optimum assigns a number instead. See
+    # `_resolve_auto_mm_processor_worker_num`.
+    auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
@@ -332,7 +327,8 @@ class BaseMultimodalProcessor(ABC):
         self.mm_processor_worker_num = (
             1
             if skip_mm_pool
-            else requested_mm_processor_worker_num or self.auto_mm_processor_worker_num
+            else requested_mm_processor_worker_num
+            or self._resolve_auto_mm_processor_worker_num()
         )
         if (
             self.mm_processor_worker_num > 1
@@ -616,6 +612,36 @@ class BaseMultimodalProcessor(ABC):
         if processor is None:
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
+
+    def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        """Whether image preprocessing submits its work to the serving GPU.
+
+        The fast image processor runs inside the tokenizer process but on
+        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
+        preprocessing worker there is one more competitor for that device rather
+        than added parallelism.
+        """
+        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+            return False
+        if self.disable_fast_image_processor:
+            return False
+        image_processor = getattr(self._processor, "image_processor", None)
+        return isinstance(image_processor, BaseImageProcessor)
+
+    def _resolve_auto_mm_processor_worker_num(self) -> int:
+        """The worker count to use when the user did not ask for one.
+
+        Two workers overlap preprocessing that runs on the CPU, where the second
+        thread is real parallelism: measured on Qwen2.5-VL with full-page images
+        at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
+        GB300. On the GPU path the same second worker only contends for the
+        scheduler's device -- flat on H200, and 9.30 -> 4.02 req/s on GB300 --
+        so that path stays at one.
+        """
+        declared = self.auto_mm_processor_worker_num
+        if declared is not None:
+            return declared
+        return 1 if self._preprocessing_competes_with_the_scheduler() else 2
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
         """The device for the fast image processor, or None to leave it unset.

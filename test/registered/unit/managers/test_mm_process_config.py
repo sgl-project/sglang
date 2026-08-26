@@ -75,6 +75,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         mm_process_config,
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
+        image_processor=None,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
@@ -99,6 +100,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
+        if image_processor is not None:
+            mock_hf_processor.image_processor = image_processor
 
         # Call real __init__ so we test actual config extraction
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
@@ -175,10 +178,51 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
 
-    def test_default_is_concurrent(self):
+    def test_cpu_preprocessing_path_gets_two_workers(self):
+        """A processor whose preprocessing stays on the CPU: the second worker is
+        real parallelism there (H200 4.46 -> 6.08 req/s, GB300 7.07 -> 8.76)."""
         proc = self._make_processor({})
         self.assertEqual(proc.mm_processor_worker_num, 2)
         self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_gpu_preprocessing_path_stays_at_one_worker(self):
+        """A fast image processor submits to the device the scheduler serves
+        from, so a second worker there only contends for it: flat on H200 and
+        9.30 -> 4.02 req/s on GB300 for full-page images."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {}, image_processor=MagicMock(spec=BaseImageProcessor)
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_explicit_request_overrides_the_path_decision(self):
+        """The server argument wins: an operator who measured their own workload
+        can still ask for concurrency on the GPU path."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {},
+            mm_processor_worker_num=2,
+            image_processor=MagicMock(spec=BaseImageProcessor),
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_model_declared_count_beats_the_path_default(self):
+        """A model that measured its own optimum declares it on the class."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 3)
 
     def test_clone_resolves_tokenizer_like_init(self):
         proc = self._make_processor({})
