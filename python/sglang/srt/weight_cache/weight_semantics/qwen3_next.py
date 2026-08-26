@@ -29,10 +29,14 @@ class Qwen3NextWeightSemanticsAdapter(Qwen35WeightSemanticsAdapter):
         config: Any,
         up_first_w13_parameter_ids: Sequence[int] = (),
         num_fused_shared_experts: int = 0,
+        embed_vocab_group: str = "tp",
+        lm_head_vocab_group: str = "tp",
     ) -> None:
         super().__init__(
             config=config,
             up_first_w13_parameter_ids=up_first_w13_parameter_ids,
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
         if num_fused_shared_experts not in (0, 1):
             raise WeightManifestError(

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_enable_ipc_weight_cache,
 )
@@ -16,6 +15,7 @@ from sglang.srt.weight_cache.daemon import (
     launch_weight_cache_daemons,
 )
 from sglang.srt.weight_cache.mooncake_weight_adapter import (
+    _parallel_axes,
     build_mooncake_weight_manifests,
 )
 from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
@@ -35,10 +35,10 @@ from sglang.srt.weight_cache.weight_runtime_manifest import (
     ImmutableWeightRuntimeManifestBuilder,
     LogicalTensorView,
     WeightParallelTopology,
+    create_weight_runtime_manifest_builder,
     model_identity_from_config,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
@@ -186,26 +186,44 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
         self.assertEqual(_resolve_active_moe_runner_backend(model, "auto"), "triton")
 
-    def test_weight_parallel_layout_supports_pp_and_ep_but_not_dp(self):
+    def test_weight_parallel_layout_supports_attention_dp_pp_and_ep(self):
         validate_weight_heterogeneous_transfer_configuration(
             tp_size=8,
-            dp_size=1,
+            dp_size=2,
             ep_size=4,
             pp_size=2,
+            enable_dp_attention=True,
             quantization=None,
         )
-        parallel_layout = WeightParallelLayout(tp_size=4, pp_size=2, ep_size=2)
+        parallel_layout = WeightParallelLayout(
+            tp_size=4, dp_size=2, pp_size=2, ep_size=2
+        )
         self.assertEqual(parallel_layout.world_size, 8)
+        self.assertEqual(parallel_layout.dp_size, 2)
         self.assertEqual(
             tuple(parallel_layout.iter_ranks()),
             tuple((pp, tp) for pp in range(2) for tp in range(4)),
         )
-        with self.assertRaises(WeightHeterogeneousTransferError):
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "without enable_dp_attention"
+        ):
             validate_weight_heterogeneous_transfer_configuration(
                 tp_size=2,
                 dp_size=2,
                 ep_size=1,
                 pp_size=1,
+                enable_dp_attention=False,
+                quantization=None,
+            )
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "must be divisible by dp_size"
+        ):
+            validate_weight_heterogeneous_transfer_configuration(
+                tp_size=3,
+                dp_size=2,
+                ep_size=1,
+                pp_size=1,
+                enable_dp_attention=True,
                 quantization=None,
             )
         with self.assertRaises(WeightHeterogeneousTransferError):
@@ -214,8 +232,88 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 dp_size=1,
                 ep_size=1,
                 pp_size=1,
+                enable_dp_attention=False,
                 quantization="fp8",
             )
+
+    def test_local_expert_axis_is_not_misclassified_as_tp(self):
+        from mooncake.reshard.weight import ReplicatedAxis, SplitAxis
+
+        tensor = {"shard_dims": (0, 2), "expert_id": None}
+        self.assertEqual(
+            _parallel_axes(tensor, tp_size=2, pp_size=1, ep_size=1),
+            (SplitAxis("tp", dim=2),),
+        )
+        self.assertEqual(
+            _parallel_axes(tensor, tp_size=4, pp_size=1, ep_size=2),
+            (
+                SplitAxis("ep", dim=0),
+                SplitAxis("tp", dim=2),
+            ),
+        )
+        self.assertEqual(
+            _parallel_axes(
+                {
+                    "shard_dims": (0,),
+                    "global_shape": (32, 8),
+                    "local_shape": (32, 8),
+                    "expert_id": None,
+                },
+                tp_size=2,
+                pp_size=1,
+                ep_size=1,
+            ),
+            (ReplicatedAxis("tp"),),
+        )
+
+    def test_qwen3_dp_attention_uses_attention_tp_for_embedding(self):
+        config = SimpleNamespace(
+            model_type="qwen3",
+            vocab_size=32,
+            hidden_size=8,
+            tie_word_embeddings=False,
+        )
+        topology = WeightParallelTopology(
+            tp_rank=1,
+            tp_size=2,
+            attention_tp_rank=0,
+            attention_tp_size=1,
+        )
+        builder = create_weight_runtime_manifest_builder(
+            model=SimpleNamespace(modules=lambda: ()),
+            config=config,
+            topology=topology,
+            dp_attention_enabled=True,
+        )
+        embed_view = builder._adapter.describe_parameter(
+            names=("model.embed_tokens.weight",),
+            parameter=torch.empty(32, 8),
+            topology=topology,
+        )[0]
+        lm_head_view = builder._adapter.describe_parameter(
+            names=("lm_head.weight",),
+            parameter=torch.empty(16, 8),
+            topology=topology,
+        )[0]
+
+        self.assertEqual(embed_view.global_offset, (0, 0))
+        self.assertEqual(embed_view.local_shape, (32, 8))
+        self.assertEqual(lm_head_view.global_offset, (16, 0))
+        self.assertEqual(lm_head_view.local_shape, (16, 8))
+        source_builder = create_weight_runtime_manifest_builder(
+            model=SimpleNamespace(modules=lambda: ()),
+            config=config,
+            topology=WeightParallelTopology(),
+        )
+        source_embed_view = source_builder._adapter.describe_parameter(
+            names=("model.embed_tokens.weight",),
+            parameter=torch.empty(32, 8),
+            topology=WeightParallelTopology(),
+        )[0]
+        self.assertEqual(
+            source_embed_view.layout_fingerprint,
+            embed_view.layout_fingerprint,
+        )
 
     def test_manifest_server_aggregates_source_ranks(self):
         server = object.__new__(WeightManifestServer)
@@ -234,6 +332,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     "gpu_id": gpu_id,
                     "parallel_layout": {
                         "tp_size": 2,
+                        "dp_size": 2,
                         "pp_size": 1,
                         "ep_size": 1,
                     },
@@ -249,6 +348,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         source = SourceWeightsManifest.from_wire(server.get_source_weights_manifest())
         self.assertEqual(source.node_id, "source-node")
         self.assertEqual(source.gpu_ids, (2, 3))
+        self.assertEqual(source.parallel_layout.dp_size, 2)
         self.assertEqual(
             tuple(item["rank"] for item in source.runtime_inventories), (0, 1)
         )
@@ -256,7 +356,9 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
     def test_target_reads_complete_source_weights_manifest(self):
         expected = SourceWeightsManifest(
             node_id="source-node",
-            parallel_layout=WeightParallelLayout(tp_size=2, pp_size=1, ep_size=1),
+            parallel_layout=WeightParallelLayout(
+                tp_size=2, dp_size=2, pp_size=1, ep_size=1
+            ),
             gpu_ids=(0, 1),
             runtime_inventories=({"rank": 0}, {"rank": 1}),
             content_checksum_groups=(({"rank": 0},), ({"rank": 1},)),

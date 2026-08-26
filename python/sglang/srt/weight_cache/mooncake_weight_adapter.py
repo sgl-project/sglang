@@ -92,13 +92,24 @@ def _parallel_axes(
     if pp_size > 1:
         axes.append(OwnershipAxis("pp"))
 
-    shard_dims = tuple(tensor.get("shard_dims") or ())
+    declared_shard_dims = tuple(tensor.get("shard_dims") or ())
+    global_shape = tuple(tensor.get("global_shape") or ())
+    local_shape = tuple(tensor.get("local_shape") or ())
+    shard_dims = tuple(
+        dim
+        for dim in declared_shard_dims
+        if not global_shape or not local_shape or local_shape[dim] != global_shape[dim]
+    )
     ep_dim = None
     if tensor.get("expert_id") is not None:
         axes.append(OwnershipAxis("ep"))
-    elif ep_size > 1 and 0 in shard_dims:
+    elif 0 in shard_dims and (ep_size > 1 or len(declared_shard_dims) > 1):
+        # Aggregated MoE tensors are emitted as one logical fragment per
+        # expert. Even with EP=1, dim 0 is the locally enumerated expert axis,
+        # not a second TP split axis.
         ep_dim = 0
-        axes.append(SplitAxis("ep", dim=ep_dim))
+        if ep_size > 1:
+            axes.append(SplitAxis("ep", dim=ep_dim))
 
     tp_dims = tuple(dim for dim in shard_dims if dim != ep_dim)
     if tp_dims:
@@ -126,6 +137,7 @@ def build_mooncake_weight_manifests(
         ParallelTopology,
         PlacementFragment,
         RuntimeBindingFragment,
+        SplitAxis,
         TensorDescriptor,
         TopologyParticipant,
         WeightPlacementManifest,
@@ -199,19 +211,22 @@ def build_mooncake_weight_manifests(
                 storage_offset_bytes,
             )
 
+            parallel_axes = _parallel_axes(
+                tensor,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                ep_size=ep_size,
+            )
             descriptor = TensorDescriptor(
                 tensor_id=tensor["tensor_id"],
                 global_shape=tuple(tensor["global_shape"]),
                 dtype=tensor["dtype"],
                 itemsize=itemsize,
-                shard_dims=tuple(tensor.get("shard_dims") or ()),
-                layout_fingerprint=tensor["layout_fingerprint"],
-                parallel_axes=_parallel_axes(
-                    tensor,
-                    tp_size=tp_size,
-                    pp_size=pp_size,
-                    ep_size=ep_size,
+                shard_dims=tuple(
+                    axis.dim for axis in parallel_axes if isinstance(axis, SplitAxis)
                 ),
+                layout_fingerprint=tensor["layout_fingerprint"],
+                parallel_axes=parallel_axes,
                 layer_id=tensor.get("layer_id"),
                 expert_id=tensor.get("expert_id"),
             )

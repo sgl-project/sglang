@@ -8,10 +8,13 @@ then use Mooncake's manifest planner and Transfer Engine reader to pull exactly
 the ranges needed by each target rank. No Engine control-plane participation is
 required and both daemon-owned models remain immutable.
 
-The weight cache has no data-parallel ownership dimension, so this module
-supports TP, PP and static EP layouts while intentionally keeping DP=1.  The
-Mooncake planner consumes layout-independent logical tensor boxes; PP and EP
-support therefore belongs here, above Mooncake, rather than in the transport.
+SGLang attention DP reuses the global TP workers: attention weights are
+replicated across attention-DP ranks while FFN weights remain sharded across
+the full TP world.  The runtime manifest therefore folds attention DP into one
+Mooncake model-replica coordinate and records its effects through attention-TP
+tensor geometry.  Registry rank counts remain TP x PP.  The planner consumes
+layout-independent logical tensor boxes, so TP, PP, static EP and attention-DP
+support belongs here, above Mooncake, rather than in the transport.
 """
 
 from __future__ import annotations
@@ -51,12 +54,17 @@ class WeightParallelLayout:
     """Process and weight ownership dimensions managed by weight cache."""
 
     tp_size: int
+    dp_size: int = 1
     pp_size: int = 1
     ep_size: int = 1
 
     def __post_init__(self) -> None:
-        if min(self.tp_size, self.pp_size, self.ep_size) < 1:
-            raise ValueError("TP, PP and EP sizes must be positive")
+        if min(self.tp_size, self.dp_size, self.pp_size, self.ep_size) < 1:
+            raise ValueError("TP, DP, PP and EP sizes must be positive")
+        if self.tp_size % self.dp_size != 0:
+            raise ValueError(
+                f"tp_size={self.tp_size} must be divisible by dp_size={self.dp_size}"
+            )
         if self.tp_size % self.ep_size != 0:
             raise ValueError(
                 f"tp_size={self.tp_size} must be divisible by ep_size={self.ep_size}"
@@ -64,7 +72,8 @@ class WeightParallelLayout:
 
     @property
     def world_size(self) -> int:
-        # EP partitions the TP group and is not an independent process axis.
+        # Attention DP and EP partition/reuse the TP group; neither adds a
+        # daemon process axis.
         return self.tp_size * self.pp_size
 
     def iter_ranks(self):
@@ -362,23 +371,27 @@ def validate_weight_heterogeneous_transfer_configuration(
     dp_size: int,
     ep_size: int,
     pp_size: int,
+    enable_dp_attention: bool,
     nnodes: int = 1,
     quantization: Optional[str] = None,
 ) -> None:
     unsupported = []
     if nnodes != 1:
         unsupported.append(f"nnodes={nnodes}")
-    if dp_size != 1:
-        unsupported.append(f"dp_size={dp_size}")
+    if dp_size != 1 and not enable_dp_attention:
+        unsupported.append(f"dp_size={dp_size} without enable_dp_attention")
     if quantization is not None:
         unsupported.append(f"quantization={quantization!r}")
     if unsupported:
         raise WeightHeterogeneousTransferError(
-            "weight-cache heterogeneous transfer supports only single-node, DP=1 "
-            "and unquantized weights; unsupported: " + ", ".join(unsupported)
+            "weight-cache heterogeneous transfer supports only single-node, "
+            "attention DP and unquantized weights; unsupported: "
+            + ", ".join(unsupported)
         )
     try:
-        WeightParallelLayout(tp_size=tp_size, pp_size=pp_size, ep_size=ep_size)
+        WeightParallelLayout(
+            tp_size=tp_size, dp_size=dp_size, pp_size=pp_size, ep_size=ep_size
+        )
     except ValueError as error:
         raise WeightHeterogeneousTransferError(str(error)) from error
 
@@ -417,6 +430,9 @@ def _build_weight_runtime_inventory(
     pp_size: int,
     pp_rank: int,
     ep_size: int,
+    dp_size: int,
+    dp_attention_enabled: bool,
+    dp_lm_head_enabled: bool,
     gpu_id: int,
     transfer_endpoint: str,
     model_id: str,
@@ -434,8 +450,13 @@ def _build_weight_runtime_inventory(
         get_tensor_model_parallel_rank,
         get_tensor_model_parallel_world_size,
     )
-    from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
+    parallel = get_parallel()
+    # Mooncake DP means a complete model replica. Attention DP is only a
+    # replica for attention weights, while FFN weights still span global TP.
+    # Fold it into one logical DP replica and describe its real placement via
+    # attention_tp_rank/size, matching SGLang's proven runtime-manifest model.
     parallel_topology = WeightParallelTopology(
         dp_rank=0,
         dp_size=1,
@@ -450,13 +471,14 @@ def _build_weight_runtime_inventory(
         attention_tp_rank=get_attn_tensor_model_parallel_rank(),
         attention_tp_size=get_attn_tensor_model_parallel_world_size(),
     )
-    expected_topology = (tp_size, tp_rank, pp_size, pp_rank, ep_size)
+    expected_topology = (tp_size, tp_rank, pp_size, pp_rank, ep_size, dp_size)
     actual_topology = (
         parallel_topology.tp_size,
         parallel_topology.tp_rank,
         parallel_topology.pp_size,
         parallel_topology.pp_rank,
         parallel_topology.ep_size,
+        parallel.attn_dp_size,
     )
     if actual_topology != expected_topology:
         raise WeightHeterogeneousTransferError(
@@ -471,10 +493,14 @@ def _build_weight_runtime_inventory(
         moe_runner_backend=_resolve_active_moe_runner_backend(
             model, get_exec().moe.moe_runner_backend
         ),
+        dp_attention_enabled=dp_attention_enabled,
+        dp_lm_head_enabled=dp_lm_head_enabled,
+        embed_replication_enabled=envs.SGLANG_ENABLE_EMBED_REPLICATION.get(),
     )
     worker_id = (
         f"weight-cache:{os.getpid()}:gpu{gpu_id}:pp{pp_rank}:tp{tp_rank}:"
-        f"ep{parallel_topology.ep_rank}:mtp{parallel_topology.moe_tp_rank}"
+        f"adp{parallel.attn_dp_rank}:ep{parallel_topology.ep_rank}:"
+        f"mtp{parallel_topology.moe_tp_rank}"
     )
     runtime_inventory = manifest_builder.build(
         model_id=model_id,
@@ -537,6 +563,9 @@ class WeightsManifestState:
         pp_size: int,
         pp_rank: int,
         ep_size: int,
+        dp_size: int,
+        dp_attention_enabled: bool,
+        dp_lm_head_enabled: bool,
         gpu_id: int,
         revision: str,
         is_source_daemon: bool,
@@ -552,6 +581,9 @@ class WeightsManifestState:
                 pp_size=pp_size,
                 pp_rank=pp_rank,
                 ep_size=ep_size,
+                dp_size=dp_size,
+                dp_attention_enabled=dp_attention_enabled,
+                dp_lm_head_enabled=dp_lm_head_enabled,
                 gpu_id=gpu_id,
                 transfer_endpoint=transfer_endpoint,
                 model_id=model_identity_from_config(model_config.hf_config),
@@ -568,6 +600,7 @@ class WeightsManifestState:
                 runtime_inventory=runtime_inventory,
                 parallel_layout=WeightParallelLayout(
                     tp_size=tp_size,
+                    dp_size=dp_size,
                     pp_size=pp_size,
                     ep_size=ep_size,
                 ),
@@ -618,6 +651,7 @@ class SourceWeightsManifest:
             "node_id": self.node_id,
             "parallel_layout": {
                 "tp_size": self.parallel_layout.tp_size,
+                "dp_size": self.parallel_layout.dp_size,
                 "pp_size": self.parallel_layout.pp_size,
                 "ep_size": self.parallel_layout.ep_size,
             },
@@ -633,6 +667,7 @@ class SourceWeightsManifest:
             parallel_layout_data = wire_manifest["parallel_layout"]
             parallel_layout = WeightParallelLayout(
                 tp_size=int(parallel_layout_data["tp_size"]),
+                dp_size=int(parallel_layout_data.get("dp_size", 1)),
                 pp_size=int(parallel_layout_data["pp_size"]),
                 ep_size=int(parallel_layout_data["ep_size"]),
             )
@@ -677,6 +712,7 @@ def register_source_weights_manifest(
     global_rank: int,
     gpu_id: int,
     tp_size: int,
+    dp_size: int,
     pp_size: int,
     ep_size: int,
     manifest_state: WeightsManifestState,
@@ -691,6 +727,7 @@ def register_source_weights_manifest(
         "gpu_id": gpu_id,
         "parallel_layout": {
             "tp_size": tp_size,
+            "dp_size": dp_size,
             "pp_size": pp_size,
             "ep_size": ep_size,
         },

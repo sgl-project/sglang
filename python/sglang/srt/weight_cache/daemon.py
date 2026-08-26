@@ -426,6 +426,7 @@ class WeightCacheDaemon:
                 dp_size=self.dp_size,
                 ep_size=self.ep_size,
                 pp_size=self.pp_size,
+                enable_dp_attention=self.enable_dp_attention,
                 nnodes=self.server_args.nnodes,
                 quantization=self.quantization or model_config.quantization,
             )
@@ -525,6 +526,9 @@ class WeightCacheDaemon:
                 pp_size=self.pp_size,
                 pp_rank=self.pp_rank,
                 ep_size=self.ep_size,
+                dp_size=(self.dp_size if self.enable_dp_attention else 1),
+                dp_attention_enabled=self.enable_dp_attention,
+                dp_lm_head_enabled=self.enable_dp_lm_head,
                 gpu_id=self.gpu_id,
                 revision=(
                     self.revision
@@ -546,6 +550,7 @@ class WeightCacheDaemon:
                 ),
                 gpu_id=self.gpu_id,
                 tp_size=self.tp_size,
+                dp_size=(self.dp_size if self.enable_dp_attention else 1),
                 pp_size=self.pp_size,
                 ep_size=self.ep_size,
                 manifest_state=self.weights_manifest_state,
@@ -890,6 +895,7 @@ def _prepare_weight_heterogeneous_transfer(
         dp_size=server_args.dp_size,
         ep_size=server_args.ep_size,
         pp_size=server_args.pp_size,
+        enable_dp_attention=server_args.enable_dp_attention,
         nnodes=server_args.nnodes,
         quantization=server_args.quantization,
     )

@@ -278,9 +278,57 @@ class Qwen35WeightSemanticsAdapter:
         *,
         config: Any,
         up_first_w13_parameter_ids: Sequence[int] = (),
+        embed_vocab_group: str = "tp",
+        lm_head_vocab_group: str = "tp",
     ) -> None:
+        for vocab_group in (embed_vocab_group, lm_head_vocab_group):
+            if vocab_group not in ("tp", "attn_tp", "replicated"):
+                raise WeightManifestError(
+                    f"invalid Qwen vocabulary parallel group: {vocab_group!r}"
+                )
         self._config = config
         self._up_first_w13_parameter_ids = frozenset(up_first_w13_parameter_ids)
+        self._embed_vocab_group = embed_vocab_group
+        self._lm_head_vocab_group = lm_head_vocab_group
+
+    def _vocab_views(
+        self,
+        *,
+        tensor_id: str,
+        parameter: Any,
+        topology: WeightParallelTopology,
+    ) -> tuple[LogicalTensorView, ...]:
+        vocab_group = (
+            self._embed_vocab_group
+            if tensor_id == "embed_tokens.weight"
+            else self._lm_head_vocab_group
+        )
+        if vocab_group == "replicated":
+            return _replicated_view(
+                parameter=parameter,
+                tensor_id=tensor_id,
+                layer_id=None,
+                layout="vocab-parallel",
+                expected_shape=(
+                    int(self._config.vocab_size),
+                    int(self._config.hidden_size),
+                ),
+            )
+        if vocab_group == "attn_tp":
+            rank = topology.attention_tp_rank
+            size = topology.attention_tp_size
+        else:
+            rank = topology.tp_rank
+            size = topology.tp_size
+        return _split_dim_zero(
+            parameter=parameter,
+            tensor_ids=(tensor_id,),
+            global_extents=(int(self._config.vocab_size),),
+            ranks=(rank,),
+            sizes=(size,),
+            layer_id=None,
+            layout="vocab-parallel",
+        )
 
     def describe_parameter(
         self,
@@ -394,14 +442,10 @@ class Qwen35WeightSemanticsAdapter:
                 view
                 for tensor_id in canonical_names
                 if tensor_id in ("embed_tokens.weight", "lm_head.weight")
-                for view in _split_dim_zero(
+                for view in self._vocab_views(
+                    tensor_id=tensor_id,
                     parameter=parameter,
-                    tensor_ids=(tensor_id,),
-                    global_extents=(int(self._config.vocab_size),),
-                    ranks=(topology.tp_rank,),
-                    sizes=(topology.tp_size,),
-                    layer_id=None,
-                    layout="vocab-parallel",
+                    topology=topology,
                 )
             )
         if name.endswith(("A_log", "dt_bias")):
@@ -830,10 +874,14 @@ class Qwen35MultimodalWeightSemanticsAdapter:
         text_config: Any,
         vision_config: Any,
         up_first_w13_parameter_ids: Sequence[int] = (),
+        embed_vocab_group: str = "tp",
+        lm_head_vocab_group: str = "tp",
     ) -> None:
         self._text = Qwen35WeightSemanticsAdapter(
             config=text_config,
             up_first_w13_parameter_ids=up_first_w13_parameter_ids,
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
         self._vision = Qwen35VisionWeightSemanticsAdapter(config=vision_config)
 

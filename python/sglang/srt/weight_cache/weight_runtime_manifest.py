@@ -465,6 +465,9 @@ def create_weight_runtime_manifest_builder(
     topology: WeightParallelTopology,
     is_multimodal: bool = False,
     moe_runner_backend: str | None = None,
+    dp_attention_enabled: bool = False,
+    dp_lm_head_enabled: bool = False,
+    embed_replication_enabled: bool = False,
 ):
     model_type = getattr(config, "model_type", None)
     text_model_types = (
@@ -531,6 +534,17 @@ def create_weight_runtime_manifest_builder(
             ):
                 up_first_w13_parameters.add(id(parameter))
 
+    def vocab_parallel_groups(
+        vocab_config: Any, *, dp_embed_group: str
+    ) -> tuple[str, str]:
+        if not dp_attention_enabled:
+            return "tp", "tp"
+        embed_group = dp_embed_group
+        if bool(getattr(vocab_config, "tie_word_embeddings", False)):
+            return embed_group, embed_group
+        lm_head_group = "attn_tp" if dp_lm_head_enabled else "tp"
+        return embed_group, lm_head_group
+
     if is_multimodal:
         text_config = getattr(config, "text_config", None)
         vision_config = getattr(config, "vision_config", None)
@@ -538,16 +552,28 @@ def create_weight_runtime_manifest_builder(
             raise WeightManifestError(
                 "Qwen3.5 multimodal config is missing text_config or vision_config"
             )
+        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
+            config,
+            dp_embed_group="replicated",
+        )
         adapter = Qwen35MultimodalWeightSemanticsAdapter(
             text_config=text_config,
             vision_config=vision_config,
             up_first_w13_parameter_ids=up_first_w13_parameters,
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
     elif model_type == "qwen3_next":
+        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
+            config,
+            dp_embed_group="attn_tp",
+        )
         adapter = Qwen3NextWeightSemanticsAdapter(
             config=config,
             up_first_w13_parameter_ids=up_first_w13_parameters,
             num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
     elif model_type in deepseek_model_types:
         from .weight_semantics.deepseek_v2 import (
@@ -562,20 +588,38 @@ def create_weight_runtime_manifest_builder(
             if model_type == "deepseek_v4"
             else DeepseekV2WeightSemanticsAdapter
         )
+        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
+            config,
+            dp_embed_group=("replicated" if embed_replication_enabled else "attn_tp"),
+        )
         adapter = adapter_class(
             config=config,
             up_first_w13_parameter_ids=up_first_w13_parameters,
             num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
     elif model_type in ("qwen3", "qwen3_moe"):
+        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
+            config,
+            dp_embed_group="attn_tp",
+        )
         adapter = Qwen3WeightSemanticsAdapter(
             config=config,
             up_first_w13_parameter_ids=up_first_w13_parameters,
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
     else:
+        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
+            config,
+            dp_embed_group="replicated",
+        )
         adapter = Qwen35WeightSemanticsAdapter(
             config=config,
             up_first_w13_parameter_ids=up_first_w13_parameters,
+            embed_vocab_group=embed_vocab_group,
+            lm_head_vocab_group=lm_head_vocab_group,
         )
 
     return ImmutableWeightRuntimeManifestBuilder(

@@ -71,6 +71,7 @@ class WeightManifestServer:
 
         parallel_layout = {
             "tp_size": int(data["parallel_layout"]["tp_size"]),
+            "dp_size": int(data["parallel_layout"].get("dp_size", 1)),
             "pp_size": int(data["parallel_layout"]["pp_size"]),
             "ep_size": int(data["parallel_layout"]["ep_size"]),
         }
