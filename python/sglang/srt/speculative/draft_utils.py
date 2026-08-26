@@ -250,8 +250,11 @@ class DraftBackendFactory:
     def _create_intel_xpu_decode_backend(self):
         from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
 
-        return XPUMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+        return (
+            "intel_xpu",
+            XPUMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
         )
 
     def _create_aiter_decode_backend(self):
@@ -445,7 +448,10 @@ class DraftBackendFactory:
     def _create_intel_xpu_prefill_backend(self):
         from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
-        return XPUAttentionBackend(self.draft_model_runner, skip_prefill=False)
+        return (
+            "intel_xpu",
+            XPUAttentionBackend(self.draft_model_runner, skip_prefill=False),
+        )
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

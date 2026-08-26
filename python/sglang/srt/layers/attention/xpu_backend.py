@@ -539,10 +539,9 @@ class XPUAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         # Piecewise XPU graph for prefill pre-allocates a fixed-address output
-        # buffer (_attn_output) so graph replay writes to the same storage. It is
-        # set by radix_attention only on the graph path; pass it as flash_attn's
-        # `out` solely when present (older builds lack the `out` kwarg entirely).
-        attn_output_buffer = getattr(forward_batch, "_attn_output", None)
+        # buffer so graph replay writes to the same storage. radix_attention sets
+        # it only on the graph path; None on the eager path.
+        attn_output_buffer = forward_batch._attn_output
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -625,29 +624,21 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=None,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=True,
-                    **kwargs,
+                expand = self.forward_metadata_spec_decode_expand
+                o_expand, lse_expand = self._cascade_expand_attn(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
+                    value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    expand.page_table,
+                    expand.cache_seqlens_int32,
+                    layer.scaling,
+                    layer.logit_cap,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
-                    softmax_lse_expand.T.contiguous(),
+                    lse_expand.contiguous(),
                 )
             else:
                 o = result
@@ -777,6 +768,70 @@ class XPUAttentionBackend(AttentionBackend):
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
+
+    def _cascade_expand_attn(
+        self,
+        q: torch.Tensor,
+        k_flat: torch.Tensor,
+        v_flat: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        scale: float,
+        softcap: float,
+    ):
+        """Tree-branch ("expand") half of cascade target-verify / draft-decode.
+
+        The expand ``page_table`` stores *token-slot* indices (absolute positions
+        in the flat KV cache), not paged block indices, so it cannot be fed to the
+        paged decode kernel on XPU (which has no ``page_size == 1`` variant -- only
+        64/128). Feeding token-slots as block indices makes every branch key
+        resolve to ``page_table[row, 0]``'s block, so the scattered draft slots are
+        never read (tree-verify KV mis-indexing).
+
+        Each query row attends to only a small set (<= ``speculative_num_draft_
+        tokens``) of scattered branch slots. We gather them densely into a *ragged*
+        buffer (valid slots packed per row, matching ``cu_seqlens_k``) and run the
+        non-paged varlen decode kernel (``flash_attn_varlen_func`` with
+        ``return_softmax_lse=True``), which stays in bf16 with no padding. The
+        result is merged with the paged prefix pass via ``merge_state_v2``.
+        """
+        num_rows = q.shape[0]
+        pt = page_table.to(torch.long)
+        seqlens = cache_seqlens.to(torch.long)
+        m = pt.shape[1]
+
+        # Gather the scattered branch KV into a dense ragged buffer. ``valid`` is
+        # row-major and the page_table packs valid entries first per row, so
+        # ``pt[valid]`` yields slots in exactly cu_seqlens_k order.
+        valid = torch.arange(m, device=pt.device).unsqueeze(0) < seqlens.unsqueeze(1)
+        flat_slots = pt[valid]
+        k_ragged = k_flat.index_select(0, flat_slots).contiguous()
+        v_ragged = v_flat.index_select(0, flat_slots).contiguous()
+
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens.to(torch.int32), dim=0, dtype=torch.int32),
+            (1, 0),
+        )
+        cu_seqlens_q = torch.arange(0, num_rows + 1, dtype=torch.int32, device=q.device)
+        max_seqlen_k = int(seqlens.max().item()) if num_rows > 0 else 0
+
+        # GQA/MQA is handled inside the kernel via q_group_size = Hq // Hk, so we
+        # pass K/V with their native Hk heads (no repeat_interleave needed).
+        out, lse, *_ = flash_attn_varlen_func(
+            q=q.contiguous(),
+            k=k_ragged,
+            v=v_ragged,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=False,
+            softcap=softcap,
+            return_softmax_lse=True,
+        )
+        # varlen returns softmax_lse as (Hq, total_q); transpose to (num_rows, Hq).
+        return out, lse.transpose(0, 1).contiguous()
 
     def forward_decode(
         self,
@@ -968,31 +1023,21 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=None,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=True,
-                            **kwargs,
-                        )
+                    expand = self.forward_metadata_spec_decode_expand
+                    o_expand, lse_expand = self._cascade_expand_attn(
+                        q_reshaped,
+                        key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
+                        value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        expand.page_table,
+                        expand.cache_seqlens_int32,
+                        layer.scaling,
+                        layer.logit_cap,
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
-                        softmax_lse_expand.T.contiguous(),
+                        lse_expand.contiguous(),
                     )
                 else:
                     o = result
@@ -1095,18 +1140,12 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        # Spec-decode graph support is limited to topk <= 1 (chain drafts). The
-        # topk > 1 tree path needs the expand/custom-mask metadata that the graph
-        # buffers here don't carry, so reject it explicitly.
         is_verify = forward_mode.is_target_verify()
         is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
         is_draft_extend = forward_mode.is_draft_extend_v2()
         assert (
             forward_mode.is_decode_or_idle() or is_verify or is_draft_extend
         ), "XPUAttentionBackend XPU graph only supports decode / target-verify / draft-extend modes"
-        assert not (
-            (is_verify or is_draft_decode or is_draft_extend) and self.topk > 1
-        ), "XPUAttentionBackend XPU graph spec decoding supports topk <= 1 only"
 
         # Per-sequence query rows and the extra KV length beyond seq_lens:
         #  * target-verify packs `speculative_num_draft_tokens` query rows per req
