@@ -213,7 +213,11 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
     # dead branch is pruned before tl.arange validation.
     v_ld_base = (
-        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+        mixed_qkvz
+        + i_bs * qkvz_row_stride
+        + TOTAL_Q
+        + TOTAL_K
+        + i_qk * V_PER_GROUP * HEAD_V
     )
     z_ld_base = v_ld_base + TOTAL_V
 
