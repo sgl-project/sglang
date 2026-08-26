@@ -521,7 +521,9 @@ class HiCacheHF3FS(HiCacheStorage):
         self.metadata_client.delete_keys(self.rank, [f"{self._dtype_key_prefix}{key}"])
 
     def exists(self, key: str) -> bool:
-        result = self.metadata_client.exists(self.rank, [f"{self._dtype_key_prefix}{key}"])
+        result = self.metadata_client.exists(
+            self.rank, [f"{self._dtype_key_prefix}{key}"]
+        )
         return result[0] if result else False
 
     def batch_exists(

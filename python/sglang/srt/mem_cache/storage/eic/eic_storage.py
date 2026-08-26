@@ -315,9 +315,7 @@ class EICStorage(HiCacheStorage):
     def _init_eic_prefix(self):
         kv_dtype_str = str(self.kv_cache_dtype)
         if self.is_mla_model:
-            self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}_dtype_{kv_dtype_str}@sglang"
-            )
+            self.eic_prefix = f"{self.model_name}_mla_att_{self.host_kvcache_layout}_dtype_{kv_dtype_str}@sglang"
         else:
             self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_dtype_{kv_dtype_str}_@sglang"
 

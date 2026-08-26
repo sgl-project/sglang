@@ -7,14 +7,17 @@ do not silently reuse each other's cache entries.
 Issue: https://github.com/sgl-project/sglang/issues/33268
 """
 
-import os
 import tempfile
+
 import pytest
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _make_config(
@@ -50,7 +53,9 @@ class TestHiCacheDtypeKeyCollision:
         """Two configs differing only in kv_cache_dtype must have different suffixes."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_bf16 = HiCacheFile(_make_config("torch.bfloat16"), file_path=tmpdir)
-            cache_fp8 = HiCacheFile(_make_config("torch.float8_e4m3fn"), file_path=tmpdir)
+            cache_fp8 = HiCacheFile(
+                _make_config("torch.float8_e4m3fn"), file_path=tmpdir
+            )
 
             assert cache_bf16.config_suffix != cache_fp8.config_suffix, (
                 f"Suffix collision: bf16={cache_bf16.config_suffix}, "
@@ -78,9 +83,9 @@ class TestHiCacheDtypeKeyCollision:
                 f"dtype leaked into suffix when kv_cache_dtype is None: "
                 f"{cache.config_suffix}"
             )
-            assert cache.config_suffix == "_DeepSeek-V4-Flash", (
-                f"Unexpected suffix for None dtype: {cache.config_suffix}"
-            )
+            assert (
+                cache.config_suffix == "_DeepSeek-V4-Flash"
+            ), f"Unexpected suffix for None dtype: {cache.config_suffix}"
 
     def test_same_dtype_produces_same_suffix(self):
         """Two configs with the same kv_cache_dtype must produce the same suffix."""
@@ -91,10 +96,12 @@ class TestHiCacheDtypeKeyCollision:
 
     def test_non_mla_model_dtype_in_suffix(self):
         """Non-MLA models should also include dtype in the suffix."""
-        cfg_bf16 = _make_config("torch.bfloat16", is_mla_model=False, tp_size=4,
-                                model_name="Qwen2.5-7B")
-        cfg_fp8 = _make_config("torch.float8_e5m2", is_mla_model=False, tp_size=4,
-                               model_name="Qwen2.5-7B")
+        cfg_bf16 = _make_config(
+            "torch.bfloat16", is_mla_model=False, tp_size=4, model_name="Qwen2.5-7B"
+        )
+        cfg_fp8 = _make_config(
+            "torch.float8_e5m2", is_mla_model=False, tp_size=4, model_name="Qwen2.5-7B"
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_bf16 = HiCacheFile(cfg_bf16, file_path=tmpdir)
             cache_fp8 = HiCacheFile(cfg_fp8, file_path=tmpdir)
@@ -127,8 +134,7 @@ class TestHiCacheDtypeKeyCollision:
             dtype_pos = cache.config_suffix.find("_dtype_")
             assert cp_pos >= 0 and dtype_pos >= 0
             assert dtype_pos > cp_pos, (
-                f"dtype suffix should come after CP suffix: "
-                f"{cache.config_suffix}"
+                f"dtype suffix should come after CP suffix: " f"{cache.config_suffix}"
             )
 
     def test_empty_string_dtype_treated_as_set(self):
@@ -175,9 +181,15 @@ class TestHiCacheStorageConfigField:
     def test_default_kv_cache_dtype_is_none(self):
         """The field should default to None for backward compatibility."""
         cfg = HiCacheStorageConfig(
-            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
-            attn_cp_rank=0, attn_cp_size=1, is_mla_model=False,
-            enable_storage_metrics=False, is_page_first_layout=False,
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
             model_name="test",
         )
         assert cfg.kv_cache_dtype is None
@@ -185,9 +197,15 @@ class TestHiCacheStorageConfigField:
     def test_kv_cache_dtype_can_be_set(self):
         """The field should be settable via constructor."""
         cfg = HiCacheStorageConfig(
-            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
-            attn_cp_rank=0, attn_cp_size=1, is_mla_model=False,
-            enable_storage_metrics=False, is_page_first_layout=False,
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
             model_name="test",
             kv_cache_dtype="torch.bfloat16",
         )
@@ -196,9 +214,15 @@ class TestHiCacheStorageConfigField:
     def test_existing_fields_unaffected(self):
         """Adding kv_cache_dtype should not break existing fields."""
         cfg = HiCacheStorageConfig(
-            tp_rank=2, tp_size=4, pp_rank=1, pp_size=2,
-            attn_cp_rank=0, attn_cp_size=1, is_mla_model=True,
-            enable_storage_metrics=True, is_page_first_layout=True,
+            tp_rank=2,
+            tp_size=4,
+            pp_rank=1,
+            pp_size=2,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=True,
+            enable_storage_metrics=True,
+            is_page_first_layout=True,
             model_name="test-model",
             kv_cache_dtype="torch.float8_e4m3fn",
         )
@@ -214,4 +238,4 @@ class TestHiCacheStorageConfigField:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    raise SystemExit(pytest.main([__file__, "-v", "-s"]))
