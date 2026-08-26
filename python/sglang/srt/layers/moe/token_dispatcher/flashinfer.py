@@ -211,6 +211,16 @@ class FlashinferDispatcher(BaseDispatcher):
     ) -> FlashinferDispatchOutput:
         output_dtype = hidden_states.dtype
         dispatch_type = self.dispatch_type
+        # The configured dispatch dtype is process-wide, while a speculative
+        # model can use a different activation quantization scheme from the
+        # target model. A per-token-activation MoE intentionally publishes no
+        # static input scale, so it must keep BF16 on the wire even when the
+        # target model uses NVFP4 dispatch.
+        if (
+            dispatch_type == FlashinferA2ADispatchType.NVFP4
+            and (self.quant_config or {}).get("input_global_scale") is None
+        ):
+            dispatch_type = FlashinferA2ADispatchType.BF16
         x = hidden_states
         x_sf = None
         # FlashInfer dispatch requires materialized top-k IDs and weights.
@@ -222,8 +232,7 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_weights = topk_output.topk_weights
 
         if dispatch_type == FlashinferA2ADispatchType.NVFP4:
-            global_scale = (self.quant_config or {}).get("input_global_scale", None)
-            assert global_scale is not None
+            global_scale = self.quant_config["input_global_scale"]
             if x.shape[0] > 0:
                 x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
             else:
