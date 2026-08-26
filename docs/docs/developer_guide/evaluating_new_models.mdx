@@ -28,10 +28,11 @@ python -m sglang.test.run_eval \
 **GSM8K**
 
 ```bash Command
-python -m sglang.test.few_shot_gsm8k \
-  --host http://127.0.0.1 \
+python -m sglang.test.run_eval \
+  --eval-name gsm8k \
+  --host 127.0.0.1 \
   --port 30000 \
-  --num-questions 200 \
+  --num-examples 200 \
   --num-shots 5
 ```
 
@@ -57,7 +58,7 @@ python -m sglang.test.run_eval \
 ```
 
 <Tip>
-For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-r1`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
+For reasoning models, add `--thinking-mode <mode>`. Supported values are `deepseek-v3`, `qwen-3`, `glm-45`, and `kimi-k2`. You may skip it if the model has forced thinking enabled.
 </Tip>
 
 **HumanEval**

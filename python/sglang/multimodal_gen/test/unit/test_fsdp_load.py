@@ -10,8 +10,12 @@ from safetensors.torch import safe_open, save_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
+)
 from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 
 
 class _UniformDtypeModel(nn.Module):
@@ -45,6 +49,10 @@ class _CustomEntrypointModel(_UniformDtypeModel):
 
 
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
+    def test_quant_config_detection_uses_the_runtime_instance(self):
+        self.assertTrue(fsdp_load._is_bitsandbytes_quant_config(BitsAndBytesConfig()))
+        self.assertFalse(fsdp_load._is_bitsandbytes_quant_config(Fp8Config()))
+
     def _load_and_capture_policy(
         self,
         model_cls: type[nn.Module],

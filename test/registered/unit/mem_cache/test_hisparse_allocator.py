@@ -116,6 +116,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
+            swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )

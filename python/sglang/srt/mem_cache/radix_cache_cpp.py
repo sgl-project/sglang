@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.runtime_context import (
+    get_memory,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -59,7 +62,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.ongoing_load_back: Set[IOHandle] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.device = self.token_to_kv_pool_allocator.device
@@ -72,7 +75,7 @@ class RadixCacheCpp(BasePrefixCache):
         if params.enable_metrics:
             self.init_metrics_collector()
 
-        if not server_args.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             self.tree = RadixTreeCpp(
                 disabled=self.disable,
                 page_size=self.page_size,
