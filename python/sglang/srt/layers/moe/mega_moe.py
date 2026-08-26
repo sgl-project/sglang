@@ -42,31 +42,9 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
-_MEGA_MOE_DG_ENV_APPLIED = False
-
 
 def _use_amd_flydsl_mega_moe() -> bool:
     return envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
-
-
-def _apply_mega_moe_dg_env() -> None:
-    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
-
-    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
-    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
-    Forwarding once at first use is sufficient (these are static config
-    flags, not per-request state) and matches the `setdefault` pattern so
-    explicit `DG_USE_*` overrides from outside still win.
-    """
-    global _MEGA_MOE_DG_ENV_APPLIED
-    if _MEGA_MOE_DG_ENV_APPLIED:
-        return
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
-        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
-    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
-        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
-    _MEGA_MOE_DG_ENV_APPLIED = True
-
 
 def _get_mega_moe_symm_buffer(
     group,
@@ -77,8 +55,6 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
 ) -> SymmBuffer:
     import deep_gemm
-
-    _apply_mega_moe_dg_env()
 
     key = (
         id(group),
@@ -252,7 +228,7 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    use_fp4_acts = os.getenv("DG_USE_FP4_ACTS") == "1"
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation

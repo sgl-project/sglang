@@ -37,6 +37,9 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
     TcPiecewiseCudaGraphBackend,
 )
+from sglang.srt.runtime_context import (
+    get_exec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -58,7 +61,7 @@ def resolve_decode_backend(
     the Full-style backend is wired for NPU today).
     """
     model_runner = cuda_graph_runner.model_runner
-    cfg = model_runner.server_args.cuda_graph_config
+    cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
     enable_memory_saver = model_runner.server_args.enable_memory_saver
@@ -86,7 +89,7 @@ def resolve_decode_backend(
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=enable_memory_saver,
-            debug_eager=model_runner.server_args.debug_cuda_graph,
+            debug_eager=get_exec().graph.debug_cuda_graph,
         )
     if backend_name == Backend.TC_PIECEWISE:
         global _TC_PIECEWISE_DECODE_FALLBACK_LOGGED
@@ -106,14 +109,14 @@ def resolve_prefill_backend(
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
     model_runner = cuda_graph_runner.model_runner
-    cfg = model_runner.server_args.cuda_graph_config
+    cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
-            debug_eager=model_runner.server_args.debug_cuda_graph,
+            debug_eager=get_exec().graph.debug_cuda_graph,
         )
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(

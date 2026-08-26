@@ -17,8 +17,6 @@ ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.17
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
-#if need other arg please add in MOONCAKE_COMPILE_ARG
-ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -173,11 +171,6 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
-# Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
-# (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN,
-# so the CUDA-13 nvidia-nccl-cu13 pip install below resolved an invalid PyPI
-# version. A distinct ARG name avoids the collision.
-ARG SGL_NCCL_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -253,10 +246,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
-    && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-           python3 -m pip install --force-reinstall --no-deps \
-               "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
-       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
@@ -418,8 +407,10 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
-ARG MOONCAKE_COMPILE_ARG
 ARG MSCCLPP_VERSION
+# Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
+# (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
+ARG SGL_NCCL_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -539,6 +530,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     tabulate \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+
+# PyTorch 2.13 requires nvidia-nccl-cu13==2.29.7, so keep that version while
+# resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7
+# at runtime; apply the override only after the constrained dependency solve.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip install --force-reinstall --no-deps \
+            "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
+    fi
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
