@@ -24,12 +24,12 @@ from sgl_kernel_npu.mamba.causal_conv1d_verify import (
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.linear.kda_backend import (
-    KDAAttnBackend,
-    ragged_verify_dense_scatter_indices,
-)
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.ragged_verify import (
+    ragged_verify_dense_scatter_indices,
+)
 
 _LOG2_E = math.log2(math.e)
 

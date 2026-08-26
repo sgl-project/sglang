@@ -56,6 +56,7 @@ class GDNAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     linear_attn_prefill_backend: str | None = None
+    enable_linear_replayssm_spec: bool = False
 
     @property
     def batch_size(self) -> int:
@@ -253,6 +254,7 @@ class MockGDNModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
+            enable_linear_replayssm_spec=case.enable_linear_replayssm_spec,
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=case.linear_attn_prefill_backend,
@@ -301,6 +303,7 @@ class MockGDNModelRunner(ModelRunner):
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=speculative_num_draft_tokens or None,
             enable_overlap_schedule=False,
+            enable_linear_replayssm_spec=case.enable_linear_replayssm_spec,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(
