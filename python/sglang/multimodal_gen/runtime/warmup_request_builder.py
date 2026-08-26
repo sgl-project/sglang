@@ -6,10 +6,11 @@ first real request, without copying user traffic. It starts from the model's
 sampling defaults, then keeps startup bounded by choosing common low-cost
 resolution/frame buckets and trimming the denoising step count.
 
-When warmup-calibrated auto residency is active, a second probe restores the
-full default serving shape but keeps the trimmed step count. Memory depends on
-the activation shape rather than the number of repeated denoising steps, so
-this directly measures placement headroom without running a full generation.
+When warmup-calibrated auto residency is active, warmup uses the full default
+serving shape but keeps the trimmed step count. Memory depends on the
+activation shape rather than the number of repeated denoising steps, so this
+directly measures placement headroom without running a full generation or an
+extra stateful pipeline request.
 
 Image models may run a tiny second step because first/last step paths often
 initialize different kernels or scheduler state. Video models cap frames and
@@ -405,14 +406,14 @@ def resolve_default_workload_shape(
     return width, height, num_frames
 
 
-def _resolve_auto_residency_probe_shape(
+def _resolve_auto_residency_warmup_shape(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
     *,
     warmup_shape: tuple[int, int, int | None],
     server_based_warmup: bool,
 ) -> tuple[int, int, int] | None:
-    """Return a full serving-shape memory probe when bounded warmup is smaller.
+    """Return the full serving shape when bounded warmup is smaller.
 
     The probe still runs only the bounded warmup step count. Denoising steps
     repeat the same activation shape, so one full-shape forward measures the
@@ -544,8 +545,8 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
-    auto_residency_probe_shape = (
-        _resolve_auto_residency_probe_shape(
+    auto_residency_warmup_shape = (
+        _resolve_auto_residency_warmup_shape(
             server_args,
             sampling_defaults,
             warmup_shape=(width, height, warmup_num_frames),
@@ -554,6 +555,9 @@ def build_warmup_reqs(
         if warmup_resolutions is None
         else None
     )
+    if auto_residency_warmup_shape is not None:
+        width, height, warmup_num_frames = auto_residency_warmup_shape
+        resolutions[0] = (width, height)
 
     # build warmup reqs
     warmup_reqs = []
@@ -614,44 +618,8 @@ def build_warmup_reqs(
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:
                 req.extra["server_based_warmup"] = True
+            if auto_residency_warmup_shape is not None:
+                req.extra["auto_residency_full_shape_probe"] = True
             warmup_reqs.append(req)
 
-        if auto_residency_probe_shape is not None and (width, height) == resolutions[0]:
-            warmup_reqs.append(
-                _build_auto_residency_probe_req(
-                    req_kwargs,
-                    probe_shape=auto_residency_probe_shape,
-                    warmup_steps=warmup_steps,
-                    return_warmup_result=return_warmup_result,
-                    server_based_warmup=server_based_warmup,
-                    server_args=server_args,
-                )
-            )
-
     return warmup_reqs
-
-
-def _build_auto_residency_probe_req(
-    req_kwargs: dict,
-    *,
-    probe_shape: tuple[int, int, int],
-    warmup_steps: int,
-    return_warmup_result: bool,
-    server_based_warmup: bool,
-    server_args: ServerArgs,
-) -> Req:
-    width, height, num_frames = probe_shape
-    probe_kwargs = req_kwargs.copy()
-    probe_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
-    probe_kwargs.update(width=width, height=height, num_frames=num_frames)
-    probe_req = Req(**probe_kwargs)
-    probe_req.set_as_warmup(warmup_steps)
-    probe_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
-        probe_req, server_args
-    )
-    if return_warmup_result:
-        probe_req.extra["return_warmup_result"] = True
-    if server_based_warmup:
-        probe_req.extra["server_based_warmup"] = True
-    probe_req.extra["auto_residency_full_shape_probe"] = True
-    return probe_req

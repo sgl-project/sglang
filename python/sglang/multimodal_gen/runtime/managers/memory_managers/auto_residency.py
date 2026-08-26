@@ -226,6 +226,35 @@ def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
     )
 
 
+def resolve_measured_default_workload(
+    workload: DefaultWorkload, records: Iterable[WarmupMemoryRecord]
+) -> DefaultWorkload:
+    """Fill an implicit default resolution from the executed warmup.
+
+    Image-edit pipelines can derive their output size from the input image, so
+    the sampling defaults legitimately omit width and height. The warmup record
+    is captured after input validation and therefore contains the effective
+    serving shape. Keep the model-default frame count because video warmup may
+    intentionally cap frames before measurement.
+    """
+    if workload.workload_units() is not None:
+        return workload
+    measured = [
+        record
+        for record in records
+        if record.succeeded and record.width > 0 and record.height > 0
+    ]
+    if not measured:
+        return workload
+    representative = max(measured, key=lambda record: record.width * record.height)
+    return DefaultWorkload(
+        width=representative.width,
+        height=representative.height,
+        num_frames=workload.num_frames,
+        num_inference_steps=workload.num_inference_steps,
+    )
+
+
 def estimate_default_workload_peak_bytes(
     *,
     records: Iterable[WarmupMemoryRecord],
@@ -801,25 +830,43 @@ def _vram_reserve_bytes(budget_bytes: int) -> int:
 
 def _binding_phase_constraints(
     report: RankResidencyReport,
+    candidate_component_names: set[str],
 ) -> list[tuple[str, int, tuple[str, ...]]]:
-    """Keep only the highest peak for each active-component placement.
+    """Keep the binding measured and conservative unobserved phases.
 
     Every candidate has the same device delta in phases with the same active
     component set. The lower peaks are therefore provably redundant; removing
     them reduces the exact optimizer's resource dimension without changing
-    its feasible placements.
+    its feasible placements. A short calibration may not reach a later
+    timestep-routed component (for example the second DiT in a two-stage
+    denoiser), so give each unobserved candidate a synthetic phase at the
+    measured request peak. This prevents permanent residents from being
+    placed in memory that the later component may need.
     """
     phase_peaks = report.estimated_peak_bytes_by_phase
     if not phase_peaks:
         if report.estimated_peak_bytes is None:
             return []
         phase_peaks = {"request": report.estimated_peak_bytes}
+    request_peak = (
+        report.estimated_peak_bytes
+        if report.estimated_peak_bytes is not None
+        else max(phase_peaks.values())
+    )
     binding: dict[tuple[str, ...], tuple[str, int]] = {}
     for phase_name, phase_peak in phase_peaks.items():
         active = tuple(sorted(report.active_components_by_phase.get(phase_name, ())))
         current = binding.get(active)
         if current is None or (phase_peak, phase_name) > (current[1], current[0]):
             binding[active] = (phase_name, phase_peak)
+    observed_components = {
+        component_name for active in binding for component_name in active
+    }
+    for component_name in sorted(candidate_component_names - observed_components):
+        binding[(component_name,)] = (
+            f"unobserved:{component_name}",
+            request_peak,
+        )
     return [
         (f"gpu:rank{report.rank}:{phase_name}", phase_peak, active)
         for active, (phase_name, phase_peak) in sorted(
@@ -920,8 +967,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     if not candidates:
         return _skip_plan("no implicitly offloaded components to promote")
 
+    candidate_component_names = {candidate.component_name for candidate in candidates}
     phase_constraints = {
-        report.rank: _binding_phase_constraints(report) for report in reports
+        report.rank: _binding_phase_constraints(report, candidate_component_names)
+        for report in reports
     }
     resource_budgets: dict[str, int] = {}
     for report in reports:

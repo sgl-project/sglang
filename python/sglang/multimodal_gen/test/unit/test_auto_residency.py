@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     AppliedPromotion,
     AutoResidencyPlan,
     AutoResidencyRollbackError,
+    DefaultWorkload,
     PromotionCandidate,
     RankResidencyReport,
     WarmupMemoryRecord,
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_applied_changes,
     plan_auto_residency,
     rank_candidates_by_h2d_savings,
+    resolve_measured_default_workload,
     rollback_promotions,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -40,7 +42,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
-    _resolve_auto_residency_probe_shape,
+    _resolve_auto_residency_warmup_shape,
     _resolve_warmup_num_frames,
 )
 
@@ -317,6 +319,60 @@ def _report(
     )
 
 
+class TestResolveMeasuredDefaultWorkload:
+    def test_uses_effective_warmup_resolution_for_implicit_image_size(self):
+        workload = DefaultWorkload(
+            width=None,
+            height=None,
+            num_frames=1,
+            num_inference_steps=40,
+        )
+
+        resolved = resolve_measured_default_workload(
+            workload,
+            [
+                _record(width=512, height=512),
+                _record(width=1024, height=1024),
+            ],
+        )
+
+        assert resolved == DefaultWorkload(
+            width=1024,
+            height=1024,
+            num_frames=1,
+            num_inference_steps=40,
+        )
+
+    def test_keeps_default_frames_when_warmup_caps_video(self):
+        workload = DefaultWorkload(
+            width=None,
+            height=None,
+            num_frames=81,
+            num_inference_steps=30,
+        )
+
+        resolved = resolve_measured_default_workload(
+            workload, [_record(width=832, height=480, num_frames=17)]
+        )
+
+        assert resolved.num_frames == 81
+
+    def test_does_not_replace_explicit_default_shape(self):
+        workload = DefaultWorkload(
+            width=1280,
+            height=720,
+            num_frames=81,
+            num_inference_steps=30,
+        )
+
+        assert (
+            resolve_measured_default_workload(
+                workload, [_record(width=512, height=512)]
+            )
+            is workload
+        )
+
+
 class TestPlanAutoResidency:
     def test_rank_skip_reason_propagates(self):
         plan = plan_auto_residency(
@@ -427,6 +483,37 @@ class TestPlanAutoResidency:
         )
 
         assert not plan.promotions
+
+    def test_unobserved_later_component_gets_a_conservative_phase(self):
+        first_transformer = _candidate("first_transformer", weight_gib=26, h2d_gib=100)
+        second_transformer = PromotionCandidate(
+            component_name="second_transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=26 * GIB_BYTES,
+            h2d_bytes_per_request=90 * GIB_BYTES,
+            target_layerwise_resident_layers=(40,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=26 * GIB_BYTES,
+            inactive_device_delta_bytes=0,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=80,
+                    estimated_gib=30,
+                    candidates=[first_transformer, second_transformer],
+                    phase_peaks_gib={"early_denoise": 30},
+                    phase_components={
+                        "early_denoise": ("first_transformer",),
+                    },
+                )
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "first_transformer"
+        ]
+        assert "gpu:rank0:unobserved:second_transformer" in plan.resource_budget_bytes
 
     def test_redundant_phase_constraints_collapse_to_the_highest_peak(self):
         plan = plan_auto_residency(
@@ -1292,7 +1379,7 @@ class TestWarmupFrameAdjustment:
         assert num_frames == 21
 
 
-class TestAutoResidencyProbeShape:
+class TestAutoResidencyWarmupShape:
     def _patch_gate(self, monkeypatch, reason: str | None = None) -> None:
         monkeypatch.setattr(
             "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
@@ -1328,7 +1415,7 @@ class TestAutoResidencyProbeShape:
 
     def test_capped_video_gets_a_full_shape_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        probe = _resolve_auto_residency_probe_shape(
+        probe = _resolve_auto_residency_warmup_shape(
             self._wan_like_args(),
             self._defaults(81),
             warmup_shape=(832, 480, 17),
@@ -1338,7 +1425,7 @@ class TestAutoResidencyProbeShape:
 
     def test_matching_warmup_needs_no_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        probe = _resolve_auto_residency_probe_shape(
+        probe = _resolve_auto_residency_warmup_shape(
             self._wan_like_args(),
             self._defaults(17, width=832, height=480),
             warmup_shape=(832, 480, 17),
@@ -1348,7 +1435,7 @@ class TestAutoResidencyProbeShape:
 
     def test_unknown_target_resolution_skips_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        probe = _resolve_auto_residency_probe_shape(
+        probe = _resolve_auto_residency_warmup_shape(
             self._wan_like_args(),
             self._defaults(81, width=None, height=None),
             warmup_shape=(832, 480, 17),
@@ -1357,10 +1444,10 @@ class TestAutoResidencyProbeShape:
         assert probe is None
 
     def test_skip_gate_disables_probe(self, monkeypatch):
-        # The probe costs a full extra warmup forward, so it must
-        # share the promotion's own gate (kill switch, quantized, manual, ...)
+        # Full-shape calibration must share the promotion's own gate (kill
+        # switch, quantized, manual, ...).
         self._patch_gate(monkeypatch, reason="performance_mode=manual")
-        probe = _resolve_auto_residency_probe_shape(
+        probe = _resolve_auto_residency_warmup_shape(
             self._wan_like_args(),
             self._defaults(81),
             warmup_shape=(832, 480, 17),
@@ -1370,7 +1457,7 @@ class TestAutoResidencyProbeShape:
 
     def test_supported_resolution_fills_missing_target_size(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        probe = _resolve_auto_residency_probe_shape(
+        probe = _resolve_auto_residency_warmup_shape(
             self._wan_like_args(),
             self._defaults(
                 81,

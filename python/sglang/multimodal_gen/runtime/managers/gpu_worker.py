@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     plan_summary_payload,
     rank_candidates_by_h2d_savings,
     resolve_default_workload,
+    resolve_measured_default_workload,
     rollback_promotions,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -1205,6 +1206,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         try:
             workload = resolve_default_workload(self.server_args)
+            workload = resolve_measured_default_workload(workload, records)
             local_report = self._build_auto_residency_report(
                 workload=workload, records=records
             )

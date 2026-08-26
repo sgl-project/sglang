@@ -22,6 +22,7 @@ import pytest
 import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import DEFAULT_FPS
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
@@ -127,9 +128,9 @@ def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
         overrides["num_frames"] = 1
     elif sampling.num_frames is not None:
         overrides["num_frames"] = sampling.num_frames
-    elif sampling.fps is not None:
+    else:
         # /v1/videos resolves an omitted num_frames from seconds * fps.
-        overrides["num_frames"] = sampling.seconds * sampling.fps
+        overrides["num_frames"] = sampling.seconds * (sampling.fps or DEFAULT_FPS)
     if sampling.fps is not None:
         overrides["fps"] = sampling.fps
     for name in ("num_inference_steps", "guidance_scale", "true_cfg_scale"):

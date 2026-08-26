@@ -137,6 +137,23 @@ class TestServerManagerReadiness(unittest.TestCase):
             },
         )
 
+    def test_video_case_warmup_matches_endpoint_default_fps(self):
+        case = SimpleNamespace(
+            server_args=SimpleNamespace(modality="video"),
+            sampling_params=SimpleNamespace(
+                output_size="",
+                num_frames=None,
+                fps=None,
+                seconds=2,
+                extras={},
+            ),
+        )
+
+        self.assertEqual(
+            _case_warmup_sampling_params(case),
+            {"num_frames": 48},
+        )
+
     def test_waits_for_health_after_http_startup(self):
         manager = ServerManager("test-model", port=11000, wait_deadline=1)
         with tempfile.TemporaryDirectory() as temp_dir:

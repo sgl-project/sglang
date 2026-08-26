@@ -382,7 +382,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
 
-    def test_auto_residency_adds_a_full_serving_shape_probe(self):
+    def test_auto_residency_uses_one_full_serving_shape_probe(self):
         server_args = SimpleNamespace(
             warmup_steps=1,
             enable_cfg_parallel=False,
@@ -423,16 +423,16 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
 
+        self.assertEqual(len(reqs), 1)
         self.assertEqual(
-            [(req.width, req.height, req.num_frames) for req in reqs],
-            [(832, 480, 17), (1280, 720, 81)],
+            (reqs[0].width, reqs[0].height, reqs[0].num_frames),
+            (1280, 720, 81),
         )
-        self.assertNotIn("auto_residency_full_shape_probe", reqs[0].extra)
-        self.assertTrue(reqs[1].extra["auto_residency_full_shape_probe"])
-        self.assertEqual(reqs[1].num_inference_steps, 2)
+        self.assertTrue(reqs[0].extra["auto_residency_full_shape_probe"])
+        self.assertEqual(reqs[0].num_inference_steps, 2)
         self.assertIn(
             "auto residency probe (1280x720x81f, 2/35 steps)",
-            format_warmup_req(reqs[1]),
+            format_warmup_req(reqs[0]),
         )
 
     def test_server_based_warmup_uses_model_default_resolution(self):
