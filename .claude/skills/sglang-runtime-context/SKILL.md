@@ -22,12 +22,18 @@ flags/resources/forward tiers.
 
 ## Config: publish + namespace bags
 
-**`ServerArgs` is a pristine seed. Business code never reads it for decisions —
-resolved configuration lives in the namespace bags.**
+**`ServerArgs` holds the raw input and nothing else. Resolution writes no field:
+it declares, and the declarations are what the namespace bags are projected from.
+Business code never reads the record for a decision — and after this cut, a field
+read there answers with what the operator typed, not with what resolution
+decided.**
 
 - Every publishing process entry calls `publish(server_args, role=...)`
   (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
-  detokenizer, encoder, weight-cache daemon, ...); the roles are enumerated once,
+  detokenizer, encoder, weight-cache daemon, the multi-tokenizer worker, the
+  spawned encoder TP/DP workers, the benchmark work functions, ...); constructors
+  do not publish — `ModelRunner`, `TokenizerManager` and `MMEncoder` call
+  `assert_published` and fail loudly if an entry forgot. The roles are enumerated once,
   as the keys of `ROLE_NAMESPACE_SETS` — there is no `launcher` role, the launch
   path publishes as `tokenizer`. The remaining non-publisher is
   `run_multi_detokenizer_router_process`: it *is* handed a `ServerArgs`, and uses
@@ -82,13 +88,15 @@ resolved configuration lives in the namespace bags.**
   the target runner.
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
-  tokenizer/chat-template load. They are resolution, not mutation, and they write
-  **in place** via `arg_groups.overrides.declare_late_resolution(server_args,
-  source, **fields)`, which refuses the published instance. In place is the point:
-  every holder of that object must see the resolved value — the HTTP server, the
-  multi-tokenizer workers it is serialized for, the schedulers it forks. Returning a
-  variant here is a bug: the launcher rebinds its local and everyone else keeps the
-  unresolved object.
+  tokenizer/chat-template load. They are resolution, not mutation, and they
+  **declare** via `arg_groups.overrides.declare_late_resolution(server_args,
+  source, **fields)`, which refuses the published instance. The declaration lands
+  in the stash on that very object, so every holder of it carries the decision —
+  the HTTP server, the multi-tokenizer workers it is serialized for, the
+  schedulers it forks — and each of them publishes bags projected from it. The
+  fields stay the operator's input; `resolution_result(sa, field)` and the bags
+  are what answer for the decision. Returning a variant here is a bug: the
+  launcher rebinds its local and everyone else keeps the unresolved object.
 - **A value another runner / worker owns is a constructor argument, not a config
   copy.** The draft worker's `context_length`, load format and attention backend
   travel as arguments to `TpModelWorker` / `ModelRunner` and live on the runner
@@ -99,8 +107,8 @@ resolved configuration lives in the namespace bags.**
 
 **Why a bag override cannot stand in for late resolution or per-runner
 construction.** The bags are projected at
-publish *from the instance's fields*, so anything the runtime must read has to be on
-the instance before publish — an override afterwards puts instance and bags back out
+publish *from the declarations over the instance's raw fields*, so anything the
+runtime must read has to be declared before publish — an override afterwards puts instance and bags back out
 of agreement, and whole-object readers (`ModelConfig.from_server_args`,
 `build_load_config`, `MMEncoder`'s own `self.server_args.X`) never see it. And bags do
 not cross a process boundary: a child publishes from the object it receives and
@@ -114,7 +122,8 @@ bag to override at all.
 - **Per-runner values** — there is no per-runner `ServerArgs` any more. The
   draft-worker config copy is gone: every worker (`TpModelWorker`, the draft
   workers in `speculative/`) is handed the *same* instance the process published,
-  so `self.server_args.X` and the bag leaf agree **at publish** — a
+  so a bag leaf is the decision and `self.server_args.X` is the operator's
+  input — a
   post-publish `override` moves only the bag, which is exactly why a field that
   is process-wide config (`attention_backend`, `skip_tokenizer_init`,
   `kv_cache_dtype`) reads from the bags like any other, and why a residual
@@ -139,9 +148,9 @@ bag to override at all.
   `Engine`s can share one process, bags are last-publish-wins across them") is
   **retracted** — owner ruling (2026-08-15): a process holds at most one live
   config at a time (concurrent multi-Engine is unsupported; sequential rebuild
-  stays legal, unit tests rely on it). What still reads the instance in those
-  files is pinned pair by pair in the exposure ratchet, each with its own
-  disposition; none of it is a boundary to imitate. What
+  stays legal, unit tests rely on it). Nothing in those files reads the instance
+  any more -- the exposure ratchet's pin set is empty, so the next such read is a
+  new entry that has to argue for itself. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
   `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
@@ -149,18 +158,17 @@ bag to override at all.
   supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
   `eplb/expert_location.py`) — **or the field is one that resolution fills in
-  and the callee runs in a process that has published.** That second case is
-  pinned debt, not a style question: the record is destined to carry the
-  user's raw input, so `server_args.page_size` inside a runner-owned
-  constructor will read the raw pre-resolution value instead of the effective
-  one. Debt means a decision, not automatically a bag read: pick where the
+  and the callee runs in a process that has published.** That second case is a
+  decision, not a style question: the record carries the user's raw input, so a
+  resolution-filled field read off it inside a runner-owned constructor answers
+  with the pre-resolution value instead of the effective one. Debt means a decision, not automatically a bag read: pick where the
   value should come from — usually the `get_*()` bag, sometimes a runner stamp
   or a constructor argument (the per-mode attention pair and the encode-server
   `gpu_id` above are dispositions of exactly this debt). The per-instance
   boundaries above are **not** exempt from this unless-clause (the multi-Engine
   exemption is retracted); each one gets its own disposition.
   `test_supplied_instance_exposure_ratchet.py`
-  pins the remaining set — three spellings of the read: `server_args.field`,
+  pins that set (empty today) — three spellings of the read: `server_args.field`,
   literal-name `getattr(server_args, "field", default)`, and the parked form
   (`self.x = server_args` in a method that takes the parameter, read as
   `self.x.field` anywhere in the class) — and fails on a new one, so the
@@ -321,9 +329,9 @@ what sits beside it is residue, not a family — and not for one single reason:
   without publishing has to keep patching the factory (or publish itself);
 - `MMEncoder` publishes the very instance it is handed (`publish(server_args,
   role="encoder")`) and takes its per-worker device as a separate `gpu_id`
-  argument, so its `self.server_args` reads and the bag agree today. They are on
-  this list as a construction-path convention rather than a semantic exception —
-  and the residual is real: a post-publish `override` would not reach them.
+  argument. Its `self.server_args` reads are on this list as a construction-path
+  convention, and the residual is real: they answer with the raw input, so a leaf
+  resolution decided and a post-publish `override` both pass them by.
 
 Their tests are not one story: a `GrammarManager` built standalone turns the
 factory's bag read into "config namespace not published" unless the test patches
@@ -358,14 +366,30 @@ if you do it, say so in the test.
 
 ### Mid-resolution reads (inside the pipeline only)
 
-Resolution itself still runs in `__post_init__`: handlers and hooks read the
-in-flight state through `resolved_view(server_args)` / `self._resolved()`, fields are
-read-only during resolution, and declarations materialize once at the very end of
-`__post_init__` (gate order, last writer wins) — *then* `publish` snapshots the
-resolved values into the bags. `resolved_view` is pipeline-internal
-(`server_args.py` / `arg_groups/`, plus helpers the pipeline itself invokes
-mid-resolution, e.g. `adaptive_spec_params`); do not introduce new
-out-of-pipeline call sites.
+Resolution runs in `__post_init__` and **writes nothing onto the record**: a
+handler declares (`self._declare` / `declare_resolution`), the declaration goes
+into the stash, and the fields keep what the caller passed. So a mid-resolution
+read of a field answers with the *raw input* — every reader in the pipeline goes
+through a view instead:
+
+- `resolving_view(server_args)` / `self._resolved()` — the live view (walks the
+  stash per read). This is what handlers and hooks bind, conventionally as
+  `cfg = resolving_view(self)` at the top of the handler.
+- `resolved_view(server_args)` — snapshots the overlay when built, which is what
+  a post-process pass wants: it reads the state at *its* slot.
+
+`test_resolution_reads_the_declarations` pins direct field reads at zero over the
+two scopes it can derive exactly (every `arg_groups` function taking a config,
+every `ServerArgs` handler the dispatcher reaches). Readers the pipeline calls
+from elsewhere (`ModelConfig`, the platform defaults, the spec-algo hook) have
+moved to the view as well — a field read there is the same bug, just one the
+derivation cannot enumerate.
+
+One consequence worth knowing: because the fields are the raw input, resolving a
+bare `dataclasses.replace` copy lands in the same place as the parent — the
+pipeline reads only its own input. `replace_resolved` is the way to copy a
+resolved record (it carries the declarations and the `model_config` memo, so the
+copy does not re-resolve at all).
 
 ### Adding a model-specific config adjustment
 
@@ -411,7 +435,8 @@ probes, swappable ACTIVE values. Not for config mirrors (read the bag leaf inste
 
 - Groups are typed dataclasses on `Flags` (`capture` / `moe` / `dp`): typo-safe writes,
   transactional test-only `override(**kw)` context manager.
-- `flags.moe` is materialized by `initialize_moe_config(server_args)` at scheduler init;
+- `flags.moe` is materialized by `initialize_moe_config()` at scheduler init (it
+  reads `exec.moe` / `spec` / `model`, and takes no record);
   accessors (`get_moe_a2a_backend` etc.) are thin shims with lazy defaults. The speculative
   contexts (`speculative_moe_backend_context`) swap the ACTIVE leaves around draft forwards.
 - `flags.dp` is materialized by `initialize_dp_attention`; `is_dp_attention_enabled()` is a
@@ -473,8 +498,12 @@ ONE thread — do not design for TBO threads that don't exist.
   them explicitly on the mock; `MagicMock(spec=...)` raises on attributes that only
   exist post-`__init__`, which is the fastest way to find a missed stub.
 - `reset_context()` in teardown when a test publishes outside a scoped override.
-- `ServerArgs(model_path="dummy")` early-returns `__post_init__` (no materialization, no
+- `ServerArgs(model_path="dummy")` early-returns the pipeline (few declarations, no
   strict guard) — fine for lightweight fixtures.
+- **Asserting what resolution decided reads `resolution_result(sa, "field")`**, not
+  `sa.field`: the field is the raw input. Assert the field only when the point of
+  the case *is* that the record stayed pristine (the FA4 page-size and waterfill
+  cases do exactly that, and say so).
 - **Run changed test files per-file** (own process), the way CI does: a monolithic local
   pytest run lets a context published by an earlier file mask a missing-publish bug in a
   later one.

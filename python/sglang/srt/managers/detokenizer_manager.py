@@ -39,7 +39,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.runtime_context import get_device, get_serving, publish
+from sglang.srt.runtime_context import (
+    get_device,
+    get_model,
+    get_observability,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -130,7 +136,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             self.tokenizer = get_tokenizer(
                 get_serving().tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
             )
@@ -151,7 +157,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
 
     def init_request_dispatcher(self):

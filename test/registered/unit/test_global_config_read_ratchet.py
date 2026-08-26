@@ -53,6 +53,18 @@ _SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/
 # The test below asserts this map is exactly the set of such reads, so the
 # reasons cannot drift away from the code.
 _CONFIGURED_SIZE_CALL_SITES = {
+    ("srt/layers/cp/base.py", "attn_cp_size"): (
+        "the lazy strategy bind in a worker: the CP group is what the strategy "
+        "is being built for, and the configured width is what describes it"
+    ),
+    ("benchmark/one_batch.py", "pp_size"): (
+        "CPU affinity for this rank, computed right after the work function "
+        "publishes and before dist init, so the groups do not exist yet"
+    ),
+    ("benchmark/one_batch.py", "tp_size"): (
+        "the same affinity computation: the layout is the configured one, and "
+        "the live group is not up at this point in the work function"
+    ),
     ("srt/entrypoints/engine.py", "pp_size"): (
         "the launch path decides how many scheduler processes to spawn; it runs "
         "before any of them exists, so there is no group to ask"
@@ -67,6 +79,13 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/ray/engine.py", "pp_size"): (
         "the Ray driver sizes the actor placement group; the actors it is about "
         "to create are the ones that will hold the process groups"
+    ),
+    ("srt/ray/engine.py", "tp_size"): (
+        "the same placement arithmetic as the stage count: the driver sizes "
+        "the actors that will hold the process groups"
+    ),
+    ("srt/ray/data_parallel_controller.py", "tp_size"): (
+        "the same arithmetic on the DP path, also in the driver"
     ),
     ("srt/ray/data_parallel_controller.py", "pp_size"): (
         "same placement arithmetic on the DP path -- ranks per TP group, "
@@ -114,6 +133,26 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ),
     ("srt/managers/scheduler.py", "dcp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/model_executor/runner/base_runner.py", "tp_size"): (
+        "the same window as the stage count next to it: a draft runner shares "
+        "the target's groups, so the live property would answer for the wrong "
+        "runner"
+    ),
+    ("srt/model_executor/cpu_graph_runner.py", "tp_size"): (
+        "the same window, on the CPU graph path"
+    ),
+    ("srt/entrypoints/v1_loads.py", "tp_size"): (
+        "the accelerator count is arithmetic over the launch shape, reported "
+        "from the tokenizer process, which holds no model groups"
+    ),
+    ("srt/disaggregation/nixl/conn.py", "tp_size"): (
+        "the NIXL rank arithmetic runs on the transfer path, which the CPU-only "
+        "conn tests exercise without starting torch.distributed"
+    ),
+    ("srt/managers/tokenizer_control_mixin.py", "tp_size"): (
+        "the tokenizer divides its worker count by the launch width; it holds "
+        "no model groups"
     ),
     ("srt/model_executor/runner/base_runner.py", "pp_size"): (
         "the runner's layer window is arithmetic over the configured stage "
@@ -211,6 +250,27 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/disaggregation/encoder/runtime.py", "tp_size"): (
         "the encode server's launch entry sizes its workers before it has "
         "spawned any of them"
+    ),
+    ("srt/disaggregation/encoder/grpc_server.py", "tp_size"): (
+        "the same worker-count arithmetic on the gRPC entry: it spawns the TP "
+        "workers, so their groups do not exist yet"
+    ),
+    ("srt/disaggregation/encoder/server.py", "tp_size"): (
+        "`MMEncoder` builds its own TP group from this size -- "
+        "`initialize_model_parallel` is the call being handed it, so there is "
+        "nothing live to ask"
+    ),
+    ("srt/disaggregation/encoder/receiver.py", "tp_size"): (
+        "the receiver labels and shards by the launch width; it runs in the "
+        "tokenizer process, which holds no encoder groups"
+    ),
+    ("srt/managers/rust_server.py", "tp_size"): (
+        "the rust server decides its transport from the launch width, in the "
+        "tokenizer process, which holds no model groups"
+    ),
+    ("compile_deep_gemm.py", "tp_size"): (
+        "the warm-up request fans bootstrap rooms across the launch's ranks; it "
+        "runs in the tokenizer process, which holds no model groups"
     ),
     ("srt/utils/common.py", "tp_size"): (
         "the require_*_tp_gather predicates compared the configured tp_size "

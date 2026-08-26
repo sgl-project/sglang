@@ -111,14 +111,14 @@ class ElasticEPStateManager:
 
             inst.ep_join_rank_offset = get_parallel().config.ep_join_rank_offset
             if server_args.is_ep_joiner:
-                cls._init_joiner_state(inst, server_args)
+                cls._init_joiner_state(inst)
 
             cls._instance = inst
 
         return cls._instance
 
     @classmethod
-    def _init_joiner_state(cls, inst: ElasticEPState, server_args: ServerArgs) -> None:
+    def _init_joiner_state(cls, inst: ElasticEPState) -> None:
         global_rank = torch.distributed.get_rank()
         inst.active_ranks.zero_()
         inst.active_ranks[global_rank] = 1

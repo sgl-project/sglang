@@ -216,7 +216,7 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().config.tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().config.dp_size
         self.pp_size = get_parallel().config.pp_size
@@ -351,7 +351,7 @@ class BaseRunner(ABC):
             dp_size=get_parallel().config.dp_size,
             pp_size=get_parallel().config.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
             encoder_len_fill_value=(
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
@@ -535,9 +535,9 @@ class BaseRunner(ABC):
             )
 
         # TP-gather requirements for global token metadata.
-        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
-        require_attn_tp_gather_ = require_attn_tp_gather(mr.server_args)
-        if require_gathered_buffer(mr.server_args):
+        require_mlp_tp_gather_ = require_mlp_tp_gather()
+        require_attn_tp_gather_ = require_attn_tp_gather()
+        if require_gathered_buffer():
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:

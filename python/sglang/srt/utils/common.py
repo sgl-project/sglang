@@ -105,7 +105,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
@@ -3719,7 +3719,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args: ServerArgs):
+def require_mlp_tp_gather():
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -3763,7 +3763,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         return False
 
 
-def require_attn_tp_gather(server_args: ServerArgs):
+def require_attn_tp_gather():
     """
     Check if the input of attention is scattered.
     """
@@ -3790,35 +3790,33 @@ def require_attn_tp_gather(server_args: ServerArgs):
         return False
 
 
-def require_gathered_buffer(server_args: ServerArgs):
-    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+def require_gathered_buffer():
+    return require_mlp_tp_gather() or require_attn_tp_gather()
 
 
-def require_mlp_sync(server_args: ServerArgs):
+def require_mlp_sync():
     from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().config.enable_dp_attention or require_gathered_buffer(
-        server_args
-    )
+    return get_parallel().config.enable_dp_attention or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+def get_cuda_graph_batch_size_alignment() -> int:
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
     if alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
 
-def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
-    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
 
 
-def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
-    if not require_mlp_sync(server_args):
+def get_eager_max_batch_size(max_batch_size: int) -> int:
+    if not require_mlp_sync():
         return max_batch_size
 
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
@@ -4625,11 +4623,15 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
-def reserve_rope_cache_for_long_sequences(
-    model, server_args, model_config, logger=None
-):
-    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
     from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
@@ -4637,7 +4639,7 @@ def reserve_rope_cache_for_long_sequences(
 
     # 1) Estimate base context upper bound
     base_ctx = (
-        getattr(server_args, "context_length", None)
+        get_model().context_length
         or getattr(model_config, "context_len", None)
         or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
@@ -4645,8 +4647,8 @@ def reserve_rope_cache_for_long_sequences(
     )
 
     # 2) Speculative decoding expansion
-    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
     reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
 
     # 3) Align to reduce reallocation frequency

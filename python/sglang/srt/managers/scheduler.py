@@ -39,7 +39,6 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_schedule,
-    get_server_args,
     get_serving,
     get_spec,
 )
@@ -416,7 +415,7 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
-        self.init_soft_watchdog(server_args)
+        self.init_soft_watchdog()
 
         # Parse args
         self.server_args = server_args
@@ -903,15 +902,15 @@ class Scheduler(
             "moe_topk",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
-            initialize_moe_config(self.server_args)
+            initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
-        initialize_fp8_gemm_config(self.server_args)
-        initialize_fp4_gemm_config(self.server_args)
+        initialize_fp8_gemm_config()
+        initialize_fp4_gemm_config()
         initialize_bf16_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
-        self.require_mlp_sync = require_mlp_sync(self.server_args)
+        self.require_mlp_sync = require_mlp_sync()
 
     def init_tp_model_worker(self):
         worker_kwargs = dict(
@@ -1289,7 +1288,7 @@ class Scheduler(
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
-    def init_soft_watchdog(self, server_args: ServerArgs):
+    def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
@@ -1341,7 +1340,6 @@ class Scheduler(
             and self._hosts_rust_server()
         ):
             maybe_create_ascend_config_store(
-                server_args=self.server_args,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -1493,8 +1491,8 @@ class Scheduler(
             )
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
-        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
-        needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
+        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
+        needs_confidence_relay = decide_needs_confidence_relay()
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
@@ -2089,7 +2087,6 @@ class Scheduler(
             tree_cache=self.tree_cache,
             offload_tags=self.weight_updater.offload_tags,
             ps=self.ps,
-            server_args=self.server_args,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
@@ -2213,7 +2210,6 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
-            server_args=self.server_args,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -4415,7 +4411,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
-        ret["world_size"] = compute_world_size(get_server_args())
+        ret["world_size"] = compute_world_size(get_parallel().config)
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
