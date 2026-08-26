@@ -400,6 +400,56 @@ class CompressorAscendBackendMixin:
 
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
+        # §24.41 (Run 25): register the DSV4 NPU pool family into the trap's
+        # static address map (idempotent dict writes + one-shot layout log).
+        # The scheduler-side probe cannot reach this pool object (its
+        # token_to_kv_pool attribute path differs), so the 0x12c-region
+        # neighborhood of r2t stayed unregistered through Run 25. This runs
+        # on the forward thread once per layer -- cheap and safe.
+        try:
+            from sglang.srt.layers.cp.layer_trap import (
+                layer_trap_register_tensors,
+            )
+
+            _cand = {}
+            for _pn in ("swa_kv_pool", "c4_kv_pool", "c128_kv_pool"):
+                _sub = getattr(pool, _pn, None)
+                _kvs = getattr(_sub, "kv_buffer", None)
+                if isinstance(_kvs, list) and _kvs and torch.is_tensor(_kvs[0]):
+                    _cand[_pn] = _kvs[0]
+            _idxp = getattr(pool, "c4_indexer_kv_pool", None)
+            for _attr, _name in (
+                ("index_k_buffer", "idx_k0"),
+                ("index_scale_buffer", "idx_s0"),
+            ):
+                _lst = getattr(_idxp, _attr, None)
+                if isinstance(_lst, list) and _lst and torch.is_tensor(_lst[0]):
+                    _cand[_name] = _lst[0]
+            for _attr, _prefix in (
+                ("compress_state_pools", "c{r}st"),
+                ("indexer_compress_state_pools", "c{r}sti"),
+            ):
+                _pools = getattr(pool, _attr, None)
+                if isinstance(_pools, list):
+                    for _pool in _pools:
+                        if _pool is None:
+                            continue
+                        _r = getattr(_pool, "ratio", None)
+                        if _r not in (4, 128):
+                            continue
+                        _st = getattr(
+                            getattr(_pool, "kv_score_buffer", None), "kv_score", None
+                        )
+                        if torch.is_tensor(_st):
+                            _cand[_prefix.format(r=_r) + "0"] = _st
+                        _sc = getattr(_pool, "state_cache_3d", None)
+                        if torch.is_tensor(_sc):
+                            _cand[_prefix.format(r=_r) + "sc0"] = _sc
+            if torch.is_tensor(self.req_to_token):
+                _cand["r2t"] = self.req_to_token
+            layer_trap_register_tensors(_cand)
+        except Exception:
+            pass
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
         table_cache = fm.dsv4_explicit_state_block_tables
