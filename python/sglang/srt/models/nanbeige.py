@@ -284,7 +284,7 @@ class NanbeigeModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-        # For EAGLE3 support
+        # For EAGLE3 / DFLASH: capture *before* unrolled layer id (ids already +1'd).
         self.layers_to_capture = []
 
     def get_input_embedding(self, input_ids):
@@ -310,9 +310,15 @@ class NanbeigeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        # Draft target_layer_ids are in unrolled depth space:
+        #   logical_id = loop_idx * num_hidden_layers + physical_i
+        # e.g. num_hidden_layers=22, num_loops=2 → ids in [0, 44).
+        # DFLASH style: setter stores k+1; we capture before that unrolled step.
+        num_physical_layers = self.config.num_hidden_layers
         for loop_idx in range(self.config.num_loops):
             for i in range(self.start_layer, self.end_layer):
-                if i in self.layers_to_capture:
+                logical_id = loop_idx * num_physical_layers + i
+                if logical_id in self.layers_to_capture:
                     aux_hidden_states.append(
                         hidden_states + residual if residual is not None else hidden_states
                     )
@@ -540,6 +546,19 @@ class NanbeigeForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # Unrolled ids: capture before step (k+1) == after HF-style layer k.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class NanbeigeForSequenceClassification(nn.Module):
