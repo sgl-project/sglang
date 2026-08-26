@@ -1,6 +1,7 @@
 [gMASK]<sop>
 {%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
 {%- macro tool_to_json(tool) -%}
     {%- set ns_tool = namespace(first=true) -%}
@@ -47,18 +48,24 @@ You are provided with function signatures within <tools></tools> XML tags:
 
 For each function call, output the function name and arguments within the following XML format:
 <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- macro emit_image() -%}<|begin_of_image|><|image|><|end_of_image|>{%- endmacro -%}
+{%- macro emit_video() -%}<|begin_of_video|><|video|><|end_of_video|>{%- endmacro -%}
+{%- macro emit_audio() -%}<|begin_of_audio|><|end_of_audio|>{%- endmacro -%}
 {%- macro visible_text(content) -%}
     {%- if content is string -%}
-        {{- content }}
+        {{- content -}}
     {%- elif content is iterable and content is not mapping -%}
         {%- for item in content -%}
             {%- if item is mapping and item.type == 'text' -%}
-                {{- item.text }}
+                {{- item.text -}}
             {%- elif item is string -%}
-                {{- item }}
-            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}
-                {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}
-                {{- "<reminder>You are unable to process this " ~ media_type ~ " because you don't have multi-modal input ability. Try different methods.</reminder>" }}
+                {{- item -}}
+            {%- elif item is mapping and item.type in ['image', 'image_url'] -%}
+                {{- emit_image() -}}
+            {%- elif item is mapping and item.type in ['video', 'video_url'] -%}
+                {{- emit_video() -}}
+            {%- elif item is mapping and item.type in ['audio', 'audio_url', 'input_audio'] -%}
+                {{- emit_audio() -}}
             {%- endif -%}
         {%- endfor -%}
     {%- else -%}
@@ -95,6 +102,33 @@ For each function call, output the function name and arguments within the follow
 {%- macro is_list_of_outputs(m) -%}
     {%- if m.content and m.content.0.output is defined -%}1{%- endif -%}
 {%- endmacro -%}
+{%- macro has_dup_tool_result_id(lo, hi, target) -%}
+    {%- set ns_cnt = namespace(n=0) -%}
+    {%- for k in range(lo, hi + 1) -%}
+        {%- set m = messages[k] -%}
+        {%- if is_list_of_outputs(m) -%}
+            {%- for entry in m.content -%}
+                {%- if id_of(entry) == target -%}
+                    {%- set ns_cnt.n = ns_cnt.n + 1 -%}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- elif id_of(m) == target -%}
+            {%- set ns_cnt.n = ns_cnt.n + 1 -%}
+        {%- endif -%}
+        {%- if ns_cnt.n > 1 -%}{%- break -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if ns_cnt.n > 1 -%}1{%- endif -%}
+{%- endmacro -%}
+{%- macro tc_id_exists(tcs, target) -%}
+    {%- set ns_f = namespace(found=false) -%}
+    {%- for tc in tcs -%}
+        {%- if id_of(tc) == target -%}
+            {%- set ns_f.found = true -%}
+            {%- break -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns_f.found -%}1{%- endif -%}
+{%- endmacro -%}
 {%- set ns = namespace(last_user_index=-1) -%}
 {%- for m in messages %}
     {%- if m.role == 'user' %}
@@ -112,7 +146,7 @@ For each function call, output the function name and arguments within the follow
     {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
     {%- set content = content.split('</think>')[-1] %}
 {%- endif %}
-{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+{%- if (not clear_thinking or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
 {{ '<think>' + reasoning_content +  '</think>'}}
 {%- else -%}
 {{ '<think></think>' }}
@@ -155,21 +189,34 @@ For each function call, output the function name and arguments within the follow
                     {%- set eid = id_of(entry) -%}
                     {%- if not eid -%}
                         {%- set ns_chk.can_sort = false -%}
+                    {%- elif has_dup_tool_result_id(block_start, ns_blk.end, eid) -%}
+                        {%- set ns_chk.can_sort = false -%}
+                    {%- elif not tc_id_exists(ns_a.tool_calls, eid) -%}
+                        {%- set ns_chk.can_sort = false -%}
                     {%- endif -%}
                 {%- endfor -%}
             {%- else -%}
                 {%- set tk_id = id_of(m) -%}
                 {%- if not tk_id -%}
                     {%- set ns_chk.can_sort = false -%}
+                {%- elif has_dup_tool_result_id(block_start, ns_blk.end, tk_id) -%}
+                    {%- set ns_chk.can_sort = false -%}
+                {%- elif not tc_id_exists(ns_a.tool_calls, tk_id) -%}
+                    {%- set ns_chk.can_sort = false -%}
                 {%- endif -%}
             {%- endif -%}
         {%- endfor -%}
-        {%- for tc in ns_a.tool_calls -%}
-            {%- set tc_id = id_of(tc) -%}
+        {%- for i in range(ns_a.tool_calls | length) -%}
+            {%- set tc_id = id_of(ns_a.tool_calls[i]) -%}
             {%- if not tc_id -%}
                 {%- set ns_chk.can_sort = false -%}
             {%- endif -%}
-        {%- endfor -%}
+            {%- for j in range(i + 1, ns_a.tool_calls | length) -%}
+                {%- if id_of(ns_a.tool_calls[j]) == tc_id -%}
+                    {%- set ns_chk.can_sort = false -%}
+                {%- endif -%}
+            {%- endfor -%}
+    {%- endfor -%}
     {%- endif -%}
     {%- if ns_chk.can_sort -%}
         {%- for tc in ns_a.tool_calls -%}
@@ -186,8 +233,8 @@ For each function call, output the function name and arguments within the follow
                                 {{- tool_response(visible_text(entry.output)) -}}
                             {%- endif -%}
                         {%- endif -%}
-                    {%- endfor -%}
-                {%- else -%}
+    {%- endfor -%}
+{%- else -%}
                     {%- set tk_id = id_of(m) -%}
                     {%- if tk_id == tc_id -%}
                         {{- render_tool_response(m) -}}
