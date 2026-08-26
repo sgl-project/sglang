@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -417,6 +418,8 @@ class WeightsUpdater:
             for _, module in modules_to_update:
                 if isinstance(module, TeaCacheMixin):
                     module.reset_teacache_state()
+                if isinstance(module, CachableDiT):
+                    module.seacache.reset()
 
         logger.info(message)
         return success, message

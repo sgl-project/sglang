@@ -113,6 +113,7 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
         "data_type",
         "supported_resolutions",
         "teacache_params",
+        "seacache_params",
     }
 )
 
