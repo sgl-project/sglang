@@ -691,7 +691,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.12.post1"
+    MOONCAKE_VERSION="0.3.14.dev20260825"
     NIXL_VERSION="1.3.0"
     # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
     source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
@@ -711,11 +711,16 @@ install_extra_deps() {
     # files that the live variant's RECORD still references, so we force a
     # reinstall to restore them — pip would otherwise see "already satisfied"
     # and skip.
+    # TEST ONLY: pull the pre-release mooncake wheel from test.pypi (not on prod
+    # PyPI yet). Kept as a dedicated install so --index-strategy unsafe-best-match
+    # can't pull the other bundled packages below from test.pypi. Revert before merge.
+    MOONCAKE_EXTRA_INDEX="--extra-index-url https://test.pypi.org/simple/"
     if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
-        $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        $PIP_CMD install ${MOONCAKE_PKG} ${MOONCAKE_EXTRA_INDEX} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
-    $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+    $PIP_CMD install ${MOONCAKE_PKG} ${MOONCAKE_EXTRA_INDEX} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
