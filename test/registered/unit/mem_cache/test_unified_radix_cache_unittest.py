@@ -596,16 +596,18 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                 list(range(1, length + 1)),
             )
 
-        lru = cache.tree_core.lru_lists[component_type]
-        first = lru.get_lru_no_lock()
-        second = lru.get_prev_no_lock(first)
-        leaf = lru.get_prev_no_lock(second)
-        self.assertNotIn(first, cache.tree_core.evictable_device_leaves)
-        self.assertNotIn(second, cache.tree_core.evictable_device_leaves)
-        self.assertIn(leaf, cache.tree_core.evictable_device_leaves)
-        for node in (first, second, leaf):
-            self.assertIsNotNone(node.component_data[component_type].value)
-            self.assertIsNotNone(node.component_data[ComponentType.FULL].value)
+        lru_node_ids = cache.tree_core.get_component_device_lru_node_ids(
+            component_type
+        )
+        first = lru_node_ids[-1]
+        second = lru_node_ids[-2]
+        leaf = lru_node_ids[-3]
+        self.assertFalse(cache.tree_core.is_device_evictable_leaf(first))
+        self.assertFalse(cache.tree_core.is_device_evictable_leaf(second))
+        self.assertTrue(cache.tree_core.is_device_evictable_leaf(leaf))
+        for node_id in (first, second, leaf):
+            self.assertIsNotNone(_device_value(cache, node_id, component_type))
+            self.assertIsNotNone(_device_value(cache, node_id, ComponentType.FULL))
         return cache, first, second, leaf
 
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
@@ -650,16 +652,18 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     cache, first, second, leaf = self._build_internal_chain(
                         component_type, enable_session_radix_cache
                     )
-                    first_size = len(first.component_data[component_type].value)
+                    first_size = len(_device_value(cache, first, component_type))
 
                     result, drain_count = self._evict_for_alloc_after_first_drain(
                         cache, component_type
                     )
 
-                    self.assertIsNone(first.component_data[component_type].value)
-                    self.assertIsNotNone(second.component_data[component_type].value)
-                    self.assertIsNotNone(leaf.component_data[component_type].value)
-                    self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+                    self.assertIsNone(_device_value(cache, first, component_type))
+                    self.assertIsNotNone(_device_value(cache, second, component_type))
+                    self.assertIsNotNone(_device_value(cache, leaf, component_type))
+                    self.assertIsNotNone(
+                        _device_value(cache, leaf, ComponentType.FULL)
+                    )
                     self.assertEqual(result.num_tokens_evicted, 0)
                     self.assertEqual(drain_count, 1)
                     evicted = (
@@ -681,8 +685,8 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                         component_type, enable_session_radix_cache
                     )
                     request_count = sum(
-                        len(node.component_data[component_type].value)
-                        for node in (first, second)
+                        len(_device_value(cache, node_id, component_type))
+                        for node_id in (first, second)
                     )
                     params = (
                         EvictParams(swa_num_tokens=request_count)
@@ -692,10 +696,12 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
 
                     result = cache.evict(params)
 
-                    self.assertIsNone(first.component_data[component_type].value)
-                    self.assertIsNone(second.component_data[component_type].value)
-                    self.assertIsNotNone(leaf.component_data[component_type].value)
-                    self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+                    self.assertIsNone(_device_value(cache, first, component_type))
+                    self.assertIsNone(_device_value(cache, second, component_type))
+                    self.assertIsNotNone(_device_value(cache, leaf, component_type))
+                    self.assertIsNotNone(
+                        _device_value(cache, leaf, ComponentType.FULL)
+                    )
                     evicted = (
                         result.swa_num_tokens_evicted
                         if component_type is ComponentType.SWA
@@ -3494,7 +3500,7 @@ class UnifiedRadixCacheSuite:
 
         req_id = "sibling-publish"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -3565,7 +3571,7 @@ class UnifiedRadixCacheSuite:
         avail0 = self._host_avail_sizes(cons)
         req_id = "masked-overlap"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -3606,7 +3612,7 @@ class UnifiedRadixCacheSuite:
 
         req_id = "post-check-overlap"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -3633,7 +3639,7 @@ class UnifiedRadixCacheSuite:
             dtype=torch.int64,
             device=cons.tree_core.empty_match_result.device_indices.device,
         )
-        req.last_node = cons.root_node.id
+        req.last_node = cons.root_node_handle()
         with mock.patch.object(cons.cache_controller, "load", adversarial_load):
             with self.assertRaisesRegex(RuntimeError, "ownership violation"):
                 cons.init_load_back(
@@ -5512,7 +5518,7 @@ class UnifiedRadixCacheSuite:
                 cache, "evict_for_alloc", autospec=True
             ) as evict_for_alloc,
         ):
-            prep = comp.prepare_load_back(leaf.id, req=req)
+            prep = comp.prepare_load_back(leaf, req=req)
         evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.mamba_pool_idx), int(retry_slot[0]))
@@ -5947,7 +5953,7 @@ class UnifiedRadixCacheSuite:
         with mock.patch.object(
             cache, "evict_for_alloc", wraps=cache.evict_for_alloc
         ) as evict_for_alloc_mock:
-            self.assertTrue(cache.load_back(leaf.id))
+            self.assertTrue(cache.load_back(leaf))
 
         # Full pre-eviction must not be triggered by SWA pool pressure.
         full_pre_evict_calls = [
@@ -7207,11 +7213,11 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
                 "evict_device_next_node",
                 lambda: make(
                     EvictDeviceNextNodeResult,
-                    node_id=node.id,
+                    node_id=node,
                     made_progress=True,
                 ),
                 lambda: cache._evict_device_next_node(ComponentType.FULL, tracker),
-                (node.id, True),
+                (node, True),
             ),
             (
                 "evict_device_leaf",
