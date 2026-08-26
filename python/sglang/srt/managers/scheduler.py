@@ -3232,9 +3232,16 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, running_bs, chunked_req_in_batch=False):
         res = get_parallel().pp_max_micro_batch_size - running_bs
-        res = min(res, self.req_to_token_pool.available_size())
+        # An in-flight chunked prefill already holds a req_to_token_pool slot
+        # (deducted from available_size()) and is re-counted in the adder's
+        # can_run_list by add_chunked_req, so add that held slot back here to
+        # avoid declaring the batch full one request early.
+        res = min(
+            res,
+            self.req_to_token_pool.available_size() + int(chunked_req_in_batch),
+        )
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -3356,9 +3363,17 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        chunked_req = self.chunked_req
+        if chunked_req is not None:
+            chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(chunked_req)
+
+        # Only compensate the pool term when the already-allocated chunk is
+        # counted in this batch. Hybrid-SWA may park it without appending it,
+        # while a final chunk is appended even though add_chunked_req returns None.
+        chunked_req_in_batch = chunked_req is not None and any(
+            req is chunked_req for req in adder.can_run_list
+        )
 
         if self.enable_lora:
             running_loras = {
@@ -3382,12 +3397,16 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, chunked_req_in_batch=chunked_req_in_batch
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if len(adder.can_run_list) >= (
+                    self.req_to_token_pool.available_size() + int(chunked_req_in_batch)
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
