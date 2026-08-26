@@ -221,6 +221,10 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
         default_factory=lambda: [1000, 757, 522]
     )
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.dit_config.prefer_cudnn_sdpa_on_sm120 = True
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("memory",),

@@ -120,3 +120,4 @@ class WanVideoConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=WanVideoArchConfig)
 
     prefix: str = "Wan"
+    prefer_cudnn_sdpa_on_sm120: bool = False
