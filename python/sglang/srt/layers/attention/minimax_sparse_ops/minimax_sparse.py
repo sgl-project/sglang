@@ -46,8 +46,7 @@ def minimax_sparse_prefill(
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
     idx_sink: Optional[torch.Tensor],  # [num_idx_heads, idx_head_dim]
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch_size, ]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     cu_seqlens: torch.Tensor,  # [batch_size + 1, ] (Q-side cumulative)
     seq_lens: torch.Tensor,  # [batch_size, ] total K length (prefix + chunk)
     prefix_lens: torch.Tensor,  # [batch_size, ]
@@ -66,6 +65,7 @@ def minimax_sparse_prefill(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    query_block_to_req: Optional[torch.Tensor] = None,
     seqlens_cpu: Optional[List[int]] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
@@ -73,6 +73,7 @@ def minimax_sparse_prefill(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    page_size: int = 1,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -86,6 +87,8 @@ def minimax_sparse_prefill(
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
+    if query_block_to_req is not None:
+        all_seqblock_q = query_block_to_req.shape[0]
 
     # All seqlen is less than topk, use full attention
     # Step 1: Flash attention with topk index (using index head)
@@ -94,8 +97,7 @@ def minimax_sparse_prefill(
         k_cache=idx_k_cache,
         v_cache=idx_v_cache,
         sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
+        page_table=page_table,
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         prefix_lens=prefix_lens,
@@ -112,9 +114,11 @@ def minimax_sparse_prefill(
         cu_seqblocks_q=cu_seqblocks_q,
         max_seqblock_q=max_seqblock_q,
         all_seqblock_q=all_seqblock_q,
+        query_block_to_req=query_block_to_req,
         q_scale=idx_q_scale,
         k_scale=idx_k_scale,
         v_scale=idx_v_scale,
+        page_size=page_size,
     )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
@@ -136,8 +140,7 @@ def minimax_sparse_prefill(
                 k_cache=k_cache,
                 v_cache=v_cache,
                 topk_idx=topk_idx,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
+                page_table=page_table,
                 cu_seqlens=cu_seqlens,
                 seq_lens=seq_lens,
                 prefix_lens=prefix_lens,
@@ -154,8 +157,7 @@ def minimax_sparse_prefill(
                 k_cache=k_cache,
                 v_cache=v_cache,
                 sink=sink,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
+                page_table=page_table,
                 topk_idx=topk_idx,
                 block_size_q=block_size_q,
                 block_size_k=block_size_k,
@@ -166,9 +168,11 @@ def minimax_sparse_prefill(
                 sm_scale=sm_scale,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
+                query_block_to_req=query_block_to_req,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -176,8 +180,7 @@ def minimax_sparse_prefill(
             k_cache=k_cache,
             v_cache=v_cache,
             sink=sink,
-            req_to_token=req_to_token,
-            slot_ids=slot_ids,
+            page_table=page_table,
             topk_idx=topk_idx,
             block_size_q=block_size_q,
             block_size_k=block_size_k,
@@ -188,9 +191,11 @@ def minimax_sparse_prefill(
             sm_scale=sm_scale,
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
+            query_block_to_req=query_block_to_req,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            page_size=page_size,
         )
     return idx_o, o
 
@@ -206,8 +211,7 @@ def minimax_sparse_decode(
     idx_v_cache: Optional[
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged); None when disable_index_value
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch_size, ]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch_size, ]
     max_seqlen: int,  # max of seq_lens, passed from caller to avoid sync during CUDA graph capture
     block_size_q: int,  # useless for now, will always be 1
@@ -241,10 +245,9 @@ def minimax_sparse_decode(
         sink=idx_sink,
         k_cache=idx_k_cache,
         v_cache=idx_v_cache,
-        req_to_token=req_to_token,
+        page_table=page_table,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
-        slot_ids=slot_ids,
         block_size=block_size_k,
         topk=topk,
         init_blocks=init_blocks,
@@ -282,8 +285,7 @@ def minimax_sparse_decode(
                     k_cache=k_cache,
                     v_cache=v_cache,
                     topk_idx=topk_idx,
-                    req_to_token=req_to_token,
-                    slot_ids=slot_ids,
+                    page_table=page_table,
                     seq_lens=seq_lens,
                     block_size_k=block_size_k,
                     sm_scale=sm_scale,
@@ -300,15 +302,15 @@ def minimax_sparse_decode(
                     sink=sink,
                     k_cache=k_cache,
                     v_cache=v_cache,
-                    req_to_token=req_to_token,
+                    page_table=page_table,
                     seq_lens=seq_lens,
-                    slot_ids=slot_ids,
                     block_size=block_size_k,
                     topk_idx=topk_idx,
                     sm_scale=sm_scale,
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    page_size=page_size,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -316,14 +318,14 @@ def minimax_sparse_decode(
                 sink=sink,
                 k_cache=k_cache,
                 v_cache=v_cache,
-                req_to_token=req_to_token,
+                page_table=page_table,
                 seq_lens=seq_lens,
-                slot_ids=slot_ids,
                 block_size=block_size_k,
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     return idx_o, o

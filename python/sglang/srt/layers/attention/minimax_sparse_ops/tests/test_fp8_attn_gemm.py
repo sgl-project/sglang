@@ -14,16 +14,19 @@ indexer, non-unit k_scale/v_scale semantics, and bf16-path regression.
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+    build_page_table_snapshot,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 
@@ -40,6 +43,19 @@ FP8_RTOL = 6e-2
 # widening mode (bf16 Q, fp8 KV) computes on exactly the dequantized values.
 WIDEN_ATOL = 1e-3
 WIDEN_RTOL = 1e-3
+
+
+def _build_page_table(req_to_token, slot_ids, seq_lens, max_slots, page_size=1):
+    max_pages = (req_to_token.shape[1] + page_size - 1) // page_size
+    page_table = torch.empty(
+        (slot_ids.shape[0], max_pages),
+        dtype=torch.int32,
+        device=req_to_token.device,
+    )
+    build_page_table_snapshot(
+        page_table, req_to_token, slot_ids, seq_lens, page_size, max_slots
+    )
+    return page_table
 
 
 def qdq(x: torch.Tensor):
@@ -137,8 +153,9 @@ def build_prefill_inputs(
 
 
 def run_step3_decode(q, k, v, req_to_token, seq_lens, slot_ids, topk_idx, **kw):
+    page_table = _build_page_table(req_to_token, slot_ids, seq_lens, k.shape[0])
     return flash_decode_with_gqa_share_sparse(
-        q, None, k, v, req_to_token, seq_lens, slot_ids, 128, topk_idx, **kw
+        q, None, k, v, page_table, seq_lens, 128, topk_idx, **kw
     )
 
 
@@ -223,13 +240,13 @@ def test_step3_decode_bf16_regression():
 
 
 def run_step3_prefill(q, k, v, r2t, sids, tidx, cu, seq_lens, prefix, max_q, **kw):
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0])
     return flash_prefill_with_gqa_share_sparse(
         q=q,
         k_cache=k,
         v_cache=v,
         sink=None,
-        req_to_token=r2t,
-        slot_ids=sids,
+        page_table=page_table,
         topk_idx=tidx,
         block_size_q=1,
         block_size_k=128,
@@ -270,8 +287,26 @@ def test_step3_prefill_all_fp8_vs_dequant_ref():
     k8, kr = qdq(k)
     v8, vr = qdq(v)
     out8 = run_step3_prefill(q8, k8, v8, r2t, sids, tidx, cu, seq_lens, prefix, max_q)
+    query_block_to_req = torch.repeat_interleave(
+        torch.arange(seq_lens.shape[0], device=DEVICE, dtype=torch.int32),
+        torch.diff(cu),
+    )
+    packed_out8 = run_step3_prefill(
+        q8,
+        k8,
+        v8,
+        r2t,
+        sids,
+        tidx,
+        cu,
+        seq_lens,
+        prefix,
+        max_q,
+        query_block_to_req=query_block_to_req,
+    )
     ref = run_step3_prefill(qr, kr, vr, r2t, sids, tidx, cu, seq_lens, prefix, max_q)
     assert out8.dtype == torch.bfloat16
+    torch.testing.assert_close(packed_out8, out8, rtol=0, atol=0)
     torch.testing.assert_close(out8.float(), ref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
 
 
@@ -323,14 +358,14 @@ def test_step3_prefill_scales():
 
 
 def run_indexer_decode(q, k, v, r2t, seq_lens, sids, **kw):
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0])
     return flash_decode_with_topk_idx(
         q=q,
         sink=None,
         k_cache=k,
         v_cache=v,
-        req_to_token=r2t,
+        page_table=page_table,
         seq_lens=seq_lens,
-        slot_ids=sids,
         max_seqlen=int(seq_lens.max().item()),
         block_size=128,
         topk=4,
@@ -396,13 +431,13 @@ def test_indexer_decode_score_only_fp8():
 
 
 def run_indexer_prefill(q, k, v, r2t, sids, cu, seq_lens, prefix, max_q, max_k, **kw):
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0])
     return flash_prefill_with_topk_index(
         q=q,
         k_cache=k,
         v_cache=v,
         sink=None,
-        req_to_token=r2t,
-        slot_ids=sids,
+        page_table=page_table,
         cu_seqlens=cu,
         seq_lens=seq_lens,
         prefix_lens=prefix,
@@ -428,10 +463,29 @@ def test_indexer_prefill_all_fp8_vs_dequant_ref():
     o8, tidx8 = run_indexer_prefill(
         q8, k8, v8, r2t, sids, cu, seq_lens, prefix, max_q, max_k
     )
+    query_block_to_req = torch.repeat_interleave(
+        torch.arange(seq_lens.shape[0], device=DEVICE, dtype=torch.int32),
+        torch.diff(cu),
+    )
+    packed_o8, packed_tidx8 = run_indexer_prefill(
+        q8,
+        k8,
+        v8,
+        r2t,
+        sids,
+        cu,
+        seq_lens,
+        prefix,
+        max_q,
+        max_k,
+        query_block_to_req=query_block_to_req,
+    )
     oref, tidxref = run_indexer_prefill(
         qr, kr, vr, r2t, sids, cu, seq_lens, prefix, max_q, max_k
     )
     assert o8.dtype == torch.bfloat16
+    torch.testing.assert_close(packed_o8, o8, rtol=0, atol=0)
+    torch.testing.assert_close(packed_tidx8, tidx8, rtol=0, atol=0)
     torch.testing.assert_close(o8.float(), oref.float(), atol=FP8_ATOL, rtol=FP8_RTOL)
     assert _topk_overlap(tidx8, tidxref) >= 0.9
 

@@ -23,6 +23,9 @@ from sglang.kernels.ops.attention.minimax_decode_topk import (
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+    build_page_table_snapshot,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -82,6 +85,9 @@ def test_fused_page_table_matches_custom(bs, seq_len, nqh):
     for b in range(bs):
         r2t[b] = ((b * ppr + idxs // ps) * ps + idxs % ps).int()
 
+    page_table = torch.empty((bs, ppr), dtype=torch.int32, device=dev)
+    build_page_table_snapshot(page_table, r2t, sid, sl, ps, kf.shape[0])
+
     nb = (seq_len + block - 1) // block
     score = torch.full((1, bs, nb), -float("inf"), device=dev, dtype=torch.float32)
     score[0, :, :nb] = torch.randn(bs, nb, device=dev)
@@ -90,11 +96,20 @@ def test_fused_page_table_matches_custom(bs, seq_len, nqh):
     # block-id selection -> custom kernel (reference)
     ti = minimax_decode_topk(score, sl, block, topk)
     ref = flash_decode_with_gqa_share_sparse(
-        q, None, kf, vf, r2t, sl, sid, block, ti, sm_scale=D**-0.5
+        q,
+        None,
+        kf,
+        vf,
+        page_table,
+        sl,
+        block,
+        ti,
+        sm_scale=D**-0.5,
+        page_size=ps,
     )
 
     # fused page-table + effective KV length -> trtllm (allocated + returned)
-    pt, cache = minimax_decode_topk_page_table(score, sl, r2t, sid, block, topk, ps)
+    pt, cache = minimax_decode_topk_page_table(score, sl, page_table, block, topk, ps)
     # the kernel's effective KV length must match the actual block selection
     expect_cache = _effective_kv_from_selection(ti, sl, block)
     assert torch.equal(cache, expect_cache), f"{cache} != {expect_cache}"
@@ -141,6 +156,9 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
     for b in range(bs):
         r2t[b] = ((b * ppr + idxs // ps) * ps + idxs % ps).int()
 
+    page_table = torch.empty((bs, ppr), dtype=torch.int32, device=dev)
+    build_page_table_snapshot(page_table, r2t, sid, sl, ps, bs * ppr * ps)
+
     nb = (seq_len + block - 1) // block
     score = torch.full((nkv, bs, nb), -float("inf"), device=dev, dtype=torch.float32)
     score[:, :, :nb] = torch.randn(nkv, bs, nb, device=dev)
@@ -148,7 +166,7 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
 
     # per-head block-id selection is the reference for the flattened page table
     ti = minimax_decode_topk(score, sl, block, topk)  # [nkv, bs, topk]
-    pt, cache = minimax_decode_topk_page_table(score, sl, r2t, sid, block, topk, ps)
+    pt, cache = minimax_decode_topk_page_table(score, sl, page_table, block, topk, ps)
     msp = topk * ppb
     assert pt.shape == (bs * nkv, msp) and cache.shape == (bs * nkv,)
 

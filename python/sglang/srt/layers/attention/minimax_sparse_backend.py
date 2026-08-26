@@ -116,6 +116,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
+        self._decode_cuda_graph_max_bs = int(
+            runner.server_args.cuda_graph_config.decode.max_bs or 0
+        )
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
@@ -147,6 +150,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
+        prefill_graph_bs = runner.server_args.cuda_graph_config.prefill.bs or ()
+        max_prefill_num_tokens = max(prefill_graph_bs, default=0)
+        self._full_cg_query_block_capacity = (
+            max_prefill_num_tokens + self.block_size_q - 1
+        ) // self.block_size_q
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
@@ -231,6 +239,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
+        # GPU sparse kernels consume a page-table snapshot instead of the live
+        # token table; CUDA Graph replay requires an address-stable backing.
+        self._cuda_graph_page_table: Optional[torch.Tensor] = None
+        self._active_page_table: Optional[torch.Tensor] = None
+        # Full prefill fixes the request axis at capture capacity. Pack active
+        # query blocks so sparse kernels do not launch work for sentinel slots.
+        self._full_cg_query_block_to_req: Optional[torch.Tensor] = None
+        self._active_query_block_to_req: Optional[torch.Tensor] = None
+
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
@@ -325,6 +342,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
+        self._active_page_table = None
+        if not self.is_npu:
+            self._init_full_cg_prefill_query_metadata(forward_batch, in_capture)
+        if (
+            not self.is_npu
+            and in_capture
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+        ):
+            # Full prefill capture runs before decode CUDA Graph initialization.
+            # Allocate final backings now so later graph initialization cannot
+            # replace addresses already captured by the prefill graph.
+            self._ensure_cuda_graph_page_table(
+                max(forward_batch.batch_size, self._decode_cuda_graph_max_bs)
+            )
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
         if self.is_npu:
@@ -332,9 +363,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._prefill_meta = None
             self._extend_meta = None
             self._extend_meta_key = None
+
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens[:bs]
+        seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
-            self._max_seqlen_q = int(max(extend_lens))
+            self._max_seqlen_q = int(max(extend_lens[:bs]))
         else:
             self._max_seqlen_q = 1
         if in_capture and (
@@ -345,12 +380,43 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
-            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            self._max_seqlen_k = int(seq_lens_cpu.max().item())
 
-        # Build plan + page table eager (outside capture) so captured forward_decode
-        # runs only device-side ops; host-side code can't be captured.
-        if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
-            self._prepare_msa_decode_meta(forward_batch)
+        if not self.is_npu:
+            if (
+                self._cuda_graph_page_table is not None
+                and bs <= self._cuda_graph_page_table.shape[0]
+            ):
+                self._active_page_table = self._cuda_graph_page_table[:bs]
+            else:
+                max_num_pages = max(
+                    1, (self._max_seqlen_k + self.page_size - 1) // self.page_size
+                )
+                self._active_page_table = torch.empty(
+                    (bs, max_num_pages),
+                    dtype=torch.int32,
+                    device=self.req_to_token.device,
+                )
+
+            from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+                build_page_table_snapshot,
+            )
+
+            active_num_pages = max(
+                1, (self._max_seqlen_k + self.page_size - 1) // self.page_size
+            )
+            build_page_table_snapshot(
+                self._active_page_table[:, :active_num_pages],
+                self.req_to_token,
+                forward_batch.req_pool_indices[:bs],
+                seq_lens,
+                self.page_size,
+                self.kv_pool.size + self.page_size,
+            )
+
+            # Build MSA metadata eagerly so captured decode runs only device-side ops.
+            if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
+                self._prepare_msa_decode_meta(seq_lens)
 
         # ---- REPLAY-FRESH native verify block_table ----
         if (
@@ -392,19 +458,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     // self.page_size
                 ).to(torch.int32)
 
-    def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
-        """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
+    def _prepare_msa_decode_meta(self, seq_lens: torch.Tensor):
+        """Refresh the persistent per-batch-size MSA decode plan from the snapshot."""
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             build_msa_decode_cg_plan,
             update_msa_decode_cg_meta,
         )
 
-        bs = forward_batch.seq_lens.shape[0]
+        bs = seq_lens.shape[0]
         if bs == 0:
             return
         entry = self._msa_cg.get(bs)
         if entry is None:
-            device = forward_batch.seq_lens.device
+            device = seq_lens.device
             plan = build_msa_decode_cg_plan(
                 self.num_q_heads,
                 self.num_kv_heads,
@@ -423,9 +489,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         update_msa_decode_cg_meta(
             plan,
             kv_indices_buf,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            self._active_page_table,
+            seq_lens,
             self.block_size_k,
             self.topk_blocks,
             self.num_q_heads,
@@ -477,8 +542,69 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.seq_lens.to(torch.int32)
             )
 
+    def _ensure_cuda_graph_page_table(self, max_bs: int):
+        if self.is_npu:
+            return
+        if (
+            self._cuda_graph_page_table is not None
+            and self._cuda_graph_page_table.shape[0] >= max_bs
+        ):
+            return
+        max_num_pages = (
+            self.req_to_token.shape[1] + self.page_size - 1
+        ) // self.page_size
+        self._cuda_graph_page_table = torch.empty(
+            (max_bs, max_num_pages),
+            dtype=torch.int32,
+            device=self.req_to_token.device,
+        )
+
+    def _init_full_cg_prefill_query_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ):
+        self._active_query_block_to_req = None
+        if forward_batch.forward_mode not in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            return
+
+        if in_capture:
+            num_query_blocks = (
+                forward_batch.input_ids.shape[0] + self.block_size_q - 1
+            ) // self.block_size_q
+            self._ensure_full_cg_query_block_to_req(
+                max(num_query_blocks, self._full_cg_query_block_capacity)
+            )
+            self._active_query_block_to_req = self._full_cg_query_block_to_req[
+                :num_query_blocks
+            ]
+
+        if self._full_cg_query_block_to_req is not None:
+            from sglang.kernels.ops.attention.minimax_sparse.prefill.scheduler import (
+                build_query_block_to_req,
+            )
+
+            build_query_block_to_req(
+                self._full_cg_query_block_to_req,
+                forward_batch.extend_seq_lens[: forward_batch.batch_size],
+                self.block_size_q,
+            )
+
+    def _ensure_full_cg_query_block_to_req(self, num_query_blocks: int):
+        if (
+            self._full_cg_query_block_to_req is not None
+            and self._full_cg_query_block_to_req.shape[0] >= num_query_blocks
+        ):
+            return
+        self._full_cg_query_block_to_req = torch.empty(
+            num_query_blocks,
+            dtype=torch.int32,
+            device=self.req_to_token.device,
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        pass
+        self._ensure_cuda_graph_page_table(max_bs)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1397,6 +1523,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 minimax_sparse_prefill,
             )
 
+            assert self._active_page_table is not None
+
             idx_o, o = minimax_sparse_prefill(
                 q,
                 k_cache,
@@ -1406,8 +1534,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_cache,
                 idx_v_cache,
                 None,
-                self.req_to_token,
-                forward_batch.req_pool_indices,
+                self._active_page_table,
                 cu_seqlens,
                 seq_lens,
                 prefix_lens,
@@ -1428,6 +1555,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                page_size=self.page_size,
+                query_block_to_req=self._active_query_block_to_req,
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
@@ -1564,6 +1693,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 minimax_sparse_decode,
             )
 
+            assert self._active_page_table is not None
+
             idx_o, o = minimax_sparse_decode(
                 q,
                 None,
@@ -1573,8 +1704,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 None,
                 idx_k_cache,
                 idx_v_cache,
-                self.req_to_token,
-                forward_batch.req_pool_indices,
+                self._active_page_table,
                 forward_batch.seq_lens,
                 self._max_seqlen_k,
                 1,
