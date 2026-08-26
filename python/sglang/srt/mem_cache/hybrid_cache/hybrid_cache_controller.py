@@ -201,6 +201,10 @@ class HybridCacheController(BaseHiCacheController):
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+            self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
+            self.mem_pool_device.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -549,6 +553,9 @@ class HybridCacheController(BaseHiCacheController):
     def start_loading(self) -> int:
         if not self.load_queue:
             return -1
+
+        self._drain_pending_prefetch()
+
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
@@ -560,58 +567,53 @@ class HybridCacheController(BaseHiCacheController):
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
+        self._prefetch_state = (
+            host_indices,
+            device_indices,
+            producer_event,
+            ack_finish_event,
+            resolved_pool_transfers,
+        )
+        self._prefetch_next_layer = 1
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             target_device_pool = self.mem_pool_host.anchor_entry.device_pool
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    target_device_pool,
+            self.mem_pool_host.load_to_device_per_layer(
+                target_device_pool,
+                host_indices,
+                device_indices,
+                0,
+                self.io_backend,
+                pool_transfers=resolved_pool_transfers,
+            )
+            if (
+                self.has_draft
+                and host_indices.numel() > 0
+                and self.mem_pool_host_draft.layer_num > 0
+            ):
+                self.mem_pool_host_draft.load_to_device_per_layer(
+                    self.mem_pool_device_draft,
                     host_indices,
                     device_indices,
-                    i,
+                    0,
+                    self.io_backend,
+                )
+
+            if self.has_mtp_draft and len(self.mtp_draft_device_pools) > 0:
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mtp_draft_device_pools[0],
+                    host_indices,
+                    device_indices,
+                    self.layer_num,
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
+                    is_draft=True,
                 )
-                if (
-                    self.has_draft
-                    and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
-                ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-
-                # HiCache now supports draft caches through two paths:
-                #
-                # - Packed: standard NextN/MTP models (DeepSeek-V3.2, GLM-5.x,
-                #   DeepSeek-V4, MiMo-V2.5) and DeepSeek-V4 DSpark. Draft KV/indexer/SWA
-                #   buffers are appended to the matching target host pools as tail layers
-                #   and share their slot mappings. D2H/H2D therefore moves target and draft
-                #   in the same cache operation; the branch below restores the tail layers.
-                #
-                # - Sidecar: standalone EAGLE/EAGLE3 (for example Llama-2/Llama-3.1),
-                #   DFlash (for example Gemma-4), and non-DeepSeek-V4 DSpark. Draft
-                #   KV/indexer/SWA gets a separate host-pool entry sized to its source target
-                #   pool. Its PoolTransfer follows the target KV or SWA indices and is
-                #   attached to the same cache operation.
-
-                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mtp_draft_device_pools[i],
-                        host_indices,
-                        device_indices,
-                        self.layer_num + i,
-                        self.io_backend,
-                        pool_transfers=resolved_pool_transfers,
-                        is_draft=True,
-                    )
-                producer_event.complete(i)
-            ack_finish_event.record()
+            producer_event.complete(0)
+            if self.layer_num <= 1:
+                ack_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
@@ -630,6 +632,70 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return producer_id
+
+    def trigger_layer_load(self, layer_id: int) -> None:
+        if self._prefetch_state is None:
+            return
+        if layer_id < self._prefetch_next_layer:
+            return
+        if layer_id >= self.layer_num:
+            return
+
+        self._prefetch_next_layer = layer_id + 1
+        (
+            host_indices,
+            device_indices,
+            producer_event,
+            ack_finish_event,
+            resolved_pool_transfers,
+        ) = self._prefetch_state
+
+        target_device_pool = self.mem_pool_host.anchor_entry.device_pool
+        with device_module.stream(self.load_stream):
+            self.mem_pool_host.load_to_device_per_layer(
+                target_device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                self.io_backend,
+                pool_transfers=resolved_pool_transfers,
+            )
+            if (
+                self.has_draft
+                and host_indices.numel() > 0
+                and layer_id < self.mem_pool_host_draft.layer_num
+            ):
+                self.mem_pool_host_draft.load_to_device_per_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    self.io_backend,
+                )
+            if self.has_mtp_draft and layer_id < len(self.mtp_draft_device_pools):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mtp_draft_device_pools[layer_id],
+                    host_indices,
+                    device_indices,
+                    self.layer_num + layer_id,
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                    is_draft=True,
+                )
+            producer_event.complete(layer_id)
+            if layer_id == self.layer_num - 1:
+                ack_finish_event.record()
+                self._prefetch_state = None
+
+    def _drain_pending_prefetch(self) -> None:
+        if self._prefetch_state is None:
+            return
+        _, _, producer_event, ack_finish_event, _ = self._prefetch_state
+        with device_module.stream(self.load_stream):
+            for i in range(self._prefetch_next_layer, self.layer_num):
+                producer_event.load_events[i].record()
+            ack_finish_event.record()
+        self._prefetch_state = None
 
     def _record_transfer_indices_on_stream(
         self,
