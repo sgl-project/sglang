@@ -959,11 +959,6 @@ class Envs:
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
-    # Route decode-size HC mix through the fused CuTe split-K GEMM pair
-    # instead of the persistent Triton mix.
-    SGLANG_HC_MIX_CUDA = EnvBool(True)
-    # Split the HC combine gate dot across CTAs instead of one CTA per row.
-    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
