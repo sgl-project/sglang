@@ -223,6 +223,19 @@ def _resolve_system_prompt(
 
 
 
+def _cond_image_to_pil(raw_img):
+    """Convert a raw condition image (PIL / path / tensor) to a PIL image."""
+    from PIL import Image as PILImage
+
+    if isinstance(raw_img, PILImage.Image):
+        return raw_img
+    if isinstance(raw_img, str):
+        return PILImage.open(raw_img)
+    if isinstance(raw_img, torch.Tensor):
+        return PILImage.fromarray(raw_img.cpu().permute(1, 2, 0).numpy())
+    return None
+
+
 def _build_causal_attention_mask(
     batch_size: int,
     seq_len: int,
@@ -761,7 +774,22 @@ class HunyuanImage3AR(PipelineStage):
         return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
     def _preprocess_cond_image(self, pil_image, processor):
-        """Preprocess cond image → JointImageInfo with dual VAE+ViT tensors."""
+        """Preprocess cond image → JointImageInfo with dual VAE+ViT tensors.
+
+        Mirrors vllm-omni's ``_build_cond_joint_image`` and the official
+        ``HunyuanImage3ImageProcessor.get_image_with_size``:
+
+        - The VAE input is snapped to the processor's resolution bucket
+          (center crop, aspect preserved).
+        - The ViT input goes through the SigLIP2 NaFlex processor (normalized
+          to [-1, 1], patch count capped at ``max_num_patches`` and padded with
+          a pixel attention mask), not a manual patchify.
+
+        The official repo processor exposes ``vae_reso_group`` /
+        ``pil_image_to_tensor`` / ``vit_processor``; vllm-omni's wrapper uses
+        ``reso_group`` / ``vae_processor`` / ``vision_encoder_processor``.
+        Both are supported; manual fallbacks are last resort only.
+        """
         from .hunyuan_image3_tokenizer import ImageInfo, JointImageInfo
 
         pil_image = pil_image.convert("RGB")
@@ -778,13 +806,18 @@ class HunyuanImage3AR(PipelineStage):
         vae_w_factor = vae_w
         vae_h_factor = vae_h
 
-        if processor is not None and hasattr(processor, "reso_group"):
-            base_size, ratio_idx = processor.reso_group.get_base_size_and_ratio_index(
+        reso_group = None
+        if processor is not None:
+            reso_group = getattr(processor, "vae_reso_group", None) or getattr(
+                processor, "reso_group", None
+            )
+        if reso_group is not None:
+            base_size, ratio_idx = reso_group.get_base_size_and_ratio_index(
                 orig_width, orig_height
             )
             base_size = int(base_size)
             ratio_idx = int(ratio_idx)
-            reso = processor.reso_group[ratio_idx]
+            reso = reso_group[ratio_idx]
             target_width = int(reso.width)
             target_height = int(reso.height)
         else:
@@ -794,8 +827,13 @@ class HunyuanImage3AR(PipelineStage):
             target_height = (orig_height // vae_h_factor) * vae_h_factor
 
         vae_input = self._resize_and_crop_center(pil_image, target_width, target_height)
-        if processor is not None and hasattr(processor, "vae_processor"):
-            vae_tensor = processor.vae_processor(vae_input)
+        vae_to_tensor = None
+        if processor is not None:
+            vae_to_tensor = getattr(processor, "pil_image_to_tensor", None) or getattr(
+                processor, "vae_processor", None
+            )
+        if vae_to_tensor is not None:
+            vae_tensor = vae_to_tensor(vae_input)
         else:
             import torchvision.transforms as T
             # Match vllm-omni HunyuanImage3ImageProcessor: normalize to [-1, 1]
@@ -815,14 +853,22 @@ class HunyuanImage3AR(PipelineStage):
         )
 
         vit_patch_size = 1
-        if processor is not None and hasattr(processor, "vision_encoder_processor"):
-            vit_inputs = processor.vision_encoder_processor(pil_image, return_tensors="pt")
+        vit_processor = None
+        if processor is not None:
+            vit_processor = getattr(processor, "vit_processor", None) or getattr(
+                processor, "vision_encoder_processor", None
+            )
+        if vit_processor is not None:
+            # SigLIP2 NaFlex: pixel_values are normalized, patch-count capped
+            # and padded to max_num_patches; pixel_attention_mask marks valid
+            # patches and spatial_shapes gives the valid patch grid.
+            vit_inputs = vit_processor(pil_image, return_tensors="pt")
             vit_tensor = vit_inputs["pixel_values"].squeeze(0)
             spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)
             pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0)
             vit_token_h = int(spatial_shapes[0].item())
             vit_token_w = int(spatial_shapes[1].item())
-            vit_patch_size = getattr(processor.vision_encoder_processor, "patch_size", 1)
+            vit_patch_size = getattr(vit_processor, "patch_size", 1)
             if isinstance(vit_patch_size, (tuple, list)):
                 vit_patch_size = int(vit_patch_size[0])
         else:
@@ -1017,12 +1063,43 @@ class HunyuanImage3AR(PipelineStage):
         tokenizer = self._resolve_custom_tokenizer(server_args)
         processor = self._resolve_processor(server_args)
 
-        # 2. Determine image resolution
-        width, height = align_hunyuan_image3_resolution(batch.width, batch.height)
+        # --- Resolve raw conditional images early (TI2I / I2I) ---
+        raw_cond_images = getattr(batch, "condition_image", None)
+        # Fall back to image_path if condition_image is absent
+        if raw_cond_images is None:
+            image_path = getattr(batch, "image_path", None)
+            if image_path is not None:
+                raw_cond_images = image_path if isinstance(image_path, list) else [image_path]
+        if raw_cond_images is not None and not isinstance(raw_cond_images, (list, tuple)):
+            raw_cond_images = [raw_cond_images]
+
+        # 2. Determine image resolution.
+        # For TI2I, when the user did not explicitly request an output size,
+        # follow the reference image's size (matching vllm-omni) so the
+        # generated token grid aligns with the reference image's grid.
+        sp = batch.sampling_params
+        user_explicit_fields = getattr(sp, "_explicit_fields", set()) if sp else set()
+        first_cond_pil = _cond_image_to_pil(raw_cond_images[0]) if raw_cond_images else None
+        if (
+            first_cond_pil is not None
+            and "width" not in user_explicit_fields
+            and "height" not in user_explicit_fields
+        ):
+            img_w, img_h = first_cond_pil.size
+            width, height = align_hunyuan_image3_resolution(img_w, img_h)
+            batch.width, batch.height = width, height
+            logger.info(
+                "TI2I: output resolution follows reference image (%dx%d) -> %dx%d",
+                img_w, img_h, width, height,
+            )
+        else:
+            width, height = align_hunyuan_image3_resolution(batch.width, batch.height)
         if processor is not None:
             image_info = processor.build_gen_image_info(f"{height}x{width}")
             height = image_info.image_height
             width = image_info.image_width
+            if (batch.width, batch.height) != (width, height):
+                batch.width, batch.height = width, height
             token_h = image_info.token_height
             token_w = image_info.token_width
             # Ensure ImageInfo uses the tokenizer's module class so that
@@ -1119,32 +1196,21 @@ class HunyuanImage3AR(PipelineStage):
 
         # --- Conditional image handling (TI2I / I2I) ---
         cond_image_infos_list = None
-        raw_cond_images = getattr(batch, "condition_image", None)
-        # Fall back to image_path if condition_image is absent
-        if raw_cond_images is None:
-            image_path = getattr(batch, "image_path", None)
-            if image_path is not None:
-                if isinstance(image_path, list):
-                    raw_cond_images = image_path
-                else:
-                    raw_cond_images = [image_path]
-        if raw_cond_images is not None:
-            if not isinstance(raw_cond_images, (list, tuple)):
-                raw_cond_images = [raw_cond_images]
+        if raw_cond_images:
             cond_joint_infos = []
             for raw_img in raw_cond_images:
-                from PIL import Image as PILImage
-                if not isinstance(raw_img, PILImage.Image):
-                    if isinstance(raw_img, str):
-                        raw_img = PILImage.open(raw_img)
-                    elif isinstance(raw_img, torch.Tensor):
-                        raw_img = PILImage.fromarray(
-                            raw_img.cpu().permute(1, 2, 0).numpy()
-                        )
-                joint_info, _, _, _ = self._preprocess_cond_image(raw_img, processor)
+                pil_img = _cond_image_to_pil(raw_img)
+                if pil_img is None:
+                    logger.warning(
+                        "Skipping unsupported condition image of type %s",
+                        type(raw_img).__name__,
+                    )
+                    continue
+                joint_info, _, _, _ = self._preprocess_cond_image(pil_img, processor)
                 cond_joint_infos.append(joint_info)
-            cond_image_infos_list = [cond_joint_infos]
-            tokenizer_kwargs["batch_cond_image_info"] = cond_image_infos_list
+            if cond_joint_infos:
+                cond_image_infos_list = [cond_joint_infos]
+                tokenizer_kwargs["batch_cond_image_info"] = cond_image_infos_list
 
         tokenizer_output_dict = tokenizer.apply_chat_template(**tokenizer_kwargs)
         if isinstance(tokenizer_output_dict, dict):
