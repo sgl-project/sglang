@@ -184,11 +184,14 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 class _TestServerArgs(SimpleNamespace):
     canonical_residency_mode = ServerArgs.canonical_residency_mode
+    configured_residency_mode = ServerArgs.configured_residency_mode
     explicit_residency_mode = ServerArgs.explicit_residency_mode
     _legacy_component_offload_flag = staticmethod(
         ServerArgs._legacy_component_offload_flag
     )
     residency_mode = ServerArgs.residency_mode
+    auto_residency_mode = ServerArgs.auto_residency_mode
+    host_pin_budget = ServerArgs.host_pin_budget
     is_arg_explicitly_set = ServerArgs.is_arg_explicitly_set
     is_explicit_layerwise_offload_component = (
         ServerArgs.is_explicit_layerwise_offload_component
@@ -209,6 +212,7 @@ def _server_args(**kwargs):
         num_gpus=1,
         nnodes=1,
         _required_resident_components=set(),
+        _auto_residency_modes={},
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
         cpu_offload_components=None,

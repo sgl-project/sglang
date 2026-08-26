@@ -11,7 +11,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
-    AUTO_RESIDENCY_FEATURE_NAME,
     GIB_BYTES,
     MIN_VRAM_RESERVE_BYTES,
     AppliedResidencyChange,
@@ -1376,20 +1375,50 @@ class _FakeLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
         self.layerwise_offload_managers = managers
 
 
+class _FakeLazyLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
+    layer_names = ["layers"]
+
+    def __init__(self, num_layers: int = 4):
+        nn.Module.__init__(self)
+        self.layers = nn.ModuleList(nn.Linear(4, 4) for _ in range(num_layers))
+        self.layerwise_offload_managers = []
+
+    def configure_layerwise_offload(
+        self,
+        server_args,
+        *,
+        pin_budget=None,
+        component_name=None,
+        pin_during_initialization=True,
+    ):
+        del server_args, pin_budget, component_name, pin_during_initialization
+        tensors = {
+            f"layers.{index}.weight": layer.weight
+            for index, layer in enumerate(self.layers)
+        }
+        self.layerwise_offload_managers = [_FakeLayerwiseManager(tensors)]
+
+
 class _StubResidencyArgs:
     """Duck-typed stand-in for the two ServerArgs hooks adjustments use."""
 
     def __init__(self):
-        self.required: set[str] = set()
+        self.auto_modes: dict[str, str] = {}
 
-    def require_component_resident(self, component_name, *, feature_name):
-        self.required.add(component_name)
+    def auto_residency_mode(self, component_name):
+        return self.auto_modes.get(component_name)
 
-    def release_required_component_residency(self, component_name, *, feature_name):
-        self.required.discard(component_name)
+    def residency_mode(self, component_name):
+        return self.auto_modes.get(component_name, COMPONENT_OFFLOAD)
 
-    def component_residency_requirement(self, component_name):
-        return AUTO_RESIDENCY_FEATURE_NAME if component_name in self.required else None
+    def set_auto_residency_mode(self, component_name, mode):
+        self.auto_modes[component_name] = mode
+
+    def clear_auto_residency_mode(self, component_name):
+        self.auto_modes.pop(component_name, None)
+
+    def host_pin_budget(self):
+        return None
 
 
 def _plan_for(candidates: list[ResidencyTarget]) -> AutoResidencyPlan:
@@ -1636,6 +1665,81 @@ class TestCollectResidencyTargets:
             and candidate.target_mode() == LAYERWISE_OFFLOAD
             for candidate in candidates
         )
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+        assert component.target_layerwise_pinned_layers == ((),)
+        assert component.pinned_host_delta_bytes == 0
+
+    def test_component_offload_frontier_can_expand_layerwise_lazily(self):
+        module = _FakeLazyLayerwiseDit(num_layers=4)
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+        )
+
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+        full_stage = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (4,)
+        )
+        assert component.current_placement
+        assert full_stage.h2d_bytes_per_request == component.h2d_bytes_per_request
+        assert any(
+            candidate.target_layerwise_resident_layers == (2,)
+            for candidate in candidates
+        )
+        assert any(candidate.target_mode() == RESIDENT for candidate in candidates)
+
+    def test_lazy_layerwise_frontier_keeps_buffers_out_of_managed_weights(self):
+        module = _FakeLazyLayerwiseDit(num_layers=2)
+        module.layers[0].register_buffer("cache", torch.zeros(4096))
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+        )
+
+        full_stage = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+        )
+        # Each Linear packs a 16-element weight and 4-element bias. The buffer
+        # remains resident and is not copied into the layerwise store.
+        assert full_stage.target_resident_weight_bytes == 2 * 20 * 4
+        assert full_stage.target_device_weight_bytes == (
+            full_stage.target_resident_weight_bytes
+            + module.layers[0].cache.untyped_storage().nbytes()
+        )
+
+    def test_component_weight_footprint_deduplicates_tied_storage(self):
+        module = nn.Module()
+        backing = torch.empty(1024)
+        module.register_parameter("left", nn.Parameter(backing[:512]))
+        module.register_parameter("right", nn.Parameter(backing[512:]))
+
+        assert component_runtime_weight_bytes({"transformer": module}) == {
+            "transformer": backing.untyped_storage().nbytes()
+        }
 
     def test_auto_resident_component_keeps_offload_as_a_target(self):
         module = nn.Linear(4, 4)
@@ -1700,6 +1804,77 @@ class TestCollectResidencyTargets:
 
 
 class TestApplyAndRollback:
+    def test_lazy_layerwise_configuration_rolls_back_to_component_offload(self):
+        module = _FakeLazyLayerwiseDit(num_layers=4)
+        args = _StubResidencyArgs()
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: COMPONENT_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+        )
+        target = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([target]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+
+        assert len(module.layerwise_offload_managers) == 1
+        assert module.layerwise_offload_managers[0].resident_layers == 2
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert module.layerwise_offload_managers == []
+        assert args.auto_modes == {}
+
+    def test_layerwise_can_become_component_offload_and_rollback(self):
+        module = _FakeLazyLayerwiseDit(num_layers=4)
+        args = _StubResidencyArgs()
+        module.configure_layerwise_offload(args)
+        args.auto_modes["text_encoder"] = LAYERWISE_OFFLOAD
+        candidates = collect_residency_targets(
+            modules={"text_encoder": module},
+            residency_mode_of=lambda _name: LAYERWISE_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=1,
+        )
+        target = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([target]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+
+        assert module.layerwise_offload_managers == []
+        assert args.auto_modes == {"text_encoder": COMPONENT_OFFLOAD}
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert len(module.layerwise_offload_managers) == 1
+        assert args.auto_modes == {"text_encoder": LAYERWISE_OFFLOAD}
+
     def test_component_offload_promotion_marks_resident_without_moving(self):
         module = nn.Linear(4, 4)
         args = _StubResidencyArgs()
@@ -1708,18 +1883,18 @@ class TestApplyAndRollback:
             modules={"text_encoder": module},
             server_args=args,
         )
-        assert args.required == {"text_encoder"}
+        assert args.auto_modes == {"text_encoder": RESIDENT}
         assert [p.component_name for p in applied] == ["text_encoder"]
 
         rollback_residency_changes(
             applied=applied, modules={"text_encoder": module}, server_args=args
         )
-        assert args.required == set()
+        assert args.auto_modes == {}
 
     def test_component_resident_can_be_demoted_and_rollback_restores_it(self):
         module = nn.Linear(4, 4)
         args = _StubResidencyArgs()
-        args.required.add("text_encoder")
+        args.auto_modes["text_encoder"] = RESIDENT
         candidate = ResidencyTarget(
             component_name="text_encoder",
             residency_mode=COMPONENT_OFFLOAD,
@@ -1734,14 +1909,14 @@ class TestApplyAndRollback:
             modules={"text_encoder": module},
             server_args=args,
         )
-        assert args.required == set()
+        assert args.auto_modes == {"text_encoder": COMPONENT_OFFLOAD}
 
         rollback_residency_changes(
             applied=applied,
             modules={"text_encoder": module},
             server_args=args,
         )
-        assert args.required == {"text_encoder"}
+        assert args.auto_modes == {"text_encoder": RESIDENT}
 
     def test_layerwise_promotion_loads_all_layers_and_rollback_rearms(self):
         manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
@@ -1763,7 +1938,7 @@ class TestApplyAndRollback:
         )
         assert manager.enabled is True
         assert manager.register_hooks_calls == 1
-        assert args.required == set()
+        assert args.auto_modes == {}
 
     def test_partial_layerwise_promotion_restores_exact_group_counts(self):
         managers = [
@@ -1800,7 +1975,7 @@ class TestApplyAndRollback:
         )
 
         assert [manager.resident_layers for manager in managers] == [2, 2]
-        assert args.required == set()
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
         rollback_residency_changes(
             applied=applied,
             modules={"transformer": module},
@@ -1819,7 +1994,7 @@ class TestApplyAndRollback:
         module = _FakeLayerwiseDit([manager])
         module.disable_offload()
         args = _StubResidencyArgs()
-        args.required.add("transformer")
+        args.auto_modes["transformer"] = RESIDENT
         candidate = ResidencyTarget(
             component_name="transformer",
             residency_mode=LAYERWISE_OFFLOAD,
@@ -1838,7 +2013,7 @@ class TestApplyAndRollback:
 
         assert manager.enabled is True
         assert manager.resident_layers == 1
-        assert args.required == set()
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
 
         rollback_residency_changes(
             applied=applied,
@@ -1847,7 +2022,7 @@ class TestApplyAndRollback:
         )
         assert manager.enabled is False
         assert manager.resident_layers == 2
-        assert args.required == {"transformer"}
+        assert args.auto_modes == {"transformer": RESIDENT}
 
     def test_mid_failure_rolls_back_already_applied_promotions(self):
         manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
@@ -1863,7 +2038,7 @@ class TestApplyAndRollback:
                 modules={"transformer": module},
                 server_args=args,
             )
-        assert args.required == set()
+        assert args.auto_modes == {}
         assert manager.enabled is True
         # Validation finishes before any placement is touched.
         assert manager.register_hooks_calls == 0
@@ -2042,9 +2217,7 @@ class TestApplyAndRollback:
 
     def test_failed_rollback_raises_rollback_error_with_visible_cause(self):
         class _BrokenArgs(_StubResidencyArgs):
-            def release_required_component_residency(
-                self, component_name, *, feature_name
-            ):
+            def clear_auto_residency_mode(self, component_name):
                 # str(AssertionError()) is "" -- describe_error must keep it
                 # visible so no truthiness filter can drop it
                 raise AssertionError()
@@ -2072,9 +2245,7 @@ class TestApplyAndRollback:
         released: list[str] = []
 
         class _PartialArgs(_StubResidencyArgs):
-            def release_required_component_residency(
-                self, component_name, *, feature_name
-            ):
+            def clear_auto_residency_mode(self, component_name):
                 if component_name == "vae":
                     raise RuntimeError("boom")
                 released.append(component_name)

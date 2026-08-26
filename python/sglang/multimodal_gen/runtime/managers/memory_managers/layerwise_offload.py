@@ -45,6 +45,55 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _align_numel_offset(
+    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+) -> int:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_numel = max(1, alignment_bytes // element_size)
+    remainder = offset % alignment_numel
+    return offset if remainder == 0 else offset + alignment_numel - remainder
+
+
+def estimate_layer_weight_bytes(
+    layers: torch.nn.ModuleList | torch.nn.Sequential,
+) -> dict[int, int]:
+    """Physical per-layer store sizes using the real manager's packing rules."""
+    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
+    for name, tensor in layers.named_parameters():
+        layer_index_text, separator, _ = name.partition(".")
+        if not separator or not layer_index_text.isdigit():
+            continue
+        layer_index = int(layer_index_text)
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
+            local_tensor
+        )
+
+    totals = {layer_index: 0 for layer_index in range(len(layers))}
+    for layer_index, dtype_to_tensors in grouped.items():
+        for dtype, tensors in dtype_to_tensors.items():
+            contiguous_numel = 0
+            for tensor in tensors:
+                if tensor.is_contiguous():
+                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                    contiguous_numel += tensor.numel()
+                    continue
+                storage_numel = (
+                    0
+                    if tensor.numel() == 0
+                    else 1
+                    + sum(
+                        (size - 1) * abs(stride)
+                        for size, stride in zip(tensor.shape, tensor.stride())
+                    )
+                )
+                totals[layer_index] += storage_numel * tensor.element_size()
+            totals[layer_index] += (
+                contiguous_numel * torch.empty((), dtype=dtype).element_size()
+            )
+    return totals
+
+
 def release_unused_pinned_memory() -> None:
     """Return unreferenced cached HostPin blocks to the CUDA driver.
 
@@ -382,6 +431,7 @@ class LayerwiseOffloadManager:
         residency_policy: str = RESIDENCY_POLICY_LEADING,
         pin_budget: HostPinBudget | None = None,
         pin_component_name: str = "layerwise offload",
+        pin_during_initialization: bool = True,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -397,6 +447,7 @@ class LayerwiseOffloadManager:
         # was never reached. A private budget reads the same host limit.
         self._pin_budget = pin_budget if pin_budget is not None else HostPinBudget()
         self._pin_component_name = pin_component_name
+        self._pin_during_initialization = pin_during_initialization
         self._layer_hosting: Dict[int, str] = {}
         # an explicit MPS zero avoids staging the next layer alongside the
         # active one; MPS has no transfer overlap to recover from that cost
@@ -536,21 +587,6 @@ class LayerwiseOffloadManager:
     ) -> torch.Tensor:
         return self._wrap_for_target(target, self._get_shared_empty_tensor(dtype))
 
-    @staticmethod
-    def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
-        element_size = torch.empty((), dtype=dtype).element_size()
-        return max(1, alignment_bytes // element_size)
-
-    @classmethod
-    def _align_numel_offset(
-        cls, offset: int, dtype: torch.dtype, alignment_bytes: int = 32
-    ) -> int:
-        alignment_numel = cls._get_alignment_numel(dtype, alignment_bytes)
-        remainder = offset % alignment_numel
-        if remainder == 0:
-            return offset
-        return offset + alignment_numel - remainder
-
     @torch.compiler.disable
     def _initialize(self) -> None:
         if not self.enabled:
@@ -589,12 +625,10 @@ class LayerwiseOffloadManager:
                 for _, weight in weights:
                     tensor = self._to_local_tensor(weight)
                     if tensor.is_contiguous():
-                        contiguous_numel = self._align_numel_offset(
-                            contiguous_numel, dtype
-                        )
+                        contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
                         contiguous_numel += tensor.numel()
                         if not self._mapped_regions.holds(tensor):
-                            anonymous_numel = self._align_numel_offset(
+                            anonymous_numel = _align_numel_offset(
                                 anonymous_numel, dtype
                             )
                             anonymous_numel += tensor.numel()
@@ -652,7 +686,11 @@ class LayerwiseOffloadManager:
         resident = [idx for idx in sorted(totals) if idx not in set(streamed)]
         for layer_idx in streamed + resident:
             layer_bytes = totals[layer_idx]
-            if self.pin_cpu_memory and pinned_bytes + layer_bytes <= spendable:
+            if (
+                self.pin_cpu_memory
+                and self._pin_during_initialization
+                and pinned_bytes + layer_bytes <= spendable
+            ):
                 hosting[layer_idx] = "pinned"
                 pinned_bytes += layer_bytes
                 pin_order.append(layer_idx)
@@ -821,7 +859,7 @@ class LayerwiseOffloadManager:
                     # satisfy a 32-byte alignment contract. Reusing one flat buffer
                     # is still fine, but each logical tensor slice must start on an
                     # aligned offset inside that buffer.
-                    current_offset = self._align_numel_offset(current_offset, dtype)
+                    current_offset = _align_numel_offset(current_offset, dtype)
                     aligned_offsets[name] = current_offset
                     current_offset += local_weight.numel()
 
@@ -1938,6 +1976,7 @@ class LayerwiseOffloadableModuleMixin:
         *,
         pin_budget: HostPinBudget | None = None,
         component_name: str | None = None,
+        pin_during_initialization: bool = True,
     ):
         self.park_non_layer_weights_between_uses = (
             server_args.performance_mode == "memory"
@@ -2016,6 +2055,7 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 pin_budget=pin_budget,
                 pin_component_name=pin_component_name,
+                pin_during_initialization=pin_during_initialization,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
@@ -2215,6 +2255,25 @@ class LayerwiseOffloadableModuleMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+    def remove_layerwise_offload(self) -> None:
+        """Restore an ordinary component-managed module.
+
+        Every real layer is materialized before the manager stores are dropped,
+        and HostPin allowances are returned first. Auto residency uses this for
+        both a selected component-offload target and transactional rollback of
+        a lazily configured layerwise target.
+        """
+        managers = list(self.layerwise_offload_managers or ())
+        if not managers:
+            return
+        for manager in managers:
+            manager.set_pinned_layers(())
+        self.restore_non_layer_weights()
+        self.disable_offload()
+        self.layerwise_offload_managers = []
+        self._parked_non_layer_weights.clear()
+        self._park_placeholders.clear()
 
 
 def iter_materialized_weights(module: torch.nn.Module):
@@ -2494,7 +2553,7 @@ def configure_layerwise_offload_modules(
         reverse=True,
     )
     local_worker_count = max(1, server_args.num_gpus // server_args.nnodes)
-    pin_budget = HostPinBudget.for_local_worker(local_worker_count)
+    pin_budget = server_args.host_pin_budget()
     logger.info(
         "Layerwise offload host memory: %s; this worker may pin %.2f GiB "
         "after splitting the node allowance across %d local workers",

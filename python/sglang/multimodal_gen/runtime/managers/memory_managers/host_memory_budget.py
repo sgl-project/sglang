@@ -14,8 +14,11 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+from collections.abc import Iterable
 
 import psutil
+import torch
+from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -272,22 +275,30 @@ def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     return max(0, weight_bytes) * max(1, uses_per_request)
 
 
-def module_weight_bytes(module) -> int:
-    """Bytes of parameters and buffers a module would hand to the host."""
-    seen: set[int] = set()
+def tensor_storage_bytes(tensors: Iterable[torch.Tensor]) -> int:
+    """Physical bytes backing tensors, deduplicated across aliases and views."""
+    seen: set[tuple[torch.device, int]] = set()
     total = 0
-    for tensor in list(module.parameters()) + list(module.buffers()):
+    for tensor in tensors:
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
         try:
             storage = tensor.untyped_storage()
             pointer = storage.data_ptr()
             storage_bytes = storage.nbytes()
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             continue
-        if pointer == 0 or pointer in seen:
+        storage_key = (tensor.device, pointer)
+        if pointer == 0 or storage_key in seen:
             continue
-        seen.add(pointer)
+        seen.add(storage_key)
         total += storage_bytes
     return total
+
+
+def module_weight_bytes(module) -> int:
+    """Physical bytes of parameters and buffers a module would hand to the host."""
+    return tensor_storage_bytes((*module.parameters(), *module.buffers()))
 
 
 def describe_host_memory() -> str:

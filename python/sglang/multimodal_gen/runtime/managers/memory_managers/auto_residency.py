@@ -25,6 +25,7 @@ single placement to serve two different lifecycle objectives.
 from __future__ import annotations
 
 import statistics
+from itertools import chain
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 import msgspec
@@ -42,10 +43,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
     host_memory_available_bytes,
+    tensor_storage_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     compute_streamed_layers,
+    estimate_layer_weight_bytes,
     is_layerwise_offloaded_module,
     iter_materialized_weights,
     release_unused_pinned_memory,
@@ -89,8 +92,6 @@ ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
 MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
 MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
 LATENCY_EQUIVALENCE_FRACTION = 0.01
-
-AUTO_RESIDENCY_FEATURE_NAME = "auto residency"
 
 PLACEMENT_STATUS_SKIPPED = "skipped"
 PLACEMENT_STATUS_ADJUSTED = "adjusted"
@@ -256,7 +257,8 @@ class AppliedResidencyChange(msgspec.Struct, frozen=True):
     previous_layerwise_resident_layers: tuple[int, ...] | None = None
     previous_layerwise_pinned_layers: tuple[tuple[int, ...], ...] | None = None
     previous_layerwise_offload_enabled: bool = True
-    previous_required_resident: bool = False
+    previous_layerwise_configured: bool = True
+    previous_auto_residency_mode: str | None = None
     pinned_host_changed: bool = False
 
 
@@ -603,14 +605,12 @@ def estimate_workload_phase_peaks(
 
 def _module_weight_bytes(module: nn.Module) -> int:
     """Full weight+buffer footprint, reading through layerwise CPU buffers."""
-    param_bytes = sum(
-        tensor.numel() * tensor.element_size()
-        for _, tensor in iter_materialized_weights(module)
+    return tensor_storage_bytes(
+        chain(
+            (tensor for _, tensor in iter_materialized_weights(module)),
+            module.buffers(),
+        )
     )
-    buffer_bytes = sum(
-        tensor.numel() * tensor.element_size() for tensor in module.buffers()
-    )
-    return param_bytes + buffer_bytes
 
 
 def component_runtime_weight_bytes(modules: Mapping[str, object]) -> dict[str, int]:
@@ -794,6 +794,206 @@ def _layerwise_resident_targets(managers: Sequence) -> list[tuple[int, ...]]:
     return sorted(targets)
 
 
+class _EstimatedLayerwiseManager:
+    """Size-only layer group used before a real offload manager exists."""
+
+    def __init__(
+        self,
+        *,
+        layer_bytes: dict[int, int],
+        prefetch_size: int,
+        residency_policy: str,
+        pin_cpu_memory: bool,
+    ) -> None:
+        self._layer_bytes = layer_bytes
+        self.num_layers = len(layer_bytes)
+        self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
+        self.residency_policy = residency_policy
+        self.pin_cpu_memory = pin_cpu_memory
+        self.resident_layers = 0
+
+    def layer_weight_bytes(self) -> dict[int, int]:
+        return self._layer_bytes
+
+    def layer_host_store_bytes(self) -> dict[int, int]:
+        return self._layer_bytes
+
+    def pinned_host_weight_bytes(self) -> int:
+        return 0
+
+    def pinned_layer_indices(self) -> tuple[int, ...]:
+        return ()
+
+    def pinnable_layer_indices(self) -> tuple[int, ...]:
+        if not self.pin_cpu_memory:
+            return ()
+        return tuple(self._layer_bytes)
+
+    def resident_weight_bytes(self, resident_layers: int | None = None) -> int:
+        count = self.resident_layers if resident_layers is None else resident_layers
+        streamed = set(
+            compute_streamed_layers(
+                num_layers=self.num_layers,
+                resident_layers=count,
+                policy=self.residency_policy,
+            )
+        )
+        return sum(
+            weight_bytes
+            for layer_index, weight_bytes in self._layer_bytes.items()
+            if layer_index not in streamed
+        )
+
+    def peak_managed_device_weight_bytes(
+        self, resident_layers: int | None = None
+    ) -> int:
+        count = self.resident_layers if resident_layers is None else resident_layers
+        streamed = compute_streamed_layers(
+            num_layers=self.num_layers,
+            resident_layers=count,
+            policy=self.residency_policy,
+        )
+        resident_bytes = self.resident_weight_bytes(count)
+        copy_window = min(self.prefetch_size, len(streamed))
+        streamed_window_bytes = sum(
+            sorted(
+                (self._layer_bytes.get(index, 0) for index in streamed),
+                reverse=True,
+            )[:copy_window]
+        )
+        return resident_bytes + streamed_window_bytes
+
+
+def _estimate_unconfigured_layerwise_managers(
+    *,
+    module: LayerwiseOffloadableModuleMixin,
+    prefetch_value: float,
+    residency_policy: str,
+    pin_cpu_memory: bool,
+) -> list[_EstimatedLayerwiseManager]:
+    """Read an unloaded module's block sizes without allocating CPU stores."""
+    named_modules = dict(module.named_modules())
+    estimates = []
+    for layer_name in module.layer_names:
+        layers = named_modules.get(layer_name)
+        if not isinstance(layers, (nn.ModuleList, nn.Sequential)) or not layers:
+            continue
+        num_layers = len(layers)
+        if prefetch_value < 1.0:
+            prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))
+        else:
+            prefetch_size = int(prefetch_value)
+        estimates.append(
+            _EstimatedLayerwiseManager(
+                layer_bytes=estimate_layer_weight_bytes(layers),
+                prefetch_size=prefetch_size,
+                residency_policy=residency_policy,
+                pin_cpu_memory=pin_cpu_memory,
+            )
+        )
+    return estimates
+
+
+def _unconfigured_layerwise_targets(
+    *,
+    component_name: str,
+    module: LayerwiseOffloadableModuleMixin,
+    current_mode: str,
+    full_weight_bytes: int,
+    num_inference_steps: int,
+    prefetch_value: float,
+    residency_policy: str,
+    pin_cpu_memory: bool,
+) -> tuple[list[ResidencyTarget], int]:
+    """Virtual layerwise frontier for a component still using coarse offload.
+
+    The first selected virtual state configures real managers lazily. It starts
+    pageable and is remeasured immediately; the next fixed-point round then
+    exposes the exact HostPin frontier from the realized stores.
+    """
+    managers = _estimate_unconfigured_layerwise_managers(
+        module=module,
+        prefetch_value=prefetch_value,
+        residency_policy=residency_policy,
+        pin_cpu_memory=pin_cpu_memory,
+    )
+    if not managers:
+        return [], 0
+    managed_weight_bytes = sum(
+        sum(manager.layer_weight_bytes().values()) for manager in managers
+    )
+    if managed_weight_bytes <= 0:
+        return [], 0
+    unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
+    uses_per_request = (
+        max(1, num_inference_steps) if is_dit_component_name(component_name) else 1
+    )
+    empty_pins = tuple(() for _ in managers)
+    maximum_transfer_work = _layerwise_transfer_work_bytes(
+        managers=managers,
+        resident_layers=tuple(0 for _ in managers),
+        pinned_layers=empty_pins,
+        uses_per_streamed_layer=uses_per_request,
+    )
+    current_resident = current_mode == RESIDENT
+    current_inactive_bytes = full_weight_bytes if current_resident else 0
+    initial_managed_bytes = sum(
+        manager.peak_managed_device_weight_bytes(0) for manager in managers
+    )
+    host_materialize_scratch = max(
+        (
+            weight_bytes
+            for manager in managers
+            for weight_bytes in manager.layer_host_store_bytes().values()
+        ),
+        default=0,
+    )
+    targets = []
+    for resident_layers in _layerwise_resident_targets(managers):
+        resident_bytes = sum(
+            manager.resident_weight_bytes(count)
+            for manager, count in zip(managers, resident_layers)
+        )
+        active_managed_bytes = sum(
+            manager.peak_managed_device_weight_bytes(count)
+            for manager, count in zip(managers, resident_layers)
+        )
+        transfer_work = _layerwise_transfer_work_bytes(
+            managers=managers,
+            resident_layers=resident_layers,
+            pinned_layers=empty_pins,
+            uses_per_streamed_layer=uses_per_request,
+        )
+        targets.append(
+            ResidencyTarget(
+                component_name=component_name,
+                residency_mode=COMPONENT_OFFLOAD,
+                target_residency_mode=LAYERWISE_OFFLOAD,
+                target_resident_weight_bytes=resident_bytes,
+                h2d_bytes_per_request=maximum_transfer_work - transfer_work,
+                target_layerwise_resident_layers=resident_layers,
+                target_layerwise_pinned_layers=empty_pins,
+                host_materialize_scratch_bytes=host_materialize_scratch,
+                device_transition_delta_bytes=(
+                    unmanaged_weight_bytes
+                    + initial_managed_bytes
+                    - current_inactive_bytes
+                ),
+                active_device_delta_bytes=(
+                    unmanaged_weight_bytes + active_managed_bytes - full_weight_bytes
+                ),
+                present_device_delta_bytes=(
+                    unmanaged_weight_bytes + active_managed_bytes - full_weight_bytes
+                ),
+                inactive_device_delta_bytes=(
+                    unmanaged_weight_bytes - current_inactive_bytes
+                ),
+                target_device_weight_bytes=unmanaged_weight_bytes + resident_bytes,
+            )
+        )
+    return targets, maximum_transfer_work
+
+
 def _layerwise_host_transition_bytes(
     *,
     managers: Sequence,
@@ -825,6 +1025,8 @@ def collect_residency_targets(
     allow_host_pin_reallocation: bool = True,
     mixed_dtype_components: Iterable[str] = (),
     auto_resident_components: Iterable[str] = (),
+    layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str]] | None = None,
+    pin_cpu_memory: bool = True,
 ) -> list[ResidencyTarget]:
     """Build complete target-state frontiers for auto-managed components.
 
@@ -857,7 +1059,17 @@ def collect_residency_targets(
             # A loader or another runtime feature owns this hard requirement.
             continue
 
-        if baseline_mode == COMPONENT_OFFLOAD:
+        has_layerwise_managers = isinstance(
+            module, LayerwiseOffloadableModuleMixin
+        ) and bool(module.layerwise_offload_managers)
+        if has_layerwise_managers and current_mode == COMPONENT_OFFLOAD:
+            # Temporary managers used by offload-during-compile do not own the
+            # serving placement. Only an effective layerwise mode proves that
+            # these managers form the current serving frontier.
+            continue
+        frontier_mode = LAYERWISE_OFFLOAD if has_layerwise_managers else baseline_mode
+
+        if frontier_mode == COMPONENT_OFFLOAD:
             if current_mode not in (COMPONENT_OFFLOAD, RESIDENT):
                 continue
             if is_layerwise_offloaded_module(module):
@@ -869,6 +1081,35 @@ def collect_residency_targets(
             if weight_bytes <= 0:
                 continue
             current_resident = current_mode == RESIDENT
+            virtual_targets: list[ResidencyTarget] = []
+            maximum_transfer_work = 0
+            if (
+                isinstance(module, LayerwiseOffloadableModuleMixin)
+                and layerwise_tuning_of is not None
+            ):
+                prefetch_value, _, residency_policy = layerwise_tuning_of(
+                    name, module.layerwise_offload_dit_group_enabled
+                )
+                virtual_targets, maximum_transfer_work = (
+                    _unconfigured_layerwise_targets(
+                        component_name=name,
+                        module=module,
+                        current_mode=current_mode,
+                        full_weight_bytes=weight_bytes,
+                        num_inference_steps=num_inference_steps,
+                        prefetch_value=prefetch_value,
+                        residency_policy=residency_policy,
+                        pin_cpu_memory=pin_cpu_memory,
+                    )
+                )
+            uses_per_request = (
+                max(1, num_inference_steps) if is_dit_component_name(name) else 1
+            )
+            component_transfer_work = (
+                maximum_transfer_work // uses_per_request
+                if maximum_transfer_work
+                else 0
+            )
             candidates.extend(
                 [
                     ResidencyTarget(
@@ -876,7 +1117,9 @@ def collect_residency_targets(
                         residency_mode=baseline_mode,
                         target_residency_mode=COMPONENT_OFFLOAD,
                         target_resident_weight_bytes=0,
-                        h2d_bytes_per_request=0,
+                        h2d_bytes_per_request=max(
+                            0, maximum_transfer_work - component_transfer_work
+                        ),
                         host_materialize_scratch_bytes=(
                             weight_bytes if current_resident else 0
                         ),
@@ -897,7 +1140,7 @@ def collect_residency_targets(
                         residency_mode=baseline_mode,
                         target_residency_mode=RESIDENT,
                         target_resident_weight_bytes=weight_bytes,
-                        h2d_bytes_per_request=weight_bytes,
+                        h2d_bytes_per_request=(maximum_transfer_work or weight_bytes),
                         permanent_residency=True,
                         device_transition_delta_bytes=0,
                         active_device_delta_bytes=0,
@@ -910,6 +1153,7 @@ def collect_residency_targets(
                     ),
                 ]
             )
+            candidates.extend(virtual_targets)
             continue
 
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
@@ -953,11 +1197,52 @@ def collect_residency_targets(
         current_pinned_bytes = sum(
             manager.pinned_host_weight_bytes() for manager in managers
         )
-        maximum_transfer_work = _layerwise_transfer_work_bytes(
+        layerwise_maximum_transfer_work = _layerwise_transfer_work_bytes(
             managers=managers,
             resident_layers=tuple(0 for _ in managers),
             pinned_layers=tuple(() for _ in managers),
             uses_per_streamed_layer=uses_per_request,
+        )
+        full_weight_bytes = _module_weight_bytes(module)
+        unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
+        component_transfer_work = 2 * full_weight_bytes
+        maximum_transfer_work = max(
+            layerwise_maximum_transfer_work, component_transfer_work
+        )
+
+        empty_resident_layers = tuple(0 for _ in managers)
+        empty_pinned_layers = tuple(() for _ in managers)
+        unpin_scratch, _ = _layerwise_host_transition_bytes(
+            managers=managers,
+            current_pinned_layers=current_pinned_layers,
+            target_pinned_layers=empty_pinned_layers,
+        )
+        candidates.append(
+            ResidencyTarget(
+                component_name=name,
+                residency_mode=frontier_mode,
+                target_residency_mode=COMPONENT_OFFLOAD,
+                target_resident_weight_bytes=0,
+                h2d_bytes_per_request=max(
+                    0, maximum_transfer_work - component_transfer_work
+                ),
+                target_layerwise_resident_layers=empty_resident_layers,
+                target_layerwise_pinned_layers=empty_pinned_layers,
+                pinned_host_delta_bytes=-current_pinned_bytes,
+                host_unpin_scratch_bytes=unpin_scratch,
+                device_transition_delta_bytes=(
+                    0 if current_permanent else managed_weight_bytes
+                ),
+                active_device_delta_bytes=(
+                    full_weight_bytes - current_peak_device_bytes
+                ),
+                present_device_delta_bytes=(
+                    full_weight_bytes - current_peak_device_bytes
+                ),
+                inactive_device_delta_bytes=-current_inactive_device_bytes,
+                target_device_weight_bytes=0,
+                target_pinned_host_bytes=0,
+            )
         )
 
         for target_resident_layers in _layerwise_resident_targets(managers):
@@ -1001,7 +1286,7 @@ def collect_residency_targets(
                 candidates.append(
                     ResidencyTarget(
                         component_name=name,
-                        residency_mode=baseline_mode,
+                        residency_mode=frontier_mode,
                         target_residency_mode=LAYERWISE_OFFLOAD,
                         target_resident_weight_bytes=target_resident_bytes,
                         h2d_bytes_per_request=(
@@ -1027,7 +1312,9 @@ def collect_residency_targets(
                             and target_resident_layers == current_resident_layers
                             and target_pinned_layers == current_pinned_layers
                         ),
-                        target_device_weight_bytes=target_resident_bytes,
+                        target_device_weight_bytes=(
+                            unmanaged_weight_bytes + target_resident_bytes
+                        ),
                         target_pinned_host_bytes=target_pinned_bytes,
                     )
                 )
@@ -1063,7 +1350,7 @@ def collect_residency_targets(
             candidates.append(
                 ResidencyTarget(
                     component_name=name,
-                    residency_mode=baseline_mode,
+                    residency_mode=frontier_mode,
                     target_residency_mode=RESIDENT,
                     target_resident_weight_bytes=managed_weight_bytes,
                     h2d_bytes_per_request=maximum_transfer_work,
@@ -1092,7 +1379,7 @@ def collect_residency_targets(
                     current_placement=(
                         current_permanent and permanent_pins == current_pinned_layers
                     ),
-                    target_device_weight_bytes=managed_weight_bytes,
+                    target_device_weight_bytes=full_weight_bytes,
                     target_pinned_host_bytes=permanent_pinned_bytes,
                 )
             )
@@ -1549,7 +1836,11 @@ def apply_residency_changes(
                 raise RuntimeError(
                     f"residency target {candidate.component_name!r} is missing"
                 )
-            if candidate.residency_mode == LAYERWISE_OFFLOAD and not isinstance(
+            layerwise_transition = (
+                candidate.residency_mode == LAYERWISE_OFFLOAD
+                or candidate.target_mode() == LAYERWISE_OFFLOAD
+            )
+            if layerwise_transition and not isinstance(
                 module, LayerwiseOffloadableModuleMixin
             ):
                 raise RuntimeError(
@@ -1564,24 +1855,32 @@ def apply_residency_changes(
                     "layerwise-managed between planning and apply"
                 )
             target_modules[candidate.component_name] = module
-            previous_required_resident = (
-                server_args.component_residency_requirement(candidate.component_name)
-                == AUTO_RESIDENCY_FEATURE_NAME
+            previous_auto_mode = server_args.auto_residency_mode(
+                candidate.component_name
             )
-            if candidate.residency_mode == LAYERWISE_OFFLOAD:
+            if layerwise_transition:
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError(
                         f"partial residency target {candidate.component_name!r} "
                         "lost its layerwise offload capability"
                     )
-                previous = tuple(
-                    manager.resident_layers
-                    for manager in module.layerwise_offload_managers
+                previous_configured = bool(module.layerwise_offload_managers)
+                previous = (
+                    tuple(
+                        manager.resident_layers
+                        for manager in module.layerwise_offload_managers
+                    )
+                    if previous_configured
+                    else ()
                 )
-                previous_pinned = module.layerwise_pinned_layers()
-                enabled = {
-                    manager.enabled for manager in module.layerwise_offload_managers
-                }
+                previous_pinned = (
+                    module.layerwise_pinned_layers() if previous_configured else ()
+                )
+                enabled = (
+                    {manager.enabled for manager in module.layerwise_offload_managers}
+                    if previous_configured
+                    else {False}
+                )
                 if len(enabled) != 1:
                     raise RuntimeError(
                         f"placement target {candidate.component_name!r} has mixed "
@@ -1594,9 +1893,11 @@ def apply_residency_changes(
                     previous_layerwise_resident_layers=previous,
                     previous_layerwise_pinned_layers=previous_pinned,
                     previous_layerwise_offload_enabled=enabled.pop(),
-                    previous_required_resident=previous_required_resident,
+                    previous_layerwise_configured=previous_configured,
+                    previous_auto_residency_mode=previous_auto_mode,
                     pinned_host_changed=(
-                        candidate.target_layerwise_pinned_layers != previous_pinned
+                        previous_configured
+                        and candidate.target_layerwise_pinned_layers != previous_pinned
                     ),
                 )
                 if candidate.target_layerwise_pinned_layers is None:
@@ -1609,11 +1910,12 @@ def apply_residency_changes(
             snapshots[candidate.component_name] = AppliedResidencyChange(
                 component_name=candidate.component_name,
                 residency_mode=candidate.residency_mode,
-                previous_required_resident=previous_required_resident,
+                previous_auto_residency_mode=previous_auto_mode,
             )
         pinning_changes = [
             candidate
             for candidate in ordered_changes
+            if snapshots[candidate.component_name].previous_layerwise_configured
             if candidate.target_layerwise_pinned_layers is not None
             and candidate.target_layerwise_pinned_layers
             != previous_pins_by_component[candidate.component_name]
@@ -1672,38 +1974,54 @@ def apply_residency_changes(
                 applied_names.add(candidate.component_name)
             module = target_modules[candidate.component_name]
             target_mode = candidate.target_mode()
-            if candidate.residency_mode == LAYERWISE_OFFLOAD:
+            if (
+                candidate.residency_mode == LAYERWISE_OFFLOAD
+                or target_mode == LAYERWISE_OFFLOAD
+            ):
                 assert isinstance(module, LayerwiseOffloadableModuleMixin)
+                snapshot = snapshots[candidate.component_name]
+                if not snapshot.previous_layerwise_configured:
+                    module.configure_layerwise_offload(
+                        server_args,
+                        pin_budget=server_args.host_pin_budget(),
+                        component_name=candidate.component_name,
+                        pin_during_initialization=False,
+                    )
+                    if not module.layerwise_offload_managers:
+                        raise RuntimeError(
+                            f"residency target {candidate.component_name!r} "
+                            "did not configure any layerwise groups"
+                        )
                 module.set_layerwise_pinned_layers(
                     candidate.target_layerwise_pinned_layers or ()
                 )
-                if target_mode == RESIDENT:
-                    server_args.require_component_resident(
-                        candidate.component_name,
-                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                if target_mode == COMPONENT_OFFLOAD:
+                    module.remove_layerwise_offload()
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, COMPONENT_OFFLOAD
+                    )
+                    module.to("cpu")
+                elif target_mode == RESIDENT:
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, RESIDENT
                     )
                     if is_layerwise_offloaded_module(module):
                         module.disable_offload()
                 else:
                     if not is_layerwise_offloaded_module(module):
                         module.enable_offload()
-                    server_args.release_required_component_residency(
-                        candidate.component_name,
-                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                    server_args.set_auto_residency_mode(
+                        candidate.component_name, LAYERWISE_OFFLOAD
                     )
                     module.set_layerwise_resident_layer_counts(
                         candidate.target_layerwise_resident_layers
                     )
                 continue
             if target_mode == RESIDENT:
-                server_args.require_component_resident(
-                    candidate.component_name,
-                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
-                )
+                server_args.set_auto_residency_mode(candidate.component_name, RESIDENT)
             elif target_mode == COMPONENT_OFFLOAD:
-                server_args.release_required_component_residency(
-                    candidate.component_name,
-                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                server_args.set_auto_residency_mode(
+                    candidate.component_name, COMPONENT_OFFLOAD
                 )
                 module.to("cpu")
             else:
@@ -1763,9 +2081,34 @@ def rollback_residency_changes(
             if adjustment.previous_layerwise_resident_layers is not None:
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError("lost layerwise offload capability")
+                if not adjustment.previous_layerwise_configured:
+                    module.remove_layerwise_offload()
+                    if adjustment.previous_auto_residency_mode is None:
+                        server_args.clear_auto_residency_mode(adjustment.component_name)
+                    else:
+                        server_args.set_auto_residency_mode(
+                            adjustment.component_name,
+                            adjustment.previous_auto_residency_mode,
+                        )
+                    if (
+                        server_args.residency_mode(adjustment.component_name)
+                        != RESIDENT
+                    ):
+                        module.to("cpu")
+                    continue
                 currently_enabled = {
                     manager.enabled for manager in module.layerwise_offload_managers
                 }
+                if not currently_enabled:
+                    module.configure_layerwise_offload(
+                        server_args,
+                        pin_budget=server_args.host_pin_budget(),
+                        component_name=adjustment.component_name,
+                        pin_during_initialization=False,
+                    )
+                    currently_enabled = {
+                        manager.enabled for manager in module.layerwise_offload_managers
+                    }
                 if len(currently_enabled) != 1:
                     raise RuntimeError("layerwise managers have mixed enabled states")
                 current_enabled = currently_enabled.pop()
@@ -1774,15 +2117,12 @@ def rollback_residency_changes(
                     module.enable_offload()
                 elif not previous_enabled and current_enabled:
                     module.disable_offload()
-                if adjustment.previous_required_resident:
-                    server_args.require_component_resident(
-                        adjustment.component_name,
-                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
-                    )
+                if adjustment.previous_auto_residency_mode is None:
+                    server_args.clear_auto_residency_mode(adjustment.component_name)
                 else:
-                    server_args.release_required_component_residency(
+                    server_args.set_auto_residency_mode(
                         adjustment.component_name,
-                        feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                        adjustment.previous_auto_residency_mode,
                     )
                 module.restore_layerwise_resident_layers(
                     adjustment.previous_layerwise_resident_layers
@@ -1793,15 +2133,12 @@ def rollback_residency_changes(
                     adjustment.previous_layerwise_pinned_layers
                 )
                 continue
-            if adjustment.previous_required_resident:
-                server_args.require_component_resident(
-                    adjustment.component_name,
-                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
-                )
+            if adjustment.previous_auto_residency_mode is None:
+                server_args.clear_auto_residency_mode(adjustment.component_name)
             else:
-                server_args.release_required_component_residency(
+                server_args.set_auto_residency_mode(
                     adjustment.component_name,
-                    feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+                    adjustment.previous_auto_residency_mode,
                 )
             if not isinstance(module, nn.Module):
                 continue
@@ -1810,7 +2147,7 @@ def rollback_residency_changes(
                 # offload_during_compile window); moving it to CPU behind the
                 # manager would strand its bookkeeping.
                 pass
-            elif not adjustment.previous_required_resident:
+            elif server_args.residency_mode(adjustment.component_name) != RESIDENT:
                 module.to("cpu")
         except Exception as e:
             errors.append(f"{adjustment.component_name}: {describe_error(e)}")

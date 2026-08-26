@@ -198,6 +198,9 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         configured_residency_mode=lambda _name: "resident",
         explicit_residency_mode=lambda _name: None,
         component_residency_requirement=lambda _name: None,
+        auto_residency_mode=lambda _name: None,
+        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        pin_cpu_memory=True,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100, 100)
@@ -242,6 +245,9 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         configured_residency_mode=lambda _name: "resident",
         explicit_residency_mode=lambda _name: None,
         component_residency_requirement=lambda _name: None,
+        auto_residency_mode=lambda _name: None,
+        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        pin_cpu_memory=True,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)

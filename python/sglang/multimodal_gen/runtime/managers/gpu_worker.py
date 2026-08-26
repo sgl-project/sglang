@@ -50,7 +50,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    AUTO_RESIDENCY_FEATURE_NAME,
     GIB_BYTES,
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
@@ -82,6 +81,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     peek_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
@@ -202,6 +204,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._auto_residency_applied: list[AppliedResidencyChange] = []
         self._auto_residency_round_sizes: list[int] = []
+        # Keep every round on one serving objective. Re-warm measurements
+        # validate and refine memory constraints, but placement-dependent
+        # latency must not rewrite the utility function and cause oscillation.
+        self._auto_residency_reference_request_duration_ns: int | None = None
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
@@ -1463,14 +1469,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             auto_resident_components={
                 name
                 for name in self.pipeline.modules
-                if self.server_args.component_residency_requirement(name)
-                == AUTO_RESIDENCY_FEATURE_NAME
+                if self.server_args.auto_residency_mode(name) == RESIDENT
             },
+            layerwise_tuning_of=lambda name, dit_group: (
+                self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
+            ),
+            pin_cpu_memory=self.server_args.pin_cpu_memory,
         )
-        estimated_request_duration_ns, _, _ = estimate_default_workload_timing(
+        measured_request_duration_ns, _, _ = estimate_default_workload_timing(
             records=records,
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
+        )
+        reference_request_duration_ns = self.__dict__.get(
+            "_auto_residency_reference_request_duration_ns"
+        )
+        if reference_request_duration_ns is None and measured_request_duration_ns > 0:
+            reference_request_duration_ns = measured_request_duration_ns
+            self._auto_residency_reference_request_duration_ns = (
+                reference_request_duration_ns
+            )
+        estimated_request_duration_ns = (
+            reference_request_duration_ns or measured_request_duration_ns
         )
         candidate_latency_savings_ns = estimate_candidate_latency_savings_ns(
             candidates=candidates,
