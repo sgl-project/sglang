@@ -5,10 +5,15 @@ import torch
 
 from sglang.srt.lora.backend.base_backend import _compute_moe_lora_info
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_xpu_ci(est_time=5, stage="stage-a", runner_config="1-gpu-xpu")
 
 DEVICE = get_device()
 
@@ -70,14 +75,6 @@ def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
 
 
 def test_compute_moe_lora_info_rejects_undercovered_launch():
-    """An undersized ``max_len`` is rejected on every device.
-
-    ``max_len`` sizes the token-mapping launch grid: one tile row per segment
-    must cover every token, or the tail of ``token_lora_mapping`` is left
-    unwritten. The geometry check is plain integer math, so it runs on the
-    fallback devices too -- a caller that miscomputes ``max_len`` fails loudly
-    on XPU instead of surfacing only once the batch reaches a CUDA host.
-    """
     device = DEVICE
     seg_indptr = torch.tensor([0, 300], dtype=torch.int32, device=device)
     weight_indices = torch.tensor([0], dtype=torch.int32, device=device)

@@ -15,9 +15,10 @@ Covers two regression bugs that surface only with `--lora-use-virtual-experts`
   wrap, or past-end) and don't get assigned to a real expert in the
   consumer-block table.
 
-Both kernels run on CUDA. The fallback is gated on `virtual_num_experts >= 1024`
-in production, but we exercise it directly here at smaller sizes for cheaper
-iteration; one test sticks to the >1024 regime to mirror the production trigger.
+Both kernels run on CUDA or XPU; only the CUDA-JIT align variant is CUDA-only.
+The fallback is gated on `virtual_num_experts >= 1024` in production, but we
+exercise it directly here at smaller sizes for cheaper iteration; one test
+sticks to the >1024 regime to mirror the production trigger.
 
 Usage:
     python -m pytest test/registered/lora/test_virtual_experts_kernels.py -v
@@ -28,18 +29,14 @@ import unittest
 import torch
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_xpu_ci(est_time=20, stage="stage-a", runner_config="1-gpu-xpu")
 
 
 def _require_accelerator_device():
-    """Return the active GPU device string, or skip if no GPU is available.
-
-    The virtual-experts kernels are triton kernels that run on CUDA or XPU
-    (Intel triton). They have no CPU implementation.
-    """
     if not (is_cuda() or is_xpu()):
         raise unittest.SkipTest("CUDA or XPU required")
     return get_device(0)
