@@ -224,16 +224,31 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
+        fixed_idle_graph = idle_layout is not None and num_tokens_per_req is not None
+        if fixed_idle_graph:
+            # ForwardBatch snapshots this flag (and uses it while performing
+            # its initial graph-admission check), so the override must happen
+            # before prepare_for_verify rather than on the resulting batch.
+            batch.can_run_dp_cuda_graph = True
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        if idle_layout is not None and num_tokens_per_req is not None:
-            # The local schedule batch is empty, but fixed compact capture has
-            # already materialized this shared token-keyed graph on every DP
-            # rank.  All ranks must replay it to keep graph/HCCL order aligned.
-            verify_forward_batch.can_run_dp_cuda_graph = True
-        elif idle_layout is None and num_tokens_per_req is not None:
+        if fixed_idle_graph and not can_run_cuda_graph:
+            graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+            raise RuntimeError(
+                "fixed idle ragged verify was not admitted to the captured graph: "
+                f"runner={graph_runner is not None}, "
+                f"supports_ragged={getattr(graph_runner.attn_backend, 'supports_ragged_verify_graph', None) if graph_runner is not None else None}, "
+                f"capture_tokens={getattr(graph_runner, 'capture_num_tokens', None)}, "
+                f"graph_tokens={idle_layout.graph_num_tokens}, "
+                f"batch_size={verify_forward_batch.batch_size}, "
+                f"dp_graph={verify_forward_batch.can_run_dp_cuda_graph}, "
+                f"replace_embeds={verify_forward_batch.replace_embeds is not None}, "
+                f"hidden={verify_forward_batch.capture_hidden_mode}/"
+                f"{getattr(graph_runner, 'capture_hidden_mode', None)}"
+            )
+        if idle_layout is None and num_tokens_per_req is not None:
             # Fixed compact capture has token-keyed ragged graphs only.  Under
             # SUM_LEN this rank owns zero tokens, so keep its empty collective
             # participation eager instead of looking up the uncaptured bs=1
