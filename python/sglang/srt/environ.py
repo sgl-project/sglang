@@ -493,6 +493,7 @@ class Envs:
     # rank. This is especially useful for latency-sensitive bs=1 serving.
     SGLANG_DSPARK_FIXED_VERIFY_LEN = EnvInt(0)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
+    SGLANG_DSPARK_NPU_FP32_WOA = EnvBool(False)
     SGLANG_DSPARK_FUSED_LOCAL_TOP1 = EnvBool(False)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)

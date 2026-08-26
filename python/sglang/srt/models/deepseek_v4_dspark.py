@@ -130,6 +130,9 @@ class DSparkAttention(MqaAttentionBase):
         )
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
+        self._use_fp32_wo_a = (
+            _is_npu and envs.SGLANG_DSPARK_NPU_FP32_WOA.get()
+        )
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
         if _is_npu:
@@ -332,7 +335,7 @@ class DSparkAttention(MqaAttentionBase):
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
+        if self._use_fast_kernel and not self._use_fp32_wo_a:
             o = torch.einsum("bgd,grd->bgr", o, wo_a)
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
