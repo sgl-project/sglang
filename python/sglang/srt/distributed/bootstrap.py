@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
 )
@@ -127,10 +128,14 @@ def init_torch_distributed(
         # included in later KV-cache sizing instead of appearing during capture.
         if (
             device == "cuda"
-            and get_parallel().enable_tp_lm_head_all_to_all
+            and get_parallel().config.enable_tp_lm_head_all_to_all
             and ps.tp_size > 1
         ):
             _prewarm_tp_lm_head_all_to_all()
+
+    maybe_wait_for_gated_launch(
+        host=server_args.host, port=server_args.gated_launch_port
+    )
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
@@ -261,7 +266,7 @@ def _init_parallel_groups(
         duplicate_attn_cp_group=(
             is_hip()
             and server_args.enable_two_batch_overlap
-            and get_parallel().enable_dsa_prefill_context_parallel
+            and get_parallel().config.enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,

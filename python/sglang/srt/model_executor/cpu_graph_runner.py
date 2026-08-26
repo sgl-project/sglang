@@ -40,7 +40,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_exec,
     get_flags,
     get_lora,
@@ -185,6 +184,7 @@ def register_fake_ops(tp_size: int):
         "fused_add_layernorm_cpu",
         "multimodal_rotary_embedding_cpu",
         "apply_multidimensional_rope_cpu",
+        "fused_sigmoid_mul_cpu",
     ]
     for op in none_return_ops:
 
@@ -208,6 +208,19 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
+    def _(q, k, q_weight, k_weight, eps, head_dim):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_with_gate_cpu")
+    def _(q_gate, k, q_weight, k_weight, eps, head_dim, num_head):
+        seq_len = q_gate.shape[0]
+        num_head_kv = k.shape[1] // head_dim
+        q_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        k_out = k.new_empty((seq_len * num_head_kv, head_dim))
+        gate_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        return q_out, k_out, gate_out
 
     @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
     def _(q, k, *args, **kwargs):
@@ -597,8 +610,8 @@ class CPUGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.dp_size = get_parallel().config.dp_size
+        self.pp_size = get_parallel().config.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode

@@ -7,8 +7,8 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_model,
+    get_parallel,
     get_spec,
 )
 
@@ -242,7 +242,7 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=configured_tp_size(),
+            tp_size=get_parallel().config.tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

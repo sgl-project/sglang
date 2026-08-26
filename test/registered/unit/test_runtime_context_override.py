@@ -87,7 +87,7 @@ class TestContextOverride(CustomTestCase):
             speculative_accept_threshold_single=0.5,
             speculative_accept_threshold_acc=0.9,
         )
-        self.assertEqual(rc.get_parallel().pp_max_micro_batch_size, 8)
+        self.assertEqual(rc.get_parallel().config.pp_max_micro_batch_size, 8)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_single, 0.5)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_acc, 0.9)
 

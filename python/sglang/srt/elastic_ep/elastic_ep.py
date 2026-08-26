@@ -12,7 +12,6 @@ from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
 )
@@ -93,7 +92,7 @@ class ElasticEPStateManager:
 
         if get_exec().moe.elastic_ep_backend is not None:
             world_size = torch.distributed.get_world_size()
-            active_rank_capacity = get_parallel().max_ep_size or world_size
+            active_rank_capacity = get_parallel().config.max_ep_size or world_size
             assert active_rank_capacity >= world_size, (
                 f"--max-ep-size ({active_rank_capacity}) must be >= "
                 f"world_size ({world_size})."
@@ -110,7 +109,7 @@ class ElasticEPStateManager:
             if get_exec().moe.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
 
-            inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
+            inst.ep_join_rank_offset = get_parallel().config.ep_join_rank_offset
             if server_args.is_ep_joiner:
                 cls._init_joiner_state(inst, server_args)
 
@@ -128,11 +127,12 @@ class ElasticEPStateManager:
 
         if get_exec().moe.ep_join_mode == "scale":
             inst.effective_ep_size = (
-                get_parallel().ep_join_rank_offset + configured_tp_size()
+                get_parallel().config.ep_join_rank_offset
+                + get_parallel().config.tp_size
             )
             inst.original_ep_size = (
-                get_parallel().elastic_ep_initial_size
-                or get_parallel().ep_join_rank_offset
+                get_parallel().config.elastic_ep_initial_size
+                or get_parallel().config.ep_join_rank_offset
             )
             inst.has_scaled = True
         else:
@@ -317,7 +317,7 @@ def elastic_expanded_world_enabled() -> bool:
     inst = ElasticEPStateManager.instance()
     if inst is None:
         return False
-    if get_parallel().max_ep_size is None:
+    if get_parallel().config.max_ep_size is None:
         return False
     active_target_size = inst.effective_ep_size
     if inst.pending_ep_size is not None and inst.scale_phase in (
