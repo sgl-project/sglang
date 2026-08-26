@@ -1,12 +1,9 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import requests
-import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
-    TboForwardBatchPreparer,
     compute_split_seq_index,
     compute_split_token_index,
 )
@@ -121,82 +118,6 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
             actual = (actual_seq_idx, actual_token_idx)
             print(f"{extend_lens=} {expect=} {actual=}")
             self.assertEqual(actual, expect)
-
-    def test_eager_prepare_preserves_zero_parent_cpu_count(self):
-        """An idle MAX_LEN parent must produce two zero-count TBO children."""
-        batch = SimpleNamespace(
-            tbo_split_seq_index=2,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
-            extend_seq_lens_cpu=None,
-            num_token_non_padded_cpu=0,
-        )
-
-        with (
-            patch.object(
-                TboForwardBatchPreparer,
-                "compute_tbo_children_num_token_non_padded",
-                return_value=(0, 0),
-            ),
-            patch.object(TboForwardBatchPreparer, "prepare_raw") as prepare_raw,
-        ):
-            TboForwardBatchPreparer.prepare(batch)
-
-        prepare_raw.assert_called_once()
-        child_cpu_counts = prepare_raw.call_args.kwargs[
-            "tbo_children_num_token_non_padded_cpu"
-        ]
-        self.assertEqual(child_cpu_counts, (0, 0))
-
-    def test_capture_count_falls_back_to_physical_rows(self):
-        """A decode CUDA-graph capture batch has no CPU count mirror."""
-        batch = SimpleNamespace(
-            tbo_split_seq_index=2,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
-            extend_seq_lens_cpu=None,
-            input_ids=torch.empty(8, dtype=torch.long),
-            num_token_non_padded_cpu=None,
-        )
-
-        with patch(
-            "sglang.srt.batch_overlap.two_batch_overlap.get_device",
-            return_value=SimpleNamespace(device="cpu"),
-        ):
-            children = (
-                TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
-                    batch
-                )
-            )
-
-        self.assertEqual(children.cpu().tolist(), [2, 6])
-
-    def test_prepare_falls_back_to_physical_rows_for_missing_cpu_count(self):
-        """prepare() must propagate the capture fallback to TBO children."""
-        batch = SimpleNamespace(
-            tbo_split_seq_index=2,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
-            extend_seq_lens_cpu=None,
-            input_ids=torch.empty(8, dtype=torch.long),
-            num_token_non_padded_cpu=None,
-        )
-
-        with (
-            patch.object(
-                TboForwardBatchPreparer,
-                "compute_tbo_children_num_token_non_padded",
-                return_value=torch.tensor([2, 6], dtype=torch.int32),
-            ),
-            patch.object(TboForwardBatchPreparer, "prepare_raw") as prepare_raw,
-        ):
-            TboForwardBatchPreparer.prepare(batch)
-
-        prepare_raw.assert_called_once()
-        child_cpu_counts = prepare_raw.call_args.kwargs[
-            "tbo_children_num_token_non_padded_cpu"
-        ]
-        self.assertEqual(child_cpu_counts, (2, 6))
 
 
 class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):

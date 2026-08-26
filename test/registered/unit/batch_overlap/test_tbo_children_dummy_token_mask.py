@@ -16,6 +16,7 @@ CPU-only.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -37,6 +38,18 @@ def _make_extend_batch(*, padded_num_tokens: int, num_token_non_padded_cpu: int)
         extend_seq_lens_cpu=[4, 4],
         input_ids=torch.zeros(padded_num_tokens, dtype=torch.long),
         num_token_non_padded_cpu=num_token_non_padded_cpu,
+    )
+
+
+def _make_decode_capture_batch(*, num_tokens: int):
+    # Decode CUDA-graph capture batches do not populate the CPU mirror.
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        tbo_split_seq_index=2,
+        extend_seq_lens_cpu=None,
+        input_ids=torch.zeros(num_tokens, dtype=torch.long),
+        num_token_non_padded_cpu=None,
     )
 
 
@@ -90,9 +103,12 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
             seq_lens_sum=bs,
             spec_info=None,
         )
-        with get_context().override_server_args(
-            attention_backend="fa3", moe_dense_tp_size=None
-        ), get_parallel().override(attn_tp_size=1):
+        with (
+            get_context().override_server_args(
+                attention_backend="fa3", moe_dense_tp_size=None
+            ),
+            get_parallel().override(attn_tp_size=1),
+        ):
             child = TboForwardBatchPreparer.filter_batch(
                 parent,
                 start_token_index=0,
@@ -103,6 +119,29 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
                 out_num_token_non_padded_cpu=0,
             )
         self.assertEqual(child.num_token_non_padded_cpu, 0)
+
+    def test_capture_count_falls_back_to_physical_rows(self):
+        batch = _make_decode_capture_batch(num_tokens=8)
+        self.assertEqual(self._children_counts(batch), [2, 6])
+
+    def test_prepare_falls_back_to_physical_rows_for_missing_cpu_count(self):
+        batch = _make_decode_capture_batch(num_tokens=8)
+
+        with (
+            patch.object(
+                TboForwardBatchPreparer,
+                "compute_tbo_children_num_token_non_padded",
+                return_value=torch.tensor([2, 6], dtype=torch.int32),
+            ),
+            patch.object(TboForwardBatchPreparer, "prepare_raw") as prepare_raw,
+        ):
+            TboForwardBatchPreparer.prepare(batch)
+
+        prepare_raw.assert_called_once()
+        self.assertEqual(
+            prepare_raw.call_args.kwargs["tbo_children_num_token_non_padded_cpu"],
+            (2, 6),
+        )
 
 
 if __name__ == "__main__":
