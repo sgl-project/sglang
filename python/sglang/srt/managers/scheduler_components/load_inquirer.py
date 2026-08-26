@@ -112,9 +112,10 @@ class SchedulerLoadInquirer:
             decode_retracted_queue = (
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
-            decode_demotion_queue = (
-                self.get_disagg_decode_prealloc_queue().demotion_queue
-            )
+            decode_demotion_queue = [
+                entry.req
+                for entry in self.get_disagg_decode_prealloc_queue().demotion_queue
+            ]
             waiting_queues.append(decode_prealloc_queue)
             waiting_queues.append(decode_transfer_queue)
             waiting_queues.append(decode_retracted_queue)
