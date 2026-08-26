@@ -568,7 +568,7 @@ class LTX2DenoisingStage(DenoisingStage):
             generator=generator,
             dtype=(
                 torch.float32
-                if current_platform.is_float64_supported()
+                if not current_platform.is_float64_supported()
                 else torch.float64
             ),
             device=reference_tensor.device,
