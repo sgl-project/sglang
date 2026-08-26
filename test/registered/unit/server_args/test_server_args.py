@@ -1262,6 +1262,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "NemotronHPuzzleForCausalLM",
             "Qwen2MoeForCausalLM",
             "Qwen3MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
         )
         for architecture in supported:
             with self.subTest(architecture=architecture):

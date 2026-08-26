@@ -610,6 +610,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+
+        if (
+            (
+                get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
+            )
+            and self.shared_expert is not None
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        ):
+            router_output = self._forward_router_experts(hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states, apply_gate=not use_fused_gate
+                )
+                shared_output.record_stream(current_stream)
+            current_stream.wait_stream(self.alt_stream)
+            return router_output, shared_output
+
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate

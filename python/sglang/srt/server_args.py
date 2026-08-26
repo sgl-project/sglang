@@ -319,6 +319,9 @@ FLASHINFER_MEGAMOE_SUPPORTED_MODEL_ARCHITECTURES = frozenset(
         # Qwen3 MoE has no separate shared-expert branch and is part of the
         # original FlashInfer MegaMOE integration.
         "Qwen3MoeForCausalLM",
+        # Qwen3.5 MoE reuses Qwen2MoeSparseMoeBlock for routed experts. Its
+        # separately quantized shared expert stays outside MegaMOE.
+        "Qwen3_5MoeForConditionalGeneration",
     }
 )
 
