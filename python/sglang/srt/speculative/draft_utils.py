@@ -1,3 +1,8 @@
+from sglang.srt.layers.attention.qsa.config import (
+    QSA_VARIANT_COMPRESSED,
+    is_qwen_qsa,
+    parse_qsa_profile,
+)
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -108,11 +113,6 @@ class DraftBackendFactory:
 
     def create_draft_extend_backend(self):
         if self._is_qwen_qsa_draft_model():
-            from sglang.srt.layers.attention.qsa.config import (
-                QSA_VARIANT_COMPRESSED,
-                parse_qsa_profile,
-            )
-
             profile = parse_qsa_profile(
                 self.draft_model_runner.model_config.hf_config
             )
@@ -172,8 +172,6 @@ class DraftBackendFactory:
         return wrapped
 
     def _is_qwen_qsa_draft_model(self) -> bool:
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
-
         return is_qwen_qsa(self.draft_model_runner.model_config.hf_config)
 
     def _create_qwen_qsa_decode_backend(self):

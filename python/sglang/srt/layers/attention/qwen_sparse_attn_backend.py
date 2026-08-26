@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.graph_metadata import (
+    launch_graph_metadata,
+    supports_graph_metadata_kernels,
+)
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
@@ -38,6 +42,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_sm100_supported, is_sm121
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +58,6 @@ def _resolve_trtllm_sparse_decode():
     at decode row counts; the trtllm-gen decode kernel over a page-aligned
     scratch measures ~35% faster for the gather+attention pair.
     """
-    from sglang.srt.utils import is_sm100_supported, is_sm121
-
     if not (is_sm100_supported() or is_sm121()):
         return None
     try:
@@ -1078,10 +1081,6 @@ class QwenSparseAttnBackend(AttentionBackend):
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
         if self.req_to_token is None:
             return False
-        from sglang.srt.layers.attention.qsa.graph_metadata import (
-            supports_graph_metadata_kernels,
-        )
-
         return seq_lens.is_cuda and supports_graph_metadata_kernels(
             metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
         )
@@ -1131,10 +1130,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         then rebuild every per-row graph buffer on-GPU from lengths plus
         the sidecar — no allocation, no reserve, no copy-on-write.
         """
-
-        from sglang.srt.layers.attention.qsa.graph_metadata import (
-            launch_graph_metadata,
-        )
 
         indexer = metadata.indexer_metadata
         pool = indexer.token_to_kv_pool

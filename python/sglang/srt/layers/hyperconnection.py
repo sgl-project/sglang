@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.elementwise.hc_combine import hc_combine, hc_combine_split
+from sglang.kernels.ops.elementwise.hc_mix import hc_mix, permute_pad_up_weight
+from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
@@ -50,10 +53,6 @@ class GroupedGemmaRMSNorm(nn.Module):
             and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
-            from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
-                grouped_gemma_rmsnorm,
-            )
-
             return grouped_gemma_rmsnorm(
                 x, self.weight, self._jit_group_size, self.variance_epsilon
             )
@@ -244,11 +243,6 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
-            from sglang.kernels.ops.elementwise.hc_mix import (
-                hc_mix,
-                permute_pad_up_weight,
-            )
-
             if self._mix_up_weight_padded is None:
                 self._mix_up_weight_padded = permute_pad_up_weight(
                     self.input_mix_weight_up.weight, self.hc_count
@@ -298,10 +292,6 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
-
                 return hc_combine_split(
                     block_output,
                     hyper_input,
@@ -310,8 +300,6 @@ class GatedResidual(HyperConnectionBase):
                     self.hc_count,
                     self.hidden_size,
                 )
-            from sglang.kernels.ops.elementwise.hc_combine import hc_combine
-
             return hc_combine(
                 block_output,
                 hyper_input,

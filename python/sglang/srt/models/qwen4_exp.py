@@ -21,6 +21,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+from sglang.srt.layers.attention.qsa.glue import (
+    build_qsa_indexer,
+    get_qsa_indexer_metadata,
+    resolve_qsa_sparse_backend,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -1439,9 +1445,6 @@ class Qwen4ExpAttentionDecoderLayer(
     ) -> None:
         config.attn_output_gate = True
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
-        from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
-
         self.is_qsa = is_qwen_qsa(config)
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
@@ -1459,11 +1462,6 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.qsa.glue import (
-            get_qsa_indexer_metadata,
-            resolve_qsa_sparse_backend,
-        )
-
         backend = get_attn_backend()
         sparse_backend = resolve_qsa_sparse_backend(backend)
         should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)

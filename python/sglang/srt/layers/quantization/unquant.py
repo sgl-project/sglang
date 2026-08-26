@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_sm100_supported,
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
@@ -143,8 +144,6 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _flashinfer_pr4266_run_splitk_dense, _flashinfer_pr4266_splitk_tactic
     global _enable_bf16_splitk_gemm
-
-    from sglang.srt.utils import is_sm100_supported
 
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
