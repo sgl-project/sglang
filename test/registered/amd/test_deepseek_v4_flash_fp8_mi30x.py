@@ -9,6 +9,9 @@ MI300X strategies it is the only TP-only one (balanced and high-throughput add
 DP attention and the prefill delayer), so it is the narrowest cell that still
 covers the gfx942 serving path. Keep this in sync with that cell.
 
+The cell as published could not load this checkpoint; the fix is in the
+cookbook PR and is the SGLANG_DSV4_FP4_EXPERTS entry below.
+
 Accuracy only: gfx942 has no DSV4 perf baseline to regress against yet, and the
 MI35x suite already carries the 8k/1k throughput numbers. The GSM8K threshold
 matches the MI35x FP8 test so the two architectures are comparable on the same
@@ -47,6 +50,12 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 3600
 
 ENV_VARS = {
+    # The routed experts of this checkpoint are FP8, not mxfp4-packed. The env
+    # default is mxfp4 and the auto-detect fallback reads the safetensors header
+    # from the local HF cache, so it returns None on a runner that has not pulled
+    # the weights yet and the wrong default wins -- weight load then dies on a
+    # factor-of-2 shape mismatch. Set it rather than depend on cache state.
+    "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_USE_ROCM700A": "0",
     "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
     "AITER_BF16_FP8_MOE_BOUND": "0",
