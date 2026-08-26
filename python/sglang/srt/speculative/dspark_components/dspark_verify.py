@@ -228,6 +228,12 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if idle_layout is None and num_tokens_per_req is not None:
+            # Fixed compact capture has token-keyed ragged graphs only.  Under
+            # SUM_LEN this rank owns zero tokens, so keep its empty collective
+            # participation eager instead of looking up the uncaptured bs=1
+            # non-ragged graph.
+            verify_forward_batch.can_run_dp_cuda_graph = False
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
