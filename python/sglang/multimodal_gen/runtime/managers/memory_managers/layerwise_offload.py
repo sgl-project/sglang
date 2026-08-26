@@ -2119,7 +2119,7 @@ def configure_layerwise_offload_modules(
         key=_h2d_bytes_a_pin_would_save,
         reverse=True,
     )
-    pin_budget = HostPinBudget()
+    pin_budget = HostPinBudget(node_local_ranks=server_args.node_local_gpu_worker_count)
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
     for component_name in selected_pipeline_component_names:

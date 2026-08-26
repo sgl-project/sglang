@@ -1586,6 +1586,15 @@ class ServerArgs(DisaggServerArgsMixin):
     ) -> None:
         self._component_layerwise_capabilities[component_name] = supported
 
+    @property
+    def node_local_gpu_worker_count(self) -> int:
+        """GPU worker processes sharing this node's host memory.
+
+        Per-process host budgets divide by it, because each worker reads the
+        same host-wide free-memory number.
+        """
+        return max(1, self.num_gpus // max(1, self.nnodes))
+
     def has_layerwise_offload_components(self) -> bool:
         return bool(
             self.dit_layerwise_offload
