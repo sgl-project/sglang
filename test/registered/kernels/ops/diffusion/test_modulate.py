@@ -146,6 +146,79 @@ def test_residual_gate_add_dtypes(dtype, gate_shape):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", [(1, 17, 65), (1, 7800, 2240), (2, 33, 128)])
+def test_residual_gate_add_transposed_residual(dtype, shape):
+    batch, tokens, hidden_size = shape
+    residual = torch.randn(
+        (batch, hidden_size, tokens), device=DEVICE, dtype=dtype
+    ).transpose(1, 2)
+    update = torch.randn(shape, device=DEVICE, dtype=dtype)
+    gate = torch.randn((1, 1, hidden_size), device=DEVICE, dtype=dtype)
+
+    assert not residual.is_contiguous()
+    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    ref = residual + update * gate
+    out = residual_gate_add_cuda(residual, update, gate)
+    _assert_gate_add(out, ref)
+    assert out.stride() == ref.stride() == residual.stride()
+
+
+def test_residual_gate_add_transposed_storage_offsets():
+    tokens, hidden_size = 33, 128
+    residual = (
+        torch.randn(1 + tokens * hidden_size, device=DEVICE, dtype=torch.bfloat16)[1:]
+        .view(1, hidden_size, tokens)
+        .transpose(1, 2)
+    )
+    update = torch.randn(1 + tokens * hidden_size, device=DEVICE, dtype=torch.bfloat16)[
+        1:
+    ].view(1, tokens, hidden_size)
+    gate = torch.randn(1 + hidden_size, device=DEVICE, dtype=torch.bfloat16)[1:].view(
+        1, 1, hidden_size
+    )
+
+    assert residual.storage_offset() > 0
+    assert update.storage_offset() > 0
+    assert gate.storage_offset() > 0
+    assert can_use_residual_gate_add_cuda(residual, update, gate)
+    out = residual_gate_add_cuda(residual, update, gate)
+    assert torch.equal(out, residual + update * gate)
+
+
+def test_residual_gate_add_transposed_torch_compile_fullgraph():
+    residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
+        1, 2
+    )
+    update = torch.randn_like(residual, memory_format=torch.contiguous_format)
+    gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
+    compiled = torch.compile(residual_gate_add, fullgraph=True)
+    out = compiled(residual, update, gate)
+    assert torch.equal(out, residual + update * gate)
+    assert out.stride() == residual.stride()
+
+
+def test_residual_gate_add_transposed_cuda_graph():
+    residual = torch.randn((1, 128, 32), device=DEVICE, dtype=torch.bfloat16).transpose(
+        1, 2
+    )
+    update = torch.randn_like(residual, memory_format=torch.contiguous_format)
+    gate = torch.randn((1, 1, 128), device=DEVICE, dtype=torch.bfloat16)
+
+    # Build the JIT module before capture; graph capture must contain only the
+    # allocation and kernel launch used during steady-state replay.
+    residual_gate_add_cuda(residual, update, gate)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = residual_gate_add_cuda(residual, update, gate)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(out, residual + update * gate)
+    assert out.stride() == residual.stride()
+
+
 def test_residual_gate_add_guards_and_eager_fallback():
     residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
