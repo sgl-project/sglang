@@ -250,6 +250,21 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
         validate_declarations(server_args, [entry])
 
 
+def apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
+    """Write record fields past the guard that forbids post-resolution writes.
+
+    Resolution declares, so nothing in the pipeline calls this. It exists for
+    ``RuntimeContext.override_server_args``, the launch stand-in tests use: there
+    the caller's values are both the operator's input and resolution's answer.
+    """
+    object.__setattr__(server_args, "_internal_write", True)
+    try:
+        for field, value in fields.items():
+            setattr(server_args, field, value)
+    finally:
+        object.__setattr__(server_args, "_internal_write", False)
+
+
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Record a resolution write in the declaration stash.
 
