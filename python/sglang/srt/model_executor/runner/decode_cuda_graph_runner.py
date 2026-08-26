@@ -339,6 +339,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
+        if (
+            self.ragged_verify_mode
+            and _is_npu
+            and envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get() > 0
+            and not self.attn_backend.supports_ragged_verify_graph
+        ):
+            # Fixed-width compact verify is also representable by the regular
+            # uniform graph.  Keep Ascend backends without dynamic-ragged
+            # metadata support on that proven path while retaining the compact
+            # verify window outside the graph runner.
+            self.ragged_verify_mode = False
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
             if self.ragged_verify_mode
@@ -730,22 +741,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
-        fixed_verify_len = int(envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get())
-        # Ascend's hybrid wrapper conservatively rejects dynamic ragged replay.
-        # A DSpark fixed-width tier replays the capture shape unchanged, so it
-        # does not depend on that dynamic metadata capability.
-        is_npu_fixed_shape = bool(
-            _is_npu
-            and fixed_verify_len > 0
-            and fixed_verify_len == self.captured_req_width
-            and getattr(forward_batch.spec_info, "num_tokens_per_req", None)
-            == fixed_verify_len
-            and ragged_layout.graph_num_tokens in self.capture_num_tokens
-        )
-        if (
-            not self.attn_backend.supports_ragged_verify_graph
-            and not is_npu_fixed_shape
-        ):
+        if not self.attn_backend.supports_ragged_verify_graph:
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
