@@ -78,14 +78,22 @@ class WaterfillBalancer:
         rank: int,
         layer_id: int,
         routed_scaling_factor: float = 1.0,
+        rsf_prefolded_in_topk: bool = False,
     ):
         self.num_routed_experts = num_routed_experts
         self.world_size = world_size
         self.rank = rank
         self.layer_id = layer_id
         self.old_experts_per_rank = num_routed_experts // world_size
+        # 1/rsf compensates the post-MoE routed_scaling_factor multiply so
+        # the always-on shared expert nets out to 1.0x. When rsf is
+        # pre-folded into the routed topk weights (aiter /
+        # apply_routed_scaling_factor_on_output families) that multiply is
+        # skipped and the shared expert needs its full 1.0 weight.
         self.shared_weight = (
-            1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
+            1.0
+            if rsf_prefolded_in_topk
+            else (1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0)
         )
         self._counts_buf: Optional[Tensor] = None
         self.use_static_waterfill = not envs.SGLANG_DISABLE_STATIC_WATERFILL.get()
