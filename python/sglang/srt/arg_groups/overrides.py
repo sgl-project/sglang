@@ -1482,8 +1482,32 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_sm100_supported() and server_args.attention_backend is None:
-        overrides["attention_backend"] = "flashinfer"
+    if is_blackwell_supported() and server_args.is_attention_backend_not_set():
+        if server_args.speculative_algorithm is not None:
+            speculative_algorithm = server_args.speculative_algorithm.upper()
+            if is_sm100_supported() and server_args.speculative_eagle_topk in (
+                None,
+                1,
+            ):
+                overrides["attention_backend"] = "trtllm_mha"
+                if server_args.page_size is None:
+                    overrides["page_size"] = 64
+                if server_args.mamba_radix_cache_strategy == "auto":
+                    overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "triton"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "flashinfer"
+        elif is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
     return overrides
 
 
