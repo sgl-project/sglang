@@ -411,6 +411,56 @@ def _chain_reads(written):
     return sorted(found)
 
 
+def _passes_named_at_call_sites() -> set:
+    """Names passed to ``run_post_process_pass(sa, fn)`` anywhere in the tree."""
+    names = set()
+    for path in sorted(pathlib.Path(next(iter(sglang.__path__))).rglob("*.py")):
+        source = path.read_text(encoding="utf-8-sig")
+        if "run_post_process_pass" not in source:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "run_post_process_pass"
+                and len(node.args) == 2
+                and isinstance(node.args[1], ast.Name)
+            ):
+                names.add(node.args[1].id)
+    return names
+
+
+class TestEveryInvokedPassIsRegistered(CustomTestCase):
+    """The registry is what the scans above enumerate, so a pass missing from it
+    is a pass nothing checks.
+
+    Being invoked and being registered are two edits, and `_a2a_fusion_adjustments`
+    shipped with only the first: it ran in production while the registry-driven
+    scans walked past it. The call sites are the ground truth here -- the registry
+    is derived from a decorator someone has to remember.
+    """
+
+    def test_the_registry_covers_every_call_site(self):
+        from sglang.srt.arg_groups import overrides
+
+        invoked = _passes_named_at_call_sites()
+        self.assertGreater(
+            len(invoked),
+            20,
+            f"only {len(invoked)} call sites found; the scan is broken, not the tree",
+        )
+        registered = {fn.__name__ for fn in overrides.POST_PROCESS_PASSES}
+        self.assertEqual(
+            set(),
+            invoked - registered,
+            "these passes are invoked but carry no @register_post_process, so "
+            "every check that walks POST_PROCESS_PASSES skips them",
+        )
+
+
 class TestNoChainReadsOfResolvedConfig(CustomTestCase):
     def test_the_census_has_something_to_count(self):
         """A written set that collapsed would make the pin vacuous.

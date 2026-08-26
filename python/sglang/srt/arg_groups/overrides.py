@@ -190,10 +190,10 @@ def resolving_view(server_args: Any) -> ResolvingConfig:
     return ResolvingConfig(server_args)
 
 
-# Ordered post-process passes (the normalization stage). List order is the
-# end-state execution order and mirrors today's handler call sequence in
-# __post_init__; during the transition each pass is invoked from its legacy
-# slot via run_post_process_pass, so ordering is preserved byte-for-byte.
+# Registered post-process passes, in definition order. Each is invoked from its
+# own slot, so this is a registry the checks enumerate rather than an execution
+# order: `_hisparse_validation` runs from `check_server_args`, a later stage than
+# the rest, and sits here among the __post_init__ passes.
 POST_PROCESS_PASSES: List[Callable[..., dict]] = []
 
 
@@ -2805,6 +2805,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     return {}
 
 
+@register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
@@ -2980,6 +2981,7 @@ def validate_declarations(
             )
 
 
+@register_post_process
 def _hrm_text_attention_force(view: Any) -> dict:
     """HRM-Text's bidirectional prefix attention only works on the Triton
     backend. Invoked as the last attention declaration of the resolution
