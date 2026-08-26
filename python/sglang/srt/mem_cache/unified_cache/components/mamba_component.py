@@ -680,10 +680,11 @@ class MambaComponent(TreeComponent):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        host_indices = self._mamba_pool_host.alloc(1)
-        if host_indices is None:
-            self.cache.evict_host(1, ComponentType.MAMBA)
-            host_indices = self._mamba_pool_host.alloc(1)
+        host_indices = self.cache.host_pool_group.alloc(
+            1,
+            pool=PoolName.MAMBA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.MAMBA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -897,7 +898,7 @@ class MambaComponent(TreeComponent):
         if self._mamba_pool_host is None:
             return
         for host_value in host_values:
-            self._mamba_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.MAMBA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
