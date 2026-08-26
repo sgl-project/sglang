@@ -1960,7 +1960,13 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "DeepseekV4ForCausalLM",
+        # DeepseekV4ForCausalLM is deliberately absent: with EP + the NextN draft
+        # runner, the fusion workspace creation barriers inside cuda-graph capture
+        # against the capture loop's own barrier -- rank killed by the NCCL
+        # watchdog at 10 min, peers die on gloo "connection closed by peer"
+        # (miles test_session_server_multi_role/test_deepseekv4, 2/2 rounds).
+        # v0.5.16 never auto-enabled DSV4; an explicit
+        # --flashinfer-allreduce-fusion-backend still opts in.
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
