@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace host::norm {
 
 /**
@@ -166,3 +168,5 @@ using StorageType = std::conditional_t<                    // storage type
 inline constexpr uint32_t kSmemBufferSize = 33;
 
 }  // namespace device::norm
+
+}  // namespace sglang

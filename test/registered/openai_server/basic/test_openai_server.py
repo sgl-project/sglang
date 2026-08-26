@@ -7,6 +7,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 
 import json
 import random
+import re
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -18,6 +19,7 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.anthropic_messages_kit import AnthropicMessagesMixin
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST,
@@ -25,14 +27,15 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=182, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=280, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestOpenAIServer(CustomTestCase):
+class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -50,6 +53,107 @@ class TestOpenAIServer(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def test_ignore_eos(self):
+        """ignore_eos=True must keep generating past EOS up to max_tokens."""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        max_tokens = 200
+
+        response_default = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": False},
+        )
+
+        response_ignore_eos = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Count from 1 to 20."},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            extra_body={"ignore_eos": True},
+        )
+
+        default_tokens = len(
+            self.tokenizer.encode(response_default.choices[0].message.content)
+        )
+        ignore_eos_tokens = len(
+            self.tokenizer.encode(response_ignore_eos.choices[0].message.content)
+        )
+
+        # Check if ignore_eos resulted in more tokens or exactly max_tokens
+        # The ignore_eos response should either:
+        # 1. Have more tokens than the default response (if default stopped at EOS before max_tokens)
+        # 2. Have exactly max_tokens (if it reached the max_tokens limit)
+        self.assertTrue(
+            ignore_eos_tokens > default_tokens or ignore_eos_tokens >= max_tokens,
+            f"ignore_eos did not generate more tokens: {ignore_eos_tokens} vs {default_tokens}",
+        )
+
+        self.assertEqual(
+            response_ignore_eos.choices[0].finish_reason,
+            "length",
+            f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
+        )
+
+    def test_ebnf(self):
+        """`ebnf` in extra_body must be enforced by the grammar backend."""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        ebnf_grammar = r"""
+        root ::= "Hello" | "Hi" | "Hey"
+        """
+        pattern = re.compile(r"^(Hello|Hi|Hey)[.!?]*\s*$")
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a helpful EBNF test bot."},
+                {"role": "user", "content": "Say a greeting (Hello, Hi, or Hey)."},
+            ],
+            temperature=0,
+            max_tokens=32,
+            extra_body={"ebnf": ebnf_grammar},
+        )
+        text = response.choices[0].message.content.strip()
+        self.assertTrue(len(text) > 0, "Got empty text from EBNF generation")
+        self.assertRegex(text, pattern, f"Text '{text}' doesn't match EBNF choices")
+
+    def test_ebnf_strict_json(self):
+        """Stricter EBNF: exact {"name":"Alice"} shape, no extra fields."""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        ebnf_grammar = r"""
+        root    ::= "{" pair "}"
+        pair    ::= "\"name\"" ":" string
+        string  ::= "\"" [A-Za-z]+ "\""
+        """
+        pattern = re.compile(r'^\{"name":"[A-Za-z]+"\}$')
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "EBNF mini-JSON generator."},
+                {
+                    "role": "user",
+                    "content": "Generate single key JSON with only letters.",
+                },
+            ],
+            temperature=0,
+            max_tokens=64,
+            extra_body={"ebnf": ebnf_grammar},
+        )
+        text = response.choices[0].message.content.strip()
+        self.assertTrue(len(text) > 0, "Got empty text from EBNF strict JSON test")
+        self.assertRegex(
+            text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
+        )
 
     def run_completion(
         self, echo, logprobs, use_list_input, parallel_sample_num, token_input
@@ -148,7 +252,6 @@ class TestOpenAIServer(CustomTestCase):
 
         is_firsts = {}
         for response in generator:
-            print(f"{response=}")
             usage = response.usage
             if usage is not None:
                 assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
@@ -443,6 +546,57 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             client.models.retrieve("non-existent-model")
 
 
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAICompletionWithRust(CustomTestCase):
+    """Run the existing Completion matrix unchanged through the Rust frontend."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    # Reuse the reference test methods directly so Python and Rust coverage
+    # cannot drift into separate matrices.
+    run_completion = TestOpenAIServer.run_completion
+    run_completion_stream = TestOpenAIServer.run_completion_stream
+    test_completion = TestOpenAIServer.test_completion
+    test_completion_stream = TestOpenAIServer.test_completion_stream
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
+    """Run the existing Chat matrix unchanged through the Rust frontend."""
+
+    run_chat_completion = TestOpenAIServer.run_chat_completion
+    run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
+    test_chat_completion = TestOpenAIServer.test_chat_completion
+    test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
+
+    # This class is a Chat gate; Completion already has its own Rust matrix.
+    test_completion = None
+    test_completion_stream = None
+
+
 class TestOpenAIServerv1Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -632,20 +786,24 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert isinstance(resp.output, list)
         assert resp.status in (
             "completed",
+            "incomplete",
             "in_progress",
             "queued",
             "failed",
             "cancelled",
         )
-        if resp.status == "completed":
+        if resp.status in ("completed", "incomplete"):
             assert resp.usage is not None
-            assert resp.usage.prompt_tokens >= 0
-            assert resp.usage.completion_tokens >= 0
+            assert resp.usage.input_tokens >= 0
+            assert resp.usage.output_tokens >= 0
             assert resp.usage.total_tokens >= 0
         if hasattr(resp, "error"):
             assert resp.error is None
         if hasattr(resp, "incomplete_details"):
-            assert resp.incomplete_details is None
+            if resp.status == "incomplete":
+                assert resp.incomplete_details.reason == "max_output_tokens"
+            else:
+                assert resp.incomplete_details is None
         if getattr(resp, "text", None):
             fmt = resp.text.get("format") if isinstance(resp.text, dict) else None
             if fmt:
@@ -664,8 +822,8 @@ class TestOpenAIServerv1Responses(CustomTestCase):
 
     def test_response_completion(self):
         resp = self.run_response(temperature=0, max_output_tokens=16)
-        assert resp.status in ("completed", "in_progress", "queued")
-        if resp.status == "completed":
+        assert resp.status in ("completed", "incomplete", "in_progress", "queued")
+        if resp.status in ("completed", "incomplete"):
             assert resp.usage is not None
             assert resp.usage.total_tokens >= 0
 
@@ -746,9 +904,10 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertEqual(body.get("object"), "response")
         self.assertIn("output", body)
         self.assertIn("status", body)
-        if "usage" in body:
-            self.assertIn("prompt_tokens", body["usage"])
-            self.assertIn("total_tokens", body["usage"])
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIn("output_tokens", body["usage"])
+        self.assertIn("total_tokens", body["usage"])
 
     def test_response_prefill(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

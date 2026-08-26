@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from copy import deepcopy
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -10,8 +9,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_server_args
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
@@ -22,15 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DRAFT_BACKENDS = (
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "trtllm_mha",
-    "ascend",
-)
-
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_worker: TpModelWorker
@@ -40,20 +29,20 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 
 
 def _resolve_draft_attention_backend_fallback(
-    *, draft_server_args: ServerArgs, algo_label: str
+    *, server_args: ServerArgs, algo_label: str
 ) -> str:
-    draft_backend = draft_server_args.speculative_draft_attention_backend
+    draft_backend = server_args.speculative_draft_attention_backend
     if draft_backend is None:
-        draft_backend, _ = draft_server_args.get_attention_backends()
+        draft_backend, _ = server_args.get_attention_backends()
     if draft_backend is None:
         return "triton" if torch.version.hip else "flashinfer"
-    if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
+    if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = "triton" if torch.version.hip else "flashinfer"
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
             algo_label,
-            _SUPPORTED_DRAFT_BACKENDS,
+            DRAFT_ATTENTION_BACKEND_CHOICES,
             draft_backend,
             fallback,
         )
@@ -70,47 +59,41 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    draft_worker_cls: type[TpModelWorker] = TpModelWorker,
 ) -> DraftWorkerBundle:
-    draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
     draft_backend = attention_backend_override or (
         _resolve_draft_attention_backend_fallback(
-            draft_server_args=draft_server_args, algo_label=algo_label
+            server_args=server_args, algo_label=algo_label
         )
     )
-    # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
-    # adjustments through the audited mutation point. Keep the resolved value
-    # on speculative_draft_attention_backend: downstream draft-worker logic
-    # keys on that field (backend selection in _get_attention_backend and the
-    # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
-    # would silently skip those paths. context_length keeps the draft aligned
-    # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
-        skip_tokenizer_init=True,
-        speculative_draft_attention_backend=draft_backend,
-        prefill_attention_backend=None,
-        decode_attention_backend=None,
-        attention_backend=draft_backend,
-        context_length=target_model_config.context_len,
-    )
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
 
-    saved_server_args = get_server_args()
-    try:
-        draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+    # The draft's model construction runs its own MoE gates; the scope routes
+    # their fusion decision to the speculative leaf and gives the target its
+    # ACTIVE value back. It deliberately does not swap runner_backend: these
+    # workers run the draft outside speculative_moe_backend_context, so a
+    # construction-only swap would build and execute under different backends.
+    with draft_model_build_scope():
+        draft_worker = draft_worker_cls(
+            server_args=server_args,
             gpu_id=gpu_id,
             ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            # The draft runs at absolute target positions.
+            context_length=target_model_config.context_len,
+            draft_attention_backend=draft_backend,
         )
-    finally:
-        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
+
+    # DFlash drafts have no vocab; borrow the target's.
+    if draft_model_runner.model_config.vocab_size is None:
+        draft_model_runner.model_config.vocab_size = target_model_config.vocab_size
     return DraftWorkerBundle(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,

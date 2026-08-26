@@ -2,19 +2,15 @@
 only decrease.
 
 After ``ServerArgs.__post_init__`` returns, the instance carries the resolved
-configuration; the resolution pipeline (``server_args.py`` and
-``arg_groups/``) is the only place that computes it. Every assignment to a
-``server_args`` field elsewhere weakens that contract, so the count below is
-an exact pin: new mutations must not appear, and removals must lower the
-baseline to lock in the progress.
+configuration and the resolution pipeline (``server_args.py`` and
+``arg_groups/``) is the only place that computes it: resolved config changes go
+to the context bags via ``get_context().override(source, **fields)``, and a
+value one runner or worker owns travels as a constructor argument. The baseline
+is therefore an exact pin at zero -- new mutations must not appear, and removals
+must lower it.
 
-Every audited runtime adjustment goes through ``ServerArgs.override(source,
-**fields)`` — the single mutation entry point, which records provenance and
-keeps whitelisted fields consistent with the declaration stash. The baseline
-is therefore zero. The registered test harness additionally runs with
-``SGLANG_STRICT_CONFIG_MUTATION=1``, under which a bare assignment after
-resolution raises at runtime; this ratchet catches sites the tests never
-execute.
+``ServerArgs.__setattr__`` already raises on a bare assignment after
+resolution; this textual scan is what reaches the sites tests never execute.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,8 +65,9 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 f"server_args mutations outside the resolution pipeline grew: "
                 f"{count} > baseline {_BASELINE}. Configuration is resolved in "
                 "ServerArgs.__post_init__; declare through the pipeline "
-                "(passes / declare_load_time_override) or go through "
-                "ServerArgs.override(source, ...) instead of assigning fields."
+                "(passes / declare_late_resolution), change resolved config "
+                "with get_context().override(source, ...), or hand the value "
+                "to its runner as a constructor argument — do not assign fields."
             )
         if count < _BASELINE:
             self.fail(

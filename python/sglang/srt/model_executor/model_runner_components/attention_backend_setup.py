@@ -17,7 +17,8 @@ from sglang.srt.utils import init_cublas
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.server_args import ServerArgs
+
+from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +68,21 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
-    server_args = model_runner.server_args
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
     if model_runner.device in ("cuda", "musa"):
         init_cublas()
 
-    resolved = _resolve_attention_backend_strs(
-        server_args=server_args, is_draft_worker=model_runner.is_draft_worker
+    # Already resolved and stamped on the runner before this call.
+    resolved = ResolvedAttentionBackendStr(
+        prefill=model_runner.prefill_attention_backend_str,
+        decode=model_runner.decode_attention_backend_str,
+        is_draft_override=bool(
+            model_runner.is_draft_worker and model_runner.draft_attention_backend
+        ),
     )
 
-    if server_args.enable_pdmux:
+    if get_disagg().enable_pdmux:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=True
         )
@@ -87,10 +92,12 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 resolved=resolved,
                 init_new_workspace=False,
             )
-            for _ in range(server_args.sm_group_num)
+            for _ in range(get_disagg().sm_group_num)
         ]
         decode_attn_backend = decode_attn_backend_group[0]
-    elif server_args.enable_two_batch_overlap and not model_runner.is_draft_worker:
+    elif (
+        get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker
+    ):
         attn_backend = TboAttnBackend.init_new(
             lambda: _build_resolved_backend(
                 model_runner=model_runner,
@@ -140,10 +147,7 @@ def get_attention_backend(
     *, model_runner: ModelRunner, init_new_workspace: bool = False
 ) -> AttentionBackend:
     """Init attention kernel backend."""
-    resolved = _resolve_attention_backend_strs(
-        server_args=model_runner.server_args,
-        is_draft_worker=model_runner.is_draft_worker,
-    )
+    resolved = resolve_attention_backend_strs(model_runner=model_runner)
     return _build_resolved_backend(
         model_runner=model_runner,
         resolved=resolved,
@@ -151,10 +155,17 @@ def get_attention_backend(
     )
 
 
-def _resolve_attention_backend_strs(
-    *, server_args: ServerArgs, is_draft_worker: bool
+def resolve_attention_backend_strs(
+    *, model_runner: ModelRunner
 ) -> ResolvedAttentionBackendStr:
-    draft_attn_backend = server_args.speculative_draft_attention_backend
+    """The (prefill, decode) backends this runner runs.
+
+    A draft runner's backend is its own (``ModelRunner.draft_attention_backend``):
+    target and draft coexist in one process, so it cannot come from the
+    process-wide config.
+    """
+    is_draft_worker = model_runner.is_draft_worker
+    draft_attn_backend = model_runner.draft_attention_backend
     if is_draft_worker and draft_attn_backend:
         logger.warning(f"Overriding draft attention backend to {draft_attn_backend}.")
         # Single backend for all draft modes (no prefill/decode split).
@@ -163,7 +174,7 @@ def _resolve_attention_backend_strs(
             decode=draft_attn_backend,
             is_draft_override=True,
         )
-    prefill, decode = server_args.get_attention_backends()
+    prefill, decode = attention_backends()
     return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
 
 
@@ -218,7 +229,7 @@ def _build_resolved_backend(
     else:
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,
-            backend_str=model_runner.server_args.attention_backend,
+            backend_str=resolved.prefill,
             init_new_workspace=init_new_workspace,
         )
     return attn_backend

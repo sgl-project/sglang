@@ -68,12 +68,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
         cls.bootstrap_port = f"{int(base_port) + 500}"
+        # Pin distinct nccl (torch.distributed rendezvous) ports below the
+        # ephemeral range; otherwise both sides derive them from get_free_port()
+        # and can race onto the same port, failing at init_process_group with
+        # EADDRINUSE.
+        cls.prefill_nccl_port = f"{int(base_port) + 300}"
+        cls.decode_nccl_port = f"{int(base_port) + 400}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.base_url = cls.lb_url
         print(
-            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} "
+            f"{cls.bootstrap_port=} {cls.prefill_nccl_port=} {cls.decode_nccl_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
         if cls.capture_per_side_logs:
@@ -116,6 +123,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             "prefill",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
@@ -141,6 +150,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             "decode",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
             "--tp",
             str(cls.decode_tp_size),
             "--base-gpu-id",

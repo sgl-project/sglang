@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 // Fixed constants for the Inkling model
 static constexpr int kInklingRoutedExperts = 256;
@@ -672,7 +672,7 @@ void dispatch_inkling_gate_topk_renorm_v2(
       return enable_pdl ? launch(inkling_gate_topk_renorm_v2_kernel<8, kPacked, true>)
                         : launch(inkling_gate_topk_renorm_v2_kernel<8, kPacked, false>);
     default:
-      ::host::panic({}, "warps_per_block must be one of {0, 1, 2, 4, 8}");
+      host::panic({}, "warps_per_block must be one of {0, 1, 2, 4, 8}");
   }
 }
 
@@ -725,7 +725,7 @@ void dispatch_inkling_gate_gemv(
                         : launch(inkling_gate_gemv_kernel<2, kFused, kPacked, false>);
     default:
       // 4 experts/block would need >48KB static smem (dynamic smem territory).
-      ::host::panic({}, "experts_per_block must be one of {0, 1, 2}");
+      host::panic({}, "experts_per_block must be one of {0, 1, 2}");
   }
 }
 
@@ -735,8 +735,6 @@ void check_gate_row_alignment(const void* ptr, int64_t stride_m) {
           (stride_m * static_cast<int64_t>(sizeof(float))) % device::kMaxVecBytes == 0,
       "logits rows must be device::kMaxVecBytes-aligned (production pitch is 264 floats)");
 }
-
-}  // namespace
 
 void inkling_gate_topk_renorm(
     tvm::ffi::TensorView logits,
@@ -1008,8 +1006,6 @@ void inkling_gate_gemv(
       device_.unwrap());
 }
 
-namespace {
-
 // Shared verification for the fused GEMV entry points; returns tokens.
 int64_t verify_inkling_gate_gemv_fused_common(
     tvm::ffi::TensorView x,
@@ -1042,8 +1038,6 @@ int64_t verify_inkling_gate_gemv_fused_common(
   RuntimeCheck(shared_w.stride(1) == 1, "shared_w must be contiguous");
   return tokens;
 }
-
-}  // namespace
 
 // Fully fused gate: GEMV + top-k + renorm in a single launch. `workspace` is a
 // [>=M, 264] fp32 scratch and `ticket` a zero-initialized int32[1] that the
@@ -1137,3 +1131,5 @@ void inkling_gate_gemv_fused_packed(
       experts_per_block,
       device_.unwrap());
 }
+
+}  // namespace sglang

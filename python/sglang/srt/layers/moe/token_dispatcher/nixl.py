@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.runtime_context import get_parallel
 
 try:
     from nixl_ep import Buffer
@@ -30,6 +31,13 @@ try:
     use_nixl = True
 except ImportError:
     use_nixl = False
+
+try:
+    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
+except ImportError:
+    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
+
+assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +135,7 @@ class NixlEPBuffer:
         offset = ElasticEPStateManager.get_ep_join_rank_offset()
         global_rank = rank + offset
 
-        from sglang.srt.runtime_context import get_server_args
-
-        max_ep_size = get_server_args().max_ep_size or world_size
+        max_ep_size = get_parallel().max_ep_size or world_size
         nixl_max_ranks = max_ep_size
 
         num_rdma_bytes = 0
@@ -226,9 +232,8 @@ class _NixlEPDispatcherImplBase:
             elastic_state.active_ranks if elastic_state is not None else None
         )
         self._active_world_size = dist.get_world_size(group)
-        from sglang.srt.runtime_context import get_server_args
 
-        _max_ep = get_server_args().max_ep_size or self._active_world_size
+        _max_ep = get_parallel().max_ep_size or self._active_world_size
         self._mask_buffer = (
             torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
@@ -290,7 +295,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(NIXL_EP_TOPK_INDICES_DTYPE)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts

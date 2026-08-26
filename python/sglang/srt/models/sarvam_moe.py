@@ -61,10 +61,12 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
     DeepseekMHAForwardMixin,
 )
 from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
     get_forward,
+    get_memory,
     get_model,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -156,12 +158,13 @@ for backend in CONCAT_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_concat_rope_backend)
 
 
-def get_attn_forward_method(server_args, forward_batch) -> AttnForwardMethod:
+def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
+    prefill_backend, decode_backend = attention_backends()
     is_decode = forward_batch.forward_mode.is_decode_or_idle()
     if is_decode:
-        backend = server_args.decode_attention_backend or server_args.attention_backend
+        backend = decode_backend
     else:
-        backend = server_args.prefill_attention_backend or server_args.attention_backend
+        backend = prefill_backend
         if (
             forward_batch.forward_mode.is_extend_without_speculative()
             and backend == "fa3"
@@ -274,7 +277,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -453,7 +456,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_model().kv_cache_dtype
 
-        self._server_args = None
         self.current_attention_backend = None
 
         if self.q_lora_rank is None:
@@ -608,18 +610,12 @@ class SarvamMoEMLAAttention(nn.Module):
         return k
 
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
-        if self._server_args is None:
-            self._server_args = get_server_args()
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.current_attention_backend = (
-                self._server_args.decode_attention_backend
-                or self._server_args.attention_backend
-            )
-        else:
-            self.current_attention_backend = (
-                self._server_args.prefill_attention_backend
-                or self._server_args.attention_backend
-            )
+        prefill_backend, decode_backend = attention_backends()
+        self.current_attention_backend = (
+            decode_backend
+            if forward_batch.forward_mode.is_decode_or_idle()
+            else prefill_backend
+        )
 
     def _maybe_fp8_bmm(
         self,
@@ -683,7 +679,7 @@ class SarvamMoEMLAAttention(nn.Module):
         )
 
         self._set_current_attention_backend(forward_batch)
-        can_use_prefix_cache = not self._server_args.disable_radix_cache
+        can_use_prefix_cache = not get_memory().disable_radix_cache
         do_prefix_merge = has_extend_prefix and can_use_prefix_cache
 
         if do_prefix_merge and forward_batch.num_prefix_chunks is None:
@@ -764,11 +760,9 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             return self._run_mha_prefill(
@@ -878,10 +872,8 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             output = self._run_mha_prefill(
@@ -936,11 +928,9 @@ class SarvamMoEMLAAttention(nn.Module):
 
         q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
             attn_output = self.attn_mqa(
@@ -1230,7 +1220,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

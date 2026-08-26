@@ -14,6 +14,7 @@
 
 """Public import facade and runtime helpers for context parallel strategies."""
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from sglang.srt.layers.cp.base import (
@@ -33,6 +34,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -40,6 +42,8 @@ if TYPE_CHECKING:
 
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
@@ -176,9 +180,7 @@ def prepare_cp_forward(forward_batch) -> None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
-            forward_batch.attn_cp_metadata.per_rank_actual_token[
-                get_parallel().attn_cp_rank
-            ]
+            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
         )
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
@@ -192,14 +194,41 @@ def cp_split_before_forward(
 ) -> Tuple[Optional[Any], Optional[Any]]:
     """Shard embeddings and positions for CP-v2 model-runner forwarding."""
     assert is_cp_v2_active(forward_batch)
+    assert complete_hidden_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch),
+        cp_shard_position_ids(complete_position_ids, forward_batch),
+    )
+
+
+def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
+    assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
-    return (
-        strategy.shard_hidden_states(complete_hidden_states, forward_batch),
-        strategy.shard_position_ids(complete_position_ids, forward_batch),
-    )
+    return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
+
+
+def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
+    assert is_cp_v2_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert complete_position_ids is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.shard_position_ids(complete_position_ids, forward_batch)
+
+
+def cp_round_robin_input_ids_v2(input_ids: Any, forward_batch):
+    assert is_cp_v2_active(forward_batch)
+    if not get_moe_a2a_backend().is_none():
+        return cp_shard_hidden_states(input_ids, forward_batch)
+
+    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    padded_input_ids = input_ids.new_zeros(physical_tokens)
+    padded_input_ids[: input_ids.shape[0]] = input_ids
+    return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
@@ -209,16 +238,70 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     assert strategy is not None
 
     if isinstance(x, tuple):
-        hidden_states, *rest = x
-        hidden_states = strategy.gather_hidden_states(
-            hidden_states, forward_batch, stream
+        gathered = tuple(
+            (
+                strategy.gather_hidden_states(item, forward_batch, stream)
+                if item is not None
+                else None
+            )
+            for item in x
         )
         # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
-        if len(rest) == 1 and rest[0] is None:
-            return hidden_states
-        return (hidden_states, *rest)
+        if len(gathered) == 2 and gathered[1] is None:
+            return gathered[0]
+        return gathered
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
+
+
+def cp_materialize_global_token_order(
+    x: Any, forward_batch, stream: Optional[Any] = None
+):
+    """Materialize a CP tensor in the global logical token order."""
+    if is_cp_v2_active(forward_batch):
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.gather_kv_cache(x, forward_batch, stream)
+
+    # TODO(hzh0425): Keep the legacy gather temporarily for CP-v1 compatibility. Remove it
+    # with the follow-up CP-v1 cleanup.
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        x, get_parallel().attn_cp_size, forward_batch, stream
+    )
+
+
+@contextmanager
+def cp_shard_model_inputs(
+    complete_hidden_states: Any,
+    complete_position_ids: Any,
+    forward_batch,
+):
+    """Restore the shared batch so logits processing keeps full-batch metadata."""
+    assert is_cp_v2_active(forward_batch)
+    sharded_hidden_states = cp_shard_hidden_states(
+        complete_hidden_states, forward_batch
+    )
+    sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    spec_hidden_states = getattr(spec_info, "hidden_states", None)
+    spec_hidden_states_backup = None
+    if (
+        spec_hidden_states is not None
+        and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
+    ):
+        spec_hidden_states_backup = spec_hidden_states
+        spec_info.hidden_states = cp_shard_hidden_states(
+            spec_hidden_states, forward_batch
+        )
+
+    try:
+        yield sharded_hidden_states, sharded_positions
+    finally:
+        if spec_hidden_states_backup is not None:
+            spec_info.hidden_states = spec_hidden_states_backup
 
 
 def _to_int_list(values) -> Optional[list[int]]:
@@ -244,6 +327,11 @@ __all__ = [
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",
+    "cp_materialize_global_token_order",
+    "cp_round_robin_input_ids_v2",
+    "cp_shard_hidden_states",
+    "cp_shard_model_inputs",
+    "cp_shard_position_ids",
     "cp_split_before_forward",
     "prepare_cp_forward",
     "is_glm_dsa_cache_layer_split_enabled",

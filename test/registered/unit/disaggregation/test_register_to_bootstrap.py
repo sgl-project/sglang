@@ -5,29 +5,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
-
-
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
+
+    def setUp(self):
+        # register_to_bootstrap reads get_parallel().load_balance_method /
+        # .enable_dsa_cache_layer_split and get_serving().port from the
+        # published config.
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room", port=30000
+        )
+        override.install()
+        self.addCleanup(override.restore)
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -282,11 +278,8 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
-
-        mgr.server_args = MagicMock()
-        mgr.server_args.kv_cache_dtype = "auto"
-        mgr.server_args.load_balance_method = "follow_bootstrap_room"
-        mgr.server_args.port = 30000
+        # Resolved per-runner value threaded through KVArgs (the payload field).
+        mgr.kv_cache_dtype_str = "auto"
 
         return mgr
 
