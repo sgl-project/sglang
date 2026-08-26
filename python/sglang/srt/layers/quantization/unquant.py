@@ -87,7 +87,6 @@ _use_cutedsl_bf16_gemm = None
 _flashinfer_pr4266_run_splitk_dense = None
 _flashinfer_pr4266_splitk_tactic = None
 _enable_bf16_splitk_gemm = False
-_logged_bf16_gemm_shapes = set()
 
 # Qwen4-Exp TP4 decode tactics measured on B300 (sm103) under CUDA graph
 # replay against cuBLAS/nvjet with splitKreduce. Every entry beat the
@@ -138,13 +137,6 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
 
 def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
     return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
-
-
-def _log_bf16_gemm_shape(m: int, n: int, k: int) -> None:
-    key = (m, n, k)
-    if key not in _logged_bf16_gemm_shapes:
-        _logged_bf16_gemm_shapes.add(key)
-        logger.info("BF16_GEMM_SHAPE m=%d n=%d k=%d", m, n, k)
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
@@ -238,8 +230,6 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
-    if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
-        _log_bf16_gemm_shape(m, weight.shape[0], weight.shape[1])
     if (
         _enable_bf16_splitk_gemm
         and bias is None
@@ -368,8 +358,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             m = x.numel() // x.shape[-1]
-            if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
-                _log_bf16_gemm_shape(m, layer.weight.shape[0], layer.weight.shape[1])
             if (
                 _enable_bf16_splitk_gemm
                 and bias is None
@@ -400,10 +388,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
-        if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get() and x.ndim == 2:
-            _log_bf16_gemm_shape(
-                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
-            )
         if (
             _enable_bf16_splitk_gemm
             and bias is None
