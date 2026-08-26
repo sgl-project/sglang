@@ -79,8 +79,6 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -89,8 +87,6 @@ export const config = {
           subtitle: "Mooncake",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["Start Mooncake and place the configuration file on every serving node."],
         },
       ],
