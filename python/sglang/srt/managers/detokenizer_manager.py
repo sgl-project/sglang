@@ -39,6 +39,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.runtime_context import (
+    get_device,
+    get_model,
+    get_observability,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -127,9 +134,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             self.vocab_size = None
         else:
             self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
+                get_serving().tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
             )
@@ -141,16 +148,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
 
     def init_request_dispatcher(self):
@@ -481,6 +488,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
+            weight_versions=recv_obj.weight_versions,
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
@@ -520,6 +528,7 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+    publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
 
     manager = None

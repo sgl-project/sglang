@@ -293,6 +293,13 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
+    def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        policy = self._determine_active_policy(waiting_queue)
+        return (
+            isinstance(policy, CacheAwarePolicy)
+            or self.tree_cache.supports_fast_match_prefix()
+        )
+
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
     ) -> Policy:

@@ -37,14 +37,32 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      run_start_metadata:
+        required: false
+        type: string
+        default: '{}'
+        description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
       skip_pr_test_health_check:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
+      is_nightly_pipeline_job:
+        description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
+        type: boolean
+        default: false
+      partitions:
+        description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
+        type: string
+        default: '{"size":1,"arr":[0]}'
       github-token:
         description: 'GitHub token for API calls'
         type: string
         default: ${{ github.token }}
+      test_timeout_minutes:
+        required: false
+        type: string
+        default: '300'
+        description: 'timeout-minutes for the Run test step'
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -56,6 +74,10 @@ concurrency:
 jobs:
   e2e:
     name: ${{ inputs.test_suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJson(inputs.partitions).arr }}
     runs-on: ${{ inputs.runner }}
     container:
       image: ${{ inputs.image }}
@@ -149,6 +171,11 @@ jobs:
                 core.info(`[health-check] Filtered out h20 job: ${j.name}`);
                 return false;
               }
+              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
+              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+                core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
+                return false;
+              }
               // If the failing step is the health check, it's a cascade — skip it
               const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
               if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
@@ -188,16 +215,18 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 300
+        timeout-minutes: ${{ fromJson(inputs.test_timeout_minutes) }}
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
-          SGLANG_TEST_METRICS_OUTPUT: /root/.cache/tests/output/metrics/metrics
         shell: bash
         run: |
+          # Fail fast on any command error, undefined variable, or pipe failure.
+          set -euo pipefail
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -207,26 +236,89 @@ jobs:
           echo "Test mode: suite (${test_suite})"
           tc_name="${test_suite}"
 
+          # The ID is used to locate the current job instance,
+          # size determines whether parallel execution is enabled.
+          PARTITION_ID=${{ matrix.partition }}
+          PARTITION_SIZE=${{ fromJson(inputs.partitions).size }}
+          # Append directory suffixes when there are parallel partition jobs
+          # within the test suite to prevent collision of result artifact directories.
+          if [ "${PARTITION_SIZE}" -gt 1 ]; then
+            tc_name="${test_suite}-p${PARTITION_ID}"
+          fi
+
+          # Provided automatically by the GitHub server.
+          # run_id is the unique identifier for the workflow run,
+          # attempt represents the re‑run attempt count of the job.
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+
+          # Parse run metadata (branch_label / workflow_name / create_time)
+          # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
+          branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
+          create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
+          if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+
+          # Print persistence‑directory‑prefix variables
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
+
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
+            mkdir -p ${test_data_output_path}
+
+            # Set and print the output path for test‑case results and metrics persistence.
+            export METRICS_DATA_FILE=${test_data_output_path}
+            export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
+            echo "METRICS_DATA_FILE=${METRICS_DATA_FILE}"
+            echo "SGLANG_TEST_METRICS_OUTPUT=${SGLANG_TEST_METRICS_OUTPUT}"
+          fi
+
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
           PIP_FOR_SGLANG="pip"
+          # Shared pip index list (public PyPI, tsinghua mirror, then the in-cluster cache).
+          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
+          PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+
+          # Shared pip installer: try each index until one succeeds, fail the job if all fail.
+          install_pkg() {
+            local pkg="$1"
+            ok=0
+            for index in "${PIP_INDEXES[@]}"; do
+              echo "${pkg}: try via ${index}"
+              if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                ok=1; break
+              fi
+            done
+            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
+          }
+
+          # Transformers (pinned version): prefer the offline wheel cache, fall back to online install.
           if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
             echo "===== Install transformers for sglang - Begin ====="
             TRANSFORMERS_PKG_PATH_SOURCE=/root/.cache/.cache/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
             if [ ! -d "${TRANSFORMERS_PKG_PATH_SOURCE}" ]; then
               echo "The dependent transformers package does not exist: ${TRANSFORMERS_PKG_PATH_SOURCE}."
               echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} online."
-              pip install transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}" -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+              install_pkg "transformers==${TRANSFORMERS_VERSION_FOR_SGLANG}"
             else
               echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
               TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
               mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-              cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
-              pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
+              cp "${TRANSFORMERS_PKG_PATH_SOURCE}/"* "${TRANSFORMERS_PKG_PATH_TARGET}/"
+              ${PYTHON_FOR_SGLANG} -m pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
             fi
             echo "===== Install transformers for sglang in virtual env - End ====="
           fi
           echo "Transformers version for sglang: $(${PIP_FOR_SGLANG} show transformers | grep Version | cut -d: -f2)"
+
+          # Install missing python deps (skip if already importable)
+          REQUIRED_PIP_PKGS=(tabulate)
+          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
+            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
+            install_pkg "${pkg}"
+          done
 
           echo "scaling_governor performance num: \
             $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | grep performance | wc -l)"
@@ -246,21 +338,64 @@ jobs:
           mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
           cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
 
+          # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
+          # which abort the whole script under `set -u`. Temporarily disable -u.
+          set +u
           source /usr/local/Ascend/cann/set_env.sh || true
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+          set -u
 
-          # Set environment of cann
-          log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
-          rm -rf ${log_path}
-          mkdir -p ${log_path}
+          # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            log_path="/root/.cache/tests/logs/log/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}/${HOSTNAME}"
+          else
+            current_date=$(date -u -d '+8 hours' +%Y%m%d)
+            log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          fi
+          rm -rf "${log_path}"
+          mkdir -p "${log_path}"
           echo "Log path: ${log_path}"
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
           cd test
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+
+          # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
+          # --nightly: Collect test cases registered for nightly runs.
+          # --continue-on-error: Keep running remaining cases even if one fails.
+          NIGHTLY_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly --continue-on-error"
+          fi
+
+          # Append configuration arguments when the test suite is split into multiple parallel jobs.
+          PARTITION_ARGS=""
+          if [ "${PARTITION_SIZE}" -gt 1 ] 2>/dev/null; then
+            PARTITION_ARGS="--auto-partition-id ${PARTITION_ID} --auto-partition-size ${PARTITION_SIZE}"
+          fi
+
+          # Append `--timeout-from-est‑time` when the job belongs to the nightly pipeline.
+          # per‑case timeout is derived from each case's est_time.
+          TIMEOUT_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            TIMEOUT_FLAG="--timeout-from-est-time"
+          fi
+
+          # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
+          # under the structured path; PR runs only tee to /tmp/test_output.log.
+          # Use an array so the extra target is omitted when empty: passing an empty
+          # string arg makes GNU tee fail (exit code 1) and flips the pipeline exit code.
+          LOG_TEE_TARGETS=("/tmp/test_output.log")
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
+          fi
+
+          # Run NPU test suite with run_suite.py.
+          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+          # tee pipe, so leftover server processes cannot block the pipeline on exit.
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -272,10 +407,8 @@ jobs:
             status_icon="❌"
           fi
 
-          echo "test_status=${test_status}" >> $GITHUB_ENV
-          echo "tc_name=${tc_name}" >> $GITHUB_ENV
+          echo "tc_name=${tc_name}"
           export test_status tc_name
-
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)

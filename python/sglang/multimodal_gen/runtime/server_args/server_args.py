@@ -32,15 +32,26 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+    normalize_component_residency,
+    resolve_component_residency_mode,
+    resolve_diffusers_pipeline_offload,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
+    LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
-    cpu_offload_flags_for_layerwise_components,
     is_dit_component_name,
     is_image_encoder_component_name,
+    is_legacy_dit_offload_component_name,
     is_text_encoder_component_name,
     is_vae_component_name,
     layerwise_component_matches_any_selection,
@@ -66,6 +77,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -75,7 +89,7 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
-LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -89,15 +103,7 @@ RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
-    mode = mode.lower()
-    if mode == "snapshot":
-        logger.warning(
-            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
-            "as original. Please use ltx2_two_stage_device_mode=original or "
-            "resident instead. This alias may be removed after two release cycles."
-        )
-        return "original"
-    return mode
+    return mode.lower()
 
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
@@ -143,7 +149,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -155,7 +163,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
         "lightricks/ltx-2",
+        "lightricks/ltx-2.3",
+        "meituan-longcat/longcat-image",
         "ltx-2",
+        "ltx-2.3",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
@@ -175,9 +186,12 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
+        "LTX23PipelineConfig",
+        "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -290,15 +304,27 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    # Exact weight-file overrides retain the base component configuration.
+    component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Explicit quantization override for one component. Self-describing
+    # checkpoints remain auto-detected and do not need this override.
+    component_quantizations: dict[str, str] = field(default_factory=dict)
+    # Component-local layer name patterns to skip during online quantization.
+    component_quantization_ignored_layers: dict[str, list[str]] = field(
+        default_factory=dict
+    )
+    # Optional LTX-2.5 decoder is large enough to load only when requested.
+    load_diffusion_decoder: bool = False
 
-    # path to pre-quantized transformer weights (single .safetensors or directory).
+    # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
-    # Per-component transformer weight overrides (key = model_index.json component name).
-    # Pipelines use this when a checkpoint ships separate quantized weights for
-    # secondary DiT components; the generic loader consumes it without model-specific
-    # filename logic.
-    component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
-
+    # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
+    minimax_h3_adaln_cache_path: str | None = None
+    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
+    minimax_h3_adaln_online: bool = False
+    # Widest timestep plan the rebuild slab is sized for; see
+    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int = 4
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -310,6 +336,8 @@ class ServerArgs(DisaggServerArgsMixin):
     lora_target_modules: list[str] | None = None
 
     # CPU offload parameters
+    # Exact component keys or component groups mapped to a residency mode.
+    component_residency: dict[str, str] | list[str] | str | None = None
     # Exact component keys from model_index.json, or a legacy component group.
     cpu_offload_components: list[str] | None = None
     dit_cpu_offload: bool | None = None
@@ -323,6 +351,15 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
+    # Per-component overrides of the three knobs above; an entry wins for that
+    # component.
+    layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
+    layerwise_resident_layers: dict[str, float] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -331,6 +368,15 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
+    _required_resident_components: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _fsdp_disabled_components: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _component_layerwise_capabilities: dict[str, bool] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -497,9 +543,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._normalize_component_residency()
+        self._adjust_cpu_offload_components()
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
-        self._adjust_cpu_offload_components()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -606,8 +653,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
+            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -683,8 +731,20 @@ class ServerArgs(DisaggServerArgsMixin):
         replica_size = (self.num_gpus or tp_size) // dp_size
 
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
+        # An explicit fold policy is honored for any multi-rank replica —
+        # pure-TP (replica == tp) and dp>1 shapes included. Encoder layout is
+        # independent of the DiT's parallelism; the replica group is simply
+        # "the ranks that share this batch". `auto` keeps its conservative
+        # proposals below and never folds a pure-TP replica.
+        fold_replica = (
+            self.encoder_parallel == "fold"
+            and not self.disagg_mode
+            and replica_size > 1
+        )
 
-        if fold_world:
+        if fold_replica:
+            mode = "replica"
+        elif fold_world:
             mode = "world"
         elif tp_size == 1 and sp_degree > 1:
             # Preserve prior behavior for dp>1 / disaggregated SP runs.
@@ -756,48 +816,23 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.image_encoder_cpu_offload = True
 
     def _adjust_cpu_offload_components(self) -> None:
-        """Apply the unified CPU offload component selector, when provided."""
+        """Normalize the legacy component offload selector, when provided."""
         if self.cpu_offload_components is None:
             return
+        normalized = normalize_cpu_offload_components(self.cpu_offload_components)
+        self.cpu_offload_components = normalized if normalized is not None else []
 
-        legacy_flags = (
-            "dit_cpu_offload",
-            "text_encoder_cpu_offload",
-            "image_encoder_cpu_offload",
-            "vae_cpu_offload",
+    def _normalize_component_residency(self) -> None:
+        self.component_residency = normalize_component_residency(
+            self.component_residency
         )
-        conflicting_flags = [
-            flag_name
-            for flag_name in legacy_flags
-            if self.is_arg_explicitly_set(flag_name)
-        ]
-        if conflicting_flags:
-            formatted_flags = ", ".join(
-                "--" + flag_name.replace("_", "-") for flag_name in conflicting_flags
-            )
-            raise ValueError(
-                "--cpu-offload-components cannot be combined with the legacy "
-                f"CPU offload flags: {formatted_flags}"
-            )
-
-        selected_components = (
-            normalize_cpu_offload_components(self.cpu_offload_components) or []
-        )
-        self.cpu_offload_components = selected_components
-        self.dit_cpu_offload = self.should_cpu_offload_component("transformer")
-        self.text_encoder_cpu_offload = self.should_cpu_offload_component(
-            "text_encoder"
-        )
-        self.image_encoder_cpu_offload = self.should_cpu_offload_component(
-            "image_encoder"
-        )
-        self.vae_cpu_offload = self.should_cpu_offload_component("vae")
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
+        env_mode = None
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
             mode = (
@@ -812,6 +847,29 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
                 f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
+            )
+
+        explicit_nonresident_dits = {
+            component_name: residency_mode
+            for component_name in ("transformer", "transformer_2")
+            if (residency_mode := self.explicit_residency_mode(component_name))
+            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+        }
+        if mode == "resident" and explicit_nonresident_dits:
+            configured = ", ".join(
+                f"{name}={residency_mode}"
+                for name, residency_mode in explicit_nonresident_dits.items()
+            )
+            if self.is_arg_explicitly_set("ltx2_two_stage_device_mode") or env_mode:
+                raise ValueError(
+                    "ltx2_two_stage_device_mode=resident conflicts with explicit "
+                    f"component residency: {configured}"
+                )
+            mode = "original"
+            logger.info(
+                "Using ltx2_two_stage_device_mode=original because DiT offload "
+                "was explicitly configured: %s",
+                configured,
             )
 
         self.ltx2_two_stage_device_mode = mode
@@ -895,6 +953,23 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
             if (
@@ -948,6 +1023,71 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Invalid attention backend '{backend}'. "
                 f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
             ) from None
+
+    @staticmethod
+    def _parse_component_value_map(
+        value: dict[str, Any] | str | None, *, option: str
+    ) -> dict[str, str]:
+        """Parse a ``component=value`` map, the same shape as component backends."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{option} must be a dict or a comma-separated component=value string"
+            )
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"{option} must use component=value entries")
+            component, entry = pair.split("=", 1)
+            result[component.strip()] = entry.strip()
+        return result
+
+    def layerwise_tuning_for(
+        self, component_name: str | None, *, dit_group: bool
+    ) -> tuple[float, float, str]:
+        """Prefetch size, resident layers and residency policy for one component."""
+        prefetch_map = self._parse_component_value_map(
+            self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
+        )
+        resident_map = self._parse_component_value_map(
+            self.layerwise_resident_layers, option="--layerwise-resident-layers"
+        )
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+
+        def _pick(mapping: dict[str, str], group_default, aux_default):
+            if component_name is not None and component_name in mapping:
+                return mapping[component_name]
+            return group_default if dit_group else aux_default
+
+        prefetch = float(_pick(prefetch_map, self.dit_offload_prefetch_size, 0.0))
+        resident = float(_pick(resident_map, self.dit_layerwise_resident_layers, 0.0))
+        policy = str(
+            _pick(
+                policy_map,
+                self.dit_layerwise_residency_policy,
+                RESIDENCY_POLICY_LEADING,
+            )
+        )
+        if policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {policy!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
+            )
+        return prefetch, resident, policy
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -1273,131 +1413,266 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
-            self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-            self.layerwise_offload_components = None
-            if (
-                self.dit_cpu_offload
-                or self.text_encoder_cpu_offload
-                or self.image_encoder_cpu_offload
-                or self.vae_cpu_offload
+            if self.num_gpus != 1:
+                raise ValueError("MPS currently supports only --num-gpus 1")
+            if self.component_residency is not None and any(
+                mode not in (RESIDENT, LAYERWISE_OFFLOAD)
+                for mode in self.component_residency.values()
             ):
-                logger.warning(
-                    "Disabling component CPU offload on MPS because the component "
-                    "residency offload strategy is only validated on CUDA."
+                raise ValueError(
+                    "MPS supports only resident or layerwise-offload component "
+                    "residency"
                 )
-            self.dit_cpu_offload = False
-            self.text_encoder_cpu_offload = False
-            self.image_encoder_cpu_offload = False
-            self.vae_cpu_offload = False
+            self.use_fsdp_inference = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
 
-    def should_cpu_offload_component(self, component_name: str) -> bool:
-        if self.cpu_offload_components is not None:
-            return cpu_offload_component_matches(
+    def canonical_residency_mode(self, component_name: str) -> str | None:
+        """Resolve the canonical selector for one component, if present."""
+        return resolve_component_residency_mode(
+            component_name, self.component_residency
+        )
+
+    def explicit_residency_mode(self, component_name: str) -> str | None:
+        """Resolve explicit controls in canonical-to-compatibility priority."""
+        mode = self.canonical_residency_mode(component_name)
+        if mode is not None:
+            return mode
+
+        if self.is_explicit_layerwise_offload_component(component_name):
+            return LAYERWISE_OFFLOAD
+
+        if self.is_arg_explicitly_set("cpu_offload_components"):
+            if not self.cpu_offload_components:
+                return RESIDENT
+            if cpu_offload_component_matches(
                 component_name, self.cpu_offload_components
-            )
-        if is_dit_component_name(component_name) or component_name in (
-            "connectors",
-            "unconditional_transformer",
-            "vision_language_encoder",
+            ):
+                return COMPONENT_OFFLOAD
+
+        legacy_flag = self._legacy_component_offload_flag(component_name)
+        if legacy_flag is not None and self.is_arg_explicitly_set(legacy_flag):
+            legacy_values = {
+                "dit_cpu_offload": self.dit_cpu_offload,
+                "text_encoder_cpu_offload": self.text_encoder_cpu_offload,
+                "image_encoder_cpu_offload": self.image_encoder_cpu_offload,
+                "vae_cpu_offload": self.vae_cpu_offload,
+            }
+            return COMPONENT_OFFLOAD if legacy_values[legacy_flag] else RESIDENT
+
+        # ``--dit-layerwise-offload false`` historically has no matching CPU
+        # flag, but explicitly requests that the DiT not be layerwise-offloaded.
+        if is_legacy_dit_offload_component_name(component_name) and (
+            self.is_arg_explicitly_set("dit_layerwise_offload")
         ):
-            return bool(self.dit_cpu_offload)
+            return RESIDENT
+        return None
+
+    @staticmethod
+    def _legacy_component_offload_flag(component_name: str) -> str | None:
+        if is_legacy_dit_offload_component_name(component_name):
+            return "dit_cpu_offload"
         if is_text_encoder_component_name(component_name):
-            return bool(self.text_encoder_cpu_offload)
+            return "text_encoder_cpu_offload"
         if is_image_encoder_component_name(component_name):
-            return bool(self.image_encoder_cpu_offload)
-        if is_vae_component_name(component_name) or component_name == "sound_tokenizer":
-            return bool(self.vae_cpu_offload)
-        return False
+            return "image_encoder_cpu_offload"
+        if is_vae_component_name(component_name):
+            return "vae_cpu_offload"
+        return None
+
+    def residency_mode(self, component_name: str) -> str:
+        """Return the effective residency mode for a loaded component."""
+        if current_platform.is_cpu():
+            return RESIDENT
+        if component_name in self._required_resident_components:
+            return RESIDENT
+
+        explicit_mode = self.explicit_residency_mode(component_name)
+        if explicit_mode is not None:
+            return explicit_mode
+
+        component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if self._component_layerwise_capabilities.get(component_name, True):
+            if component_names and (
+                LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names
+                or layerwise_component_matches_any_selection(
+                    component_name, component_names
+                )
+                or (
+                    LAYERWISE_OFFLOAD_DIT_GROUP in component_names
+                    and is_dit_component_name(component_name)
+                )
+            ):
+                return LAYERWISE_OFFLOAD
+
+        if self.cpu_offload_components is not None:
+            if cpu_offload_component_matches(
+                component_name, self.cpu_offload_components
+            ):
+                return COMPONENT_OFFLOAD
+        if is_legacy_dit_offload_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.dit_cpu_offload else RESIDENT
+        if is_text_encoder_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.text_encoder_cpu_offload else RESIDENT
+        if is_image_encoder_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.image_encoder_cpu_offload else RESIDENT
+        if is_vae_component_name(component_name):
+            return COMPONENT_OFFLOAD if self.vae_cpu_offload else RESIDENT
+        return RESIDENT
+
+    def should_cpu_offload_component(self, component_name: str) -> bool:
+        return self.residency_mode(component_name) == COMPONENT_OFFLOAD
+
+    def should_start_component_on_cpu(self, component_name: str) -> bool:
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            LAYERWISE_OFFLOAD,
+        )
+
+    def require_component_resident(
+        self, component_name: str, *, feature_name: str
+    ) -> None:
+        configured_mode = self.canonical_residency_mode(component_name)
+        if configured_mode is not None and configured_mode != RESIDENT:
+            raise ValueError(
+                f"{feature_name} requires {component_name!r} to be resident; "
+                f"got {configured_mode!r} from --component-residency"
+            )
+        self._required_resident_components.add(component_name)
+
+    def should_use_fsdp_for_component(self, component_name: str) -> bool:
+        return bool(
+            self.use_fsdp_inference
+            and component_name not in self._fsdp_disabled_components
+            and self.residency_mode(component_name) == RESIDENT
+        )
+
+    def disable_fsdp_for_component(self, component_name: str) -> None:
+        self._fsdp_disabled_components.add(component_name)
+
+    def record_component_layerwise_capability(
+        self, component_name: str, *, supported: bool
+    ) -> None:
+        self._component_layerwise_capabilities[component_name] = supported
+
+    def has_layerwise_offload_components(self) -> bool:
+        return bool(
+            self.dit_layerwise_offload
+            or self.layerwise_offload_components
+            or (
+                self.component_residency
+                and LAYERWISE_OFFLOAD in self.component_residency.values()
+            )
+        )
 
     def should_configure_layerwise_offload_for_lazy_component(
         self, component_name: str
     ) -> bool:
-        """Return whether a lazy-loaded component should try layerwise offload.
+        """Return whether a lazy-loaded component needs layerwise setup."""
+        return self.residency_mode(component_name) == LAYERWISE_OFFLOAD
 
-        Lazy components are loaded after the normal pipeline-wide configuration
-        pass, so they should only attempt layerwise configuration when their
-        component name is covered by the selected layerwise scope.
-        """
-        component_names = normalize_layerwise_offload_components(
-            self.layerwise_offload_components
-        )
-        if not component_names:
-            return False
-        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+    def is_explicit_layerwise_offload_component(self, component_name: str) -> bool:
+        if self.canonical_residency_mode(component_name) == LAYERWISE_OFFLOAD:
             return True
-        return layerwise_component_matches_any_selection(
-            component_name, component_names
+
+        if self.is_arg_explicitly_set("layerwise_offload_components"):
+            selected_components = normalize_layerwise_offload_components(
+                self.layerwise_offload_components
+            )
+            if selected_components and (
+                LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_components
+                or layerwise_component_matches_any_selection(
+                    component_name, selected_components
+                )
+                or (
+                    LAYERWISE_OFFLOAD_DIT_GROUP in selected_components
+                    and is_dit_component_name(component_name)
+                )
+            ):
+                return True
+
+        return bool(
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+            and self.dit_layerwise_offload
+            and is_dit_component_name(component_name)
         )
 
     @property
     def is_dit_layerwise_offload_selected(self) -> bool:
-        """returns if dit is selected to be layerwise-offload"""
-        component_names = self.layerwise_offload_components
-        return bool(
-            component_names
-            and "dit_cpu_offload"
-            in cpu_offload_flags_for_layerwise_components(component_names)
-        )
+        """Return whether the primary DiT resolves to layerwise offload."""
+        return self.residency_mode("transformer") == LAYERWISE_OFFLOAD
 
     def _adjust_layerwise_offload_components(self):
-        explicitly_set_component_names = normalize_layerwise_offload_components(
+        selected_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
         )
         if self.dit_layerwise_offload:
-            if explicitly_set_component_names is None:
-                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
-            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
-                explicitly_set_component_names = [
+            if selected_component_names is None:
+                selected_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in selected_component_names:
+                selected_component_names = [
                     LAYERWISE_OFFLOAD_DIT_GROUP,
-                    *explicitly_set_component_names,
+                    *selected_component_names,
                 ]
 
-        if explicitly_set_component_names is not None:
-            self.layerwise_offload_components = explicitly_set_component_names
-            self._disable_non_dit_cpu_offload_for_layerwise_components(
-                explicitly_set_component_names
+        self.layerwise_offload_components = selected_component_names
+        self._clear_non_dit_component_offload_for_layerwise_groups(
+            selected_component_names or ()
+        )
+
+        has_explicit_dit_offload = bool(
+            self.canonical_residency_mode("transformer")
+            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            or self.is_explicit_layerwise_offload_component("transformer")
+            or (
+                self.is_arg_explicitly_set("cpu_offload_components")
+                and cpu_offload_component_matches(
+                    "transformer", self.cpu_offload_components
+                )
             )
-            return
-
-    def _disable_non_dit_cpu_offload_for_layerwise_components(
-        self, component_names: list[str]
-    ) -> None:
-        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
-        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
-        disabled_flag_names: list[str] = []
-
+            or (self.is_arg_explicitly_set("dit_cpu_offload") and self.dit_cpu_offload)
+        )
         if (
-            "text_encoder_cpu_offload" in flag_names
-            and self.text_encoder_cpu_offload is not False
+            self.is_arg_explicitly_set("dit_layerwise_offload")
+            and not self.dit_layerwise_offload
+            and not has_explicit_dit_offload
+        ):
+            self.dit_cpu_offload = False
+
+    def _clear_non_dit_component_offload_for_layerwise_groups(
+        self, selected_component_names: tuple[str, ...] | list[str]
+    ) -> None:
+        selected = set(selected_component_names)
+        select_all = LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected
+        disabled_explicit_flags: list[str] = []
+
+        if (select_all or LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in selected) and (
+            self.text_encoder_cpu_offload is not False
         ):
             self.text_encoder_cpu_offload = False
-            disabled_flag_names.append("text_encoder_cpu_offload")
-        if (
-            "image_encoder_cpu_offload" in flag_names
-            and self.image_encoder_cpu_offload is not False
+            if self.is_arg_explicitly_set("text_encoder_cpu_offload"):
+                disabled_explicit_flags.append("text_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in selected) and (
+            self.image_encoder_cpu_offload is not False
         ):
             self.image_encoder_cpu_offload = False
-            disabled_flag_names.append("image_encoder_cpu_offload")
-        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            if self.is_arg_explicitly_set("image_encoder_cpu_offload"):
+                disabled_explicit_flags.append("image_encoder_cpu_offload")
+        if (select_all or LAYERWISE_OFFLOAD_VAE_GROUP in selected) and (
+            self.vae_cpu_offload is not False
+        ):
             self.vae_cpu_offload = False
-            disabled_flag_names.append("vae_cpu_offload")
+            if self.is_arg_explicitly_set("vae_cpu_offload"):
+                disabled_explicit_flags.append("vae_cpu_offload")
 
-        explicit_disabled_flag_names = [
-            flag_name
-            for flag_name in disabled_flag_names
-            if self.is_arg_explicitly_set(flag_name)
-        ]
-        if explicit_disabled_flag_names:
+        if disabled_explicit_flags:
             logger.info(
-                "Ignoring explicit CPU-offload flags because layerwise offload "
-                "manages the same component weights: %s",
-                ", ".join(
-                    f"{flag_name}=False" for flag_name in explicit_disabled_flag_names
-                ),
+                "Ignoring component-offload flags because layerwise offload "
+                "controls the same component groups: %s",
+                ", ".join(disabled_explicit_flags),
             )
 
     def _adjust_autocast(self):
@@ -1446,6 +1721,72 @@ class ServerArgs(DisaggServerArgsMixin):
     def __post_init__(self):
         # configure logger before use
         configure_logger(server_args=self)
+
+        component_paths: dict[str, str] = {}
+        component_weights_paths = dict(self.component_weights_paths)
+        for component, path in self.component_paths.items():
+            supports_weight_file_override = (
+                is_dit_component_name(component)
+                or is_text_encoder_component_name(component)
+                or is_image_encoder_component_name(component)
+                or is_vae_component_name(component)
+            )
+            if (
+                not supports_weight_file_override
+                or not is_explicit_weight_file_reference(path)
+            ):
+                component_paths[component] = path
+                continue
+            existing = component_weights_paths.get(component)
+            if existing is not None and existing != path:
+                raise ValueError(
+                    f"Conflicting weight overrides for component {component!r}: "
+                    f"{existing!r} and {path!r}"
+                )
+            component_weights_paths[component] = path
+        self.component_paths = component_paths
+        self.component_weights_paths = component_weights_paths
+        normalized_quantizations: dict[str, str] = {}
+        for component, quantization in self.component_quantizations.items():
+            component = str(component).strip().replace("-", "_")
+            quantization = str(quantization).strip().lower()
+            if not component or not quantization:
+                raise ValueError(
+                    "Component quantization entries require a component and method"
+                )
+            previous = normalized_quantizations.get(component)
+            if previous is not None and previous != quantization:
+                raise ValueError(
+                    f"Conflicting quantization overrides for {component!r}: "
+                    f"{previous!r} and {quantization!r}"
+                )
+            normalized_quantizations[component] = quantization
+        self.component_quantizations = normalized_quantizations
+        normalized_ignored_layers: dict[str, list[str]] = {}
+        for component, layers in self.component_quantization_ignored_layers.items():
+            component = str(component).strip().replace("-", "_")
+            if isinstance(layers, str):
+                layers = [layers]
+            if (
+                not component
+                or not isinstance(layers, (list, tuple))
+                or not all(isinstance(layer, str) and layer.strip() for layer in layers)
+            ):
+                raise ValueError(
+                    "Component quantization ignored layers require a component "
+                    "and non-empty layer patterns"
+                )
+            normalized_ignored_layers[component] = [layer.strip() for layer in layers]
+        missing_quantization = set(normalized_ignored_layers) - set(
+            self.component_quantizations
+        )
+        if missing_quantization:
+            raise ValueError(
+                "Component quantization ignored layers require a matching "
+                "quantization override for: "
+                f"{', '.join(sorted(missing_quantization))}"
+            )
+        self.component_quantization_ignored_layers = normalized_ignored_layers
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -1496,6 +1837,38 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--minimax-h3-adaln-online",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_adaln_online,
+            help=(
+                "Rebuild MiniMax H3 AdaLN outputs from the checkpoint per "
+                "request instead of keeping the 24.2 GiB of adaln_proj weights "
+                "resident. Works with any step count or schedule and needs no "
+                "prebuilt artifact. Requires unquantized weights."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-plan-width",
+            type=int,
+            default=ServerArgs.minimax_h3_adaln_plan_width,
+            help=(
+                "Widest timestep plan --minimax-h3-adaln-online sizes its slab "
+                "for. The default 4 covers every task; a deployment serving "
+                "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
+                "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-cache-path",
+            type=str,
+            default=ServerArgs.minimax_h3_adaln_cache_path,
+            help=(
+                "Path to a precomputed MiniMax H3 AdaLN cache. This only "
+                "supports the matching unquantized H3 checkpoint and rejects "
+                "requests whose timestep embeddings are not present in the cache."
+            ),
+        )
+        parser.add_argument(
             "--model-id",
             type=str,
             default=ServerArgs.model_id,
@@ -1526,16 +1899,27 @@ class ServerArgs(DisaggServerArgsMixin):
                 "or model_index.json. Must match a registered pipeline_name."
             ),
         )
+        parser.add_argument(
+            "--load-diffusion-decoder",
+            action=StoreBoolean,
+            default=ServerArgs.load_diffusion_decoder,
+            help=(
+                "Load the optional LTX-2.5 diffusion decoder so requests may set "
+                "use_diffusion_decoder. Offline generate enables this automatically "
+                "when --use-diffusion-decoder is passed."
+            ),
+        )
         # attention
         parser.add_argument(
             "--attention-backend",
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
@@ -1675,8 +2059,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "`auto` folds encoders wide enough to benefit (best "
                 "single-request latency) and data-parallels eligible native "
                 "text encoders at batch>1; `fold` always tensor-parallels the "
-                "encoder weights; `dp` never folds and splits the batch across "
-                "ranks (best batched throughput; requires TP=1 and DP=1); "
+                "encoder weights across the replica; `dp` never folds and "
+                "splits the batch across encoder copies inside each replica, "
+                "composing with encoder TP (best batched throughput); "
                 "`replicate` disables both. The default is `auto`."
             ),
         )
@@ -1855,7 +2240,20 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
-        # layerwise offload
+        # component residency and legacy offload controls
+        parser.add_argument(
+            "--component-residency",
+            type=str,
+            nargs="+",
+            default=ServerArgs.component_residency,
+            metavar="COMPONENT=MODE",
+            help=(
+                "Select resident, component-offload, or layerwise-offload for "
+                "pipeline components. Exact model_index.json component keys override "
+                "the dit, text_encoder, image_encoder, vae, and all groups. "
+                "Components without an assignment keep their automatic placement."
+            ),
+        )
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -1879,8 +2277,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Select component keys from model_index.json for coarse CPU offload. "
                 "Use dit, text_encoder, image_encoder, or vae as group aliases; "
                 "all selects every loaded module and none disables component offload. "
-                "This unified option cannot be combined with the legacy "
-                "per-component CPU offload flags."
+                "This compatibility option can be combined with per-component CPU "
+                "offload flags; selected components take component-offload while "
+                "unmatched components retain their existing settings."
             ),
         )
         parser.add_argument(
@@ -1889,9 +2288,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
-            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
-            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
+            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. If legacy DiT offload "
+            "flags are also provided, layerwise offload is the effective DiT mode.",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -1924,6 +2322,37 @@ class ServerArgs(DisaggServerArgsMixin):
             "count. Unlike raising the prefetch size, resident layers are transferred "
             "once (not re-streamed every step), so this trades VRAM for lower denoise "
             "latency when memory is available.",
+        )
+        parser.add_argument(
+            "--layerwise-prefetch-size",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-offload-prefetch-size, as "
+            "component=value entries, e.g. --layerwise-prefetch-size "
+            "text_encoder=2,vae=2. Same units as the DiT flag. Components with "
+            "no entry keep their group default. Prefetch overlaps a layer's "
+            "transfer with the previous layer's compute, which happens within a "
+            "single pass, so it is worth tuning on any streamed component.",
+        )
+        parser.add_argument(
+            "--layerwise-resident-layers",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-resident-layers, as "
+            "component=value entries, e.g. --layerwise-resident-layers "
+            "text_encoder=4. Resident layers are transferred once at startup "
+            "rather than streamed, so they cut the transfer of every pass "
+            "including the first -- an auxiliary component that runs once per "
+            "request still benefits, it just recovers the VRAM once per request "
+            "instead of once per denoising step.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-policy",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-policy, as "
+            "component=value entries, e.g. --layerwise-residency-policy "
+            "text_encoder=strided.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",
@@ -1977,8 +2406,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
-                "'snapshot' is deprecated, treated as 'original', and may be "
-                "removed after two release cycles. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
@@ -2399,38 +2826,38 @@ class ServerArgs(DisaggServerArgsMixin):
         )
 
     @staticmethod
-    def _extract_component_paths(
+    def _extract_dynamic_component_map(
         unknown_args: list[str],
+        *,
+        option_prefixes: tuple[str, ...],
+        alias_suffix: str,
     ) -> tuple[dict[str, str], list[str]]:
-        """
-        Extract dynamic component path args from unrecognised CLI args.
-
-        Supported forms:
-        - ``--<component>-path /path/to/component``
-        - ``--component-paths.<component> /path/to/component`` (expanded from config)
-        """
-        component_paths: dict[str, str] = {}
+        component_values: dict[str, str] = {}
         remaining: list[str] = []
         i = 0
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
             component = None
-            if key_part.startswith("--component-paths."):
-                component = key_part[len("--component-paths.") :].replace("-", "_")
-            elif key_part.startswith("--component_paths."):
-                component = key_part[len("--component_paths.") :].replace("-", "_")
-            elif key_part.startswith("--") and key_part.endswith("-path"):
-                component = key_part[2:-5].replace("-", "_")
+            for option_prefix in option_prefixes:
+                if key_part.startswith(option_prefix):
+                    component = key_part[len(option_prefix) :].replace("-", "_")
+                    break
+            if (
+                component is None
+                and key_part.startswith("--")
+                and key_part.endswith(alias_suffix)
+            ):
+                component = key_part[2 : -len(alias_suffix)].replace("-", "_")
 
             if component is not None:
                 if "=" in arg:
-                    component_paths[component] = arg.split("=", 1)[1]
+                    component_values[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
                     "-"
                 ):
                     i += 1
-                    component_paths[component] = unknown_args[i]
+                    component_values[component] = unknown_args[i]
                 else:
                     remaining.append(arg)
                     i += 1
@@ -2439,11 +2866,92 @@ class ServerArgs(DisaggServerArgsMixin):
                 remaining.append(arg)
             i += 1
 
-        # canonicalize and validate
-        for component, path in component_paths.items():
-            path = os.path.expanduser(path)
-            component_paths[component] = path
-        return component_paths, remaining
+        return {
+            component: os.path.expanduser(value)
+            for component, value in component_values.items()
+        }, remaining
+
+    @classmethod
+    def _extract_component_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component configuration paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=("--component-paths.", "--component_paths."),
+            alias_suffix="-path",
+        )
+
+    @classmethod
+    def _extract_component_weights_paths(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic component weight-file paths and aliases."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-weights-paths.",
+                "--component_weights_paths.",
+            ),
+            alias_suffix="-weights-path",
+        )
+
+    @classmethod
+    def _extract_component_quantizations(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract explicit per-component quantization methods."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-quantizations.",
+                "--component_quantizations.",
+            ),
+            alias_suffix="-quantization",
+        )
+
+    @staticmethod
+    def _extract_component_quantization_ignored_layers(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        ignored_layers: dict[str, list[str]] = {}
+        remaining: list[str] = []
+        i = 0
+        prefixes = (
+            "--component-quantization-ignored-layers.",
+            "--component_quantization_ignored_layers.",
+        )
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            prefix = next(
+                (candidate for candidate in prefixes if key_part.startswith(candidate)),
+                None,
+            )
+            if prefix is None:
+                remaining.append(arg)
+                i += 1
+                continue
+
+            component = key_part[len(prefix) :].replace("-", "_")
+            if "=" in arg:
+                values = [arg.split("=", 1)[1]]
+            else:
+                values = []
+                while i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    values.append(unknown_args[i])
+            if component and values:
+                ignored_layers[component] = values
+            else:
+                remaining.append(arg)
+            i += 1
+        return ignored_layers, remaining
 
     @staticmethod
     def _extract_component_attention_backends(
@@ -2492,8 +3000,17 @@ class ServerArgs(DisaggServerArgsMixin):
         if unknown_args is None:
             unknown_args = []
 
-        # extract dynamic --<component>-path from unknown args
-        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_quantizations, remaining = cls._extract_component_quantizations(
+            unknown_args
+        )
+        dynamic_ignored_layers, remaining = (
+            cls._extract_component_quantization_ignored_layers(remaining)
+        )
+        # Extract the more specific weights suffix before the generic path alias.
+        dynamic_weights_paths, remaining = cls._extract_component_weights_paths(
+            remaining
+        )
+        dynamic_paths, remaining = cls._extract_component_paths(remaining)
         dynamic_attention_backends, remaining = (
             cls._extract_component_attention_backends(remaining)
         )
@@ -2519,6 +3036,23 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
             explicit_arg_names.add("component_paths")
+        if dynamic_weights_paths:
+            existing = dict(provided_args.get("component_weights_paths") or {})
+            existing.update(dynamic_weights_paths)
+            provided_args["component_weights_paths"] = existing
+            explicit_arg_names.add("component_weights_paths")
+        if dynamic_quantizations:
+            existing = dict(provided_args.get("component_quantizations") or {})
+            existing.update(dynamic_quantizations)
+            provided_args["component_quantizations"] = existing
+            explicit_arg_names.add("component_quantizations")
+        if dynamic_ignored_layers:
+            existing = dict(
+                provided_args.get("component_quantization_ignored_layers") or {}
+            )
+            existing.update(dynamic_ignored_layers)
+            provided_args["component_quantization_ignored_layers"] = existing
+            explicit_arg_names.add("component_quantization_ignored_layers")
         if dynamic_attention_backends:
             existing = cls._parse_component_attention_backend_map(
                 provided_args.get("component_attention_backends")
@@ -2609,7 +3143,11 @@ class ServerArgs(DisaggServerArgsMixin):
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
         cls._reject_retired_args(kwargs)
-        explicit_arg_names = set(kwargs)
+        explicit_arg_names = kwargs.get("_explicit_arg_names")
+        if explicit_arg_names is None:
+            explicit_arg_names = set(kwargs)
+        else:
+            explicit_arg_names = set(explicit_arg_names)
 
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
@@ -2682,6 +3220,17 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_offload(self):
+        if (
+            self.component_residency is not None
+            and self.pipeline_config.task_type.is_action_gen()
+        ):
+            raise ValueError(
+                "--component-residency is not supported by action-generation "
+                "pipelines; use their existing model-specific offload controls"
+            )
+        if self.backend == Backend.DIFFUSERS and self.component_residency is not None:
+            resolve_diffusers_pipeline_offload(self.component_residency)
+
         # validate dit_offload_prefetch_size
         if self.dit_offload_prefetch_size > 1 and (
             isinstance(self.dit_offload_prefetch_size, float)
@@ -2766,16 +3315,11 @@ class ServerArgs(DisaggServerArgsMixin):
             )
             self.use_fsdp_inference = False
 
-        if self.layerwise_offload_components:
+        if self.has_layerwise_offload_components():
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
             is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
-            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
-                logger.warning(
-                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
-                )
-                self.use_fsdp_inference = False
 
             if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
                 raise ValueError(
@@ -2790,10 +3334,22 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.performance_mode == "memory"
                 or self.is_arg_explicitly_set("layerwise_offload_components")
                 or self.dit_layerwise_offload
+                or (
+                    self.component_residency
+                    and LAYERWISE_OFFLOAD in self.component_residency.values()
+                )
             ):
+                selected_components = list(self.layerwise_offload_components or ())
+                if self.component_residency:
+                    selected_components.extend(
+                        selector
+                        for selector, mode in self.component_residency.items()
+                        if mode == LAYERWISE_OFFLOAD
+                    )
+                selected_components = list(dict.fromkeys(selected_components))
                 logger.info_once(
                     "Using layerwise offload components: "
-                    f"{', '.join(self.layerwise_offload_components)}. "
+                    f"{', '.join(selected_components or ())}. "
                     "This reduces peak GPU memory and can increase latency; use "
                     "--performance-mode speed for GPU-resident defaults when memory allows."
                 )
@@ -2803,7 +3359,10 @@ class ServerArgs(DisaggServerArgsMixin):
             return
         if not current_platform.is_cuda():
             raise ValueError("--direct-gpu-weight-loading requires CUDA")
-        if self.dit_cpu_offload or self.is_dit_layerwise_offload_selected:
+        if (
+            self.should_cpu_offload_component("transformer")
+            or self.residency_mode("transformer") == LAYERWISE_OFFLOAD
+        ):
             raise ValueError(
                 "--direct-gpu-weight-loading requires a GPU-resident DiT; disable "
                 "DiT CPU and layerwise offload"
@@ -2919,10 +3478,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if self.encoder_parallel == "dp" and (
-            (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
-        ):
-            raise ValueError("encoder_parallel=dp requires tp_size=1 and dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

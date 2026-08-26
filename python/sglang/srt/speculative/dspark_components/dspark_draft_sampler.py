@@ -9,12 +9,24 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    select_draft_hidden_without_anchor,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
 # Same free-memory floor init_cuda_graphs requires before draft capture.
 _CAPTURE_HEADROOM_GB = 1.0
+
+
+def _base_logits_dtype(model) -> torch.dtype:
+    """Dtype of the block logits; a quantized head's packed `weight` carries no
+    logits dtype, its kernel emits the activation (draft param) dtype instead."""
+    weight = model.lm_head.weight
+    if weight.is_floating_point():
+        return weight.dtype
+    return next(model.markov_head.parameters()).dtype
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -40,6 +52,8 @@ class DsparkDraftSampler:
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.sample_from_anchor = bool(model.sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         max_bs = int(max_bs)
         if out is not None:
             assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
@@ -70,7 +84,7 @@ class DsparkDraftSampler:
             )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=model.lm_head.weight.dtype,
+                dtype=_base_logits_dtype(model),
                 device=device,
             )
 
@@ -91,10 +105,19 @@ class DsparkDraftSampler:
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        bs = hidden_states.shape[0] // self.query_token_num
+        if self.sample_from_anchor:
+            model_hidden = hidden_states
+            sample_hidden = hidden_states.view(bs, self.gamma, -1)
+        else:
+            model_hidden, sample_hidden = select_draft_hidden_without_anchor(
+                hidden_states,
+                bs=bs,
+                gamma=self.gamma,
+            )
+        base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
+        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
         if self.folded_sampling:
 
@@ -116,7 +139,7 @@ class DsparkDraftSampler:
         draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=sample_hidden,
             sampler=sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -126,7 +149,7 @@ class DsparkDraftSampler:
             )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=sample_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
@@ -144,9 +167,11 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
         return True
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
+    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
+    available_gb = get_available_gpu_memory(
+        device, torch.get_device_module().current_device()
+    )
     if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
