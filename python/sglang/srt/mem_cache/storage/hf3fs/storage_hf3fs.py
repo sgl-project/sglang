@@ -446,6 +446,9 @@ class HiCacheHF3FS(HiCacheStorage):
         if self.skip_backup:
             return True
 
+        # Must match the read side (_batch_get); a dtype-scoped key that is
+        # stored unprefixed can never be found again.
+        keys = [f"{self._dtype_key_prefix}{key}" for key in keys]
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
@@ -534,6 +537,7 @@ class HiCacheHF3FS(HiCacheStorage):
             keys = self._get_mha_zero_copy_keys(keys)
             factor = 2
 
+        keys = [f"{self._dtype_key_prefix}{key}" for key in keys]
         results = self.metadata_client.exists(self.rank, keys)
 
         i = 0

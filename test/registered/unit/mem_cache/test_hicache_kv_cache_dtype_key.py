@@ -7,9 +7,11 @@ do not silently reuse each other's cache entries.
 Issue: https://github.com/sgl-project/sglang/issues/33268
 """
 
+import os
 import tempfile
 
 import pytest
+import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
@@ -235,6 +237,121 @@ class TestHiCacheStorageConfigField:
         assert cfg.is_page_first_layout is True
         assert cfg.model_name == "test-model"
         assert cfg.kv_cache_dtype == "torch.float8_e4m3fn"
+
+
+class TestHf3fsDtypeKeyRoundTrip:
+    """Store-then-load round trip through the hf3fs KV backend.
+
+    The dtype prefix must be applied identically on write and read. When it is
+    applied on _batch_get but not on _batch_set, a page stored under "key" is
+    looked up as "dtype_..._key" and never found, so a warm cache reads back
+    zero pages (the observed cached_tokens=0 remote miss). The suffix-substring
+    tests above never exercise _batch_set/_batch_get, so only a round trip
+    catches a one-sided prefix.
+    """
+
+    PAGE_BYTES = 256
+
+    def _backend(self, path, metadata_client, kv_cache_dtype):
+        from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
+
+        return HiCacheHF3FS(
+            rank=0,
+            file_path=path,
+            file_size=self.PAGE_BYTES * 16,
+            numjobs=1,
+            bytes_per_page=self.PAGE_BYTES,
+            entries=8,
+            client_timeout=1,
+            dtype=torch.uint8,
+            metadata_client=metadata_client,
+            use_mock_client=True,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+
+    def _metadata_client(self):
+        from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
+            Hf3fsLocalMetadataClient,
+        )
+
+        return Hf3fsLocalMetadataClient()
+
+    def _page(self, fill):
+        return torch.full((self.PAGE_BYTES,), fill, dtype=torch.uint8)
+
+    def _read_back(self, backend, keys):
+        # _batch_get fills the passed-in tensors in place and returns hit flags.
+        out = [torch.zeros(self.PAGE_BYTES, dtype=torch.uint8) for _ in keys]
+        hits = backend._batch_get(keys, out)
+        return hits, out
+
+    def test_dtype_page_round_trips(self):
+        """A dtype-scoped page stored via _batch_set is found again by _batch_get.
+
+        Red on the one-sided-prefix bug (all misses); green when write and read
+        prefix symmetrically.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = self._backend(
+                os.path.join(tmpdir, "kv.bin"),
+                self._metadata_client(),
+                "torch.bfloat16",
+            )
+            try:
+                keys = ["page_a", "page_b"]
+                written = [self._page(3), self._page(7)]
+                assert all(backend._batch_set(keys, written))
+
+                hits, out = self._read_back(backend, keys)
+                assert all(hits), f"stored pages not found on read back: {hits}"
+                assert torch.equal(out[0], written[0])
+                assert torch.equal(out[1], written[1])
+            finally:
+                backend.close()
+
+    def test_different_dtype_does_not_reuse_pages(self):
+        """The dtype prefix isolates two runs sharing one store, file, and key.
+
+        Writer and reader share the same metadata client and file and differ
+        only in kv_cache_dtype, so a hit here would mean the prefix failed to
+        scope the key -- the collision this feature exists to prevent. Guards
+        against the prefix being dropped on either path (which would collapse
+        the two dtypes onto one page).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kv.bin")
+            metadata_client = self._metadata_client()
+            writer = self._backend(path, metadata_client, "torch.bfloat16")
+            reader = self._backend(path, metadata_client, "torch.float8_e4m3fn")
+            try:
+                keys = ["shared_key"]
+                assert all(writer._batch_set(keys, [self._page(5)]))
+                hits, _ = self._read_back(reader, keys)
+                assert not any(hits)
+            finally:
+                writer.close()
+                reader.close()
+
+    def test_none_dtype_round_trips(self):
+        """kv_cache_dtype=None keeps the legacy unprefixed key and round-trips.
+
+        Backward-compat guard: caches written before the feature (no prefix)
+        must remain readable, so the None path must apply no prefix on either
+        side.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = self._backend(
+                os.path.join(tmpdir, "kv.bin"), self._metadata_client(), None
+            )
+            try:
+                keys = ["page_x"]
+                written = [self._page(9)]
+                assert all(backend._batch_set(keys, written))
+                hits, out = self._read_back(backend, keys)
+                assert all(hits)
+                assert torch.equal(out[0], written[0])
+            finally:
+                backend.close()
 
 
 if __name__ == "__main__":
