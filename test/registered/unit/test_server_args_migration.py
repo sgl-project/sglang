@@ -23,9 +23,12 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         cls.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(cls.parser)
 
-    def _parse(self, args_list):
+    def _parse_raw(self, args_list):
         args = self.parser.parse_args(["--model", "dummy"] + args_list)
-        server_args = ServerArgs.from_cli_args(args)
+        return ServerArgs.from_cli_args(args)
+
+    def _parse(self, args_list):
+        server_args = self._parse_raw(args_list)
         # Parsing hands back the raw record; the cases below read values that
         # resolution normalises, so resolve here the way a launcher would.
         server_args.resolve_once()
@@ -87,7 +90,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_media_url_security_args(self):
         try:
-            sa = self._parse(
+            sa = self._parse_raw(
                 [
                     "--allowed-media-domains",
                     "Media.Example.com.",
@@ -96,7 +99,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "32",
                 ]
             )
-            # The normalization is a declaration.
+            sa._handle_media_url_security()
             self.assertEqual(
                 resolution_result(sa, "allowed_media_domains"),
                 ["127.0.0.1", "media.example.com"],
@@ -108,9 +111,13 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_media_url_security_args_reject_invalid_values(self):
         try:
             with self.assertRaises(ValueError):
-                self._parse(["--allowed-media-domains", "https://media.example.com"])
+                sa = self._parse_raw(
+                    ["--allowed-media-domains", "https://media.example.com"]
+                )
+                sa._handle_media_url_security()
             with self.assertRaises(ValueError):
-                self._parse(["--media-url-max-file-size-mb", "-1"])
+                sa = self._parse_raw(["--media-url-max-file-size-mb", "-1"])
+                sa._handle_media_url_security()
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
@@ -148,9 +155,50 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             )
 
     def test_deprecated_flags_still_work(self):
-        """Deprecated flags set the correct dest field."""
+        """Deprecated flags continue redirecting to their replacement fields."""
         sa = self._parse(["--stream-output"])
         self.assertTrue(sa.incremental_streaming_output)
+
+        sa = self._parse(["--enable-gdn-replayssm-spec"])
+        self.assertTrue(sa.enable_linear_replayssm_spec)
+
+        sa = self._parse(["--enable-expert-distribution-metrics"])
+        self.assertEqual(sa.expert_balancedness_report_mode, "server_log")
+
+    def test_deprecated_registrations_are_sorted_by_date_then_flag(self):
+        expected = [
+            "--prefill-round-robin-balance",
+            "--stream-output",
+            "--enable-flashinfer-allreduce-fusion",
+            "--collect-tokens-histogram",
+            "--speculative-dflash-draft-window-size",
+            "--dsa-prefill-cp-mode",
+            "--enable-dsa-prefill-context-parallel",
+            "--enable-nsa-prefill-context-parallel",
+            "--nsa-decode-backend",
+            "--nsa-prefill-backend",
+            "--nsa-prefill-cp-mode",
+            "--cuda-graph-bs",
+            "--cuda-graph-max-bs",
+            "--disable-cuda-graph",
+            "--disable-piecewise-cuda-graph",
+            "--enable-breakable-cuda-graph",
+            "--enforce-piecewise-cuda-graph",
+            "--piecewise-cuda-graph-compiler",
+            "--piecewise-cuda-graph-max-tokens",
+            "--piecewise-cuda-graph-tokens",
+            "--enable-prefill-context-parallel",
+            "--prefill-cp-mode",
+            "--mamba-scheduler-strategy",
+            "--enable-gdn-replayssm-spec",
+            "--enable-expert-distribution-metrics",
+        ]
+        actual = [
+            action.option_strings[0]
+            for action in self.parser._actions
+            if action.option_strings and action.option_strings[0] in expected
+        ]
+        self.assertEqual(actual, expected)
 
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""

@@ -15,6 +15,9 @@ import zmq.asyncio
 from fastapi import HTTPException
 from PIL import Image
 
+from sglang.srt.arg_groups.encoder_transfer_hook import (
+    resolve_encoder_transfer_backend,
+)
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
@@ -48,7 +51,6 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     prepare_kimi_k3_encoder_inputs,
 )
 from sglang.srt.runtime_context import get_context, publish, reset_context
-from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 

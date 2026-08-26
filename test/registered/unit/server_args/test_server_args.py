@@ -1,5 +1,4 @@
 import dataclasses
-import importlib
 import json
 import os
 import socket
@@ -10,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
+from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
@@ -28,7 +28,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.runtime_context import get_context, get_serving
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    SAMPLING_BACKEND_CHOICES,
+    PortArgs,
+    ServerArgs,
+    prepare_server_args,
+)
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -61,7 +66,7 @@ class TestPrepareServerArgs(CustomTestCase):
                     f"parser, got SystemExit({exc.code})"
                 )
 
-            args.resolve_once()
+            handle_mega_moe(args)
 
             self.assertTrue(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
@@ -74,9 +79,7 @@ class TestPrepareServerArgs(CustomTestCase):
         }
         with patch.dict(os.environ, deepgemm_env, clear=False):
             args = prepare_server_args(["--model-path", "dummy"])
-            # Resolve, or the check that the environment stays untouched has
-            # nothing to be untouched by.
-            args.resolve_once()
+            handle_mega_moe(args)
 
             self.assertFalse(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
@@ -84,13 +87,15 @@ class TestPrepareServerArgs(CustomTestCase):
 
     def test_prefill_decode_interval(self):
         args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
-        args.resolve_once()
+        args._validate_prefill_decode_interval()
         self.assertEqual(resolution_result(args, "prefill_decode_interval"), 16)
 
         with self.assertRaisesRegex(
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
-            ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+            ServerArgs(
+                model_path="dummy", prefill_decode_interval=-1
+            )._validate_prefill_decode_interval()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -110,23 +115,23 @@ class TestPrepareServerArgs(CustomTestCase):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 
     def test_return_hidden_states_mode_configuration(self):
-        def _resolved(**kwargs):
+        def _handled(**kwargs):
             server_args = ServerArgs(**kwargs)
-            server_args.resolve_once()
+            server_args._handle_return_hidden_states_mode()
             return server_args
 
-        disabled = _resolved(model_path="dummy")
+        disabled = _handled(model_path="dummy")
         self.assertFalse(resolution_result(disabled, "enable_return_hidden_states"))
         self.assertIsNone(resolution_result(disabled, "return_hidden_states_mode"))
 
-        last = _resolved(
+        last = _handled(
             model_path="dummy",
             return_hidden_states_mode="last",
         )
         self.assertTrue(resolution_result(last, "enable_return_hidden_states"))
         self.assertEqual(resolution_result(last, "return_hidden_states_mode"), "last")
 
-        legacy_full = _resolved(
+        legacy_full = _handled(
             model_path="dummy",
             enable_return_hidden_states=True,
         )
@@ -143,7 +148,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 "last",
             ]
         )
-        parsed_last.resolve_once()
+        parsed_last._handle_return_hidden_states_mode()
         self.assertTrue(resolution_result(parsed_last, "enable_return_hidden_states"))
         self.assertEqual(
             resolution_result(parsed_last, "return_hidden_states_mode"), "last"
@@ -154,7 +159,7 @@ class TestPrepareServerArgs(CustomTestCase):
             ValueError,
             "return_hidden_states_mode must be one of",
         ):
-            _resolved(
+            _handled(
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
@@ -2056,40 +2061,34 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
 
-    The choice set is built once at server_args.py import time, so each subtest
-    reloads the module with the env var set to the desired value.
+    The gate is read in add_cli_args, so each subtest just builds a parser with
+    the env var set -- no module reload.
     """
 
-    def _reload_server_args_with_env(self, *, enabled: bool):
-        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
-        try:
-            return importlib.reload(server_args_module)
-        finally:
-            if previous is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
-            else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+    def _parse(self, argv, *, enabled: bool):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1" if enabled else "0"},
+            clear=False,
+        ):
+            return prepare_server_args(argv)
 
     def test_token_oracle_rejected_when_env_disabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=False)
-        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+        self.assertNotIn("token_oracle", SAMPLING_BACKEND_CHOICES)
 
         with self.assertRaises(SystemExit):
-            reloaded.prepare_server_args(
+            self._parse(
                 [
                     "--model-path",
                     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                     "--sampling-backend",
                     "token_oracle",
-                ]
+                ],
+                enabled=False,
             )
 
     def test_token_oracle_accepted_when_env_enabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=True)
-        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
-
-        parsed = reloaded.prepare_server_args(
+        parsed = self._parse(
             [
                 "--model-path",
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -2101,9 +2100,23 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
                 # to "pytorch", masking what we want to verify).
                 "--device",
                 "cuda",
-            ]
+            ],
+            enabled=True,
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+    def test_gate_does_not_mutate_the_module_level_list(self):
+        """The env gate builds the parser's choices; it must not leak."""
+        self._parse(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--device",
+                "cuda",
+            ],
+            enabled=True,
+        )
+        self.assertNotIn("token_oracle", SAMPLING_BACKEND_CHOICES)
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):

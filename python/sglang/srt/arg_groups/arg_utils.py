@@ -58,6 +58,22 @@ from typing import (
 A = Annotated
 
 
+class Choices(list):
+    """A CLI choice list that out-of-tree code may extend.
+
+    ``Arg(choices=...)`` and argparse both hold this object rather than a copy,
+    so an append made before the parser is built is visible to it. A plain
+    ``list`` would work identically; the type exists so that a module-level
+    choice list reads as an extension point, and so its adder can live on the
+    line below it instead of in a second block that has to be kept in order.
+    """
+
+    def add(self, choice: str) -> None:
+        """Preserve set-like ``.add(choice)`` compatibility."""
+        if choice not in self:
+            self.append(choice)
+
+
 @dataclasses.dataclass(frozen=True)
 class Arg:
     """CLI argument metadata attached to a dataclass field via ``Annotated``."""

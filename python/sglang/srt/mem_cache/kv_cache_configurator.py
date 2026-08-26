@@ -1503,7 +1503,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+        from sglang.srt.arg_groups.minimax_m3_hook import m3_fp8_attn_gemm_enabled
 
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)

@@ -24,15 +24,14 @@ class TestContextOverride(CustomTestCase):
         rc.reset_context()
 
     def _publish(self):
-        sa = ServerArgs(model_path="dummy")
+        sa = ServerArgs(model_path="dummy", hicache_ratio=2.0)
         # Through publish, so the record is resolved the way a process resolves it.
         rc.publish(sa, role="test")
         return sa
 
     def test_override_writes_bag_not_server_args(self):
         sa = self._publish()
-        # The published leaf, not the field: `hicache_ratio` is resolved by
-        # declaration, so the field still holds what the caller passed.
+        # The published leaf changes while the raw input record stays pristine.
         before = rc.get_memory().hicache_ratio
         pristine = sa.hicache_ratio
         rc.get_context().override("test", hicache_ratio=before + 1.0)
