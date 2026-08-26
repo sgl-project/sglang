@@ -2235,6 +2235,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2262,6 +2263,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
@@ -2294,6 +2296,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi300x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
@@ -2514,6 +2517,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2542,6 +2546,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
@@ -2577,6 +2582,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "flash", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
@@ -2714,6 +2720,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2742,6 +2749,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
@@ -2777,6 +2785,7 @@ sgl-eval run aime25 \\
       match: { hw: "mi355x", variant: "pro", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [
+        "SGLANG_DSV4_FP4_EXPERTS=0",
         "SGLANG_USE_ROCM700A=0",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
