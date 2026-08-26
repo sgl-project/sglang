@@ -720,6 +720,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        # Qwen4-Exp MTP: the NEXTN draft layer ships inside the target
+        # checkpoint (model.mtp.*), so the draft model path defaults to
+        # the target model path.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(

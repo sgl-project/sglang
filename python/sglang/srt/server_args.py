@@ -194,6 +194,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -2720,6 +2721,17 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("exec.offload"),
+    ] = None
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3851,6 +3863,7 @@ class ServerArgs:
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
         self._handle_hardware_runtime_validation()
+        self._handle_offload_compatibility()
         if cfg.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -4020,7 +4033,18 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
+        self._handle_offload_compatibility()
         self._resolution_finished = True
+
+    def _handle_offload_compatibility(self):
+        if self.ple_offload_embedding and (
+            self.cpu_offload_gb > 0 or self.offload_group_size > 0
+        ):
+            raise ValueError(
+                "--ple-offload-embedding cannot be combined with "
+                "--cpu-offload-gb or --offload-group-size: generic layer offload "
+                "would stage the pinned PLE embedding back to the device."
+            )
 
     def _handle_return_hidden_states_mode(self):
         cfg = resolving_view(self)
@@ -6143,6 +6167,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ]:
             # The quantization/moe_runner_backend resolution moved to the
             # override registry (arg_groups/overrides.py:
@@ -8455,6 +8480,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",

@@ -98,6 +98,8 @@ class TreeNode:
         self.mamba_last_access_time = self.last_access_time
 
         self.hit_count = 0
+        # QSA compressed pages ending exactly at this node's group boundary
+        # (one entry per registered page ledger); None on non-boundary nodes.
         self.host_ref_counter = 0
         self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
@@ -760,7 +762,6 @@ class MambaRadixCache(BasePrefixCache):
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if mamba_exist:
             self._free_mamba_value(mamba_value_donated)
-
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
             MatchPrefixParams(

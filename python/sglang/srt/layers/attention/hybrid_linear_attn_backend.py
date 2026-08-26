@@ -10,6 +10,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -314,11 +315,13 @@ class MambaAttnBackendBase(AttentionBackend):
         the last complete chunk boundary, mamba_track_mask rows only)."""
         conv_state_len = self.conv_states_shape[-1]
 
-        lens_to_track = (
-            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
+        # Shared with the Qwen4-Exp PLE side states so the boundary can never
+        # drift between them.
+        aligned_len = forward_batch.mamba_track_aligned_lens()
+        assert aligned_len is not None, (
+            "conv-state tracking requires mamba_track_seqlens and extend_prefix_lens; "
+            "this path should only run when the track mask is set on an extend batch"
         )
-        chunk_size = mamba_cache_chunk_size()
-        aligned_len = (lens_to_track // chunk_size) * chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -1013,6 +1016,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
+            # skip linear/mamba metadata (mirrors init_forward_metadata).
+            self.full_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -1024,8 +1034,20 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
+            # skip linear/mamba metadata (mirrors init_forward_metadata).
+            self.full_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        if layer_id in self.full_attn_layers:
+            return self.full_attn_backend.get_indexer_metadata(
+                layer_id, forward_batch
+            )
+        return None
 
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
@@ -1271,6 +1293,98 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
         )
+
+        self._update_ple_state_after_mtp_verify(
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+
+    @staticmethod
+    def _scatter_speculative_state_with_mask(
+        dst: torch.Tensor,
+        src: torch.Tensor,
+        dst_indices_raw: torch.Tensor,
+        step_indices_raw: torch.Tensor,
+    ):
+        if dst is None or src is None or step_indices_raw.numel() == 0:
+            return
+        if dst.is_cuda and src.is_cuda:
+            fused_mamba_state_scatter_with_mask(
+                dst, src, dst_indices_raw, step_indices_raw
+            )
+            return
+
+        device = dst.device
+        dst_indices = dst_indices_raw.to(device=device, dtype=torch.long)
+        steps = step_indices_raw.to(device=device, dtype=torch.long)
+        src_indices = torch.arange(steps.shape[0], device=device, dtype=torch.long)
+        valid = (
+            (steps >= 0)
+            & (steps < src.shape[2])
+            & (dst_indices >= 0)
+            & (dst_indices < dst.shape[1])
+            & (src_indices < src.shape[1])
+        )
+        valid_indices = valid.nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            return
+        dst[:, dst_indices[valid_indices]] = src[
+            :, src_indices[valid_indices], steps[valid_indices]
+        ]
+
+    def _update_ple_state_after_mtp_verify(
+        self,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ):
+        """Roll the accepted per-step PLE side states into their main slots."""
+        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+
+        state_pairs = []
+        short_conv_pool = req_to_token_pool.short_conv_pool
+        if (
+            short_conv_pool.conv_state is not None
+            and short_conv_pool.intermediate_conv_state is not None
+        ):
+            state_pairs.append(
+                (
+                    short_conv_pool.conv_state,
+                    short_conv_pool.intermediate_conv_state,
+                )
+            )
+
+        ngram_pool = req_to_token_pool.ngram_pool
+        if (
+            ngram_pool.context is not None
+            and ngram_pool.intermediate_context is not None
+        ):
+            state_pairs.append(
+                (
+                    ngram_pool.context.unsqueeze(0),
+                    ngram_pool.intermediate_context.unsqueeze(0),
+                )
+            )
+
+        for state, intermediate_state in state_pairs:
+            self._scatter_speculative_state_with_mask(
+                state,
+                intermediate_state,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            if mamba_track_indices is not None:
+                self._scatter_speculative_state_with_mask(
+                    state,
+                    intermediate_state,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

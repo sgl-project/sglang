@@ -18,6 +18,9 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
+        # Qwen3.5 is dense; only its MoE variant has routed experts. Without this
+        # the count would inherit Qwen3Next's 512 default.
+        num_experts=None,
         **kwargs,
     ):
         # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
@@ -26,7 +29,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         if kwargs.get("rope_scaling") is None and rope_parameters is not None:
             kwargs["rope_scaling"] = rope_parameters
 
-        super().__init__(**kwargs)
+        super().__init__(num_experts=num_experts, **kwargs)
         if self.rope_scaling is None:
             self.rope_scaling = rope_parameters or {}
 
@@ -119,8 +122,8 @@ class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, num_experts=512, **kwargs):
+        super().__init__(num_experts=num_experts, **kwargs)
 
 
 # All Moe variant classes need explicit __init__ because the kw_only=True

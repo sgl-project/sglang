@@ -1341,7 +1341,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config.vision_config.deepstack_visual_indexes
             )
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+            # Only enable deepstack when the checkpoint declares deepstack
+            # capture layers (Qwen4-Exp ships an empty list).
+            self.use_deepstack = (
+                {Modality.IMAGE: True, Modality.VIDEO: True}
+                if self.num_deepstack_embeddings > 0
+                else {}
+            )
         else:
             self.deepstack_visual_indexes = []
             self.num_deepstack_embeddings = 0

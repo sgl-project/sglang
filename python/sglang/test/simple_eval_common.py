@@ -438,6 +438,17 @@ HTML_JINJA = """
 """
 
 
+def import_load_dataset():
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError(
+            "The 'datasets' package is required for this evaluation. "
+            "Please install it with: pip install datasets"
+        )
+    return load_dataset
+
+
 def format_multichoice_question(row):
     return QUERY_TEMPLATE_MULTICHOICE.format(**row)
 
