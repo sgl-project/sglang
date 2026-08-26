@@ -926,6 +926,30 @@ class C4IndexerAscendBackendMixin:
             )
         except Exception:
             pass
+        # §24.47 (Run 31): produce-time audit -- SOURCE vs VICTIM
+        # discriminator for c4_topk_indices. Run 30 saw garbage (min=-
+        # 1322056757 / max=INT32_MAX) in the table at attention time on the
+        # catch rank; that alone cannot tell whether the indexer kernel
+        # EMITTED garbage (source -> CANN op dump / tiling audit of
+        # npu_quant_lightning_indexer) or the buffer was DIRTIED afterwards
+        # by a foreign OOB writer (victim -> reopen the writer model).
+        # This counts junk (negative-not-(-1) or INT32_MAX-family) in the
+        # SAME stream right after the op, zero-sync (device-side counter,
+        # read only inside [mf-scatter]'s existing D2H). Slot names carry
+        # the "produce-time" prefix: proc:junk > 0 => indexer EMITTED it;
+        # proc:junk == 0 while the attention-time c4topk:junk > 0 => the
+        # buffer was clean at production and dirtied in between.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob,
+            )
+
+            _p64 = topk_idxs.reshape(-1).to(torch.int64)
+            _pjunk = (_p64 < 0) & (_p64 != -1)
+            _pjunk |= _p64 >= (1 << 31) - 2
+            count_scatter_oob(_pjunk, "c4topk:proc-junk")
+        except Exception:
+            pass
         return topk_idxs.view(-1, self._dsv4_index_topk)
 
     def forward_c4_indexer(
@@ -2275,10 +2299,39 @@ class DeepseekV4AscendAttnBackend(
             topk = fm.c4_topk_indices
             try:
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                    count_scatter_oob,
                     record_oob_extremes,
+                    record_oob_first_rc,
                 )
 
                 record_oob_extremes("c4topk", topk)
+                # §24.46: split the c4topk negatives into SENTINEL vs JUNK.
+                # Run 30 (multi-node) convicted cmp_sparse_indices as the sole
+                # non-zero index signal: min=-1 on catch ranks (graph-buffer
+                # sentinel tail) but min=-1322056757 / max=INT32_MAX on the
+                # exact rank+second of a catch -- REAL garbage, not sentinel.
+                # Fixed-shape ops only (nonzero is illegal on captured
+                # streams, §24.43 Run 27). junk = negative-and-not-(-1) OR
+                # INT32_MAX-family (>= 2^31-2, both garbage signatures).
+                _t64 = topk.to(torch.int64)
+                _sent = _t64 == -1
+                _junk = (_t64 < 0) & ~_sent
+                _junk |= _t64 >= (1 << 31) - 2
+                count_scatter_oob(_sent.reshape(-1), "c4topk:sent")
+                count_scatter_oob(_junk.reshape(-1), "c4topk:junk")
+                # first junk (row, col) via sentinel fill (same trick as
+                # record_oob_first_rc but for the junk mask, 2D coords).
+                if topk.dim() == 2:
+                    _rows = torch.arange(
+                        topk.shape[0], device=topk.device, dtype=torch.int64
+                    ).unsqueeze(1)
+                    _rj = torch.where(_junk.any(dim=1), _rows, torch.full_like(_rows, (1 << 31) - 1)).min().reshape(1)
+                    record_oob_extremes("c4topk:jrow", _rj)
+                    _cols = torch.arange(
+                        topk.shape[1], device=topk.device, dtype=torch.int64
+                    ).unsqueeze(0)
+                    _cj = torch.where(_junk, _cols, torch.full_like(_cols, -(1 << 30))).max()
+                    record_oob_extremes("c4topk:jcol", torch.stack([_cj.reshape(1), _rj]))
             except Exception:
                 pass
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
@@ -2312,11 +2365,28 @@ class DeepseekV4AscendAttnBackend(
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        # §24.47 (Run 31): b2b squeeze around the S2 index_put.
+        # b2b_swa_pre/post queue same-stream dirty-counts of the active r2t
+        # region; a positive delta surfaces as 'swa-b2b' in [mf-scatter] and
+        # convicts the set_swa_buffer index_put (S2) with zero sync. Both
+        # calls no-op unless the trap is enabled and the batch is extend.
+        try:
+            from sglang.srt.layers.cp.layer_trap import b2b_swa_post, b2b_swa_pre
+
+            b2b_swa_pre(forward_batch)
+        except Exception:
+            pass
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,
             cache=swa_k,
         )
+        try:
+            from sglang.srt.layers.cp.layer_trap import b2b_swa_post
+
+            b2b_swa_post(forward_batch)
+        except Exception:
+            pass
 
     def _build_npu_compress_metadata_verify(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata

@@ -62,6 +62,71 @@ _addrs: dict = {}
 # convicts the deterministic collective kernel, not freed-memory noise.
 _gather_sites: collections.deque = collections.deque(maxlen=512)
 
+# §24.47 (Run 31): b2b SWA IndexPut squeeze -- same-stream back-to-back
+# device-side dirty check around set_swa_buffer's index_put. The put runs on
+# the forward stream; comparing a dirty-predicate count of the active r2t
+# region in the SAME stream right before and right after the put means: if
+# the put (or anything queued between the two checks) dirtied r2t, the
+# post-count exceeds the pre-count and the delta convicts the S2 family with
+# ZERO host synchronization (the count tensors are device-side, read only
+# inside [mf-scatter]'s existing piggyback D2H). Same-stream FIFO => no
+# sliding window; catches are un-missable if the writer is the put.
+_B2B_PRE = {}
+_B2B_ARMED = False
+
+
+def b2b_swa_pre(forward_batch) -> None:
+    """Queue the dirty-count of active r2t rows BEFORE set_swa_buffer."""
+    global _B2B_ARMED
+    if not _enabled() or _B2B_ARMED:
+        return
+    act = _active(forward_batch)
+    if act is None:
+        return
+    r2t, idx, w = act
+    try:
+        # int64 view is safe: r2t is int32; bitcast-style compare in int64
+        # keeps the <0 | >=2^30 predicate identical to [mf-raw].
+        seg = r2t[idx, :w].to(torch.int64)
+        _B2B_PRE.clear()
+        _B2B_PRE["cnt"] = ((seg < 0) | (seg >= 1 << 30)).sum().reshape(1)
+        _B2B_PRE["n"] = seg.numel()
+    except Exception:
+        _B2B_PRE.clear()
+
+
+def b2b_swa_post(forward_batch) -> None:
+    """Queue the same dirty-count AFTER the put; accumulate the delta.
+
+    The delta is added to a device-side counter via count_scatter_oob so it
+    surfaces in the [mf-scatter] readout without any new D2H: 'swa-b2b' > 0
+    => the index_put (or the ops queued between the two checks -- exactly
+    the S2 window) dirtied active r2t entries.
+    """
+    global _B2B_ARMED
+    if not _enabled() or _B2B_ARMED:
+        return
+    if "cnt" not in _B2B_PRE:
+        return
+    act = _active(forward_batch)
+    if act is None:
+        return
+    r2t, idx, w = act
+    try:
+        seg = r2t[idx, :w].to(torch.int64)
+        post = ((seg < 0) | (seg >= 1 << 30)).sum().reshape(1)
+        delta = post - _B2B_PRE["cnt"]
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+            count_scatter_oob,
+        )
+
+        # mask trick: count_scatter_oob sums a bool mask; feed it the sign
+        # bit of a positive delta via clamp (delta>0 <=> mask True).
+        count_scatter_oob((delta > 0).reshape(1), "swa-b2b")
+        _B2B_PRE.clear()
+    except Exception:
+        _B2B_PRE.clear()
+
 
 def layer_trap_note_gather(tag: str, tensors: dict) -> None:
     """Record one gather call site's buffers into the rolling registry."""
