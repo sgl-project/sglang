@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -136,6 +136,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         available_size = allocator.available_size()
         if available_size < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+
 
 
 def retraction_backup(

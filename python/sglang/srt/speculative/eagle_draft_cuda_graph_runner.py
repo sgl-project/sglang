@@ -647,7 +647,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         # forward_batch.batch_size was overwritten to bs above when padding.
+        forward_batch.num_padding = bs - raw_bs
         self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        forward_batch.num_padding = None
         self.raw_bs = raw_bs
         self.bs = bs
 

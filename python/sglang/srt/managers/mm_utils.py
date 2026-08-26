@@ -716,7 +716,15 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
+            # copy when a draft re-reads this after the target forward: the
+            # target may overwrite input_embeds in place (deepstack add_,
+            # residual reuse), which would corrupt the MTP draft's input.
+            forward_batch.mm_input_embeds = (
+                input_embeds.clone()
+                if forward_batch.spec_algorithm is not None
+                and not forward_batch.spec_algorithm.is_none()
+                else input_embeds
+            )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
