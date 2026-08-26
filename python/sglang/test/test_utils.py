@@ -42,8 +42,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_xpu,
     kill_process_tree,
-    kill_processes,
-    list_descendants,
     retry,
 )
 from sglang.srt.utils.network import is_port_available
@@ -837,19 +835,15 @@ def terminate_and_kill_process_tree(
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
     resources in userspace.
     """
-    # The launcher kills its children fire-and-forget and exits on SIGTERM, so
-    # kill_process_tree() below can find neither it nor them; the snapshot is
-    # the only remaining handle on the workers still holding GPU memory.
-    descendants = list_descendants(process.pid)
-
-    process.terminate()
-    try:
-        process.wait(timeout=terminate_timeout)
-    except subprocess.TimeoutExpired:
-        pass
-
-    kill_process_tree(process.pid, wait_timeout=wait_timeout)
-    kill_processes(descendants, wait_timeout=wait_timeout)
+    kill_process_tree(
+        process.pid,
+        wait_timeout=wait_timeout,
+        terminate_timeout=terminate_timeout,
+    )
+    # The kill already reaped the child, so the handle never learns it exited
+    # and warns "subprocess N is still running" at GC. Poll to settle it; the
+    # resulting returncode is meaningless because we did not do the reaping.
+    process.poll()
 
 
 def popen_launch_pd_server(

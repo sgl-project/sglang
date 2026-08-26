@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 # A launched server is a launcher process owning worker children. The launcher
 # can exit before the fallback kill runs, and a worker left behind holds GPU
@@ -21,18 +21,17 @@ PARENT_SCRIPT = (
     "print(child.pid, flush=True); "
     "time.sleep(60)"
 )
+STUBBORN_PARENT_SCRIPT = (
+    "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + PARENT_SCRIPT
+)
 CHILD_SCRIPT = "import time; time.sleep(60)"
 
 
 class TestTerminateAndKillProcessTree(unittest.TestCase):
-    def test_reaps_descendant_after_parent_exits(self):
-        """Cleanup must not leave a descendant behind when the parent dies first.
-
-        Once the parent PID is gone its children are unwalkable, so a cleanup
-        that only discovers the tree after termination silently leaks them.
-        """
+    def _launch(self, parent_script):
+        """A parent holding one child, plus psutil handles for both."""
         process = subprocess.Popen(
-            [sys.executable, "-c", PARENT_SCRIPT, CHILD_SCRIPT],
+            [sys.executable, "-c", parent_script, CHILD_SCRIPT],
             stdout=subprocess.PIPE,
             text=True,
         )
@@ -49,14 +48,37 @@ class TestTerminateAndKillProcessTree(unittest.TestCase):
             kill_process_tree(child_pid, wait_timeout=5)
 
         self.addCleanup(cleanup_processes)
+        return process, psutil.Process(process.pid), psutil.Process(child_pid)
 
-        child = psutil.Process(child_pid)
+    def _assert_gone(self, proc, label):
+        # A zombie has already released its resources; only a running one leaks.
+        try:
+            leaked = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            leaked = False
+        self.assertFalse(leaked, f"{label} {proc.pid} survived the cleanup")
+
+    def test_reaps_descendant_after_parent_exits(self):
+        """Cleanup must not leave a descendant behind when the parent dies first.
+
+        Once the parent PID is gone its children are unwalkable, so a cleanup
+        that only discovers the tree after termination silently leaks them.
+        """
+        process, _, child = self._launch(PARENT_SCRIPT)
+
         terminate_and_kill_process_tree(process, terminate_timeout=5, wait_timeout=5)
 
         self.assertIsNotNone(process.poll(), "parent survived the cleanup")
-        # A zombie has already released its resources; only a running child leaks.
-        child_leaked = child.is_running() and child.status() != psutil.STATUS_ZOMBIE
-        self.assertFalse(child_leaked, f"child {child_pid} survived the cleanup")
+        self._assert_gone(child, "child")
+
+    def test_reaps_tree_when_parent_ignores_sigterm(self):
+        """A parent that outlives SIGTERM still gets the whole tree SIGKILLed."""
+        process, parent, child = self._launch(STUBBORN_PARENT_SCRIPT)
+
+        terminate_and_kill_process_tree(process, terminate_timeout=2, wait_timeout=5)
+
+        self._assert_gone(parent, "parent")
+        self._assert_gone(child, "child")
 
 
 if __name__ == "__main__":
