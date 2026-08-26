@@ -139,6 +139,17 @@ The helper defaults to eager. Add `--torch-compile` only for a labeled compile
 control. `--no-torch-compile` remains accepted for compatibility but is no
 longer required.
 
+The helper runs `--iterations` requests per measurement (default 4) in one
+process and reports the fastest. Request 1 pays `torch.compile` and first-shape
+specialization, so a single-shot number is first-request latency, not steady
+state -- on few-step models that overstates denoise latency several-fold, and
+only for the compile arm, which biases every compile-vs-eager ratio. The default
+is 4 because convergence is model-dependent: most presets settle after one
+request, `zimage-base` after three. Raise it when the per-request series in
+`results_<label>.json` is still sloping downward; a tail that never flattens is
+a recompilation bug rather than a warmup shortfall. Use `--iterations 1` only to
+reproduce a published single-shot number.
+
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
 do not compare its per-stage values with synchronized results.
@@ -516,6 +527,13 @@ For every benchmark run, write a perf dump JSON:
 sglang generate ... --warmup-mode request --perf-dump-path "${BENCH_DIR}/<result>.json"
 ```
 
+A perf dump only ever describes request 1, because `sglang generate` dumps
+`results[0]`. Under `--iterations` that is the cold request, so the dump's
+denoise and e2e values are not the reported steady-state numbers and the two can
+differ several-fold. Take latency from `results_<label>.json`, which carries the
+reported minimum plus the per-request series; use the perf dump for stage
+breakdown and peak memory.
+
 Before/after comparison:
 
 ```bash
@@ -674,6 +692,8 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] fixed-shape new perf dump saved
 - [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
 - [ ] `compare_perf.py` table generated
+- [ ] latency claims taken from `results_<label>.json`, not the request-1 perf dump
+- [ ] per-request series flat at the reported `--iterations`
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
 - [ ] reference image or video checked for correctness
