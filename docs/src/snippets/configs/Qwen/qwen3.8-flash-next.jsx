@@ -7,10 +7,10 @@
 // Attention (QSA) — over an ultra-sparse MoE, plus an in-checkpoint
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
-// Every recipe on this page is single-node: the NVIDIA cells run TP4 (so four
-// GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node) and the
-// AMD cells run TP8. That fits because 6B active params keeps compute small and
-// the N-gram table is the only large weight block.
+// Every recipe on this page is single-node: BF16 and FP8 run TP4 (so four GPUs
+// of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4 runs on
+// a single GPU, and the AMD cells run TP8. That fits because 6B active params
+// keeps compute small and the N-gram table is the only large weight block.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -127,10 +127,10 @@ export const config = {
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----
-    // TP only. Every cell on the page is single-node TP (4 on NVIDIA, 8 on AMD)
-    // with no DP-attention anywhere, and the values stop at 8 because that is
-    // the widest single host here. CP and DP-Attention are left out until
-    // there's a validated shape for them on this checkpoint.
+    // TP only. Every cell on the page is single-node TP (4 for BF16/FP8, 1 for
+    // NVFP4, 8 on AMD) with no DP-attention anywhere, and the values stop at 8
+    // because that is the widest single host here. CP and DP-Attention are left
+    // out until there's a validated shape for them on this checkpoint.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 1, 2, 4, 8] },
@@ -139,7 +139,8 @@ export const config = {
 
     // ----- Card: "MoE Parallelism" -----
     // EP degree only: the ultra-sparse MoE spreads its expert pool across ranks,
-    // and the high-throughput cells already pair TP4 with EP4. No a2a/runner
+    // and the BF16/FP8 high-throughput cells already pair TP4 with EP4 (the TP1
+    // NVFP4 cells have only one rank, so EP stays 1 there). No a2a/runner
     // backend row — the cells leave `--moe-a2a-backend` and
     // `--moe-runner-backend` unset so the runner resolves from the checkpoint's
     // own quant_method, and no alternative backend is validated here yet.
@@ -180,8 +181,8 @@ export const config = {
   // Every cell below is a verified recipe. Ordering: the first cell seeds the
   // Deploy panel's default selection.
   //
-  // The NVIDIA cells are identical across H200/B200/B300/GB300 — the shape is
-  // TP4 either way, and `--linear-attn-{prefill,decode}-backend flashinfer` is
+  // Within a quantization the NVIDIA cells are identical across
+  // H200/B200/B300/GB300, and `--linear-attn-{prefill,decode}-backend flashinfer` is
   // pinned explicitly rather than left to the GDN default, which differs by GPU
   // generation (Triton on SM90, and the flashinfer decode default is gated on
   // `--mamba-ssm-dtype bfloat16`). Pinning both makes one recipe portable.
@@ -520,7 +521,10 @@ export const config = {
     },
 
     // ==== NVFP4 (Blackwell only) ====
-    // Same two operating points as BF16 against the RadixArk NVFP4 checkpoint.
+    // Single-GPU: the FP4 weights fit one card, so these run TP1 rather than the
+    // TP4 the BF16/FP8 cells use. That leaves one rank, so there is no EP to
+    // spend and the two tiers differ only by the MTP head — `ep_size *
+    // moe_dp_size <= tp_size` would reject an --ep here.
     // No H200 cell: SM90 has no FP4 tensor cores.
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
@@ -528,7 +532,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
@@ -550,8 +554,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--ep 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
@@ -568,7 +571,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
@@ -590,8 +593,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--ep 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
@@ -608,7 +610,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
@@ -630,8 +632,7 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--ep 4",
+        "--tp 1",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
