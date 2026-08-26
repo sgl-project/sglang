@@ -122,6 +122,90 @@ def test_mha_fp8_e4m3_kv_pool_uses_static_scales():
     assert torch.equal(pool.v_buffer[0][loc], v_ref)
 
 
+@pytest.mark.parametrize(
+    ("k_scale", "v_scale"),
+    [(None, None), (0.5, 0.25)],
+    ids=["unit-scale-default", "non-unit-static-scale"],
+)
+def test_mha_fp8_e4m3_pool_decode_numerics(k_scale, v_scale):
+    seq_len = 16
+    num_heads = 2
+    head_dim = 64
+    num_kv_splits = 8
+    sm_scale = head_dim**-0.5
+    pool = MHATokenToKVPool(
+        size=seq_len,
+        page_size=1,
+        dtype=torch.float8_e4m3fn,
+        head_num=num_heads,
+        head_dim=head_dim,
+        layer_num=1,
+        device=DEVICE,
+        enable_memory_saver=False,
+        quant_method=CPUFP8KVCacheMethod(),
+    )
+    layer = SimpleNamespace(layer_id=0)
+    loc = torch.arange(seq_len, dtype=torch.int64, device=DEVICE)
+    cache_k = torch.randn(
+        (seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+    )
+    cache_v = torch.randn(
+        (seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+    )
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=k_scale, v_scale=v_scale)
+
+    effective_k_scale = 1.0 if k_scale is None else k_scale
+    effective_v_scale = 1.0 if v_scale is None else v_scale
+    k_dequant = (pool.get_key_buffer(0).float() * effective_k_scale).to(torch.bfloat16)
+    v_dequant = (pool.get_value_buffer(0).float() * effective_v_scale).to(
+        torch.bfloat16
+    )
+    query = torch.randn((1, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE)
+    output = torch.empty_like(query)
+    req_to_token = loc.to(torch.int32).unsqueeze(0)
+    req_pool_indices = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    seq_lens = torch.full((1,), seq_len, dtype=torch.int64, device=DEVICE)
+    attn_logits = torch.empty(
+        (1, num_heads, num_kv_splits, head_dim + 1),
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+    torch.ops.sgl_kernel.decode_attention_cpu(
+        query,
+        pool.get_key_buffer(0),
+        pool.get_value_buffer(0),
+        effective_k_scale,
+        effective_v_scale,
+        output,
+        None,
+        None,
+        None,
+        attn_logits,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        sm_scale,
+        0.0,
+        False,
+        0,
+        None,
+        None,
+    )
+
+    output_ref = (
+        torch.nn.functional.scaled_dot_product_attention(
+            query.movedim(0, 1).unsqueeze(0),
+            k_dequant[:seq_len].movedim(0, 1).unsqueeze(0),
+            v_dequant[:seq_len].movedim(0, 1).unsqueeze(0),
+            scale=sm_scale,
+        )
+        .squeeze(0)
+        .movedim(1, 0)
+    )
+    torch.testing.assert_close(output, output_ref, atol=3e-2, rtol=1e-6)
+
+
 @pytest.mark.skipif(
     not cpu_has_amx_support(), reason="FP8 E4M3 MLA KV cache requires AMX"
 )

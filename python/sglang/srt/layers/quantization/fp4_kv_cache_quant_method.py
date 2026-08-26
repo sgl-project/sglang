@@ -364,8 +364,8 @@ class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        if k_scale is None or v_scale is None:
-            raise ValueError("CPU FP8 KV cache requires static K/V scales.")
+        k_scale = 1.0 if k_scale is None else k_scale
+        v_scale = 1.0 if v_scale is None else v_scale
         k_buffer[loc] = (cache_k / k_scale).to(torch.float8_e4m3fn)
         v_buffer[loc] = (cache_v / v_scale).to(torch.float8_e4m3fn)
 

@@ -139,7 +139,7 @@ class TestCPUFP8KVCacheMethod(CustomTestCase):
         self.assertIsNone(buffers["v_scale_buffer"])
         self.assertEqual(method.compute_cell_size(2, 8, 1, 4), 128)
 
-    def test_requires_static_scales(self):
+    def test_defaults_to_unit_scales(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             CPUFP8KVCacheMethod,
         )
@@ -147,16 +147,19 @@ class TestCPUFP8KVCacheMethod(CustomTestCase):
         method = CPUFP8KVCacheMethod()
         buffers = method.create_buffers(1, 1, 8, 1, "cpu")
         cache = torch.ones(1, 1, 8, dtype=torch.bfloat16)
-        with self.assertRaisesRegex(ValueError, "static K/V scales"):
-            method.quantize_and_store(
-                buffers["k_buffer"][0],
-                buffers["v_buffer"][0],
-                buffers["k_scale_buffer"],
-                buffers["v_scale_buffer"],
-                torch.tensor([0]),
-                cache,
-                cache,
-            )
+        method.quantize_and_store(
+            buffers["k_buffer"][0],
+            buffers["v_buffer"][0],
+            buffers["k_scale_buffer"],
+            buffers["v_scale_buffer"],
+            torch.tensor([0]),
+            cache,
+            cache,
+        )
+
+        expected = cache.to(torch.float8_e4m3fn)
+        torch.testing.assert_close(buffers["k_buffer"][0][0], expected[0])
+        torch.testing.assert_close(buffers["v_buffer"][0][0], expected[0])
 
 
 class TestNVFP4KVCacheMethod(CustomTestCase):
