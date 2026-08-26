@@ -320,7 +320,7 @@ class NanbeigeModel(nn.Module):
                 logical_id = loop_idx * num_physical_layers + i
                 if logical_id in self.layers_to_capture:
                     aux_hidden_states.append(
-                        hidden_states + residual if residual is not None else hidden_states
+                        hidden_states + residual if residual is not None else hidden_states.clone()
                     )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
