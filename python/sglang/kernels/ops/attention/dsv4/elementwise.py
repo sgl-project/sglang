@@ -57,10 +57,12 @@ def _jit_main_k_norm_rope_flashmla_module(
     rope_dim: int,
     page_size: int,
     layout: KVLayout,
+    uniform_fp8_store: bool = False,
 ):
-    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
+    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache
+    (or, with uniform_fp8_store, plain e4m3 rows in the uniform 512B pool)."""
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl(), uniform_fp8_store
     )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
@@ -278,6 +280,7 @@ def fused_k_norm_rope_flashmla(
     kvcache: torch.Tensor,
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    uniform_fp8_store: bool = False,
 ) -> None:
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
     cache at ``out_loc``."""
@@ -287,11 +290,12 @@ def fused_k_norm_rope_flashmla(
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
         assert layout is KVLayout.V4, "the V4.1 KV layouts are CUDA (sm100) only"
+        assert not uniform_fp8_store
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size, layout
+            kv.dtype, head_dim, rope_dim, page_size, layout, uniform_fp8_store
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
