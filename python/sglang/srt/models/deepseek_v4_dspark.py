@@ -59,7 +59,7 @@ from sglang.srt.models.dspark import (
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
-    use_lifecycle_only_draft_model,
+    use_empty_draft_model_for_pp_prefill,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -80,8 +80,6 @@ _is_npu = is_npu()
 
 
 class _BlockFp8LinearSlice(nn.Module):
-    """Persistent K-block slice of a loaded block-FP8 ReplicatedLinear."""
-
     def __init__(
         self,
         *,
@@ -794,7 +792,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         else:
             pp_rank = 0
             pp_size = 1
-        self.is_lifecycle_only = use_lifecycle_only_draft_model(
+        self.is_lifecycle_only = use_empty_draft_model_for_pp_prefill(
             disaggregation_mode=get_disagg().disaggregation_mode,
             pp_rank=pp_rank,
             pp_size=pp_size,
@@ -813,8 +811,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.is_lifecycle_only:
-            # Keep ModelRunner's distributed lifecycle aligned without building
-            # draft compute modules on PP ranks that cannot contribute context.
             self.stages = nn.ModuleList()
             self.markov_head = None
             self.confidence_head = None
@@ -894,7 +890,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projection_stage = nn.Module()
         projection_stage.main_proj = stage0.main_proj
         projection_stage.main_norm = stage0.main_norm
-        # Preserve stages.0.main_proj parameter names for online weight updates.
         self.stages = nn.ModuleList([projection_stage])
         self.markov_head = None
         self.confidence_head = None
@@ -941,7 +936,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def project_target_hidden_partial(
         self, main_hidden: torch.Tensor, feature_indices: list[int]
     ) -> torch.Tensor:
-        """Project PP-local target features into an additive pre-norm context."""
         if not feature_indices:
             raise ValueError("feature_indices must be non-empty.")
         feature_indices = [int(index) for index in feature_indices]
@@ -972,8 +966,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         full_features = main_hidden.new_zeros(
             main_hidden.shape[0], self.num_target_features, hidden_size
         )
-        # Reuse ReplicatedLinear.forward so FP8 weights and scales follow the
-        # same quantization path as the full, non-PP projection.
         feature_index = torch.tensor(
             feature_indices, dtype=torch.long, device=main_hidden.device
         )

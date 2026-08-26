@@ -60,7 +60,7 @@ def resolve_single_owner_pp_rank(
     return None
 
 
-def use_lifecycle_only_draft_model(
+def use_empty_draft_model_for_pp_prefill(
     *,
     disaggregation_mode: str,
     pp_rank: int,

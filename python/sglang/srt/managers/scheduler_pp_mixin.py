@@ -1200,8 +1200,6 @@ class SchedulerPPMixin:
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         next_draft_input = None
         if isinstance(batch, ScheduleBatch) and batch.spec_algorithm.is_dspark():
-            # PP outputs may be on CPU after result processing, while draft state is
-            # filtered with device-resident batch indices.
             next_token_ids = next_token_ids.to(
                 device=batch.device,
                 dtype=torch.int64,

@@ -199,20 +199,16 @@ class PrefillBootstrapQueue:
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
-        layer_shard_enabled = getattr(
-            self.token_to_kv_pool, "layer_shard_enabled", False
-        )
-        layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
-        layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
+        layer_shard_enabled = self.token_to_kv_pool.layer_shard_enabled
         transfer_draft_cache = (
             self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
-        ) and (not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1)
+        ) and (
+            not layer_shard_enabled
+            or self.token_to_kv_pool.layer_shard_rank
+            == self.token_to_kv_pool.layer_shard_size - 1
+        )
         kv_args.prefill_start_layer = (
-            getattr(
-                self.token_to_kv_pool,
-                "layer_shard_start",
-                self.token_to_kv_pool.start_layer,
-            )
+            self.token_to_kv_pool.layer_shard_start
             if layer_shard_enabled
             else self.token_to_kv_pool.start_layer
         )
@@ -226,7 +222,7 @@ class PrefillBootstrapQueue:
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
-            else getattr(self.token_to_kv_pool, "end_layer", None)
+            else self.token_to_kv_pool.end_layer
         )
 
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
@@ -475,7 +471,6 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
-        """Return ordered PP candidates without reserving local resources."""
         good_rids: List[str] = []
         failed_rids: List[str] = []
         if len(self.queue) == 0:
@@ -881,10 +876,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         transfer_status: Optional[Tuple[List[str], List[str]]] = None,
     ) -> List[Req]:
-        """
-        Poll the requests in the middle of transfer. If done, return the request.
-        transfer_status: For PP, the consensus success and failure request ids.
-        """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1043,9 +1034,6 @@ class SchedulerDisaggregationPrefillMixin:
     def get_transferred_rids(
         self: Scheduler,
     ) -> Tuple[List[str], List[str]]:
-        """
-        Used by PP, inspect terminal transfer states without popping requests.
-        """
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,

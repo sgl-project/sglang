@@ -167,6 +167,7 @@ class TestDisaggregationWire(unittest.TestCase):
             layer_shard_start=20,
             start_layer=0,
             end_layer=40,
+            get_kv_layer_ids=lambda: [20, 21, 22],
         )
 
         src_layer_ids = get_transfer_kv_layer_ids(kv_pool, 3)

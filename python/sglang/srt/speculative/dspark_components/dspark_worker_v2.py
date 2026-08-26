@@ -224,7 +224,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.gamma), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+        if self.draft_model.uses_own_vocab_modules:
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
@@ -232,12 +232,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         else:
             target_model = self.target_worker.model_runner.model
             needs_lm_head = not self._is_context_only_pp_prefill_rank
-            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
-            if needs_lm_head and (lm_head is None or not hasattr(lm_head, "weight")):
-                raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
-                )
             if needs_lm_head:
+                try:
+                    lm_head = unwrap_lora_layer(target_model.lm_head)
+                    lm_head.weight
+                except AttributeError as exc:
+                    raise RuntimeError(
+                        "DSpark requires the target model to expose `lm_head` with `weight`."
+                    ) from exc
                 self.draft_model.attach_shared_modules(
                     embed_tokens=unwrap_lora_layer(
                         self._resolve_target_embed_tokens(target_model)
@@ -366,25 +368,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers = None
 
     def _resolve_target_embed_tokens(self, target_model):
-        if hasattr(target_model, "get_input_embeddings"):
-            return target_model.get_input_embeddings()
-        return target_model.model.get_input_embeddings()
+        return target_model.get_input_embeddings()
 
     def _init_pp_context_feature_indices(self) -> None:
         if self.ps.pp_size <= 1:
             return
-        if not hasattr(self.draft_model, "project_target_hidden_partial"):
-            return
 
-        target_layer_ids = getattr(
-            self.model_runner.spec_aux_config, "dflash_target_layer_ids", None
-        )
+        target_layer_ids = self.model_runner.spec_aux_config.dflash_target_layer_ids
         if not target_layer_ids:
             return
 
         target_model = self.target_worker.model_runner.model
-        start_layer = int(getattr(target_model, "start_layer", 0))
-        end_layer = int(getattr(target_model, "end_layer", 0))
+        start_layer = int(target_model.start_layer)
+        end_layer = int(target_model.end_layer)
         target_layer_to_feature = {
             int(layer_id): idx for idx, layer_id in enumerate(target_layer_ids)
         }
@@ -694,9 +690,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        # Non-last PP ranks return PPProxyTensors and do not sample tokens, so
-        # next_token_ids is None there. Positions are still needed for local
-        # draft-KV injection, and should live on this worker's device.
         device = self.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
         draft_seq_lens = torch.tensor(

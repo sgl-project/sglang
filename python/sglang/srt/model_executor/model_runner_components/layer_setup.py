@@ -197,7 +197,6 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
-    # DSPARK uses a separate draft worker even when the target config bundles MTP layers.
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())

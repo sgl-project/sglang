@@ -497,6 +497,7 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    uses_own_vocab_modules = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -593,7 +594,6 @@ class DFlashDraftModel(nn.Module):
     def project_target_hidden_partial(
         self, target_hidden: torch.Tensor, feature_indices: list[int]
     ) -> torch.Tensor:
-        """Project PP-local target features into an additive pre-norm context."""
         if not feature_indices:
             raise ValueError("feature_indices must be non-empty.")
         feature_indices = [int(i) for i in feature_indices]

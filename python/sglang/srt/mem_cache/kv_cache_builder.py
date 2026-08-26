@@ -68,14 +68,11 @@ def get_draft_kv_pool(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
     if spec_algorithm.is_dspark() and draft_worker.is_lifecycle_only_pp_prefill_rank:
         return None
 
-    # V2 workers nest the draft runner under `.draft_worker`.
     if get_spec().enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:

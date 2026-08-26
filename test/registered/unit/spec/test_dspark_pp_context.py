@@ -28,7 +28,7 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
-    use_lifecycle_only_draft_model,
+    use_empty_draft_model_for_pp_prefill,
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
@@ -69,7 +69,6 @@ def _make_deepseek_v4_dspark_projection_model(
 
 class TestDSparkPPContext(CustomTestCase):
     def test_full_projection_fast_path_requires_final_pp_owner(self):
-        """Only final-rank ownership can bypass the ctx_acc handoff."""
         with patch.dict(
             os.environ,
             {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
@@ -90,7 +89,7 @@ class TestDSparkPPContext(CustomTestCase):
                 )
             )
 
-    def test_lifecycle_only_draft_model_is_limited_to_non_owner_ranks(self):
+    def test_empty_draft_model_is_limited_to_non_owner_pp_prefill_ranks(self):
         common = dict(
             disaggregation_mode="prefill",
             pp_size=8,
@@ -98,10 +97,12 @@ class TestDSparkPPContext(CustomTestCase):
             num_hidden_layers=43,
         )
         for pp_rank in range(7):
-            self.assertTrue(use_lifecycle_only_draft_model(pp_rank=pp_rank, **common))
-        self.assertFalse(use_lifecycle_only_draft_model(pp_rank=7, **common))
+            self.assertTrue(
+                use_empty_draft_model_for_pp_prefill(pp_rank=pp_rank, **common)
+            )
+        self.assertFalse(use_empty_draft_model_for_pp_prefill(pp_rank=7, **common))
         self.assertFalse(
-            use_lifecycle_only_draft_model(
+            use_empty_draft_model_for_pp_prefill(
                 pp_rank=0,
                 **{**common, "target_layer_ids": [35, 40]},
             )
@@ -172,7 +173,6 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertIs(actual, expected)
 
     def test_pp_spec_verify_buffers_use_token_axis(self):
-        """PP verify buffers must cover bs times speculative token width."""
         max_bs = 64
         num_tokens_per_req = 6
         max_num_token = max_bs * num_tokens_per_req
@@ -209,7 +209,6 @@ class TestDSparkPPContext(CustomTestCase):
         )
 
     def test_partial_projection_sum_matches_full_projection(self):
-        """PP partial projections must preserve the full pre-norm FC result."""
         torch.manual_seed(0)
         hidden_size = 4
         model = DFlashDraftModel.__new__(DFlashDraftModel)
@@ -235,7 +234,6 @@ class TestDSparkPPContext(CustomTestCase):
         torch.testing.assert_close(pp_projected, full_projected)
 
     def test_deepseek_v4_partial_projection_survives_context_only_pruning(self):
-        """Cross-rank contributions must retain full projection math after pruning."""
         torch.manual_seed(1)
         hidden_size = 4
         model = _make_deepseek_v4_dspark_projection_model(
@@ -268,7 +266,6 @@ class TestDSparkPPContext(CustomTestCase):
         )
 
     def test_deepseek_v4_capture_is_local_to_each_pp_rank(self):
-        """A target feature on a non-last rank must not disappear from ctx_acc."""
         model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
         torch.nn.Module.__init__(model)
         model.pp_group = SimpleNamespace(is_last_rank=False)
@@ -285,7 +282,6 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertEqual(model.model.dspark_layers_to_capture, [12, 18])
 
     def test_non_last_pp_prefill_does_not_require_target_lm_head(self):
-        """PP0-PP(N-2) must initialize without the last rank's lm_head."""
         self.assertTrue(
             _is_context_only_pp_prefill_rank(
                 disaggregation_mode="prefill",
@@ -302,7 +298,6 @@ class TestDSparkPPContext(CustomTestCase):
         )
 
     def test_context_only_rank_does_not_require_draft_attention_backend(self):
-        """Projection-only ranks must initialize overlap state without draft attention."""
         target_backend = object()
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._is_context_only_pp_prefill_rank = True
@@ -338,7 +333,6 @@ class TestDSparkPPContext(CustomTestCase):
         )
 
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
-        """A context-only PP rank must not reserve the full draft KV capacity."""
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True

@@ -40,10 +40,15 @@ class TestPPPDConsensus(CustomTestCase):
             end_layer = 6
             head_num = 1
             page_size = 64
+            layer_shard_enabled = False
 
             @staticmethod
             def get_contiguous_buf_infos():
                 return [10, 11], [100, 100], [10, 10]
+
+            @staticmethod
+            def get_kv_layer_ids():
+                return [4, 5]
 
         class FakeDraftPool:
             start_layer = 0
@@ -77,7 +82,6 @@ class TestPPPDConsensus(CustomTestCase):
         return queue, FakeKVArgs, FakeManager
 
     def test_transfer_failure_overrides_ordered_success_intersection(self):
-        """A failure on one PP rank must terminate an otherwise successful rid."""
         status = _pp_merge_transfer_status(
             previous=(["req-a", "req-b", "req-c"], ["req-x"]),
             current=(["req-c", "req-a", "req-b"], ["req-b", "req-y"]),
@@ -89,7 +93,6 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
     def test_bootstrap_probe_respects_local_metadata_credit_prefix(self):
-        """A slower PP rank must not advertise requests it cannot admit."""
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.queue = [
             SimpleNamespace(
@@ -134,7 +137,6 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
     def test_bootstrap_probe_reports_failures_after_metadata_backpressure(self):
-        """Admission backpressure must not hide terminal failures later in FIFO."""
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.queue = [
             SimpleNamespace(
@@ -175,7 +177,6 @@ class TestPPPDConsensus(CustomTestCase):
         self.assertEqual(failed_rids, ["req-failed"])
 
     def test_remote_failure_waits_for_local_transfer_terminal_state(self):
-        """Do not release source KV while the local Mooncake worker is reading it."""
         sender = SimpleNamespace()
         req = SimpleNamespace(
             rid="req-race",
@@ -238,7 +239,6 @@ class TestPPPDConsensus(CustomTestCase):
         handle_failure.assert_called_once_with(req)
 
     def test_only_last_pp_registers_draft_kv_for_transfer(self):
-        """Draft KV has one prefill owner even though every PP rank has a worker."""
         layer_ids_by_rank = []
         for pp_rank in (0, 1):
             queue, fake_args, fake_manager = self._make_prefill_queue(pp_rank)
@@ -266,7 +266,6 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
     def test_pp_prefill_entries_pair_with_pp1_decode_entries(self):
-        """Each PP source maps target layers plus the unique draft entry by id."""
         decode_layer_ids = [
             0,
             1,
