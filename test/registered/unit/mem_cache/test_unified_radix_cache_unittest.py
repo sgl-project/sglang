@@ -2489,6 +2489,28 @@ class UnifiedRadixCacheSuite:
             time.sleep(0.01)
         self.fail(f"prefetch {req_id} did not complete in time")
 
+    def _load_back_req(self, cache, req_id, prefix_len, prefix_indices=None):
+        """Request stand-in for consuming a staged prefetch. A real Req, not a
+        mock: the Mamba handoff reads and writes its state-slot fields, and a
+        Mock's auto-attributes would silently pass for a device slot."""
+        req = Req(
+            rid=req_id,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.last_node = cache.root_node.id
+        req.prefix_indices = (
+            prefix_indices
+            if prefix_indices is not None
+            else torch.zeros(
+                prefix_len,
+                dtype=torch.int64,
+                device=cache.tree_core.empty_match_result.device_indices.device,
+            )
+        )
+        return req
+
     def _consume_staged_prefetch(
         self, cache, req_id, prefix_len=None, prefix_indices=None, timeout: float = 10.0
     ):
@@ -2501,21 +2523,12 @@ class UnifiedRadixCacheSuite:
         f = cache.buffer_pipeline.staged_prefetches[req_id]
         if prefix_len is None:
             prefix_len = f.matched_len
-        req = mock.Mock()
-        req.rid = req_id
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
             # bogus slots into the tree).
             assert len(prefix_indices) == prefix_len
-            req.prefix_indices = prefix_indices
-        else:
-            req.prefix_indices = torch.zeros(
-                prefix_len,
-                dtype=torch.int64,
-                device=cache.tree_core.empty_match_result.device_indices.device,
-            )
-        req.last_node = cache.root_node.id
+        req = self._load_back_req(cache, req_id, prefix_len, prefix_indices)
         new_indices, _last_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=f.num_tokens, req=req
@@ -2933,11 +2946,6 @@ class UnifiedRadixCacheSuite:
         prefetch_policy: str = "wait_complete",
         storage_extra: Optional[dict] = None,
     ):
-        if self.cfg.has_mamba:
-            self.skipTest(
-                "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
-                "on the admission-time load-back read path)"
-            )
         self._init_hicache(
             cache,
             storage_backend="file",
@@ -2989,7 +2997,9 @@ class UnifiedRadixCacheSuite:
         )
 
     def _produce_buffer_l3(self, storage_dir, seq, marker=None):
-        """Producer tree in buffer mode: insert seq and push it to L3."""
+        """Producer tree in buffer mode: insert seq and push it to L3.
+        Returns (leaf, expected_kv, expected_mamba); the expectations are None
+        without a marker, and expected_mamba is None on non-Mamba configs."""
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(prod, storage_dir)
         self._insert(prod, prod_alloc, prod_rtp, seq)
@@ -2998,13 +3008,42 @@ class UnifiedRadixCacheSuite:
                 MatchPrefixParams(key=RadixKey(array("q", seq)))
             ).last_device_node
         )
-        expected = None
+        expected_kv = None
+        expected_mamba = None
         if marker is not None:
             m = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
             self._fill_full_kv(prod_alloc, m.device_indices, marker=marker)
-            expected = self._snapshot_full_kv(prod_alloc, m.device_indices)
+            expected_kv = self._snapshot_full_kv(prod_alloc, m.device_indices)
+            if self.cfg.has_mamba:
+                state = leaf.component_data[ComponentType.MAMBA].value
+                self._fill_mamba_state(prod_rtp, state, marker=marker + 11)
+                expected_mamba = self._snapshot_mamba_state(prod_rtp, state)
         self._buffer_backup_and_wait(prod, leaf)
-        return leaf, expected
+        return leaf, expected_kv, expected_mamba
+
+    def _assert_mamba_state_restored(
+        self, cache, req_to_token_pool, req, leaf, expected
+    ):
+        expected_temporal, expected_conv = expected
+        node_state = leaf.component_data[ComponentType.MAMBA].value
+        self.assertIsNotNone(node_state, "published node carries no Mamba state")
+        self.assertIsNotNone(req.mamba_pool_idx, "request bound no Mamba state slot")
+        self.assertIsNone(req.mamba_cow_src_index)
+        self.assertFalse(req.mamba_needs_clear)
+        for label, indices in (
+            ("node", node_state),
+            ("request", req.mamba_pool_idx.unsqueeze(0)),
+        ):
+            temporal, conv = self._snapshot_mamba_state(req_to_token_pool, indices)
+            self.assertTrue(
+                torch.equal(temporal, expected_temporal),
+                f"{label} temporal state does not match the producer's",
+            )
+            for actual, want in zip(conv, expected_conv):
+                self.assertTrue(
+                    torch.equal(actual, want),
+                    f"{label} conv state does not match the producer's",
+                )
 
     def _buffer_swa_seq(self, min_pages=4):
         """Sequence long enough for SWA prefetch (one full window + 1)."""
@@ -3074,7 +3113,7 @@ class UnifiedRadixCacheSuite:
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
         seq = self._buffer_swa_seq()
-        _, (expected_k, expected_v) = self._produce_buffer_l3(
+        _, (expected_k, expected_v), expected_mamba = self._produce_buffer_l3(
             storage_dir, seq, marker=7
         )
 
@@ -3134,14 +3173,7 @@ class UnifiedRadixCacheSuite:
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id
-        req.last_node = cons.root_node.id
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req = self._load_back_req(cons, req_id, held.matched_len)
         spliced, _last = cons.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=held.num_tokens, req=req
@@ -3175,6 +3207,12 @@ class UnifiedRadixCacheSuite:
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, mc.device_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
+        if self.cfg.has_mamba:
+            # The recurrent state has to land twice off the one bounce: on the
+            # published node (so the span is reusable) and in the consuming
+            # request's own slot (the deferred D2D CoW is not ordered against
+            # this H2D, so the load-back must write the slot itself).
+            self._assert_mamba_state_restored(cons, cons_rtp, req, leaf, expected_mamba)
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         cpu_events = [
             e
@@ -3248,14 +3286,7 @@ class UnifiedRadixCacheSuite:
 
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id
-        req.last_node = cons.root_node.id
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req = self._load_back_req(cons, req_id, held.matched_len)
         spliced, last_node = cons.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=held.num_tokens, req=req
@@ -3450,14 +3481,7 @@ class UnifiedRadixCacheSuite:
             return real_load(*args, **kwargs)
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
-        req.rid = req_id
-        req.prefix_indices = torch.zeros(
-            0,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
-        req.last_node = cons.root_node.id
+        req = self._load_back_req(cons, req_id, 0)
         with mock.patch.object(cons.cache_controller, "load", adversarial_load):
             with self.assertRaisesRegex(RuntimeError, "ownership violation"):
                 cons.init_load_back(
@@ -3964,8 +3988,8 @@ class UnifiedRadixCacheSuite:
         kv_pool = self._get_full_kv_pool(allocator)
         layer_id = kv_pool.start_layer
         # Assign through __setitem__: `buf[indices]` is an advanced-index copy,
-        # so `.fill_()` on it leaves the pool untouched and every bytes-match
-        # assertion downstream compares zeros to zeros.
+        # so `.fill_()` on it would leave the pool untouched and every
+        # bytes-match assertion downstream would compare zeros to zeros.
         kv_pool.get_key_buffer(layer_id)[indices] = marker
         kv_pool.get_value_buffer(layer_id)[indices] = marker + 1
 
