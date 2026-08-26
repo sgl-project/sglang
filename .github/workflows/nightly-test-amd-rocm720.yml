@@ -1384,9 +1384,10 @@ jobs:
   # below carry the perf numbers, and there is no gfx942 DSV4 baseline to
   # regress against until this job is green.
   #
-  # Deliberately absent from check-all-jobs: #36390 reports DSV4-Flash FP8
-  # output degrading with context length on MI300X, so this is expected red
-  # until that is fixed. Add it to the needs list once it passes.
+  # Deliberately absent from check-all-jobs for its first landing: the cookbook
+  # marks this recipe verified on MI300X but #36390 reports DSV4-Flash FP8
+  # degrading with context length there, and no CI run has ever settled which
+  # holds. Add it to the needs list once it has passed.
   # ==============================================================================
 
   nightly-8-gpu-deepseek-v4-flash-rocm720:
@@ -2327,7 +2328,7 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720
       - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
       # 8-GPU DeepSeek-V4 (MI35x). The MI30x nightly-8-gpu-deepseek-v4-flash job
-      # is excluded on purpose while #36390 is open; see its section comment.
+      # is excluded on purpose for its first landing; see its section comment.
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720

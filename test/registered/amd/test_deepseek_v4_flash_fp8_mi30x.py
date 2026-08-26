@@ -2,19 +2,20 @@
 
 GSM8K few-shot accuracy for DeepSeek-V4-Flash FP8 on MI30x (gfx942) ROCm 7.2.
 
+The launch config is the cookbook's MI300X Flash FP8 low-latency single-node
+recipe, verbatim -- the one the docs tell users to run, marked `verified: true`
+in docs/src/snippets/configs/deepseek-ai/deepseek-v4.jsx. Of the three published
+MI300X strategies it is the only TP-only one (balanced and high-throughput add
+DP attention and the prefill delayer), so it is the narrowest cell that still
+covers the gfx942 serving path. Keep this in sync with that cell.
+
 Accuracy only: gfx942 has no DSV4 perf baseline to regress against yet, and the
 MI35x suite already carries the 8k/1k throughput numbers. The GSM8K threshold
-matches the MI35x FP8 test so the two architectures are directly comparable on
-the same eval.
+matches the MI35x FP8 test so the two architectures are comparable on the same
+eval.
 
-The launch config below is the gfx942 one from #36390, which is the only
-DSV4-Flash FP8 configuration observed to serve on 8x MI300X. It differs from the
-MI35x test in three places, each forced by gfx942:
-
-- ``aiter`` attention and DSA backends rather than ``dsv4``.
-- ``SGLANG_OPT_SWIGLU_CLAMP_FUSION=0``: the fusion dispatches a CUDA-only kernel.
-- ``--moe-runner-backend triton``: the aiter fused MoE returns different logprobs
-  for identical greedy requests on gfx942.
+Unlike the MI35x FP8 test this recipe also runs `--kv-cache-dtype fp8_e4m3` and
+EAGLE, so it is the gfx942 MLA + KV-FP8 signal as well.
 
 Registry: nightly-amd-accuracy-8-gpu-deepseek-v4-flash suite
 """
@@ -46,11 +47,9 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 3600
 
 ENV_VARS = {
-    "SGLANG_DEFAULT_THINKING": "1",
-    "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_DSV4_FP4_EXPERTS": "false",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_OPT_SWIGLU_CLAMP_FUSION": "0",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
+    "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
 
@@ -68,26 +67,26 @@ class TestDeepseekV4FlashFp8Mi30x(CustomTestCase):
             "--tp",
             "8",
             "--attention-backend",
-            "aiter",
-            "--dsa-prefill-backend",
-            "aiter",
-            "--dsa-decode-backend",
-            "aiter",
-            "--moe-runner-backend",
-            "triton",
-            "--disable-radix-cache",
-            "--disable-cuda-graph",
-            "--max-running-requests",
+            "dsv4",
+            "--page-size",
             "256",
             "--mem-fraction-static",
-            "0.75",
+            "0.90",
+            "--swa-full-tokens-ratio",
+            "0.1",
+            "--disable-shared-experts-fusion",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
             "--chunked-prefill-size",
             "8192",
-            "--disable-shared-experts-fusion",
-            "--tool-call-parser",
-            "deepseekv4",
-            "--reasoning-parser",
-            "deepseek-v4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
         ]
 
         cls.process = popen_launch_server(
