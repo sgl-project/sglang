@@ -1055,8 +1055,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -1067,6 +1065,7 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+        del qkv_a
 
         return q
 
@@ -1149,8 +1148,6 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
             q.record_stream(stream_q)
 
-        del qkv_a
-
         # Indexer + compressor: serial on current.
         if self.indexer is not None:
             self.indexer(
@@ -1170,6 +1167,7 @@ class MQALayer(MqaAttentionBase):
         # Join stream_kv + stream_q before downstream attention.
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_q)
+        del qkv_a
         return q
 
     def _forward_prepare_multi_stream_hip(
