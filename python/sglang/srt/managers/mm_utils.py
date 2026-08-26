@@ -13,7 +13,7 @@ import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -41,6 +41,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.transport import (
+    TensorTransportMode,
+    determine_tensor_transport_mode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -54,11 +58,6 @@ from sglang.utils import logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
-
-# TODO(mick): nccl
-# cuda_ipc: for intranode tensor sharing
-TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -1497,13 +1496,7 @@ atexit.register(clear_reusable_shm_feature_cache)
 def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        from sglang.srt.managers.tokenizer_manager import (
-            determine_tensor_transport_mode,
-        )
-
-        _is_default_tensor_transport = (
-            determine_tensor_transport_mode(get_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
 
 

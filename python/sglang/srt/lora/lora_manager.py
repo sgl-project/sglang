@@ -99,7 +99,7 @@ class LoRAManager:
         self.pending_lora_load_events = {}
 
         self.eviction_policy = server_args.lora_eviction_policy
-        self.enable_dp_attention: bool = get_parallel().enable_dp_attention
+        self.enable_dp_attention: bool = get_parallel().config.enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )

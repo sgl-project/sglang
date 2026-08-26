@@ -1945,10 +1945,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_cosmos3_super_keeps_default_offload_policy(self):
+    def test_auto_cosmos3_super_keeps_dit_resident_on_high_memory_gpu(self):
+        # Super is a single-DiT pipeline like Nano, so above the threshold the
+        # component-offload round trip is pure per-request copy cost.
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
             available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Super",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_cosmos3_super_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
+            available_memory_gb=100,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Super",
                 "performance_mode": "auto",

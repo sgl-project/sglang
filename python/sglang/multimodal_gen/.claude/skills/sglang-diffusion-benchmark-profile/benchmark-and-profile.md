@@ -213,6 +213,28 @@ The helper refuses to reuse an existing per-run cache directory and never
 redirects `SGLANG_CACHE_DIR`, so compiled kernel caches remain separate. Never
 point this option at a shared Hugging Face or ModelScope cache.
 
+When a machine already exposes a read-only Hugging Face cache, seed the
+task-owned cache with a copy-on-write directory overlay instead of copying its
+checkpoints. Immutable blobs and snapshot payloads remain symlinks, while
+metadata directories stay writable so a partial seed can download missing
+files into the task cache. The option may be repeated. Cleanup removes only the
+task-owned overlay and new downloads; it never follows links or modifies the
+seed cache:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality-bcg-matrix \
+  --label h100 \
+  --output-dir "${BENCH_DIR}" \
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --seed-model-cache-root /path/to/read-only/huggingface \
+  --cleanup-model-cache
+```
+
+Each seed path must be either a Hugging Face home containing `hub/` or the
+`hub` directory itself. Do not seed from a task cache that is being cleaned.
+
 Run the `LTX-2.3` one-stage skill preset:
 
 ```bash
@@ -293,6 +315,11 @@ Use the preset categories this way:
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
 | `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
 | `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
+| `longcat-image-edit` | `meituan-longcat/LongCat-Image-Edit` | No | Native edit baseline using the public SGLang edit fixture. Its 1536x1024 source resolves to 1264x848 under the checkpoint's roughly-one-megapixel aspect-ratio rule, and the BCG comparator captures that exact serving canvas; prompt rewrite is disabled to isolate the DiT. |
+| `longcat-image-edit-turbo` | `meituan-longcat/LongCat-Image-Edit-Turbo` | No | Matching distilled edit baseline using the same public fixture, prompt, and 1264x848 BCG canvas. Its registered sampling class owns the eight-step, guidance-1 schedule. |
+| `qwen-edit-base` | `Qwen/Qwen-Image-Edit` | No | Covers the original native `QwenImageEditPipelineConfig`, which is distinct from the 2509/2511 edit-plus paths; public SGLang edit fixture, 1024x1024. |
+| `qwen-image-layered` | `Qwen/Qwen-Image-Layered` | No | Native layered-image path using the same public reference image and four-frame request as the GPU server case, at the registered 640x640 canvas. |
+| `stable-diffusion-3.5-medium` | `stabilityai/stable-diffusion-3.5-medium-diffusers` | No | Representative native `StableDiffusion3PipelineConfig` path at 1024x1024. The repository is gated, so export `HF_TOKEN`; an unauthenticated run is a recorded access blocker, not model evidence. |
 | `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
 | `sana-wm-bidirectional` | `Efficient-Large-Model/SANA-WM_bidirectional` | No | Dense two-stage TI2V baseline at the native 1280x704 shape, 49 frames, 16 fps, 20 steps, guidance 4.5, and a 48-frame forward/left action program. Uses the shared cat fixture. |
 | `sana-wm-streaming` | `Efficient-Large-Model/SANA-WM_streaming` | No | Matching offline chunk-causal two-stage baseline with the streaming DiT and chunked refiner enabled; uses the same shape, fixture, seed, and camera action for comparison. |
@@ -351,6 +378,24 @@ Use the preset categories this way:
 | `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
 | `firered-edit-1.1` | `FireRedTeam/FireRed-Image-Edit-1.1` | No | Skill-only FireRed 1.1 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
 | `hunyuan3d-shape` | `tencent/Hunyuan3D-2` | No | Skill-only Hunyuan3D shape-generation preset; primary metric is `Hunyuan3DShapeDenoisingStage` |
+
+Pi0.5 is registered as an action-policy pipeline, not an image/video `sglang
+generate` pipeline, so it must not be inserted into this preset table or timed
+with visual-output hashes. Use its checked-in real-model lane instead:
+
+```bash
+SGLANG_RUN_PI05_E2E=1 \
+SGLANG_PI05_E2E_NUM_GPUS=1 \
+SGLANG_PI05_E2E_PERF_DUMP=/path/to/pi05-perf.json \
+PYTHONPATH=python python3 -m pytest -s \
+  python/sglang/multimodal_gen/test/single_test_file/test_pi05_e2e.py
+```
+
+The action lane uses three deterministic 224x224 camera inputs, deterministic
+noise, two denoise steps by default, repeatability/prefix-cache checks, and a
+three-request median. Treat `action_denoise_ms` as its primary metric. Isolate
+and clean its model cache with the same task-owned-cache discipline as visual
+models; BCG/quality comparisons are not applicable to this API.
 
 For Wan2.2 video models, remember the difference between **nightly alignment**
 and **best latency tuning**:
