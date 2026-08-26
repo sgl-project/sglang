@@ -1,10 +1,9 @@
 """Tests for multimodal tensor transport topology detection."""
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,17 +21,12 @@ class TestTensorTransportMode(CustomTestCase):
 
         for nnodes, dist_init_addr, expected in cases:
             with self.subTest(nnodes=nnodes, dist_init_addr=dist_init_addr):
-                # `nnodes` is a config-only leaf, so the stand-in carries it
-                # under `config`, where the published bag serves it.
-                parallel = SimpleNamespace(
-                    config=SimpleNamespace(
-                        nnodes=nnodes,
-                        dist_init_addr=dist_init_addr,
-                    ),
-                )
-                with patch(
-                    "sglang.srt.multimodal.transport.get_parallel",
-                    return_value=parallel,
+                # `nnodes` is a config-only leaf: the published `parallel` bag
+                # serves it, so force it by publishing a context rather than
+                # standing in for the accessor.
+                with get_context().override_server_args(
+                    nnodes=nnodes,
+                    dist_init_addr=dist_init_addr,
                 ):
                     self.assertEqual(determine_tensor_transport_mode(), expected)
 

@@ -304,6 +304,7 @@ class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.runtime_context import (
+            ParallelContext,
             get_parallel,
             publish,
             reset_context,
@@ -383,14 +384,24 @@ class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
                         f"get_parallel().config.{name} followed the live topology "
                         "instead of the published configuration",
                     )
-        # A bare read of a leaf with no live property is not a config read any
-        # more, and the error says where it went. Spelled through `getattr` so a
-        # mechanical `.config` sweep cannot "fix" the very read under test.
-        with self.assertRaisesRegex(
-            AttributeError, r"read it as get_parallel\(\)\.config\.nccl_port"
-        ):
-            getattr(get_parallel(), "nccl_port")
+        # A leaf with no live property reads bare: there is no live value it
+        # could be confused with. Compared against the declaration the bag was
+        # projected from, so the two sides do not come from the same read.
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        self.assertEqual(
+            resolution_result(server_args, "nccl_port"),
+            getattr(get_parallel(), "nccl_port"),
+            "a config-only leaf read bare disagreed with what resolution decided",
+        )
         reset_context()
+
+        # Before publish there is no value to hand back, and the error has to
+        # name that rather than look like a misspelled attribute.
+        with self.assertRaisesRegex(ValueError, r"'parallel' not published"):
+            getattr(ParallelContext(), "nccl_port")
+        with self.assertRaisesRegex(AttributeError, r"has no 'not_a_leaf'"):
+            getattr(ParallelContext(), "not_a_leaf")
 
     def test_no_live_topology_read_before_distributed_init(self):
         offenders = []

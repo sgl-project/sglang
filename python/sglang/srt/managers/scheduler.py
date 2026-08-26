@@ -458,16 +458,16 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
-        self.enable_dp_attention = get_parallel().config.enable_dp_attention
+        self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
-                get_parallel().config.enable_dp_attention,
+                get_parallel().enable_dp_attention,
                 tp_rank,
                 get_parallel().config.tp_size,
-                get_parallel().config.dp_size,
+                get_parallel().dp_size,
                 get_parallel().config.attn_cp_size,
             )
         )
@@ -477,7 +477,7 @@ class Scheduler(
             pp_rank=pp_rank,
             pp_size=get_parallel().config.pp_size,
             dp_rank=dp_rank,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
@@ -487,7 +487,7 @@ class Scheduler(
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
-            moe_ep_size=get_parallel().config.ep_size,
+            moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=get_parallel().config.moe_dp_size,
             gpu_id=gpu_id,
@@ -1064,7 +1064,7 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_parallel().config.pp_max_micro_batch_size:
+        if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
@@ -1408,7 +1408,7 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
-                dp_size=get_parallel().config.dp_size,
+                dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -3255,7 +3255,7 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
     ) -> int:
-        pp_budget = get_parallel().config.pp_max_micro_batch_size - running_bs
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
         active_batch = running_batch or self.running_batch
@@ -4954,7 +4954,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = get_parallel().config.max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_ep_size or old_ep_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5224,7 +5224,7 @@ def configure_scheduler_process(
         prefix += f" MOE_DP{moe_dp_rank}"
     if get_parallel().config.tp_size > 1:
         prefix += f" TP{shown_tp}"
-    if get_parallel().config.ep_size > 1:
+    if get_parallel().ep_size > 1:
         prefix += f" EP{shown_moe_ep}"
 
     # Config the process
@@ -5240,7 +5240,7 @@ def configure_scheduler_process(
         set_gpu_proc_affinity(
             get_parallel().config.pp_size,
             get_parallel().config.tp_size,
-            get_parallel().config.nnodes,
+            get_parallel().nnodes,
             gpu_id,
         )
     if not envs.SGLANG_NUMA_BIND_V2.get():
