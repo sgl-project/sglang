@@ -176,22 +176,22 @@ class TestXPUDecoderRerank(CustomTestCase):
 
 
 # Ported from test/manual/prefill_only/test_cross_encoder_models.py.
-# Big-VRAM XPU keeps the original fp32+triton parity; small-VRAM XPU falls back
-# to bf16+intel_xpu (same 1e-2 tolerance as the NPU sibling test).
+# fp32+triton fits on B60 (22GiB) but OOMs on B580 (~12GiB); bf16+intel_xpu on
+# this encoder model does not match HF (tracked separately), so on <20GiB XPU
+# the class is skipped rather than shipping a knowingly-wrong config.
 CROSS_ENCODER_MODEL_PATH = "BAAI/bge-reranker-v2-m3"
 CROSS_ENCODER_TP_SIZE = 1
 CROSS_ENCODER_SCORE_TOLERANCE = 1e-2
-
-if _HAS_LARGE_XPU:
-    CROSS_ENCODER_TORCH_DTYPE = torch.float32
-    CROSS_ENCODER_ATTENTION_BACKEND = "triton"
-    CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
-else:
-    CROSS_ENCODER_TORCH_DTYPE = torch.bfloat16
-    CROSS_ENCODER_ATTENTION_BACKEND = "intel_xpu"
-    CROSS_ENCODER_MEM_FRACTION_STATIC = 0.55
+CROSS_ENCODER_TORCH_DTYPE = torch.float32
+CROSS_ENCODER_ATTENTION_BACKEND = "triton"
+CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
 
 
+@unittest.skipUnless(
+    _HAS_LARGE_XPU,
+    "bge-reranker-v2-m3 fp32+triton OOMs on <20GiB XPU (B580); "
+    "bf16+intel_xpu on this encoder produces wrong scores.",
+)
 class TestXPUCrossEncoderRerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
