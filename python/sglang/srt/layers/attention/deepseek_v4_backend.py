@@ -216,6 +216,11 @@ class DSV4AttnMetadata:
     # (TrtllmSparseTablePool; duck-typed to avoid an import cycle). Shared by
     # every metadata object the backend creates; never copied.
     trtllm_table_pool: Optional[object] = None
+    # When True (trtllm decode/verify with the stride-capable topk_v2 path),
+    # init_trtllm_sparse_buffers rebinds c4_sparse_page_indices to the
+    # combined table's tail columns so the indexer's per-layer top-k writes
+    # land in the table directly (no per-layer copy).
+    trtllm_topk_writes_table: bool = False
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -283,6 +288,8 @@ class DSV4AttnMetadata:
                 # Shared backend-owned pool object; same reference on both
                 # sides, never content-copied.
                 "trtllm_table_pool",
+                # Plain config flag (same value on both sides).
+                "trtllm_topk_writes_table",
             ],
         )
 
@@ -514,14 +521,31 @@ class DSV4AttnMetadata:
         if self.c4_sparse_page_indices is not None:
             w4 = self.c4_sparse_page_indices.shape[-1]
             assert w4 % 4 == 0, f"{w4=}"
-            # The c4 tail + lens are per-layer values written by the decode
-            # forward; between the inert re-fill here and the per-layer fill
-            # the rows are -1 / SWA-only, never allocator garbage.
+            # Only the c4 index tail is a per-layer value (each layer's
+            # indexer picks its own top-k); the LENS are metadata-level
+            # (c4_sparse_topk_lengths, identical across layers), so write
+            # them once per step here instead of twice per layer in the
+            # decode forward. Between the inert re-fill here and the
+            # per-layer index fill the rows are -1 / SWA-only, never
+            # allocator garbage.
             self.trtllm_c4_indices = pool.view(
                 "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + w4
             )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = pool.view("d_c4_lens", num_tokens, fill=SWA_WINDOW)
+            self.trtllm_c4_lens = pool.view(
+                "d_c4_lens",
+                num_tokens,
+                fill=SWA_WINDOW,
+                src=(self.c4_sparse_topk_lengths + SWA_WINDOW).to(torch.int32),
+            )
+            if self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None:
+                # Aim the indexer's per-layer top-k output directly at the
+                # combined table's tail columns (the topk_v2 kernel handles
+                # the row stride); the decode forward skips its per-layer
+                # copy when it sees this alias. The raw-indices channel
+                # (prefill / indexer capture) reroutes the indexer to the
+                # stride-unaware v1 kernel, so never alias when it exists.
+                self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
         if self.c128_page_indices is not None:
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
@@ -2596,6 +2620,7 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
             trtllm_table_pool=getattr(self, "trtllm_table_pool", None),
+            trtllm_topk_writes_table=getattr(self, "trtllm_topk_writes_table", False),
         )
 
         if need_compress:

@@ -223,6 +223,17 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
+        # Let the indexer's per-layer top-k write straight into the combined
+        # table tail (decode/verify) -- only when the stride-capable topk_v2
+        # kernel is the guaranteed writer (sgl-kernel backend, v2 enabled,
+        # no indexer-capture side channel that reroutes to the v1 kernel).
+        self.trtllm_topk_writes_table = (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and model_runner.server_args.dsa_topk_backend == "sgl-kernel"
+            and not getattr(
+                model_runner.server_args, "enable_return_indexer_topk", False
+            )
+        )
 
         # Persistent combined-table storage (see TrtllmSparseTablePool). The
         # decode-side roles are consumed inside CUDA-graph capture, so they
@@ -464,11 +475,18 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert (
                 SWA_WINDOW + width == sparse_indices.shape[1]
             ), f"{width=} {sparse_indices.shape=}"
-            sparse_indices[:, SWA_WINDOW:].copy_(extra_indices)
-            # Lens include the fixed 128 SWA slots; SWA validity itself is
-            # derived from seq_lens inside the kernel.
-            sparse_topk_lens.copy_(extra_topk_lengths)
-            sparse_topk_lens.add_(SWA_WINDOW)
+            # Only the index tail is per-layer (each layer's indexer top-k);
+            # the lens (metadata-level c4_sparse_topk_lengths + SWA_WINDOW)
+            # were written once per step by init_trtllm_sparse_buffers. When
+            # trtllm_topk_writes_table aliased c4_sparse_page_indices to this
+            # very tail, the indexer already wrote it in place -- skip the
+            # copy (the alias decision is capture-stable, so this host branch
+            # is safe under CUDA graphs).
+            tail = sparse_indices[:, SWA_WINDOW:]
+            if extra_indices.data_ptr() != tail.data_ptr() or extra_indices.stride(
+                0
+            ) != tail.stride(0):
+                tail.copy_(extra_indices)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
