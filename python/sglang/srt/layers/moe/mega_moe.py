@@ -43,8 +43,10 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
+
 def _use_amd_flydsl_mega_moe() -> bool:
     return envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+
 
 def _get_mega_moe_symm_buffer(
     group,
