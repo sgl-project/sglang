@@ -77,7 +77,7 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
         )
         self.assertEqual(
             get_json_schema_properties(self.tools[0].function.parameters)["payload"],
-            payload_schema | {"required": ["value"]},
+            {"type": "string"},
         )
 
         parser = FunctionCallParser(self.tools, "qwen3_coder")
@@ -232,7 +232,7 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
 
                 other_chunks = [
                     chunk.replace(">acme</", ">other</").replace(
-                        '{"value":"hello"}', '{"x":1}'
+                        '{"value":"hello"}', '{ "x": 1.00 }'
                     )
                     for chunk in chunks
                 ]
@@ -244,13 +244,13 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                             '<invoke name="acme">',
                             "<kind>other",
                             "</kind>",
-                            '<payload>{"x":1}',
+                            '<payload>{ "x": 1.00 }',
                             "</payload>",
                             "</invoke>",
                             "</tool_call>",
                         )
                     ]
-                expected = {"kind": "other", "payload": '{"x":1}'}
+                expected = {"kind": "other", "payload": '{ "x": 1.00 }'}
 
                 parser = FunctionCallParser(self.tools, parser_name)
                 _, calls = parser.parse_non_stream("".join(other_chunks))
@@ -283,6 +283,18 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             "<|tool_calls_section_end|>"
         )
         self.assertEqual(calls[0].name, "acme")
+
+    def test_streaming_arguments_are_not_buffered(self):
+        parser = FunctionCallParser(self.tools, "qwen3_coder")
+        parameters = ""
+        for chunk in (
+            "<tool_call>",
+            "<function=acme>",
+            "<parameter=kind>acme</parameter>",
+        ):
+            _, calls = parser.parse_stream_chunk(chunk)
+            parameters += "".join(call.parameters for call in calls)
+        self.assertIn('"kind": "acme"', parameters)
 
 
 if __name__ == "__main__":

@@ -369,7 +369,14 @@ def get_json_schema_properties(
             name for branch in branch_properties for name in branch
         ):
             choices = [branch[name] for branch in branch_properties if name in branch]
-            property_schema = choices[0] if len(choices) == 1 else {keyword: choices}
+            if keyword in ("anyOf", "oneOf") and len(choices) < len(branch_properties):
+                # The missing branch leaves this property unconstrained, so preserve
+                # its raw spelling until sibling arguments select a branch.
+                property_schema = {"type": "string"}
+            else:
+                property_schema = (
+                    choices[0] if len(choices) == 1 else {keyword: choices}
+                )
             current_schema = properties.get(name, {})
             if current_schema in ({}, True):
                 properties[name] = property_schema

@@ -290,6 +290,14 @@ class MinimaxM3Detector(BaseFormatDetector):
         return True
 
     def _consume_scalar_param(self, calls: List[ToolCallItem]) -> bool:
+        if (
+            not self._current_string_started
+            and not self._current_param_buffer
+            and self._buffer.startswith(self.PARAM_START_PREFIX)
+        ):
+            self._current_param_is_complex = True
+            return self._consume_complex_param(calls)
+
         end_token = self._parameter_end_token(self._current_param_name)
         end = self._buffer.find(end_token)
         if end == -1:
@@ -525,6 +533,10 @@ class MinimaxM3Detector(BaseFormatDetector):
                 tag = chunk[1:gt].strip()
                 text = chunk[gt + 1 :]
                 parent_frame = stack[-1]
+                if not isinstance(parent_frame["value"], (dict, list)):
+                    parent_frame["value"] = self._new_container_for_schema(
+                        parent_frame["schema"]
+                    )
                 child_schema = self._get_child_schema(
                     parent_frame["schema"], tag, parent_frame["value"]
                 )

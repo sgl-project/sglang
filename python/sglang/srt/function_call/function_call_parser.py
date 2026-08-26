@@ -1,6 +1,7 @@
 import inspect
 import json
 import logging
+import re
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from jsonschema import Draft202012Validator
@@ -53,6 +54,8 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
     get_json_schema_properties,
+    infer_type_from_json_schema,
+    resolve_local_json_schema_refs,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,69 +123,131 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
-        self.schema_validators = {}
-        self.streaming_calls: Dict[int, ToolCallItem] = {}
+        self.schema_branches = {}
+        self.streaming_calls: Dict[int, Tuple[Optional[str], str]] = {}
         self.detector_tools: List[Tool] = []
         for tool in tools:
             parameters = tool.function.parameters
             if isinstance(parameters, dict):
                 properties = get_json_schema_properties(parameters)
                 if properties != parameters.get("properties", {}):
-                    self.schema_validators[tool.function.name] = Draft202012Validator(
-                        parameters
-                    )
                     function = tool.function.model_copy(
                         update={"parameters": parameters | {"properties": properties}}
                     )
                     tool = tool.model_copy(update={"function": function})
+                schema = resolve_local_json_schema_refs(parameters, parameters)
+                for keyword in ("anyOf", "oneOf"):
+                    branches = schema.get(keyword)
+                    if isinstance(branches, list):
+                        if properties == parameters.get("properties", {}):
+                            function = tool.function.model_copy(
+                                update={"parameters": parameters.copy()}
+                            )
+                            tool = tool.model_copy(update={"function": function})
+                        base_schema = {
+                            key: value
+                            for key, value in schema.items()
+                            if key != keyword
+                        }
+                        candidates = []
+                        for branch in branches:
+                            candidate_schema = base_schema | {
+                                "allOf": [*base_schema.get("allOf", []), branch]
+                            }
+                            candidate_properties = get_json_schema_properties(
+                                candidate_schema
+                            )
+                            candidates.append(
+                                (
+                                    candidate_properties,
+                                    {
+                                        key: infer_type_from_json_schema(value)
+                                        for key, value in candidate_properties.items()
+                                    },
+                                    Draft202012Validator(candidate_schema),
+                                )
+                            )
+                        self.schema_branches[tool.function.name] = {
+                            "parameters": tool.function.parameters,
+                            "properties": properties,
+                            "candidates": candidates,
+                        }
+                        break
             self.detector_tools.append(tool)
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
-    def _normalize_calls(
+    def _update_tool_schemas(
         self, calls: List[ToolCallItem], streaming: bool = False
-    ) -> List[ToolCallItem]:
-        """Preserve raw strings whenever they satisfy the original tool schema."""
-        result = []
+    ) -> None:
+        """Select a root schema branch without decoding valid string arguments."""
         for call in calls:
-            pending = self.streaming_calls.get(call.tool_index)
-            name = call.name or (pending.name if pending else None)
-            validator = self.schema_validators.get(name)
-            if validator is None:
-                result.append(call)
+            pending_name, pending_parameters = self.streaming_calls.get(
+                call.tool_index, (None, "")
+            )
+            name = call.name or pending_name
+            branch_config = self.schema_branches.get(name)
+            if branch_config is None:
                 continue
 
-            parameters = (pending.parameters if pending else "") + call.parameters
+            tool_parameters = branch_config["parameters"]
+            if streaming and call.name and not pending_name:
+                tool_parameters["properties"] = branch_config["properties"]
+
+            parameters = pending_parameters + call.parameters
+            complete = False
             try:
                 arguments = json.loads(parameters)
+                complete = True
             except json.JSONDecodeError:
-                if streaming:
-                    self.streaming_calls[call.tool_index] = ToolCallItem(
-                        tool_index=call.tool_index, name=name, parameters=parameters
-                    )
-                    if call.name:
-                        result.append(call.model_copy(update={"parameters": ""}))
-                else:
-                    result.append(call)
-                continue
-
-            self.streaming_calls.pop(call.tool_index, None)
-            for key, value in arguments.items():
-                if isinstance(value, str):
+                try:
+                    arguments = json.loads(parameters + "}")
+                except json.JSONDecodeError:
+                    if streaming:
+                        self.streaming_calls[call.tool_index] = (name, parameters)
                     continue
-                string_value = json.dumps(
-                    value, ensure_ascii=False, separators=(",", ":")
-                )
-                if validator.is_valid(arguments | {key: string_value}):
-                    arguments[key] = string_value
-            result.append(
-                call.model_copy(
-                    update={
-                        "name": None if pending else call.name,
-                        "parameters": json.dumps(arguments, ensure_ascii=False),
-                    }
-                )
-            )
-        return result
+
+            if not isinstance(arguments, dict):
+                continue
+            if streaming:
+                self.streaming_calls[call.tool_index] = (name, parameters)
+
+            candidates = []
+            for candidate_properties, property_types, validator in branch_config[
+                "candidates"
+            ]:
+                # Candidate copies can be coerced for validation while the original
+                # string remains byte-for-byte available for a string branch.
+                candidate_arguments = arguments.copy()
+                for key, value in arguments.items():
+                    expected_type = property_types.get(key)
+                    if isinstance(value, str) and expected_type not in (None, "string"):
+                        try:
+                            candidate_arguments[key] = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+                errors = validator.iter_errors(candidate_arguments)
+                if all(error.validator == "required" for error in errors):
+                    candidates.append((candidate_properties, candidate_arguments))
+
+            if len(candidates) == 1:
+                candidate_properties, selected_arguments = candidates[0]
+                selected_properties = candidate_properties | {
+                    key: value
+                    for key, value in branch_config["properties"].items()
+                    if candidate_properties.get(key) in (None, {}, True)
+                }
+                if streaming and not complete:
+                    tool_parameters["properties"] = selected_properties
+                if (
+                    complete
+                    and (not streaming or not pending_parameters)
+                    and selected_arguments != arguments
+                ):
+                    call.parameters = json.dumps(selected_arguments, ensure_ascii=False)
+
+            if streaming and complete:
+                self.streaming_calls.pop(call.tool_index, None)
+                tool_parameters["properties"] = branch_config["properties"]
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -215,7 +280,8 @@ class FunctionCallParser:
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.detector_tools)
-        tool_call_list = self._normalize_calls(parsed_result.calls)
+        self._update_tool_schemas(parsed_result.calls)
+        tool_call_list = parsed_result.calls
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
@@ -238,14 +304,18 @@ class FunctionCallParser:
         final_normal_text = ""
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(
-            chunk_text, self.detector_tools
+        chunks = (
+            re.findall(r".*?</[^>]+>|.+", chunk_text, re.DOTALL) or [""]
+            if self.schema_branches
+            else [chunk_text]
         )
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(self._normalize_calls(sp_result.calls, streaming=True))
-            final_normal_text = sp_result.normal_text
+        for chunk in chunks:
+            sp_result = self.detector.parse_streaming_increment(
+                chunk, self.detector_tools
+            )
+            final_normal_text += sp_result.normal_text
+            final_calls.extend(sp_result.calls)
+            self._update_tool_schemas(sp_result.calls, streaming=True)
 
         return final_normal_text, final_calls
 
@@ -258,13 +328,9 @@ class FunctionCallParser:
         if not self.tools:
             return "", []
         sp_result = self.detector.finish(self.detector_tools)
-        calls = self._normalize_calls(sp_result.calls, streaming=True)
-        calls.extend(
-            call.model_copy(update={"name": None})
-            for call in self.streaming_calls.values()
-        )
+        self._update_tool_schemas(sp_result.calls, streaming=True)
         self.streaming_calls.clear()
-        return sp_result.normal_text, calls
+        return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
