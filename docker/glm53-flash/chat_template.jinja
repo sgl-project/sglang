@@ -1,0 +1,210 @@
+[gMASK]<sop>
+{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{%- if tools -%}
+{%- macro tool_to_json(tool) -%}
+    {%- set ns_tool = namespace(first=true) -%}
+    {{ '{' -}}
+    {%- for k, v in tool.items() -%}
+        {%- if k != 'defer_loading' and k != 'strict' -%}
+            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}
+            {%- set ns_tool.first = false -%}
+            "{{ k }}": {{ v | tojson(ensure_ascii=False) }}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- '}' -}}
+{%- endmacro -%}
+{%- macro tool_references_to_response(refs) -%}
+    {{- '<tool_response><tools>\n' -}}
+    {%- for tr in refs -%}
+        {%- for tool in tools -%}
+            {%- if 'function' in tool -%}
+                {%- set tool = tool['function'] -%}
+            {%- endif -%}
+            {%- if tool.name == tr.name -%}
+                {{- tool_to_json(tool) + '\n' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endfor -%}
+    {{- '</tools></tool_response>' -}}
+{%- endmacro -%}
+<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{% for tool in tools %}
+{%- if 'function' in tool -%}
+    {%- set tool = tool['function'] -%}
+{%- endif -%}
+{% if tool.defer_loading is not defined or not tool.defer_loading %}
+{{ tool_to_json(tool) }}
+{% endif %}
+{% endfor %}
+</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text }}
+            {%- elif item is string -%}
+                {{- item }}
+            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}
+                {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}
+                {{- "<reminder>You are unable to process this " ~ media_type ~ " because you don't have multi-modal input ability. Try different methods.</reminder>" }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro tool_response(text) -%}
+{{- '<tool_response>' + text + '</tool_response>' -}}
+{%- endmacro -%}
+{%- macro render_tool_response(m) -%}
+{%- if m.content is string -%}
+    {{- tool_response(m.content) -}}
+{%- elif m.content and m.content is not mapping and m.content.0.type == "tool_reference" -%}
+    {{- tool_references_to_response(m.content) -}}
+{%- elif is_list_of_outputs(m) -%}
+    {%- for tr in m.content -%}
+        {%- if tr.output is iterable and tr.output is not string and tr.output is not mapping and tr.output and tr.output.0.type == "tool_reference" -%}
+            {{- tool_references_to_response(tr.output) -}}
+        {%- else -%}
+            {{- tool_response(visible_text(tr.output)) -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- tool_response(visible_text(m.content)) -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro id_of(obj) -%}
+    {%- if obj.tool_call_id -%}
+        {{- obj.tool_call_id -}}
+    {%- elif obj.id -%}
+        {{- obj.id -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro is_list_of_outputs(m) -%}
+    {%- if m.content and m.content.0.output is defined -%}1{%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1) -%}
+{%- for m in messages %}
+    {%- if m.role == 'user' %}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}
+{%- elif m.role == 'assistant' -%}
+<|assistant|>
+{%- set content = visible_text(m.content) %}
+{%- if m.reasoning_content is string %}
+    {%- set reasoning_content = m.reasoning_content %}
+{%- elif '</think>' in content %}
+    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
+    {%- set content = content.split('</think>')[-1] %}
+{%- endif %}
+{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+{{ '<think>' + reasoning_content +  '</think>'}}
+{%- else -%}
+{{ '<think></think>' }}
+{%- endif -%}
+{%- if content.strip() -%}
+{{ content.strip() }}
+{%- endif -%}
+{% if m.tool_calls %}
+{% for tc in m.tool_calls %}
+{%- if tc.function %}
+    {%- set tc = tc.function %}
+{%- endif %}
+{{- '<tool_call>' + tc.name -}}
+{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}
+{% endif %}
+{%- elif m.role == 'tool' -%}
+{%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+    {{- '<|observation|>' -}}
+    {%- set block_start = loop.index0 -%}
+    {%- set ns_blk = namespace(end=block_start) -%}
+    {%- for j in range(block_start, messages|length) -%}
+        {%- if messages[j].role == 'tool' -%}
+            {%- set ns_blk.end = j -%}
+        {%- else -%}
+            {%- break -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- set ns_a = namespace(tool_calls=none) -%}
+    {%- if block_start > 0 and messages[block_start - 1].role == 'assistant' and messages[block_start - 1].tool_calls -%}
+        {%- set ns_a.tool_calls = messages[block_start - 1].tool_calls -%}
+    {%- endif -%}
+    {%- set ns_chk = namespace(can_sort=true) -%}
+    {%- if not ns_a.tool_calls -%}
+        {%- set ns_chk.can_sort = false -%}
+    {%- else -%}
+        {%- for k in range(block_start, ns_blk.end + 1) -%}
+            {%- set m = messages[k] -%}
+            {%- if is_list_of_outputs(m) -%}
+                {%- for entry in m.content -%}
+                    {%- set eid = id_of(entry) -%}
+                    {%- if not eid -%}
+                        {%- set ns_chk.can_sort = false -%}
+                    {%- endif -%}
+                {%- endfor -%}
+            {%- else -%}
+                {%- set tk_id = id_of(m) -%}
+                {%- if not tk_id -%}
+                    {%- set ns_chk.can_sort = false -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- for tc in ns_a.tool_calls -%}
+            {%- set tc_id = id_of(tc) -%}
+            {%- if not tc_id -%}
+                {%- set ns_chk.can_sort = false -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- if ns_chk.can_sort -%}
+        {%- for tc in ns_a.tool_calls -%}
+            {%- set tc_id = id_of(tc) -%}
+            {%- for k in range(block_start, ns_blk.end + 1) -%}
+                {%- set m = messages[k] -%}
+                {%- if is_list_of_outputs(m) -%}
+                    {%- for entry in m.content -%}
+                        {%- set eid = id_of(entry) -%}
+                        {%- if eid == tc_id -%}
+                            {%- if entry.output is iterable and entry.output is not string and entry.output is not mapping and entry.output and entry.output.0.type == "tool_reference" -%}
+                                {{- tool_references_to_response(entry.output) -}}
+                            {%- else -%}
+                                {{- tool_response(visible_text(entry.output)) -}}
+                            {%- endif -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                {%- else -%}
+                    {%- set tk_id = id_of(m) -%}
+                    {%- if tk_id == tc_id -%}
+                        {{- render_tool_response(m) -}}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- else -%}
+        {%- for k in range(block_start, ns_blk.end + 1) -%}
+            {{- render_tool_response(messages[k]) -}}
+        {%- endfor -%}
+    {%- endif -%}
+{% endif -%}
+{%- elif m.role == 'system' -%}
+<|system|>{{ visible_text(m.content) }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    <|assistant|>{{- '<think>' -}}
+{%- endif -%}

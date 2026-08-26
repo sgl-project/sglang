@@ -1,0 +1,2 @@
+# tokenizer.json is ~20 MB; fetch from HF before building (see README.md)
+tokenizer.json
