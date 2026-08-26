@@ -101,3 +101,15 @@ jobs:
           # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
           docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t ${IMAGE_REPO}:${tag}-${{ env.DATE }} --no-cache
           docker push ${IMAGE_REPO}:${tag}-${{ env.DATE }}
+
+  validate:
+    name: Validate ROCm 10 RC4 on MI300 and MI35x
+    needs: publish
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
+    with:
+      rocm_version: rocm10rc4
+      ref: ${{ github.sha }}
+      job_filter: nightly-perf-2-gpu-text-rocm720,nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720
+      continue_on_error: true
+    secrets: inherit
