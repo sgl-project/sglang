@@ -1675,7 +1675,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            batch_output.new_seq_lens = batch.seq_lens
+            if batch.forward_mode.is_mixed() and batch.decoding_reqs:
+                # Each decode-tail request committed its pending bonus token
+                # this step, so its next-iter length advances by one.
+                new_seq_lens = batch.seq_lens.clone()
+                new_seq_lens[-len(batch.decoding_reqs) :] += 1
+            else:
+                new_seq_lens = batch.seq_lens
+            batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
@@ -1720,7 +1727,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,
-                seq_lens=batch.seq_lens,
+                seq_lens=new_seq_lens,
             )
             return batch_output
 

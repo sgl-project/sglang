@@ -136,14 +136,17 @@ class SpeculativeAlgorithm(Enum):
         (a 1-token extend of its pending bonus token) and the worker resumes
         drafting afterward. An algorithm joins this list once its worker's
         resume path is verified: EAGLE-family re-seeds draft state via the
-        prefill draft-extend. standalone likely works (draft prefill covers
-        the gap) but is unverified; ngram publishes its overlap relay into
-        accept bufs, not output_tokens_buf, so the mixed input resolve would
-        read stale rows.
+        prefill draft-extend; dflash-family injects target hidden states into
+        the draft KV over out_cache_loc, which covers the mixed tails.
+        standalone likely works (draft prefill covers the gap) but is
+        unverified; ngram publishes its overlap relay into accept bufs, not
+        output_tokens_buf, so the mixed input resolve would read stale rows.
         """
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
         )
 
     def supports_ragged_verify(self) -> bool:

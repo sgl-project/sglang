@@ -325,16 +325,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
-        )
-
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -521,16 +511,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
-
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
         )
 
     from sglang.srt.speculative.ragged_verify import (
