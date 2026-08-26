@@ -278,9 +278,12 @@ class MinimaxM3Detector(BaseFormatDetector):
             return False
 
         self._current_param_buffer += self._buffer[:end]
-        value = self._parse_parameter(
-            self._current_param_buffer, self._current_param_schema
+        parse_value = (
+            self._parse_parameter
+            if self.PARAM_START_PREFIX in self._current_param_buffer
+            else self._convert_leaf_value
         )
+        value = parse_value(self._current_param_buffer, self._current_param_schema)
         self._append_stream_call(calls, json.dumps(value, ensure_ascii=False))
         self._buffer = self._buffer[end + len(end_token) :]
         self._clear_current_param()

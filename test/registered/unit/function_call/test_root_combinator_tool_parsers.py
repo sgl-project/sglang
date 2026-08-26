@@ -66,6 +66,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                 self.assertEqual(
                     get_json_schema_properties(schema), {"payload": payload_schema}
                 )
+                schema["properties"] = {"payload": {}}
+                self.assertEqual(
+                    get_json_schema_properties(schema), {"payload": payload_schema}
+                )
 
         self.assertEqual(
             get_json_schema_properties(self.tools[0].function.parameters)["kind"],
@@ -225,6 +229,39 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                     _, calls = parser.parse_stream_chunk(chunk)
                     parameters += "".join(call.parameters for call in calls)
                 self.assertEqual(json.loads(parameters), self.expected)
+
+                other_chunks = [
+                    chunk.replace(">acme</", ">other</").replace(
+                        '{"value":"hello"}', '{"x":1}'
+                    )
+                    for chunk in chunks
+                ]
+                if parser_name == "minimax-m3":
+                    other_chunks = [
+                        ns + segment
+                        for segment in (
+                            "<tool_call>",
+                            '<invoke name="acme">',
+                            "<kind>other",
+                            "</kind>",
+                            '<payload>{"x":1}',
+                            "</payload>",
+                            "</invoke>",
+                            "</tool_call>",
+                        )
+                    ]
+                expected = {"kind": "other", "payload": '{"x":1}'}
+
+                parser = FunctionCallParser(self.tools, parser_name)
+                _, calls = parser.parse_non_stream("".join(other_chunks))
+                self.assertEqual(json.loads(calls[0].parameters), expected)
+
+                parser = FunctionCallParser(self.tools, parser_name)
+                parameters = ""
+                for chunk in other_chunks:
+                    _, calls = parser.parse_stream_chunk(chunk)
+                    parameters += "".join(call.parameters for call in calls)
+                self.assertEqual(json.loads(parameters), expected)
 
     def test_other_schema_consumers(self):
         other_tool = Tool(

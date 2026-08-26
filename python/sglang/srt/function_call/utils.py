@@ -361,15 +361,22 @@ def get_json_schema_properties(
     properties = direct_properties.copy()
 
     for keyword in ("anyOf", "oneOf", "allOf"):
-        for branch in schema.get(keyword, []):
-            branch_properties = get_json_schema_properties(branch, root_schema)
-            for name, property_schema in branch_properties.items():
-                if name in direct_properties:
-                    continue
-                if name in properties and properties[name] != property_schema:
-                    properties[name] = {keyword: [properties[name], property_schema]}
-                else:
-                    properties[name] = property_schema
+        branch_properties = [
+            get_json_schema_properties(branch, root_schema)
+            for branch in schema.get(keyword, [])
+        ]
+        for name in dict.fromkeys(
+            name for branch in branch_properties for name in branch
+        ):
+            choices = [branch[name] for branch in branch_properties if name in branch]
+            property_schema = choices[0] if len(choices) == 1 else {keyword: choices}
+            current_schema = properties.get(name, {})
+            if current_schema in ({}, True):
+                properties[name] = property_schema
+            elif (
+                property_schema not in ({}, True) and current_schema != property_schema
+            ):
+                properties[name] = {"allOf": [current_schema, property_schema]}
     return properties
 
 

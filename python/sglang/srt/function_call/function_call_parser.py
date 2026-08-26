@@ -1,6 +1,9 @@
 import inspect
+import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+
+from jsonschema import Draft202012Validator
 
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
@@ -117,18 +120,69 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.schema_validators = {}
+        self.streaming_calls: Dict[int, ToolCallItem] = {}
         self.detector_tools: List[Tool] = []
         for tool in tools:
             parameters = tool.function.parameters
             if isinstance(parameters, dict):
                 properties = get_json_schema_properties(parameters)
                 if properties != parameters.get("properties", {}):
+                    self.schema_validators[tool.function.name] = Draft202012Validator(
+                        parameters
+                    )
                     function = tool.function.model_copy(
                         update={"parameters": parameters | {"properties": properties}}
                     )
                     tool = tool.model_copy(update={"function": function})
             self.detector_tools.append(tool)
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def _normalize_calls(
+        self, calls: List[ToolCallItem], streaming: bool = False
+    ) -> List[ToolCallItem]:
+        """Preserve raw strings whenever they satisfy the original tool schema."""
+        result = []
+        for call in calls:
+            pending = self.streaming_calls.get(call.tool_index)
+            name = call.name or (pending.name if pending else None)
+            validator = self.schema_validators.get(name)
+            if validator is None:
+                result.append(call)
+                continue
+
+            parameters = (pending.parameters if pending else "") + call.parameters
+            try:
+                arguments = json.loads(parameters)
+            except json.JSONDecodeError:
+                if streaming:
+                    self.streaming_calls[call.tool_index] = ToolCallItem(
+                        tool_index=call.tool_index, name=name, parameters=parameters
+                    )
+                    if call.name:
+                        result.append(call.model_copy(update={"parameters": ""}))
+                else:
+                    result.append(call)
+                continue
+
+            self.streaming_calls.pop(call.tool_index, None)
+            for key, value in arguments.items():
+                if isinstance(value, str):
+                    continue
+                string_value = json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":")
+                )
+                if validator.is_valid(arguments | {key: string_value}):
+                    arguments[key] = string_value
+            result.append(
+                call.model_copy(
+                    update={
+                        "name": None if pending else call.name,
+                        "parameters": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+            )
+        return result
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -161,7 +215,7 @@ class FunctionCallParser:
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.detector_tools)
-        tool_call_list = parsed_result.calls
+        tool_call_list = self._normalize_calls(parsed_result.calls)
         if tool_call_list or has_tool_call:
             return parsed_result.normal_text, tool_call_list
         else:
@@ -190,7 +244,7 @@ class FunctionCallParser:
         if sp_result.normal_text:
             final_normal_text = sp_result.normal_text
         if sp_result.calls:
-            final_calls.extend(sp_result.calls)
+            final_calls.extend(self._normalize_calls(sp_result.calls, streaming=True))
             final_normal_text = sp_result.normal_text
 
         return final_normal_text, final_calls
@@ -204,7 +258,13 @@ class FunctionCallParser:
         if not self.tools:
             return "", []
         sp_result = self.detector.finish(self.detector_tools)
-        return sp_result.normal_text, sp_result.calls
+        calls = self._normalize_calls(sp_result.calls, streaming=True)
+        calls.extend(
+            call.model_copy(update={"name": None})
+            for call in self.streaming_calls.values()
+        )
+        self.streaming_calls.clear()
+        return sp_result.normal_text, calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
