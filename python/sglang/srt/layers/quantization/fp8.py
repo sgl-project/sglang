@@ -1085,6 +1085,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # The MxFP4 wrapper methods borrow this instance for weight loading;
+        # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -2140,6 +2142,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        # The runner backend is global, so it is also true for a borrowed delegate,
+        # which has no moe_runner_config and whose kernel ignores these params.
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
