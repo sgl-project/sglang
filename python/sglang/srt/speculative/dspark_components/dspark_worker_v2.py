@@ -529,17 +529,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
-        if self._verify_planner.has_fixed_verify_len:
-            from sglang.srt.layers.dp_attention import DpPaddingMode
-
-            fixed_width = self._verify_planner.fixed_verify_len
-            scaled_tokens = [int(n) * fixed_width for n in batch.global_num_tokens]
-            if not DpPaddingMode.get_dp_padding_mode(
-                batch.is_extend_in_batch, scaled_tokens
-            ).is_max_len():
-                # SUM_LEN keeps idle ranks at zero tokens.  Materializing the
-                # graph tier here would make ForwardBatch pad fixed_width -> 0.
-                return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
             return None
