@@ -908,7 +908,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum by (instance) (rate(sglang_realtime_tokens_total{mode=\"prefill_cache\"}[$__rate_interval])) / sum by (instance) (rate(sglang_realtime_tokens_total{mode=~\"prefill_cache|prefill_compute\"}[$__rate_interval]))",
+          "expr": "sum by (instance) (rate(sglang:realtime_tokens_total{mode=\"prefill_cache\"}[$__rate_interval])) / sum by (instance) (rate(sglang:realtime_tokens_total{mode=~\"prefill_cache|prefill_compute\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
