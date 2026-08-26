@@ -19,7 +19,7 @@ class TestSWABasic(ScriptedTestCase):
         model_path=_SWA_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
 
     def test_naive_swa_chunked(self):
@@ -112,7 +112,7 @@ class TestSWAHalfWindowChunk(ScriptedTestCase):
         model_path=_SWA_MODEL,
         chunked_prefill_size=_SWA_WINDOW // 2,
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
 
     def test_swa_prompt_2x_window_half_chunks(self):
@@ -134,7 +134,7 @@ class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
         model_path=_SWA_MODEL,
         chunked_prefill_size=_SWA_WINDOW * 2,
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
 
     def test_swa_chunk_size_exceeds_window(self):
@@ -155,7 +155,7 @@ class TestSWARadix(ScriptedTestCase):
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         mem_fraction_static=0.70,
         disable_radix_cache=False,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
 
     def test_swa_radix_partial_hit_straddles_window(self):
