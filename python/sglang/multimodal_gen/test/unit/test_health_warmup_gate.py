@@ -134,8 +134,14 @@ class TestServerManagerReadiness(unittest.TestCase):
             ["http://127.0.0.1:11000/health"] * 2,
         )
 
-    def test_start_cleans_up_process_when_readiness_fails(self):
-        manager = ServerManager("test-model", port=11000, wait_deadline=1)
+    def test_start_preserves_quoted_args_and_cleans_up_on_readiness_failure(self):
+        warmup = '{"height":720,"width":1280}'
+        manager = ServerManager(
+            "test-model",
+            port=11000,
+            wait_deadline=1,
+            extra_args=f"--warmup-sampling-params '{warmup}'",
+        )
         process = SimpleNamespace(pid=123, stdout=None)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -148,7 +154,7 @@ class TestServerManagerReadiness(unittest.TestCase):
                 mock.patch(
                     "sglang.multimodal_gen.test.server.test_server_utils.subprocess.Popen",
                     return_value=process,
-                ),
+                ) as subprocess_popen,
                 mock.patch.object(
                     manager,
                     "_wait_for_ready",
@@ -165,6 +171,8 @@ class TestServerManagerReadiness(unittest.TestCase):
                     manager.start()
 
         kill_process.assert_called_once_with(123)
+        command = subprocess_popen.call_args.args[0]
+        self.assertEqual(command[command.index("--warmup-sampling-params") + 1], warmup)
 
 
 if __name__ == "__main__":

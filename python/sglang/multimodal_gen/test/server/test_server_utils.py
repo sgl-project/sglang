@@ -405,7 +405,7 @@ class ServerManager:
             "--log-level=debug",
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
         if not any(arg.startswith(access_log_exclude_flag) for arg in command):
             command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])

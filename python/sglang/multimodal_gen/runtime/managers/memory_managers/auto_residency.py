@@ -2,16 +2,15 @@
 """Warmup-calibrated automatic component residency promotion.
 
 Under ``--performance-mode auto`` with server warmup, each rank measures the
-peak GPU memory of the synthetic warmup requests, extrapolates it to the
-model's default workload, and promotes implicitly offloaded components
+peak GPU memory of bounded synthetic warmup requests and a low-step probe at
+the complete default serving shape, then promotes implicitly offloaded components
 (component offload -> resident, layerwise offload -> fully loaded) when the
 estimate plus the promoted weights still fits under a safety reserve.
 
-The estimate splits the measured peak into a persistent part (weights and
-buffers alive before the forward) and an activation part (everything above
-it); only the activation part scales with the workload ratio. Scaling the
-whole peak would multiply resident weights by the video frame/area cap ratio
-(~16x for Wan-class defaults) and promotion would never trigger.
+When no full-shape measurement is available, the fallback estimate splits the
+measured peak into persistent weights and workload-scaled activations. Scaling
+the whole peak would multiply resident weights by the video frame/area cap
+ratio (~16x for Wan-class defaults) and promotion would never trigger.
 
 Promotion targets the model default workload only (default resolution,
 default frames, batch=1). Larger shapes, batches, or multi-image inputs need
@@ -214,25 +213,12 @@ class AppliedPromotion(msgspec.Struct, frozen=True):
 def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
     """Resolve the default request shape promotion is optimized for."""
     from sglang.multimodal_gen.runtime.warmup_request_builder import (
-        _apply_warmup_frame_contract,
         get_model_sampling_defaults,
+        resolve_default_workload_shape,
     )
 
     defaults = get_model_sampling_defaults(server_args)
-    # __post_init__ already applied the model's _default_width/_default_height
-    width = defaults.width
-    height = defaults.height
-    if (width is None or height is None) and defaults.supported_resolutions:
-        # worst-case the target with the largest supported shape
-        width, height = max(
-            defaults.supported_resolutions, key=lambda size: size[0] * size[1]
-        )
-    num_frames = defaults.num_frames or 1
-    if num_frames > 1:
-        # same contract the warmup requests and real requests get
-        num_frames = _apply_warmup_frame_contract(
-            server_args, defaults, num_frames=num_frames
-        )
+    width, height, num_frames = resolve_default_workload_shape(server_args, defaults)
     return DefaultWorkload(
         width=width,
         height=height,

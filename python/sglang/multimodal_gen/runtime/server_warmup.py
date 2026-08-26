@@ -237,9 +237,14 @@ def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
 
 def format_warmup_req(req_or_group: Any) -> str:
     req = get_first_generation_req(req_or_group)
-    prefix = (
-        "server warmup req" if is_server_based_warmup(req_or_group) else "warmup req"
-    )
+    if req is not None and req.extra.get("auto_residency_full_shape_probe"):
+        prefix = "auto residency probe"
+    else:
+        prefix = (
+            "server warmup req"
+            if is_server_based_warmup(req_or_group)
+            else "warmup req"
+        )
     if req is None:
         return prefix
 

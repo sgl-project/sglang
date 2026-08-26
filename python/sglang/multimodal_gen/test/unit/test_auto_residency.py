@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
-    _resolve_calibration_num_frames,
+    _resolve_auto_residency_probe_shape,
     _resolve_warmup_num_frames,
 )
 
@@ -1306,7 +1306,7 @@ class TestWarmupFrameAdjustment:
         assert num_frames == 21
 
 
-class TestCalibrationFrames:
+class TestAutoResidencyProbeShape:
     def _patch_gate(self, monkeypatch, reason: str | None = None) -> None:
         monkeypatch.setattr(
             "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
@@ -1322,71 +1322,80 @@ class TestCalibrationFrames:
             num_gpus=1,
         )
 
-    def _defaults(self, num_frames: int) -> SimpleNamespace:
+    def _defaults(
+        self,
+        num_frames: int,
+        *,
+        width: int | None = 1280,
+        height: int | None = 720,
+        supported_resolutions=None,
+    ) -> SimpleNamespace:
         return SimpleNamespace(
+            width=width,
+            height=height,
             num_frames=num_frames,
+            supported_resolutions=supported_resolutions,
             adjust_frames=True,
             enable_sequence_shard=None,
             num_frames_round_down=False,
         )
 
-    def test_capped_video_gets_a_smaller_calibration_size(self, monkeypatch):
+    def test_capped_video_gets_a_full_shape_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        calibration = _resolve_calibration_num_frames(
+        probe = _resolve_auto_residency_probe_shape(
             self._wan_like_args(),
             self._defaults(81),
-            warmup_num_frames=17,
+            warmup_shape=(832, 480, 17),
             server_based_warmup=True,
         )
-        assert calibration == 9
+        assert probe == (1280, 720, 81)
 
-    def test_uncapped_video_needs_no_calibration(self, monkeypatch):
+    def test_matching_warmup_needs_no_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        calibration = _resolve_calibration_num_frames(
+        probe = _resolve_auto_residency_probe_shape(
             self._wan_like_args(),
-            self._defaults(13),
-            warmup_num_frames=13,
+            self._defaults(17, width=832, height=480),
+            warmup_shape=(832, 480, 17),
             server_based_warmup=True,
         )
-        assert calibration is None
+        assert probe is None
 
-    def test_unknown_warmup_frames_skip_calibration(self, monkeypatch):
+    def test_unknown_target_resolution_skips_probe(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        calibration = _resolve_calibration_num_frames(
+        probe = _resolve_auto_residency_probe_shape(
             self._wan_like_args(),
-            self._defaults(81),
-            warmup_num_frames=None,
+            self._defaults(81, width=None, height=None),
+            warmup_shape=(832, 480, 17),
             server_based_warmup=True,
         )
-        assert calibration is None
+        assert probe is None
 
-    def test_skip_gate_disables_calibration(self, monkeypatch):
-        # the calibration request costs a full extra warmup forward: it must
+    def test_skip_gate_disables_probe(self, monkeypatch):
+        # The probe costs a full extra warmup forward, so it must
         # share the promotion's own gate (kill switch, quantized, manual, ...)
         self._patch_gate(monkeypatch, reason="performance_mode=manual")
-        calibration = _resolve_calibration_num_frames(
+        probe = _resolve_auto_residency_probe_shape(
             self._wan_like_args(),
             self._defaults(81),
-            warmup_num_frames=17,
+            warmup_shape=(832, 480, 17),
             server_based_warmup=True,
         )
-        assert calibration is None
+        assert probe is None
 
-    def test_frame_contract_collapse_skips_calibration(self, monkeypatch):
-        # LongLive2 aligns both 17 and 9 to 29 latent-block frames: a second
-        # measurement at the same size adds nothing.
+    def test_supported_resolution_fills_missing_target_size(self, monkeypatch):
         self._patch_gate(monkeypatch)
-        args = SimpleNamespace(
-            pipeline_config=LongLive2T2VConfig(),
-            num_gpus=1,
-        )
-        calibration = _resolve_calibration_num_frames(
-            args,
-            self._defaults(61),
-            warmup_num_frames=29,
+        probe = _resolve_auto_residency_probe_shape(
+            self._wan_like_args(),
+            self._defaults(
+                81,
+                width=None,
+                height=None,
+                supported_resolutions=[(832, 480), (1024, 1024)],
+            ),
+            warmup_shape=(832, 480, 17),
             server_based_warmup=True,
         )
-        assert calibration is None
+        assert probe == (1024, 1024, 81)
 
 
 class TestAutoResidencySkipReason:

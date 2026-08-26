@@ -382,6 +382,59 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
 
+    def test_auto_residency_adds_a_full_serving_shape_probe(self):
+        server_args = SimpleNamespace(
+            warmup_steps=1,
+            enable_cfg_parallel=False,
+            enable_torch_compile=False,
+            enable_breakable_cuda_graph=False,
+            pipeline_class_name=None,
+            num_gpus=1,
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                adjust_num_frames=lambda value: value,
+                vae_stride=None,
+                vae_scale_factor=None,
+                vae_config=SimpleNamespace(arch_config=None),
+            ),
+            is_arg_explicitly_set=lambda _name: False,
+        )
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            num_inference_steps=35,
+            adjust_frames=False,
+            supported_resolutions=[(1280, 720), (832, 480)],
+        )
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+                return_value=sampling_defaults,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.warmup_request_builder.auto_residency_args_skip_reason",
+                return_value=None,
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(
+            [(req.width, req.height, req.num_frames) for req in reqs],
+            [(832, 480, 17), (1280, 720, 81)],
+        )
+        self.assertNotIn("auto_residency_full_shape_probe", reqs[0].extra)
+        self.assertTrue(reqs[1].extra["auto_residency_full_shape_probe"])
+        self.assertEqual(reqs[1].num_inference_steps, 2)
+        self.assertIn(
+            "auto residency probe (1280x720x81f, 2/35 steps)",
+            format_warmup_req(reqs[1]),
+        )
+
     def test_server_based_warmup_uses_model_default_resolution(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1

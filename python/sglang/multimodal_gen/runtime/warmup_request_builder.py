@@ -6,6 +6,11 @@ first real request, without copying user traffic. It starts from the model's
 sampling defaults, then keeps startup bounded by choosing common low-cost
 resolution/frame buckets and trimming the denoising step count.
 
+When warmup-calibrated auto residency is active, a second probe restores the
+full default serving shape but keeps the trimmed step count. Memory depends on
+the activation shape rather than the number of repeated denoising steps, so
+this directly measures placement headroom without running a full generation.
+
 Image models may run a tiny second step because first/last step paths often
 initialize different kernels or scheduler state. Video models cap frames and
 steps to keep startup bounded. Explicit warmup resolutions share this builder;
@@ -49,10 +54,6 @@ SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
 SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES = 25
-# Second, smaller frame count used to calibrate auto residency: two workload
-# sizes let the estimator fit peak = constant + slope * units instead of
-# scaling one measured peak (whose constant part dominates under offload).
-SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES = 9
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
 
@@ -384,39 +385,53 @@ def _apply_warmup_frame_contract(
     return num_frames
 
 
-def _resolve_calibration_num_frames(
+def resolve_default_workload_shape(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+) -> tuple[int | None, int | None, int]:
+    """Resolve the serving shape used by warmup-based memory planning."""
+    width = sampling_defaults.width
+    height = sampling_defaults.height
+    if (width is None or height is None) and sampling_defaults.supported_resolutions:
+        width, height = max(
+            sampling_defaults.supported_resolutions,
+            key=lambda size: size[0] * size[1],
+        )
+    num_frames = sampling_defaults.num_frames or 1
+    if num_frames > 1:
+        num_frames = _apply_warmup_frame_contract(
+            server_args, sampling_defaults, num_frames=num_frames
+        )
+    return width, height, num_frames
+
+
+def _resolve_auto_residency_probe_shape(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
     *,
-    warmup_num_frames: int | None,
+    warmup_shape: tuple[int, int, int | None],
     server_based_warmup: bool,
-) -> int | None:
-    """A second, smaller warmup frame count for auto-residency calibration.
+) -> tuple[int, int, int] | None:
+    """Return a full serving-shape memory probe when bounded warmup is smaller.
 
-    Only produced when the main video warmup was frame-capped and the
-    auto-residency promotion is actually eligible to consume the measurement:
-    the estimator then has two workload
-    sizes to fit the constant/linear split of the peak. Returns None when a
-    second measurement adds no information (same adjusted frames) or would
-    never be read.
+    The probe still runs only the bounded warmup step count. Denoising steps
+    repeat the same activation shape, so one full-shape forward measures the
+    placement constraints directly without paying for a full generation or
+    extrapolating a small-shape allocator peak.
     """
-    if not server_based_warmup or not _is_video_warmup_task(server_args):
-        return None
-    if warmup_num_frames is None:
+    if not server_based_warmup:
         return None
     if auto_residency_args_skip_reason(server_args) is not None:
         return None
-    default_num_frames = sampling_defaults.num_frames or 1
-    if warmup_num_frames >= default_num_frames:
-        return None
-    calibration_num_frames = _apply_warmup_frame_contract(
-        server_args,
-        sampling_defaults,
-        num_frames=SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES,
+    width, height, num_frames = resolve_default_workload_shape(
+        server_args, sampling_defaults
     )
-    if calibration_num_frames == warmup_num_frames or calibration_num_frames <= 0:
+    if width is None or height is None:
         return None
-    return calibration_num_frames
+    target = (width, height, num_frames)
+    if target == warmup_shape:
+        return None
+    return target
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
@@ -529,11 +544,11 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
-    calibration_num_frames = (
-        _resolve_calibration_num_frames(
+    auto_residency_probe_shape = (
+        _resolve_auto_residency_probe_shape(
             server_args,
             sampling_defaults,
-            warmup_num_frames=warmup_num_frames,
+            warmup_shape=(width, height, warmup_num_frames),
             server_based_warmup=server_based_warmup,
         )
         if warmup_resolutions is None
@@ -601,17 +616,11 @@ def build_warmup_reqs(
                 req.extra["server_based_warmup"] = True
             warmup_reqs.append(req)
 
-        if calibration_num_frames is not None and (width, height) == resolutions[0]:
-            # The calibration measurement runs AFTER the main warmup request:
-            # one-time allocations (compile scratch, cuDNN workspaces,
-            # allocator pool growth) then land in the larger measurement,
-            # which can only steepen the fitted slope -- the safe direction.
-            # Measuring the small shape first flattened the slope and
-            # under-estimated the default workload peak.
+        if auto_residency_probe_shape is not None and (width, height) == resolutions[0]:
             warmup_reqs.append(
-                _build_calibration_warmup_req(
+                _build_auto_residency_probe_req(
                     req_kwargs,
-                    calibration_num_frames=calibration_num_frames,
+                    probe_shape=auto_residency_probe_shape,
                     warmup_steps=warmup_steps,
                     return_warmup_result=return_warmup_result,
                     server_based_warmup=server_based_warmup,
@@ -622,25 +631,27 @@ def build_warmup_reqs(
     return warmup_reqs
 
 
-def _build_calibration_warmup_req(
+def _build_auto_residency_probe_req(
     req_kwargs: dict,
     *,
-    calibration_num_frames: int,
+    probe_shape: tuple[int, int, int],
     warmup_steps: int,
     return_warmup_result: bool,
     server_based_warmup: bool,
     server_args: ServerArgs,
 ) -> Req:
-    calibration_kwargs = req_kwargs.copy()
-    calibration_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
-    calibration_kwargs["num_frames"] = calibration_num_frames
-    calibration_req = Req(**calibration_kwargs)
-    calibration_req.set_as_warmup(warmup_steps)
-    calibration_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
-        calibration_req, server_args
+    width, height, num_frames = probe_shape
+    probe_kwargs = req_kwargs.copy()
+    probe_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
+    probe_kwargs.update(width=width, height=height, num_frames=num_frames)
+    probe_req = Req(**probe_kwargs)
+    probe_req.set_as_warmup(warmup_steps)
+    probe_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+        probe_req, server_args
     )
     if return_warmup_result:
-        calibration_req.extra["return_warmup_result"] = True
+        probe_req.extra["return_warmup_result"] = True
     if server_based_warmup:
-        calibration_req.extra["server_based_warmup"] = True
-    return calibration_req
+        probe_req.extra["server_based_warmup"] = True
+    probe_req.extra["auto_residency_full_shape_probe"] = True
+    return probe_req
