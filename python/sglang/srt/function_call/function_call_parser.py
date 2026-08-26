@@ -136,43 +136,75 @@ class FunctionCallParser:
                     )
                     tool = tool.model_copy(update={"function": function})
                 schema = resolve_local_json_schema_refs(parameters, parameters)
-                for keyword in ("anyOf", "oneOf"):
-                    branches = schema.get(keyword)
-                    if isinstance(branches, list):
-                        if properties == parameters.get("properties", {}):
-                            function = tool.function.model_copy(
-                                update={"parameters": parameters.copy()}
-                            )
-                            tool = tool.model_copy(update={"function": function})
-                        base_schema = {
+                conjuncts = [schema]
+                index = 0
+                while index < len(conjuncts):
+                    conjunct = conjuncts[index]
+                    nested = (
+                        conjunct.get("allOf") if isinstance(conjunct, dict) else None
+                    )
+                    if isinstance(nested, list):
+                        remainder = {
                             key: value
-                            for key, value in schema.items()
-                            if key != keyword
+                            for key, value in conjunct.items()
+                            if key != "allOf"
                         }
-                        candidates = []
-                        for branch in branches:
-                            candidate_schema = base_schema | {
-                                "allOf": [*base_schema.get("allOf", []), branch]
-                            }
-                            candidate_properties = get_json_schema_properties(
-                                candidate_schema
-                            )
-                            candidates.append(
-                                (
-                                    candidate_properties,
-                                    {
-                                        key: infer_type_from_json_schema(value)
-                                        for key, value in candidate_properties.items()
-                                    },
-                                    Draft202012Validator(candidate_schema),
-                                )
-                            )
-                        self.schema_branches[tool.function.name] = {
-                            "parameters": tool.function.parameters,
-                            "properties": properties,
-                            "candidates": candidates,
-                        }
+                        conjuncts[index : index + 1] = [remainder, *nested]
+                    else:
+                        index += 1
+
+                alternative = None
+                for index, conjunct in enumerate(conjuncts):
+                    if not isinstance(conjunct, dict):
+                        continue
+                    for keyword in ("anyOf", "oneOf"):
+                        branches = conjunct.get(keyword)
+                        if isinstance(branches, list):
+                            alternative = index, keyword, branches
+                            break
+                    if alternative:
                         break
+
+                if alternative:
+                    index, keyword, branches = alternative
+                    if properties == parameters.get("properties", {}):
+                        function = tool.function.model_copy(
+                            update={"parameters": parameters.copy()}
+                        )
+                        tool = tool.model_copy(update={"function": function})
+                    conjuncts[index] = {
+                        key: value
+                        for key, value in conjuncts[index].items()
+                        if key != keyword
+                    }
+                    base_schema = {
+                        key: parameters[key]
+                        for key in ("$defs", "definitions")
+                        if key in parameters
+                    } | {"allOf": conjuncts}
+                    candidates = []
+                    for branch in branches:
+                        candidate_schema = base_schema | {
+                            "allOf": [*base_schema["allOf"], branch]
+                        }
+                        candidate_properties = get_json_schema_properties(
+                            candidate_schema
+                        )
+                        candidates.append(
+                            (
+                                candidate_properties,
+                                {
+                                    key: infer_type_from_json_schema(value)
+                                    for key, value in candidate_properties.items()
+                                },
+                                Draft202012Validator(candidate_schema),
+                            )
+                        )
+                    self.schema_branches[tool.function.name] = {
+                        "parameters": tool.function.parameters,
+                        "properties": properties,
+                        "candidates": candidates,
+                    }
             self.detector_tools.append(tool)
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 

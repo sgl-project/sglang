@@ -86,6 +86,52 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
             "payload", parser.detector_tools[0].function.parameters["properties"]
         )
 
+    def test_branch_selection_descends_through_all_of(self):
+        parameters = self.tools[0].function.parameters
+        variants = {
+            "explicit": {
+                "type": "object",
+                "$defs": parameters["$defs"],
+                "allOf": [{"oneOf": parameters["oneOf"]}],
+            },
+            "root_ref": {
+                "$ref": "#/$defs/Root",
+                "$defs": parameters["$defs"]
+                | {
+                    "Root": {
+                        "type": "object",
+                        "oneOf": parameters["oneOf"],
+                    }
+                },
+            },
+        }
+        chunks = [
+            "<tool_call>",
+            "<function=acme>",
+            "<parameter=kind>acme</parameter>",
+            '<parameter=payload>{"value":"hello"}</parameter>',
+            "</function>",
+            "</tool_call>",
+        ]
+
+        for name, parameters in variants.items():
+            with self.subTest(name=name):
+                function = self.tools[0].function.model_copy(
+                    update={"parameters": parameters}
+                )
+                tool = self.tools[0].model_copy(update={"function": function})
+
+                parser = FunctionCallParser([tool], "qwen3_coder")
+                _, calls = parser.parse_non_stream("".join(chunks))
+                self.assertEqual(json.loads(calls[0].parameters), self.expected)
+
+                parser = FunctionCallParser([tool], "qwen3_coder")
+                streamed = ""
+                for chunk in chunks:
+                    _, calls = parser.parse_stream_chunk(chunk)
+                    streamed += "".join(call.parameters for call in calls)
+                self.assertEqual(json.loads(streamed), self.expected)
+
     def test_parsers(self):
         ns = MINIMAX_NS_TOKEN
         cases = [
