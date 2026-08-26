@@ -18,6 +18,7 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 from safetensors.torch import safe_open
+from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
@@ -50,7 +51,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -175,6 +180,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "token_tags",
         "block_token_tags",
         "block_combined_indices",
+        "subblock_sparse_query_block_mask",
         "skip_mask_out_condition",
         "prompt_embeds",
         "refined_prompt_embeds_length",
@@ -558,6 +564,7 @@ def _minimax_h3_attention_core_impl(
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
     ulysses_active: bool,
+    subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
@@ -602,14 +609,47 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
-        out = attention._attention_impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-        )
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        ):
+            impl = attention._attention_impl
+            sparse_will_run = (
+                cu_seqlens_host is not None
+                and impl._sparse_ready(q, k)
+                and any(
+                    stop - start >= impl.schedule.min_seq_len
+                    for start, stop in zip(
+                        cu_seqlens_host[:-1],
+                        cu_seqlens_host[1:],
+                    )
+                )
+            )
+            if sparse_will_run and subblock_sparse_query_block_mask is None:
+                raise ValueError(
+                    "MiniMax H3 requires subblock_sparse_query_block_mask "
+                    "when SubBlock sparse attention is active"
+                )
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+                first_segment_sparse_query_block_mask=(
+                    subblock_sparse_query_block_mask
+                ),
+            )
+        else:
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
@@ -866,6 +906,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
     ) -> torch.Tensor:
@@ -942,6 +983,7 @@ class MiniMaxH3Attention(nn.Module):
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
@@ -1484,6 +1526,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
@@ -1514,6 +1557,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
@@ -1653,7 +1697,10 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _aliases = ["MiniMaxH3Transformer3DModel"]
+    _aliases = [
+        "MiniMaxH3Transformer3DModel",
+        "MiniMaxH3PrunedTransformer3DModel",
+    ]
     _fsdp_shard_conditions = [is_block]
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
@@ -1665,6 +1712,65 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        full_width = self.arch.adaln_affine_input_dim
+        if full_width is None:
+            return adapter
+
+        suffix = ".adaln_proj.linear.lora_A"
+        a_keys = sorted(key for key in adapter if key.endswith(suffix))
+        if not a_keys:
+            return adapter
+        widths = {int(adapter[key].shape[-1]) for key in a_keys}
+        if widths == {self.arch.time_embed_dim}:
+            return adapter
+        if widths != {full_width}:
+            raise ValueError(
+                "MiniMax H3 pruned AdaLN LoRA inputs must be uniformly "
+                f"{self.arch.time_embed_dim} or {full_width} wide, got "
+                f"{sorted(widths)}."
+            )
+
+        basis = self.adaln_basis
+        mean = self.adaln_mean
+        assert basis is not None and mean is not None
+        if isinstance(basis, DTensor):
+            basis = basis.full_tensor()
+            mean = mean.full_tensor()
+        if torch.count_nonzero(basis).item() == 0:
+            raise ValueError(
+                "MiniMax H3 pruned LoRA projection requires adaln_basis and "
+                "adaln_mean from the component checkpoint."
+            )
+
+        projected = dict(adapter)
+        work_device = adapter[a_keys[0]].device
+        work_basis = basis.to(device=work_device, dtype=torch.float64)
+        work_mean = mean.to(device=work_device, dtype=torch.float64)
+        for a_key in a_keys:
+            b_key = a_key[: -len("lora_A")] + "lora_B"
+            if b_key not in adapter:
+                raise ValueError(f"MiniMax H3 AdaLN LoRA is missing {b_key!r}.")
+            a = adapter[a_key]
+            b = adapter[b_key]
+            a64 = a.to(torch.float64)
+            b64 = b.to(device=work_device, dtype=torch.float64)
+            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
+                b64 @ (a64 @ work_mean)
+            ).to(torch.float32)
+
+        logger.info(
+            "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
+            len(a_keys),
+            full_width,
+            self.arch.time_embed_dim,
+        )
+        return projected
 
     def prepare_adaln_plans(self, step_timesteps: list[torch.Tensor]) -> None:
         """Fill the AdaLN cache for this request before denoising starts.
@@ -1845,6 +1951,28 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 ),
                 requires_grad=False,
             )
+        if arch.adaln_affine_input_dim is None:
+            self.register_parameter("adaln_basis", None)
+            self.register_parameter("adaln_mean", None)
+        else:
+            self.register_parameter(
+                "adaln_basis",
+                nn.Parameter(
+                    torch.empty(
+                        arch.time_embed_dim,
+                        arch.adaln_affine_input_dim,
+                        dtype=_FP32_DTYPE,
+                    ),
+                    requires_grad=False,
+                ),
+            )
+            self.register_parameter(
+                "adaln_mean",
+                nn.Parameter(
+                    torch.empty(arch.adaln_affine_input_dim, dtype=_FP32_DTYPE),
+                    requires_grad=False,
+                ),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1880,6 +2008,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if self._adaln_precomputed
             else None
         )
+        # Component overrides disappear when the loader context exits. Preserve
+        # only that selection; process-wide overrides are resolved at first use.
+        self._component_attention_backend_override = get_component_forced_attn_backend()
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
@@ -1902,9 +2033,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
             return
+        selected_backend = (
+            get_global_forced_attn_backend()
+            or self._component_attention_backend_override
+        )
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
+            selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():
@@ -1929,6 +2065,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 if not name.startswith("time_embedder.")
             ]
             fp32_param_names.append("adaln_t_table")
+            if self.adaln_basis is not None:
+                fp32_param_names.extend(("adaln_basis", "adaln_mean"))
         for name in fp32_param_names:
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:
@@ -2246,6 +2384,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
         )
         update_mask = _required_kwarg(kwargs, "update_mask")
+        subblock_sparse_query_block_mask = kwargs.get(
+            "subblock_sparse_query_block_mask"
+        )
         block_token_tags = kwargs.get("block_token_tags")
         token_tags = kwargs.get("token_tags")
         if block_token_tags is None:
@@ -2308,6 +2449,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}"
             )
         device = x.device
+        if subblock_sparse_query_block_mask is not None and not isinstance(
+            subblock_sparse_query_block_mask, torch.Tensor
+        ):
+            raise ValueError("subblock_sparse_query_block_mask must be a tensor")
         self._resolve_attention_backend_once()
 
         # Row split is 2D: ring first (an outer, contiguous ring_chunk_len
@@ -2443,6 +2588,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_host=cu_seqlens_host,
                 max_seqlen=max_seqlen,
+                subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                 ulysses_active=ulysses_ws > 1,
                 ring_active=ring_ws > 1,
                 adaln_params=(

@@ -494,6 +494,12 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "--component-weights-paths.text_encoder",
                 "owner/repo/text_encoder.safetensors",
                 "--image-encoder-weights-path=/custom/image_encoder.safetensors",
+                "--component-quantizations.text_encoder",
+                "kitchen_int8",
+                "--component-quantization-ignored-layers.text_encoder",
+                "model.layers.0",
+                "lm_head",
+                "--transformer-quantization=fp8",
                 "--component-attention-backends.transformer",
                 "fa3",
             ]
@@ -535,6 +541,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             {"transformer": "fa"},
             server_args.component_attention_backends,
+        )
+        self.assertEqual(
+            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            server_args.component_quantizations,
+        )
+        self.assertEqual(
+            {"text_encoder": ["model.layers.0", "lm_head"]},
+            server_args.component_quantization_ignored_layers,
         )
 
     def test_serve_cli_defaults_warmup_on(self):
@@ -1931,10 +1945,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_cosmos3_super_keeps_default_offload_policy(self):
+    def test_auto_cosmos3_super_keeps_dit_resident_on_high_memory_gpu(self):
+        # Super is a single-DiT pipeline like Nano, so above the threshold the
+        # component-offload round trip is pure per-request copy cost.
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
             available_memory_gb=139,
+            kwargs={
+                "model_path": "nvidia/Cosmos3-Super",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_cosmos3_super_offloads_dit_below_resident_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(model_path="nvidia/Cosmos3-Super"),
+            available_memory_gb=100,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Super",
                 "performance_mode": "auto",
