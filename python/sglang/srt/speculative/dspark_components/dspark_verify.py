@@ -26,6 +26,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -565,6 +566,19 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._inject_gate_armed: Optional[bool] = None
+        self._early_main_proj = (
+            _is_npu
+            and commit_ctx is not None
+            and envs.SGLANG_NPU_DSPARK_EARLY_MAIN_PROJ.get()
+            and hasattr(commit_ctx.draft_model, "write_projected_target_hidden_kv")
+            and hasattr(
+                commit_ctx.resolve_pool(),
+                "set_swa_key_buffer_radix_fused_norm_rope",
+            )
+        )
+        self._main_proj_stream = (
+            torch.cuda.Stream() if self._early_main_proj else None
+        )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -645,16 +659,38 @@ class DsparkVerifyEpilogue:
         bs: int,
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
-        self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
-        self._scatter(compact_logits, compact_hidden, verify_lens, bs)
+        projected_hidden = self._start_main_proj(compact_hidden)
+        self._scatter_logits(compact_logits, verify_lens, bs)
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
+        compact_for_scatter = self._finish_main_proj(projected_hidden, compact_hidden)
+        self.strided_hidden = self._ensure_out(
+            self.strided_hidden, compact_for_scatter
+        )
+        self._scatter_hidden(compact_for_scatter, verify_lens, bs)
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
             )
 
-    def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
+    def _start_main_proj(self, compact_hidden):
+        if not self._early_main_proj:
+            return None
+        # main_proj has no bias, so project(compact)->scatter is exactly the
+        # same as scatter(compact, fill=0)->project.  Doing the narrower scatter
+        # also lets the cube-heavy projection overlap the vector-heavy accept.
+        current_stream = torch.cuda.current_stream()
+        self._main_proj_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._main_proj_stream):
+            return self.commit_ctx.draft_model.project_target_hidden(compact_hidden)
+
+    def _finish_main_proj(self, projected_hidden, compact_hidden):
+        if not self._early_main_proj:
+            return compact_hidden
+        torch.cuda.current_stream().wait_stream(self._main_proj_stream)
+        return projected_hidden
+
+    def _scatter_logits(self, compact_logits, verify_lens, bs: int) -> None:
         scatter_compact_to_strided_into(
             compact=compact_logits,
             verify_lens=verify_lens,
@@ -662,6 +698,8 @@ class DsparkVerifyEpilogue:
             stride=self.stride,
             fill_value=0.0,
         )
+
+    def _scatter_hidden(self, compact_hidden, verify_lens, bs: int) -> None:
         scatter_compact_to_strided_into(
             compact=compact_hidden,
             verify_lens=verify_lens,
@@ -736,12 +774,20 @@ class DsparkVerifyEpilogue:
                 stride=self.stride,
             )
         with torch.inference_mode():
-            ctx.draft_model.write_target_hidden_kv(
-                main_hidden=self.strided_hidden[: bs * self.stride],
-                swa_loc=inject_layout.swa_loc,
-                positions=inject_layout.positions,
-                pool=pool,
-            )
+            if self._early_main_proj:
+                ctx.draft_model.write_projected_target_hidden_kv(
+                    main_x=self.strided_hidden[: bs * self.stride],
+                    swa_loc=inject_layout.swa_loc,
+                    positions=inject_layout.positions,
+                    pool=pool,
+                )
+            else:
+                ctx.draft_model.write_target_hidden_kv(
+                    main_hidden=self.strided_hidden[: bs * self.stride],
+                    swa_loc=inject_layout.swa_loc,
+                    positions=inject_layout.positions,
+                    pool=pool,
+                )
 
 
 def accept_draft_tokens(

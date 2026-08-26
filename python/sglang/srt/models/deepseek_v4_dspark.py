@@ -795,6 +795,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         main_x = self.project_target_hidden(main_hidden)
+        self.write_projected_target_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def write_projected_target_hidden_kv(
+        self,
+        *,
+        main_x: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
         swa_loc = swa_loc.to(torch.int32)
         kvs = CommitKvProj.execute(
             main_x=main_x,
