@@ -16,10 +16,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
-    HostPoolGroup,
     LogicalHostPool,
-    PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -143,6 +142,7 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
+    packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -154,6 +154,7 @@ def build_pool_entry(
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
+        packed_draft_device_pools=packed_draft_device_pools,
     )
 
 
@@ -195,6 +196,7 @@ def build_kv_only_group(
                 layer_mapping=full_layer_mapping,
                 transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
                 is_anchor=True,
+                packed_draft_device_pools=mtp_draft_device_pools,
             )
         ]
     )
@@ -266,6 +268,7 @@ def build_hybrid_swa_group(
                 device_free_fn=(
                     swa_attn_allocator.free if swa_attn_allocator is not None else None
                 ),
+                packed_draft_device_pools=mtp_swa_device_pools,
             ),
         ]
     )
@@ -315,9 +318,6 @@ def build_kv_only_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=server_args.hicache_host_memory_mode,
     )
-    if params.mtp_draft_device_pools:
-        cache_controller.set_mtp_draft_pools(params.mtp_draft_device_pools)
-
     return host_pool_group, cache_controller
 
 
@@ -386,8 +386,6 @@ def build_hybrid_swa_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=server_args.hicache_host_memory_mode,
     )
-    if mtp_swa_device_pools:
-        cache_controller.set_mtp_draft_pools(mtp_swa_device_pools)
     return host_pool_group, cache_controller
 
 
@@ -740,6 +738,7 @@ def build_deepseek_v4_hicache_stack(
                 device_evict_fn=device_swa_evict_fn,
                 device_alloc_fn=swa_attn_allocator.alloc,
                 device_free_fn=swa_attn_allocator.free,
+                packed_draft_device_pools=tuple(mtp_swa_device_buffers),
             )
         )
     elif unified_swa_hicache:
@@ -1049,8 +1048,6 @@ def build_deepseek_v4_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=server_args.hicache_host_memory_mode,
     )
-    if mtp_swa_device_buffers:
-        cache_controller.set_mtp_draft_pools(mtp_swa_device_buffers)
     return host_pool_group, cache_controller
 
 
@@ -1112,6 +1109,7 @@ def build_hybrid_mamba_stack(
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
             is_anchor=True,
+            packed_draft_device_pools=mtp_draft_device_pools,
         ),
         build_pool_entry(
             name=PoolName.MAMBA,
@@ -1145,8 +1143,6 @@ def build_hybrid_mamba_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=server_args.hicache_host_memory_mode,
     )
-    if mtp_draft_device_pools:
-        cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
     return host_pool_group, cache_controller
 
 
@@ -1310,6 +1306,7 @@ def build_anchor_sidecar_stack(
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
             is_anchor=True,
+            packed_draft_device_pools=mtp_draft_device_pools,
         ),
         build_pool_entry(
             name=sidecar_pool_name,
@@ -1317,6 +1314,7 @@ def build_anchor_sidecar_stack(
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+            packed_draft_device_pools=mtp_draft_device_pools,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
@@ -1339,8 +1337,6 @@ def build_anchor_sidecar_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=server_args.hicache_host_memory_mode,
     )
-    if mtp_draft_device_pools:
-        cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
     return host_pool_group, cache_controller
 
 

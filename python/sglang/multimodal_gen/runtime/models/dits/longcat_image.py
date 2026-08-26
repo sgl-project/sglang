@@ -443,6 +443,7 @@ class _LongCatSingleAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
         cos_sin_cache: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -464,7 +465,7 @@ class _LongCatSingleAttention(nn.Module):
             positions,
         )
 
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, num_replicated_prefix=num_replicated_prefix)
         return x.flatten(2, 3).to(q.dtype)
 
 
@@ -564,6 +565,8 @@ class _SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            # Text is replicated per SP rank; keep it out of the all-to-all.
+            num_replicated_prefix=text_seq_len,
             cos_sin_cache=cos_sin_cache,
             positions=positions,
         )

@@ -537,14 +537,20 @@ class TestStrictL3Coupled(unittest.TestCase):
 
         comp = self._comp(strict=True)
         comp.sliding_window_size = sliding_window
-        comp._swa_kv_pool_host = types.SimpleNamespace(
+        swa_pool = types.SimpleNamespace(
             slot_page_size=ring,
             alloc=lambda n: _t.arange(n, dtype=_t.int64),
         )
+        comp._swa_kv_pool_host = swa_pool
         comp.cache = types.SimpleNamespace(
             cache_controller=object(),
             page_size=self.PAGE_SIZE,
             evict_host=lambda *a, **k: None,
+            # the assembler hands the component the very pool it registers under
+            # PoolName.SWA, so the group stand-in has to alloc from swa_pool too
+            host_pool_group=types.SimpleNamespace(
+                alloc=lambda n, *, pool=None, reclaim=None: swa_pool.alloc(n),
+            ),
         )
         comp.tree_core = types.SimpleNamespace(
             has_swa_host_pool=True,
