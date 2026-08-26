@@ -264,6 +264,9 @@ def execute_prefill_cp_bcg(
     # executes runner/__init__.py, which imports this module through the prefill
     # runner. Defer the runtime-only dependency until runner initialization has
     # completed to keep the server-argument compatibility check acyclic.
+    from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+        replay_kda_route_plan,
+    )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
     cp_input = runner.prefill_cp_bcg_input
@@ -274,10 +277,16 @@ def execute_prefill_cp_bcg(
         num_tokens=static_num_tokens,
         raw_num_tokens=raw_num_tokens,
     ):
-        local_output = runner.backend.replay(
-            ShapeKey(size=static_num_tokens),
-            static_forward_batch,
-            **kwargs,
+        shape_key = ShapeKey(size=static_num_tokens)
+        local_output = replay_kda_route_plan(
+            shape_key,
+            "prefill",
+            lambda: runner.backend.replay(
+                shape_key,
+                static_forward_batch,
+                **kwargs,
+            ),
+            plans=runner.kda_cuda_graph_route_plans,
         )
         local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
 
