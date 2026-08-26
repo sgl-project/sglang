@@ -18,8 +18,15 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
 
-
 _DECODE_TOKENS_PER_REQUEST_HEADROOM = 8
+
+# MoonEP's own default is B = E / EP, which makes every expert a group GEMM
+# touches local. That is a training rule: at K3/EP16 it is 56 slots and a
+# 182 GB expert pool per rank, which does not fit. Inference only needs enough
+# slots to cover the hot experts, and overflowing B stays *correct* -- the GEMM
+# reads the owner's rows through the symmetric mapping, just slower -- so a
+# small number is safe. MoonEP's README recommends 3-4.
+_DEFAULT_PREFETCH_SLOTS = 4
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -156,7 +163,9 @@ class MoonEPBuffer:
             num_prefetch_slots = envs.SGLANG_MOONEP_NUM_PREFETCH_SLOTS.get()
         num_prefetch_slots = int(num_prefetch_slots)
         if num_prefetch_slots <= 0:
-            return num_experts // num_ep_ranks
+            # Never more than MoonEP's own rule -- a model with fewer local
+            # experts than the default would otherwise get useless slots.
+            return min(_DEFAULT_PREFETCH_SLOTS, num_experts // num_ep_ranks)
         return MoonEPBuffer._require_positive_int(
             "num_prefetch_slots", num_prefetch_slots
         )
@@ -775,42 +784,21 @@ class MoonEPDispatcher(BaseDispatcher):
     def prefetch_weight(
         self,
         plan: Any,
-        weight_layout: MoonEPExpertWeightLayout | None = None,
-        layer_id: int | None = None,
+        weight_layout: MoonEPExpertWeightLayout,
     ) -> None:
         """Fill this rank's prefetch slots with the duplicated experts.
 
-        ``weight_layout`` is the BF16 PoC form: one contiguous ``[E+B]`` block
-        per projection, indexed by global expert id. ``layer_id`` selects the
-        symmetric-memory form, where the sources are VMM ranges shared by every
-        layer and the plan's expert ids have to be remapped to rows before the
-        copy can find them.
+        BF16 only: ``weight_layout`` is one contiguous ``[E+B]`` block per
+        projection, indexed by global expert id. Quantized experts live in the
+        symmetric pool and are prefetched from ``pre_permute`` instead, which
+        is where the plan's expert ids get remapped to pool rows.
         """
-        assert (weight_layout is None) != (layer_id is None), (
-            "MoonEPDispatcher.prefetch_weight takes exactly one of "
-            "weight_layout or layer_id"
-        )
-        if weight_layout is not None:
-            self._get_buffer().prefetch_weight(
-                plan=plan,
-                async_finish=False,
-                full_gate_weight=weight_layout.full_gate_weight,
-                full_up_weight=weight_layout.full_up_weight,
-                full_down_weight=weight_layout.full_down_weight,
-            )
-            return
-
-        from sglang.srt.layers.moe.token_dispatcher import moonep_weights
-
-        weight_pairs, scale_pairs = moonep_weights.prefetch_pairs(layer_id)
         self._get_buffer().prefetch_weight(
             plan=plan,
             async_finish=False,
-            weight_pairs=weight_pairs,
-            scale_pairs=scale_pairs or None,
-            experts_to_copy=moonep_weights.expert_rows(
-                layer_id, plan.experts_to_copy[self._get_rank()]
-            ),
+            full_gate_weight=weight_layout.full_gate_weight,
+            full_up_weight=weight_layout.full_up_weight,
+            full_down_weight=weight_layout.full_down_weight,
         )
 
     def register_deepep_dispatch_hook(self, hook):

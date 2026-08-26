@@ -40,6 +40,7 @@ class MoonEPWeightPool:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.block_rows = num_local_experts + num_prefetch_slots
+        _check_prefetch_tiling(specs)
         self.chunk_rows = _resolve_chunk_rows(specs, num_layers * self.block_rows)
         self._layers: dict[int, int] = {}
 
@@ -108,6 +109,34 @@ class MoonEPWeightPool:
             + self.num_local_experts
         )
         return self.ranges[kind][start : start + self.num_prefetch_slots]
+
+
+def _check_prefetch_tiling(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+) -> None:
+    """Reject shapes MoonEP's prefetch copy cannot tile.
+
+    ``retile_for_prefetch`` views each expert as ``[128, X]`` uint8 and asserts
+    the per-expert byte count divides its tile evenly. Its own message names
+    only the byte counts, which is impossible to connect back to a model
+    dimension, and it fires on the first forward -- long after the weights are
+    loaded. Checking here fails at allocation with the dimension named.
+    """
+    from moonep.prefetch import prefetch_retile_nbytes
+
+    # Rounding one byte up lands on the tile size itself.
+    tile = prefetch_retile_nbytes(1)
+    for kind, (trailing, dtype) in specs.items():
+        per_expert = math.prod(trailing) * torch.empty(0, dtype=dtype).element_size()
+        if per_expert % tile:
+            raise ValueError(
+                f"MoonEP cannot prefetch {kind} for this model: one expert is "
+                f"{per_expert} bytes ({tuple(trailing)} x {dtype}), and the "
+                f"prefetch copy needs a multiple of {tile} "
+                f"(nearest is {prefetch_retile_nbytes(per_expert)}). This "
+                "follows from the model's hidden and intermediate sizes, so "
+                "it is not something the server can pad around."
+            )
 
 
 def _minimum_aligned_rows(trailing_shape, dtype: torch.dtype) -> int:
@@ -247,7 +276,7 @@ def prefetch_pairs(
 
     Scales are re-tiled by the copy and so are kept apart from the weights.
     The scale views are the *storage* orientation, which is what a byte copy
-    has to move -- see the MN-major note in the module docstring.
+    has to move -- see the MN-major note in this module's docstring.
     """
     assert _pool is not None, "MoonEP expert pool was never created"
     weights = [

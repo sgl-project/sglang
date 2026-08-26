@@ -331,6 +331,7 @@ def _maybe_alloc_moonep_expert_pool(
     hidden_size: int,
     weight_dtype: torch.dtype,
     mxfp4_block: int,
+    use_deep_gemm: bool,
 ) -> Optional[dict]:
     """This layer's slice of MoonEP's symmetric expert pool, or None.
 
@@ -341,10 +342,19 @@ def _maybe_alloc_moonep_expert_pool(
     ``[E, MN, K/32]`` uint8 the checkpoint carries.
     """
     from sglang.srt.layers.moe.token_dispatcher import moonep_weights
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 
     if not get_moe_a2a_backend().is_moonep():
         return None
+
+    if not use_deep_gemm:
+        raise NotImplementedError(
+            "MoonEP with quantized experts requires --moe-runner-backend "
+            f"deep_gemm, got '{get_moe_runner_backend().value}'. The experts "
+            "live in a symmetric range so peers can read each other's rows "
+            "over NVLink, and only the deep_gemm m-grouped contiguous GEMM "
+            "addresses rows outside this rank's own chunk."
+        )
 
     scale_pack = 4 * mxfp4_block  # e8m0 bytes per int32 x elements per byte
     return moonep_weights.alloc_expert_tensors(
@@ -524,6 +534,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=hidden_size,
             weight_dtype=weight_dtype,
             mxfp4_block=mxfp4_block,
+            use_deep_gemm=self.use_deep_gemm,
         )
 
         # Fused gate_up_proj (column parallel)

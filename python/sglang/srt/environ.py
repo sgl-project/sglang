@@ -977,7 +977,8 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    # -1 uses MoonEP's training-safe default B = E / EP.
+    # <= 0 resolves to min(4, E / EP). MoonEP's own default is E / EP, which
+    # is a training rule and does not fit at inference scale.
     SGLANG_MOONEP_NUM_PREFETCH_SLOTS = EnvInt(-1)
     SGLANG_MOONEP_TOKEN_PADDING = EnvInt(128)
     # Decode-phase token capacity; <= 0 derives it from max_running_requests.
