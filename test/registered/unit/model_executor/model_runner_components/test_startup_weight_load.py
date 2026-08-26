@@ -25,6 +25,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_model_with_memory_saver,
 )
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+    _STARTUP_WEIGHT_LOAD_PROFILE_SPECS,
     ModelStorageManifest,
     StartupWeightLoadManager,
     StartupWeightLoadOptions,
@@ -32,7 +33,6 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadProfile,
     StartupWeightLoadState,
     StartupWeightLoadTimings,
-    _STARTUP_WEIGHT_LOAD_PROFILE_SPECS,
     _get_startup_weight_load_profile,
     evaluate_startup_weight_load_admission,
 )
@@ -394,9 +394,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertEqual(
             set(registered_architectures), expected_profiles_by_architecture
         )
-        for architecture, expected_profile in (
-            expected_profiles_by_architecture.items()
-        ):
+        for architecture, expected_profile in expected_profiles_by_architecture.items():
             with self.subTest(architecture=architecture):
                 self.assertEqual(
                     _get_startup_weight_load_profile(architecture), expected_profile

@@ -203,16 +203,12 @@ class StartupWeightLoadOptions:
             ep_num_redundant_experts=get_exec().moe.ep_num_redundant_experts,
             init_expert_location=get_exec().moe.init_expert_location,
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
-            enable_elastic_expert_backup=(
-                get_exec().moe.enable_elastic_expert_backup
-            ),
+            enable_elastic_expert_backup=(get_exec().moe.enable_elastic_expert_backup),
             ep_join_mode=get_exec().moe.ep_join_mode,
             max_ep_size=get_parallel().max_ep_size,
             linear_attn_backend=get_exec().mamba.linear_attn_backend,
             linear_attn_decode_backend=get_exec().mamba.linear_attn_decode_backend,
-            linear_attn_prefill_backend=(
-                get_exec().mamba.linear_attn_prefill_backend
-            ),
+            linear_attn_prefill_backend=(get_exec().mamba.linear_attn_prefill_backend),
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
             enable_memory_saver=get_exec().features.enable_memory_saver,
