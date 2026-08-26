@@ -600,6 +600,7 @@ class KVarNAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
             kvarn_decode_attention,
             kvarn_scatter_store,
+            _kvarn_build_packed_kv_kernel,
         )
 
         device = self.device
@@ -675,7 +676,114 @@ class KVarNAttnBackend(AttentionBackend):
         except Exception as e:
             logger.warning(f"KVarN verify kernel warmup failed (non-fatal): {e}")
 
+        # Warm up build_packed_kv kernel for the prefill/extend path.
+        # Each distinct (B, max_blocks, GROUP, D, K_BITS, V_BITS) triggers a
+        # Triton JIT compilation. Real workloads hit many combinations during
+        # long prefills, so pre-compile the most common ones during startup.
+        try:
+            self._warmup_build_packed_kv_kernel(B, max_blocks_per_req)
+        except Exception as e:
+            logger.warning(f"KVarN build_packed_kv warmup failed (non-fatal): {e}")
+
         logger.info("KVarN Triton kernels warmed up")
+
+    def _warmup_build_packed_kv_kernel(
+        self, max_batch_size: int, max_blocks_per_req: int
+    ):
+        """Pre-compile the Triton kernel used by the prefill/extend materialize path."""
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            _kvarn_build_packed_kv_kernel,
+        )
+
+        device = self.device
+        D = self.head_dim
+        Hk = self.num_kv_heads
+        G = self.group
+
+        # Common batch sizes: 1..max_batch_size. Cap at 8 to keep startup fast.
+        batch_sizes = list(range(1, min(max_batch_size, 8) + 1))
+
+        # Common max_blocks values across the full context range.
+        # The kernel specializes on MAX_BLOCKS_PER_REQ as a tl.constexpr, so
+        # we sweep powers of two plus a few intermediate points.
+        max_blocks_values = set([1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
+        # Also cover the actual max_blocks_per_req if it is not already included
+        max_blocks_values.add(max_blocks_per_req)
+        # Clip to the real max so we do not waste time on impossible shapes
+        max_blocks_values = sorted(
+            b for b in max_blocks_values if b <= max(1, max_blocks_per_req)
+        )
+
+        for B in batch_sizes:
+            for max_blocks in max_blocks_values:
+                total_tokens = B * G  # one group per request -> minimal non-zero shape
+                if total_tokens == 0:
+                    continue
+
+                block_table = torch.zeros(
+                    B, max_blocks, dtype=torch.int32, device=device
+                )
+                # Point every block to slot 0 so the kernel loads valid tail-pool data.
+                # Slot 0 is reserved/dummy and is valid memory; the kernel only reads
+                # from tail pool when pool_slot >= 0.
+                block_table[:] = 0
+
+                seq_lens_t = torch.full(
+                    (B,), G, dtype=torch.int32, device=device
+                )
+                cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
+                cu_seqlens[1:] = torch.cumsum(seq_lens_t, dim=0)
+
+                K_packed = torch.empty(
+                    total_tokens, Hk, D, dtype=torch.float16, device=device
+                )
+                V_packed = torch.empty(
+                    total_tokens, Hk, self.v_head_dim, dtype=torch.float16, device=device
+                )
+
+                try:
+                    _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
+                        block_table,
+                        seq_lens_t,
+                        cu_seqlens,
+                        self._block_to_slot_t,
+                        self.kv_cache_int4[0],
+                        self.tail_K[0],
+                        self.tail_V[0],
+                        K_packed,
+                        V_packed,
+                        block_table.stride(0),
+                        self.kv_cache_int4[0].stride(0),
+                        self.kv_cache_int4[0].stride(1),
+                        self._tail_K_stride0,
+                        self._tail_K_stride1,
+                        self._tail_K_stride2,
+                        K_packed.stride(0),
+                        K_packed.stride(1),
+                        MAX_BLOCKS_PER_REQ=max_blocks,
+                        D=D,
+                        GROUP=self.group,
+                        K_BITS=self.cfg.key_bits,
+                        V_BITS=self.cfg.value_bits,
+                        NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+                        K_PACKED_OFFSET=self.cfg.k_packed_offset,
+                        K_S_COL_OFFSET=self.cfg.k_s_col_offset,
+                        K_ZP_OFFSET=self.cfg.k_zp_offset,
+                        K_S_ROW_OFFSET=self.cfg.k_s_row_offset,
+                        V_PACKED_OFFSET=self.cfg.v_packed_offset,
+                        V_S_COL_OFFSET=self.cfg.v_s_col_offset,
+                        V_S_ROW_OFFSET=self.cfg.v_s_row_offset,
+                        V_ZP_OFFSET=self.cfg.v_zp_offset,
+                        num_warps=4,
+                        num_stages=2,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "KVarN build_packed_kv warmup skipped for B=%d max_blocks=%d: %s",
+                        B,
+                        max_blocks,
+                        e,
+                    )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 1
