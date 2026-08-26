@@ -14,7 +14,6 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -88,190 +87,23 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// ---------------------------------------------------------------------------
-// ROCm wave-level helpers.
-//
-// Two things dominate this kernel's latency on CDNA, and neither of them is
-// bandwidth (one decode row is 8K x fp32 = 32KB, which is nothing):
-//
-//   1. `atomicAdd(&s_counter, 1)` runs once per *selected element*.  With
-//      TopK = 2048 that is at least 2048 LDS atomics all targeting a single
-//      address, and same-address LDS atomics are resolved lane by lane.
-//   2. `run_cumsum()` is a 256-entry Hillis-Steele suffix scan in which only
-//      the first 256 of 1024 threads do any work -- yet all 16 wave64s pay 8
-//      `__syncthreads()`.  It is called up to 5 times per row, so the block
-//      eats ~40 barriers to scan 256 integers.
-//
-// Both are addressed below with wave primitives.  The CUDA path is unchanged:
-// `SGL_TOPK_SELECT` / `SGL_TOPK_CAND` / `SGL_TOPK_TAIL` degrade to exactly the
-// `::atomicAdd` expressions they replace, and `run_cumsum` keeps its original
-// body.
-// ---------------------------------------------------------------------------
-// Compile-time switch.  Overridable from the build so that an A/B against
-// this patch does not need a source edit:
-//
-//     -DSGL_TOPK_WAVE_OPT=0   original atomics and tree cumsum
-//     -DSGL_TOPK_WAVE_OPT=1   wave-aggregated atomics and wave cumsum
-//
-// Tested with #if rather than #ifdef throughout, so that an explicit 0
-// actually turns the path off instead of merely being defined.
-//
-// The three transforms are switched separately because they do not pay off
-// together: SGL_TOPK_WAVE_HIST is where the time is, SGL_TOPK_WAVE_CUMSUM is a
-// small unconditional win, and SGL_TOPK_WAVE_EMIT is a loss on long rows (see
-// the note on selection density above sgl_wave_atomic_inc).
 #ifdef USE_ROCM
-#ifndef SGL_TOPK_WAVE_OPT
-#define SGL_TOPK_WAVE_OPT 1
-#endif
-#else
-#define SGL_TOPK_WAVE_OPT 0
-#endif
-
-// Wave-aggregate the stage-1 histogram. Measured on gfx950 at batch 64: 53 ->
-// 357 us at length 71000, so it defaults off. The premise -- that same-address
-// LDS atomics serialize lane by lane and are the cost -- does not hold here.
-// The aggregation loop runs once per distinct bin in the wave, and the bins are
-// not as few as the exponent-only key suggests: the small-magnitude tail of a
-// logit row spreads over many low exponents, so a wave64 typically carries
-// 20-30 distinct bins and the loop costs far more than the atomic it replaces.
-// Kept behind a switch because it is the obvious thing to try.
-#ifndef SGL_TOPK_WAVE_HIST
-#define SGL_TOPK_WAVE_HIST 0
-#endif
-#ifndef SGL_TOPK_WAVE_CUMSUM
-#define SGL_TOPK_WAVE_CUMSUM SGL_TOPK_WAVE_OPT
-#endif
-// Wave-aggregate the TopK counters in the emit loop. Off by default: it costs
-// more than it saves on long rows (see the note above sgl_wave_atomic_inc), and
-// it also forces the emit loop back to one element per trip.
-#ifndef SGL_TOPK_WAVE_EMIT
-#define SGL_TOPK_WAVE_EMIT 0
-#endif
-
-// Number of elements each thread loads per trip of the two full-length loops.
+// Elements each thread loads per trip of the two full-length loops below.
 //
-// This is where the time actually is. Both loops are a dependent chain of
+// This is where the kernel's time goes. Both loops are a dependent chain of
 // load -> classify -> LDS atomic, and the grid is one block per row, so at
-// batch 64 only 64 of 256 CUs are occupied and there is no other work to hide
-// the load latency behind. Issuing a few loads before consuming any of them
-// fills that gap; 2 measured best, 4 and 8 give the registers back to the
-// scheduler and lose part of the win.
-//
-// 1 is the original one-element-per-trip loop and is what the CUDA path gets,
-// so its generated code is unchanged.
-#ifndef SGL_TOPK_UNROLL
-#if SGL_TOPK_WAVE_OPT
-#define SGL_TOPK_UNROLL 2
-#else
-#define SGL_TOPK_UNROLL 1
-#endif
-#endif
+// batch 64 only 64 of 256 CUs are occupied and there is no other work resident
+// to hide the load latency behind. Issuing a couple of loads before consuming
+// either of them fills that gap; 2 measured best on gfx950, 4 and 8 spend the
+// registers without buying more overlap.
+constexpr int kUnroll = 2;
 
-#if SGL_TOPK_WAVE_HIST || SGL_TOPK_WAVE_CUMSUM || SGL_TOPK_WAVE_EMIT
 #ifdef __AMDGCN_WAVEFRONT_SIZE
 constexpr int kWaveSize = __AMDGCN_WAVEFRONT_SIZE;
 #else
 constexpr int kWaveSize = 64;
 #endif
-
-// Broadcast from a wave-uniform lane index.
-//
-// `__shfl` lowers to ds_bpermute, an LDS instruction with LDS latency, even
-// when the source lane is uniform. v_readlane_b32 is a scalar read of one lane
-// and costs a fraction of that, which matters because these broadcasts sit in
-// the innermost loops.
-__device__ __forceinline__ int sgl_wave_bcast(int v, int lane) {
-  return __builtin_amdgcn_readlane(v, lane);
-}
-#endif
-
-#if SGL_TOPK_WAVE_EMIT
-
-// Wave-aggregated `atomicAdd(addr, +1)`.
-//
-// This only pays when the predicate is dense. The emit loop visits every one of
-// `length` elements but selects only TopK of them, so at length 70k the
-// selection density is under 3%: the atomic being removed almost never fires,
-// while the ballot replacing it is issued by every lane on every element. That
-// is why this is a separate switch from SGL_TOPK_WAVE_HIST, where every lane
-// contributes on every element.
-//
-// Every lane of the wave must call this with its own predicate and with the
-// wave converged -- do NOT call it from inside the `if (pred)` body, because a
-// compiler that if-converts the branch would leave EXEC untouched and the
-// ballot would then count lanes that did not select anything.
-//
-// Returns the same slot the serial `atomicAdd` loop would have handed out
-// (modulo which lane gets which slot, which was already unspecified), or -1
-// when `pred` is false.
-__device__ __forceinline__ int sgl_wave_atomic_inc(int* addr, bool pred) {
-  const unsigned long long mask = __ballot(pred ? 1 : 0);
-  if (mask == 0ull) return -1;
-  const int lane = __lane_id();
-  const int leader = __ffsll(mask) - 1;
-  int base = 0;
-  if (lane == leader) base = ::atomicAdd(addr, static_cast<int>(__popcll(mask)));
-  base = sgl_wave_bcast(base, leader);
-  if (!pred) return -1;
-  return base + static_cast<int>(__popcll(mask & ((1ull << lane) - 1ull)));
-}
-
-// Wave-aggregated `atomicAdd(addr, -1)`, matching the serial semantics of the
-// last-round tail fill: the first caller sees the pre-decrement value, the
-// next sees one less, and so on.  Returns INT_MIN when `pred` is false (the
-// caller's `pos > 0` test rejects it).
-__device__ __forceinline__ int sgl_wave_atomic_dec(int* addr, bool pred) {
-  const unsigned long long mask = __ballot(pred ? 1 : 0);
-  if (mask == 0ull) return INT_MIN;
-  const int lane = __lane_id();
-  const int leader = __ffsll(mask) - 1;
-  int base = 0;
-  if (lane == leader) base = ::atomicAdd(addr, -static_cast<int>(__popcll(mask)));
-  base = sgl_wave_bcast(base, leader);
-  if (!pred) return INT_MIN;
-  return base - static_cast<int>(__popcll(mask & ((1ull << lane) - 1ull)));
-}
-
-#define SGL_TOPK_SELECT(pred_, addr_) sgl_wave_atomic_inc((addr_), (pred_))
-#define SGL_TOPK_CAND(pred_, addr_) sgl_wave_atomic_inc((addr_), (pred_))
-#define SGL_TOPK_TAIL(pred_, addr_) sgl_wave_atomic_dec((addr_), (pred_))
-#else
-#define SGL_TOPK_SELECT(pred_, addr_) ((pred_) ? ::atomicAdd((addr_), 1) : -1)
-#define SGL_TOPK_CAND(pred_, addr_) ((pred_) ? ::atomicAdd((addr_), 1) : -1)
-#define SGL_TOPK_TAIL(pred_, addr_) ((pred_) ? ::atomicAdd((addr_), -1) : INT_MIN)
-#endif
-
-#if SGL_TOPK_WAVE_HIST
-// Wave-aggregated histogram increment: every lane adds 1 to s_histogram[bin],
-// but lanes sharing a bin are folded into one atomic.
-//
-// This is the loop that costs, not the TopK counter. Stage 1 does one LDS
-// atomic per *scanned* element -- `length` of them per row, against TopK for
-// the counter -- and the bins collide almost perfectly: convert_to_uint8 keeps
-// the sign plus seven exponent bits, so a single bin spans a 4x magnitude
-// range and a row of attention logits lands in a handful of bins. Same-address
-// LDS atomics are resolved lane by lane, so an unaggregated wave64 pays ~64
-// serialized LDS cycles per instruction.
-//
-// The loop below runs once per *distinct* bin present in the wave, which is
-// that same handful, and each iteration is a ballot plus a scalar broadcast.
-// The resulting histogram is identical; only the order of the increments to a
-// given counter changes, and addition is associative.
-//
-// Every lane must call this with the wave converged; `remaining` is derived
-// from ballots and is therefore wave-uniform, so the loop itself is uniform.
-__device__ __forceinline__ void sgl_wave_hist_inc(int* hist, int bin, bool pred) {
-  unsigned long long remaining = __ballot(pred ? 1 : 0);
-  while (remaining) {
-    const int leader = __ffsll(remaining) - 1;
-    const int leader_bin = sgl_wave_bcast(bin, leader);
-    const unsigned long long same = remaining & __ballot(bin == leader_bin);
-    if (__lane_id() == leader) ::atomicAdd(&hist[leader_bin], static_cast<int>(__popcll(same)));
-    remaining &= ~same;
-  }
-}
-#endif
+#endif  // USE_ROCM
 
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
@@ -296,34 +128,26 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
 
-#if SGL_TOPK_WAVE_HIST
-  // Trip count is block-uniform so the wave stays converged for the ballots
-  // inside sgl_wave_hist_inc; the tail is handled by the predicate instead of
-  // by lanes dropping out of the loop.
-  {
-    const int iters = (length + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (int it = 0; it < iters; ++it) {
-      const int idx = tx + it * BLOCK_SIZE;
-      const bool valid = idx < length;
-      const int bin = valid ? static_cast<int>(convert_to_uint8(input[idx + row_start])) : 0;
-      sgl_wave_hist_inc(s_histogram, bin, valid);
-    }
+#ifndef USE_ROCM
+  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    const auto bin = convert_to_uint8(input[idx + row_start]);
+    ::atomicAdd(&s_histogram[bin], 1);
   }
 #else
-  // Loads first, then the atomics, so SGL_TOPK_UNROLL loads are in flight at
-  // once instead of one. Strided by BLOCK_SIZE to keep each load coalesced;
-  // row_start is arbitrary so a wider vector load is not available.
-  for (int base = tx; base < length; base += SGL_TOPK_UNROLL * BLOCK_SIZE) {
-    float v[SGL_TOPK_UNROLL];
-    bool ok[SGL_TOPK_UNROLL];
+  // Same work, but the loads for a trip are all issued before any of them is
+  // consumed. Stride stays BLOCK_SIZE so each load is still coalesced; row_start
+  // is an arbitrary runtime offset, so a wider vector load is not available.
+  for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+    float v[kUnroll];
+    bool ok[kUnroll];
 #pragma unroll
-    for (int k = 0; k < SGL_TOPK_UNROLL; ++k) {
+    for (int k = 0; k < kUnroll; ++k) {
       const int idx = base + k * BLOCK_SIZE;
       ok[k] = idx < length;
       v[k] = ok[k] ? input[idx + row_start] : 0.0f;
     }
 #pragma unroll
-    for (int k = 0; k < SGL_TOPK_UNROLL; ++k) {
+    for (int k = 0; k < kUnroll; ++k) {
       if (ok[k]) ::atomicAdd(&s_histogram[convert_to_uint8(v[k])], 1);
     }
   }
@@ -331,11 +155,14 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   __syncthreads();
 
   const auto run_cumsum = [&] {
-#if SGL_TOPK_WAVE_CUMSUM
-    // Same result (an inclusive suffix sum over s_histogram[0..RADIX)), but
-    // confined to wave 0 and using shuffles, so the block pays 1 barrier
-    // instead of 8.  s_histogram[RADIX] is not touched here; it is zeroed by
-    // the `tx < RADIX + 1` initialisers and must stay 0.
+#ifdef USE_ROCM
+    // Inclusive suffix sum over s_histogram[0..RADIX), confined to wave 0 and
+    // done with shuffles, so the block pays 1 barrier instead of 8: the
+    // original runs 8 rounds in which only 256 of the 1024 threads work, yet
+    // all 16 wave64s stop at every one. Worth ~1.3 us per launch.
+    //
+    // s_histogram[RADIX] is not touched here; the `tx < RADIX + 1` initialisers
+    // zero it and it must stay 0.
     static_assert(RADIX % kWaveSize == 0);
     if (tx < kWaveSize) {
       constexpr int kPerLane = RADIX / kWaveSize;
@@ -391,9 +218,10 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      const bool sel = bin > threshold_bin;
-      const int pos = SGL_TOPK_SELECT(sel, &s_counter);
-      if (sel) index[pos] = idx;
+      if (bin > threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      }
     }
     __syncthreads();
     return;
@@ -404,56 +232,52 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
     __syncthreads();
 
-#if !SGL_TOPK_WAVE_EMIT
-    // Same body as below, but with SGL_TOPK_UNROLL loads issued before any of
-    // them is consumed. Only valid without the wave-aggregated counters, whose
-    // ballots would end up under the per-element `ok[k]` predicate and count
-    // the wrong lanes.
-    for (int base = tx; base < length; base += SGL_TOPK_UNROLL * BLOCK_SIZE) {
-      float v[SGL_TOPK_UNROLL];
-      bool ok[SGL_TOPK_UNROLL];
+#ifndef USE_ROCM
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto raw_input = input[idx + row_start];
+      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+      if (bin > threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      } else if (bin == threshold_bin) {
+        const auto pos = ::atomicAdd(&s_num_input[0], 1);
+        /// NOTE: (dark) fuse the histogram computation here
+        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+          s_input_idx[0][pos] = idx;
+          const auto bin = convert_to_uint32(raw_input);
+          const auto sub_bin = (bin >> 24) & 0xFF;
+          ::atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      }
+    }
+#else
+    for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+      float v[kUnroll];
+      bool ok[kUnroll];
 #pragma unroll
-      for (int k = 0; k < SGL_TOPK_UNROLL; ++k) {
-        const int idx = base + k * BLOCK_SIZE;
-        ok[k] = idx < length;
-        v[k] = ok[k] ? input[idx + row_start] : 0.0f;
+      for (int k = 0; k < kUnroll; ++k) {
+        const int i = base + k * BLOCK_SIZE;
+        ok[k] = i < length;
+        v[k] = ok[k] ? input[i + row_start] : 0.0f;
       }
 #pragma unroll
-      for (int k = 0; k < SGL_TOPK_UNROLL; ++k) {
+      for (int k = 0; k < kUnroll; ++k) {
         if (!ok[k]) continue;
         const int idx = base + k * BLOCK_SIZE;
         const auto raw_input = v[k];
         const auto bin = static_cast<int>(convert_to_uint8(raw_input));
         if (bin > threshold_bin) {
-          index[::atomicAdd(&s_counter, 1)] = idx;
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
         } else if (bin == threshold_bin) {
-          const auto cpos = ::atomicAdd(&s_num_input[0], 1);
-          if (C10_LIKELY(cpos < static_cast<int>(SMEM_INPUT_SIZE))) {
-            s_input_idx[0][cpos] = idx;
-            /// NOTE: (dark) fuse the histogram computation here
+          const auto pos = ::atomicAdd(&s_num_input[0], 1);
+          /// NOTE: (dark) fuse the histogram computation here
+          if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+            s_input_idx[0][pos] = idx;
             const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
             ::atomicAdd(&s_histogram[sub_bin], 1);
           }
         }
-      }
-    }
-#else
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      // Both ballots are issued unconditionally by every lane so the wave stays
-      // converged; the stores below are what is predicated.
-      const bool sel = bin > threshold_bin;
-      const bool cand = bin == threshold_bin;
-      const int pos = SGL_TOPK_SELECT(sel, &s_counter);
-      const int cpos = SGL_TOPK_CAND(cand, &s_num_input[0]);
-      if (sel) {
-        index[pos] = idx;
-      } else if (cand && C10_LIKELY(cpos < static_cast<int>(SMEM_INPUT_SIZE))) {
-        s_input_idx[0][cpos] = idx;
-        /// NOTE: (dark) fuse the histogram computation here
-        const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
-        ::atomicAdd(&s_histogram[sub_bin], 1);
       }
     }
 #endif
@@ -485,10 +309,11 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
         const auto offset = 24 - round * 8;
-        const auto bin = static_cast<int>((convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF);
-        const bool sel = bin > threshold_bin;
-        const int pos = SGL_TOPK_SELECT(sel, &s_counter);
-        if (sel) index[pos] = idx;
+        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        }
       }
       __syncthreads();
       break;
@@ -502,28 +327,25 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         const auto idx = s_input_idx[r_idx][i];
         const auto raw_input = input[idx + row_start];
         const auto offset = 24 - round * 8;
-        const auto bin = static_cast<int>((convert_to_uint32(raw_input) >> offset) & 0xFF);
-        const bool sel = bin > threshold_bin;
-        const bool cand = bin == threshold_bin;
-        // `round` is uniform across the block, so this branch is uniform and
-        // both arms keep their ballots converged.
-        const int pos = SGL_TOPK_SELECT(sel, &s_counter);
-        if (round == 3) {
-          const int rpos = SGL_TOPK_TAIL(cand, &s_last_remain);
-          if (sel) {
-            index[pos] = idx;
-          } else if (cand && rpos > 0) {
-            index[TopK - rpos] = idx;
-          }
-        } else {
-          const int cpos = SGL_TOPK_CAND(cand, &s_num_input[r_idx ^ 1]);
-          if (sel) {
-            index[pos] = idx;
-          } else if (cand && C10_LIKELY(cpos < static_cast<int>(SMEM_INPUT_SIZE))) {
-            /// NOTE: (dark) fuse the histogram computation here
-            s_input_idx[r_idx ^ 1][cpos] = idx;
-            const auto sub_bin = (convert_to_uint32(raw_input) >> (offset - 8)) & 0xFF;
-            ::atomicAdd(&s_histogram[sub_bin], 1);
+        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          if (round == 3) {
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[TopK - pos] = idx;
+            }
+          } else {
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+              /// NOTE: (dark) fuse the histogram computation here
+              s_input_idx[r_idx ^ 1][pos] = idx;
+              const auto bin = convert_to_uint32(raw_input);
+              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
+              ::atomicAdd(&s_histogram[sub_bin], 1);
+            }
           }
         }
       }
