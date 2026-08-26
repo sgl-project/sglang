@@ -480,6 +480,7 @@ def _report(
     pinned_host_gib: int = 0,
     host_pin_capacity_gib: int = 0,
     host_transition_headroom_gib: int = 0,
+    device_transition_allocated_gib: int = 0,
     target_workload_measured: bool = False,
     estimated_request_duration_ns: int = 0,
     candidate_latency_savings_ns: dict[str, int] | None = None,
@@ -504,6 +505,7 @@ def _report(
         pinned_host_bytes=pinned_host_gib * GIB_BYTES,
         host_pin_capacity_bytes=host_pin_capacity_gib * GIB_BYTES,
         host_transition_headroom_bytes=(host_transition_headroom_gib * GIB_BYTES),
+        device_transition_allocated_bytes=(device_transition_allocated_gib * GIB_BYTES),
         estimated_request_duration_ns=estimated_request_duration_ns,
         candidate_latency_savings_ns=candidate_latency_savings_ns or {},
         candidates=candidates if candidates is not None else [_candidate("vae")],
@@ -1098,6 +1100,98 @@ class TestPlanAutoResidency:
         assert plan.changes == []
         assert plan.resource_budget_bytes["hostram:node0:rank0:pin"] == 5 * GIB_BYTES
 
+    def test_component_demotion_must_fit_host_materialization_headroom(self):
+        demote = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            host_materialize_scratch_bytes=6 * GIB_BYTES,
+            device_transition_delta_bytes=-6 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    host_transition_headroom_gib=5,
+                    candidates=[demote],
+                )
+            ]
+        )
+
+        assert plan.changes == []
+        assert (
+            plan.resource_budget_bytes["hostram:node0:rank0:materialize"]
+            == 5 * GIB_BYTES
+        )
+
+    def test_layerwise_materialization_must_fit_transition_vram(self):
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+            device_transition_delta_bytes=10 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=50,
+                    device_transition_allocated_gib=90,
+                    target_workload_measured=True,
+                    candidates=[resident],
+                )
+            ]
+        )
+
+        assert plan.changes == []
+        assert (
+            plan.resource_budget_bytes["gpu:rank0:placement-transition"]
+            == 5 * GIB_BYTES
+        )
+
+    def test_device_release_can_fund_later_layerwise_materialization(self):
+        release = ResidencyTarget(
+            component_name="cold_transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=-10 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            device_transition_delta_bytes=-10 * GIB_BYTES,
+        )
+        materialize = ResidencyTarget(
+            component_name="hot_transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+            device_transition_delta_bytes=10 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=100,
+                    estimated_gib=50,
+                    device_transition_allocated_gib=95,
+                    target_workload_measured=True,
+                    candidates=[release, materialize],
+                )
+            ]
+        )
+
+        assert {candidate.component_name for candidate in plan.changes} == {
+            "cold_transformer",
+            "hot_transformer",
+        }
+
     def test_complete_state_frontier_can_replace_an_earlier_resident(self):
         transformer_offload = ResidencyTarget(
             component_name="transformer",
@@ -1256,6 +1350,8 @@ class _FakeLayerwiseManager:
 
     def load_all_layers(self):
         self.load_all_layers_calls += 1
+        if self._event_log is not None:
+            self._event_log.append(f"{self._event_name}:load")
         if self.fail_load:
             raise RuntimeError("CUDA out of memory")
 
@@ -1267,6 +1363,8 @@ class _FakeLayerwiseManager:
 
     def sync_all_layers_to_cpu(self):
         self.sync_to_cpu_calls += 1
+        if self._event_log is not None:
+            self._event_log.append(f"{self._event_name}:sync")
 
     def release_all(self):
         self.release_all_calls += 1
@@ -1555,6 +1653,50 @@ class TestCollectResidencyTargets:
         assert set(by_mode) == {COMPONENT_OFFLOAD, RESIDENT}
         assert by_mode[RESIDENT].current_placement
         assert by_mode[COMPONENT_OFFLOAD].inactive_device_delta_bytes < 0
+        assert by_mode[COMPONENT_OFFLOAD].device_transition_delta_bytes < 0
+        assert by_mode[COMPONENT_OFFLOAD].host_materialize_scratch_bytes > 0
+
+    def test_layerwise_frontier_accounts_for_immediate_materialization(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            }
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+        resident = next(
+            candidate for candidate in candidates if candidate.permanent_residency
+        )
+        assert (
+            resident.device_transition_delta_bytes == manager.offloaded_weight_bytes()
+        )
+
+        module.disable_offload()
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": RESIDENT}),
+            baseline_residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            auto_resident_components={"transformer"},
+        )
+        streamed = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        )
+        assert (
+            streamed.device_transition_delta_bytes == -manager.offloaded_weight_bytes()
+        )
 
 
 class TestApplyAndRollback:
@@ -1779,6 +1921,55 @@ class TestApplyAndRollback:
 
         assert events == ["source:unpin", "flush", "target:pin"]
         assert all(adjustment.pinned_host_changed for adjustment in applied)
+
+    def test_vram_handoff_releases_before_materializing(self):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        source = _FakeLayerwiseDit([source_manager])
+        target = _FakeLayerwiseDit([target_manager])
+        source.disable_offload()
+        events.clear()
+        candidates = [
+            ResidencyTarget(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_residency_mode=LAYERWISE_OFFLOAD,
+                target_resident_weight_bytes=0,
+                h2d_bytes_per_request=-1,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((),),
+                device_transition_delta_bytes=-source_manager.offloaded_weight_bytes(),
+                active_device_delta_bytes=100,
+            ),
+            ResidencyTarget(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_residency_mode=RESIDENT,
+                target_resident_weight_bytes=target_manager.offloaded_weight_bytes(),
+                h2d_bytes_per_request=10,
+                target_layerwise_resident_layers=(1,),
+                target_layerwise_pinned_layers=((),),
+                device_transition_delta_bytes=target_manager.offloaded_weight_bytes(),
+                active_device_delta_bytes=-100,
+            ),
+        ]
+
+        apply_residency_changes(
+            plan=_plan_for(candidates),
+            modules={"source": source, "target": target},
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["source:sync", "target:load"]
 
     def test_hostpin_rollback_releases_new_owner_before_restoring_old_owner(
         self, monkeypatch

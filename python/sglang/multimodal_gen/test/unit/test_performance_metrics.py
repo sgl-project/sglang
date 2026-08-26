@@ -202,6 +202,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     device_module = Mock()
     device_module.mem_get_info.return_value = (100, 100)
     device_module.memory_reserved.return_value = 0
+    device_module.memory_allocated.return_value = 1
 
     with patch.object(torch, "get_device_module", return_value=device_module):
         report = worker._build_auto_residency_report(
@@ -245,6 +246,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     device_module = Mock()
     device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)
     device_module.memory_reserved.return_value = 2 * GIB_BYTES
+    device_module.memory_allocated.return_value = 60 * GIB_BYTES
     monkeypatch.setattr(
         gpu_worker_module.envs,
         "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB",
@@ -272,6 +274,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         )
 
     assert report.budget_bytes == 80 * GIB_BYTES
+    assert report.device_transition_allocated_bytes == 60 * GIB_BYTES
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

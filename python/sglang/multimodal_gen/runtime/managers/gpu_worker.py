@@ -1499,6 +1499,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
             )
             // local_worker_count,
+            device_transition_allocated_bytes=int(
+                torch.get_device_module().memory_allocated()
+            ),
             estimated_request_duration_ns=estimated_request_duration_ns,
             candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,

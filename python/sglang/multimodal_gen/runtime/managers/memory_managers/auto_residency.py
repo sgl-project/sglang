@@ -149,6 +149,12 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
     pinned_host_delta_bytes: int = 0
     host_unpin_scratch_bytes: int = 0
     host_pin_scratch_bytes: int = 0
+    host_materialize_scratch_bytes: int = 0
+    # Signed device-memory delta while applying the placement before the
+    # validation warmup. Layerwise -> resident materializes every managed
+    # layer immediately; a demotion can release those bytes first and fund a
+    # later materialization in the same transaction.
+    device_transition_delta_bytes: int = 0
     permanent_residency: bool = False
     # Device-memory delta relative to the measured placement. A component
     # already loaded for its own phase has a different delta from phases where
@@ -226,6 +232,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     pinned_host_bytes: int = 0
     host_pin_capacity_bytes: int = 0
     host_transition_headroom_bytes: int = 0
+    device_transition_allocated_bytes: int = 0
     estimated_request_duration_ns: int = 0
     candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[ResidencyTarget] = []
@@ -870,6 +877,12 @@ def collect_residency_targets(
                         target_residency_mode=COMPONENT_OFFLOAD,
                         target_resident_weight_bytes=0,
                         h2d_bytes_per_request=0,
+                        host_materialize_scratch_bytes=(
+                            weight_bytes if current_resident else 0
+                        ),
+                        device_transition_delta_bytes=(
+                            -weight_bytes if current_resident else 0
+                        ),
                         active_device_delta_bytes=0,
                         inactive_device_delta_bytes=(
                             -weight_bytes if current_resident else 0
@@ -886,6 +899,7 @@ def collect_residency_targets(
                         target_resident_weight_bytes=weight_bytes,
                         h2d_bytes_per_request=weight_bytes,
                         permanent_residency=True,
+                        device_transition_delta_bytes=0,
                         active_device_delta_bytes=0,
                         inactive_device_delta_bytes=(
                             0 if current_resident else weight_bytes
@@ -1000,6 +1014,9 @@ def collect_residency_targets(
                         ),
                         host_unpin_scratch_bytes=unpin_scratch,
                         host_pin_scratch_bytes=pin_scratch,
+                        device_transition_delta_bytes=(
+                            -managed_weight_bytes if current_permanent else 0
+                        ),
                         active_device_delta_bytes=(
                             target_peak_device_bytes - current_peak_device_bytes
                         ),
@@ -1057,6 +1074,9 @@ def collect_residency_targets(
                     ),
                     host_unpin_scratch_bytes=unpin_scratch,
                     host_pin_scratch_bytes=pin_scratch,
+                    device_transition_delta_bytes=(
+                        0 if current_permanent else managed_weight_bytes
+                    ),
                     permanent_residency=True,
                     active_device_delta_bytes=(
                         managed_weight_bytes - current_peak_device_bytes
@@ -1235,6 +1255,14 @@ def _consensus_candidates(
                 host_pin_scratch_bytes=max(
                     candidate.host_pin_scratch_bytes for candidate in rank_candidates
                 ),
+                host_materialize_scratch_bytes=max(
+                    candidate.host_materialize_scratch_bytes
+                    for candidate in rank_candidates
+                ),
+                device_transition_delta_bytes=max(
+                    candidate.device_transition_delta_bytes
+                    for candidate in rank_candidates
+                ),
                 permanent_residency=permanent.pop(),
                 active_device_delta_bytes=max(
                     candidate.active_device_delta_bytes for candidate in rank_candidates
@@ -1307,13 +1335,25 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 0,
                 report.budget_bytes - phase_peak - reserves_by_rank[report.rank],
             )
-    has_hostpin_options = any(
+    has_device_transition_options = any(
+        candidate.device_transition_delta_bytes != 0 for candidate in candidates
+    )
+    if has_device_transition_options:
+        for report in reports:
+            resource_budgets[f"gpu:rank{report.rank}:placement-transition"] = max(
+                0,
+                report.budget_bytes
+                - report.device_transition_allocated_bytes
+                - reserves_by_rank[report.rank],
+            )
+    has_host_resources = any(
         candidate.pinned_host_delta_bytes != 0
         or candidate.host_unpin_scratch_bytes != 0
         or candidate.host_pin_scratch_bytes != 0
+        or candidate.host_materialize_scratch_bytes != 0
         for candidate in candidates
     )
-    if has_hostpin_options:
+    if has_host_resources:
         for report in reports:
             prefix = f"node{report.node_rank}:rank{report.rank}"
             resource_budgets[f"hostpin:{prefix}"] = max(
@@ -1324,6 +1364,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 report.host_transition_headroom_bytes
             )
             resource_budgets[f"hostram:{prefix}:pin"] = (
+                report.host_transition_headroom_bytes
+            )
+            resource_budgets[f"hostram:{prefix}:materialize"] = (
                 report.host_transition_headroom_bytes
             )
 
@@ -1378,7 +1421,11 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 else:
                     phase_cost = rank_candidate.inactive_device_delta_bytes
                 resource_deltas[resource_name] = phase_cost
-            if has_hostpin_options:
+            if has_device_transition_options:
+                resource_deltas[f"gpu:rank{report.rank}:placement-transition"] = (
+                    rank_candidate.device_transition_delta_bytes
+                )
+            if has_host_resources:
                 prefix = f"node{report.node_rank}:rank{report.rank}"
                 host_resource = f"hostpin:{prefix}"
                 resource_deltas[host_resource] = (
@@ -1390,6 +1437,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 )
                 resource_deltas[f"hostram:{prefix}:pin"] = (
                     rank_candidate.host_pin_scratch_bytes
+                )
+                resource_deltas[f"hostram:{prefix}:materialize"] = (
+                    rank_candidate.host_materialize_scratch_bytes
                 )
         options.append(
             PlacementOption(
@@ -1476,6 +1526,7 @@ def apply_residency_changes(
         ordered_changes = sorted(
             plan.changes,
             key=lambda candidate: (
+                candidate.device_transition_delta_bytes,
                 max(
                     candidate.active_device_delta_bytes,
                     candidate.inactive_device_delta_bytes,
@@ -1567,20 +1618,36 @@ def apply_residency_changes(
             and candidate.target_layerwise_pinned_layers
             != previous_pins_by_component[candidate.component_name]
         ]
-        if pinning_changes:
+        host_transition_changes = [
+            candidate
+            for candidate in ordered_changes
+            if candidate.host_unpin_scratch_bytes
+            or candidate.host_pin_scratch_bytes
+            or candidate.host_materialize_scratch_bytes
+        ]
+        if host_transition_changes:
             host_headroom = max(
                 0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
             )
             required_unpin = sum(
-                candidate.host_unpin_scratch_bytes for candidate in pinning_changes
+                candidate.host_unpin_scratch_bytes
+                for candidate in host_transition_changes
             )
             required_pin = sum(
-                candidate.host_pin_scratch_bytes for candidate in pinning_changes
+                candidate.host_pin_scratch_bytes
+                for candidate in host_transition_changes
             )
-            if max(required_unpin, required_pin) > host_headroom:
+            required_materialize = sum(
+                candidate.host_materialize_scratch_bytes
+                for candidate in host_transition_changes
+            )
+            required_host_headroom = max(
+                required_unpin, required_pin, required_materialize
+            )
+            if required_host_headroom > host_headroom:
                 raise MemoryError(
-                    "host memory changed after planning: HostPin repack needs "
-                    f"{max(required_unpin, required_pin) / GIB_BYTES:.2f} GiB "
+                    "host memory changed after planning: placement transition needs "
+                    f"{required_host_headroom / GIB_BYTES:.2f} GiB "
                     f"but {host_headroom / GIB_BYTES:.2f} GiB is available"
                 )
         applied_names: set[str] = set()
