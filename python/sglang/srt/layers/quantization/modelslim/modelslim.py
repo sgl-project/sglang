@@ -209,18 +209,31 @@ class ModelSlimConfig(QuantizationConfig):
         Kimi-K3's upstream model uses ``mlp`` internally while its ModelSlim
         checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
         Some multimodal checkpoints also keep the outer ``language_model``
-        prefix.  Resolve those layout-only differences at the quantization
-        boundary.
+        prefix, and Qwen3.5-GDN fuses the per-projection ``in_proj_*`` linears
+        on the model side while the checkpoint keeps the unfused names.
+        Resolve those layout-only differences at the quantization boundary.
         """
         candidates = [prefix]
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
+        # Fused GDN projections (in_proj_qkvz = in_proj_qkv + in_proj_z,
+        # in_proj_ba = in_proj_b + in_proj_a): the checkpoint records the
+        # unfused per-projection schemes.
+        for fused, unfused in (
+            (".in_proj_qkvz", (".in_proj_qkv", ".in_proj_z")),
+            (".in_proj_ba", (".in_proj_b", ".in_proj_a")),
+        ):
+            if fused in prefix:
+                candidates.extend(prefix.replace(fused, u) for u in unfused)
+
         for candidate in list(candidates):
             if candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
-            else:
-                candidates.append(f"language_model.{candidate}")
+            elif candidate.startswith("model.visual."):
+                candidates.append(candidate.removeprefix("model."))
+            elif candidate.startswith("visual."):
+                candidates.append(f"model.{candidate}")
 
         return list(dict.fromkeys(candidates))
 
