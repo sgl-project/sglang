@@ -81,17 +81,24 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)
-        self.assertIsNone(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), None
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
+        ):
+            self.assertIsNone(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), None
+                )
             )
-        )
-        self._install()
-        self.assertFalse(is_shared_experts_fusion_disabled())
+            self._install()
+            self.assertFalse(is_shared_experts_fusion_disabled())
 
     def test_enforcing_with_more_than_one_shared_expert_is_rejected(self):
         self._publish(enforce=True)
-        with self.assertRaisesRegex(ValueError, "exactly one shared"):
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
+        ), self.assertRaisesRegex(ValueError, "exactly one shared"):
             DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
                 SimpleNamespace(n_shared_experts=2), None
             )
@@ -113,50 +120,62 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         matched = SimpleNamespace(
             get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
         )
-        self.assertIsNone(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), matched
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
+        ):
+            self.assertIsNone(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), matched
+                )
             )
-        )
 
     def test_dspark_entry_class_uses_the_v4_gate(self):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""
         self._publish(enforce=False)
 
-        self._install(DeepseekV4ForCausalLMDSpark)
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
+        ):
+            self._install(DeepseekV4ForCausalLMDSpark)
 
-        self.assertTrue(is_shared_experts_fusion_disabled())
+            self.assertTrue(is_shared_experts_fusion_disabled())
 
     def test_dspark_records_explicitly_forced_fusion(self):
         """A forced DSpark build must retain its fused shared-expert count."""
         self._publish(enforce=True)
-        self._install(DeepseekV4ForCausalLMDSpark)
-
-        class Stage(nn.Module):
-            def __init__(self, **_kwargs):
-                super().__init__()
-
-        class MarkovHead(nn.Module):
-            def __init__(self, **_kwargs):
-                super().__init__()
-
-        with (
-            patch(
-                "sglang.srt.models.deepseek_v4_dspark.DSparkV4Stage",
-                Stage,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_v4_dspark.DSparkV4MarkovHead",
-                MarkovHead,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_v4_dspark.build_dspark_v4_confidence_head",
-                return_value=None,
-            ),
+        with patch(
+            "sglang.srt.distributed.parallel_state._MOE_EP",
+            new_callable=lambda: SimpleNamespace(world_size=1),
         ):
-            model = DeepseekV4ForCausalLMDSpark(self._make_dspark_config())
+            self._install(DeepseekV4ForCausalLMDSpark)
 
-        self.assertEqual(model.num_fused_shared_experts, 1)
+            class Stage(nn.Module):
+                def __init__(self, **_kwargs):
+                    super().__init__()
+
+            class MarkovHead(nn.Module):
+                def __init__(self, **_kwargs):
+                    super().__init__()
+
+            with (
+                patch(
+                    "sglang.srt.models.deepseek_v4_dspark.DSparkV4Stage",
+                    Stage,
+                ),
+                patch(
+                    "sglang.srt.models.deepseek_v4_dspark.DSparkV4MarkovHead",
+                    MarkovHead,
+                ),
+                patch(
+                    "sglang.srt.models.deepseek_v4_dspark.build_dspark_v4_confidence_head",
+                    return_value=None,
+                ),
+            ):
+                model = DeepseekV4ForCausalLMDSpark(self._make_dspark_config())
+
+            self.assertEqual(model.num_fused_shared_experts, 1)
 
     def test_dspark_loads_forced_shared_expert_into_fused_slot(self):
         """Forced DSpark shared tensors must load instead of being skipped."""
