@@ -237,7 +237,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             else cuda_graph_bs <= self.max_bs
         )
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
         return is_bs_supported
 
     def capture_one_shape(
