@@ -139,7 +139,9 @@ _EXPOSED = {
     ("dllm/config.py", "model_path"),
     ("multimodal/processors/base_processor.py", "image_processor_backend"),
     ("speculative/spec_registry.py", "disable_overlap_schedule"),
+    ("disaggregation/encoder/server.py", "model_loader_extra_config"),
     ("layers/moe/utils.py", "deepep_mode"),
+    ("layers/moe/utils.py", "disable_shared_experts_fusion"),
     ("layers/moe/utils.py", "moe_a2a_backend"),
     ("layers/moe/utils.py", "moe_runner_backend"),
     ("layers/moe/utils.py", "quantization"),
@@ -158,6 +160,8 @@ _EXPOSED = {
     ("configs/model_config.py", "quantization"),
     ("configs/model_config.py", "speculative_algorithm"),
     ("configs/model_config.py", "speculative_draft_model_quantization"),
+    ("dllm/config.py", "max_running_requests"),
+    ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
@@ -169,18 +173,25 @@ _EXPOSED = {
     ("layers/cp/bcg.py", "cp_strategy"),
     ("layers/cp/bcg.py", "enable_prefill_cp"),
     ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
+    ("layers/moe/utils.py", "deepep_mode"),
+    ("layers/moe/utils.py", "moe_a2a_backend"),
+    ("layers/moe/utils.py", "moe_runner_backend"),
+    ("layers/moe/utils.py", "quantization"),
+    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
     ("lora/lora_manager.py", "enable_lora_overlap_loading"),
     ("lora/marlin_lora_temp/policy.py", "lora_paths"),
+    ("model_loader/expert_pack_runtime.py", "model_path"),
+    ("model_loader/expert_pack_runtime.py", "tokenizer_path"),
+    ("multimodal/processors/base_processor.py", "image_processor_backend"),
     ("parser/template_detection.py", "model_path"),
     ("speculative/adaptive_spec_params.py", "speculative_algorithm"),
     ("speculative/adaptive_spec_params.py", "speculative_eagle_topk"),
     ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
     ("speculative/spec_info.py", "enable_multi_layer_eagle"),
+    ("speculative/spec_registry.py", "disable_overlap_schedule"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
-    # The daemon command and constructor snapshot the resolved startup layout
-    # before the daemon's loading lifecycle can apply any runtime overrides.
     ("weight_cache/daemon.py", "attn_cp_size"),
     ("weight_cache/daemon.py", "deepep_mode"),
     ("weight_cache/daemon.py", "dp_size"),
@@ -189,6 +200,7 @@ _EXPOSED = {
     ("weight_cache/daemon.py", "enable_dp_lm_head"),
     ("weight_cache/daemon.py", "ep_size"),
     ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_loader_extra_config"),
     ("weight_cache/daemon.py", "model_path"),
     ("weight_cache/daemon.py", "moe_a2a_backend"),
     ("weight_cache/daemon.py", "moe_dense_tp_size"),
@@ -209,9 +221,12 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
+    ("configs/model_config.py", "dtype"),
+    ("configs/model_config.py", "model_path"),
     ("dllm/config.py", "model_path"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
+    ("model_loader/expert_pack_runtime.py", "model_path"),
     ("weight_cache/daemon.py", "dp_size"),
     ("weight_cache/daemon.py", "dtype"),
     ("weight_cache/daemon.py", "ep_size"),
@@ -219,7 +234,6 @@ _OVERRIDDEN_AND_READ = {
     ("weight_cache/daemon.py", "model_path"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
-    ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
     ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
     ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
@@ -229,6 +243,11 @@ _OVERRIDDEN_AND_READ = {
     ("parser/template_detection.py", "model_path"),
     ("utils/common.py", "speculative_num_draft_tokens"),
     ("utils/common.py", "speculative_num_steps"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
 }
 
 
@@ -682,8 +701,11 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         root = _PACKAGE_ROOT
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "_late_resolution" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):
@@ -734,6 +756,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                             written |= _expanded_override_keys(rel, tree, node, kw)
         return written
 
+    _READS_CACHE = None
+
     def _supplied_instance_reads(self) -> set:
         """Three spellings of the same read: ``server_args.field`` off the
         parameter, ``getattr(server_args, "field", default)`` with a literal
@@ -746,13 +770,18 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         census still does not count -- but those reads are gone for every
         resolution-written field and ``test_chain_read_ratchet.py`` holds them
         at zero, so the gap is no longer where the risk is."""
+        if TestSuppliedInstanceExposure._READS_CACHE is not None:
+            return TestSuppliedInstanceExposure._READS_CACHE
         pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
             if rel.startswith(_OWNERS):
                 continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "server_args" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 # A silently dropped module shrinks `found` and reads as
                 # intentional surface shrinkage under the bidirectional pin.
@@ -818,6 +847,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         and node.value.value.id == "self"
                     ):
                         pairs.add((rel, node.attr))
+        TestSuppliedInstanceExposure._READS_CACHE = pairs
         return pairs
 
     @staticmethod
@@ -826,8 +856,13 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         written = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "record_config_updates" not in source and not (
+                "get_context" in source and "override" in source
+            ):
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 raise AssertionError(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):

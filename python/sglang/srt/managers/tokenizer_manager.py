@@ -89,7 +89,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -105,6 +105,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -410,7 +411,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().dp_size
+        self.elastic_worker_count = get_parallel().config.dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -486,7 +487,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper(server_args)
-            transport_mode = determine_tensor_transport_mode(self.server_args)
+            transport_mode = determine_tensor_transport_mode()
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
@@ -1547,7 +1548,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
             or (
-                (not get_parallel().enable_dp_attention)
+                (not get_parallel().config.enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -3596,16 +3597,6 @@ def get_processor_wrapper(server_args):
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )
-
-
-def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = get_parallel().dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
 
 
 class SignalHandler:

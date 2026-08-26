@@ -11,6 +11,7 @@ Env knobs:
                                   baseline storage; see precision_baseline_store
   SGLANG_PRECISION_HF_TOKEN       write token for that repo (not HF_TOKEN, which
                                   carries the runner's gated-model read token)
+  SGLANG_PRECISION_HF_READ_ONLY=1 fetch and compare without updating the store
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -55,16 +57,16 @@ DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
 # Fallback when the layer count can't be resolved: never silently shrink coverage.
 DUMPER_FILTER_ALL_LAYERS = (
-    r"match(r'^non_intrusive__model\.layers\.\d+\.inputs\.1$', name)"
+    r"match(r'^non_intrusive__model\.layers\.\d+\."
+    r"(inputs\.1|self_attn\.inputs\.hidden_states)$', name)"
 )
+COMPARATOR_FILTER = r"self_attn\.inputs\.hidden_states"
 LAYER_CAPTURE_STRIDE = 8
 MAX_TOKENS = 2
 SCHEMA_VERSION = 3
 EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
-# Pin fusion ON: captured inputs.1 must be TP-partial (the comparator's tp:partial
-# contract), and SM90 auto-enable was dropped in #23402.
 PRECISION_FUSION_BACKEND = "trtllm"
 
 
@@ -91,7 +93,10 @@ def _build_dumper_filter(capture_layers: Optional[list[int]]) -> str:
     alt = "|".join(
         str(i) for i in sorted(capture_layers, key=lambda x: (-len(str(x)), x))
     )
-    return rf"match(r'^non_intrusive__model\.layers\.({alt})\.inputs\.1$', name)"
+    return (
+        rf"match(r'^non_intrusive__model\.layers\.({alt})\."
+        rf"(inputs\.1|self_attn\.inputs\.hidden_states)$', name)"
+    )
 
 
 def _resolve_num_layers(model_path: str) -> Optional[int]:
@@ -116,8 +121,6 @@ def _resolve_num_layers(model_path: str) -> Optional[int]:
 
 
 def _assert_decode_captured(exp_dir: Path, *, tp_size: int) -> None:
-    # One dump per (layer, rank) == prefill only: decode never ran, which would
-    # pass the comparison while silently halving coverage. Fail loudly instead.
     pts = list(exp_dir.glob("*.pt"))
     if not pts:
         raise AssertionError(f"no .pt dumps produced in {exp_dir}")
@@ -129,11 +132,10 @@ def _assert_decode_captured(exp_dir: Path, *, tp_size: int) -> None:
                 layers.add(kv[len("layer_id=") :])
             elif kv.startswith("step="):
                 steps.add(kv[len("step=") :])
-    prefill_only = len(layers) * tp_size
-    if len(pts) <= prefill_only:
+    if not steps or steps == {"0"}:
         raise AssertionError(
             f"decode path not captured: {len(pts)} .pt files for {len(layers)} "
-            f"layers x {tp_size} tp (== {prefill_only}, prefill-only); "
+            f"layers x {tp_size} tp; "
             f"steps={sorted(steps)}. The model generated no decode tokens "
             f"(check --max-total-tokens vs the decode reservation, max_tokens, "
             f"and ignore_eos)."
@@ -152,6 +154,7 @@ def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
             dump_cfg["ignore_eos"],
             tp_size,
             dump_cfg["dumper_filter"],
+            dump_cfg["comparator_filter"],
             dump_cfg["fusion_backend"],
         )
     )
@@ -385,6 +388,7 @@ def _test_one_model(
         "max_tokens": MAX_TOKENS,
         "ignore_eos": True,
         "dumper_filter": _build_dumper_filter(capture_layers),
+        "comparator_filter": COMPARATOR_FILTER,
         "num_hidden_layers": num_layers,
         "capture_layers": capture_layers,
         "fusion_backend": PRECISION_FUSION_BACKEND,
@@ -410,6 +414,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
+        _assert_fused_tp_layout(today_exp_dir, tp_size=model_setup.tp_size)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -486,8 +491,6 @@ def _test_one_model(
 def _maybe_hf_fetch(
     *, hf_cfg, model: str, baseline_exp_dir: Path, capture_signature: str
 ) -> None:
-    if baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt")):
-        return
     try:
         src = _hfs.fetch_latest_baseline(
             config=hf_cfg,
@@ -495,7 +498,16 @@ def _maybe_hf_fetch(
             target_tensors_dir=baseline_exp_dir,
             capture_signature=capture_signature,
         )
-        if src is not None:
+        if src is None:
+            # Without this line a run that found no signature-matching baseline
+            # and a run that compared cleanly both look green in the log; only
+            # the former silently re-establishes instead of detecting drift.
+            print(
+                f"[hf-store] no baseline matching capture_signature="
+                f"{capture_signature} for {model}; re-establishing",
+                flush=True,
+            )
+        else:
             print(f"[hf-store] restored baseline for {model} from {src}", flush=True)
     except Exception as e:
         msg = f"[hf-store] fetch failed for {model}: {e}"
@@ -516,6 +528,10 @@ def _maybe_hf_push(
     comparator_report: Optional[Path] = None,
     comparator_stats: Optional[dict[str, Any]] = None,
 ) -> None:
+    if hf_cfg.read_only:
+        print(f"[hf-store] read-only; not pushing {model}", flush=True)
+        return
+
     # Under CI a push failure raises rather than warns, so a misconfigured
     # store can't quietly mask the regression-detection guarantee.
     pt_files = list(tensors_dir.glob("*.pt"))
@@ -534,6 +550,7 @@ def _maybe_hf_push(
             "temperature": 0,
             "diff_threshold": diff_threshold,
             "dumper_filter": dump_cfg["dumper_filter"],
+            "comparator_filter": dump_cfg["comparator_filter"],
             "num_hidden_layers": dump_cfg.get("num_hidden_layers"),
             "capture_layers": dump_cfg.get("capture_layers"),
             "capture_signature": dump_cfg.get("capture_signature"),
@@ -593,7 +610,6 @@ def _run_server_and_dump(
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
-        # Explicit `trtllm`, not `auto` (which resolves to mnnvl on SM90).
         "--flashinfer-allreduce-fusion-backend",
         PRECISION_FUSION_BACKEND,
     ]
@@ -648,18 +664,100 @@ def _run_comparator(
         str(target),
         "--diff-threshold",
         str(threshold),
+        "--filter",
+        COMPARATOR_FILTER,
         "--output-format",
         "json",
         "--allow-skipped-pattern",
         "input_ids|positions|seq_lens|req_pool_indices|rids",
-        # inputs.1 is hidden_states entering the layer (inputs.0 = positions).
-        # LayerCommunicator defers the cross-layer allreduce, so layer N sees
-        # per-tp partial sums; bs h[tp:partial] sums across tp on the h axis
-        # before diffing.
         "--override-dims",
-        r"^non_intrusive__model\.layers\.\d+\.inputs\.1$:bs h[tp:partial]",
+        (
+            r"^non_intrusive__model\.layers\.\d+\.self_attn\.inputs\."
+            r"hidden_states$:bs h # tp:replicated"
+        ),
     ]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+
+_RANK_TAG_RE = re.compile(r"(?:^|___)rank=(\d+)(?:___|$)")
+_NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
+_STEP_TAG_RE = re.compile(r"(?:^|___)step=(-?\d+)(?:___|$)")
+_DUMP_INDEX_TAG_RE = re.compile(r"(?:^|___)dump_index=(\d+)(?:___|$)")
+_LAYER_INPUT_RE = re.compile(r"^non_intrusive__model\.layers\.(\d+)\.inputs\.1$")
+_ATTN_INPUT_RE = re.compile(
+    r"^non_intrusive__model\.layers\.(\d+)\.self_attn\.inputs\.hidden_states$"
+)
+
+
+def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
+    reference_by_bundle: dict[str, Any] = {}
+    ranks_by_bundle: dict[str, set[int]] = {}
+    names_by_bundle: dict[str, str] = {}
+    partial_bundles: set[str] = set()
+    for path in sorted(dump_dir.glob("*.pt")):
+        name_match = _NAME_TAG_RE.search(path.stem)
+        rank_match = _RANK_TAG_RE.search(path.stem)
+        step_match = _STEP_TAG_RE.search(path.stem)
+        index_match = _DUMP_INDEX_TAG_RE.search(path.stem)
+        if None in (name_match, rank_match, step_match, index_match):
+            continue
+        name = name_match.group(1)
+        if not (_LAYER_INPUT_RE.match(name) or _ATTN_INPUT_RE.match(name)):
+            continue
+        # Bundle = the same tensor across ranks. Key on the parsed tags, not on
+        # a rank-masked filename: the dumper appends per-rank parallel tags
+        # under include_parallel_rank_in_filename, and those would survive the
+        # mask and split every bundle into one rank each. dump_index stays in
+        # the key so a name dumped more than once in a step is not collapsed.
+        bundle = f"step={step_match.group(1)}___dump_index={index_match.group(1)}___name={name}"
+        names_by_bundle[bundle] = name
+        ranks_by_bundle.setdefault(bundle, set()).add(int(rank_match.group(1)))
+        raw = torch.load(path, weights_only=False, map_location="cpu")
+        value = raw.get("value") if isinstance(raw, dict) else raw
+        reference = reference_by_bundle.get(bundle)
+        if reference is None:
+            reference_by_bundle[bundle] = value
+            continue
+        if not torch.equal(reference, value):
+            partial_bundles.add(bundle)
+    expected_ranks = set(range(tp_size))
+    incomplete = [
+        bundle for bundle, ranks in ranks_by_bundle.items() if ranks != expected_ranks
+    ]
+    if incomplete:
+        raise RuntimeError(
+            f"incomplete TP dumps in {dump_dir}: {sorted(incomplete)[:10]}"
+        )
+    if not names_by_bundle:
+        raise RuntimeError(f"no named tensor dumps found in {dump_dir}")
+    non_initial_layer_inputs = [
+        bundle
+        for bundle, name in names_by_bundle.items()
+        if (match := _LAYER_INPUT_RE.match(name)) and int(match.group(1)) > 0
+    ]
+    attn_inputs = [
+        bundle for bundle, name in names_by_bundle.items() if _ATTN_INPUT_RE.match(name)
+    ]
+    if not non_initial_layer_inputs:
+        raise AssertionError("no non-initial transformer layer input dumps found")
+    if not attn_inputs:
+        raise AssertionError("no post-fusion attention input dumps found")
+    replicated_layer_inputs = [
+        bundle for bundle in non_initial_layer_inputs if bundle not in partial_bundles
+    ]
+    if replicated_layer_inputs:
+        raise AssertionError(
+            "flashinfer allreduce fusion did not produce TP-partial layer inputs; "
+            f"replicated tensors={replicated_layer_inputs}"
+        )
+    partial_attn_inputs = [
+        bundle for bundle in attn_inputs if bundle in partial_bundles
+    ]
+    if partial_attn_inputs:
+        raise AssertionError(
+            "post-fusion attention inputs were not replicated; "
+            f"TP-partial tensors={partial_attn_inputs}"
+        )
 
 
 def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
