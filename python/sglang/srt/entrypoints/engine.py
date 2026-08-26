@@ -28,8 +28,6 @@ import multiprocessing as mp
 import os
 import random
 import signal
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -99,6 +97,18 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_moe_dp_size,
+    configured_pp_size,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+    publish,
+    restore_context,
+    snapshot_context,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -157,9 +167,9 @@ def init_tokenizer_manager(
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
+        model_path=get_model().model_path,
+        chat_template=get_serving().chat_template,
+        completion_template=get_serving().completion_template,
     )
 
     # Resolve any remaining auto parsers using template manager's detection results
@@ -278,8 +288,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         # Engine-spawned weight cache daemons owned by *this* instance (empty
-        # unless --weight-cache-mode daemon). Kept per-instance so two Engines
-        # in one process each reap only their own daemons in shutdown().
+        # unless --weight-cache-mode daemon), so shutdown() reaps exactly what
+        # this Engine spawned.
         self._weight_cache_daemon_procs = weight_cache_daemon_procs
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
@@ -335,7 +345,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = get_parallel().dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -660,12 +670,6 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if server_args.dp_size > 1:
-            raise ValueError(
-                "Weight cache daemon mode does not support dp_size > 1. "
-                "Please set --dp-size 1 when using --weight-cache-mode daemon."
-            )
-
         # Multi-node needs an explicit rendezvous address; otherwise each node
         # picks its own local 127.0.0.1 port (below) and the per-node daemons
         # can never form the joint process group.
@@ -680,7 +684,7 @@ class Engine(EngineScoreMixin, EngineBase):
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                server_args.pp_size,
+                configured_pp_size(),
                 tp_size,
                 server_args.node_rank,
             )
@@ -701,7 +705,7 @@ class Engine(EngineScoreMixin, EngineBase):
         daemon_procs = []
         logger.info(
             f"Launching {num_daemons} weight cache daemon(s) on node "
-            f"{server_args.node_rank} for model={server_args.model_path}, "
+            f"{server_args.node_rank} for model={get_model().model_path}, "
             f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
             f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
             f"dist_init_method={dist_init_method}"
@@ -709,6 +713,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
             compute_global_rank,
@@ -731,49 +736,14 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "sglang.srt.weight_cache.daemon",
-                    "--model-path",
-                    server_args.model_path,
-                    "--gpu-id",
-                    str(gpu_id),
-                    "--tp-size",
-                    str(tp_size),
-                    "--tp-rank",
-                    str(tp_rank),
-                    "--pp-size",
-                    str(server_args.pp_size),
-                    "--pp-rank",
-                    str(pp_rank),
-                    "--dp-size",
-                    "1",
-                    "--ep-size",
-                    str(server_args.ep_size),
-                    "--load-format",
-                    server_args.load_format,
-                    "--dtype",
-                    server_args.dtype,
-                    "--dist-init-method",
-                    dist_init_method,
-                ]
-                if server_args.quantization:
-                    cmd += ["--quantization", server_args.quantization]
-                if (
-                    server_args.model_loader_extra_config
-                    and server_args.model_loader_extra_config != "{}"
-                ):
-                    cmd += [
-                        "--model-loader-extra-config",
-                        server_args.model_loader_extra_config,
-                    ]
-                if server_args.trust_remote_code:
-                    cmd += ["--trust-remote-code"]
-                if server_args.revision:
-                    cmd += ["--revision", server_args.revision]
+                proc = spawn_weight_cache_daemon(
+                    server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    dist_init_method=dist_init_method,
+                )
 
-                proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists). On any failure
@@ -798,10 +768,10 @@ class Engine(EngineScoreMixin, EngineBase):
                             )
                         # Check if daemon process is still alive
                         for p in daemon_procs:
-                            if p.poll() is not None:
+                            if not p.is_alive():
                                 raise RuntimeError(
                                     f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                    f"with code {p.returncode}"
+                                    f"with code {p.exitcode}"
                                 )
                     logger.info(
                         f"Weight cache daemon for pp_rank={pp_rank} "
@@ -832,17 +802,17 @@ class Engine(EngineScoreMixin, EngineBase):
         if not procs:
             return
         for p in procs:
-            if p.poll() is None:
+            if p.is_alive():
                 p.terminate()  # SIGTERM -> daemon cleanup handler runs
         for p in procs:
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            p.join(timeout=timeout)
+            if p.is_alive():
                 logger.warning(
                     f"Weight cache daemon (pid={p.pid}) did not exit within "
                     f"{timeout}s of SIGTERM; sending SIGKILL."
                 )
                 p.kill()
+                p.join()
 
     @classmethod
     def _launch_scheduler_processes(
@@ -862,7 +832,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -875,7 +845,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,
-                    server_args.pp_size,
+                    configured_pp_size(),
                     server_args.tp_size,
                     server_args.node_rank,
                 )
@@ -982,7 +952,7 @@ class Engine(EngineScoreMixin, EngineBase):
         processes: List[mp.Process] = []
         names: List[str] = []
 
-        if server_args.detokenizer_worker_num <= 1:
+        if get_serving().detokenizer_worker_num <= 1:
             proc = mp.Process(
                 target=run_detokenizer_process_func,
                 args=(server_args, port_args),
@@ -995,7 +965,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_ipc_name = port_args.detokenizer_ipc_name
         worker_ipc_names: List[str] = []
         try:
-            for i in range(server_args.detokenizer_worker_num):
+            for i in range(get_serving().detokenizer_worker_num):
                 worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
                 port_args.detokenizer_ipc_name = worker_ipc
                 proc = mp.Process(
@@ -1073,48 +1043,71 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Configure global environment
         configure_logger(server_args)
+        server_args.resolve_once()
+
         _set_envs_and_config(server_args)
 
         # Defensive: ensure plugins loaded (may already be loaded by
         # Engine.__init__ or CLI entry).
         load_plugins()
 
+        # Not read-only: the LoRA checks normalize adapter paths through late
+        # resolution, which a published config refuses. Hence before publish --
+        # and before the parser detection below, which consumes the "auto"
+        # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Allocate ports for inter-process communications
-        if port_args is None:
-            port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-        # Start the engine info bootstrap server if per-rank info is needed.
-        engine_info_bootstrap_server = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
-            bootstrap_port = server_args.engine_info_bootstrap_port
-            if not is_port_available(bootstrap_port):
-                raise RuntimeError(
-                    f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
-                    f"When running multiple instances on the same node, each instance must use a "
-                    f"different --engine-info-bootstrap-port."
-                )
-            engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                host=server_args.host, port=bootstrap_port
-            )
-
+        # Needs a tokenizer and a chat template, so it cannot live in the
+        # pipeline; after the plugins, which may register the parser detected.
         if (
             server_args.reasoning_parser == "auto"
             or server_args.tool_call_parser == "auto"
         ):
             resolve_auto_parsers(server_args)
 
-        # Launch daemons (daemon mode only). Handles are threaded back to the
-        # owning Engine instance (not a class attr) so two Engines in one process
-        # don't clobber each other's daemon list.
-        weight_cache_daemon_procs: List = []
-        if server_args.weight_cache_mode == "daemon":
-            weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
+        # This publish replaces whatever was published before it, so the
+        # rollback below restores that rather than clearing the process: a
+        # caller that catches the launch error still has the context it had.
+        context_before_publish = snapshot_context()
+        publish(server_args, role="tokenizer")
+
+        # Nothing below has spawned yet, so a failure here leaves a record the
+        # caller can hand back -- but only once the publication goes with it:
+        # the validation stage writes through late resolution, which refuses a
+        # record that is already published.
+        try:
+            # Allocate ports for inter-process communications
+            if port_args is None:
+                port_args = PortArgs.init_new(server_args)
+            logger.info(f"{server_args=}")
+
+            # Start the engine info bootstrap server if per-rank info is needed.
+            engine_info_bootstrap_server = None
+            if (
+                get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+                and server_args.node_rank == 0
+            ):
+                bootstrap_port = server_args.engine_info_bootstrap_port
+                if not is_port_available(bootstrap_port):
+                    raise RuntimeError(
+                        f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                        f"When running multiple instances on the same node, each instance must use a "
+                        f"different --engine-info-bootstrap-port."
+                    )
+                engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                    host=server_args.host, port=bootstrap_port
+                )
+
+            # Launch daemons (daemon mode only). The handles travel back to the
+            # Engine that spawned them; shutdown() reaps from there.
+            weight_cache_daemon_procs: List = []
+            if server_args.weight_cache_mode == "daemon":
+                weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
+                    server_args
+                )
+        except BaseException:
+            restore_context(context_before_publish)
+            raise
 
         # Launch scheduler processes
         # Passed only when there is one: this hook is an override point, and a
@@ -1352,15 +1345,34 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **self.tokenizer_manager.resolved_config_dict(
-                    dataclasses.asdict(self.tokenizer_manager.server_args)
-                ),
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
             }
         )
+
+    def get_model_info(self):
+        """What this engine is serving right now.
+
+        `get_server_info` answers with the record: the launch configuration,
+        parsers included -- `auto` resolves into the record before the config
+        is published. This surface adds what the control plane changed after
+        publication: the model a weight update swapped in, its load format, an
+        operator-set weight version. The HTTP and gRPC model-info endpoints
+        answer with the same fields.
+        """
+        tm = self.tokenizer_manager
+        return {
+            "model_path": tm.model_path,
+            "served_model_name": tm.served_model_name,
+            "is_generation": tm.is_generation,
+            "weight_version": tm.config_value("weight_version"),
+            "load_format": tm.config_value("load_format"),
+            "reasoning_parser": tm.config_value("reasoning_parser"),
+            "tool_call_parser": tm.config_value("tool_call_parser"),
+        }
 
     def init_weights_update_group(
         self,
@@ -1641,7 +1653,6 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
@@ -1829,18 +1840,25 @@ def _calculate_rank_ranges(
 def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
+
+    Called while the launcher is deciding what to spawn, so the sizes are the
+    configured ones -- the groups this is laying out do not exist yet.
+    """
+    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
+    tp_size = server_args.tp_size
+    attn_cp_size = configured_attn_cp_size()
+    moe_dp_size = configured_moe_dp_size()
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
     # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-    moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
+    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
+    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
+    moe_dp_rank = tp_rank // (tp_size // moe_dp_size)
     moe_ep_rank = (
         tp_rank
-        % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
+        % (tp_size // moe_dp_size)
+        // (tp_size // moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank

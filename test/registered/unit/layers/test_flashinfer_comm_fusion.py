@@ -10,9 +10,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-gb300")
+# Collectives are mocked and world_size is a plain int, so the world_size=4
+# cases need one real CUDA device.
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeWorkspace:

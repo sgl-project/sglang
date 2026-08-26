@@ -1,11 +1,11 @@
+import base64
 import functools
 import json
 import os
-import subprocess
 import warnings
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -25,6 +25,9 @@ def _default_hip() -> bool:
         return False
 
 
+_NON_UTF8_PREFIX = "base64:"
+
+
 def _default_cache_subdir(name: str) -> str:
     """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
 
@@ -37,11 +40,12 @@ def _default_cache_subdir(name: str) -> str:
 class EnvField:
     _allow_set_name = True
 
-    def __init__(self, default: Any):
+    def __init__(self, default: Any, secret: bool = False):
         self.default = default
         # NOTE: environ can only accept str values, so we need a flag to indicate
         # whether the env var is explicitly set to None.
         self._set_to_none = False
+        self.secret = secret
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -157,8 +161,8 @@ class _DeprecatedEnvFallback:
         SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
     """
 
-    def __init__(self, default: Any, deprecated_name: str):
-        super().__init__(default)
+    def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
+        super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
@@ -318,6 +322,7 @@ class Envs:
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+    SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
 
     # ===================================================================
     # Logging
@@ -330,6 +335,7 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
     # IPC, broadcasters, and ports
@@ -351,6 +357,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Set to true by the check-changes CI job when a PR touches nothing under
+    # rust/; default false so local and scheduled runs never skip the cargo tests.
+    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
@@ -442,7 +451,6 @@ class Envs:
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
-    SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
@@ -511,7 +519,13 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # Size the KV pool after CUDA-graph capture.
+
+    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
+    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
+    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
+    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
     # ===================================================================
@@ -524,6 +538,9 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Window for the token-weighted recent cache-hit rate used to estimate
+    # waiting-queue prefill load.
+    SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
@@ -593,9 +610,16 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Deprecated: the unified radix tree is the default tree cache now, so the
+    # registry no longer reads this. Kept because a few model/arch call sites
+    # still assert on it; do not use in new code.
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # TODO(DSV4): @ispobock this has bug on main branch when retract
+    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
+    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
+    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
@@ -617,6 +641,11 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # Deferred decode-side KV release: on abort, hold an in-flight request's KV
+    # pages/slot until the prefill acks the transfer drained, or the timeout
+    # below fires. Off by default (no behavior/perf impact when disabled).
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -647,7 +676,7 @@ class Envs:
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.
-    EXA_API_KEY = EnvStr(None)
+    EXA_API_KEY = EnvStr(None, secret=True)
     SGLANG_EXA_NUM_RESULTS = EnvInt(10)
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
@@ -667,6 +696,10 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # Buffer mode: pin a staged prefetch's device anchor from IO commit to
+    # consumption so eviction cannot waste the fetch; cap = fraction of pool.
+    SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK = EnvBool(False)
+    SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -798,6 +831,15 @@ class Envs:
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
+    # DSV4 Aiter flags
+    SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
+    # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
+    # go back to the unfused chain on the verify path.
+    SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
+    SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+
     # ===================================================================
     # Apple Silicon and MLX
     # ===================================================================
@@ -824,16 +866,13 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
-    # Keep K3 shared experts and dense MLPs sharded over attention TP.
-    SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
-    SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
-    # Quantize x to int8 in the dispatch operator
-    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
-    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
+    # Ascend DeepEP library; the MTP draft-build scopes override it to False).
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
@@ -901,6 +940,10 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # Split TRTLLM-GEN decode attention into sorted, equal-size request groups.
+    # One preserves the default single-call path; values above one are useful
+    # for batches whose KV sequence lengths have a large spread.
+    SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
@@ -926,6 +969,9 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
+    # Reorders the fp32 accumulation, so off by default.
+    SGLANG_MLA_DECODE_TUNE = EnvBool(False)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
@@ -992,10 +1038,13 @@ class Envs:
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
     # ===================================================================
-    SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
+    # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
+    # read by several call sites; do not use in new code.
+    SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
@@ -1015,25 +1064,12 @@ class Envs:
     # ===================================================================
     # DeepGEMM Mega MoE
     # ===================================================================
-    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
-    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
-    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
-    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
-    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
-    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
-    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
-    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
-    # this combination on the host side.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
-    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
     # ===================================================================
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
-    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
     # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
@@ -1044,6 +1080,11 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # MiniCPM sparse attention developer switches
+    SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
+    SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
+    SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
@@ -1052,7 +1093,6 @@ class Envs:
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
-    SGLANG_CUTLASS_MOE = EnvBool(False)
 
     # ===================================================================
     # Logits and log-probability processing
@@ -1091,14 +1131,6 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
-    # Allow CustomAllReduceV2 on a process group that spans nodes (MNNVL
-    # fabric). Requires torch symmetric memory to rendezvous across nodes
-    # (fabric handles + IMEX). Graph zero-copy input registration is not
-    # supported in this mode and is disabled; all-reduce inside CUDA graphs
-    # falls back to eager pull from the symm workspace. Auto-enabled on
-    # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
-    # override in either direction.
-    SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
 
     # ===================================================================
     # RoPE cache
@@ -1181,6 +1213,8 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    # Reuse wholly-free graph-pool segments for step-local eager allocations.
+    SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
@@ -1209,6 +1243,7 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
@@ -1238,22 +1273,13 @@ class Envs:
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
     # ===================================================================
-    # DeepSeek V4 - model and quantization
+    # DeepSeek V4
     # ===================================================================
-    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
-    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
-    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
-    SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
-    SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
-    SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
-    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
-    SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
-    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
-    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
+
+    # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
@@ -1261,18 +1287,13 @@ class Envs:
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
 
-    # ===================================================================
-    # DeepSeek V4 - kernels and indexer
-    # ===================================================================
+    # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
-    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
-    SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
@@ -1281,29 +1302,18 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Deprecated: DSV4 compressor V2 is always used.
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
-    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
-    # ===================================================================
-    # DeepSeek V4 - cache, GEMM, and distributed
-    # ===================================================================
-    # TODO(DSV4): @ispobock this has bug on main branch when retract
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
-    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
-    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
+    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
+    # _apply_wo_a_bf16_matmul.
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
-    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
-    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
-    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
-    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
 
     # ===================================================================
     # Inkling
@@ -1484,6 +1494,8 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Use the ROCm radix-4 router for covered K3 top-k workloads.
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -1533,24 +1545,154 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
-    if old_name in os.environ:
-        if new_name is None:
-            warnings.warn(f"Environment variable {old_name} has been deprecated.")
-        else:
+def exportable_env_vars() -> dict[str, str]:
+    return {
+        field.name: _exportable_value(os.environ[field.name])
+        for field in sorted(
+            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
+            key=lambda field: field.name,
+        )
+        if not field.secret and field.name in os.environ
+    }
+
+
+def _exportable_value(value: str) -> str:
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return (
+            _NON_UTF8_PREFIX
+            + base64.b64encode(value.encode(errors="surrogateescape")).decode()
+        )
+    return value
+
+
+class _DeprecatedEnv:
+    """One deprecated env var: warn if it is set, and optionally forward its
+    (possibly transformed) value to a replacement env var."""
+
+    def __init__(
+        self,
+        replacement: Optional[str] = None,
+        transform: Optional[Callable[[str], str]] = None,
+        note: Optional[str] = None,
+    ):
+        self.replacement = replacement
+        self.transform = transform
+        self.note = note
+
+    def apply(self, old_name: str):
+        if old_name not in os.environ:
+            return
+        message = f"Environment variable {old_name} is deprecated."
+        if self.replacement is not None:
+            message += f" Please use {self.replacement} instead."
+        if self.note is not None:
+            message += f" {self.note}"
+        warnings.warn(message)
+        if self.replacement is not None:
+            value = os.environ[old_name]
+            if self.transform is not None:
+                value = self.transform(value)
+            os.environ[self.replacement] = value
+
+
+def _ms_to_s(value: str) -> str:
+    return str(float(value) / 1000.0)
+
+
+def _invert_bool(value: str) -> str:
+    return "0" if value.lower() in ("true", "1", "yes", "y") else "1"
+
+
+# The single registry for deprecated environment variables, processed once at
+# import by _handle_deprecated_envs(). Add new deprecations here instead of
+# ad-hoc warnings. For a rename where the old name must keep working through a
+# descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    # Renamed: the value is forwarded to the replacement.
+    "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
+    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": _DeprecatedEnv(
+        replacement="SGLANG_MOE_NVFP4_DISPATCH"
+    ),
+    "SGLANG_ENABLE_THINKING": _DeprecatedEnv(replacement="SGLANG_DEFAULT_THINKING"),
+    "SGLANG_REASONING_EFFORT": _DeprecatedEnv(
+        replacement="SGLANG_DSV4_REASONING_EFFORT"
+    ),
+    "SGLANG_USE_JIT_ALL_REDUCE": _DeprecatedEnv(
+        replacement="SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
+    ),
+    # The legacy DISABLE flags have the opposite polarity of their replacement.
+    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
+        replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
+    ),
+    # Renamed with a unit change.
+    "SGLANG_QUEUED_TIMEOUT_MS": _DeprecatedEnv(
+        replacement="SGLANG_REQ_WAITING_TIMEOUT",
+        transform=_ms_to_s,
+        note="Note the unit change: milliseconds -> seconds.",
+    ),
+    "SGLANG_FORWARD_TIMEOUT_MS": _DeprecatedEnv(
+        replacement="SGLANG_REQ_RUNNING_TIMEOUT",
+        transform=_ms_to_s,
+        note="Note the unit change: milliseconds -> seconds.",
+    ),
+    # Removed without replacement.
+    "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
+    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
+    "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
+    "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
+    "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
+    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
+    "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
+    # DSV4 compressor V2 is always used.
+    "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
+    # Replaced by CLI flags.
+    "SGLANG_ENABLE_GRPC": _DeprecatedEnv(
+        note="Please use '--grpc-port' to enable the native gRPC server."
+    ),
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
+        note="Please use '--enable-prefill-delayer' instead."
+    ),
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": _DeprecatedEnv(
+        note="Please use '--prefill-delayer-max-delay-passes' instead."
+    ),
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
+        note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
+        note="Please use '--moe-runner-backend=cutlass' and/or "
+        "'--speculative-moe-runner-backend=cutlass' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
+    ),
+    "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
+        note="DFlash now auto-enables the min-free-slots delay; unset this env. "
+        "To override the threshold, use '--min-free-slots-delay'."
+    ),
+    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
+        note="The unified radix tree is the default tree cache now; unset this "
+        "env. The field is still defined for legacy call sites."
+    ),
+}
+
+
+def _handle_deprecated_envs():
+    for old_name, deprecation in _DEPRECATED_ENVS.items():
+        deprecation.apply(old_name)
+
+    # Rewrite the legacy SGL_ prefix to SGLANG_ (names not covered above).
+    for key, value in list(os.environ.items()):
+        if key.startswith("SGL_") and key not in _DEPRECATED_ENVS:
+            new_key = key.replace("SGL_", "SGLANG_", 1)
             warnings.warn(
-                f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+                f"Environment variable {key} is deprecated, please use {new_key}"
             )
-            os.environ[new_name] = os.environ[old_name]
-
-
-def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
-    """Warn when a deprecated environment variable is used.
-
-    This is for env vars that are deprecated in favor of CLI flags.
-    """
-    if env_name in os.environ:
-        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+            os.environ[new_key] = value
 
 
 def third_party_cache_defaults() -> Dict[str, str]:
@@ -1580,157 +1722,11 @@ def redirect_third_party_caches():
         os.environ.setdefault(key, value)
 
 
-def _convert_SGL_to_SGLANG():
-    _print_deprecated_env("SGLANG_GC_LOG", "SGLANG_LOG_GC")
-    _print_deprecated_env(
-        "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "SGLANG_MOE_NVFP4_DISPATCH"
-    )
-    _print_deprecated_env(
-        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
-    )
-    _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
-    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
-    _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
-    _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
-    _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
-    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
-    _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
-    _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
-    _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
-    _print_deprecated_env(
-        "SGLANG_USE_JIT_ALL_REDUCE", "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
-    )
-    _deprecated_ms_to_s = {
-        "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
-        "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",
-    }
-    for old_name, new_name in _deprecated_ms_to_s.items():
-        if old_name in os.environ:
-            ms_val = os.environ[old_name]
-            warnings.warn(
-                f"Environment variable {old_name} (in ms) is deprecated, "
-                f"please use {new_name} (in seconds) instead"
-            )
-            os.environ[new_name] = str(float(ms_val) / 1000.0)
+_handle_deprecated_envs()
 
-    for key, value in os.environ.items():
-        if key.startswith("SGL_"):
-            new_key = key.replace("SGL_", "SGLANG_", 1)
-            warnings.warn(
-                f"Environment variable {key} is deprecated, please use {new_key}"
-            )
-            os.environ[new_key] = value
-
-
-_convert_SGL_to_SGLANG()
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_GRPC",
-    "Please use '--grpc-port' to enable the native gRPC server.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
-    "Please use '--enable-prefill-delayer' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES",
-    "Please use '--prefill-delayer-max-delay-passes' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
-    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_DFLASH_PREFILL_REFILL_TARGET",
-    "DFlash now auto-enables the min-free-slots delay; unset this env. To "
-    "override the threshold, use '--min-free-slots-delay'.",
-)
-
-# Import cuda_coredump to trigger auto-injection of CUDA env vars
-# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
-# set CUDA_* env vars in the shell before launching Python.
-import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
-
-
-def example_with_exit_stack():
-    # Use this style of context manager in unit test
-    exit_stack = ExitStack()
-    exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
-    assert envs.SGLANG_TEST_RETRACT.get() is False
-    exit_stack.close()
-    assert envs.SGLANG_TEST_RETRACT.get() is None
-
-
-def example_with_subprocess():
-    command = ["python", "-c", "import os; print(os.getenv('SGLANG_TEST_RETRACT'))"]
-    with envs.SGLANG_TEST_RETRACT.override(True):
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        process.wait()
-        output = process.stdout.read().decode("utf-8").strip()
-        assert output == "True"
-
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output = process.stdout.read().decode("utf-8").strip()
-    assert output == "None"
-
-
-def example_with_implicit_bool_avoidance():
-    @contextmanager
-    def assert_throws(message_matcher: str):
-        try:
-            yield
-        except Exception as e:
-            assert message_matcher in str(e), f"{e=}"
-            print(f"assert_throws find expected error: {e}")
-            return
-        raise AssertionError("assert_throws do not see exceptions")
-
-    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
-        if envs.SGLANG_TEST_RETRACT:
-            pass
-
-    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
-        if (1 != 1) or envs.SGLANG_TEST_RETRACT:
-            pass
-
-    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
-        if envs.SGLANG_TEST_RETRACT or (1 == 1):
-            pass
-
-
-def examples():
-    # Example usage for envs
-    envs.SGLANG_TEST_RETRACT.clear()
-    assert envs.SGLANG_TEST_RETRACT.get() is False
-
-    envs.SGLANG_TEST_RETRACT.set(None)
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
-
-    envs.SGLANG_TEST_RETRACT.clear()
-    assert not envs.SGLANG_TEST_RETRACT.is_set()
-
-    envs.SGLANG_TEST_RETRACT.set(True)
-    assert envs.SGLANG_TEST_RETRACT.get() is True
-
-    with envs.SGLANG_TEST_RETRACT.override(None):
-        assert (
-            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
-        )
-
-    assert envs.SGLANG_TEST_RETRACT.get() is True
-
-    envs.SGLANG_TEST_RETRACT.set(None)
-    with envs.SGLANG_TEST_RETRACT.override(True):
-        assert envs.SGLANG_TEST_RETRACT.get() is True
-
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
-
-    example_with_exit_stack()
-    example_with_subprocess()
-    example_with_implicit_bool_avoidance()
-
-
-if __name__ == "__main__":
-    examples()
+# Trigger auto-injection of CUDA coredump env vars when SGLANG_CUDA_COREDUMP=1.
+# Best-effort; for strict guarantees, set CUDA_* env vars in the shell before
+# launching Python. Imported conditionally to keep the default import of this
+# module free of non-stdlib side effects.
+if envs.SGLANG_CUDA_COREDUMP.get():
+    import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip

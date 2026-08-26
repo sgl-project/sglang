@@ -28,25 +28,21 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
+    can_use_linear_gelu,
+    can_use_ln_modulate,
     fused_gelu_active,
+    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.fused_ln_modulate import (
-    can_fuse_ln_modulate,
     fused_ln_modulate,
     fused_ln_modulate_active,
-    mark_fused_ln_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
-    can_use_fused_layernorm_modulate,
-    fused_layernorm_modulate,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    mark_fused_ln_modulate_site,
+    modulate_scale_shift,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -182,7 +178,7 @@ def _flux_norm_modulate(
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     if out is not None:
         return out
-    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
 
@@ -396,7 +392,7 @@ class FluxGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -420,7 +416,7 @@ class FluxFusedGELUProj(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -896,7 +892,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if fused_gelu_active(self) and can_fuse_linear_gelu(
+            if fused_gelu_active(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(

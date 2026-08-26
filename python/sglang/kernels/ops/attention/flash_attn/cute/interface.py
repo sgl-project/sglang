@@ -151,16 +151,34 @@ class FwdConfig:
 
 
 def _tile_size_fwd_sm90(
-    head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None
+    head_dim,
+    head_dim_v,
+    is_causal,
+    is_local,
+    sparse_block_size_q=None,
+    sparse_block_size_kv=None,
 ):
     """Return FwdConfig for SM90 forward.
 
     Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
     for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
 
-    When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
-    optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
+    When sparse block sizes are set, the compute tiles must respect both axes of
+    the sparse mask. The 64x64 case is used by SubBlock attention: every 64-row
+    query block has its own independently routed list of 64-row KV blocks, so it
+    cannot be coarsened to the usual 128x128 tile without changing the mask.
+
+    For other sparse masks, tile_m must divide sparse_block_size_q. For
+    head_dim <= 96 the optimal tile_m=192 is used when compatible, otherwise we
+    fall back to 128.
     """
+    if (
+        head_dim == 128
+        and sparse_block_size_q == 64
+        and sparse_block_size_kv == 64
+    ):
+        return FwdConfig(64, 64, True, True)
+
     if head_dim <= 64:
         # C++: 192×192 non-causal, 192×128 causal/local.
         # Python: 192×128 RS+OL is consistently best across seqlens.
@@ -718,8 +736,19 @@ def _flash_attn_fwd(
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
+            sparse_block_size_kv = (
+                block_sparse_tensors.block_size[1]
+                if block_sparse_tensors is not None
+                and block_sparse_tensors.block_size is not None
+                else None
+            )
             fwd_cfg = _tile_size_fwd_sm90(
-                head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q
+                head_dim,
+                head_dim_v,
+                causal,
+                local,
+                sparse_block_size_q=sparse_q,
+                sparse_block_size_kv=sparse_block_size_kv,
             )
     else:
         fwd_cfg = FwdConfig(

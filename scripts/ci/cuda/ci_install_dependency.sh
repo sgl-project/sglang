@@ -506,6 +506,17 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_nccl() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 # Trust an installed wheel only if the version matches and every RECORD file is
 # on disk (dist-info can survive a partial install - cf. the cusparselt guard).
 # reject-local refuses wheels installed from a local file: a kernel-PR job
@@ -843,6 +854,7 @@ main() {
     install_pytorch_stack
     install_cuda12_deepep_wheel
     install_sglang
+    install_nccl
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
