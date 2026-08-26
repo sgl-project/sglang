@@ -234,6 +234,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         params_dtype: Optional[torch.dtype] = None,
+        output_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
@@ -244,6 +245,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -537,10 +539,13 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         if self.tp_size == 1:
             with symm_alloc:
-                return self.quant_method.embedding(self, input_.long())
+                output_parallel = self.quant_method.embedding(self, input_.long())
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
         if self._use_triton_embedding(input_):
             with symm_alloc:
-                return fused_vocab_parallel_embedding(
+                output_parallel = fused_vocab_parallel_embedding(
                     input_,
                     self.weight,
                     self.shard_indices.org_vocab_start_index,
@@ -549,6 +554,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.shard_indices.added_vocab_start_index,
                     self.shard_indices.added_vocab_end_index,
                 )
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
         masked_input, input_mask = get_masked_input_and_mask(
             input_,
@@ -560,6 +568,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 

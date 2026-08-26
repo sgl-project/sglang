@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -430,6 +431,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+
+    # Trailing synthetic request rows of a padded CUDA-graph replay. Stamped by
+    # the graph runners for backends whose seq-len fill value is ambiguous
+    # (QSA's fill is 1, a legal real length); None outside replay.
+    num_padding: Optional[int] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -1021,6 +1027,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
+
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of THIS extend chunk covered by the tracked (extra-buffer) state.
+
+        The extra-buffer scheduler parks its snapshot at a `mamba_cache_chunk_size`
+        boundary, not at the current position, so anything snapshotting alongside it
+        needs the same boundary. Sole home of this math: `_init_track_conv_indices`
+        and the Qwen4-Exp PLE side states all call it so they cannot drift apart. The
+        `+1` that `_force_track_h` adds cancels under the floor division, which is
+        why one expression serves both.
+
+        None when tracking metadata is absent (no mask, or a prefill CUDA-graph
+        replay that does not carry `mamba_track_seqlens` — mamba skips tracking there
+        too). Masked-off rows hold garbage and are the caller's mask to handle.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+
+        chunk_size = mamba_cache_chunk_size()
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """

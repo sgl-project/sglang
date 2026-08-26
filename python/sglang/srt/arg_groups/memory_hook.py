@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
+def handle_offload_compatibility(server_args: Any) -> None:
+    """Validates only: the pinned PLE embedding must not ride generic offload.
+
+    Runs twice -- before the dummy-model boundary for explicit flags, and after
+    the model overrides materialize so the Qwen4-Exp declared default is seen.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+
 def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     """
     Configure GPU memory-dependent settings including

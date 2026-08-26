@@ -502,6 +502,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -526,6 +527,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -954,6 +956,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",

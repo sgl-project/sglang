@@ -81,6 +81,9 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
+        if self._is_qwen_qsa_draft_model():
+            return self._create_qwen_qsa_decode_backend()
+
         # Returns a per-step CONTAINER, not an AttentionBackend, so
         # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
         _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
@@ -112,6 +115,26 @@ class DraftBackendFactory:
         )
 
     def create_draft_extend_backend(self):
+        if self._is_qwen_qsa_draft_model():
+            from sglang.srt.layers.attention.qsa.config import (
+                QSA_VARIANT_COMPRESSED,
+                parse_qsa_profile,
+            )
+
+            profile = parse_qsa_profile(
+                self.draft_model_runner.model_config.hf_config
+            )
+            if profile is not None and profile.variant != QSA_VARIANT_COMPRESSED:
+                # Tokenwise QSA has no graph-stable indexer metadata; keep
+                # the intentional eager draft-extend path and never fall
+                # back to a dense backend.
+                return None
+            # Compressed QSA draft-extend uses the draft model runner's own
+            # (QSA-wrapped hybrid) backend.  Its replay path pads the
+            # variable accepted-token rows to the captured static width, so
+            # the draft-extend CUDA graph expresses the dynamic accept count.
+            return self.draft_model_runner.attn_backend
+
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
@@ -155,6 +178,26 @@ class DraftBackendFactory:
             )
             wrapped.decode_attention_backend_str = backend.decode_attention_backend_str
         return wrapped
+
+    def _is_qwen_qsa_draft_model(self) -> bool:
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        return is_qwen_qsa(self.draft_model_runner.model_config.hf_config)
+
+    def _create_qwen_qsa_decode_backend(self):
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseMultiStepDraftBackend,
+        )
+
+        backend = QwenSparseMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+        backend.prefill_attention_backend_str = "qsa"
+        backend.decode_attention_backend_str = "qsa"
+        for child in backend.attn_backends:
+            child.prefill_attention_backend_str = "qsa"
+            child.decode_attention_backend_str = "qsa"
+        return backend
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (

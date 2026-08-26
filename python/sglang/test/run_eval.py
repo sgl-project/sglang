@@ -299,6 +299,8 @@ def run_eval(args):
         return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
         return _run_sgl_eval("aime25", args)
+    elif args.eval_name == "aime26":
+        return _run_sgl_eval("aime26", args)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot

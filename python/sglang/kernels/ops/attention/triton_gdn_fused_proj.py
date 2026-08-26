@@ -171,6 +171,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
+    qkvz_row_stride,
+    ba_row_stride,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
@@ -185,19 +187,19 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
-    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
 
     # ── Read from contiguous input ──
     # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * TOTAL_QKVZ + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    blk_q_ptr = (
+        mixed_qkvz + i_bs * qkvz_row_stride + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    )
     # k for head group i_qk: in the all_k region
     blk_k_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
@@ -209,7 +211,11 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
     # dead branch is pruned before tl.arange validation.
     v_ld_base = (
-        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+        mixed_qkvz
+        + i_bs * qkvz_row_stride
+        + TOTAL_Q
+        + TOTAL_K
+        + i_qk * V_PER_GROUP * HEAD_V
     )
     z_ld_base = v_ld_base + TOTAL_V
 
@@ -250,12 +256,14 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * TOTAL_BA + i_qk * V_PER_GROUP + i
+        blk_b_ptr = mixed_ba + i_bs * ba_row_stride + i_qk * V_PER_GROUP + i
         blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
 
     for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        blk_a_ptr = (
+            mixed_ba + i_bs * ba_row_stride + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        )
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
@@ -319,6 +327,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         a,
         mixed_qkvz,
         mixed_ba,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
         num_heads_qk,
         num_heads_v,
         head_qk,
