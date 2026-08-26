@@ -66,7 +66,13 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
-from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    ParallelContext,
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -903,7 +909,7 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
             hot_items = pickle.loads(pickle.dumps(hot.mm_items))
 
             with (
-                patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
+                patch.object(ParallelContext, "config", SimpleNamespace(tp_size=1)),
                 patch(
                     "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
                     return_value=(
@@ -967,7 +973,7 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
     )
 
     with (
-        patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
+        patch.object(ParallelContext, "config", SimpleNamespace(tp_size=1)),
         patch(
             "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
             return_value=(torch.full((1, 3), 2.0), torch.tensor([[1, 1, 1]])),

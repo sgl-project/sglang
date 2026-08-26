@@ -185,7 +185,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
         ]
         self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
+            draft_tp_context
+            if get_parallel().config.enable_dp_attention
+            else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)

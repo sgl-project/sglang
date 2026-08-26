@@ -44,7 +44,13 @@ export const config = {
     { id: "quant", title: "Quantization", options: [
       { id: "bf16",  label: "BF16"  },
       { id: "fp8",   label: "FP8"   },
-      { id: "nvfp4", label: "NVFP4" },
+      // Two NVFP4 exports ship separately, differing only in the lm_head:
+      // one keeps it dense bf16, the other packs it to FP4. The bf16 head is
+      // ~1.7GB larger on disk (~3.2GB at runtime), so it is strictly the
+      // harder of the two to fit -- which is why the FP4-head cells reuse the
+      // BF16-head recipes verbatim.
+      { id: "nvfp4-bf16-head", label: "NVFP4-BF16-Head" },
+      { id: "nvfp4-fp4-head",  label: "NVFP4-FP4-Head"  },
     ] },
     { id: "nodes", title: "Nodes", options: [
       { id: "single", label: "Single Node" },
@@ -62,7 +68,7 @@ export const config = {
           id: "eagle", label: "EAGLE",
           // In-checkpoint MTP head; the only availability constraint is the
           // 32GB RTX 5090, where it needs the NVFP4 weights to leave room.
-          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
           disableReason:
             "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
           // EAGLE and DSPARK need opposite mem-fraction corrections on the
@@ -100,7 +106,7 @@ export const config = {
           // EAGLE. No --min-free-slots-delay: at --max-running-requests 1 it
           // is a strict no-op, and its real semantic (disable the delayer)
           // would silently bite anyone raising concurrency to 8+.
-          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
           disableReason:
             "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
           stripPrefixes: (sel) =>
@@ -115,7 +121,16 @@ export const config = {
             // CUDA-graph capture no longer fit there. fp32 is greyed out by the
             // SSM dtype row. EAGLE and no-speculation are unaffected: replayssm
             // keeps EAGLE's state pool tiny and no-spec loads no draft weights.
-            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
+            // Measured on the 5090 at the commit the Install accordion pins:
+            // bf16 serves at 0.88, and on the FP4-head export fp32 serves at
+            // 0.89 on the balanced ratio (pool 25,911 / K=6 low-latency,
+            // 29,490 / K=5 high-throughput). fp32 on the BF16-head export is
+            // greyed out by the SSM dtype row.
+            ...(sel.hw === "rtx5090"
+              ? [sel.ssmDtype === "float32"
+                  ? "--mem-fraction-static 0.89"
+                  : "--mem-fraction-static 0.88"]
+              : []),
           ],
         },
         {
@@ -127,11 +142,17 @@ export const config = {
           // RTX PRO 6000 BF16/FP8 cells boot-and-serve). The platforms where
           // it has not been exercised carry verificationStatus "in-progress"
           // on their cells.
-          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
           disableReason:
             "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
+          // fp32 needs the balanced ratio overridden, so that family is
+          // stripped as well and re-emitted below.
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+            sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
+                : ["--mem-fraction-static"]
+              : [],
           flags: (sel) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
@@ -143,8 +164,16 @@ export const config = {
             // is the fastest recipe on this card (4.92ms median TPOT, 4.29
             // accept length). fp32 is greyed out by the SSM dtype row.
             ...(sel.hw === "rtx5090"
-              ? ["--mem-fraction-static 0.91",
-                 "--chunked-prefill-size 1024"]
+              ? sel.ssmDtype === "float32"
+                // FP4-head export, High-Throughput only (the SSM dtype row
+                // greys out the Low-Latency tier). The balanced ratio is
+                // overridden because these cells pin --max-running-requests 1,
+                // so it provisions KV for concurrency the recipe never uses and
+                // starves the state pool of the slots fp32 needs.
+                ? ["--mem-fraction-static 0.895",
+                   "--mamba-full-memory-ratio 10"]
+                : ["--mem-fraction-static 0.91",
+                   "--chunked-prefill-size 1024"]
               : []),
           ],
         },
@@ -200,17 +229,32 @@ export const config = {
           // against bfloat16's 78MB, which is why only fp32 is caught. EAGLE and
           // no-speculation are unaffected -- replayssm keeps EAGLE's pool tiny
           // and no-spec loads no draft weights at all.
+          // The 32GB RTX 5090 is the only card where an fp32 state pool and a
+          // draft model compete, and how badly depends on the lm_head:
+          //   BF16 head — the dense head's ~3.2GB leave no fp32 pool that also
+          //     clears prefill CUDA-graph capture, for either draft model.
+          //     Measured across 0.86-0.96 at both chunk sizes, plus balanced-
+          //     ratio overrides to 20.
+          //   FP4 head  — the packed head frees that headroom back: DSpark
+          //     serves at 0.89 on the balanced ratio and DFlash2 High-Throughput
+          //     at 0.895 with the ratio overridden to 10. Only DFlash2
+          //     Low-Latency stays out of reach: S=5 fp32 slots plus a full
+          //     request's KV never coexist -- buying the fifth slot cuts KV to
+          //     7,752 tokens against the 9,216 one 8192/1024 request needs, and
+          //     generation stops after a single token.
           disabled: (sel) =>
             sel.hw === "rtx5090" &&
-            (sel.spec === "dflash" || sel.spec === "dspark"),
+            (sel.quant === "nvfp4-bf16-head"
+              ? sel.spec === "dflash" || sel.spec === "dspark"
+              : sel.spec === "dflash" && sel.tier === "low-latency"),
           disableReason:
-            "On the 32GB RTX 5090 an fp32 GDN state pool and a speculative draft model " +
-            "do not fit together — use bfloat16",
+            "On the 32GB RTX 5090 this combination has no fp32 GDN state pool that " +
+            "also leaves room for prefill graph capture — use bfloat16",
           flags: ["--mamba-ssm-dtype float32"],
         },
         {
           id: "bfloat16", label: "bfloat16",
-          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
+          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
           disableReason:
             "On the 32GB RTX 5090 the bf16 GDN state pool is only a live choice for NVFP4; " +
             "the BF16 and FP8 checkpoints have no serviceable cell on this card",
@@ -222,7 +266,8 @@ export const config = {
   modelNames: {
     "default|bf16":  "Qwen/Qwen3.8-27B",
     "default|fp8":   "Qwen/Qwen3.8-27B-FP8",
-    "default|nvfp4": "RadixArk/Qwen3.8-27B-NVFP4",
+    "default|nvfp4-bf16-head": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+    "default|nvfp4-fp4-head":  "RadixArk/Qwen3.8-27B-NVFP4",
   },
 
   placeholders: {
@@ -467,7 +512,28 @@ export const config = {
     {
       // The page's headline recipe: NVFP4 W4A4 on the 96GB workstation card,
       // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", nodes: "single" },
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.85",
+        "--attention-backend flashinfer",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same recipe as the BF16-head cell above: the FP4 head is smaller,
+      // so anything that fits the bf16 head fits here with room to spare.
+      // The page's headline recipe: NVFP4 W4A4 on the 96GB workstation card,
+      // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
+      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -526,7 +592,42 @@ export const config = {
       // flight; --cuda-graph-max-bs 1 also protects the token pool (default
       // capture set costs 39,247 -> 37,347 and K 8 -> 7). The `warn` below
       // carries the user-facing guidance for raising concurrency.
-      match: { hw: "rtx5090", variant: "default", quant: "nvfp4", nodes: "single" },
+      match: { hw: "rtx5090", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
+      verified: true,
+      // Rendered with the cell so nobody ships the bs=1 pins into a
+      // multi-user deployment unaware.
+      warn:
+        "This recipe serves ONE request at a time: --max-running-requests 1 " +
+        "and --cuda-graph-max-bs 1 pin it to the validated single-stream " +
+        "envelope. To handle more concurrent requests, raise both flags " +
+        "together and re-derive --mamba-full-memory-ratio (and mem-fraction) " +
+        "with the [Mamba ratio calculator](#mamba-ratio-calculator) — on this " +
+        "32GB card the GDN state pool, not KV, is what runs out first.",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.9",
+        "--attention-backend flashinfer",
+        "--max-running-requests 1",
+        "--cuda-graph-max-bs 1",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same recipe as the BF16-head cell above: the FP4 head is smaller,
+      // so anything that fits the bf16 head fits here with room to spare.
+      // RTX 5090 32GB. NVFP4 is the only checkpoint that fits (FP8 does not
+      // boot — total_rest_memory negative at every mem-fraction, measured —
+      // and BF16 does not fit). Published operating point is ONE request in
+      // flight; --cuda-graph-max-bs 1 also protects the token pool (default
+      // capture set costs 39,247 -> 37,347 and K 8 -> 7). The `warn` below
+      // carries the user-facing guidance for raising concurrency.
+      match: { hw: "rtx5090", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       verified: true,
       // Rendered with the cell so nobody ships the bs=1 pins into a
       // multi-user deployment unaware.
@@ -578,7 +679,29 @@ export const config = {
     // packed-head export also served its DFLASH2 cells on this platform in the
     // 12-cell DFLASH2 pass.
     {
-      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included — its selector folded into the draft CUDA graph in all four
+      // of its cells here.
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.80",
+        "--attention-backend flashinfer",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same recipe as the BF16-head cell above: the FP4 head is smaller,
+      // so anything that fits the bf16 head fits here with room to spare.
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
       // included — its selector folded into the draft CUDA graph in all four
       // of its cells here.
@@ -642,7 +765,29 @@ export const config = {
     // engine default — no pin, so cell and measurement see the same kernel).
     // Verified envelope: spec none|eagle at engine-default tier/state dtype.
     {
-      match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
+      verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same recipe as the BF16-head cell above: the FP4 head is smaller,
+      // so anything that fits the bf16 head fits here with room to spare.
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       verified: true,
       // DFLASH2 has not been exercised on this platform; every other overlay
       // pick keeps this cell's original validation.

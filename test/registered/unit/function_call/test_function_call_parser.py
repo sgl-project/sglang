@@ -1,3 +1,4 @@
+import functools
 import json
 import unittest
 
@@ -16,6 +17,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=61, suite="base-c-test-cpu")
+
+
+@functools.lru_cache(maxsize=None)
+def _shared_tokenizer(path: str):
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+    return get_tokenizer(path)
 
 
 class TestBaseFormatDetector(unittest.TestCase):
@@ -339,9 +347,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
@@ -789,9 +795,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):

@@ -1235,14 +1235,17 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
             "minicpm_flashinfer": "flashinfer",
         }
-        for backend_field in (
-            "attention_backend",
-            "prefill_attention_backend",
-            "decode_attention_backend",
-        ):
-            dense_backend = dense_backends.get(getattr(server_args, backend_field))
-            if dense_backend is not None:
-                overrides[backend_field] = dense_backend
+        # Literal keys keep the written-field set statically derivable; a loop
+        # variable hides it from the census in test_chain_read_ratchet.py.
+        dense_attention = dense_backends.get(server_args.attention_backend)
+        if dense_attention is not None:
+            overrides["attention_backend"] = dense_attention
+        dense_prefill = dense_backends.get(server_args.prefill_attention_backend)
+        if dense_prefill is not None:
+            overrides["prefill_attention_backend"] = dense_prefill
+        dense_decode = dense_backends.get(server_args.decode_attention_backend)
+        if dense_decode is not None:
+            overrides["decode_attention_backend"] = dense_decode
     elif has_sparse_attention:
         uses_sparse_backend = server_args.is_attention_backend_not_set() or any(
             backend in ("minicpm_flashattn", "minicpm_flashinfer")
@@ -1479,8 +1482,32 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_sm100_supported() and server_args.attention_backend is None:
-        overrides["attention_backend"] = "flashinfer"
+    if is_blackwell_supported() and server_args.is_attention_backend_not_set():
+        if server_args.speculative_algorithm is not None:
+            speculative_algorithm = server_args.speculative_algorithm.upper()
+            if is_sm100_supported() and server_args.speculative_eagle_topk in (
+                None,
+                1,
+            ):
+                overrides["attention_backend"] = "trtllm_mha"
+                if server_args.page_size is None:
+                    overrides["page_size"] = 64
+                if server_args.mamba_radix_cache_strategy == "auto":
+                    overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "triton"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "flashinfer"
+        elif is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
     return overrides
 
 
@@ -1677,6 +1704,10 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);
+        # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1697,6 +1728,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);
+        # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
         "Qwen3NextForCausalLM",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",

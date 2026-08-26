@@ -128,12 +128,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-            self.packed_device_k_data_ptrs = torch.cat(
-                [pool.k_data_ptrs for pool in device_pools]
-            )
-            self.packed_device_v_data_ptrs = torch.cat(
-                [pool.v_data_ptrs for pool in device_pools]
-            )
+            if not _is_npu:
+                self.packed_device_k_data_ptrs = torch.cat(
+                    [pool.k_data_ptrs for pool in device_pools]
+                )
+                self.packed_device_v_data_ptrs = torch.cat(
+                    [pool.v_data_ptrs for pool in device_pools]
+                )
+            else:
+                self.packed_device_k_data_ptrs = None
+                self.packed_device_v_data_ptrs = None
             self.packed_device_k_buffers = [
                 buffer for pool in device_pools for buffer in pool.k_buffer
             ]
