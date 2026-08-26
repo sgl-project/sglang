@@ -37,6 +37,7 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -3176,6 +3177,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._dspark_pre_logits_hook = None
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -3193,6 +3195,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def set_dspark_pre_logits_hook(self, hook) -> None:
+        self._dspark_pre_logits_hook = hook
 
     @torch.no_grad()
     def forward(
@@ -3212,6 +3217,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+                if (
+                    self._dspark_pre_logits_hook is not None
+                    and get_is_capture_mode()
+                    and forward_batch.forward_mode.is_target_verify()
+                ):
+                    aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+                    self._dspark_pre_logits_hook(aux_hidden_states)
             return self.logits_processor(
                 input_ids,
                 hidden_states,

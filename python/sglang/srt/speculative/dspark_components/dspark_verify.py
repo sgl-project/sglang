@@ -579,6 +579,15 @@ class DsparkVerifyEpilogue:
         self._main_proj_stream = (
             torch.cuda.Stream() if self._early_main_proj else None
         )
+        self._preprojected_hidden: Optional[torch.Tensor] = None
+
+    def install_pre_logits_hook(self, model) -> None:
+        setter = getattr(model, "set_dspark_pre_logits_hook", None)
+        if self._early_main_proj and setter is not None:
+            setter(self.pre_logits_capture_hook)
+
+    def pre_logits_capture_hook(self, compact_hidden: torch.Tensor) -> None:
+        self._preprojected_hidden = self._start_main_proj(compact_hidden)
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -660,7 +669,10 @@ class DsparkVerifyEpilogue:
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         verify_lens = self.verify_lens_buf[:bs]
-        projected_hidden = self._start_main_proj(compact_hidden)
+        projected_hidden = self._preprojected_hidden
+        self._preprojected_hidden = None
+        if projected_hidden is None:
+            projected_hidden = self._start_main_proj(compact_hidden)
         self._scatter_logits(compact_logits, verify_lens, bs)
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
         compact_for_scatter = self._finish_main_proj(projected_hidden, compact_hidden)

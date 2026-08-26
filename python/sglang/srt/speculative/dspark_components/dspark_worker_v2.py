@@ -266,6 +266,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            self._verify_epilogue.install_pre_logits_hook(self.model_runner.model)
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         if (
