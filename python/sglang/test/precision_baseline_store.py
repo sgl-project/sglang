@@ -26,6 +26,16 @@ from huggingface_hub.errors import (
 )
 
 
+def _store_token() -> Optional[str]:
+    """Write token for the baseline dataset repo.
+
+    Deliberately not HF_TOKEN: that name already carries the runner's
+    gated-model read token, so writing the store token there would shadow it
+    and turn every gated model on the job into a 401.
+    """
+    return os.environ.get("SGLANG_PRECISION_HF_TOKEN") or None
+
+
 @dataclass
 class HfStoreConfig:
     repo: str
@@ -38,7 +48,7 @@ class HfStoreConfig:
             raise RuntimeError(
                 "SGLANG_PRECISION_HF_REPO is not set. The precision baseline "
                 "store is required (there is no local-only mode); set the repo "
-                "and HF_TOKEN_PRECISION_STORE."
+                "and SGLANG_PRECISION_HF_TOKEN."
             )
         revision = os.environ.get("SGLANG_PRECISION_HF_REVISION", "main")
         return cls(repo=repo, revision=revision)
@@ -148,6 +158,7 @@ def fetch_latest_baseline(
             repo_type="dataset",
             revision=config.revision,
             allow_patterns=[f"{run_path}/tensors/*"],
+            token=_store_token(),
         ),
         what="snapshot download",
     )
@@ -171,6 +182,7 @@ def _read_manifest(config: HfStoreConfig) -> tuple[list[dict[str, Any]], str]:
                 repo_type="dataset",
                 filename="manifest.jsonl",
                 revision=config.revision,
+                token=_store_token(),
             ),
             what="manifest fetch",
         )
@@ -215,7 +227,7 @@ def push_run(
     # Dedup: same model+date+sha → skip tensor upload but still refresh meta
     # + comparator_report + append a new manifest row, so pass-1 baseline and
     # pass-2 stats both land. force=True re-uploads tensors too.
-    api = HfApi()
+    api = HfApi(token=_store_token())
     date_str, date_path = _today_path()
     model_sanitized = _sanitize_model_name(model)
     sha7 = (
@@ -306,7 +318,7 @@ def prune_old_runs(
     # dry_run defaults True because model=None+keep_days=0 would wipe the
     # store. Live mode rewrites the manifest before deleting folders so a
     # mid-run failure leaves manifest pointing at the kept rows only.
-    api = HfApi()
+    api = HfApi(token=_store_token())
     rows, _ = _read_manifest(config)
     if not rows:
         return {"kept": [], "pruned": []}

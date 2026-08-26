@@ -25,8 +25,6 @@ limitations under the License.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-using namespace host;
-
 // clang-format off
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -37,6 +35,10 @@ using namespace host;
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 // clang-format on
+
+namespace sglang {
+
+using namespace host;
 
 #define CUTLASS_CHECK(status)                                                        \
   {                                                                                  \
@@ -278,6 +280,8 @@ void launch_sm120_fp8_blockwise_scaled_mm(
 }
 
 // Transposed GEMM D^T = Wgemm(weight, activation): puts tokens on the N axis.
+// EpilogueTileShape selects the epilogue subtile; EpilogueTileAuto resolves to
+// (64, min(CTA_N,32)) here -- see sm120_builder.inl.
 template <
     typename OutType,
     typename MmaTileShape,
@@ -391,7 +395,7 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
       OperatorClass,
       PerSmTileShape,
       ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
+      EpilogueTileShape,
       ElementAccumulator,
       ElementAccumulator,
       ElementC,
@@ -439,13 +443,34 @@ void sm120_fp8_blockwise_dispatch_shape(
     cudaStream_t stream) {
   const int m = a.size(0);
   using EpilogueTileShape = Shape<_128, _64>;
-  if (m <= 64 || (m % 4 != 0)) {
+
+  // swapAB keeps the weight on the gemm-M axis and the tokens on gemm-N, so it reads the
+  // weight once per token tile and needs only (128+TileN)*128 bytes of smem per stage.
+  // It stays ahead of the non-swapAB path well past the old m<=64 crossover: autotuned
+  // over 12 tactics x M in {4..1024} x all five Qwen3.x-27B-FP8 TP1 decode shapes
+  // (cold-L2 CUPTI + CUDA graph, one GPU per shape), the old crossover cost 4.5-7.3% of a
+  // full pass for m in [96, 256] -- e.g. out_proj at m=96: 51.74us non-swapAB (StreamK,
+  // 188 CTAs) vs 38.23us swapAB (120 CTAs).
+  if (m <= 128 || (m % 4 != 0)) {
     launch_sm120_fp8_blockwise_scaled_mm_swapab<
         OutType,
         Shape<_128, _32, _128>,
         Shape<_128, _32, _128>,
-        EpilogueTileShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
         Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
+    return;
+  }
+
+  // 128 < m <= 256: a 64-wide token tile amortizes the weight read over twice as many
+  // tokens per pass. 3 stages instead of 4 ((128+64)*128 = 24576 B per stage), which the
+  // sweep shows costs nothing.
+  if (m <= 256) {
+    launch_sm120_fp8_blockwise_scaled_mm_swapab<
+        OutType,
+        Shape<_128, _64, _128>,
+        Shape<_128, _64, _128>,
+        Shape<_128, _32>,
+        Shape<_1, _64, _1>>(out, a, b, scales_a, scales_b, stream);
     return;
   }
 
@@ -500,3 +525,5 @@ inline void fp8_blockwise_scaled_mm_sm120(
 }
 
 #endif  // defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+}  // namespace sglang

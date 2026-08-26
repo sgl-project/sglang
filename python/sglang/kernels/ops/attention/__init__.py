@@ -116,6 +116,8 @@ for _mod, _fn in [
     ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
     ("dcp_kernels", "create_dcp_kv_indices"),
     ("dcp_kernels", "correct_attn_out"),
+    ("dcp_kernels", "dcp_lse_combine_triton"),
+    ("dcp_kernels", "dcp_pack_a2a_send"),
     ("pa_page_table", "_build_pa_page_table"),
     ("nsa_triton_decode", "triton_sparse_attn_decode"),
 ]:

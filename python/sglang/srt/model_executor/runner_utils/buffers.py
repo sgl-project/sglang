@@ -421,21 +421,20 @@ class PrefillInputBuffers(ForwardInputBuffers):
         self.positions[:raw_num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
 
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            self.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+        if self.mamba_track_indices is not None:
+            if forward_batch.mamba_track_indices is not None:
+                self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
+            self.mamba_track_indices[bs:].zero_()
+        if self.mamba_track_mask is not None:
+            if forward_batch.mamba_track_mask is not None:
+                self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
+            else:
+                self.mamba_track_mask[:bs].zero_()
+            self.mamba_track_mask[bs:].zero_()
+        if self.mamba_track_seqlens is not None:
+            if forward_batch.mamba_track_seqlens is not None:
+                self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+            self.mamba_track_seqlens[bs:].zero_()
 
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_tokens].copy_(

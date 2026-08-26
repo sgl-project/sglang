@@ -1,3 +1,4 @@
+import json
 import math
 import os
 
@@ -28,7 +29,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
+    LTX2DurationStage,
     LTX2HalveResolutionStage,
     LTX2LoRASwitchStage,
     LTX2RefinementStage,
@@ -168,6 +170,20 @@ class LTX2SigmaPreparationStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
+        pinned_sigmas = server_args.pipeline_config.default_sigmas
+        if pinned_sigmas:
+            # Distilled checkpoints ship an explicit schedule; a generic linear
+            # one silently costs quality.
+            if int(batch.num_inference_steps) != len(pinned_sigmas):
+                logger.info(
+                    "Overriding num_inference_steps=%d with the pinned distilled "
+                    "sigma schedule (%d steps).",
+                    int(batch.num_inference_steps),
+                    len(pinned_sigmas),
+                )
+            batch.sigmas = list(pinned_sigmas)
+            batch.num_inference_steps = len(pinned_sigmas)
+            return batch
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
             # Gate on pipeline class to mirror the three official entry points:
             # - HQ (`ti2vid_two_stages_hq.py:164`) calls
@@ -220,6 +236,11 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
             LTX2TextConnectorStage(connectors=pipeline.get_module("connectors")),
         ]
     )
+    # Must run before latent preparation, which derives shapes from
+    # `num_frames`. A no-op unless the request sets `auto_duration`.
+    duration_head = pipeline.get_module("duration_head", None)
+    if duration_head is not None:
+        pipeline.add_stage(LTX2DurationStage(duration_head=duration_head))
 
 
 def _add_ltx2_stage1_generation_stages(
@@ -260,6 +281,8 @@ def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
             audio_vae=pipeline.get_module("audio_vae"),
             vocoder=pipeline.get_module("vocoder"),
             pipeline=pipeline,
+            # LTX-2.5 only; None elsewhere, which keeps the VAE decode path.
+            diffusion_decoder=pipeline.get_module("diffusion_decoder", None),
         )
     )
 
@@ -314,9 +337,88 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         "connectors",
     ]
 
+    # `model_index.json` points at the distilled DiT; the full / SFT weights in
+    # `transformer_full/` are deliberately omitted from it.
+    _DEV_VARIANTS = frozenset({"dev", "full", "sft"})
+    _DEV_TRANSFORMER_SUBFOLDER = "transformer_full"
+
+    def __init__(self, model_path, server_args, required_config_modules=None, **kwargs):
+        self._maybe_route_dev_transformer(model_path, server_args)
+        # LTX-2 / 2.3 ship neither. The small duration head is always available
+        # when declared; the much larger decoder is loaded only on request.
+        modules = list(required_config_modules or self._required_config_modules)
+        if "duration_head" not in modules and self._declares_component(
+            model_path, "duration_head"
+        ):
+            modules.append("duration_head")
+        if server_args.load_diffusion_decoder:
+            if not self._declares_component(model_path, "diffusion_decoder"):
+                raise ValueError(
+                    "--load-diffusion-decoder was requested, but this checkpoint "
+                    "does not declare a diffusion_decoder component."
+                )
+            if "diffusion_decoder" not in modules:
+                modules.append("diffusion_decoder")
+        super().__init__(
+            model_path, server_args, required_config_modules=modules, **kwargs
+        )
+
+    @classmethod
+    def _is_dev_variant(cls, server_args: ServerArgs) -> bool:
+        return str(server_args.model_variant or "").lower() in cls._DEV_VARIANTS
+
+    @classmethod
+    def _maybe_route_dev_transformer(cls, model_path: str, server_args: ServerArgs):
+        """Point the transformer at `transformer_full/` for the dev variant."""
+        if not cls._is_dev_variant(server_args):
+            return
+        if server_args.component_paths.get("transformer"):
+            return
+        full_path = os.path.join(str(model_path), cls._DEV_TRANSFORMER_SUBFOLDER)
+        if not os.path.isdir(full_path):
+            raise ValueError(
+                f"--model-variant {server_args.model_variant} requires "
+                f"'{cls._DEV_TRANSFORMER_SUBFOLDER}' in the checkpoint, but "
+                f"{full_path} does not exist. It is excluded from "
+                "`model_index.json`, so a partial snapshot download may have "
+                "skipped it."
+            )
+        server_args.component_paths["transformer"] = full_path
+        logger.info("Serving the LTX-2.5 dev transformer from %s", full_path)
+
+    @staticmethod
+    def _declares_component(model_path: str, component_name: str) -> bool:
+        index_path = os.path.join(str(model_path), "model_index.json")
+        if not os.path.exists(index_path):
+            return False
+        try:
+            with open(index_path) as f:
+                model_index = json.load(f)
+        except (OSError, ValueError):
+            return False
+        entry = model_index.get(component_name)
+        # model_index.json records absent optional components as [null, null].
+        return bool(entry) and entry[0] is not None
+
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
-        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+        scheduler_overrides: dict = {}
+        if self._is_dev_variant(server_args):
+            # `scheduler/` is configured for the distilled DiT; the full DiT
+            # needs the shifting back.
+            scheduler_overrides = {
+                "use_dynamic_shifting": True,
+                "shift_terminal": 0.1,
+            }
+            # It is also driven by a step count, not the distilled sigma list.
+            server_args.pipeline_config.default_sigmas = None
+            logger.info(
+                "LTX-2.5 dev variant: re-enabled dynamic shifting and dropped the "
+                "pinned distilled sigma schedule."
+            )
+        self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(
+            orig.config, **scheduler_overrides
+        )
         sync_ltx23_runtime_vae_markers(
             server_args.pipeline_config.vae_config.arch_config,
             getattr(self.get_module("vae"), "config", None),
@@ -381,12 +483,17 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
     ) -> None:
         self.exit_phase(self._phase(use))
 
-    def prepare_after_request(
+    def finish_request(
         self,
         module: torch.nn.Module,
         use: ComponentUse,
         state: ResidencyState,
+        *,
+        preferred: bool,
     ) -> None:
+        if not preferred:
+            self.finish_use(module, use, state)
+            return
         phase = self._phase(use)
         if phase != self.manager._active_phase:
             self.enter_phase(phase)
@@ -437,7 +544,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
 class LTX2TwoStageResidencyController:
     """
     LTX-2.3 two-stage residency controller.
-    It builds the selected LTX2 ComponentResidencyStrategy and keeps the
+    It builds the selected LTX2 component residency strategy and keeps the
     thin stage adapter methods that are specific to two-stage LoRA flow.
 
     Modes:
@@ -582,8 +689,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.modules["spatial_upsampler"] = module
         self.memory_usages["spatial_upsampler"] = memory_usage
 
+        # LTX-2 / 2.3 merge a distilled LoRA per stage; LTX-2.5's transformer
+        # is already distilled, so the LoRA is optional there.
         distilled_lora_path = server_args.component_paths.get("distilled_lora")
-        if not distilled_lora_path:
+        if not distilled_lora_path and not self._transformer_is_predistilled(
+            server_args
+        ):
             raise ValueError(
                 f"{self.pipeline_name} requires --distilled-lora-path "
                 "(component_paths['distilled_lora'])."
@@ -598,6 +709,15 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         # once at init (see _merge_stage1_distilled_into_base).
         self._stage1_distilled_in_base = False
         self._stage1_distilled_base_strength: float | None = None
+
+    @staticmethod
+    def _transformer_is_predistilled(server_args: ServerArgs) -> bool:
+        """Whether the checkpoint's own transformer is already distilled.
+
+        True for LTX-2.5, whose `model_index.json` points at the distilled DiT
+        and which pins the distilled sigma schedule rather than shipping a LoRA.
+        """
+        return bool(server_args.pipeline_config.default_sigmas)
 
     def _initialize_premerged_stage2_transformer(self, server_args: ServerArgs) -> None:
         transformer_path = self._resolve_component_path(
@@ -740,6 +860,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return False
 
     def should_skip_ltx2_lora_switch_stage(self) -> bool:
+        # Nothing to switch when the DiT is already distilled (LTX-2.5): there
+        # is no distilled LoRA, and both stages run the same weights.
+        if self._distilled_lora_path is None:
+            return True
         return (
             self._use_premerged_stage2_transformer
             and self._ltx2_residency.mode == "resident"
@@ -820,6 +944,11 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         return lora_nicknames, lora_paths, lora_strengths, lora_targets
 
     def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None:
+        # A pre-distilled DiT has no LoRA to switch to and runs the same
+        # weights in both stages. Guarding here covers every caller.
+        if self._distilled_lora_path is None:
+            self._active_lora_phase = phase
+            return
         distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
         phase_signature = (phase, distilled_lora_strength)
         if phase_signature == self._active_lora_signature:

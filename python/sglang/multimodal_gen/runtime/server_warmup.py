@@ -253,15 +253,16 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        progress_n = self._warmup_processed
         if _is_ci_log_env():
             logger.info(
                 "Warmup requests: %s/%s %s",
-                self._warmup_progress_bar.n,
+                progress_n,
                 self._warmup_progress_bar.total,
                 self._format_warmup_req(req_or_group),
             )
 
-        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
+        if progress_n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()
             self._warmup_progress_bar = None
 

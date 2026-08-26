@@ -37,8 +37,10 @@ from .common import (
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
@@ -224,6 +226,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_has_sidecar_config = False
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -231,7 +234,14 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        kwargs["gguf_file"] = model
+        gguf_has_sidecar_config = gguf_sidecar_dir(model, "config.json") is not None
+        if not gguf_has_sidecar_config and has_native_gguf_support(model):
+            config = build_gguf_config(model)
+            if model_override_args:
+                config.update(model_override_args)
+            return config
+        if not gguf_has_sidecar_config:
+            kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
@@ -264,9 +274,13 @@ def get_config(
             else:
                 setattr(config, key, value)
 
-    if is_gguf:
+    if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+            raise RuntimeError(
+                f"Can't get gguf config for {config.model_type}. Place a "
+                "config.json next to the .gguf file to load the config from "
+                "there instead."
+            )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
     return config

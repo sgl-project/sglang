@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -371,6 +372,7 @@ class HeliosCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             skip_sequence_parallel=True,
+            is_cross_attention=True,
         )
 
     def project_kv(self, encoder_hidden_states):
@@ -559,9 +561,8 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     with zero_history_timestep and guidance_cross_attn.
     """
 
-    _fsdp_shard_conditions = HeliosConfig()._fsdp_shard_conditions
-    _compile_conditions = HeliosConfig()._compile_conditions
-    _supported_attention_backends = HeliosConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = HeliosConfig().param_names_mapping
     reverse_param_names_mapping = HeliosConfig().reverse_param_names_mapping
     lora_param_names_mapping = HeliosConfig().lora_param_names_mapping

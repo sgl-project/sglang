@@ -35,7 +35,11 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -65,10 +69,17 @@ class MambaComponent(TreeComponent):
                 params.page_size == 1
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
         super().__init__(cache, params)
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        # params.page_size is the tree page the allocator actually uses, already
+        # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
+        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]
@@ -153,10 +164,12 @@ class MambaComponent(TreeComponent):
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
-        # that lies beyond the current Mamba boundary.
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
         aligned_seqlen = (
-            result.full_kv_hit_length // self.mamba_cache_chunk_size
-        ) * self.mamba_cache_chunk_size
+            result.full_kv_hit_length // self.mamba_checkpoint_grid
+        ) * self.mamba_checkpoint_grid
         branching_seqlen = (
             aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
         )
@@ -667,10 +680,11 @@ class MambaComponent(TreeComponent):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        host_indices = self._mamba_pool_host.alloc(1)
-        if host_indices is None:
-            self.cache.evict_host(1, ComponentType.MAMBA)
-            host_indices = self._mamba_pool_host.alloc(1)
+        host_indices = self.cache.host_pool_group.alloc(
+            1,
+            pool=PoolName.MAMBA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.MAMBA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -884,7 +898,7 @@ class MambaComponent(TreeComponent):
         if self._mamba_pool_host is None:
             return
         for host_value in host_values:
-            self._mamba_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.MAMBA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):

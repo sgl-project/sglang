@@ -1,0 +1,286 @@
+---
+title: "Qwen3.8-Max"
+metatags:
+  description: "Deploy Qwen3.8-Max model with SGLang on Ascend NPUs, including multi-node deployment mode."
+---
+
+## Introduction
+
+Qwen3.8-Max (published as Qwen3.8-2.4T-A95B) is a Mixture-of-Experts (MoE) model with 2.4 trillion total
+parameters and 95B activated per token. It uses a 92-layer hybrid architecture that combines Gated Delta
+Network (GDN) linear-attention with full-attention layers. The model has a native context length of 262,144
+tokens (extensible to over 1 million) and built-in multi-token prediction (MTP) weights for speculative
+decoding.
+
+This document demonstrates the deployment of Qwen3.8-Max on Ascend NPUs using SGLang, including multi-node PD
+mixed mode, feature configuration, and performance optimization.
+
+Qwen3.8-Max is newly released. This document is validated and written based on the **SGLang main branch (daily
+build)**. It is recommended to use the latest daily build Docker image, or build SGLang from the main branch
+source.
+
+## Supported features
+
+| Feature                       | Example usage                                                                                 |
+|-------------------------------|-----------------------------------------------------------------------------------------------|
+| Tensor Parallelism            | `--tp-size 64`                                                                                |
+| Data Parallelism              | `--enable-dp-attention \`<br/>`--dp-size 4`                                                   |
+| Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                                    |
+| Quantization                  | `--quantization modelslim`                                                                    |
+| Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 16` |
+| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
+| DP LM Head                    | `--enable-dp-lm-head`                                                                         |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+</Note>
+
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-compatibility).
+
+## Prerequisites
+
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation) — the full installation guide.
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
+### Model weights
+
+Before downloading model weights, check the model size to reserve enough disk space.
+For multi-node deployment, download the weights to a shared directory accessible to all nodes.
+
+- [Qwen/Qwen3.8-2.4T-A95B](https://www.modelscope.cn/models/Qwen/Qwen3.8-2.4T-A95B) (BF16, approximately 4.8TB)
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize a W4A8 variant from the BF16 checkpoint.
+
+<Info>
+We recommend deploying the W4A8 variant for reduced resource usage and higher throughput.
+The validated configuration in this tutorial deploys the W4A8 variant on 4 Atlas 800I A3 nodes (`--tp-size 64`, 64 dies
+in total). The BF16 checkpoint alone weighs approximately 4.8TB and requires additional nodes.
+</Info>
+
+For the hardware specifications (memory per die, dies per card),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
+online platform. You can directly pull it.
+
+The following command is based on the daily build tag, which contains the latest SGLang main branch changes.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:main-cann9.0.0-a3
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+- If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
+  container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+</Tip>
+
+## Online service deployment
+
+### Multi-node online deployment
+
+Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism while keeping
+prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
+node can provide. The validated configuration deploys the W4A8 quantized checkpoint on 4 nodes with `--tp-size 64`
+(16 dies per node), DP attention (`--dp-size 4`), and DeepEP in `auto` mode.
+
+Modify the IP addresses of the four nodes, then run the same script on all four nodes. Each node determines its own
+rank by matching the local IP address against `IPS`.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   IPS: IP addresses of each node in the cluster
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=10
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+
+# deepep
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export HCCL_BUFFSIZE=2300
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
+export HCCL_OP_EXPANSION_MODE=AIV
+
+# Run command ifconfig on each node, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
+
+IPS=('<your node1 ip>' '<your node2 ip>' '<your node3 ip>' '<your node4 ip>')
+IP_MASTER="${IPS[0]}:5000"
+
+MODEL_PATH=/path/to/model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+for i in "${!IPS[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${IPS[$i]}" || "$LOCAL_HOST2" == "${IPS[$i]}" ]];
+    then
+        echo "${IPS[$i]}"
+
+        # overlap schedule
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_RAGGED_VERIFY_MODE=static
+
+        sglang serve \
+            --model-loader-extra-config '{"enable_multithread_load": true}' \
+            --dist-init-addr $IP_MASTER --nnodes 4 --node-rank $i \
+            --model-path $MODEL_PATH \
+            --tokenizer-path $MODEL_PATH \
+            --trust-remote-code \
+            --attention-backend ascend \
+            --device npu \
+            --quantization modelslim \
+            --dtype bfloat16 \
+            --tp-size 64 \
+            --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
+            --mem-fraction-static 0.8 \
+            --chunked-prefill-size 8192 \
+            --cuda-graph-bs 16 \
+            --disable-radix-cache \
+            --max-running-requests 64 \
+            --host 0.0.0.0 \
+            --port 30000 \
+            --moe-a2a-backend deepep \
+            --deepep-mode auto \
+            --watchdog-timeout 9000
+        break
+    fi
+done
+```
+
+## Functional verification
+
+After the service is started, you can invoke the model by sending a prompt:
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 30000)
+# ============================================================
+
+curl http://${HOST}:${PORT}/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/installation#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+Qwen3.8-Max has no standalone best practice page yet, as tuning parameters are not finalized. Instead, the
+[Online service deployment](#online-service-deployment) section above provides a ready-to-use script for multi-node
+deployment, which embeds the recommended feature combinations and tuning parameters (e.g., DP attention, DeepEP,
+overlap schedule).
+
+For the full catalog of optimization features and their parameter and compatibility details,
+see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).

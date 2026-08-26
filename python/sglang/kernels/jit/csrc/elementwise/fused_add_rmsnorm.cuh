@@ -12,7 +12,7 @@
 #include <cooperative_groups.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 template <typename T, int VEC_SIZE_IN_BYTE>
 struct VecTypeTrait;
@@ -194,4 +194,4 @@ struct FusedAddRMSNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

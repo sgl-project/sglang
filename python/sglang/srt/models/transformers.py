@@ -1345,6 +1345,22 @@ class MultiModalMixin:
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
+        # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
+        # wrapper); older checkpoints still ship "vision_tower.vision_model.*"
+        # keys, so remap them when the live model lacks that sub-module.
+        vt = getattr(self.model, "vision_tower", None)
+        if vt is not None and not any(
+            name == "vision_model" for name, _ in vt.named_children()
+        ):
+            self.weight_mapper = (
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        "vision_tower.vision_model.": "model.vision_tower.",
+                    }
+                )
+                | self.weight_mapper
+            )
+
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
         if isinstance(rope_scaling, Mapping) and "mrope_section" in rope_scaling:
@@ -1497,6 +1513,14 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
+            # 5D features (num_images, num_patches, C, H, W) can't be flattened
+            # here: anyres models pad num_patches per HF processor call, so a
+            # flattened concat would leave stray padding rows once items with
+            # different tile counts are combined. Defer them and pad to the
+            # batch-wide max instead -- the model's own get_image_features
+            # re-derives each image's real patch count from image_sizes and
+            # slices the padding back out.
+            pending_5d_features: dict = {}
 
             for batch_idx in range(len(mm_inputs or [])):
                 mm_input = mm_inputs[batch_idx]
@@ -1519,6 +1543,11 @@ class MultiModalMixin:
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
+                            if feature.dim() == 5:
+                                pending_5d_features.setdefault(feature_key, []).append(
+                                    feature
+                                )
+                                continue
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
                         elif isinstance(feature, torch.Tensor) and isinstance(
@@ -1527,6 +1556,24 @@ class MultiModalMixin:
                             kwargs[feature_key] = torch.cat(
                                 [kwargs[feature_key], feature], dim=0
                             )
+
+            for feature_key, tensors in pending_5d_features.items():
+                max_patches = max(t.shape[1] for t in tensors)
+                padded = []
+                for t in tensors:
+                    if t.shape[1] < max_patches:
+                        pad = t.new_zeros(
+                            (t.shape[0], max_patches - t.shape[1], *t.shape[2:])
+                        )
+                        t = torch.cat([t, pad], dim=1)
+                    padded.append(t)
+                combined = torch.cat(padded, dim=0)
+                if feature_key in kwargs:
+                    kwargs[feature_key] = torch.cat(
+                        [kwargs[feature_key], combined], dim=0
+                    )
+                else:
+                    kwargs[feature_key] = combined
 
         return kwargs
 

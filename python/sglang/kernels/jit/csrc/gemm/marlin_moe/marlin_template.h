@@ -31,6 +31,8 @@
       std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
       "only float16 and bfloat16 is supported");
 
+namespace sglang {
+
 namespace device::marlin_moe {
 using namespace device::marlin;
 
@@ -1906,3 +1908,5 @@ __global__ void Marlin(
 }  // namespace device::marlin_moe
 
 #endif
+
+}  // namespace sglang
