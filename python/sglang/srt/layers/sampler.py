@@ -642,6 +642,11 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         use_fused_top_k_top_p = bool(torch.all((top_ks <= 1024) & (top_ks >= 1)))
 
     if use_fused_top_k_top_p:
+        # torch_npu.npu_top_k_top_p requires ``top_ps`` to share the logits
+        # dtype (e.g. DT_BFLOAT16); SamplingBatchInfo builds top_ps as float32,
+        # which the op rejects with AclNN_Parameter_Error (EZ1001, 161002).
+        # Cast to the logits dtype so the fused path works for every caller.
+        top_ps = top_ps.to(dtype=logits.dtype)
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 

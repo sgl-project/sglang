@@ -78,10 +78,12 @@ def test_eager_eligible_top_k_uses_fused_kernel(monkeypatch) -> None:
         lambda: False,
     )
 
-    output = _sample(top_k=2)
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]], dtype=torch.bfloat16)
+    output = _sample(logits=logits, top_k=2)
 
     assert output.shape == (1,)
     assert len(fused_calls) == 1
+    assert fused_calls[0][1].dtype == logits.dtype
 
 
 def test_eager_out_of_range_top_k_uses_fallback(monkeypatch) -> None:
