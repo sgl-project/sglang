@@ -79,6 +79,12 @@ export const config = {
     numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
+  accuracyLabels: [
+    ["gsm8k_pct",    "GSM8K",    "%"],
+    ["aime26_pct",   "AIME26",   "%"],
+    ["mmmu_pro_pct", "MMMU-Pro", "%"],
+  ],
+
   // Launch images — this is a day-0 model with no release cut, so both tags are
   // purpose-built rather than a version. The ROCm build targets CDNA4 (gfx950)
   // and is not interchangeable with the CUDA one.
