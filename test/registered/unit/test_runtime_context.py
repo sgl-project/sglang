@@ -911,11 +911,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)
             def probe(x):
                 par = get_parallel()
-                if par.config.enable_prefill_context_parallel:
+                if par.enable_prefill_context_parallel:
                     x = x + 1
-                if par.config.moe_dense_tp_size == 1:
+                if par.moe_dense_tp_size == 1:
                     x = x + 2
-                if par.config.dwdp_size > 1:
+                if par.dwdp_size > 1:
                     x = x + 4
                 return x
 
