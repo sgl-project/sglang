@@ -835,10 +835,10 @@ class ServerArgs:
         NS("schedule"),
     ] = None
     prefill_decode_interval: A[
-        int,
-        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        Optional[int],
+        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
         NS("schedule"),
-    ] = 0
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -3888,6 +3888,7 @@ class ServerArgs:
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
+        self._handle_qwen3_vl_hopper_serving_defaults(gpu_mem)
         self._handle_attention_backend_compatibility()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
@@ -5243,6 +5244,8 @@ class ServerArgs:
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
 
+        self._expand_multimodal_decode_graph_to_running_limit(gpu_mem)
+
         # Set cuda graph batch sizes
         if self.device != "cpu":
             if decode_cuda_graph_config.bs is None:
@@ -5365,6 +5368,75 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def _expand_multimodal_decode_graph_to_running_limit(self, gpu_mem) -> None:
+        """Keep profiled high-concurrency Qwen3-VL decode inside CUDA graph."""
+        decode_config = self.cuda_graph_config.decode
+        locked = self._cuda_graph_config_locked
+        max_running_requests = self.max_running_requests
+        if not (
+            max_running_requests is not None
+            and max_running_requests <= 512
+            and decode_config.max_bs is not None
+            and decode_config.max_bs < max_running_requests
+            and (Phase.DECODE, "max_bs") not in locked
+            and (Phase.DECODE, "bs") not in locked
+            and self._get_large_hopper_qwen3_vl_model_type(gpu_mem) is not None
+        ):
+            return
+
+        logger.info(
+            "Expanding multimodal decode CUDA graph max_bs from %d to "
+            "max_running_requests=%d.",
+            decode_config.max_bs,
+            max_running_requests,
+        )
+        decode_config.max_bs = max_running_requests
+
+    def _get_large_hopper_qwen3_vl_model_type(self, gpu_mem) -> Optional[str]:
+        if not is_sm90_supported() or gpu_mem is None or gpu_mem < 60 * 1024:
+            return None
+        model_config = self.get_model_config()
+        model_type = getattr(model_config.hf_config, "model_type", "")
+        return (
+            model_type
+            if model_config.is_multimodal and model_type in {"qwen3_vl", "qwen3_vl_moe"}
+            else None
+        )
+
+    def _handle_qwen3_vl_hopper_serving_defaults(self, gpu_mem) -> None:
+        """Select the profiled Qwen3-VL serving path on large Hopper GPUs."""
+        model_type = self._get_large_hopper_qwen3_vl_model_type(gpu_mem)
+        if model_type is None:
+            return
+
+        if not envs.SGLANG_VLM_CACHE_SIZE_MB.is_set():
+            embedding_cache_size_mb = 8192
+            logger.info(
+                "Using an %d MiB multimodal embedding cache for %s on a "
+                "large-memory GPU.",
+                embedding_cache_size_mb,
+                model_type,
+            )
+            envs.SGLANG_VLM_CACHE_SIZE_MB.set(embedding_cache_size_mb)
+
+        updates = {}
+        if self.mm_preprocess_cache_size_mb is None:
+            updates["mm_preprocess_cache_size_mb"] = 16384
+        if self.radix_eviction_policy == "lru":
+            updates["radix_eviction_policy"] = "priority"
+        if self.prefill_decode_interval is None:
+            updates["prefill_decode_interval"] = 32
+        if self.attention_backend is None and self.decode_attention_backend is None:
+            updates["decode_attention_backend"] = "flashinfer"
+
+        if updates:
+            logger.info(
+                "Applying profiled %s serving defaults on a large Hopper GPU: %s",
+                model_type,
+                updates,
+            )
+            self._declare("_handle_qwen3_vl_hopper_serving_defaults", **updates)
 
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
@@ -9155,7 +9227,10 @@ class ServerArgs:
             )
 
     def _validate_prefill_decode_interval(self):
-        if self.prefill_decode_interval < 0:
+        if (
+            self.prefill_decode_interval is not None
+            and self.prefill_decode_interval < 0
+        ):
             raise ValueError("--prefill-decode-interval must be non-negative.")
 
     def _handle_other_validations(self):

@@ -2,8 +2,11 @@
 Multi-modality utils
 """
 
+import atexit
 import copy
 import hashlib
+import math
+import mmap
 import os
 import pickle
 import sys
@@ -61,6 +64,44 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+
+# Tokenizer workers otherwise allocate and populate a new named shared-memory
+# segment for every request, even when the processor feature is an immutable
+# cache hit. Keep reusable segments alive in the producing worker and send the
+# same small descriptor on later requests. The configured budget is
+# service-wide and is split across tokenizer workers. Once a worker's share is
+# full, new features use the original one-shot path; live reusable segments are
+# never evicted because a descriptor may still be in flight to the scheduler.
+_REUSABLE_SHM_FEATURES: Dict[tuple, "ShmPointerMMData"] = {}
+_REUSABLE_SHM_FEATURE_BYTES = 0
+_REUSABLE_SHM_FEATURE_BUDGET: Optional[int] = None
+
+
+def configure_reusable_shm_feature_cache(
+    total_cache_mb: int, tokenizer_worker_num: int
+) -> None:
+    """Use the resolved preprocess-cache budget for reusable CPU transport.
+
+    An explicit SGLANG_MM_SHM_CACHE_MB value keeps precedence. This hook lets a
+    processor's model-specific automatic cache size work without a second
+    server flag or environment variable.
+    """
+    global _REUSABLE_SHM_FEATURE_BUDGET
+    if "SGLANG_MM_SHM_CACHE_MB" in os.environ:
+        return
+    worker_num = max(int(tokenizer_worker_num), 1)
+    _REUSABLE_SHM_FEATURE_BUDGET = (
+        max(int(total_cache_mb), 0) * 1024 * 1024 // worker_num
+    )
+    if _REUSABLE_SHM_FEATURE_BUDGET:
+        logger.info(
+            "Reusable multimodal SHM transport cache enabled from the "
+            "preprocess-cache default: %d MiB per tokenizer worker "
+            "(%d MiB service-wide across %d workers).",
+            _REUSABLE_SHM_FEATURE_BUDGET // (1024 * 1024),
+            total_cache_mb,
+            worker_num,
+        )
 
 
 def init_feature_buffer(device):
@@ -1266,7 +1307,13 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        precomputed_hash: Optional[int] = None,
+        *,
+        reusable: bool = False,
+    ):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
@@ -1274,7 +1321,40 @@ class ShmPointerMMData:
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.precomputed_hash = precomputed_hash
+        self.reusable = reusable
         nbytes = tensor.numel() * tensor.element_size()
+        if reusable:
+            # Persistent descriptors cannot use multiprocessing.SharedMemory:
+            # every consumer registration shares Python's set-based resource
+            # tracker, which has no reference counts and produces duplicate
+            # unregister errors at shutdown. A named tmpfs file provides the
+            # same mmap transport while ownership remains explicit here.
+            self.shm_name = make_shm_name("mm")
+            shm_path = self._reusable_shm_path()
+            fd = os.open(shm_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            mapped = None
+            try:
+                os.ftruncate(fd, nbytes)
+                if sys.platform == "linux":
+                    os.posix_fallocate(fd, 0, nbytes)
+                mapped = mmap.mmap(fd, nbytes, access=mmap.ACCESS_WRITE)
+                dst = torch.frombuffer(mapped, dtype=torch.uint8)
+                dst.copy_(tensor.view(torch.uint8).reshape(-1))
+                del dst
+            except BaseException:
+                if mapped is not None:
+                    mapped.close()
+                os.close(fd)
+                os.unlink(shm_path)
+                raise
+            mapped.close()
+            os.close(fd)
+            self._shm_handle = None
+            self._mmap_handle = None
+            self._shm_fd = None
+            self._owns_shm = True
+            return
+
         shm = shared_memory.SharedMemory(
             create=True, size=nbytes, name=make_shm_name("mm")
         )
@@ -1294,6 +1374,12 @@ class ShmPointerMMData:
         self.shm_name = shm.name
         shm.close()
         self._shm_handle = None
+        self._mmap_handle = None
+        self._shm_fd = None
+        self._owns_shm = False
+
+    def _reusable_shm_path(self) -> str:
+        return f"/dev/shm/{self.shm_name.lstrip('/')}"
 
     def __getstate__(self):
         return {
@@ -1301,6 +1387,7 @@ class ShmPointerMMData:
             "shape": self.shape,
             "dtype": self.dtype,
             "precomputed_hash": self.precomputed_hash,
+            "reusable": self.reusable,
         }
 
     def __setstate__(self, state):
@@ -1308,16 +1395,39 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
-            self.shape
-        )
+        self.reusable = state.get("reusable", False)
+        self._owns_shm = False
+        if self.reusable:
+            self._shm_fd = os.open(self._reusable_shm_path(), os.O_RDONLY)
+            nbytes = (
+                math.prod(self.shape) * torch.empty((), dtype=self.dtype).element_size()
+            )
+            self._mmap_handle = mmap.mmap(self._shm_fd, nbytes, access=mmap.ACCESS_COPY)
+            self._shm_handle = None
+            self.tensor = torch.frombuffer(self._mmap_handle, dtype=self.dtype).reshape(
+                self.shape
+            )
+        else:
+            self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+            self._mmap_handle = None
+            self._shm_fd = None
+            # Zero-copy view into shared memory (no clone, no unlink)
+            self.tensor = torch.frombuffer(
+                self._shm_handle.buf, dtype=self.dtype
+            ).reshape(self.shape)
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
         tensor = self.tensor.clone()
-        if self._shm_handle is not None:
+        del self.tensor
+        if self.reusable:
+            if self._mmap_handle is not None:
+                self._mmap_handle.close()
+                self._mmap_handle = None
+            if self._shm_fd is not None:
+                os.close(self._shm_fd)
+                self._shm_fd = None
+        elif self._shm_handle is not None:
             self._shm_handle.close()
             try:
                 self._shm_handle.unlink()
@@ -1326,11 +1436,62 @@ class ShmPointerMMData:
             self._shm_handle = None
         return tensor
 
+    def release_owner(self) -> None:
+        """Release a reusable segment owned by the producing worker."""
+        if not getattr(self, "_owns_shm", False):
+            return
+        self._owns_shm = False
+        try:
+            os.unlink(self._reusable_shm_path())
+        except FileNotFoundError:
+            pass
+
     def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
+        if getattr(self, "_owns_shm", False):
+            self.release_owner()
+            return
+        if getattr(self, "_mmap_handle", None) is not None:
+            if hasattr(self, "tensor"):
+                del self.tensor
+            self._mmap_handle.close()
+            self._mmap_handle = None
+        if getattr(self, "_shm_fd", None) is not None:
+            os.close(self._shm_fd)
+            self._shm_fd = None
+        # Consumers only close here. One-shot unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
             self._shm_handle.close()
             self._shm_handle = None
+
+
+def _get_reusable_shm_feature_budget() -> int:
+    global _REUSABLE_SHM_FEATURE_BUDGET
+    if _REUSABLE_SHM_FEATURE_BUDGET is None:
+        total_mb = max(int(os.environ.get("SGLANG_MM_SHM_CACHE_MB", "0")), 0)
+        server_args = get_server_args()
+        worker_num = max(int(getattr(server_args, "tokenizer_worker_num", 1)), 1)
+        _REUSABLE_SHM_FEATURE_BUDGET = total_mb * 1024 * 1024 // worker_num
+        if _REUSABLE_SHM_FEATURE_BUDGET:
+            logger.info(
+                "Reusable multimodal SHM transport cache enabled: %d MiB "
+                "per tokenizer worker (%d MiB service-wide across %d workers).",
+                _REUSABLE_SHM_FEATURE_BUDGET // (1024 * 1024),
+                total_mb,
+                worker_num,
+            )
+    return _REUSABLE_SHM_FEATURE_BUDGET
+
+
+def clear_reusable_shm_feature_cache() -> None:
+    """Unlink every reusable segment owned by this tokenizer worker."""
+    global _REUSABLE_SHM_FEATURE_BYTES
+    for pointer in _REUSABLE_SHM_FEATURES.values():
+        pointer.release_owner()
+    _REUSABLE_SHM_FEATURES.clear()
+    _REUSABLE_SHM_FEATURE_BYTES = 0
+
+
+atexit.register(clear_reusable_shm_feature_cache)
 
 
 def _get_is_default_transport():
@@ -1350,7 +1511,25 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
     under a burst of multimodal requests."""
+    global _REUSABLE_SHM_FEATURE_BYTES
     try:
+        budget = _get_reusable_shm_feature_budget()
+        if precomputed_hash is not None and budget:
+            key = (int(precomputed_hash), tuple(tensor.shape), tensor.dtype)
+            if pointer := _REUSABLE_SHM_FEATURES.get(key):
+                return pointer
+
+            nbytes = tensor.numel() * tensor.element_size()
+            if _REUSABLE_SHM_FEATURE_BYTES + nbytes <= budget:
+                pointer = ShmPointerMMData(
+                    tensor,
+                    precomputed_hash=precomputed_hash,
+                    reusable=True,
+                )
+                _REUSABLE_SHM_FEATURES[key] = pointer
+                _REUSABLE_SHM_FEATURE_BYTES += nbytes
+                return pointer
+
         return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
     except OSError as e:
         print_warning_once(
