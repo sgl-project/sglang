@@ -25,6 +25,7 @@ on:
           - rocm724
           - rocm720
           - rocm10rc4
+          - rocm10rc4-aiter-a6d2b564
       target_stage_select:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
@@ -138,10 +139,10 @@ permissions:
   pull-requests: read
 
 env:
-  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref || (inputs.rocm_version == 'rocm10rc4-aiter-a6d2b564' && 'a6d2b564fd671724a3720b8edf70e8d674e4d694' || '') }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   # ROCm 10 RC4 bring-up images are published to the scratch registry.
-  AMD_CI_IMAGE_REPO: ${{ inputs.rocm_version == 'rocm10rc4' && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
+  AMD_CI_IMAGE_REPO: ${{ startsWith(inputs.rocm_version, 'rocm10rc4') && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
   ROCM_VERSION: ${{ inputs.rocm_version || 'rocm724' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
