@@ -31,10 +31,9 @@ export const config = {
     { id: "fp8",   label: "FP8"   },
     { id: "nvfp4", label: "NVFP4" },
   ],
-  // BF16 and NVFP4 each ship two operating points: low latency turns the
-  // in-checkpoint MTP head on (NEXTN 3/1/4) and caps concurrency at 96, high
-  // throughput drops speculation and adds EP4. FP8 and the two AMD platforms
-  // ship one recipe each, which parks under `balanced`.
+  // BF16, FP8 and NVFP4 each ship two operating points, low latency adding the
+  // in-checkpoint MTP head (NEXTN 3/1/4) on top of the high-throughput shape.
+  // The two AMD platforms ship one recipe each, which parks under `balanced`.
   strategies: [
     { id: "low-latency",     label: "Low Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -331,11 +330,12 @@ export const config = {
     },
 
     // ==== FP8 ====
-    // One recipe per platform: the high-throughput shape (TP4 + EP4, no
-    // speculation), parked under `balanced` because there is no second FP8
-    // operating point to contrast it with.
+    // Two operating points per platform off one shape (TP4 + EP4): high
+    // throughput as-is, low latency with the in-checkpoint MTP head added.
+    // Unlike the BF16/NVFP4 low-latency cells these keep EP4 and pin no
+    // --max-running-requests, so the panel's speculative hint applies.
     {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -353,7 +353,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -371,7 +371,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -389,7 +389,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -401,6 +401,94 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep 4",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep 4",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep 4",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep 4",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
