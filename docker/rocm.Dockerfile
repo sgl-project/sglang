@@ -51,6 +51,7 @@ ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_re
 # than a published image; point these at one to build on a prebuilt base.
 ARG BASE_IMAGE_942_ROCM10RC4="rocm10rc4-base"
 ARG BASE_IMAGE_950_ROCM10RC4="rocm10rc4-base"
+ARG BASE_IMAGE_1250_ROCM10RC4="rocm10rc4-base"
 ARG BASE_IMAGE_ROCM10RC4="ubuntu:24.04"
 
 # This is necessary for scope purpose
@@ -257,12 +258,12 @@ RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
-# Both arches' device wheels go into the shared base; GPU_ARCH_LIST still
-# narrows what AITER and sgl-kernel actually compile for per stage. The device
-# wheels are named as their own specs rather than as extras, because several
-# device extras in one spec (torch[device-gfx942,device-gfx950]) silently
-# installs only the first and the missing arch then fails at runtime with
-# hipErrorInvalidImage.
+# Every supported arch's device wheels go into the shared base; GPU_ARCH_LIST
+# still narrows what AITER and sgl-kernel actually compile for per stage. The
+# device wheels are named as their own specs rather than as extras, because
+# several device extras in one spec (torch[device-gfx942,device-gfx950])
+# silently installs only the first and the missing arch then fails at runtime
+# with hipErrorInvalidImage.
 RUN python3 -m pip install --no-cache-dir \
         --pre \
         --index-url ${ROCM_INDEX_URL} \
@@ -271,13 +272,16 @@ RUN python3 -m pip install --no-cache-dir \
         "rocm-sdk-devel==${ROCM_SDK_VERSION}" \
         "rocm-sdk-device-gfx942==${ROCM_SDK_VERSION}" \
         "rocm-sdk-device-gfx950==${ROCM_SDK_VERSION}" \
+        "rocm-sdk-device-gfx1250==${ROCM_SDK_VERSION}" \
         "torch==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchvision==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchaudio==${ROCM_TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "amd-torch-device-gfx942==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "amd-torch-device-gfx950==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "amd-torch-device-gfx1250==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "amd-torchvision-device-gfx942==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "amd-torchvision-device-gfx950==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "amd-torchvision-device-gfx1250==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"
 
 RUN rocm-sdk init && rocm-sdk targets
@@ -342,6 +346,30 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 1250 with ROCm 10 RC4 and args (Python 3.12 + torch 2.11)
+# The gfx1250 bring-up from the gfx1250-rocm7_14 flavor, on the RC4 wheel
+# channel. RC4 reports HIP 7.15 — the same Helios branch 7.14 came from — so the
+# gfx1250 build paths carry over unchanged; they test GPU_ARCH_LIST=gfx1250 so
+# both flavors pick them up.
+FROM $BASE_IMAGE_1250_ROCM10RC4 AS gfx1250-rocm10rc4
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+# gfx1250 tracks a different AITER than the gfx942/gfx950 baseline: this commit
+# plus the four reverts applied at clone time are what the gfx1250 kernels were
+# brought up against.
+ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
+# Unused while BUILD_TRITON=0. Recorded because gfx1250 is the arch most likely
+# to need it: the 7.14 flavor deliberately overrides AMD's Triton with this
+# upstream revision, so this is the known-good fallback if the SDK's Triton
+# turns out to miscompile a gfx1250 kernel.
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -597,7 +625,7 @@ RUN git clone ${AITER_REPO} \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt \
- && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+ && if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     git revert --no-edit --no-commit 8d581370b; \
     git revert --no-edit --no-commit 79c11b677; \
     git revert --no-edit --no-commit 1ecb760a5; \
@@ -607,7 +635,7 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+     && if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
           PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
           && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -853,7 +881,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
-  if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
+  if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
