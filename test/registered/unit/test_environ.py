@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import functools
 import os
 import re
 import subprocess
@@ -8,7 +9,7 @@ import unittest
 import warnings
 from contextlib import ExitStack
 
-from sglang.srt.environ import _DEPRECATED_ENVS, _DeprecatedEnv, envs
+from sglang.srt.environ import _DEPRECATED_ENVS, EnvBool, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -97,6 +98,29 @@ class TestEnvField(unittest.TestCase):
             warnings.simplefilter("always")
             self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
         self.assertIn("Invalid value", str(caught[0].message))
+
+    def test_callable_default_traces_under_torch_compile(self):
+        # get() runs inside compiled model forwards, so resolving a callable
+        # default must stay traceable. lru_cache specifically: Dynamo models
+        # such a function loaded from an instance attribute as a bound method
+        # carrying `self`. A plain function default traces fine either way.
+        import torch
+
+        @functools.lru_cache(maxsize=1)
+        def default_factory():
+            return True
+
+        field = EnvBool(default_factory)
+        # Envs turns off _allow_set_name after its body, so a field built out
+        # here never gets a name from __set_name__.
+        field.name = "SGLANG_TEST_CALLABLE_DEFAULT"
+        field.clear()
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            return x + 1 if field.get() else x - 1
+
+        self.assertEqual(probe(torch.zeros(())).item(), 1.0)
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):
