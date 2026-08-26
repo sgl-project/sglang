@@ -23,15 +23,15 @@ pip install -U uv
 uv venv --python 3.12 && source .venv/bin/activate
 
 # Qwen3.8-Flash-Next model support:
-# https://github.com/sgl-project/sglang/pull/<PR-NUMBER>
+# https://github.com/sgl-project/sglang/pull/36497
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-git fetch origin pull/<PR-NUMBER>/head && git checkout FETCH_HEAD
+git fetch origin pull/36497/head && git checkout FETCH_HEAD
 uv pip install -e python
 ```
 
 <Note>
-`<PR-NUMBER>` is a placeholder — substitute the number of the SGLang PR that adds Qwen3.8-Flash-Next model support. Once that PR is in a release, `uv pip install sglang` is enough and this whole step goes away.
+Model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497). Once it is in a release, `uv pip install sglang` is enough and this whole step goes away.
 </Note>
 
 Then run the **Python** output of the command panel below in that environment.
