@@ -104,6 +104,43 @@ def _pareto_prune(states: Iterable[_State]) -> list[_State]:
     return frontier
 
 
+def _drop_locally_latency_ineligible_options(
+    options: Iterable[PlacementOption],
+    *,
+    resource_names: tuple[str, ...],
+    estimated_latency_tolerance: int,
+) -> list[PlacementOption]:
+    """Drop an option that alone spends more than the global latency slack.
+
+    When two options have the same constrained-resource vector, replacing the
+    slower one cannot make any complete plan infeasible. If that replacement
+    gains more than the final plan's entire latency tolerance, the slower
+    option cannot belong to a latency-equivalent optimum regardless of the
+    choices made by other groups. This matters when an unconstrained HostPin
+    dimension leaves many otherwise identical pin prefixes in the frontier.
+    """
+    options = list(options)
+    best_utility_by_resources: dict[tuple[int, ...], int] = {}
+    resource_vector_by_key: dict[str, tuple[int, ...]] = {}
+    for option in options:
+        resources = tuple(
+            option.resource_delta_bytes.get(resource_name, 0)
+            for resource_name in resource_names
+        )
+        resource_vector_by_key[option.option_key] = resources
+        best_utility_by_resources[resources] = max(
+            best_utility_by_resources.get(resources, option.estimated_latency_savings),
+            option.estimated_latency_savings,
+        )
+    return [
+        option
+        for option in options
+        if option.estimated_latency_savings
+        >= best_utility_by_resources[resource_vector_by_key[option.option_key]]
+        - estimated_latency_tolerance
+    ]
+
+
 def optimize_placement(
     options: Iterable[PlacementOption],
     *,
@@ -179,9 +216,20 @@ def optimize_placement(
         int(resource_budget_bytes[name]) for name in resource_names
     )
 
+    # Each local frontier includes the implicit "keep current placement" choice
+    # when selection is optional. Keep the branch representation compact so the
+    # global solve does not materialize and repeatedly Pareto-scan a large
+    # Cartesian product of layer-residency and HostPin prefixes.
     ordered_groups = []
     for group_key in sorted(grouped):
-        group_options = sorted(grouped[group_key], key=lambda option: option.option_key)
+        group_options = sorted(
+            _drop_locally_latency_ineligible_options(
+                grouped[group_key],
+                resource_names=resource_names,
+                estimated_latency_tolerance=estimated_latency_tolerance,
+            ),
+            key=lambda option: option.option_key,
+        )
         local_states = []
         if not require_selection_from_every_group:
             local_states.append(
@@ -204,102 +252,151 @@ def optimize_placement(
             )
             for option in group_options
         )
-        ordered_groups.append(
-            [state[3][0] for state in _pareto_prune(local_states) if state[3]]
-        )
-    minimum_remaining: list[tuple[int, ...]] = [
-        (0,) * len(resource_names) for _ in range(len(ordered_groups) + 1)
-    ]
-    for group_index in range(len(ordered_groups) - 1, -1, -1):
-        group_options = ordered_groups[group_index]
-        next_minimum = minimum_remaining[group_index + 1]
-        minimum_remaining[group_index] = tuple(
-            next_delta
-            + (
-                min(
-                    option.resource_delta_bytes.get(resource_name, 0)
-                    for option in group_options
-                )
-                if require_selection_from_every_group
-                else min(
-                    0,
-                    *(
-                        option.resource_delta_bytes.get(resource_name, 0)
-                        for option in group_options
-                    ),
-                )
-            )
-            for next_delta, resource_name in zip(next_minimum, resource_names)
-        )
+        ordered_groups.append(_pareto_prune(local_states))
 
-    frontier: list[_State] = [
-        (
-            (0,) * len(resource_names),
-            0,
-            (0,) * placement_cost_dimensions,
-            (),
-        )
-    ]
-    for group_index, group_options in enumerate(ordered_groups):
-        candidates = [] if require_selection_from_every_group else list(frontier)
-        for state in frontier:
-            for option in group_options:
-                resource_deltas = tuple(
-                    current + option.resource_delta_bytes.get(resource_name, 0)
-                    for current, resource_name in zip(state[0], resource_names)
-                )
-                candidates.append(
-                    (
-                        resource_deltas,
-                        state[1] + option.estimated_latency_savings,
-                        tuple(
-                            current + delta
-                            for current, delta in zip(
-                                state[2],
-                                option.placement_cost_bytes
-                                or (0,) * placement_cost_dimensions,
-                            )
-                        ),
-                        state[3] + (option,),
-                    )
-                )
-        remaining = minimum_remaining[group_index + 1]
-        reachable = [
-            state
-            for state in candidates
-            if all(
-                used + releasable <= budget
-                for used, releasable, budget in zip(
-                    state[0], remaining, resource_budgets
-                )
-            )
+    def _suffix_bounds(groups):
+        minimum_resources = [(0,) * len(resource_names) for _ in range(len(groups) + 1)]
+        maximum_utility = [0] * (len(groups) + 1)
+        minimum_cost = [
+            (0,) * placement_cost_dimensions for _ in range(len(groups) + 1)
         ]
-        frontier = _pareto_prune(reachable)
+        for group_index in range(len(groups) - 1, -1, -1):
+            group = groups[group_index]
+            minimum_resources[group_index] = tuple(
+                following + min(choice[0][resource_index] for choice in group)
+                for resource_index, following in enumerate(
+                    minimum_resources[group_index + 1]
+                )
+            )
+            maximum_utility[group_index] = maximum_utility[group_index + 1] + max(
+                choice[1] for choice in group
+            )
+            minimum_cost[group_index] = tuple(
+                following + min(choice[2][cost_index] for choice in group)
+                for cost_index, following in enumerate(minimum_cost[group_index + 1])
+            )
+        return minimum_resources, maximum_utility, minimum_cost
 
-    frontier = [
-        state
-        for state in frontier
-        if all(used <= budget for used, budget in zip(state[0], resource_budgets))
-    ]
-    if not frontier:
+    # First maximize utility. Choices with the same constrained-resource vector
+    # collapse to the fastest one; HostPin-only soft-cost alternatives therefore
+    # do not multiply this pass when HostPin is non-binding.
+    utility_groups = []
+    for group in ordered_groups:
+        best_by_resources: dict[tuple[int, ...], _State] = {}
+        for choice in group:
+            incumbent = best_by_resources.get(choice[0])
+            if incumbent is None or (-choice[1], choice[2], _selection_key(choice)) < (
+                -incumbent[1],
+                incumbent[2],
+                _selection_key(incumbent),
+            ):
+                best_by_resources[choice[0]] = choice
+        utility_groups.append(
+            sorted(
+                best_by_resources.values(),
+                key=lambda choice: (-choice[1], choice[0], _selection_key(choice)),
+            )
+        )
+
+    minimum_resources, maximum_utility, _ = _suffix_bounds(utility_groups)
+    best_utility: int | None = None
+
+    def _maximize_utility(
+        group_index: int, resources: tuple[int, ...], utility: int
+    ) -> None:
+        nonlocal best_utility
+        if (
+            best_utility is not None
+            and utility + maximum_utility[group_index] <= best_utility
+        ):
+            return
+        if any(
+            used + releasable > budget
+            for used, releasable, budget in zip(
+                resources, minimum_resources[group_index], resource_budgets
+            )
+        ):
+            return
+        if group_index == len(utility_groups):
+            best_utility = utility
+            return
+        for choice in utility_groups[group_index]:
+            _maximize_utility(
+                group_index + 1,
+                tuple(left + right for left, right in zip(resources, choice[0])),
+                utility + choice[1],
+            )
+
+    _maximize_utility(0, (0,) * len(resource_names), 0)
+    if best_utility is None:
         raise NoFeasiblePlacementError("no placement satisfies all resource budgets")
 
-    best_utility = max(state[1] for state in frontier)
-    latency_equivalent = [
-        state
-        for state in frontier
-        if state[1] >= best_utility - estimated_latency_tolerance
-    ]
-    best = min(
-        latency_equivalent,
-        key=lambda state: (
-            state[2],
-            sum(state[0]),
-            state[0],
-            -state[1],
-            _selection_key(state),
-        ),
+    # Then minimize the lexicographic soft placement cost among every plan in
+    # the single global latency-equivalence window. Depth-first bounds avoid the
+    # quadratic global Pareto scans that large layerwise frontiers otherwise
+    # trigger while preserving the exact final ordering.
+    minimum_resources, maximum_utility, minimum_cost = _suffix_bounds(ordered_groups)
+    utility_floor = best_utility - estimated_latency_tolerance
+    best: _State | None = None
+
+    def _minimize_cost(
+        group_index: int,
+        resources: tuple[int, ...],
+        utility: int,
+        cost: tuple[int, ...],
+        selections: tuple[PlacementOption, ...],
+    ) -> None:
+        nonlocal best
+        if utility + maximum_utility[group_index] < utility_floor:
+            return
+        if any(
+            used + releasable > budget
+            for used, releasable, budget in zip(
+                resources, minimum_resources[group_index], resource_budgets
+            )
+        ):
+            return
+        if best is not None:
+            lower_cost = tuple(
+                current + remaining
+                for current, remaining in zip(cost, minimum_cost[group_index])
+            )
+            if lower_cost > best[2]:
+                return
+        if group_index == len(ordered_groups):
+            candidate = (resources, utility, cost, selections)
+            if best is None or (
+                candidate[2],
+                sum(candidate[0]),
+                candidate[0],
+                -candidate[1],
+                _selection_key(candidate),
+            ) < (
+                best[2],
+                sum(best[0]),
+                best[0],
+                -best[1],
+                _selection_key(best),
+            ):
+                best = candidate
+            return
+        for choice in ordered_groups[group_index]:
+            _minimize_cost(
+                group_index + 1,
+                tuple(left + right for left, right in zip(resources, choice[0])),
+                utility + choice[1],
+                tuple(left + right for left, right in zip(cost, choice[2])),
+                selections + choice[3],
+            )
+
+    _minimize_cost(
+        0,
+        (0,) * len(resource_names),
+        0,
+        (0,) * placement_cost_dimensions,
+        (),
     )
+    assert best is not None
     full_resource_deltas = {
         resource_name: sum(
             option.resource_delta_bytes.get(resource_name, 0) for option in best[3]

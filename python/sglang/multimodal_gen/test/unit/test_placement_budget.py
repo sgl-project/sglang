@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
+import random
+
 import pytest
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.placement_budget import (
+    NoFeasiblePlacementError,
     PlacementOption,
     optimize_placement,
 )
@@ -24,6 +28,75 @@ def _option(
             "hostpin:node0": pinned,
         },
         estimated_latency_savings=savings,
+    )
+
+
+def _exhaustive_plan_key(
+    options: list[PlacementOption],
+    *,
+    resource_budget_bytes: dict[str, int],
+    estimated_latency_tolerance: int,
+    require_selection_from_every_group: bool,
+):
+    resource_names = tuple(sorted(resource_budget_bytes))
+    groups: dict[str, list[PlacementOption | None]] = {}
+    for option in options:
+        groups.setdefault(option.group_key, []).append(option)
+    choices = []
+    for group_key in sorted(groups):
+        group = sorted(groups[group_key], key=lambda option: option.option_key)
+        if not require_selection_from_every_group:
+            group = [None, *group]
+        choices.append(group)
+
+    feasible = []
+    for selections in itertools.product(*choices):
+        selected = tuple(option for option in selections if option is not None)
+        resources = tuple(
+            sum(option.resource_delta_bytes.get(name, 0) for option in selected)
+            for name in resource_names
+        )
+        if any(
+            used > resource_budget_bytes[name]
+            for name, used in zip(resource_names, resources)
+        ):
+            continue
+        utility = sum(option.estimated_latency_savings for option in selected)
+        cost_dimensions = max(
+            (len(option.placement_cost_bytes) for option in options), default=0
+        )
+        cost = tuple(
+            sum(
+                (
+                    option.placement_cost_bytes[index]
+                    if option.placement_cost_bytes
+                    else 0
+                )
+                for option in selected
+            )
+            for index in range(cost_dimensions)
+        )
+        feasible.append((selected, resources, utility, cost))
+
+    if not feasible:
+        return None
+    best_utility = max(state[2] for state in feasible)
+    utility_floor = best_utility - estimated_latency_tolerance
+    selected, resources, utility, cost = min(
+        (state for state in feasible if state[2] >= utility_floor),
+        key=lambda state: (
+            state[3],
+            sum(state[1]),
+            state[1],
+            -state[2],
+            tuple(option.option_key for option in state[0]),
+        ),
+    )
+    return (
+        tuple(option.option_key for option in selected),
+        resources,
+        utility,
+        cost,
     )
 
 
@@ -448,3 +521,92 @@ def test_nonbinding_resource_is_removed_without_losing_full_accounting():
         "gpu:rank0:runtime": 5,
         "hostpin:node0": 80,
     }
+
+
+def test_nonbinding_pin_prefixes_keep_only_globally_latency_eligible_states():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="dit",
+                option_key="dit-pin-none",
+                resource_delta_bytes={"gpu": 5, "hostpin": 0},
+                estimated_latency_savings=800,
+                placement_cost_bytes=(5, 0),
+            ),
+            PlacementOption(
+                group_key="dit",
+                option_key="dit-pin-most",
+                resource_delta_bytes={"gpu": 5, "hostpin": 80},
+                estimated_latency_savings=950,
+                placement_cost_bytes=(5, 80),
+            ),
+            PlacementOption(
+                group_key="dit",
+                option_key="dit-pin-all",
+                resource_delta_bytes={"gpu": 5, "hostpin": 100},
+                estimated_latency_savings=1_000,
+                placement_cost_bytes=(5, 100),
+            ),
+        ],
+        resource_budget_bytes={"gpu": 5, "hostpin": 100},
+        estimated_latency_tolerance=100,
+    )
+
+    # No-pin is over the global tolerance and cannot be selected. Pin-most is
+    # still latency-equivalent, so the soft memory tie-break chooses it.
+    assert [option.option_key for option in plan.selections] == ["dit-pin-most"]
+
+
+def test_branch_and_bound_matches_exhaustive_multiresource_search():
+    rng = random.Random(20260827)
+    resource_names = ("load-vram", "runtime-vram", "hostpin")
+
+    for _ in range(200):
+        options = []
+        for group_index in range(rng.randint(1, 5)):
+            for option_index in range(rng.randint(1, 4)):
+                options.append(
+                    PlacementOption(
+                        group_key=f"group-{group_index}",
+                        option_key=f"group-{group_index}:option-{option_index}",
+                        resource_delta_bytes={
+                            name: rng.randint(-5, 8) for name in resource_names
+                        },
+                        estimated_latency_savings=rng.randint(-5, 20),
+                        placement_cost_bytes=(rng.randint(0, 10), rng.randint(0, 10)),
+                    )
+                )
+        budgets = {name: rng.randint(-2, 12) for name in resource_names}
+        tolerance = rng.randint(0, 5)
+        require_every_group = rng.choice((False, True))
+        expected = _exhaustive_plan_key(
+            options,
+            resource_budget_bytes=budgets,
+            estimated_latency_tolerance=tolerance,
+            require_selection_from_every_group=require_every_group,
+        )
+
+        if expected is None:
+            with pytest.raises(NoFeasiblePlacementError):
+                optimize_placement(
+                    options,
+                    resource_budget_bytes=budgets,
+                    estimated_latency_tolerance=tolerance,
+                    require_selection_from_every_group=require_every_group,
+                )
+            continue
+
+        plan = optimize_placement(
+            options,
+            resource_budget_bytes=budgets,
+            estimated_latency_tolerance=tolerance,
+            require_selection_from_every_group=require_every_group,
+        )
+        expected_keys, expected_resources, expected_utility, expected_cost = expected
+        assert tuple(option.option_key for option in plan.selections) == expected_keys
+        assert (
+            tuple(plan.resource_delta_bytes[name] for name in sorted(resource_names))
+            == expected_resources
+        )
+        assert plan.estimated_latency_savings == expected_utility
+        assert plan.placement_cost_bytes == expected_cost
