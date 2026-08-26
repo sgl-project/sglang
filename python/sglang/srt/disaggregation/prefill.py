@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 from array import array
 from collections import deque
@@ -319,24 +320,19 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
-        # Propagate trace context to KV sender so Mooncake transfer spans
-        # link to the parent request's trace (W3C traceparent).
-        import inspect as _inspect
+        # Link Mooncake transfer spans to the parent request's W3C trace.
+        if "external_trace_header" in inspect.signature(
+            kv_sender_class.__init__
+        ).parameters:
+            trace_ctx = getattr(req.time_stats, "trace_ctx", None)
+            if getattr(trace_ctx, "tracing_enable", False):
+                root = getattr(trace_ctx, "root_span_context", None)
+                if root is not None:
+                    carrier: Dict[str, str] = {}
+                    from opentelemetry import propagate
 
-        if (
-            "external_trace_header"
-            in _inspect.signature(kv_sender_class.__init__).parameters
-        ):
-            _trace_carrier: Dict[str, str] = {}
-            _trace_ctx = getattr(
-                getattr(req.time_stats, "trace_ctx", None), "root_span_context", None
-            )
-            if _trace_ctx is not None:
-                from opentelemetry import propagate
-
-                propagate.inject(_trace_carrier, _trace_ctx)
-            if _trace_carrier:
-                _sender_kwargs["external_trace_header"] = _trace_carrier
+                    propagate.inject(carrier, root)
+                    _sender_kwargs["external_trace_header"] = carrier
         req.disagg_kv_sender = kv_sender_class(**_sender_kwargs)
         self._process_req(req)
         req.pending_bootstrap = True
