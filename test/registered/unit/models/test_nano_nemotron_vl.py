@@ -87,6 +87,9 @@ class TestNemotronHOmniModel(CustomTestCase):
         nn.Module.__init__(model)
         model.mlp1 = nn.Sequential()
         model.vision_final_layernorm = nn.LayerNorm(2)
+        model.language_model = SimpleNamespace(load_weights=lambda weights: None)
+        model.vision_model = SimpleNamespace(load_weights=lambda weights: None)
+        model.sound_encoder = None
 
         cases = (
             ("vision_projector.unknown.weight", "Unexpected Nemotron-H Omni"),
@@ -98,6 +101,54 @@ class TestNemotronHOmniModel(CustomTestCase):
         for name, message in cases:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
                 model.load_weights([(name, torch.ones(1))])
+
+    def test_language_weights_are_streamed_and_remaining_components_are_routed(self):
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        model.mlp1 = nn.Sequential()
+        model.vision_final_layernorm = None
+        source_exhausted = False
+        loaded_language_weights = []
+        loaded_vision_weights = []
+        loaded_sound_weights = []
+
+        def source_weights():
+            nonlocal source_exhausted
+            yield "language_model.model.layer.weight", torch.ones(1)
+            yield "vision_model.radio_model.encoder.weight", torch.ones(1)
+            yield "sound_encoder.projection.weight", torch.ones(1)
+            source_exhausted = True
+
+        def load_language_weights(weights):
+            self.assertFalse(source_exhausted)
+            loaded_language_weights.append(next(weights))
+
+        def load_vision_weights(weights):
+            self.assertFalse(source_exhausted)
+            loaded_vision_weights.extend(weights)
+
+        def load_sound_weights(weights):
+            self.assertFalse(source_exhausted)
+            loaded_sound_weights.extend(weights)
+
+        model.language_model = SimpleNamespace(load_weights=load_language_weights)
+        model.vision_model = SimpleNamespace(load_weights=load_vision_weights)
+        model.sound_encoder = SimpleNamespace(load_weights=load_sound_weights)
+
+        model.load_weights(source_weights())
+
+        self.assertTrue(source_exhausted)
+        self.assertEqual(
+            [name for name, _ in loaded_language_weights], ["model.layer.weight"]
+        )
+        self.assertEqual(
+            [name for name, _ in loaded_vision_weights],
+            ["radio_model.encoder.weight"],
+        )
+        self.assertEqual(
+            [name for name, _ in loaded_sound_weights],
+            ["sound_encoder.projection.weight"],
+        )
 
 
 if __name__ == "__main__":
