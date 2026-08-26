@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import (
     health_generate,
     liveness,
 )
+from sglang.multimodal_gen.test.server.test_server_common import (
+    _case_warmup_sampling_params,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 
 
@@ -112,6 +115,28 @@ class _RunningProcess:
 
 
 class TestServerManagerReadiness(unittest.TestCase):
+    def test_image_case_warmup_uses_one_frame_for_omni_model(self):
+        case = SimpleNamespace(
+            server_args=SimpleNamespace(modality="image"),
+            sampling_params=SimpleNamespace(
+                output_size="832x480",
+                num_frames=None,
+                fps=None,
+                seconds=1,
+                extras={"num_inference_steps": 35},
+            ),
+        )
+
+        self.assertEqual(
+            _case_warmup_sampling_params(case),
+            {
+                "width": 832,
+                "height": 480,
+                "num_frames": 1,
+                "num_inference_steps": 35,
+            },
+        )
+
     def test_waits_for_health_after_http_startup(self):
         manager = ServerManager("test-model", port=11000, wait_deadline=1)
         with tempfile.TemporaryDirectory() as temp_dir:

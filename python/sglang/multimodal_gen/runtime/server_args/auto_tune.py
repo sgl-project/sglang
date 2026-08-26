@@ -86,8 +86,9 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
         or server_args.transformer_weights_path
         or svdquant_enabled
     ):
-        # Residency changes can perturb quantized numerical paths through a
-        # different allocation and kernel layout.
+        # Explicit and online quantization require a fixed loading path.
+        # Self-describing pre-quantized checkpoints are safe to move after
+        # loading: residency changes storage location, not quantized values.
         return "quantized checkpoint"
     if server_args.direct_gpu_weight_loading:
         return "direct GPU weight loading requires a fixed resident placement"

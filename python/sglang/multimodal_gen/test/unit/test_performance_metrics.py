@@ -125,7 +125,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     assert record.phase_active_components["request:untracked"] == ()
 
 
-def test_loaded_quantized_checkpoint_disables_auto_residency():
+def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     worker = GPUWorker.__new__(GPUWorker)
     worker.rank = 0
     quantized_module = torch.nn.Module()
@@ -133,28 +133,41 @@ def test_loaded_quantized_checkpoint_disables_auto_residency():
         "weight",
         torch.nn.Parameter(torch.ones(1, dtype=torch.int8), requires_grad=False),
     )
-    worker.pipeline = SimpleNamespace(modules={"transformer": quantized_module})
+    worker.pipeline = SimpleNamespace(
+        modules={"transformer": quantized_module},
+        component_residency_strategies={},
+    )
+    worker.server_args = SimpleNamespace(
+        num_gpus=1,
+        node_rank=0,
+        residency_mode=lambda _name: "resident",
+        explicit_residency_mode=lambda _name: None,
+    )
+    device_module = Mock()
+    device_module.mem_get_info.return_value = (100, 100)
+    device_module.memory_reserved.return_value = 0
 
-    report = worker._build_auto_residency_report(
-        workload=DefaultWorkload(
-            width=64,
-            height=64,
-            num_frames=1,
-            num_inference_steps=1,
-        ),
-        records=[
-            WarmupMemoryRecord(
+    with patch.object(torch, "get_device_module", return_value=device_module):
+        report = worker._build_auto_residency_report(
+            workload=DefaultWorkload(
                 width=64,
                 height=64,
                 num_frames=1,
-                baseline_allocated_bytes=1,
-                peak_reserved_bytes=2,
-                succeeded=True,
-            )
-        ],
-    )
+                num_inference_steps=1,
+            ),
+            records=[
+                WarmupMemoryRecord(
+                    width=64,
+                    height=64,
+                    num_frames=1,
+                    baseline_allocated_bytes=1,
+                    peak_reserved_bytes=2,
+                    succeeded=True,
+                )
+            ],
+        )
 
-    assert report.skip_reason == "loaded quantized components: transformer"
+    assert report.skip_reason is None
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

@@ -70,7 +70,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_plan_summary,
     layerwise_host_pin_capacity_bytes,
     layerwise_pinned_host_bytes,
-    module_uses_quantized_weights,
     plan_auto_residency,
     plan_summary_payload,
     rank_candidates_by_h2d_savings,
@@ -1339,18 +1338,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             skip_reason = "no server warmup measurements"
         elif workload.workload_units() is None:
             skip_reason = "default workload resolution unknown"
-        else:
-            quantized_components = [
-                name
-                for name, module in self.pipeline.modules.items()
-                if isinstance(module, torch.nn.Module)
-                and module_uses_quantized_weights(module)
-            ]
-            if quantized_components:
-                skip_reason = (
-                    "loaded quantized components: "
-                    f"{', '.join(sorted(quantized_components))}"
-                )
         if skip_reason is None:
             # A probe that failed at or below the target is a measurement, not
             # missing data: the card cannot hold the default workload as it is

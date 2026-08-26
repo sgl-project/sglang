@@ -31,7 +31,6 @@ import msgspec
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -387,18 +386,6 @@ def _module_weight_bytes(module: nn.Module) -> int:
         tensor.numel() * tensor.element_size() for tensor in module.buffers()
     )
     return param_bytes + buffer_bytes
-
-
-def module_uses_quantized_weights(module: nn.Module) -> bool:
-    """Whether a loaded native component contains quantized weight storage."""
-    for submodule in module.modules():
-        if isinstance(submodule, LinearBase) and submodule.quant_config is not None:
-            return True
-    quantized_float_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
-    return any(
-        not tensor.is_floating_point() or tensor.dtype in quantized_float_dtypes
-        for _, tensor in iter_materialized_weights(module)
-    )
 
 
 def component_runtime_weight_bytes(modules: Mapping[str, object]) -> dict[str, int]:

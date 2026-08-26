@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
@@ -27,7 +26,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_default_workload_peak_bytes,
     estimate_workload_phase_peaks,
     format_applied_changes,
-    module_uses_quantized_weights,
     plan_auto_residency,
     rank_candidates_by_h2d_savings,
     rollback_promotions,
@@ -262,18 +260,6 @@ class TestEstimateDefaultWorkloadPeak:
 
         assert peaks["denoise"] >= 32 * GIB_BYTES
         assert active == {"denoise": ("transformer",)}
-
-
-def test_loaded_native_quantization_config_is_detected_with_bf16_weights():
-    linear = LinearBase.__new__(LinearBase)
-    nn.Module.__init__(linear)
-    linear.quant_config = object()
-    linear.register_parameter(
-        "weight",
-        nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False),
-    )
-
-    assert module_uses_quantized_weights(linear)
 
 
 def _candidate(

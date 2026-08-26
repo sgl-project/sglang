@@ -121,7 +121,11 @@ def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
     if sampling.output_size:
         width, height = sampling.output_size.lower().split("x", 1)
         overrides.update(width=int(width), height=int(height))
-    if sampling.num_frames is not None:
+    if case.server_args.modality == "image":
+        # Omni pipelines can expose a video-oriented model default even when
+        # this case calls /v1/images, whose implicit temporal extent is one.
+        overrides["num_frames"] = 1
+    elif sampling.num_frames is not None:
         overrides["num_frames"] = sampling.num_frames
     elif sampling.fps is not None:
         # /v1/videos resolves an omitted num_frames from seconds * fps.
