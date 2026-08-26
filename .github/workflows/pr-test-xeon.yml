@@ -147,6 +147,7 @@ jobs:
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
             --name ci_sglang_${{ matrix.name }} \
             sglang_xeon
