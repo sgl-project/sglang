@@ -1380,14 +1380,9 @@ jobs:
   # ==============================================================================
   # 8-GPU DeepSeek-V4-Flash (MI30x)
   #
-  # Accuracy only. This is the first DSV4 coverage on gfx942; the MI35x jobs
-  # below carry the perf numbers, and there is no gfx942 DSV4 baseline to
-  # regress against until this job is green.
-  #
-  # Deliberately absent from check-all-jobs for its first landing: the cookbook
-  # marks this recipe verified on MI300X but #36390 reports DSV4-Flash FP8
-  # degrading with context length there, and no CI run has ever settled which
-  # holds. Add it to the needs list once it has passed.
+  # Accuracy only: the MI35x jobs below carry the DSV4 perf numbers, and gfx942
+  # has no DSV4 perf baseline to regress against yet. Runs the cookbook's
+  # MI300X Flash FP8 low-latency cell, so it also covers MLA + KV-FP8 on gfx942.
   # ==============================================================================
 
   nightly-8-gpu-deepseek-v4-flash-rocm720:
@@ -2327,8 +2322,9 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720
       - nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720
-      # 8-GPU DeepSeek-V4 (MI35x). The MI30x nightly-8-gpu-deepseek-v4-flash job
-      # is excluded on purpose for its first landing; see its section comment.
+      # 8-GPU DeepSeek-V4-Flash (MI30x)
+      - nightly-8-gpu-deepseek-v4-flash-rocm720
+      # 8-GPU DeepSeek-V4 (MI35x)
       - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
