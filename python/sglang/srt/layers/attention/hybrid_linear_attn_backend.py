@@ -1203,12 +1203,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_indices_tensor: Optional[torch.Tensor] = None,
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
         ``req_pool_indices`` serves implementations that must re-derive the state
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
+
+        ``state_indices_tensor`` lets the caller pin the slot ids explicitly.
+        Pipeline parallelism needs that: only the last PP rank knows the accept
+        result, so every other rank commits a few microbatches later, when
+        ``forward_metadata`` already describes a different microbatch.
         """
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
@@ -1219,11 +1225,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if state_indices_tensor is None:
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
+        else:
+            state_indices_tensor = state_indices_tensor[:request_number]
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()

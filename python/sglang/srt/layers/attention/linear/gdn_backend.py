@@ -404,6 +404,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self.spec_pp_request_scoped_intermediate = bool(
+            getattr(model_runner.server_args, "enable_spec_pp", False)
+        ) and int(getattr(model_runner.server_args, "pp_size", 1)) > 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -553,6 +556,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.intermediate_conv_window[0]
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
+            if self.spec_pp_request_scoped_intermediate:
+                # --enable-spec-pp commits these snapshots several PP iterations
+                # later, once the accept result has come around the ring. Other
+                # microbatches verify in between, so a row indexed by this
+                # batch's position would be overwritten before it is read. Key
+                # the scratch on the request instead: req_pool_indices are
+                # unique across all live requests and the scratch is sized by
+                # max_running_requests, so the rows never collide.
+                intermediate_state_indices = forward_batch.req_pool_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

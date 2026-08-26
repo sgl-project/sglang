@@ -121,6 +121,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+# PPProxyTensors key prefix for DFLASH auxiliary hidden states forwarded along
+# the PP chain. Suffixed with the global target layer id.
+_DFLASH_AUX_PREFIX = "dflash_aux_"
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1482,6 +1485,11 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        # DFLASH aux capture under PP: `layers_to_capture` is the global set of
+        # target layers the draft consumes, `_local_capture_ids` is the subset
+        # this rank actually owns. Layers outside `[start_layer, end_layer)` are
+        # `PPMissingLayer` placeholders, so flagging them is a no-op.
+        self._local_capture_ids: list[int] = []
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1490,6 +1498,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self._local_capture_ids = sorted(
+            i for i in layers_to_capture if self.start_layer <= i < self.end_layer
+        )
 
     @property
     def start_layer(self) -> int:
@@ -1551,14 +1562,22 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
-        # Return intermediate tensors for pipeline parallelism
+        # Return intermediate tensors for pipeline parallelism. DFLASH aux
+        # hidden states ride along keyed by global layer id so the last rank can
+        # reassemble them in `layers_to_capture` order without relying on the
+        # order the ranks appended them in.
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            for layer_id, aux in zip(self._local_capture_ids, aux_hidden_states):
+                proxy[f"{_DFLASH_AUX_PREFIX}{layer_id}"] = aux
+            if pp_proxy_tensors is not None:
+                for key, value in pp_proxy_tensors.tensors.items():
+                    if key.startswith(_DFLASH_AUX_PREFIX):
+                        proxy.setdefault(key, value)
+            return PPProxyTensors(proxy)
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
@@ -1566,6 +1585,25 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        if not self.layers_to_capture:
+            return hidden_states
+
+        if pp_proxy_tensors is not None:
+            # Prepend the aux captured by the upstream stages. The failure mode
+            # of a missing capture is silent (the draft would just see a shorter
+            # context), so assert completeness here rather than downstream.
+            upstream = [
+                pp_proxy_tensors[f"{_DFLASH_AUX_PREFIX}{layer_id}"]
+                for layer_id in self.layers_to_capture
+                if layer_id < self.start_layer
+            ]
+            aux_hidden_states = upstream + aux_hidden_states
+            assert len(aux_hidden_states) == len(self.layers_to_capture), (
+                "incomplete DFLASH aux hidden capture under PP: got "
+                f"{len(aux_hidden_states)}, want {len(self.layers_to_capture)} "
+                f"(layers_to_capture={self.layers_to_capture})"
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
