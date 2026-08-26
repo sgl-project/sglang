@@ -596,9 +596,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                 list(range(1, length + 1)),
             )
 
-        lru_node_ids = cache.tree_core.get_component_device_lru_node_ids(
-            component_type
-        )
+        lru_node_ids = cache.tree_core.get_component_device_lru_node_ids(component_type)
         first = lru_node_ids[-1]
         second = lru_node_ids[-2]
         leaf = lru_node_ids[-3]
@@ -661,9 +659,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     self.assertIsNone(_device_value(cache, first, component_type))
                     self.assertIsNotNone(_device_value(cache, second, component_type))
                     self.assertIsNotNone(_device_value(cache, leaf, component_type))
-                    self.assertIsNotNone(
-                        _device_value(cache, leaf, ComponentType.FULL)
-                    )
+                    self.assertIsNotNone(_device_value(cache, leaf, ComponentType.FULL))
                     self.assertEqual(result.num_tokens_evicted, 0)
                     self.assertEqual(drain_count, 1)
                     evicted = (
@@ -699,9 +695,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     self.assertIsNone(_device_value(cache, first, component_type))
                     self.assertIsNone(_device_value(cache, second, component_type))
                     self.assertIsNotNone(_device_value(cache, leaf, component_type))
-                    self.assertIsNotNone(
-                        _device_value(cache, leaf, ComponentType.FULL)
-                    )
+                    self.assertIsNotNone(_device_value(cache, leaf, ComponentType.FULL))
                     evicted = (
                         result.swa_num_tokens_evicted
                         if component_type is ComponentType.SWA
