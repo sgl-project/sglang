@@ -63,11 +63,17 @@ class SDPAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
-        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.prefer_cudnn_sdp = bool(extra_impl_args.get("prefer_cudnn_sdp", False))
+        self.allow_cudnn_sdp = bool(
+            extra_impl_args.get("allow_cudnn_sdp", False) or self.prefer_cudnn_sdp
+        )
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
-            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            return sdpa_kernel(
+                _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS,
+                set_priority=self.prefer_cudnn_sdp,
+            )
         return nullcontext()
 
     def forward(

@@ -52,11 +52,21 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 _LONGCAT_QKNORM_ROPE = BitExactFusionGate("LongCat fused QKNorm+RoPE")
+
+
+def _longcat_attention_backend_kwargs() -> dict[str, bool]:
+    # Dense LongCat attention at 1024x1024 uses 4K-4.6K token, head-dim 128
+    # shapes. cuDNN SDPA is faster for these shapes on SM120; the priority list
+    # still retains Flash/Efficient/Math as fallbacks if cuDNN has no plan.
+    if current_platform.is_sm120():
+        return {"prefer_cudnn_sdp": True}
+    return {}
 
 
 def _longcat_qknorm_rope_reference(
@@ -318,6 +328,7 @@ class _LongCatJointAttention(nn.Module):
             num_heads=self.num_local_heads,
             head_size=attention_head_dim,
             causal=False,
+            **_longcat_attention_backend_kwargs(),
         )
 
     def forward(
@@ -437,6 +448,7 @@ class _LongCatSingleAttention(nn.Module):
             num_heads=self.num_local_heads,
             head_size=attention_head_dim,
             causal=False,
+            **_longcat_attention_backend_kwargs(),
         )
 
     def forward(
