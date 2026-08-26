@@ -19,8 +19,8 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                     name="acme",
                     parameters={
                         "type": "object",
-                        "oneOf": [
-                            {
+                        "$defs": {
+                            "AcmeRequest": {
                                 "type": "object",
                                 "properties": {
                                     "kind": {"const": "acme"},
@@ -31,7 +31,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                                     },
                                 },
                                 "required": ["kind", "payload"],
-                            },
+                            }
+                        },
+                        "oneOf": [
+                            {"$ref": "#/$defs/AcmeRequest"},
                             {
                                 "type": "object",
                                 "properties": {"kind": {"const": "other"}},

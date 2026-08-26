@@ -304,10 +304,43 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
-def get_json_schema_properties(schema: Any) -> Dict[str, Any]:
+def resolve_local_json_schema_ref(
+    ref: str, root_schema: Dict[str, Any]
+) -> Optional[Union[bool, Dict[str, Any]]]:
+    """Resolve a local JSON Pointer reference against its root schema."""
+    if not ref.startswith("#/"):
+        return None
+    value: Any = root_schema
+    for part in ref[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    if isinstance(value, (bool, dict)):
+        return value
+    return None
+
+
+def get_json_schema_properties(
+    schema: Any,
+    root_schema: Optional[Dict[str, Any]] = None,
+    seen_refs: frozenset[str] = frozenset(),
+) -> Dict[str, Any]:
     """Collect properties declared directly or in root schema combinators."""
     if not isinstance(schema, dict):
         return {}
+    if root_schema is None:
+        root_schema = schema
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref not in seen_refs:
+        target = resolve_local_json_schema_ref(ref, root_schema)
+        if target is not None:
+            siblings = {key: value for key, value in schema.items() if key != "$ref"}
+            resolved_schema = {"allOf": [target, siblings]} if siblings else target
+            return get_json_schema_properties(
+                resolved_schema, root_schema, seen_refs | {ref}
+            )
 
     direct_properties = schema.get("properties")
     if not isinstance(direct_properties, dict):
@@ -319,7 +352,10 @@ def get_json_schema_properties(schema: Any) -> Dict[str, Any]:
         if not isinstance(branches, list):
             continue
         for branch in branches:
-            for name, property_schema in get_json_schema_properties(branch).items():
+            branch_properties = get_json_schema_properties(
+                branch, root_schema, seen_refs
+            )
+            for name, property_schema in branch_properties.items():
                 if name in direct_properties:
                     continue
                 if name in properties and properties[name] != property_schema:
