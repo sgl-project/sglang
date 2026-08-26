@@ -91,7 +91,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
-    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+    from sglang.srt.mem_cache.pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -475,17 +475,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_metric_labels=self.extra_metric_labels,
             )
 
-    def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
-        self.sidecar_pool_specs.append(spec)
-
-    def register_hicache_draft_pools(
-        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    def register_sidecar_pool(
+        self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
     ) -> None:
-        if self.cache_controller is None:
-            raise RuntimeError("HiCache controller is not attached.")
-        for spec, entry in zip(specs, entries, strict=True):
+        if entry is not None:
+            if self.cache_controller is None:
+                raise RuntimeError("HiCache controller is not attached.")
             self.cache_controller.register_host_pool_entry(entry)
-            self.register_sidecar_pool(spec)
+        self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
@@ -1137,11 +1134,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if host_indices is None:
             return None
 
-        resolved = self.cache_controller._resolve_pool_transfers_allocation(
+        resolved = self.host_pool_group.resolve_host_transfers(
             extra_transfers or None,
-            alloc_host=True,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
+            primary_device_indices=device_indices,
+            primary_host_indices=host_indices,
         )
         if resolved is None and extra_transfers:
             self.host_pool_group.free(host_indices)
@@ -1195,9 +1191,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             for name, saved in saved_by_name.items()
         ]
-        resolved = self.cache_controller._resolve_pool_transfers_allocation(
+        resolved = self.cache_controller._resolve_device_transfers(
             restored_transfers or None,
-            alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=backup.host_indices,
         )
@@ -1223,10 +1218,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def retraction_discard(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
-        for transfer in backup.pool_transfers or []:
-            if transfer.indices_from_pool is None:
-                assert transfer.host_indices is not None
-                self.host_pool_group.get_pool(transfer.name).free(transfer.host_indices)
+        self.host_pool_group.release_transfers(backup.pool_transfers)
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -2259,9 +2251,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     host_indices_list.append(host_indices)
                     released_tokens += len(host_indices)
                 if host_indices_list:
-                    entry = cc.mem_pool_host.entry_map.get(pool_name)
-                    if entry is not None:
-                        entry.host_pool.free(torch.cat(host_indices_list, dim=0))
+                    cc.mem_pool_host.free(
+                        torch.cat(host_indices_list, dim=0), pool=pool_name
+                    )
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
