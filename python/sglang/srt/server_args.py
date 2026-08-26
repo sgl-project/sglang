@@ -98,6 +98,7 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
     is_xpu,
+    get_int_env_var,
     json_list_type,
     nullable_str,
     parse_connector_type,
@@ -10011,6 +10012,36 @@ class ServerArgs:
             assert (
                 cfg.chunked_prefill_size % cfg.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+            # Deterministic inference requires chunked_prefill_size >= the
+            # prefill truncation alignment (default 4096 for triton and
+            # flashinfer).  When chunked_prefill_size is smaller than the
+            # alignment, PrefillAdder always returns OTHER (trunc_len <
+            # truncation_align_size), causing the request to be retried
+            # indefinitely and the server to hang (issue #36344).
+            if cfg.enable_deterministic_inference:
+                prefill_backend = self.get_attention_backends()[0]
+                if prefill_backend == "flashinfer":
+                    align_env = "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE"
+                    align_default = 4096
+                elif prefill_backend == "triton":
+                    align_env = "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE"
+                    align_default = 4096
+                else:
+                    align_env = None
+
+                if align_env is not None:
+                    align_size = get_int_env_var(align_env, align_default)
+                    assert cfg.chunked_prefill_size >= align_size, (
+                        "--chunked-prefill-size must be >= the deterministic "
+                        f"inference prefill alignment size ({align_size}, "
+                        f"controlled by {align_env}) when "
+                        "--enable-deterministic-inference is set. A smaller "
+                        "chunked prefill size causes indefinite request retries "
+                        "and server hang. "
+                        f"Got chunked_prefill_size={cfg.chunked_prefill_size}, "
+                        f"alignment={align_size}."
+                    )
 
         # Check pdmux
         if cfg.enable_pdmux:
