@@ -1584,6 +1584,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # MiMo-V2 mxfp4 checkpoints store expert scales without the
+                    # `_inv` suffix (e.g. experts.0.down_proj.weight_scale),
+                    # while Fp8MoEMethod registers them as w13/w2_weight_scale_inv.
+                    if name.endswith("weight_scale"):
+                        inv_name = name + "_inv"
+                        if inv_name in params_dict:
+                            name = inv_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

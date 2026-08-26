@@ -391,7 +391,9 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
+        # DSV4 / MiMo-V2 mxfp4 expert layout: routed experts are MXFP4-packed.
+        # DSV4: env SGLANG_DSV4_FP4_EXPERTS (default True) applies only to V4.
+        # MiMo-V2: declared via quantization_config.store_dtype == "mxfp4".
         # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
         # FP8 expert tensor layout.
         self.is_fp4_experts: bool = False
@@ -423,6 +425,19 @@ class ModelConfig:
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+        elif _hf_arch(self.hf_config) in MIMO_V2_MODEL_ARCHS:
+            quant_cfg = _hf_attr(self.hf_config, "quantization_config")
+            if isinstance(quant_cfg, dict):
+                store_dtype = quant_cfg.get("store_dtype")
+            elif quant_cfg is not None and hasattr(quant_cfg, "to_dict"):
+                store_dtype = quant_cfg.to_dict().get("store_dtype")
+            else:
+                store_dtype = None
+            if str(store_dtype or "").lower() == "mxfp4":
+                self.is_fp4_experts = True
+                logger.info(
+                    "Detected MiMo-V2 mxfp4 routed-expert layout: is_fp4_experts=True"
+                )
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
