@@ -292,7 +292,7 @@ class RayEngine(Engine):
             ray.get(pg.ready())
 
         is_custom_pg = placement_group is not None
-        nnodes = get_parallel().config.nnodes
+        nnodes = get_parallel().nnodes
         world_size = _compute_world_size()
 
         if not is_custom_pg:
@@ -314,7 +314,7 @@ class RayEngine(Engine):
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
-        if get_parallel().config.dp_size == 1:
+        if get_parallel().dp_size == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 

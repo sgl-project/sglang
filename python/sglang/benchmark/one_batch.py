@@ -548,7 +548,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,

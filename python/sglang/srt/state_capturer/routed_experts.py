@@ -70,8 +70,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().config.dp_size,
-            max_running_requests * get_parallel().config.dp_size,
+            get_schedule().chunked_prefill_size * get_parallel().dp_size,
+            max_running_requests * get_parallel().dp_size,
         )
 
         super().__init__(

@@ -3727,8 +3727,8 @@ def require_mlp_tp_gather():
     from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().config.enable_dp_attention:
-        assert get_parallel().config.dp_size > 1, "dp_size must be greater than 1"
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3737,10 +3737,10 @@ def require_mlp_tp_gather():
             if elastic_expanded_world_enabled():
                 return True
         if (
-            get_parallel().config.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not get_parallel().config.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3756,8 +3756,8 @@ def require_mlp_tp_gather():
             return True
         else:
             return (
-                get_parallel().config.moe_dense_tp_size
-                > get_parallel().config.tp_size // get_parallel().config.dp_size
+                get_parallel().moe_dense_tp_size
+                > get_parallel().config.tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3773,17 +3773,17 @@ def require_attn_tp_gather():
     # autotuners to pick suboptimal kernel variants at small batches.
     from sglang.srt.runtime_context import get_parallel
 
-    if get_parallel().config.disable_attn_tp_gather:
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if (
         not get_moe_a2a_backend().is_none()
-        or get_parallel().config.moe_dense_tp_size is not None
+        or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().config.enable_dp_attention:
-            return get_parallel().config.dp_size < get_parallel().config.tp_size
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < get_parallel().config.tp_size
         else:
             return True
     else:
@@ -3797,7 +3797,7 @@ def require_gathered_buffer():
 def require_mlp_sync():
     from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().config.enable_dp_attention or require_gathered_buffer()
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
