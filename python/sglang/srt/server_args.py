@@ -2244,6 +2244,16 @@ class ServerArgs:
         "Use rejection sampling for speculative decoding (requires topk=1).",
         NS("spec"),
     ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification (arXiv:2403.10444) instead of token-level "
+        "verification for speculative decoding rejection sampling. Accepted "
+        "tokens per iteration are never fewer in expectation, with the same "
+        "lossless guarantee. For EAGLE/EAGLE3 it requires "
+        "--speculative-use-rejection-sampling; for DSPARK it swaps the "
+        "internal sampling-accept kernel.",
+        NS("spec"),
+    ] = False
     speculative_token_map: A[
         Optional[str], "The path of the draft model's small vocab table.", NS("spec")
     ] = None

@@ -123,6 +123,36 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Algorithm-independent validation must live here at top level: the
+    # per-family handlers (_handle_eagle_family / _handle_dflash /
+    # _handle_dspark / _handle_ngram / _handle_frozen_kv_mtp) do not all run
+    # for every algorithm, so checks parked inside one of them are silently
+    # skipped for the others.
+    if server_args.speculative_use_block_verification:
+        # Block verification (arXiv:2403.10444) replaces the token-level
+        # verification inside rejection sampling. EAGLE/EAGLE3 reach it
+        # through the opt-in rejection-sampling path; DSPARK reaches it
+        # through its internal sampling-accept kernel (greedy requests stay
+        # on AcceptGreedy and are unaffected).
+        if server_args.speculative_algorithm in ("EAGLE", "EAGLE3"):
+            if not server_args.speculative_use_rejection_sampling:
+                raise ValueError(
+                    "--speculative-use-block-verification with "
+                    f"speculative_algorithm={server_args.speculative_algorithm} "
+                    "requires --speculative-use-rejection-sampling."
+                )
+        elif server_args.speculative_algorithm != "DSPARK":
+            raise NotImplementedError(
+                "--speculative-use-block-verification is only supported for "
+                "EAGLE / EAGLE3 (with --speculative-use-rejection-sampling) "
+                "and DSPARK, not "
+                f"speculative_algorithm={server_args.speculative_algorithm}."
+            )
+        logger.info(
+            "Block verification is enabled for speculative decoding "
+            "(speculative_use_block_verification=True)."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:

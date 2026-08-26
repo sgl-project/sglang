@@ -9,8 +9,26 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_block_speculative_sampling_triton,
     chain_speculative_sampling_triton,
 )
+
+
+def _block_verification_enabled() -> bool:
+    """Whether to verify with block verification (arXiv:2403.10444) instead
+    of classic token-level rejection sampling.
+
+    Deferred import: this kernels module must stay importable without a
+    running server context (kernel unit tests, CPU fallback).
+    """
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        return bool(get_spec().speculative_use_block_verification)
+    except Exception:
+        return False
+
+
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -119,7 +137,12 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    chain_speculative_sampling_triton(
+    accept_fn = (
+        chain_block_speculative_sampling_triton
+        if _block_verification_enabled()
+        else chain_speculative_sampling_triton
+    )
+    accept_fn(
         predicts=predicts,
         accept_index=accept_index,
         accept_token_num=accept_token_num,
