@@ -20,18 +20,19 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
                     parameters={
                         "type": "object",
                         "$defs": {
+                            "Payload": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                            },
                             "AcmeRequest": {
                                 "type": "object",
                                 "properties": {
                                     "kind": {"const": "acme"},
-                                    "payload": {
-                                        "type": "object",
-                                        "properties": {"value": {"type": "string"}},
-                                        "required": ["value"],
-                                    },
+                                    "payload": {"$ref": "#/$defs/Payload"},
                                 },
                                 "required": ["kind", "payload"],
-                            }
+                            },
                         },
                         "oneOf": [
                             {"$ref": "#/$defs/AcmeRequest"},
@@ -69,6 +70,10 @@ class TestRootCombinatorToolParsers(unittest.TestCase):
         self.assertEqual(
             get_json_schema_properties(self.tools[0].function.parameters)["kind"],
             {"oneOf": [{"const": "acme"}, {"const": "other"}]},
+        )
+        self.assertEqual(
+            get_json_schema_properties(self.tools[0].function.parameters)["payload"],
+            payload_schema | {"required": ["value"]},
         )
 
         parser = FunctionCallParser(self.tools, "qwen3_coder")

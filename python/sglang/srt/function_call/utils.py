@@ -304,57 +304,65 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
-def resolve_local_json_schema_ref(
-    ref: str, root_schema: Dict[str, Any]
-) -> Optional[Union[bool, Dict[str, Any]]]:
-    """Resolve a local JSON Pointer reference against its root schema."""
-    if not ref.startswith("#/"):
-        return None
-    value: Any = root_schema
-    for part in ref[2:].split("/"):
-        key = part.replace("~1", "/").replace("~0", "~")
-        if not isinstance(value, dict) or key not in value:
-            return None
-        value = value[key]
-    if isinstance(value, (bool, dict)):
-        return value
-    return None
+def resolve_local_json_schema_refs(
+    schema: Any,
+    root_schema: Dict[str, Any],
+    seen_refs: frozenset[str] = frozenset(),
+) -> Any:
+    """Resolve local references along a schema's type-inference paths."""
+    if not isinstance(schema, dict):
+        return schema
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref in seen_refs:
+        schema = {key: value for key, value in schema.items() if key != "$ref"}
+        ref = None
+    if isinstance(ref, str) and ref.startswith("#/"):
+        target: Any = root_schema
+        for part in ref[2:].split("/"):
+            key = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or key not in target:
+                break
+            target = target[key]
+        else:
+            siblings = {key: value for key, value in schema.items() if key != "$ref"}
+            schema = {"allOf": [target, siblings]} if siblings else target
+            return resolve_local_json_schema_refs(
+                schema, root_schema, seen_refs | {ref}
+            )
+
+    return schema | {
+        keyword: [
+            resolve_local_json_schema_refs(branch, root_schema, seen_refs)
+            for branch in schema[keyword]
+        ]
+        for keyword in ("anyOf", "oneOf", "allOf")
+        if keyword in schema
+    }
 
 
 def get_json_schema_properties(
     schema: Any,
     root_schema: Optional[Dict[str, Any]] = None,
-    seen_refs: frozenset[str] = frozenset(),
 ) -> Dict[str, Any]:
     """Collect properties declared directly or in root schema combinators."""
+    if root_schema is None:
+        if not isinstance(schema, dict):
+            return {}
+        root_schema = schema
+    schema = resolve_local_json_schema_refs(schema, root_schema)
     if not isinstance(schema, dict):
         return {}
-    if root_schema is None:
-        root_schema = schema
 
-    ref = schema.get("$ref")
-    if isinstance(ref, str) and ref not in seen_refs:
-        target = resolve_local_json_schema_ref(ref, root_schema)
-        if target is not None:
-            siblings = {key: value for key, value in schema.items() if key != "$ref"}
-            resolved_schema = {"allOf": [target, siblings]} if siblings else target
-            return get_json_schema_properties(
-                resolved_schema, root_schema, seen_refs | {ref}
-            )
-
-    direct_properties = schema.get("properties")
-    if not isinstance(direct_properties, dict):
-        direct_properties = {}
+    direct_properties = {
+        name: resolve_local_json_schema_refs(property_schema, root_schema)
+        for name, property_schema in schema.get("properties", {}).items()
+    }
     properties = direct_properties.copy()
 
     for keyword in ("anyOf", "oneOf", "allOf"):
-        branches = schema.get(keyword)
-        if not isinstance(branches, list):
-            continue
-        for branch in branches:
-            branch_properties = get_json_schema_properties(
-                branch, root_schema, seen_refs
-            )
+        for branch in schema.get(keyword, []):
+            branch_properties = get_json_schema_properties(branch, root_schema)
             for name, property_schema in branch_properties.items():
                 if name in direct_properties:
                     continue
