@@ -76,6 +76,10 @@ framework-specific optimization workflow.
 - Locations: `elementwise.py`, `layernorm.py`, `fused_scale_shift_gate.py`, `qwen_image.py`, `triton/scale_shift.py`
 - Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
+- Causal-video cold start: the 4D path uses a static capped power-of-two
+  column tile rather than Triton autotuning. Do not reintroduce request-time
+  autotuning here: LingBot-World calls this path once per transformer block,
+  and tuning overhead can dominate its first denoise step.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
 - Validation: `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`.
 
