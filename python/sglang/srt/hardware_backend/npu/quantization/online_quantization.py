@@ -141,9 +141,9 @@ def npu_format_online_moe_scale(
     if spec.weight_dtype == torch.int8:
         return scale
 
-    # DynamicQuant may retain the reduced K axis. GMM interprets a rank-3 scale
-    # as per-group, so normalize per-channel scales to [E, N] first.
-    scale = scale.squeeze(-1)
+    # GMM uses the middle dimension as quantGroupNum. Preserve a singleton
+    # group axis so DynamicQuant's [E, N, 1] scale stays per-channel.
+    scale = scale.transpose(-1, -2).contiguous()
     return _encode_online_int4_scale(scale)
 
 
