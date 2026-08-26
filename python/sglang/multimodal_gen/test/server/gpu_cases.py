@@ -1152,6 +1152,74 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
     )
 
 
+def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
+    """MiniMax-H3 on a pretend 12 GiB card with a pretend 32 GiB host.
+
+    This is the cookbook's consumer recipe, and it guards the whole constrained
+    placement stack at once: the deployment-size gate that keeps the VAE on its
+    checkpoint mapping, per-layer pinning under a small budget, the courier
+    thread that ships still-mapped layers, and the decode-scoped VAE residency
+    that decodes inside the VRAM the denoise just vacated. The runner's real
+    card and host are never short, so the pretend sizes are what route the run
+    onto those paths: the allocator cap makes "fits 12 GiB" enforced rather
+    than inferred, and the runtime peak baseline is that budget.
+    """
+    return DiffusionTestCase(
+        "minimax_h3_t2va_consumer_budget_1gpu_5090",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--layerwise-resident-layers",
+                "video_vae=36",
+            ],
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
+                "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": "12",
+                # the decode holds two thirds of the decoder against the 12 GiB
+                # cap; without expandable segments, fragmentation tips the
+                # last hundred MiB over
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=("A cat walking on a sunny beach, gentle waves, soft camera pan."),
+            output_size="672x384",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 384,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 1101,
+            },
+        ),
+        run_perf_check=True,
+        perf_repeat_requests=2,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+
+
 ONE_GPU_5090_CANARY_CASE_IDS = (
     "zimage_image_t2i",
     "flux_2_klein_base_image_t2i",
@@ -1162,6 +1230,7 @@ if not current_platform.is_hip():
 
 ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
+ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
 
 
 # Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
