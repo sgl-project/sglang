@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -88,6 +91,7 @@ def _wan_default_attention_backend(
         config.prefer_cudnn_sdpa_on_sm120
         and current_platform.is_sm120()
         and not enable_torch_compile
+        and get_ring_parallel_world_size() == 1
     ):
         return AttentionBackendEnum.TORCH_CUDNN_SDPA
     return None

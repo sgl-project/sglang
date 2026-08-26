@@ -59,8 +59,9 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             AttentionBackendEnum.TORCH_CUDNN_SDPA,
         )
 
+    @patch(f"{_WAN}.get_ring_parallel_world_size", return_value=1)
     @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
-    def test_fastwan_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120):
+    def test_fastwan_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120, _mock_ring):
         config = FastWan2_1_T2V_480P_Config()
 
         self.assertTrue(config.dit_config.prefer_cudnn_sdpa_on_sm120)
@@ -69,8 +70,9 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             AttentionBackendEnum.TORCH_CUDNN_SDPA,
         )
 
+    @patch(f"{_WAN}.get_ring_parallel_world_size", return_value=1)
     @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
-    def test_wan21_1_3b_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120):
+    def test_wan21_1_3b_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120, _mock_ring):
         config = Wan2_1_T2V_1_3B_Config()
 
         self.assertTrue(config.dit_config.prefer_cudnn_sdpa_on_sm120)
@@ -79,8 +81,11 @@ class TestWanAttentionBackendRole(unittest.TestCase):
             AttentionBackendEnum.TORCH_CUDNN_SDPA,
         )
 
+    @patch(f"{_WAN}.get_ring_parallel_world_size", return_value=1)
     @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
-    def test_wan21_fun_1_3b_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120):
+    def test_wan21_fun_1_3b_prefers_cudnn_sdpa_on_sm120(
+        self, _mock_is_sm120, _mock_ring
+    ):
         config = Wan2_1_Fun_1_3B_InP_Config()
 
         self.assertTrue(config.dit_config.prefer_cudnn_sdpa_on_sm120)
@@ -105,6 +110,13 @@ class TestWanAttentionBackendRole(unittest.TestCase):
                 enable_torch_compile=True,
             )
         )
+
+    @patch(f"{_WAN}.get_ring_parallel_world_size", return_value=2)
+    @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
+    def test_fastwan_keeps_ring_backend_on_sm120(self, _mock_is_sm120, _mock_ring):
+        config = FastWan2_1_T2V_480P_Config()
+
+        self.assertIsNone(_wan_default_attention_backend(config.dit_config))
 
     @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
     def test_regular_wan_keeps_platform_default_on_sm120(self, _mock_is_sm120):
