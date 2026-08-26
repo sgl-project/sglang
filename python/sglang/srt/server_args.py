@@ -8213,16 +8213,48 @@ class ServerArgs:
                 "that selects IPC loading automatically."
             )
 
-        # Speculative decoding loads an extra draft model whose weights the
-        # daemon does not export, so refuse the combination up front instead of
-        # failing deep inside draft-worker load (draft-model daemon TBD).
+        # Speculative decoding loads an extra draft/MTP model. The weight cache
+        # supports this only for the single-draft EAGLE family (EAGLE / EAGLE3 /
+        # NEXTN / STANDALONE), where the engine launches one extra draft daemon
+        # per rank on its own "_draft" socket. Everything else either has no
+        # draft model to cache (NGRAM) or uses bespoke loaders the daemon does
+        # not replicate (DFLASH, DSPARK, plugins) — refuse those up front
+        # instead of failing deep inside draft-worker load.
         if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
-            raise ValueError(
-                "--weight-cache-mode is not supported together with speculative "
-                "decoding (--speculative-algorithm): the weight cache daemon does "
-                "not export the draft model's weights. Disable one of them "
-                "(--weight-cache-mode off) for this configuration."
-            )
+            if self.speculative_algorithm not in (
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+            ):
+                raise ValueError(
+                    "--weight-cache-mode only supports speculative decoding with "
+                    "the EAGLE family (EAGLE / EAGLE3 / NEXTN / STANDALONE); got "
+                    f"--speculative-algorithm {self.speculative_algorithm}. "
+                    "Disable one of them (--weight-cache-mode off) for this "
+                    "configuration."
+                )
+            if self.enable_multi_layer_eagle:
+                raise ValueError(
+                    "--weight-cache-mode does not support "
+                    "--enable-multi-layer-eagle yet: each MTP head would need "
+                    "its own per-index draft daemon, which the launchers do not "
+                    "spawn. Disable one of them for this configuration."
+                )
+            if self.weight_cache_socket is not None:
+                raise ValueError(
+                    "--weight-cache-socket cannot be combined with speculative "
+                    "decoding: the target and draft daemons need distinct "
+                    "sockets. Leave it unset so the per-rank paths (including "
+                    "the draft's '_draft' suffix) are derived automatically."
+                )
+            if self.nnodes > 1:
+                raise ValueError(
+                    "--weight-cache-mode with speculative decoding is "
+                    "single-node only for now: the draft daemons need a second "
+                    "cross-node rendezvous endpoint that the launchers do not "
+                    "provision. Disable one of them for multi-node deployments."
+                )
 
         if self.weight_cache_mode != "off" and self.enable_eplb:
             raise ValueError(

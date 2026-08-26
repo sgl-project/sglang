@@ -202,6 +202,7 @@ def build_load_config(
     draft_model_idx: Optional[int],
     weight_cache_mode: str,
     weight_cache_socket: Optional[str],
+    is_draft_worker: bool = False,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -231,6 +232,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        weight_cache_is_draft_model=is_draft_worker,
     )
 
 
@@ -241,13 +243,17 @@ def maybe_enable_ipc_weight_cache(
     tp_size: int,
     pp_rank: int,
     tp_rank: int,
+    is_draft_worker: bool = False,
+    draft_model_idx: Optional[int] = None,
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
     Overrides the load format to ``IPC_CACHE`` (remembering the original as the
-    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
-    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
-    weight reload) can't overwrite the captured fallback format.
+    disk fallback) and derives the per-rank daemon socket if unset. The draft
+    worker's ModelRunner resolves to the draft daemon's "_draft{idx}" socket so
+    it never handshakes with the target daemon. Idempotent: the format swap is
+    guarded on ``!= IPC_CACHE`` so a second call (e.g. a weight reload) can't
+    overwrite the captured fallback format.
     """
     if get_model().weight_cache_mode == "off":
         return
@@ -265,7 +271,11 @@ def maybe_enable_ipc_weight_cache(
         )
 
         global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
+        load_config.weight_cache_socket = get_socket_path(
+            global_rank=global_rank,
+            is_draft_model=is_draft_worker,
+            draft_model_idx=draft_model_idx,
+        )
 
 
 def load_model_with_memory_saver(

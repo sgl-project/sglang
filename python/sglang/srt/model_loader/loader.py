@@ -4363,12 +4363,18 @@ def get_model_loader(
 
             ps = get_parallel()
             global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
-            socket_path = get_socket_path(global_rank=global_rank)
+            socket_path = get_socket_path(
+                global_rank=global_rank,
+                is_draft_model=load_config.weight_cache_is_draft_model,
+                draft_model_idx=load_config.draft_model_idx,
+            )
         return IpcModelLoader(
             load_config=load_config,
             socket_path=socket_path,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
+            is_draft_model=load_config.weight_cache_is_draft_model,
+            draft_model_idx=load_config.draft_model_idx,
         )
 
     return DefaultModelLoader(load_config)

@@ -29,16 +29,21 @@ from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
+    build_daemon_model_specs,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
+    format_daemon_role,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
     hash_quant_config,
     is_ipc_quant_supported,
+    make_local_rendezvous,
+    normalize_draft_model_idx,
     recv_msg,
+    resolve_daemon_model_identity,
     send_msg,
 )
 from sglang.srt.weight_cache.transport import (
@@ -179,6 +184,10 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            # A target daemon must never serve a draft worker (and vice versa),
+            # and multi-layer MTP heads must never cross-match.
+            ("is_draft_model", True),
+            ("draft_model_idx", 0),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -243,6 +252,29 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
         self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
 
+    def test_draft_paths_never_collide_with_target(self):
+        # The draft daemon shares the rank with the target daemon on the same
+        # GPU, so only the "_draft{idx}" suffix keeps their sockets apart.
+        self.assertEqual(format_daemon_role(False), "")
+        self.assertEqual(format_daemon_role(True), "_draft0")
+        self.assertEqual(format_daemon_role(True, 2), "_draft2")
+        self.assertNotEqual(get_socket_path(3), get_socket_path(3, is_draft_model=True))
+        self.assertTrue(
+            get_socket_path(3, is_draft_model=True).endswith("rank3_draft0.sock")
+        )
+        self.assertTrue(
+            get_ready_path(3, is_draft_model=True, draft_model_idx=1).endswith(
+                "rank3_draft1.ready"
+            )
+        )
+
+    def test_normalize_draft_model_idx(self):
+        # None (single-draft, unfiltered weights) must stay distinguishable
+        # from head 0 of the multi-layer path.
+        self.assertEqual(normalize_draft_model_idx(None), -1)
+        self.assertEqual(normalize_draft_model_idx(0), 0)
+        self.assertEqual(normalize_draft_model_idx(3), 3)
+
     def test_compute_local_gpu_id_honors_base_and_step(self):
         # Single-node TP=4: identity mapping rank -> gpu.
         self.assertEqual(
@@ -261,6 +293,89 @@ class TestGlobalRankAndPaths(CustomTestCase):
                 0, 2, pp_size_per_node=1, tp_size_per_node=4, gpu_id_step=2
             ),
             4,
+        )
+
+
+class TestDaemonModelSpecs(CustomTestCase):
+    """The per-rank daemon set shared by the engine and the CLI launcher."""
+
+    def test_local_rendezvous_is_tcp_and_unique_per_group(self):
+        # Both launchers and the daemon fallback go through this helper, so a
+        # target group and a draft group can never be handed the same endpoint.
+        first = make_local_rendezvous()
+        second = make_local_rendezvous()
+        self.assertTrue(first.startswith("tcp://127.0.0.1:"))
+        self.assertTrue(second.startswith("tcp://127.0.0.1:"))
+        self.assertNotEqual(first, second)
+        self.assertGreater(int(first.rsplit(":", 1)[1]), 0)
+
+    def test_target_only_without_speculative(self):
+        specs = build_daemon_model_specs(
+            model_path="/models/demo",
+            quantization="fp8",
+            revision="v1",
+            target_dist_init_method="tcp://127.0.0.1:1000",
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertFalse(specs[0].is_draft_model)
+        self.assertEqual(specs[0].role, "")
+
+    def test_speculative_adds_draft_spec_with_model_config_fallbacks(self):
+        # Draft path/revision fall back to the target's, mirroring
+        # ModelConfig.from_server_args — that equality is what makes the
+        # daemon-side fingerprint match the draft worker's.
+        specs = build_daemon_model_specs(
+            model_path="/models/demo",
+            quantization="fp8",
+            revision="v1",
+            target_dist_init_method="tcp://127.0.0.1:1000",
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_quantization="fp8",
+            draft_dist_init_method="tcp://127.0.0.1:1001",
+        )
+        self.assertEqual(len(specs), 2)
+        draft = specs[1]
+        self.assertTrue(draft.is_draft_model)
+        self.assertEqual(draft.model_path, "/models/demo")
+        self.assertEqual(draft.revision, "v1")
+        self.assertEqual(draft.role, "_draft0")
+        self.assertEqual(draft.dist_init_method, "tcp://127.0.0.1:1001")
+
+    def test_speculative_requires_separate_draft_rendezvous(self):
+        # Target and draft daemons form separate process groups; sharing one
+        # init method would deadlock, so omitting the draft endpoint must raise.
+        with self.assertRaises(ValueError):
+            build_daemon_model_specs(
+                model_path="/models/demo",
+                quantization=None,
+                revision=None,
+                target_dist_init_method="tcp://127.0.0.1:1000",
+                speculative_algorithm="EAGLE",
+            )
+
+    def test_draft_identity_resolution_matches_spec(self):
+        # The daemon resolves its own identity through the same helper, so the
+        # launcher's spec and the daemon's load always name one checkpoint.
+        self.assertEqual(
+            resolve_daemon_model_identity(
+                is_draft_model=True,
+                model_path="/models/demo",
+                quantization="fp8",
+                revision="v1",
+                speculative_draft_model_quantization="fp8",
+            ),
+            ("/models/demo", "fp8", "v1"),
+        )
+        # The target role passes its own values through untouched.
+        self.assertEqual(
+            resolve_daemon_model_identity(
+                is_draft_model=False,
+                model_path="/models/demo",
+                quantization="fp8",
+                revision="v1",
+                speculative_draft_model_path="/models/draft",
+            ),
+            ("/models/demo", "fp8", "v1"),
         )
 
 
@@ -322,7 +437,46 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
         self.assertIs(fake_context.kwargs["target"], daemon.run_weight_cache_daemon)
         self.assertEqual(
             fake_context.kwargs["args"],
-            (server_args, 3, 3, 0, "tcp://127.0.0.1:29500"),
+            (server_args, 3, 3, 0, "tcp://127.0.0.1:29500", False, None),
+        )
+
+    def test_spawn_forwards_draft_role(self):
+        from sglang.srt.weight_cache import daemon
+
+        # A draft daemon shares the resolved ServerArgs with the target and is
+        # distinguished only by its role, which selects its socket and the draft
+        # branch of the model identity resolution.
+        server_args = SimpleNamespace(model_path="/models/demo")
+
+        class FakeProcess:
+            pid = 1234
+
+            def start(self):
+                pass
+
+        class FakeContext:
+            def Process(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeProcess()
+
+        fake_context = FakeContext()
+        from unittest import mock
+
+        with mock.patch.object(
+            daemon.multiprocessing, "get_context", return_value=fake_context
+        ):
+            daemon.spawn_weight_cache_daemon(
+                server_args,
+                gpu_id=3,
+                tp_rank=3,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29501",
+                is_draft_model=True,
+            )
+
+        self.assertEqual(
+            fake_context.kwargs["args"],
+            (server_args, 3, 3, 0, "tcp://127.0.0.1:29501", True, None),
         )
 
 

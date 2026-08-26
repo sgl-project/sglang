@@ -11,7 +11,7 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import msgspec
 
@@ -20,11 +20,13 @@ from sglang.srt.utils.common import safe_pickle_loads
 logger = logging.getLogger(__name__)
 
 # Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
+# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide;
+# ``role`` is "" for the target model and "_draft{idx}" for a speculative
+# draft/MTP model, so a target daemon and a draft daemon can coexist per GPU)
+WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}{role}.sock"
 
 # Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}{role}.ready"
 
 
 class CacheConfig(msgspec.Struct):
@@ -60,6 +62,14 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Speculative decoding: True for a draft/MTP model daemon. The draft is a
+    # different nn.Module (e.g. Qwen3_5ForCausalLMMTP) loaded from the same or
+    # a different checkpoint, so target/draft handles must never cross-match.
+    is_draft_model: bool = False
+    # Multi-layer-MTP head index the daemon's weights were filtered for
+    # (LoadConfig.draft_model_idx). Normalized via normalize_draft_model_idx():
+    # -1 encodes None (single-draft path, no per-head filtering).
+    draft_model_idx: int = -1
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -274,6 +284,173 @@ def compute_env_stamp() -> Dict[str, str]:
     return {"device_capability": device_capability, "torch_version": torch_version}
 
 
+def normalize_draft_model_idx(draft_model_idx: Optional[int]) -> int:
+    """Encode LoadConfig.draft_model_idx (Optional[int]) as a CacheConfig int.
+
+    None (single-draft path, weights not filtered per MTP head) maps to -1 so
+    it stays distinguishable from head 0 of the multi-layer path. Daemon and
+    client must both go through this so the fingerprints can't drift.
+    """
+    return -1 if draft_model_idx is None else draft_model_idx
+
+
+def format_daemon_role(
+    is_draft_model: bool = False, draft_model_idx: Optional[int] = None
+) -> str:
+    """Path suffix distinguishing the target daemon from draft/MTP daemons.
+
+    "" for the target model; "_draft{idx}" for a draft daemon (idx defaults to
+    0 on the single-draft path so the suffix is stable). Keyed into the
+    socket/ready templates so a target daemon and a draft daemon serving the
+    same rank never collide on the same Unix socket.
+    """
+    if not is_draft_model:
+        return ""
+    return f"_draft{draft_model_idx if draft_model_idx is not None else 0}"
+
+
+def make_local_rendezvous() -> str:
+    """Allocate a fresh loopback ``tcp://`` endpoint for one daemon group.
+
+    ``init_distributed_environment`` forms the group through torch's TCPStore,
+    so the endpoint has to be a ``tcp://`` URL, and each group needs its own:
+    the target daemons and the draft daemons are two separate process groups
+    that would deadlock against each other on a shared endpoint. Loopback is
+    correct because an auto-allocated group never spans nodes -- multi-node
+    runs must pass an explicit rendezvous address instead. Single source of
+    truth for both launchers and the daemon's own fallback, so the three
+    copies of this formula can't drift.
+
+    Imported lazily so protocol.py stays cheap to import.
+    """
+    from sglang.srt.utils.network import NetworkAddress, get_free_port
+
+    return NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
+
+
+class DaemonModelSpec(NamedTuple):
+    """Identity of one model a weight cache daemon can hold.
+
+    Speculative decoding runs two distinct nn.Modules per rank (the target and
+    the draft/MTP head), each with its own checkpoint slice, quantization and
+    parameter names, so each needs its own daemon on its own socket. This is the
+    single source of truth for that per-rank daemon set, shared by the engine's
+    launcher and the standalone CLI launcher so the two cannot drift.
+    """
+
+    is_draft_model: bool
+    model_path: str
+    quantization: Optional[str]
+    revision: Optional[str]
+    draft_model_idx: Optional[int]
+    speculative_algorithm: Optional[str]
+    # Rendezvous for this spec's daemons. Target and draft daemons form separate
+    # process groups (each sized tp_size * pp_size), so they must never share an
+    # init method or the two groups would deadlock against each other.
+    dist_init_method: str
+
+    @property
+    def role(self) -> str:
+        return format_daemon_role(self.is_draft_model, self.draft_model_idx)
+
+
+def resolve_daemon_model_identity(
+    *,
+    is_draft_model: bool,
+    model_path: str,
+    quantization: Optional[str],
+    revision: Optional[str],
+    speculative_draft_model_path: Optional[str] = None,
+    speculative_draft_model_quantization: Optional[str] = None,
+    speculative_draft_model_revision: Optional[str] = None,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Resolve (model_path, quantization, revision) for one daemon role.
+
+    The draft fallbacks mirror ``ModelConfig.from_server_args``, which resolves
+    the draft model as ``speculative_draft_model_path or model_path``, its
+    quantization as ``speculative_draft_model_quantization`` (no fallback to the
+    target's) and its revision as ``speculative_draft_model_revision or
+    revision``. Both the launchers' spec list and the daemon itself go through
+    this so the CacheConfig fingerprint cannot drift from the draft worker's.
+    """
+    if not is_draft_model:
+        return model_path, quantization, revision
+    return (
+        speculative_draft_model_path or model_path,
+        speculative_draft_model_quantization,
+        speculative_draft_model_revision or revision,
+    )
+
+
+def build_daemon_model_specs(
+    *,
+    model_path: str,
+    quantization: Optional[str],
+    revision: Optional[str],
+    target_dist_init_method: str,
+    speculative_algorithm: Optional[str] = None,
+    speculative_draft_model_path: Optional[str] = None,
+    speculative_draft_model_quantization: Optional[str] = None,
+    speculative_draft_model_revision: Optional[str] = None,
+    draft_dist_init_method: Optional[str] = None,
+) -> List[DaemonModelSpec]:
+    """Build the per-rank daemon set: the target model, plus the draft model
+    when speculative decoding is enabled.
+
+    Model identity per role comes from ``resolve_daemon_model_identity``, the
+    same helper the daemon uses, so the launcher's view and the daemon's load
+    always describe the same checkpoint.
+    """
+    # specs[0] is the target model by construction: every rank always serves
+    # the target weights, and the draft entry below is appended only when
+    # speculative decoding is on. The flag is the role of this entry, not a
+    # default guess about the model.
+    specs = [
+        DaemonModelSpec(
+            is_draft_model=False,
+            model_path=model_path,
+            quantization=quantization,
+            revision=revision,
+            draft_model_idx=None,
+            speculative_algorithm=None,
+            dist_init_method=target_dist_init_method,
+        )
+    ]
+    if speculative_algorithm is None:
+        return specs
+
+    if draft_dist_init_method is None:
+        raise ValueError(
+            "draft_dist_init_method is required when speculative decoding is "
+            "enabled: the draft daemons form their own process group and cannot "
+            "share the target daemons' rendezvous endpoint."
+        )
+
+    draft_model_path, draft_quantization, draft_revision = (
+        resolve_daemon_model_identity(
+            is_draft_model=True,
+            model_path=model_path,
+            quantization=quantization,
+            revision=revision,
+            speculative_draft_model_path=speculative_draft_model_path,
+            speculative_draft_model_quantization=speculative_draft_model_quantization,
+            speculative_draft_model_revision=speculative_draft_model_revision,
+        )
+    )
+    specs.append(
+        DaemonModelSpec(
+            is_draft_model=True,
+            model_path=draft_model_path,
+            quantization=draft_quantization,
+            revision=draft_revision,
+            draft_model_idx=None,
+            speculative_algorithm=speculative_algorithm,
+            dist_init_method=draft_dist_init_method,
+        )
+    )
+    return specs
+
+
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
     """Single source of truth for the daemon rank formula.
 
@@ -308,20 +485,38 @@ def compute_local_gpu_id(
     )
 
 
-def get_socket_path(global_rank: int) -> str:
+def get_socket_path(
+    global_rank: int,
+    *,
+    is_draft_model: bool = False,
+    draft_model_idx: Optional[int] = None,
+) -> str:
     """Get the Unix socket path for a weight cache daemon.
 
-    global_rank = tp_size * pp_rank + tp_rank
+    global_rank = tp_size * pp_rank + tp_rank; draft/MTP daemons get a
+    "_draft{idx}" suffix so they never collide with the target daemon.
     """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
+    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(
+        global_rank=global_rank,
+        role=format_daemon_role(is_draft_model, draft_model_idx),
+    )
 
 
-def get_ready_path(global_rank: int) -> str:
+def get_ready_path(
+    global_rank: int,
+    *,
+    is_draft_model: bool = False,
+    draft_model_idx: Optional[int] = None,
+) -> str:
     """Get the ready-file path for a weight cache daemon.
 
-    global_rank = tp_size * pp_rank + tp_rank
+    global_rank = tp_size * pp_rank + tp_rank; draft/MTP daemons get a
+    "_draft{idx}" suffix so they never collide with the target daemon.
     """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+    return WEIGHT_CACHE_READY_TEMPLATE.format(
+        global_rank=global_rank,
+        role=format_daemon_role(is_draft_model, draft_model_idx),
+    )
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
@@ -347,7 +542,13 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
+def cleanup_stale_daemon_files(
+    global_rank: int,
+    *,
+    force: bool = False,
+    is_draft_model: bool = False,
+    draft_model_idx: Optional[int] = None,
+) -> None:
     """Validate and clean up .ready/.sock files for a daemon rank.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
@@ -357,8 +558,12 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(global_rank)
-    socket_path = get_socket_path(global_rank)
+    ready_path = get_ready_path(
+        global_rank, is_draft_model=is_draft_model, draft_model_idx=draft_model_idx
+    )
+    socket_path = get_socket_path(
+        global_rank, is_draft_model=is_draft_model, draft_model_idx=draft_model_idx
+    )
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return

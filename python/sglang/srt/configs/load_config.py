@@ -110,6 +110,9 @@ class LoadConfig:
     # Weight cache daemon options
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    # True when this load is for the speculative draft/MTP model; routes the
+    # IPC loader to the draft daemon's socket and fingerprint.
+    weight_cache_is_draft_model: bool = False
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
     def __post_init__(self):

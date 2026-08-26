@@ -29,6 +29,7 @@ from .protocol import (
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
+    normalize_draft_model_idx,
     recv_msg,
     send_msg,
 )
@@ -70,12 +71,18 @@ class IpcModelLoader(BaseModelLoader):
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
+        is_draft_model: bool = False,
+        draft_model_idx: Optional[int] = None,
     ):
         super().__init__(load_config)
         self.socket_path = socket_path
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        # Draft/MTP load: fingerprints against the draft daemon (which holds a
+        # different nn.Module than the target, on its own "_draft{idx}" socket).
+        self.is_draft_model = is_draft_model
+        self.draft_model_idx = draft_model_idx
         self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
 
     def load_model(
@@ -286,6 +293,27 @@ class IpcModelLoader(BaseModelLoader):
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
 
+    @staticmethod
+    def _is_valid_local_recompute(name, local_tensor, ipc_tensor) -> bool:
+        """True if the locally-materialized buffer may replace the IPC entry.
+
+        Only the deterministically-recomputed rope cache qualifies: it must be
+        already materialized (a memoized module expanded by the rope reserve,
+        not a fresh meta tensor), same dtype and row width, and a strict
+        superset in length — rows [0, ipc_len) of both are identical because
+        _ensure_cos_sin_cache_length only appends rows.
+        """
+        if not name.endswith(".cos_sin_cache"):
+            return False
+        if local_tensor.device.type == "meta":
+            return False
+        return (
+            local_tensor.dtype == ipc_tensor.dtype
+            and local_tensor.dim() == ipc_tensor.dim()
+            and local_tensor.shape[1:] == ipc_tensor.shape[1:]
+            and local_tensor.shape[0] >= ipc_tensor.shape[0]
+        )
+
     def _load_zero_copy_mode(
         self,
         model_config,
@@ -332,6 +360,7 @@ class IpcModelLoader(BaseModelLoader):
         imported_refs = []
         imported_count = 0
         mismatched = []
+        recomputed_local = []
         new_params_count = 0
         map_tic = time.perf_counter()
 
@@ -352,6 +381,19 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
+                    # Deterministically-recomputed buffers may legitimately be
+                    # longer locally than in the daemon: get_rope() memoizes
+                    # modules in _ROPE_DICT, and after the target load
+                    # reserve_rope_cache_for_long_sequences grows cos_sin_cache
+                    # in-place for speculative decoding — the draft's "meta"
+                    # init then reuses that already-materialized, longer cache
+                    # while the daemon (a separate process that never runs the
+                    # reserve) exported the unexpanded one. The local buffer is
+                    # valid and a superset, so keep it and skip the IPC entry.
+                    if self._is_valid_local_recompute(name, ref_param, imported_tensor):
+                        recomputed_local.append(name)
+                        del imported_tensor
+                        continue
                     mismatched.append(
                         f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
@@ -366,6 +408,14 @@ class IpcModelLoader(BaseModelLoader):
 
             if name not in existing_names:
                 new_params_count += 1
+
+        if recomputed_local:
+            logger.info(
+                f"[IpcModelLoader] Kept {len(recomputed_local)} locally-recomputed "
+                f"buffer(s) instead of the daemon's shorter export (rope cache "
+                f"pre-expansion): {recomputed_local[:5]}"
+                f"{'...' if len(recomputed_local) > 5 else ''}"
+            )
 
         if mismatched:
             raise RuntimeError(
@@ -521,6 +571,8 @@ class IpcModelLoader(BaseModelLoader):
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                is_draft_model=self.is_draft_model,
+                draft_model_idx=normalize_draft_model_idx(self.draft_model_idx),
                 **compute_env_stamp(),
             )
 
@@ -531,7 +583,8 @@ class IpcModelLoader(BaseModelLoader):
                 f"arch={engine_config.model_arch}, "
                 f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
                 f"quant={engine_config.quant_method}, "
-                f"dtype={engine_config.dtype}"
+                f"dtype={engine_config.dtype}, "
+                f"role={'draft' if self.is_draft_model else 'target'}"
             )
 
             send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
@@ -570,6 +623,9 @@ class IpcModelLoader(BaseModelLoader):
             download_dir=self.load_config.download_dir,
             model_loader_extra_config=self.load_config.model_loader_extra_config,
             tp_rank=self.load_config.tp_rank,
+            # Preserve the multi-layer-MTP head filter so a draft disk fallback
+            # loads the same weight slice the daemon would have served.
+            draft_model_idx=self.load_config.draft_model_idx,
         )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
         fallback = loader_cls(fallback_config)

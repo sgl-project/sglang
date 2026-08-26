@@ -1108,16 +1108,20 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            is_draft_worker=self.is_draft_worker,
         )
 
         # If the weight cache is enabled, override the load format to IPC_CACHE
-        # and derive the per-rank daemon socket. Idempotent across reloads.
+        # and derive the per-rank daemon socket (the draft worker resolves to
+        # the draft daemon's socket). Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
             server_args=self.server_args,
             tp_size=self.ps.tp_size,
             pp_rank=self.ps.pp_rank,
             tp_rank=self.ps.tp_rank,
+            is_draft_worker=self.is_draft_worker,
+            draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
