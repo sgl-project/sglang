@@ -521,7 +521,7 @@ class TboForwardBatchPreparer:
             # None because its device buffer is refreshed per replay.
             tbo_children_num_token_non_padded_cpu=cls._split_num_token_non_padded(
                 tbo_split_token_index=cls._compute_split_token_index(batch),
-                num_token_non_padded=batch.num_token_non_padded_cpu,
+                num_token_non_padded=cls._get_num_token_non_padded_cpu(batch),
             ),
         )
 
@@ -853,11 +853,21 @@ class TboForwardBatchPreparer:
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):
         return cls.compute_tbo_children_num_token_non_padded_raw(
             tbo_split_token_index=cls._compute_split_token_index(batch),
-            # Not len(input_ids): that is the padded (MAX_LEN) token count, which
-            # would undo the idle-rank dummy-token mask that
-            # prepare_mlp_sync_batch writes onto the parent.
-            num_token_non_padded=batch.num_token_non_padded_cpu,
+            # Prefer the parent CPU count: len(input_ids) is the padded
+            # (MAX_LEN) count and would undo the idle-rank dummy-token mask.
+            # The resolver falls back to physical rows only for capture
+            # batches that intentionally leave the CPU mirror unset.
+            num_token_non_padded=cls._get_num_token_non_padded_cpu(batch),
         )
+
+    @staticmethod
+    def _get_num_token_non_padded_cpu(batch: ForwardBatch) -> int:
+        num_token_non_padded = (
+            batch.num_token_non_padded_cpu
+            if batch.num_token_non_padded_cpu is not None
+            else len(batch.input_ids)
+        )
+        return num_token_non_padded
 
     @classmethod
     def compute_tbo_children_num_token_non_padded_raw(
