@@ -125,6 +125,15 @@ class WanT2V480PConfig(PipelineConfig):
 
 
 @dataclass
+class Wan2_1_T2V_1_3B_Config(WanT2V480PConfig):
+    """Configuration for the Wan2.1 T2V 1.3B checkpoint."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.dit_config.prefer_cudnn_sdpa_on_sm120 = True
+
+
+@dataclass
 class TurboWanT2V480PConfig(WanT2V480PConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 

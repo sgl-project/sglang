@@ -109,6 +109,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     TurboWanI2V720Config,
     TurboWanT2V1_3B480PConfig,
     TurboWanT2V480PConfig,
+    Wan2_1_T2V_1_3B_Config,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
@@ -829,10 +830,14 @@ def _register_configs():
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
-        pipeline_config_cls=WanT2V480PConfig,
+        pipeline_config_cls=Wan2_1_T2V_1_3B_Config,
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=WanT2V480PConfig,
         model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
     )
     register_configs(

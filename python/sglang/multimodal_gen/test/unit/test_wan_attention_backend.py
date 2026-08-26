@@ -5,6 +5,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
+    Wan2_1_T2V_1_3B_Config,
     WanT2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
@@ -60,6 +61,16 @@ class TestWanAttentionBackendRole(unittest.TestCase):
     @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
     def test_fastwan_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120):
         config = FastWan2_1_T2V_480P_Config()
+
+        self.assertTrue(config.dit_config.prefer_cudnn_sdpa_on_sm120)
+        self.assertEqual(
+            _wan_default_attention_backend(config.dit_config),
+            AttentionBackendEnum.TORCH_CUDNN_SDPA,
+        )
+
+    @patch(f"{_WAN}.current_platform.is_sm120", return_value=True)
+    def test_wan21_1_3b_prefers_cudnn_sdpa_on_sm120(self, _mock_is_sm120):
+        config = Wan2_1_T2V_1_3B_Config()
 
         self.assertTrue(config.dit_config.prefer_cudnn_sdpa_on_sm120)
         self.assertEqual(
