@@ -105,6 +105,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     is_hip,
+    is_npu,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -122,6 +123,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -728,7 +730,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
-        if not self.attn_backend.supports_ragged_verify_graph:
+        fixed_verify_len = int(envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get())
+        # Ascend's hybrid wrapper conservatively rejects dynamic ragged replay.
+        # A DSpark fixed-width tier replays the capture shape unchanged, so it
+        # does not depend on that dynamic metadata capability.
+        is_npu_fixed_shape = bool(
+            _is_npu
+            and fixed_verify_len > 0
+            and fixed_verify_len == self.captured_req_width
+            and getattr(forward_batch.spec_info, "num_tokens_per_req", None)
+            == fixed_verify_len
+            and ragged_layout.graph_num_tokens in self.capture_num_tokens
+        )
+        if (
+            not self.attn_backend.supports_ragged_verify_graph
+            and not is_npu_fixed_shape
+        ):
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
