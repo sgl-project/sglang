@@ -577,7 +577,6 @@ class HybridCacheController(BaseHiCacheController):
         self._prefetch_next_layer = 1
 
         with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             target_device_pool = self.mem_pool_host.anchor_entry.device_pool
             self.mem_pool_host.load_to_device_per_layer(
@@ -651,6 +650,8 @@ class HybridCacheController(BaseHiCacheController):
         ) = self._prefetch_state
 
         target_device_pool = self.mem_pool_host.anchor_entry.device_pool
+        self.load_stream.wait_stream(torch.npu.current_stream())
+        torch.npu.set_stream_limit(torch.npu.current_stream(), cube_num=31, vector_num=62)
         with device_module.stream(self.load_stream):
             self.mem_pool_host.load_to_device_per_layer(
                 target_device_pool,

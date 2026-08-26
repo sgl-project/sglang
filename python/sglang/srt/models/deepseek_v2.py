@@ -1427,6 +1427,9 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        torch.npu.reset_stream_limit(torch.npu.current_stream())
+
         shared_output = None
         shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
