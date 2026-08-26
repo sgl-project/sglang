@@ -130,6 +130,36 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # (page_indptr, page_ids, last_page_len); None means use the token-level table
+    paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+def _build_paged_kv_view(
+    kv_indices: torch.Tensor, seq_lens_cpu: torch.Tensor, page_size: int
+):
+    """Token-level flashinfer KV table -> the page-level view aiter's asm
+    paged-varlen prefill expects.
+
+    The paged allocator packs each page contiguously, so a token slot's page id
+    is slot // page_size. The arithmetic runs on seq_lens_cpu so it costs no
+    device sync; only the gather touches the GPU.
+    """
+    device = kv_indices.device
+    seq_lens = seq_lens_cpu.to(torch.int64)
+    pages = (seq_lens + page_size - 1) // page_size
+
+    page_indptr = torch.zeros(pages.numel() + 1, dtype=torch.int32)
+    page_indptr[1:] = torch.cumsum(pages, dim=0)
+    tok_base = torch.zeros(pages.numel() + 1, dtype=torch.int64)
+    tok_base[1:] = torch.cumsum(seq_lens, dim=0)
+
+    within = torch.arange(
+        int(page_indptr[-1]), dtype=torch.int64
+    ) - torch.repeat_interleave(page_indptr[:-1].to(torch.int64), pages)
+    gather = torch.repeat_interleave(tok_base[:-1], pages) + within * page_size
+    page_ids = (kv_indices[gather.to(device)] // page_size).to(torch.int32)
+    last_page_len = ((seq_lens - 1) % page_size + 1).to(torch.int32)
+    return page_indptr.to(device), page_ids, last_page_len.to(device)
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -1379,6 +1409,21 @@ class AiterAttnBackend(AttentionBackend):
                         ).to(torch.int32)
                     )
 
+                # Once per batch, not per layer: forward_extend only consumes it.
+                paged_kv_view = None
+                if (
+                    envs.SGLANG_AITER_PAGED_PREFILL_ASM.get()
+                    and self.page_size == 64
+                    and not self.kv_cache_is_vectorized_5d
+                    and not self.use_sliding_window_kv_pool
+                    and not self.use_triton_unified_attention
+                ):
+                    paged_kv_view = _build_paged_kv_view(
+                        self.indices_updater_prefill.kv_indices,
+                        forward_batch.seq_lens_cpu,
+                        self.page_size,
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
@@ -1388,6 +1433,7 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                     swa_out_cache_loc=swa_out_cache_loc,
+                    paged_kv_view=paged_kv_view,
                 )
 
     def init_cuda_graph_state(
@@ -2484,12 +2530,35 @@ class AiterAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+            kv_indptr_arg = self.forward_metadata.kv_indptr[:bs0]
+            if (
+                self.forward_metadata.paged_kv_view is not None
+                and page_table is self.forward_metadata.kv_indices
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+                and self.kv_cache_dtype == fp8_dtype
+            ):
+                # These must match aiter's asm guard: there is no CK arm for 4D
+                # LINEAR page-64 fp8 hd256, so a shape the guard rejects raises
+                # rather than falling back.
+                page_indptr, page_ids, last_page_len = (
+                    self.forward_metadata.paged_kv_view
+                )
+                kv_indptr_arg = page_indptr[:bs0]
+                page_table = page_ids
+                k_cache = k_cache.view(-1, self.page_size, *k_cache.shape[-2:])
+                v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
+                extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
                 self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
+                kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,

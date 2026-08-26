@@ -525,6 +525,11 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
+    # gfx950 fp8 hd256 page-64 takes aiter's paged-varlen asm kernel instead of
+    # CK. Requires aiter with ROCm/aiter#4971; older aiter has no kernel for
+    # that shape at all, so this is opt-in. Default off.
+    SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(False)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
