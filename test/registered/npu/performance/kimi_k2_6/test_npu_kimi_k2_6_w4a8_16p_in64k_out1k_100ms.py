@@ -44,7 +44,7 @@ OTHER_ARGS = [
     "--nnodes",
     2,
     "--mem-fraction-static",
-    0.662,
+    0.7,
     "--max-running-requests",
     32,
     "--chunked-prefill-size",

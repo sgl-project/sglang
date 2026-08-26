@@ -102,7 +102,7 @@ jobs:
         run: |
           # copy source code to shared-disk
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang
+          target_path=/root/.cache/tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
@@ -118,7 +118,7 @@ jobs:
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | xargs -r kubectl delete pod -n $NAMESPACE || true
             else
               echo "No sglang job exist, start test case..."
               break
@@ -129,7 +129,7 @@ jobs:
         timeout-minutes: 300
         run: |
           # sglang_source_relative_path is shared-disk path
-          sglang_source_relative_path=tests/sglang
+          sglang_source_relative_path=tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -243,9 +243,12 @@ jobs:
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | xargs -r kubectl delete pod -n $NAMESPACE || true
             else
               echo "No sglang job exist, start test case..."
               break
             fi
           done
+
+          # clean up the per-run source copy on shared-disk
+          rm -rf /root/.cache/tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }}
