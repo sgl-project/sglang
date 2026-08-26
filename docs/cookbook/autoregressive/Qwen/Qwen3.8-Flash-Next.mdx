@@ -60,11 +60,7 @@ For how to launch either image, see [Install → Method 3: Using Docker](../../.
 
 </Accordion>
 
-Pick your hardware + quantization to generate the launch command. Every recipe on this page is **single-node**:
-
-- **Low Latency** — fastest reply for a single user. Turns the checkpoint's built-in MTP head on (`NEXTN` 3/1/4) and caps concurrency at 96. Offered on BF16 and NVFP4.
-- **Balanced** — the one verified operating point for FP8 and for both AMD cards. Use for typical multi-user serving.
-- **High Throughput** — most tokens per second across many users. Drops speculation and spreads the expert pool with `--ep 4`. Offered on BF16 and NVFP4.
+Pick your hardware + quantization to generate the launch command.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";
@@ -75,8 +71,6 @@ import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-flash-next-benchm
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
-
-This page ships four axes: **TP** degree, MoE **EP** degree, the **reasoning** and **tool-call** parsers, and the **NEXTN / MTP** speculative preset. Reasoning is baked into every NVIDIA cell, so that chip acts as an opt-out; the tool-call parser and — outside the low-latency cells — MTP are opt-ins.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
