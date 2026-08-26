@@ -41,7 +41,7 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_capture_safe_weights,
     restore_optional_checkpoint_parameter_values,
 )
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import get_context, get_exec, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -402,21 +402,23 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertIsNone(_get_startup_weight_load_profile("UnsupportedForCausalLM"))
 
     def test_auto_mode_falls_back_for_config_rejection(self):
-        server_args = SimpleNamespace(startup_weight_load_mode="auto")
         with (
             patch.object(
                 StartupWeightLoadOptions,
-                "from_server_args",
+                "from_published_config",
                 return_value=_make_options(device="cpu", is_cuda_platform=False),
+            ),
+            patch(
+                f"{_STARTUP_MODULE}.get_model",
+                return_value=SimpleNamespace(startup_weight_load_mode="auto"),
             ),
             patch(f"{_STARTUP_MODULE}.logger.info") as log_info,
         ):
-            manager = StartupWeightLoadManager.create_from_server_args(
+            manager = StartupWeightLoadManager.create_from_published_config(
                 loader=self.loader,
                 model_config=_make_model_config(),
                 load_config=self.load_config,
                 device_config=self.device_config,
-                server_args=server_args,
                 is_draft_worker=False,
             )
 
@@ -424,12 +426,15 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertIn("non_cuda: CUDA only", log_info.call_args.args[1])
 
     def test_auto_mode_creates_a_manager_when_admitted(self):
-        server_args = SimpleNamespace(startup_weight_load_mode="auto")
         with (
             patch.object(
                 StartupWeightLoadOptions,
-                "from_server_args",
+                "from_published_config",
                 return_value=_make_options(),
+            ),
+            patch(
+                f"{_STARTUP_MODULE}.get_model",
+                return_value=SimpleNamespace(startup_weight_load_mode="auto"),
             ),
             patch(
                 f"{_STARTUP_MODULE}.get_model_architecture",
@@ -440,12 +445,11 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 return_value=_CanonicalModel,
             ),
         ):
-            manager = StartupWeightLoadManager.create_from_server_args(
+            manager = StartupWeightLoadManager.create_from_published_config(
                 loader=self.loader,
                 model_config=_make_model_config(),
                 load_config=self.load_config,
                 device_config=self.device_config,
-                server_args=server_args,
                 is_draft_worker=False,
             )
 
@@ -1153,8 +1157,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         publish(server_args, role="test")
         self.addCleanup(reset_context)
         with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False):
-            options = StartupWeightLoadOptions.from_server_args(
-                server_args=server_args,
+            options = StartupWeightLoadOptions.from_published_config(
                 is_draft_worker=False,
             )
 
@@ -1188,18 +1191,20 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                 return_value=(9, 0),
             ),
         ):
-            cuda_options = StartupWeightLoadOptions.from_server_args(
-                server_args=server_args,
+            cuda_options = StartupWeightLoadOptions.from_published_config(
                 is_draft_worker=False,
             )
         self.assertEqual(cuda_options.cuda_device_capability, (9, 0))
 
-        server_args.attention_backend = "dsa"
-        server_args.prefill_attention_backend = "fa3"
-        with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False):
-            split_options = StartupWeightLoadOptions.from_server_args(
-                server_args=server_args,
-                is_draft_worker=False,
+        with (
+            get_exec().kernel.override(
+                attention_backend="dsa",
+                prefill_attention_backend="fa3",
+            ),
+            patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False),
+        ):
+            split_options = StartupWeightLoadOptions.from_published_config(
+                is_draft_worker=False
             )
         self.assertEqual(
             (
@@ -1812,7 +1817,7 @@ class TestStartupWeightLoadPolicyRouting(CustomTestCase):
             patch(f"{_LOAD_MODEL_UTILS_MODULE}.monkey_patch_vllm_parallel_state"),
             patch.object(
                 StartupWeightLoadManager,
-                "create_from_server_args",
+                "create_from_published_config",
                 return_value=manager,
             ),
         ):

@@ -22,10 +22,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     attention_backends,
-    configured_attn_cp_size,
-    configured_dcp_size,
-    configured_pp_size,
-    configured_tp_size,
     get_device,
     get_exec,
     get_lora,
@@ -36,7 +32,6 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +148,16 @@ class StartupWeightLoadOptions:
     prefetch_num_threads: int
 
     @classmethod
-    def from_server_args(
+    def from_published_config(
         cls,
         *,
-        server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> StartupWeightLoadOptions:
+        """Everything this needs is a published leaf; nothing comes off a record.
+
+        `is_draft_worker` is the exception and travels as an argument: it is
+        this runner's role, not the process's configuration.
+        """
         cuda_graph_config = get_exec().graph.cuda_graph_config
         is_cuda_platform = current_platform.is_cuda()
         device_capability = (
@@ -179,13 +178,13 @@ class StartupWeightLoadOptions:
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
             speculative_algorithm=get_spec().speculative_algorithm,
-            tp_size=configured_tp_size(),
-            attn_cp_size=configured_attn_cp_size(),
-            dcp_size=configured_dcp_size(),
-            pp_size=configured_pp_size(),
-            dp_size=get_parallel().dp_size,
-            ep_size=get_parallel().ep_size,
-            moe_dp_size=get_parallel().moe_dp_size,
+            tp_size=get_parallel().config.tp_size,
+            attn_cp_size=get_parallel().config.attn_cp_size,
+            dcp_size=get_parallel().config.dcp_size,
+            pp_size=get_parallel().config.pp_size,
+            dp_size=get_parallel().config.dp_size,
+            ep_size=get_parallel().config.ep_size,
+            moe_dp_size=get_parallel().config.moe_dp_size,
             moe_a2a_backend=get_exec().moe.moe_a2a_backend,
             moe_runner_backend=get_exec().moe.moe_runner_backend,
             fp8_gemm_runner_backend=get_exec().kernel.fp8_gemm_runner_backend,
@@ -197,7 +196,7 @@ class StartupWeightLoadOptions:
             disable_shared_experts_fusion=(
                 get_exec().moe.disable_shared_experts_fusion
             ),
-            enable_dp_attention=get_parallel().enable_dp_attention,
+            enable_dp_attention=get_parallel().config.enable_dp_attention,
             enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
             enable_eplb=get_exec().moe.enable_eplb,
             ep_num_redundant_experts=get_exec().moe.ep_num_redundant_experts,
@@ -205,7 +204,7 @@ class StartupWeightLoadOptions:
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             enable_elastic_expert_backup=(get_exec().moe.enable_elastic_expert_backup),
             ep_join_mode=get_exec().moe.ep_join_mode,
-            max_ep_size=get_parallel().max_ep_size,
+            max_ep_size=get_parallel().config.max_ep_size,
             linear_attn_backend=get_exec().mamba.linear_attn_backend,
             linear_attn_decode_backend=get_exec().mamba.linear_attn_decode_backend,
             linear_attn_prefill_backend=(get_exec().mamba.linear_attn_prefill_backend),
@@ -1218,22 +1217,20 @@ class StartupWeightLoadManager:
         self._timings: Optional[StartupWeightLoadTimings] = None
 
     @classmethod
-    def create_from_server_args(
+    def create_from_published_config(
         cls,
         *,
         loader,
         model_config: ModelConfig,
         load_config: LoadConfig,
         device_config: DeviceConfig,
-        server_args: ServerArgs,
         is_draft_worker: bool,
     ) -> Optional[StartupWeightLoadManager]:
         """Create a manager, or return ``None`` when auto selects serial."""
-        options = StartupWeightLoadOptions.from_server_args(
-            server_args=server_args,
+        options = StartupWeightLoadOptions.from_published_config(
             is_draft_worker=is_draft_worker,
         )
-        if server_args.startup_weight_load_mode == "auto":
+        if get_model().startup_weight_load_mode == "auto":
             admission = evaluate_startup_weight_load_admission(
                 loader=loader,
                 model_config=model_config,
@@ -1254,7 +1251,6 @@ class StartupWeightLoadManager:
                 plan=admission.plan,
                 fallback_to_serial=True,
             )
-
         return cls.create(
             loader=loader,
             model_config=model_config,

@@ -417,6 +417,9 @@ class StreamingSession(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        return self.inner.evict_for_alloc(params)
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)
         if result is not None:
@@ -465,7 +468,7 @@ class StreamingSession(BasePrefixCache):
                     slot.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+            self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
 

@@ -400,7 +400,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
                 self.req_to_token_pool.size,
-                model_runner.server_args,
                 model_runner.device,
             )
         )
