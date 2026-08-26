@@ -102,6 +102,34 @@ def _convert_packed_int4_weight(weight: torch.Tensor) -> torch.Tensor:
     return converted.reshape(*weight.shape[:-2], input_size, output_size // 8)
 
 
+def _convert_packed_int4_dense_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Convert dynamic-quant INT4 output to the offline dense layout."""
+    if weight.dtype != torch.int32:
+        raise TypeError(
+            "Ascend INT4 dynamic quantization must return torch.int32, got "
+            f"{weight.dtype}."
+        )
+    if weight.dim() != 2:
+        raise ValueError(
+            "Ascend INT4 dense weights must be two-dimensional, got "
+            f"shape {tuple(weight.shape)}."
+        )
+
+    output_size, packed_input_size = weight.shape
+    input_size = packed_input_size * 8
+    unpacked = torch.empty(
+        (output_size, input_size), dtype=torch.int32, device=weight.device
+    )
+    for column_offset, source_shift in enumerate(range(0, 32, 4)):
+        values = (weight >> source_shift) & 0xF
+        unpacked[:, column_offset::8] = torch.where(
+            values < 8, values, values - 16
+        )
+
+    packed = torch.ops.npu.npu_convert_weight_to_int4pack(unpacked)
+    return packed.transpose(-1, -2)
+
+
 def npu_format_online_weight(
     weight: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
@@ -112,6 +140,16 @@ def npu_format_online_weight(
     # npu_dynamic_quant packs K as raw nibbles in [N, K / 8]. QuantMatmul and
     # GMM require the interleaved weight layout produced from logical [K, N].
     return _convert_packed_int4_weight(weight)
+
+
+def npu_format_online_dense_weight(
+    weight: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
+) -> torch.Tensor:
+    if spec.mode == "w4a4_int4":
+        # Match the established offline LAOS contract: pack logical [N, K],
+        # then expose the transposed [K / 8, N] view to QuantMatmul.
+        return _convert_packed_int4_dense_weight(weight)
+    return npu_format_online_weight(weight, spec)
 
 
 def _encode_online_int4_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -130,7 +168,7 @@ def npu_format_online_dense_scale(
     scale: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
     scale = scale.flatten()
-    if spec.weight_dtype == torch.int8:
+    if spec.mode != "w4a8_int8":
         return scale
 
     # Match torch_npu.npu_trans_quant_param for FP16 output. QuantMatmul's

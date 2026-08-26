@@ -9,7 +9,7 @@ from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
     get_npu_online_integer_quant_spec,
     npu_dynamic_quantize_weight,
     npu_format_online_dense_scale,
-    npu_format_online_weight,
+    npu_format_online_dense_weight,
 )
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
@@ -122,7 +122,7 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
         copy_or_rebind_param(
             layer,
             "weight",
-            npu_format_online_weight(quantized_weight, self.spec),
+            npu_format_online_dense_weight(quantized_weight, self.spec),
         )
         if self.spec.mode == "w4a8_int8":
             copy_or_rebind_param(
@@ -182,12 +182,10 @@ def get_npu_online_linear_method() -> Optional[LinearMethodBase]:
     spec = get_npu_online_integer_quant_spec()
     if spec is None:
         return None
-    if spec.mode == "w4a4_int4":
-        # Naive dense A4W4 collapses model accuracy; retain MoE-only savings.
-        return None
     return {
         "w8a8_int8": NPUOnlineW8A8Int8LinearMethod,
         "w4a8_int8": NPUOnlineW4A8Int8LinearMethod,
+        "w4a4_int4": NPUOnlineW4A4Int4LinearMethod,
     }[spec.mode]()
 
 
