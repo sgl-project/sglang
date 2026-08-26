@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
+from sglang.srt.runtime_context import get_context, get_serving
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -2356,9 +2357,13 @@ class TestGrpcServerArgs(CustomTestCase):
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
-        server_args = SimpleNamespace(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
-        )
+        # The host comes from the `serving` bag; `grpc_worker_threads` is not a
+        # field (resolution sets it from the environment), so it stays on the
+        # stand-in the call site is handed.
+        override = get_context().override_server_args(host="127.0.0.1", grpc_port=50051)
+        override.install()
+        self.addCleanup(override.restore)
+        server_args = SimpleNamespace(grpc_worker_threads=4)
         with (
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension",
@@ -2373,7 +2378,7 @@ class TestGrpcServerArgs(CustomTestCase):
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
-                grpc_port=resolution_result(server_args, "grpc_port"),
+                grpc_port=get_serving().grpc_port,
             )
 
         self.assertEqual(handle, "handle")

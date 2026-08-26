@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import (
     get_lora,
@@ -416,7 +417,7 @@ class RuntimeHandle:
         if embedding_model_spec is not None:
             result["embedding"] = resolved_embedding_plan(
                 embedding_model_spec,
-                server_args=self.server_args,
+                config=resolving_view(self.server_args),
                 model_config=model_config,
             )
         return json.dumps(result, default=str)

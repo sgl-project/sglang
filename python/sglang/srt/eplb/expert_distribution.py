@@ -764,7 +764,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
@@ -898,9 +898,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 # Cannot use local_physical_count to support select_experts
                 self._expert_location_metadata.num_physical_experts,
             ),
-            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=get_device_namespace().device,
         )
         self._first_dump = True
 

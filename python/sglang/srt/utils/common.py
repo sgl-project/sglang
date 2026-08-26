@@ -4623,11 +4623,15 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
-def reserve_rope_cache_for_long_sequences(
-    model, server_args, model_config, logger=None
-):
-    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
     from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
@@ -4635,7 +4639,7 @@ def reserve_rope_cache_for_long_sequences(
 
     # 1) Estimate base context upper bound
     base_ctx = (
-        getattr(server_args, "context_length", None)
+        get_model().context_length
         or getattr(model_config, "context_len", None)
         or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
@@ -4643,8 +4647,8 @@ def reserve_rope_cache_for_long_sequences(
     )
 
     # 2) Speculative decoding expansion
-    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
     reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
 
     # 3) Align to reduce reallocation frequency
