@@ -196,6 +196,15 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
 
 
 @dataclass
+class Wan2_1_Fun_1_3B_InP_Config(WanI2V480PConfig):
+    """Configuration for the Wan2.1 Fun InP 1.3B checkpoint."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.dit_config.prefer_cudnn_sdpa_on_sm120 = True
+
+
+@dataclass
 class WanI2V720PConfig(WanI2V480PConfig):
     """Base configuration for Wan I2V 14B 720P pipeline architecture."""
 

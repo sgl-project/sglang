@@ -4,6 +4,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan2_1_Fun_1_3B_InP_Config,
     Wan2_1_T2V_1_3B_Config,
     WanT2V480PConfig,
 )
@@ -31,6 +32,15 @@ def test_wan21_1_3b_exact_path_uses_checkpoint_specific_config():
 
     assert info is not None
     assert info.pipeline_config_cls is Wan2_1_T2V_1_3B_Config
+
+
+def test_wan21_fun_1_3b_exact_path_uses_checkpoint_specific_config():
+    _get_config_info.cache_clear()
+
+    info = _get_config_info("weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers")
+
+    assert info is not None
+    assert info.pipeline_config_cls is Wan2_1_Fun_1_3B_InP_Config
 
 
 def test_unregistered_wan_pipeline_keeps_generic_config():
