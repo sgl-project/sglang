@@ -3979,8 +3979,6 @@ class HybridLinearKVPool(KVCache):
                     write_loc,
                     cache_k,
                     cache_v,
-                    k_scale,
-                    v_scale,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -4162,8 +4160,6 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
@@ -4179,12 +4175,7 @@ class MLATokenToKVPool(KVCache):
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
-            if _is_cpu and _cpu_has_amx_support and self.dtype == torch.float8_e4m3fn:
-                if k_scale is None:
-                    raise ValueError("CPU FP8 KV cache requires a static K scale.")
-                cache_k = (cache_k / k_scale).to(self.dtype)
-            else:
-                cache_k = cache_k.to(self.dtype)
+            cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(

@@ -191,9 +191,9 @@ class TestDecodeAttention(CustomTestCase):
         v_scale = 1.0
         if kvcache_dtype == torch.float8_e4m3fn:
             k_scale = 0.5
-            v_scale = 0.5
-            k_buffer_fp8 = (k_buffer / 0.5).to(torch.float8_e4m3fn)
-            v_buffer_fp8 = (v_buffer / 0.5).to(torch.float8_e4m3fn)
+            v_scale = 0.25
+            k_buffer_fp8 = (k_buffer / k_scale).to(torch.float8_e4m3fn)
+            v_buffer_fp8 = (v_buffer / v_scale).to(torch.float8_e4m3fn)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
 
@@ -204,10 +204,12 @@ class TestDecodeAttention(CustomTestCase):
         # set kv cache
         if not is_cross_attn:
             if kvcache_dtype == torch.float8_e4m3fn:
-                k_buffer_fp8[loc] = (key / 0.5).to(torch.float8_e4m3fn)
-                v_buffer_fp8[loc] = (value / 0.5).to(torch.float8_e4m3fn)
-                k_buffer[loc] = (k_buffer_fp8[loc].float() * 0.5).to(dtype)
-                v_buffer[loc] = (v_buffer_fp8[loc].float() * 0.5).to(dtype)
+                k_buffer[loc] = (
+                    (key / k_scale).to(torch.float8_e4m3fn).float() * k_scale
+                ).to(dtype)
+                v_buffer[loc] = (
+                    (value / v_scale).to(torch.float8_e4m3fn).float() * v_scale
+                ).to(dtype)
             else:
                 k_buffer[loc] = key
                 v_buffer[loc] = value
@@ -244,12 +246,8 @@ class TestDecodeAttention(CustomTestCase):
             k_scale,
             v_scale,
             o,
-            key if not is_cross_attn and kvcache_dtype != torch.float8_e4m3fn else None,
-            (
-                value
-                if not is_cross_attn and kvcache_dtype != torch.float8_e4m3fn
-                else None
-            ),
+            key if not is_cross_attn else None,
+            value if not is_cross_attn else None,
             loc,
             attn_logits,
             req_to_token,

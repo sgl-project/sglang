@@ -82,6 +82,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
+    cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
@@ -281,6 +282,21 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if self.use_mla_backend:
+                raise ValueError("CPU FP8 KV cache is only supported for MHA.")
+            if not cpu_has_amx_support():
+                raise ValueError("CPU FP8 KV cache requires Intel AMX support.")
+            configured_backends = {
+                self.server_args.attention_backend,
+                self.server_args.prefill_attention_backend,
+                self.server_args.decode_attention_backend,
+            } - {None}
+            if configured_backends - {"intel_amx"}:
+                raise ValueError(
+                    "CPU FP8 KV cache requires the intel_amx attention backend."
+                )
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None

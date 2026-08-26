@@ -247,9 +247,9 @@ class TestExtendAttention(CustomTestCase):
         v_scale = 1.0
         if kvcache_dtype == torch.float8_e4m3fn:
             k_scale = 0.5
-            v_scale = 0.5
-            k_buffer_fp8 = (k_buffer / 0.5).to(torch.float8_e4m3fn)
-            v_buffer_fp8 = (v_buffer / 0.5).to(torch.float8_e4m3fn)
+            v_scale = 0.25
+            k_buffer_fp8 = (k_buffer / k_scale).to(torch.float8_e4m3fn)
+            v_buffer_fp8 = (v_buffer / v_scale).to(torch.float8_e4m3fn)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
 
@@ -391,7 +391,6 @@ class TestExtendAttention(CustomTestCase):
 
         fp8_configs = [
             (1, 123, 16, 1, 128, 96, None, False, False, False),
-            (1, 123, 1, 1, 128, 96, None, False, True, False),
             (1, 123, 16, 1, 128, 96, None, False, False, True),
             (1, 20, 1, 1, 64, 64, 10, True, False, False),
         ]

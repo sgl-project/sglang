@@ -1147,6 +1147,8 @@ void decode_set_kv_buffer(
     packed_t* __restrict__ v_buffer,
     const scalar_t* __restrict__ key,
     const scalar_t* __restrict__ value,
+    float k_buf_scale,
+    float v_buf_scale,
     const int64_t* __restrict__ loc,
     int64_t batches,
     int64_t num_heads_kv,
@@ -1169,11 +1171,23 @@ void decode_set_kv_buffer(
       int64_t loc_val = loc[bs];
       packed_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      copy_stub(k_buffer_ptr, new_key_ptr, head_size);
+      if constexpr (std::is_same_v<packed_t, at::Float8_e4m3fn>) {
+        for (int64_t d = 0; d < head_size; ++d) {
+          k_buffer_ptr[d] = static_cast<packed_t>(static_cast<float>(new_key_ptr[d]) / k_buf_scale);
+        }
+      } else {
+        copy_stub(k_buffer_ptr, new_key_ptr, head_size);
+      }
       if (!is_mla) {
         packed_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
         const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        copy_stub(v_buffer_ptr, new_value_ptr, head_size_v);
+        if constexpr (std::is_same_v<packed_t, at::Float8_e4m3fn>) {
+          for (int64_t d = 0; d < head_size_v; ++d) {
+            v_buffer_ptr[d] = static_cast<packed_t>(static_cast<float>(new_value_ptr[d]) / v_buf_scale);
+          }
+        } else {
+          copy_stub(v_buffer_ptr, new_value_ptr, head_size_v);
+        }
       }
 
       // move to the next index
@@ -1875,6 +1889,7 @@ void decode_attention_cpu(
   if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
     TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
     TORCH_CHECK(k_buf_scale > 0.0 && v_buf_scale > 0.0, "Float8 kv_buffer requires positive static scales");
+    TORCH_CHECK(!is_mla, "Float8 kv_buffer is only supported for MHA on CPU");
   }
 
   // block length for k_buffer and v_buffer
@@ -1922,6 +1937,8 @@ void decode_attention_cpu(
               (packed_t*)v_buffer_data,
               key_tensor.data_ptr<scalar_t>(),
               value_tensor.data_ptr<scalar_t>(),
+              k_buf_scale_float,
+              v_buf_scale_float,
               loc.data_ptr<int64_t>(),
               num_seqs,
               num_heads_kv,

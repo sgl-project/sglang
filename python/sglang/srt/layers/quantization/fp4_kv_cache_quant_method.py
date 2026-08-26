@@ -769,6 +769,7 @@ _FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
+_CPU_FP8_BACKENDS = frozenset({"intel_amx"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -832,8 +833,8 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _ANY_BACKEND),
     ),
     CPUFP8KVCacheMethod.name: (
-        _plain(_PREFILL, _ANY_BACKEND),
-        _plain(_DECODE, _ANY_BACKEND),
+        _plain(_PREFILL, _CPU_FP8_BACKENDS),
+        _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),

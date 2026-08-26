@@ -8,8 +8,7 @@ import torch
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     CPUFP8KVCacheMethod,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import cpu_has_amx_support
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=14, suite="base-b-test-cpu")
@@ -84,42 +83,6 @@ def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
 
     assert torch.equal(k_cache, k_cache_ref)
     assert torch.equal(v_cache, v_cache_ref)
-
-
-def test_mha_fp8_e4m3_kv_pool_uses_static_scales():
-    pool = MHATokenToKVPool(
-        size=32,
-        page_size=1,
-        dtype=torch.float8_e4m3fn,
-        head_num=2,
-        head_dim=32,
-        layer_num=1,
-        device=DEVICE,
-        enable_memory_saver=False,
-        quant_method=CPUFP8KVCacheMethod(),
-    )
-    loc = torch.tensor([3, 7], dtype=torch.int64, device=DEVICE)
-    layer = SimpleNamespace(layer_id=0)
-    cache_k = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
-    cache_v = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
-
-    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=0.5, v_scale=0.25)
-
-    assert pool.k_scale_buffer is None
-    assert pool.v_scale_buffer is None
-    assert isinstance(pool.get_key_buffer(0), torch.Tensor)
-    assert isinstance(pool.get_value_buffer(0), torch.Tensor)
-
-    k_ref = pool.k_buffer[0][loc].clone()
-    v_ref = pool.v_buffer[0][loc].clone()
-    kv_cpu = pool.get_cpu_copy(loc)
-
-    pool.k_buffer[0][loc].zero_()
-    pool.v_buffer[0][loc].zero_()
-    pool.load_cpu_copy(kv_cpu, loc)
-
-    assert torch.equal(pool.k_buffer[0][loc], k_ref)
-    assert torch.equal(pool.v_buffer[0][loc], v_ref)
 
 
 @pytest.mark.parametrize(
@@ -204,43 +167,6 @@ def test_mha_fp8_e4m3_pool_decode_numerics(k_scale, v_scale):
         .movedim(1, 0)
     )
     torch.testing.assert_close(output, output_ref, atol=3e-2, rtol=1e-6)
-
-
-@pytest.mark.skipif(
-    not cpu_has_amx_support(), reason="FP8 E4M3 MLA KV cache requires AMX"
-)
-def test_mla_fp8_e4m3_kv_pool_uses_static_scale():
-    pool = MLATokenToKVPool(
-        size=32,
-        page_size=1,
-        dtype=torch.float8_e4m3fn,
-        kv_lora_rank=16,
-        qk_rope_head_dim=16,
-        layer_num=1,
-        device=DEVICE,
-        enable_memory_saver=False,
-    )
-    loc = torch.tensor([3, 7], dtype=torch.int64, device=DEVICE)
-    target_loc = torch.tensor([11, 13], dtype=torch.int64, device=DEVICE)
-    layer = SimpleNamespace(layer_id=0)
-    cache_k = torch.randn((2, 1, 32), dtype=torch.bfloat16, device=DEVICE)
-    cache_v = torch.empty((2, 1, 16), dtype=torch.bfloat16, device=DEVICE)
-
-    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=0.5, v_scale=0.5)
-
-    expected_bytes = sum(t.numel() * t.element_size() for t in pool.kv_buffer)
-    assert pool.get_kv_size_bytes() == expected_bytes
-
-    kv_ref = pool.kv_buffer[0][loc].clone()
-    pool.move_kv_cache(target_loc, loc)
-
-    assert torch.equal(pool.kv_buffer[0][target_loc], kv_ref)
-
-    kv_cpu = pool.get_cpu_copy(target_loc)
-    pool.kv_buffer[0][target_loc].zero_()
-    pool.load_cpu_copy(kv_cpu, target_loc)
-
-    assert torch.equal(pool.kv_buffer[0][target_loc], kv_ref)
 
 
 if __name__ == "__main__":
