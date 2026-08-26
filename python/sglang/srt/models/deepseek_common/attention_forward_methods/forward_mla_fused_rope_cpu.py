@@ -29,15 +29,22 @@ class DeepseekMLACpuForwardMixin:
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
+        fused_qkv_weight = (
+            getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
+            if self.has_fused_proj
+            else None
+        )
         self.qkv_proj_with_rope_is_int8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+            and fused_qkv_weight is not None
+            and fused_qkv_weight.dtype == torch.int8
         )
         self.qkv_proj_with_rope_is_fp8 = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+            and fused_qkv_weight is not None
+            and fused_qkv_weight.dtype == torch.float8_e4m3fn
         )
 
         self.weight_block_size = None

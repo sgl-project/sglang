@@ -83,7 +83,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           # GNR runs only the TP suite (needs >=6 NUMA nodes for --tp 6),
