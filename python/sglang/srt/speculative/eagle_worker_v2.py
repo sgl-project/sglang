@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -91,6 +92,7 @@ from sglang.srt.speculative.spec_utils import (
     fast_sample,
     get_plan_stream,
     load_token_map,
+    record_stream_each,
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
@@ -193,6 +195,50 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        # Keep phase handoffs outside replayed CUDA graphs.  The ring prevents
+        # a later speculative iteration from re-recording an event that an
+        # earlier plan-stream wait may still reference.  One event per kind
+        # (verify / draft-extend) is recorded per scheduler cycle and only a
+        # couple of speculative cycles can be in flight, so a small ring is
+        # ample.
+        handoff_ring_size = 8
+        if self.plan_stream is not None:
+            event_cls = torch.get_device_module(self.device).Event
+            self._verify_handoff_events = [
+                event_cls() for _ in range(handoff_ring_size)
+            ]
+            self._draft_extend_handoff_events = [
+                event_cls() for _ in range(handoff_ring_size)
+            ]
+        else:
+            self._verify_handoff_events = []
+            self._draft_extend_handoff_events = []
+        self._verify_handoff_index = 0
+        self._draft_extend_handoff_index = 0
+        self._pending_verify_handoff_event = None
+
+    def _record_handoff_event(self, kind: str, stream):
+        """Record a phase-handoff event on ``stream`` and return it.
+
+        Returns None when no plan stream exists (single-stream mode).  Events
+        come from a fixed per-kind ring; the ring size must exceed the maximum
+        number of in-flight speculative iterations so an event is never
+        re-recorded while a plan-stream wait on it is still pending.
+        """
+        if self.plan_stream is None:
+            return None
+        if kind == "verify":
+            events = self._verify_handoff_events
+            index = self._verify_handoff_index
+            self._verify_handoff_index += 1
+        else:
+            assert kind == "draft_extend"
+            events = self._draft_extend_handoff_events
+            index = self._draft_extend_handoff_index
+            self._draft_extend_handoff_index += 1
+        event = events[index % len(events)]
+        event.record(stream)
+        return event
 
     def alloc_memory_pool(
         self,
@@ -263,8 +309,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.dsa_index_topk is not None
+            else None
+        )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -554,7 +605,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -568,6 +619,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        # Publish the exact forward-stream frontier that produced the tree and
+        # verify inputs.  Host planning can run ahead, while dependent GPU work
+        # on the plan stream waits for this event.
+        self._pending_verify_handoff_event = self._record_handoff_event(
+            "verify", torch.get_device_module(self.device).current_stream()
+        )
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -891,11 +949,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
+        """Lazily grow the eager draft-extend MTP seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
+                (num_tokens, self.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
@@ -906,6 +964,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -931,9 +990,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        draft_extend_handoff_event = self._record_handoff_event(
+            "draft_extend", fwd_stream
+        )
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
+            if self.plan_stream is not None:
+                self.plan_stream.wait_event(draft_extend_handoff_event)
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
@@ -944,10 +1008,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=False,
             )
 
+        # These tensors are allocated/prepared on the plan stream and consumed
+        # asynchronously by copies and graph replay on the forward stream.
+        record_stream_each(
+            (
+                forward_batch.input_ids,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_start_loc,
+                forward_batch.spec_info.hidden_states,
+                forward_batch.spec_info.num_correct_drafts,
+                forward_batch.spec_info.num_accept_tokens,
+            ),
+            fwd_stream,
+        )
+
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
+            fwd_stream.wait_stream(self.plan_stream)
 
         # Run draft extend batch in the main compute stream
         can_run_decode_cuda_graph = (
@@ -1215,6 +1296,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
+                # The trivial input is produced on the current forward stream
+                # just like a drafted one, but this path bypasses draft() --
+                # the only other site recording the verify handoff event.
+                # Record this cycle's frontier here so the plan-stream verify
+                # wait neither asserts on a first zero-step cycle nor reuses
+                # a stale event after an adaptive downshift.
+                self.draft_worker._pending_verify_handoff_event = (
+                    self.draft_worker._record_handoff_event(
+                        "verify",
+                        torch.get_device_module(self.device).current_stream(),
+                    )
+                )
             else:
                 with (
                     self.draft_worker.draft_tp_context(
@@ -1545,6 +1638,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        verify_handoff_event = self.draft_worker._pending_verify_handoff_event
+        if self.plan_stream is not None:
+            assert verify_handoff_event is not None
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1558,6 +1654,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            verify_handoff_event=verify_handoff_event,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

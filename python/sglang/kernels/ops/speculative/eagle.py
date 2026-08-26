@@ -89,3 +89,65 @@ def fill_accept_out_cache_loc_func(
         accept_out_cache_loc,
         next_power_of_2(size),
     )
+
+
+@triton.jit
+def nextn_mamba_commit_prologue(
+    accept_lens_ptr,
+    seq_lens_ptr,
+    last_correct_ptr,
+    steps_to_track_ptr,
+    mamba_track_interval,
+    HAS_TRACK: tl.constexpr,
+):
+    # Chain-spec (topk == 1) commit prologue. accept_index[i, j] == i*draft + j
+    # for accepted slots, so the last-accepted tree step is accept_lens - 1 and
+    # the interval-crossing candidate step equals its own in-request index —
+    # no accept_index gathers are needed. One launch replaces the ~21-op eager
+    # sequence in commit_mamba_states_after_verify.
+    pid = tl.program_id(axis=0)
+    al = tl.load(accept_lens_ptr + pid).to(tl.int64)
+    # Outputs are int32 (matching the eager path, whose gathers preserve the
+    # int32 accept_index dtype); the values are tree-step indices bounded by
+    # draft_token_num, so the narrowing cast is always exact.
+    tl.store(last_correct_ptr + pid, (al - 1).to(tl.int32))
+    if HAS_TRACK:
+        pre = tl.load(seq_lens_ptr + pid).to(tl.int64)
+        post = pre + al
+        interval = mamba_track_interval.to(tl.int64)
+        crossed = (pre // interval) != (post // interval)
+        tracking_point = (post // interval) * interval
+        ith = tl.maximum(tracking_point - pre - 1, 0)
+        out = tl.where(crossed, ith, -1)
+        tl.store(steps_to_track_ptr + pid, out.to(tl.int32))
+
+
+def nextn_mamba_commit_prologue_func(
+    accept_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mamba_track_interval: int,
+    has_track: bool,
+):
+    """Fused topk==1 replacement for the eager commit prologue.
+
+    Returns (last_correct_step_indices, mamba_steps_to_track) with the same
+    dtypes/values as the eager reference path (int32, the dtype of
+    accept_index that the eager gathers preserve; track entries are -1 where
+    no interval crossing happened).
+    """
+    bs = accept_lens.shape[0]
+    last_correct = torch.empty(bs, dtype=torch.int32, device=accept_lens.device)
+    steps_to_track = (
+        torch.empty(bs, dtype=torch.int32, device=accept_lens.device)
+        if has_track
+        else last_correct  # unused dummy write target is never launched
+    )
+    nextn_mamba_commit_prologue[(bs,)](
+        accept_lens,
+        seq_lens,
+        last_correct,
+        steps_to_track,
+        mamba_track_interval,
+        HAS_TRACK=has_track,
+    )
+    return last_correct, (steps_to_track if has_track else None)

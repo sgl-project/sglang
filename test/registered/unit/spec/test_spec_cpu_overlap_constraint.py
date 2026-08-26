@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -70,6 +71,55 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
         handle_speculative_decoding(args)
 
         self.assertFalse(resolution_result(args, "disable_overlap_schedule"))
+
+    def test_hybrid_kda_allows_plan_stream_graph_load(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+        full_backend = Mock(
+            token_to_kv_pool=object(),
+            req_to_token_pool=object(),
+            max_context_len=4096,
+            needs_cpu_seq_lens=False,
+        )
+        linear_backend = Mock(
+            spec=KDAAttnBackend,
+            needs_cpu_seq_lens=False,
+            supports_overlap_plan_stream_graph_load=(
+                KDAAttnBackend.supports_overlap_plan_stream_graph_load
+            ),
+        )
+
+        backend = HybridLinearAttnBackend(full_backend, linear_backend, [])
+
+        self.assertTrue(backend.supports_overlap_plan_stream_graph_load)
+        self.assertFalse(backend.needs_cpu_seq_lens)
+
+    def test_unaudited_linear_backend_defers_plan_stream_graph_load(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            MambaAttnBackendBase,
+        )
+
+        full_backend = Mock(
+            token_to_kv_pool=object(),
+            req_to_token_pool=object(),
+            max_context_len=4096,
+            needs_cpu_seq_lens=False,
+        )
+        linear_backend = Mock(
+            spec=MambaAttnBackendBase,
+            needs_cpu_seq_lens=False,
+            supports_overlap_plan_stream_graph_load=(
+                MambaAttnBackendBase.supports_overlap_plan_stream_graph_load
+            ),
+        )
+
+        backend = HybridLinearAttnBackend(full_backend, linear_backend, [])
+
+        self.assertFalse(backend.supports_overlap_plan_stream_graph_load)
 
 
 if __name__ == "__main__":
