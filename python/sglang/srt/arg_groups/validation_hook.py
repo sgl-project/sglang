@@ -25,9 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 def check_server_args(server_args: Any):
+    from sglang.srt.arg_groups.deepseek_v4_hook import (
+        validate_deepseek_v4_fp4_indexer,
+    )
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+    validate_deepseek_v4_fp4_indexer(server_args)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

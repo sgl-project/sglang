@@ -285,6 +285,7 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         self.index_head_dim = index_head_dim
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        self.uses_aiter_fp4_layout = is_hip() and self.use_fp4_indexer
 
         self._create_buffer()
 
@@ -295,15 +296,47 @@ class DeepSeekV4IndexerPool(KVCache):
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
+        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
+                if self.uses_aiter_fp4_layout:
+                    if self.page_size != 64 or self.index_head_dim != 128:
+                        raise ValueError(
+                            "AITER DSV4 FP4 indexer layout requires page_size=64 "
+                            "and index_head_dim=128"
+                        )
+                    payload_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+                    if payload_dtype is None:
+                        raise RuntimeError(
+                            "AITER DSV4 FP4 indexer layout requires "
+                            "torch.float4_e2m1fn_x2"
+                        )
+                    self.index_k_payload_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size, 16),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        ).view(payload_dtype)
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_scale_buffer = [
+                        torch.zeros(
+                            (num_pages, 1, 4, self.page_size),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.index_k_with_scale_buffer = None
+                    return
+
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
+                        num_pages,
                         page_bytes,
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
@@ -324,7 +357,23 @@ class DeepSeekV4IndexerPool(KVCache):
         raise NotImplementedError()
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.uses_aiter_fp4_layout:
+            raise RuntimeError(
+                "AITER DSV4 FP4 indexer cache uses split payload and scale "
+                "buffers; use get_index_k_fp4_payload_buffer() and "
+                "get_index_k_fp4_scale_buffer()"
+            )
         return self.index_k_with_scale_buffer[layer_id]
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        if not self.uses_aiter_fp4_layout:
+            raise RuntimeError("Indexer cache does not use the AITER FP4 split layout")
+        return self.index_k_payload_buffer[layer_id]
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        if not self.uses_aiter_fp4_layout:
+            raise RuntimeError("Indexer cache does not use the AITER FP4 split layout")
+        return self.index_k_scale_buffer[layer_id]
 
     def get_index_k_scale_buffer(
         self,
@@ -673,6 +722,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.full_to_swa_index_mapping[kv_indices]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        if self.uses_aiter_fp4_layout:
+            raise RuntimeError(
+                "DeepSeek V4 AITER FP4 split indexer cache does not support "
+                "disaggregation/PD cache transfer; disable "
+                "--enable-deepseek-v4-fp4-indexer or disaggregation"
+            )
+
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -1103,11 +1159,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_index_k_page_size(self) -> int:
         return self.c4_indexer_kv_pool.page_size
 
+    @property
+    def uses_aiter_fp4_layout(self) -> bool:
+        return self.c4_indexer_kv_pool.uses_aiter_fp4_layout
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
+
+    def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_fp4_payload_buffer(compress_layer_id)
+
+    def get_index_k_fp4_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_fp4_scale_buffer(compress_layer_id)
 
     def get_index_k_scale_buffer(
         self,

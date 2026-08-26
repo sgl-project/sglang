@@ -1041,6 +1041,16 @@ def is_gfx95_supported():
 
 
 @lru_cache(maxsize=1)
+def is_gfx950_supported():
+    """Whether the device is an AMD gfx950 GPU."""
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        return gcn_arch == "gfx950"
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import importlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
@@ -11,11 +12,100 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import (
+    is_gfx950_supported,
+    is_hip,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION = 1
+_DEEPSEEK_V4_FP4_INDEXER_AITER_APIS = {
+    "aiter": (
+        "rope_rotate_activation",
+        "rmsnorm_rope_rotate_activation_fp4quant_kvcache",
+    ),
+    "aiter.ops.flydsl": (
+        "flydsl_pa_mqa_logits_fp4",
+        "flydsl_pa_mqa_logits_fp4_prefill",
+    ),
+}
+
+
+def _deepseek_v4_fp4_indexer_aiter_error() -> Optional[str]:
+    for module_name, api_names in _DEEPSEEK_V4_FP4_INDEXER_AITER_APIS.items():
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            return f"could not import {module_name} ({exc})"
+
+        if module_name == "aiter":
+            scatter_version = getattr(
+                module, "DSV4_FP4_KVCACHE_SCATTER_VERSION", None
+            )
+            if type(scatter_version) is not int or (
+                scatter_version < _DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION
+            ):
+                return (
+                    "the installed AITER contains the known multi-row K-cache "
+                    "scatter bug: DSV4_FP4_KVCACHE_SCATTER_VERSION must be >= "
+                    f"{_DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION}, got "
+                    f"{scatter_version!r}"
+                )
+
+            if not hasattr(getattr(module, "dtypes", None), "fp4x2"):
+                return "missing AITER dtype: aiter.dtypes.fp4x2"
+
+        missing_apis = [
+            api for api in api_names if not callable(getattr(module, api, None))
+        ]
+        if missing_apis:
+            return f"missing AITER callables: {', '.join(missing_apis)}"
+    return None
+
+
+def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_deepseek_v4_fp4_indexer:
+        return
+
+    if is_hip():
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer on HIP does not support "
+                "--enable-hierarchical-cache/HiCache; disable HiCache or "
+                "remove the FP4 indexer flag."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer on HIP does not support "
+                "PD disaggregation; use --disaggregation-mode null or "
+                "remove the FP4 indexer flag. Got "
+                f"--disaggregation-mode={cfg.disaggregation_mode!r}."
+            )
+        if not is_gfx950_supported():
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer on HIP requires an AMD "
+                "gfx950 GPU; remove the flag or run on gfx950."
+            )
+        if aiter_error := _deepseek_v4_fp4_indexer_aiter_error():
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer on HIP requires the "
+                f"pinned-image AITER FP4 APIs; {aiter_error}. Install a "
+                "matching AITER build or remove the flag."
+            )
+        return
+
+    if not (is_sm100_supported() or is_sm120_supported()):
+        raise ValueError(
+            "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
+            "DeepGEMM FP4 indexer support."
+        )
 
 
 def validate_deepseek_v4_mega_moe_token_budget(

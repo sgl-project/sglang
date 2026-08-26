@@ -1975,7 +1975,11 @@ class ServerArgs:
     ] = False
     enable_deepseek_v4_fp4_indexer: A[
         bool,
-        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+        "Enable the experimental FP4 C4 indexer path for DeepSeek V4. On CUDA, "
+        "this requires SM100 or SM120 with DeepGEMM support. On ROCm, this "
+        "requires gfx950 and compatible AITER FP4 indexer APIs; the initial HIP "
+        "path is single-node only and does not support HiCache or PD "
+        "disaggregation. Default keeps the existing indexer implementation.",
         NS("exec.kernel"),
     ] = False
     disable_custom_all_reduce: A[
