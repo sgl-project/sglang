@@ -51,9 +51,10 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
+    TLRUStrategy,
 )
 
-_EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+_EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "lru": LRUStrategy,
     "lfu": LFUStrategy,
     "fifo": FIFOStrategy,
@@ -61,18 +62,28 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "filo": FILOStrategy,
     "priority": PriorityStrategy,
     "slru": SLRUStrategy,
+    "tlru": TLRUStrategy,
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(
+    eviction_policy: str,
+    tlru_threshold: int = 0,
+    tlru_next_prompt_estimate: int = 0,
+) -> EvictionStrategy:
     policy = eviction_policy.lower()
     try:
-        return _EVICTION_POLICY_FACTORIES[policy]()
+        factory = _EVICTION_POLICY_FACTORIES[policy]
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
         raise ValueError(
             f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
         ) from None
+    if policy == "tlru":
+        return factory(
+            threshold=tlru_threshold, next_prompt_estimate=tlru_next_prompt_estimate
+        )
+    return factory()
 
 
 def maybe_init_custom_mem_pool(
