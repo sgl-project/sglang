@@ -158,3 +158,4 @@ class HunyuanVideoConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=HunyuanVideoArchConfig)
 
     prefix: str = "Hunyuan"
+    prefer_cudnn_sdpa_on_sm120: bool = False

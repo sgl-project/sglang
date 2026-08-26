@@ -164,6 +164,10 @@ class FastHunyuanConfig(HunyuanConfig):
     # No need to re-specify guidance_scale or embedded_cfg_scale as they
     # already have the desired values from HunyuanConfig
 
+    def __post_init__(self):
+        super().__post_init__()
+        self.dit_config.prefer_cudnn_sdpa_on_sm120 = True
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=60,

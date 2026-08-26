@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -79,6 +80,22 @@ logger = init_logger(__name__)
 _HUNYUAN_QKV_PACK = BitExactFusionGate("HunyuanVideo QKV RoPE pack", per_signature=True)
 _HUNYUAN_QKV_PACK_SIGS = _HUNYUAN_QKV_PACK.verified_sigs
 assert _HUNYUAN_QKV_PACK_SIGS is not None
+
+
+def _hunyuan_default_attention_backend(
+    config: HunyuanVideoConfig,
+    *,
+    enable_torch_compile: bool = False,
+) -> AttentionBackendEnum | None:
+    """Return a model-owned backend preference without overriding the CLI."""
+    if (
+        config.prefer_cudnn_sdpa_on_sm120
+        and current_platform.is_sm120()
+        and not enable_torch_compile
+        and get_ring_parallel_world_size() == 1
+    ):
+        return AttentionBackendEnum.TORCH_CUDNN_SDPA
+    return None
 
 
 def _hunyuan_qknorm(
@@ -242,6 +259,7 @@ class MMDoubleStreamBlock(nn.Module):
         mlp_ratio: float,
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
@@ -362,6 +380,7 @@ class MMDoubleStreamBlock(nn.Module):
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
             prefix=f"{prefix}.attn",
         )
         mark_hunyuan_qknorm_site(self)
@@ -492,6 +511,7 @@ class MMSingleStreamBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
@@ -560,6 +580,7 @@ class MMSingleStreamBlock(nn.Module):
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
             prefix=f"{prefix}.attn",
         )
         mark_hunyuan_qknorm_site(self)
@@ -736,6 +757,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             else None
         )
 
+        server_args = get_global_server_args()
+        default_attention_backend = _hunyuan_default_attention_backend(
+            config,
+            enable_torch_compile=server_args.enable_torch_compile,
+        )
+
         # Double blocks
         self.double_blocks = nn.ModuleList(
             [
@@ -745,6 +772,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     mlp_ratio=config.mlp_ratio,
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
+                    default_attention_backend=default_attention_backend,
                     prefix=f"{config.prefix}.double_blocks.{i}",
                     quant_config=quant_config,
                 )
@@ -761,6 +789,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     mlp_ratio=config.mlp_ratio,
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
+                    default_attention_backend=default_attention_backend,
                     prefix=f"{config.prefix}.single_blocks.{i + config.num_layers}",
                     quant_config=quant_config,
                 )
