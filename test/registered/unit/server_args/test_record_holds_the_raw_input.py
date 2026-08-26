@@ -50,10 +50,19 @@ _MINI_CONFIG = {
 _SHAPES = {
     "plain": {},
     "data_parallel": {"dp_size": 2},
+    "tensor_parallel": {"tp_size": 2},
     "speculative": {"speculative_algorithm": "EAGLE"},
+    "speculative_mtp": {"speculative_algorithm": "NEXTN"},
     "cuda_graph_knobs": {"cuda_graph_max_bs_decode": 16, "page_size": 32},
+    "explicit_graph_json": {"cuda_graph_config": {"decode": {"max_bs": 12}}},
     "attention_backend": {"attention_backend": "triton"},
     "lora": {"lora_paths": ["adapter=/tmp/does-not-need-to-exist"]},
+    "quantization": {"quantization": "fp8"},
+    "disaggregation": {"disaggregation_mode": "prefill"},
+    "deterministic": {"enable_deterministic_inference": True},
+    "hierarchical_cache": {"enable_hierarchical_cache": True},
+    "kv_events": {"kv_events_config": '{"publisher":"zmq"}'},
+    "chunked_prefill": {"chunked_prefill_size": 1024},
 }
 
 
