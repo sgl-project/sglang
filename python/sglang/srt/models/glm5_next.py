@@ -1331,28 +1331,37 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # Kept in lockstep with the wrapper gate below: a divergence drops the
+        # shared-expert weights and runs the fused slot uninitialized.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if not getattr(text_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
+        if not _is_cuda:
+            return "Shared experts fusion currently requires CUDA devices."
+        if _device_sm is not None and _device_sm < 80:
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        if get_parallel().moe_ep_size > 1:
+            return (
+                "Shared experts fusion is not supported together with expert "
+                "parallelism yet."
+            )
+        if get_moe_a2a_backend().is_deepep():
+            return (
+                "Shared experts fusion is not supported when Deepep MoE backend "
+                "is enabled."
+            )
+        return None
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_server_args().disable_shared_experts_fusion:
             return
 
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_parallel().moe_ep_size > 1:
-            disable_reason = (
-                "Shared experts fusion is not supported together with expert "
-                "parallelism yet."
-            )
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
+        disable_reason = type(self).shared_experts_fusion_disable_reason(
+            self.config, self.quant_config
+        )
 
         if disable_reason is not None:
             log_info_on_rank0(
