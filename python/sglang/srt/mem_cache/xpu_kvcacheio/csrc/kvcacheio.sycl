@@ -1,0 +1,460 @@
+// SYCL KV-cache transfer kernels for HiCache on Intel XPU.
+//
+// This is the XPU counterpart of sgl-kernel/csrc/kvcacheio/transfer.cu. Like
+// the CUDA "kernel" io_backend, work-items move the bytes themselves rather
+// than issuing per-page copies: the L2 host pool is allocated as pinned
+// (USM host) memory, which is addressable from device kernels, so a single
+// gather kernel handles an arbitrarily fragmented index set. Throughput is
+// therefore independent of page_size, whereas a per-page memcpy loop degrades
+// sharply as pages shrink.
+//
+// All submissions are asynchronous. Completion is tracked by the caller via
+// torch XPU events (see HiCacheController.start_writing / start_loading);
+// nothing here waits on the queue.
+
+#include <torch/extension.h>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+
+namespace {
+
+// ---------------------------------------------------------------- addressing
+//
+// Each functor maps (kv, layer, token_index) -> byte address, mirroring the
+// get_global_offset_* functors in transfer.cu. `kv` selects the K or V buffer.
+// MLA pools hold a single fused latent buffer instead of separate K and V, and
+// are handled by passing the same base for both with num_kv == 1, so `kv` is
+// then always 0.
+
+// Layer-first, base addresses read from a device-resident pointer table.
+// Used when layers are separate allocations (KVCache.k_data_ptrs).
+struct OffsetLayerFirstTable {
+  const uintptr_t* k_table;
+  const uintptr_t* v_table;
+  int64_t item_size;
+
+  char* at(int64_t kv, int64_t layer, int64_t index) const {
+    const uintptr_t* table = kv ? v_table : k_table;
+    return reinterpret_cast<char*>(table[layer]) + index * item_size;
+  }
+};
+
+// Layer-first, single contiguous layer (no table, no layer dimension).
+struct OffsetLayerFirst {
+  char* k_base;
+  char* v_base;
+  int64_t item_size;
+
+  char* at(int64_t kv, int64_t /*layer*/, int64_t index) const {
+    return (kv ? v_base : k_base) + index * item_size;
+  }
+};
+
+// Page-first: one buffer holding [token, layer, ...], so a token's layers are
+// strided by item_size within a layout_dim-sized block.
+struct OffsetPageFirst {
+  char* k_base;
+  char* v_base;
+  int64_t layout_dim;
+  int64_t item_size;
+
+  char* at(int64_t kv, int64_t layer, int64_t index) const {
+    return (kv ? v_base : k_base) + index * layout_dim + layer * item_size;
+  }
+};
+
+// Page-first restricted to a single layer of the device side (H2D per-layer).
+struct OffsetPageFirstAtLayer {
+  char* k_base;
+  char* v_base;
+  int64_t layout_dim;
+  int64_t item_size;
+  int64_t layer_id;
+
+  char* at(int64_t kv, int64_t /*layer*/, int64_t index) const {
+    return (kv ? v_base : k_base) + index * layout_dim + layer_id * item_size;
+  }
+};
+
+// ------------------------------------------------------------------- kernels
+
+// Unique kernel names per instantiation; this toolchain rejects unnamed
+// kernel lambdas.
+template <typename...>
+class TransferKernelName;
+
+template <typename VecT, typename SrcOffset, typename DstOffset>
+void launch_transfer(
+    sycl::queue& queue,
+    SrcOffset src_offset,
+    DstOffset dst_offset,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t num_items,
+    int64_t num_layers,
+    int64_t item_size,
+    int64_t num_kv) {
+  const int64_t vecs_per_item = item_size / static_cast<int64_t>(sizeof(VecT));
+  // Flat iteration space over (item, layer, k/v, vector-within-item).
+  const int64_t total = num_items * num_layers * num_kv * vecs_per_item;
+  if (total == 0) return;
+
+  constexpr int64_t kGroupSize = 256;
+  const int64_t num_groups = (total + kGroupSize - 1) / kGroupSize;
+
+  queue.submit([&](sycl::handler& handler) {
+    handler.parallel_for<TransferKernelName<VecT, SrcOffset, DstOffset>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(num_groups * kGroupSize), sycl::range<1>(kGroupSize)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t gid = static_cast<int64_t>(item.get_global_linear_id());
+          if (gid >= total) return;
+
+          const int64_t vec_off = gid % vecs_per_item;
+          int64_t rest = gid / vecs_per_item;
+          const int64_t kv = rest % num_kv;
+          rest /= num_kv;
+          const int64_t layer = rest % num_layers;
+          const int64_t idx = rest / num_layers;
+
+          const auto* src = reinterpret_cast<const VecT*>(
+              src_offset.at(kv, layer, src_indices[idx]));
+          auto* dst =
+              reinterpret_cast<VecT*>(dst_offset.at(kv, layer, dst_indices[idx]));
+          dst[vec_off] = src[vec_off];
+        });
+  });
+}
+
+// Widest power-of-two access size (bytes, <= 16) that divides every stride.
+// Buffer bases come from torch allocators and are at least 16-byte aligned, so
+// stride alignment alone determines what is safe to vectorize.
+int64_t pick_access_width(std::initializer_list<int64_t> strides) {
+  int64_t width = 16;
+  for (int64_t stride : strides) {
+    while (width > 1 && (stride % width) != 0) width >>= 1;
+  }
+  return width;
+}
+
+// Instantiate launch_transfer for the access width chosen at runtime.
+#define DISPATCH_ACCESS_WIDTH(WIDTH, ...)                              \
+  switch (WIDTH) {                                                     \
+    case 16:                                                           \
+      launch_transfer<sycl::vec<uint32_t, 4>>(__VA_ARGS__);            \
+      break;                                                           \
+    case 8:                                                            \
+      launch_transfer<uint64_t>(__VA_ARGS__);                          \
+      break;                                                           \
+    case 4:                                                            \
+      launch_transfer<uint32_t>(__VA_ARGS__);                          \
+      break;                                                           \
+    case 2:                                                            \
+      launch_transfer<uint16_t>(__VA_ARGS__);                          \
+      break;                                                           \
+    default:                                                           \
+      launch_transfer<uint8_t>(__VA_ARGS__);                           \
+      break;                                                           \
+  }
+
+sycl::queue& current_queue() {
+  // Honors the stream installed by `with device_module.stream(...)`, so these
+  // transfers land on HiCache's dedicated write/load stream.
+  static thread_local c10::xpu::XPUStream stream = c10::xpu::getCurrentXPUStream();
+  stream = c10::xpu::getCurrentXPUStream();
+  return stream.queue();
+}
+
+void check_indices(const at::Tensor& src_indices, const at::Tensor& dst_indices) {
+  TORCH_CHECK(
+      src_indices.scalar_type() == at::kLong && dst_indices.scalar_type() == at::kLong,
+      "indices must be int64");
+  TORCH_CHECK(
+      src_indices.numel() == dst_indices.numel(),
+      "src_indices and dst_indices must have equal length");
+  TORCH_CHECK(
+      src_indices.is_xpu() && dst_indices.is_xpu(),
+      "indices must be XPU-resident for the kernel io backend");
+}
+
+char* raw(const at::Tensor& t) {
+  return reinterpret_cast<char*>(t.data_ptr());
+}
+
+const uintptr_t* raw_table(const at::Tensor& t) {
+  TORCH_CHECK(t.scalar_type() == at::kUInt64, "pointer table must be uint64");
+  TORCH_CHECK(t.is_xpu(), "pointer table must be XPU-resident");
+  return reinterpret_cast<const uintptr_t*>(t.data_ptr());
+}
+
+}  // namespace
+
+// ============================================================== D2H (backup)
+
+// Device layer-first -> host layer-first, all layers in one launch.
+// Counterpart of transfer_kv_all_layer.
+void transfer_kv_all_layer(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers) {
+  check_indices(src_indices, dst_indices);
+  TORCH_CHECK(
+      num_layers == src_k_layers.numel(),
+      "num_layers does not match the source pointer table length");
+
+  OffsetLayerFirstTable src{raw_table(src_k_layers), raw_table(src_v_layers), item_size};
+  OffsetLayerFirstTable dst{raw_table(dst_k_layers), raw_table(dst_v_layers), item_size};
+
+  const int64_t width = pick_access_width({item_size});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src,
+      dst,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      num_layers,
+      item_size,
+      /*num_kv=*/2)
+}
+
+// Device layer-first -> host page-first, all layers in one launch.
+// Counterpart of transfer_kv_all_layer_lf_pf.
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers) {
+  check_indices(src_indices, dst_indices);
+  TORCH_CHECK(
+      num_layers == src_k_layers.numel(),
+      "num_layers does not match the source pointer table length");
+
+  OffsetLayerFirstTable src{raw_table(src_k_layers), raw_table(src_v_layers), item_size};
+  OffsetPageFirst dst{raw(dst_k), raw(dst_v), dst_layout_dim, item_size};
+
+  const int64_t width = pick_access_width({item_size, dst_layout_dim});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src,
+      dst,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      num_layers,
+      item_size,
+      /*num_kv=*/2)
+}
+
+// MLA device layer-first -> host layer-first, all layers in one launch.
+// Counterpart of transfer_kv_all_layer_mla.
+void transfer_kv_all_layer_mla(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers) {
+  check_indices(src_indices, dst_indices);
+  TORCH_CHECK(
+      num_layers == src_layers.numel(),
+      "num_layers does not match the source pointer table length");
+
+  // One fused latent buffer, so the same table serves both `kv` slots and
+  // num_kv == 1 keeps the kernel from visiting the second one.
+  const uintptr_t* src_table = raw_table(src_layers);
+  const uintptr_t* dst_table = raw_table(dst_layers);
+  OffsetLayerFirstTable src{src_table, src_table, item_size};
+  OffsetLayerFirstTable dst{dst_table, dst_table, item_size};
+
+  const int64_t width = pick_access_width({item_size});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src,
+      dst,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      num_layers,
+      item_size,
+      /*num_kv=*/1)
+}
+
+// MLA device layer-first -> host page-first, all layers in one launch.
+// Counterpart of transfer_kv_all_layer_mla_lf_pf.
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor src_layers,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers) {
+  check_indices(src_indices, dst_indices);
+  TORCH_CHECK(
+      num_layers == src_layers.numel(),
+      "num_layers does not match the source pointer table length");
+
+  const uintptr_t* src_table = raw_table(src_layers);
+  OffsetLayerFirstTable src_off{src_table, src_table, item_size};
+  OffsetPageFirst dst_off{raw(dst), raw(dst), dst_layout_dim, item_size};
+
+  const int64_t width = pick_access_width({item_size, dst_layout_dim});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src_off,
+      dst_off,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      num_layers,
+      item_size,
+      /*num_kv=*/1)
+}
+
+// ================================================================ H2D (load)
+
+// Host layer-first -> device layer-first, one layer.
+// Counterpart of transfer_kv_per_layer.
+void transfer_kv_per_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size) {
+  check_indices(src_indices, dst_indices);
+
+  OffsetLayerFirst src{raw(src_k), raw(src_v), item_size};
+  OffsetLayerFirst dst{raw(dst_k), raw(dst_v), item_size};
+
+  const int64_t width = pick_access_width({item_size});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src,
+      dst,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      /*num_layers=*/1,
+      item_size,
+      /*num_kv=*/2)
+}
+
+// Host page-first -> device layer-first, one layer.
+// Counterpart of transfer_kv_per_layer_pf_lf.
+void transfer_kv_per_layer_pf_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim) {
+  check_indices(src_indices, dst_indices);
+
+  OffsetPageFirstAtLayer src{raw(src_k), raw(src_v), src_layout_dim, item_size, layer_id};
+  OffsetLayerFirst dst{raw(dst_k), raw(dst_v), item_size};
+
+  const int64_t width = pick_access_width({item_size, src_layout_dim});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src,
+      dst,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      /*num_layers=*/1,
+      item_size,
+      /*num_kv=*/2)
+}
+
+// MLA host layer-first -> device layer-first, one layer.
+// Counterpart of transfer_kv_per_layer_mla.
+void transfer_kv_per_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size) {
+  check_indices(src_indices, dst_indices);
+
+  OffsetLayerFirst src_off{raw(src), raw(src), item_size};
+  OffsetLayerFirst dst_off{raw(dst), raw(dst), item_size};
+
+  const int64_t width = pick_access_width({item_size});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src_off,
+      dst_off,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      /*num_layers=*/1,
+      item_size,
+      /*num_kv=*/1)
+}
+
+// MLA host page-first -> device layer-first, one layer.
+// Counterpart of transfer_kv_per_layer_mla_pf_lf.
+void transfer_kv_per_layer_mla_pf_lf(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim) {
+  check_indices(src_indices, dst_indices);
+
+  OffsetPageFirstAtLayer src_off{
+      raw(src), raw(src), src_layout_dim, item_size, layer_id};
+  OffsetLayerFirst dst_off{raw(dst), raw(dst), item_size};
+
+  const int64_t width = pick_access_width({item_size, src_layout_dim});
+  DISPATCH_ACCESS_WIDTH(
+      width,
+      current_queue(),
+      src_off,
+      dst_off,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      /*num_layers=*/1,
+      item_size,
+      /*num_kv=*/1)
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("transfer_kv_all_layer", &transfer_kv_all_layer);
+  m.def("transfer_kv_all_layer_lf_pf", &transfer_kv_all_layer_lf_pf);
+  m.def("transfer_kv_per_layer", &transfer_kv_per_layer);
+  m.def("transfer_kv_per_layer_pf_lf", &transfer_kv_per_layer_pf_lf);
+  m.def("transfer_kv_all_layer_mla", &transfer_kv_all_layer_mla);
+  m.def("transfer_kv_all_layer_mla_lf_pf", &transfer_kv_all_layer_mla_lf_pf);
+  m.def("transfer_kv_per_layer_mla", &transfer_kv_per_layer_mla);
+  m.def("transfer_kv_per_layer_mla_pf_lf", &transfer_kv_per_layer_mla_pf_lf);
+}

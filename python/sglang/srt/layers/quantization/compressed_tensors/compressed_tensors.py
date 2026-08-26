@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    XPU_WNA16_SUPPORTED_BITS,
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
@@ -56,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -692,6 +694,19 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
+                _is_xpu
+                and quant_format == CompressionFormat.pack_quantized.value
+                and weight_quant.num_bits in XPU_WNA16_SUPPORTED_BITS
+            ):
+                # XPU has no Marlin; use oneDNN's int4 weight-only matmul.
+                return XPUCompressedTensorsWNA16(
+                    num_bits=weight_quant.num_bits,
+                    strategy=weight_quant.strategy,
+                    group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
+                    actorder=weight_quant.actorder,
+                )
+            if (
                 quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
@@ -979,7 +994,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
-            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+            if not isinstance(
+                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+            ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."

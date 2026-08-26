@@ -981,6 +981,41 @@ class PrefillAdder:
             reason=reason,
         )
 
+    def _log_admitted_cache_hits(self, req: Req) -> None:
+        """Report the L1/L2/L3 split of one request's cache hit, for triage.
+
+        Called only from add_one_req (first admission of a request), so the
+        tier split is measured once and not re-reported per chunked chunk.
+        """
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        total = len(req.full_untruncated_fill_ids)
+        if total <= 0:
+            return
+        device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
+            prefix_len=len(req.prefix_indices),
+            host_hit_len=req.materialized_host_hit_len(),
+            storage_hit_len=req.storage_hit_length,
+            storage_hit_start=req.storage_hit_start,
+            host_hit_is_storage=req.host_hit_is_storage,
+        )
+        total_hit = device_hit + host_hit + storage_hit
+        logger.debug(
+            "[admit] rid=%s req_tokens=%d L1(device)_hit=%d (%.1f%%) "
+            "L2(host)_hit=%d (%.1f%%) L3(storage)_hit=%d (%.1f%%) "
+            "total_hit=%d (%.1f%%)",
+            req.rid,
+            total,
+            device_hit,
+            100.0 * device_hit / total,
+            host_hit,
+            100.0 * host_hit / total,
+            storage_hit,
+            100.0 * storage_hit / total,
+            total_hit,
+            100.0 * total_hit / total,
+        )
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -1501,6 +1536,7 @@ class PrefillAdder:
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
 
+        self._log_admitted_cache_hits(req)
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req) -> bool:

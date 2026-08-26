@@ -65,6 +65,7 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -137,6 +138,21 @@ class Gemma4MultimodalEmbedder(nn.Module):
 class Gemma4ForConditionalGeneration(PreTrainedModel):
     config_class = Gemma4Config
     """Gemma4 multimodal model for conditional generation."""
+
+    # Quant configs list the vision/audio towers' *unfused* projections under
+    # the clippable wrapper's inner module (`...q_proj.linear`), but we fuse
+    # those into `qkv_proj`/`gate_up_proj` and expand a fused name back to
+    # bare shard names (`...q_proj`) when testing the ignore list. Dropping
+    # the `.linear` suffix here lets the expansion match, so quantized-text /
+    # bf16-vision checkpoints (e.g. gemma-4-31B-it-qat-w4a16-ct) keep the
+    # towers unquantized instead of looking for absent packed weights.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            ".linear": "",
+            ".linear.weight": ".weight",
+            ".linear.bias": ".bias",
+        },
+    )
 
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [

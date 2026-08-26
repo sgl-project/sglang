@@ -121,7 +121,10 @@ class L2TransferEngine:
 
     @staticmethod
     def _record_stream(transfers: list[L2Transfer], stream) -> None:
+        # `record_stream` is only meaningful for tensors on the accelerator
+        # whose stream this is -- which is not necessarily CUDA (XPU, NPU, ...).
+        device_type = stream.device.type
         for transfer in transfers:
             for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
+                if indices.device.type == device_type:
                     indices.record_stream(stream)

@@ -42,6 +42,18 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
+if _is_xpu:
+    # SYCL kernels, JIT-compiled on first use. sgl-kernel-xpu has no AOT
+    # kvcacheio module yet, so these are built from source in-tree.
+    from sglang.srt.mem_cache import xpu_kvcacheio
+
+    # The single-pool ("mla") entry points are signature-compatible with their
+    # CUDA namesakes, so the indexer pool can call them under the same names.
+    # Binding here is lazy: the wrappers compile on first call, not at import.
+    transfer_kv_all_layer_mla = xpu_kvcacheio.transfer_kv_all_layer_mla
+    transfer_kv_all_layer_mla_lf_pf = xpu_kvcacheio.transfer_kv_all_layer_mla_lf_pf
+    transfer_kv_per_layer_mla = xpu_kvcacheio.transfer_kv_per_layer_mla
+    transfer_kv_per_layer_mla_pf_lf = xpu_kvcacheio.transfer_kv_per_layer_mla_pf_lf
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +266,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -319,7 +334,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -380,7 +398,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(

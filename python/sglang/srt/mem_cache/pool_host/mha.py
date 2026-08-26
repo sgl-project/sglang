@@ -62,6 +62,10 @@ if _is_cuda or _is_hip:
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+if _is_xpu:
+    # SYCL kernels, JIT-compiled on first use. sgl-kernel-xpu has no AOT
+    # kvcacheio module yet, so these are built from source in-tree.
+    from sglang.srt.mem_cache import xpu_kvcacheio
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +375,31 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kernel_xpu":
+            if self.layout == "layer_first":
+                xpu_kvcacheio.transfer_kv_per_layer(
+                    src_k=self.k_buffer[host_layer_id],
+                    dst_k=device_pool.k_buffer[device_layer_id],
+                    src_v=self.v_buffer[host_layer_id],
+                    dst_v=device_pool.v_buffer[device_layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    item_size=self.token_stride_size,
+                )
+            elif self.layout == "page_first":
+                xpu_kvcacheio.transfer_kv_per_layer_pf_lf(
+                    src_k=self.k_buffer,
+                    dst_k=device_pool.k_buffer[device_layer_id],
+                    src_v=self.v_buffer,
+                    dst_v=device_pool.v_buffer[device_layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=host_layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -500,6 +529,32 @@ class MHATokenToKVPoolHost(HostKVCache):
                     host_v=self.v_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "kernel_xpu":
+            if self.layout == "layer_first":
+                xpu_kvcacheio.transfer_kv_all_layer(
+                    src_k_layers=device_k_data_ptrs,
+                    dst_k_layers=self.k_data_ptrs,
+                    src_v_layers=device_v_data_ptrs,
+                    dst_v_layers=self.v_data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    num_layers=self.layer_num,
+                )
+            elif self.layout == "page_first":
+                xpu_kvcacheio.transfer_kv_all_layer_lf_pf(
+                    src_k_layers=device_k_data_ptrs,
+                    dst_k=self.k_buffer,
+                    src_v_layers=device_v_data_ptrs,
+                    dst_v=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
