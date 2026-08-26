@@ -472,11 +472,12 @@ class DeepseekMLAForwardMixin:
             )
         if q_replicate_active:
             # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
-            )
+            # Keep the [T,H,V] transpose view. K3's FP8 MLA prologue accepts
+            # explicit token/head strides, so materializing a contiguous copy
+            # here only adds an HBM round trip before every decode layer.
+            q_nope_out = torch.bmm(
+                q_nope.transpose(0, 1), self.w_kc_qrep
+            ).transpose(0, 1)
         elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.

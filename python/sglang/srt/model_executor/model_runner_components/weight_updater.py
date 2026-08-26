@@ -62,7 +62,12 @@ class WeightUpdater:
     update_model_fields: Callable[..., None]
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
+    post_update_weights: Optional[Callable[[], None]] = None
     _model_update_group: dict = field(default_factory=dict)
+
+    def _run_post_update_weights(self) -> None:
+        if self.post_update_weights is not None:
+            self.post_update_weights()
 
     def init_weights_update_group(
         self,
@@ -205,6 +210,7 @@ class WeightUpdater:
             load_format=load_format,
             load_config=load_config,
         )
+        self._run_post_update_weights()
 
         if recapture_cuda_graph and (
             self.device == "cuda"
@@ -271,6 +277,7 @@ class WeightUpdater:
                 handle.wait()
 
             self.get_model().load_weights(weights)
+            self._run_post_update_weights()
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -306,6 +313,7 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
+            self._run_post_update_weights()
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
@@ -350,6 +358,7 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        self._run_post_update_weights()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -381,6 +390,7 @@ class WeightUpdater:
 
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
+        self._run_post_update_weights()
 
         return True, "Success"
 
@@ -399,6 +409,7 @@ class WeightUpdater:
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            self._run_post_update_weights()
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
