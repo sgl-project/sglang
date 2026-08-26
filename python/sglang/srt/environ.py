@@ -505,6 +505,7 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_NPU_DSPARK_EARLY_MAIN_PROJ = EnvBool(False)
+    SGLANG_NPU_DSPARK_MAIN_PROJ_NZ = EnvBool(False)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================

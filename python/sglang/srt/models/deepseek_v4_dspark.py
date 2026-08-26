@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -785,6 +786,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage0 = self.stages[0]
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
+
+    def prepare_main_proj_weight(self) -> None:
+        if not (_is_npu and envs.SGLANG_NPU_DSPARK_MAIN_PROJ_NZ.get()):
+            return
+        weight = self.stages[0].main_proj.weight
+        if weight.ndim != 2 or weight.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "Skipping DSpark main_proj NZ packing for shape=%s dtype=%s",
+                tuple(weight.shape),
+                weight.dtype,
+            )
+            return
+        weight.data = npu_format_cast(weight.data)
+        logger.info("Packed DSpark main_proj weight into NPU FRACTAL_NZ format.")
 
     def write_target_hidden_kv(
         self,
