@@ -1603,9 +1603,30 @@ def main():
                 sc["<unparsed>"] = body
             return sc, pt, fl
 
+        # §24.52 single-core A/B verdict guide (env: SGL_LI_SINGLE_CORE=1,
+        # fingerprint line "[li-single-core] ACTIVE" in the server log).
+        print(
+            "      -> VERDICT (§24.52 single-core A/B): run with "
+            "SGL_LI_SINGLE_CORE=1 and compare 'c4topk:proc-junk' against the "
+            "same workload without it. Junk GONE with =1 and BACK without it "
+            "=> the multi-core split / LD reduce race is CONVICTED "
+            "(kernel-side; collect source lines + co-occurrence log for the "
+            "CANN defect report). Junk PERSISTS on a single core => "
+            "kernel-internal single-core path or upstream input; weigh "
+            "'c4topk:jrc:negrow/negcol' below (padding vs scattered)."
+        )
         any_pt = False
         for h in mfscatter[: args.max_report]:
             sc, pt, fl = _split_slots(h["body"])
+            # §24.51 qli:* shape slots ride in the same dict (scatter group).
+            qli = {k: v for k, v in sc.items() if k.startswith("qli:")}
+            for k in qli:
+                sc.pop(k, None)
+            if qli:
+                print(
+                    f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: "
+                    f"qli-geometry {qli}"
+                )
             if sc:
                 print(
                     f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: {sc}"
@@ -1691,6 +1712,18 @@ def main():
                 "kernel-INTERNAL addressing bug (go CANN op dump / tiling "
                 "audit)."
             )
+        print(
+            "      -> VERDICT (§24.52 junk-position, c4topk:jrc): "
+            "'c4topk:jrc:negrow/negcol' (INT_MAX = none seen) name the FIRST "
+            "junk (row, col) in the produce-time topk. Junk first-appearance "
+            "in LOW rows / TAIL cols matching the batch's causal geometry "
+            "(short-context rows' tail topk slots / partial-block tail) => "
+            "padding-family reading (fill path read uninitialized memory "
+            "instead of writing -1). Junk coordinates SCATTERED / same "
+            "(row,col) repeating across ranks with the same lens => "
+            "deterministic kernel indexing bug; coordinates varying run to "
+            "run at the same shape => race (weigh the single-core A/B above)."
+        )
         if len(mfscatter) > args.max_report:
             print("  (more suppressed)")
     elif mfraw:

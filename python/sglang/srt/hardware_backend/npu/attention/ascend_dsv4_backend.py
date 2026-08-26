@@ -33,6 +33,55 @@ from sglang.srt.utils.common import rate_limited_hit
 
 logger = logging.getLogger(__name__)
 
+# §24.52 single-core A/B: force the QuantLightningIndexer to run ALL work on
+# AIC core 0 with the LD (multi-core reduce) path disabled, by rewriting the
+# AICPU-generated metadata tensor in place. Validated locally: single-core
+# output is bit-identical to multi-core on all production shapes (b1/b2,
+# k=6014/8192/133970, LD-active and LD-inactive). Production A/B usage:
+#   SGL_LI_SINGLE_CORE=1   enable the rewrite
+#   SGL_LI_SINGLE_CORE_LOG=1  log the rewrite (first call per rank)
+# Verdict rule: proc-junk (§24.47) DISAPPEARS with =1 and REAPPEARS with it
+# unset => the multi-core split / LD reduce race is convicted (kernel-side).
+# Junk persists on a single core => kernel-internal single-core path or an
+# upstream input, reopen §24.52 padding-hypothesis discriminator (c4topk:jrc).
+_LI_SINGLE_CORE = os.environ.get("SGL_LI_SINGLE_CORE", "0") == "1"
+_LI_SINGLE_CORE_LOG = os.environ.get("SGL_LI_SINGLE_CORE_LOG", "0") == "1"
+_LI_SINGLE_CORE_DONE = False
+
+# AICPU metadata layout (quant_lightning_indexer_metadata.h):
+#   LIMetadata[AIC_CORE_NUM=36][8]  per-AIC-core:
+#     [0]=coreEnable [1]=bN2Start [2]=mStart [3]=s2Start
+#     [4]=bN2End     [5]=mEnd     [6]=s2End  [7]=firstLdWsIdx
+#   LDMetadata[AIV_CORE_NUM=72][8] per-AIV-core: [0]=ldCoreEnable ...
+_LI_AIC_CORE_NUM = 36
+_LI_AIV_CORE_NUM = 72
+_LI_META_SIZE = 8
+
+
+def _force_li_single_core(meta: torch.Tensor, b_size: int) -> torch.Tensor:
+    """Rewrite the indexer metadata so only AIC core 0 runs, LD disabled.
+
+    core0 = [1, 0, 0, 0, bSize, 0, 0, 0]:
+      - bN2Start(0) != bN2End(bSize) -> loop covers ALL bN2 [0, bSize);
+        gS1End/s2End == 0 -> full gS1SplitNum / s2BlockNum fallback
+      - s2Start == 0 with full s2 coverage -> isNeedLD = False
+      - ldCoreEnable == 0 for every AIV core -> ProcessLD skipped
+    Disabled cores return before any CrossCore semaphore op (kernel.h:623),
+    so the surviving core0 AIC<->AIV pair cannot deadlock; all AIV blocks
+    still reach ProcessDecode's SyncAll().
+    """
+    m = meta.view(-1)
+    li = m[: _LI_AIC_CORE_NUM * _LI_META_SIZE].view(_LI_AIC_CORE_NUM, _LI_META_SIZE)
+    li[:, 0] = 0  # coreEnable=0 (also clears any uninitialized garbage)
+    li[0, :] = 0
+    li[0, 0] = 1
+    li[0, 4] = b_size  # bN2End (exclusive upper bound)
+    ld = m[_LI_AIC_CORE_NUM * _LI_META_SIZE:
+           (_LI_AIC_CORE_NUM + _LI_AIV_CORE_NUM) * _LI_META_SIZE].view(
+               _LI_AIV_CORE_NUM, _LI_META_SIZE)
+    ld[:, 0] = 0  # ldCoreEnable=0
+    return meta
+
 from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
     install as _install_quant_retention,
 )
@@ -874,6 +923,21 @@ class C4IndexerAscendBackendMixin:
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
+        # §24.52 single-core A/B: rewrite the AICPU split metadata so only
+        # AIC core 0 runs and the LD multi-core reduce is disabled. Zero
+        # binary change -- the kernel reads its core partitioning entirely
+        # from this tensor (kernel.h SplitCore). Default off.
+        if _LI_SINGLE_CORE:
+            global _LI_SINGLE_CORE_DONE
+            if _LI_SINGLE_CORE_LOG and not _LI_SINGLE_CORE_DONE:
+                logger.info(
+                    "[li-single-core] ACTIVE b=%d (SGL_LI_SINGLE_CORE=1)",
+                    int(fm.actual_seq_lengths_kv.shape[0]),
+                )
+                _LI_SINGLE_CORE_DONE = True
+            _force_li_single_core(
+                li_quant_metadata, int(fm.actual_seq_lengths_kv.shape[0])
+            )
         # §24.44 (Run 28): DP0 CP1's c4topk came back with FLT_MAX/garbage
         # bit patterns (0x7F7FFFFF / 0x80010000) -- audit this op's INPUTS at
         # the call site (q/page-table like the swa audit) and register the
@@ -955,6 +1019,17 @@ class C4IndexerAscendBackendMixin:
             _pjunk = (_p64 < 0) & (_p64 != -1)
             _pjunk |= _p64 >= (1 << 31) - 2
             count_scatter_oob(_pjunk, "c4topk:proc-junk")
+            # §24.52 (causal-padding hypothesis): record WHERE the junk sits.
+            # If the junk is the causal padding region (short-context rows'
+            # tail topk slots or the partial-block tail), its first (row,col)
+            # follows the causal geometry (low rows / high cols); scattered
+            # junk => the race reading. Zero-sync, same piggyback D2H.
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                record_oob_first_rc,
+            )
+
+            _j2d = _pjunk.view(topk_idxs.shape[0], -1)
+            record_oob_first_rc("c4topk:jrc", _j2d)
             # §24.51 (scheme A): record the op geometry of THIS call so the
             # catch-time [mf-scatter] readout names the victim batch's indexer
             # shapes -- shape-trigger vs data-trigger without any dump.
