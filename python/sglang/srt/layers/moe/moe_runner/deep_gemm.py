@@ -1517,8 +1517,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
         )
 
-    # ElasticBuffer always populates the handle's per-expert prefix sum, so the
-    # contiguous path never needs a host-side count list.
+    # The handle's psum replaces the legacy adapter's host-side count list.
     all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
     K = hidden_states.shape[1]
     running_state["all_tokens"] = all_tokens
@@ -1528,37 +1527,26 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    # Match the legacy deepep_normal adapter (same ep_scatter + grouped GEMM):
-    # ep_scatter writes only real-token rows and the post-permute ep_gather reads
-    # them back via output_index, so the alignment padding rows are never consumed
-    # and need no zero-init -- except under deterministic inference, where pad
-    # garbage would leak batch-dependent values into the grouped GEMM. The ue8m0
-    # packed-scale layout always keeps zeros (its in-int32 padding lanes must be 0).
-    deterministic = get_exec().deterministic.enable_deterministic_inference
-    buffer_init = torch.zeros if deterministic else torch.empty
-    input_tensor = buffer_init(
+    # ep_gather reads only real rows, so activation padding may stay uninitialized.
+    input_tensor = torch.empty(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        # Packed UE8M0 scales require zero padding lanes.
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = buffer_init(
+        input_tensor_scale = torch.empty(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
-    m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
-    # Contiguous-path alignment contract: this psum comes from ElasticBuffer
-    # dispatch(do_expand=False, expert_alignment=_EXPERT_ALIGNMENT), and DeepEP
-    # documents the non-expand psum as the inclusive prefix sum of
-    # alignment-PADDED per-expert counts (deep_ep/buffers/elastic.py). The
-    # dispatcher pins that alignment to 128 ==
-    # get_m_alignment_for_contiguous_layout(), so psum[e-1] is a valid
-    # 128-aligned group start for the contiguous grouped GEMM. Do NOT re-align
-    # here: an align_up would silently mask an upstream contract break.
+    # ElasticBuffer's non-expand psum includes alignment padding. The dispatcher
+    # pins that alignment to the grouped GEMM's 128 rows, so psum[e-1] is already
+    # a valid group start. Do not align again: that would hide a contract break.
     expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
     ep_scatter_from_psum(
         hidden_states,
@@ -1598,11 +1586,8 @@ def post_permute_deep_gemm_to_deepep_v2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if running_state.get("deepep_v2_masked", False):
-            # Masked path: GEMM output is the [E_local, max_m, hidden] slab.
-            # Repack it back to expanded row order (only real rows written;
-            # padding left uninitialized and never read) and fold in the
-            # top-k weights before combine (expanded combine does not
-            # consume them).
+            # Repack the [E_local, max_m, hidden] slab to expanded order and fold
+            # in top-k weights, which expanded combine does not consume.
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(

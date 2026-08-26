@@ -308,6 +308,15 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_tp",
 ]
 
+# These architectures take the A2A MoE path and skip post-expert all-reduce.
+_DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Qwen3MoeForCausalLM",
+    }
+)
+
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
@@ -4032,6 +4041,11 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
+        # Validate DeepEP v2 after all inference-phase and batch-size writers,
+        # while resolved_view can still see unmaterialized declarations.
+        self._validate_deepep_v2_speculative_draft()
+        self._validate_deepep_v2_dispatch_token_budget()
+
         self._resolution_finished = True
 
     def _handle_return_hidden_states_mode(self):
@@ -7427,6 +7441,90 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
+    def _validate_deepep_v2_dispatch_token_budget(self) -> None:
+        """Check the configured prefill and decode-graph buffer bounds."""
+        view = resolved_view(self)
+        if view.moe_a2a_backend != "deepep_v2":
+            return
+
+        capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if view.disaggregation_mode != "decode":
+            prefill_tokens = self.max_prefill_buffer_tokens() or (
+                view.max_prefill_tokens or 0
+            )
+            if prefill_tokens > capacity:
+                raise ValueError(
+                    "DeepEP v2 per-rank prefill budget exceeds "
+                    "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+                    f"required={prefill_tokens}, capacity={capacity}. Raise the "
+                    "environment value or lower --chunked-prefill-size/"
+                    "--max-prefill-tokens."
+                )
+
+        if view.disaggregation_mode == "prefill":
+            return
+        decode_config = getattr(self.cuda_graph_config, "decode", None)
+        if decode_config is None or decode_config.backend == Backend.DISABLED:
+            return
+
+        graph_bs = decode_config.max_bs or 0
+        if view.max_running_requests is not None:
+            attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+            per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
+            graph_bs = min(graph_bs, per_rank_pool_bs)
+        tokens_per_req = (
+            self.max_speculative_num_draft_tokens or 1
+            if view.speculative_algorithm
+            else 1
+        )
+        graph_tokens = graph_bs * tokens_per_req
+        if graph_tokens > capacity:
+            raise ValueError(
+                "DeepEP v2 per-rank decode CUDA graph exceeds "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+                f"required={graph_tokens}, capacity={capacity} "
+                f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
+                "the environment value or lower --cuda-graph-max-bs."
+            )
+
+    def _validate_deepep_v2_model_architecture(self) -> None:
+        """Allow DeepEP v2 only where its model workflow is validated."""
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            raise ValueError(
+                "DeepEP v2 MoE cannot validate a model loaded through an instance "
+                "connector. Load it from a model path or use "
+                "--moe-a2a-backend deepep."
+            )
+
+        architectures = (
+            getattr(self.get_model_config().hf_config, "architectures", None) or []
+        )
+
+        architecture = architectures[0] if architectures else None
+        if architecture not in _DEEPEP_V2_VALIDATED_ARCHITECTURES:
+            raise ValueError(
+                f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
+                f"architectures are {sorted(_DEEPEP_V2_VALIDATED_ARCHITECTURES)}. "
+                "Other model workflows may require an all-reduce after A2A "
+                "combine. Use --moe-a2a-backend deepep."
+            )
+
+    def _validate_deepep_v2_speculative_draft(self) -> None:
+        """Reject an explicit or inherited DeepEP v2 draft backend."""
+        view = resolved_view(self)
+        draft_backend = view.speculative_moe_a2a_backend
+        if draft_backend is None and view.speculative_algorithm:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
+            if not algorithm.is_ngram():
+                draft_backend = view.moe_a2a_backend
+        if draft_backend == "deepep_v2":
+            raise ValueError(
+                "DeepEP v2 MoE is not validated as a speculative draft backend. "
+                "Select another --speculative-moe-a2a-backend."
+            )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -7479,6 +7577,14 @@ class ServerArgs:
                 cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "deepep_v2":
+            self._validate_deepep_v2_model_architecture()
+            if resolved_view(self).enable_deterministic_inference:
+                raise ValueError(
+                    "DeepEP v2 does not forward deterministic=True to "
+                    "ElasticBuffer, so deterministic sorting remains disabled. "
+                    "Disable --enable-deterministic-inference or use "
+                    "--moe-a2a-backend deepep."
+                )
             # ElasticBuffer needs NCCL symmetric memory; seeding it here avoids
             # --enable-symm-mem's NVLS and 4GB prealloc. A user value still wins.
             os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
@@ -7487,8 +7593,6 @@ class ServerArgs:
             # field would silently outrank it. Read the resolving view instead.
             resolved_runner = resolved_view(self).moe_runner_backend
             if resolved_runner == "auto":
-                # deepep_v2 dispatches FP8 activations plus scales, which only
-                # deep_gemm consumes.
                 self._declare("_handle_a2a_moe", moe_runner_backend="deep_gemm")
                 logger.warning(
                     "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
@@ -7512,28 +7616,6 @@ class ServerArgs:
                     "Remove --enforce-shared-experts-fusion when using "
                     "--moe-a2a-backend deepep_v2."
                 )
-            # The per-rank buffer must cover the largest extend forward, which
-            # the chunked prefill budget bounds. chunked_prefill_size is already
-            # per-rank here. Without this the server only fails at the first
-            # full chunk, which smoke traffic may never reach.
-            if (
-                self.chunked_prefill_size
-                and self.chunked_prefill_size > 0
-                and (self.disaggregation_mode != "decode")
-            ):
-                deepep_v2_cap = (
-                    envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-                )
-                if self.chunked_prefill_size > deepep_v2_cap:
-                    raise ValueError(
-                        "DeepEP v2 MoE: the per-rank chunked prefill budget "
-                        f"({self.chunked_prefill_size} tokens; the CLI "
-                        "--chunked-prefill-size is divided by dp_size under DP "
-                        "attention) exceeds the per-rank dispatch buffer "
-                        "capacity SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_"
-                        f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
-                        "communication buffer) or lower --chunked-prefill-size."
-                    )
             # Decode is capturable under either comm mode: the masked layout is
             # chosen by phase. Prefill reads exact counts back on the host.
             self.cuda_graph_config.prefill.backend = Backend.DISABLED

@@ -236,6 +236,34 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _validate_deepep_v2_quant_method(quant_method) -> None:
+    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    config = (
+        quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+    )
+    reason = None
+    if not isinstance(quant_method, Fp8MoEMethod):
+        reason = f"selected {type(quant_method).__name__}"
+    elif quant_method.use_mxfp8:
+        reason = "selected MXFP8 weights"
+    elif quant_method.is_fp4_expert:
+        reason = "selected FP4 experts"
+    elif list(quant_method.weight_block_size or []) != [128, 128]:
+        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif config.activation_scheme != "dynamic":
+        reason = f"has activation_scheme={config.activation_scheme!r}"
+
+    if reason is not None:
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
+            f"experts with dynamic activation scaling, but this layer {reason}. "
+            "Use a compatible checkpoint or --moe-a2a-backend deepep."
+        )
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -417,6 +445,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        _validate_deepep_v2_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()

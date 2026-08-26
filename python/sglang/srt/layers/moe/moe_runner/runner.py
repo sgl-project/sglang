@@ -50,13 +50,7 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
-        # deepep_v2 only registers permute adapters for the deep_gemm runner.
-        # --moe-runner-backend is validated at server start, but the runner is
-        # picked per layer by the quant method and several of them hard-select
-        # Triton regardless (blockwise_int8, moe_wna16, w8a8_*, modelopt,
-        # unquant, ...). Without this, such a model reaches the permute
-        # registry and dies on a bare assert inside the MoE forward, after the
-        # weights are already loaded.
+        # Backstop for quant methods that resolve the per-layer runner to Triton.
         if get_moe_a2a_backend().is_deepep_v2() and not runner_backend.is_deep_gemm():
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
