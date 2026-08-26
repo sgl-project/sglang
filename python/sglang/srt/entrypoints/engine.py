@@ -716,15 +716,21 @@ class Engine(EngineScoreMixin, EngineBase):
         from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
-            compute_global_rank,
             compute_local_gpu_id,
             get_ready_path,
         )
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                cleanup_stale_daemon_files(gpu_id)
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -756,8 +762,15 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=server_args.base_gpu_id,
+                        gpu_id_step=server_args.gpu_id_step,
+                    )
+                    ready_path = get_ready_path(gpu_id)
                     while not os.path.exists(ready_path):
                         time.sleep(check_interval)
                         if time.time() - start_time > timeout:

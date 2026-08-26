@@ -11,7 +11,7 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import msgspec
 
@@ -19,12 +19,12 @@ from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
-# Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
+# Socket path template for weight cache daemons, keyed by the *physical* GPU the
+# daemon owns (see compute_daemon_key).
+WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_gpu{daemon_key}.sock"
 
 # Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_gpu{daemon_key}.ready"
 
 
 class CacheConfig(msgspec.Struct):
@@ -277,11 +277,78 @@ def compute_env_stamp() -> Dict[str, str]:
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
     """Single source of truth for the daemon rank formula.
 
-    global_rank = tp_size * pp_rank + tp_rank, so each daemon gets a unique
-    socket/ready path even across PP stages and nodes. Every call site (engine,
-    loader, model_runner, daemon) must go through this so the copies can't drift.
+    global_rank = tp_size * pp_rank + tp_rank. Used for the daemon's distributed
+    rank and for its cross-node TCP control port, where rank (not device) is the
+    right addressing unit: a mirror daemon's rank i seeds from the source
+    daemon's rank i, which is the only pairing whose shards are identical.
+
+    Note the node-local Unix socket is keyed by physical GPU instead
+    (compute_daemon_key), because there rank over-specifies and would collide
+    between two same-shape replicas on one node.
     """
     return tp_size * pp_rank + tp_rank
+
+
+def _parse_visible_devices() -> Optional[List[str]]:
+    """Return the raw CUDA/HIP visible-device entries, or None if unrestricted."""
+    for var in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        visible = os.environ.get(var)
+        if visible and visible.strip():
+            return [e.strip() for e in visible.split(",") if e.strip()]
+    return None
+
+
+def _sanitize_daemon_key(entry: str) -> str:
+    """Reduce a visible-device entry to a filename-safe key.
+
+    Entries are either plain indices ("4") or UUID forms ("GPU-1a2b-..."); both
+    are stable physical identities, so keep them as-is minus path-unsafe
+    characters.
+    """
+    return "".join(c for c in entry if c.isalnum() or c in "-_") or "unknown"
+
+
+def compute_daemon_key(gpu_id: int) -> str:
+    """Node-local key identifying the daemon that owns ``gpu_id``.
+
+    The socket/ready files live in /tmp, which is node-local, so the key only
+    has to be unique within a node — and "at most one daemon per physical GPU"
+    is the real invariant, since a daemon pins a full weight copy on its device.
+
+    Keying on the *physical* device rather than the global rank is what lets two
+    same-shape replicas coexist on one node: replica B's tp_rank 0 would
+    otherwise derive the exact same path as replica A's tp_rank 0 and trip
+    cleanup_stale_daemon_files on A's live PID.
+
+    Resolved through CUDA_VISIBLE_DEVICES (same mapping as
+    ``utils.common.get_physical_device_id``, extended to tolerate UUID entries)
+    so a replica launched with a narrowed device list — e.g.
+    CUDA_VISIBLE_DEVICES=4,5,6,7 with gpu_id 0..3 — still keys on the physical
+    device it actually runs on.
+    """
+    entries = _parse_visible_devices()
+    if entries is None:
+        return str(gpu_id)
+    if gpu_id >= len(entries):
+        raise ValueError(
+            f"[weight_cache] gpu_id={gpu_id} is out of range: the visible device "
+            f"list exposes only {len(entries)} device(s) ({entries}). The daemon "
+            f"cannot own a device it cannot see."
+        )
+    return _sanitize_daemon_key(entries[gpu_id])
+
+
+def visible_daemon_keys() -> Optional[List[str]]:
+    """Daemon keys for every device visible to this process.
+
+    Returns None when the visibility list is unset, meaning every local device
+    is visible and any key is reachable. Used to pre-check that a peer daemon's
+    device can actually be mapped before attempting CUDA IPC against it.
+    """
+    entries = _parse_visible_devices()
+    if entries is None:
+        return None
+    return [_sanitize_daemon_key(e) for e in entries]
 
 
 def compute_local_gpu_id(
@@ -308,20 +375,14 @@ def compute_local_gpu_id(
     )
 
 
-def get_socket_path(global_rank: int) -> str:
-    """Get the Unix socket path for a weight cache daemon.
-
-    global_rank = tp_size * pp_rank + tp_rank
-    """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
+def get_socket_path(gpu_id: int) -> str:
+    """Get the Unix socket path for the weight cache daemon owning ``gpu_id``."""
+    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(daemon_key=compute_daemon_key(gpu_id))
 
 
-def get_ready_path(global_rank: int) -> str:
-    """Get the ready-file path for a weight cache daemon.
-
-    global_rank = tp_size * pp_rank + tp_rank
-    """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+def get_ready_path(gpu_id: int) -> str:
+    """Get the ready-file path for the weight cache daemon owning ``gpu_id``."""
+    return WEIGHT_CACHE_READY_TEMPLATE.format(daemon_key=compute_daemon_key(gpu_id))
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
@@ -347,8 +408,8 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
-    """Validate and clean up .ready/.sock files for a daemon rank.
+def cleanup_stale_daemon_files(gpu_id: int, *, force: bool = False) -> None:
+    """Validate and clean up .ready/.sock files for the daemon owning ``gpu_id``.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
     is still running — raise RuntimeError so the caller doesn't clobber it,
@@ -357,8 +418,8 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(global_rank)
-    socket_path = get_socket_path(global_rank)
+    ready_path = get_ready_path(gpu_id)
+    socket_path = get_socket_path(gpu_id)
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return
@@ -368,14 +429,14 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     if pid is not None and _is_pid_alive(pid):
         if not force:
             raise RuntimeError(
-                f"Weight cache daemon for rank {global_rank} is already running "
+                f"Weight cache daemon for gpu {gpu_id} is already running "
                 f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
                 f"launching a new one, or pass force=True (--force) to kill it and "
                 f"take over."
             )
         logger.warning(
             f"[weight_cache] force takeover: killing existing daemon pid={pid} "
-            f"for rank {global_rank} and reclaiming its socket/ready files."
+            f"for gpu {gpu_id} and reclaiming its socket/ready files."
         )
         try:
             os.kill(pid, signal.SIGKILL)

@@ -7,10 +7,14 @@ These cover the pure-Python logic that the GPU end-to-end test
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig fingerprint matching / (de)serialization
   - quant-config hashing and method-name extraction
-  - daemon spawn configuration and socket/ready path derivation
+  - daemon spawn configuration and socket/ready path derivation, including
+    the physical-GPU keying that lets two same-shape replicas share a node
   - the IPC quantization allowlist (the gate that keeps silently-wrong
     quant methods off the zero-copy path)
   - stale-vs-live daemon file cleanup
+  - seed (daemon -> daemon mirroring) manifest metadata and the mirror's
+    fingerprint subset verification
+  - the ServerArgs guards on the weight-cache socket/seed options
 
 They intentionally require no CUDA, no model download, and no daemon
 process, so they run in the fast CPU suite and would catch a regression
@@ -22,6 +26,7 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -31,6 +36,7 @@ from sglang.srt.weight_cache.protocol import (
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
+    compute_daemon_key,
     compute_global_rank,
     compute_local_gpu_id,
     get_quant_method_name,
@@ -40,6 +46,7 @@ from sglang.srt.weight_cache.protocol import (
     is_ipc_quant_supported,
     recv_msg,
     send_msg,
+    visible_daemon_keys,
 )
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
@@ -50,6 +57,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _no_visible_device_restriction():
+    """Pin the daemon key to the logical index for tests that need a synthetic id.
+
+    compute_daemon_key resolves through CUDA_VISIBLE_DEVICES and rejects an id
+    beyond the visible list, so tests picking an out-of-range id to avoid
+    colliding with a real daemon must state that no restriction is in effect.
+    """
+    return mock.patch.dict(
+        os.environ, {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
+    )
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -238,10 +257,11 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=1, tp_rank=0), 4)
         self.assertEqual(compute_global_rank(tp_size=4, pp_rank=2, tp_rank=1), 9)
 
-    def test_socket_and_ready_paths_are_unique_per_rank(self):
-        self.assertNotEqual(get_socket_path(0), get_socket_path(1))
-        self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
-        self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
+    def test_socket_and_ready_paths_are_unique_per_gpu(self):
+        with _no_visible_device_restriction():
+            self.assertNotEqual(get_socket_path(0), get_socket_path(1))
+            self.assertTrue(get_socket_path(3).endswith("gpu3.sock"))
+            self.assertTrue(get_ready_path(3).endswith("gpu3.ready"))
 
     def test_compute_local_gpu_id_honors_base_and_step(self):
         # Single-node TP=4: identity mapping rank -> gpu.
@@ -262,6 +282,61 @@ class TestGlobalRankAndPaths(CustomTestCase):
             ),
             4,
         )
+
+
+class TestDaemonKeyAddressing(CustomTestCase):
+    """Socket/ready files are keyed by the *physical* GPU, not the global rank.
+
+    This is what makes two same-shape replicas on one node possible at all:
+    under the old rank keying, replica B's tp_rank 0 derived byte-for-byte the
+    same /tmp path as replica A's tp_rank 0, and cleanup_stale_daemon_files saw
+    A's live PID and refused to start.
+    """
+
+    def test_unrestricted_visibility_keys_on_logical_id(self):
+        with _no_visible_device_restriction():
+            self.assertEqual(compute_daemon_key(0), "0")
+            self.assertEqual(compute_daemon_key(5), "5")
+            self.assertIsNone(visible_daemon_keys())
+
+    def test_narrowed_visibility_keys_on_physical_id(self):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}):
+            # Logical 0 inside this replica is physically device 4.
+            self.assertEqual(compute_daemon_key(0), "4")
+            self.assertEqual(compute_daemon_key(3), "7")
+            self.assertEqual(visible_daemon_keys(), ["4", "5", "6", "7"])
+
+    def test_two_replicas_on_one_node_do_not_collide(self):
+        # Both replicas run tp_rank 0 on their own logical device 0; only the
+        # physical keying keeps them off the same socket.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}):
+            replica_a = [get_socket_path(i) for i in range(4)]
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}):
+            replica_b = [get_socket_path(i) for i in range(4)]
+
+        self.assertEqual(len(set(replica_a) | set(replica_b)), 8)
+        self.assertTrue(replica_b[0].endswith("gpu4.sock"))
+
+    def test_reordered_visibility_still_keys_on_physical_id(self):
+        # A permuted list must follow the physical device, not the position.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "3,2,1,0"}):
+            self.assertEqual(compute_daemon_key(0), "3")
+            self.assertEqual(compute_daemon_key(3), "0")
+
+    def test_uuid_entries_are_filename_safe(self):
+        with mock.patch.dict(
+            os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-1a2b/3c4d,GPU-5e6f"}
+        ):
+            key = compute_daemon_key(0)
+            self.assertNotIn("/", key)
+            self.assertIn(key, get_socket_path(0))
+
+    def test_gpu_id_beyond_visible_list_raises(self):
+        # Claiming a device this process cannot see is a configuration error, not
+        # something to paper over with a fabricated key.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5"}):
+            with self.assertRaises(ValueError):
+                compute_daemon_key(2)
 
 
 class TestDaemonLaunchConfiguration(CustomTestCase):
@@ -363,12 +438,18 @@ class TestIpcQuantAllowlist(CustomTestCase):
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
-    # Use a rank far outside any realistic tp*pp layout so we never collide
-    # with a daemon that might actually be running on the test host.
-    RANK = 987654
+    # Use a gpu id far outside any realistic node so we never collide with a
+    # daemon that might actually be running on the test host. The visibility
+    # restriction is cleared so the id maps straight through to the key.
+    GPU_ID = 987654
+
+    def setUp(self):
+        self._env = _no_visible_device_restriction()
+        self._env.start()
+        self.addCleanup(self._env.stop)
 
     def _paths(self):
-        return get_ready_path(self.RANK), get_socket_path(self.RANK)
+        return get_ready_path(self.GPU_ID), get_socket_path(self.GPU_ID)
 
     def tearDown(self):
         for path in self._paths():
@@ -377,7 +458,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
 
     def test_no_files_is_noop(self):
         # Neither file present: must return quietly, not raise.
-        cleanup_stale_daemon_files(self.RANK)
+        cleanup_stale_daemon_files(self.GPU_ID)
 
     def test_stale_files_without_live_pid_are_removed(self):
         ready_path, socket_path = self._paths()
@@ -387,7 +468,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
             f.write("stale contents, no pid line\n")
         open(socket_path, "w").close()
 
-        cleanup_stale_daemon_files(self.RANK)
+        cleanup_stale_daemon_files(self.GPU_ID)
 
         self.assertFalse(os.path.exists(ready_path))
         self.assertFalse(os.path.exists(socket_path))
@@ -400,7 +481,7 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
         open(socket_path, "w").close()
 
         with self.assertRaises(RuntimeError):
-            cleanup_stale_daemon_files(self.RANK)
+            cleanup_stale_daemon_files(self.GPU_ID)
 
         self.assertTrue(os.path.exists(ready_path))
         self.assertTrue(os.path.exists(socket_path))
@@ -418,11 +499,11 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
                 f.write(f"pid={child.pid}\n")
             open(socket_path, "w").close()
 
-            cleanup_stale_daemon_files(self.RANK, force=True)
+            cleanup_stale_daemon_files(self.GPU_ID, force=True)
 
             self.assertFalse(os.path.exists(ready_path))
             self.assertFalse(os.path.exists(socket_path))
-            # The daemon holding the rank must have been killed.
+            # The daemon holding the GPU must have been killed.
             self.assertEqual(child.wait(timeout=5), -9)
         finally:
             if child.poll() is None:
@@ -437,7 +518,12 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
     pointing the loader at a socket path that does not exist.
     """
 
-    RANK = 987655
+    GPU_ID = 987655
+
+    def setUp(self):
+        self._env = _no_visible_device_restriction()
+        self._env.start()
+        self.addCleanup(self._env.stop)
 
     def _model_config(self):
         from types import SimpleNamespace
@@ -459,7 +545,7 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 
-        missing_socket = get_socket_path(self.RANK)
+        missing_socket = get_socket_path(self.GPU_ID)
         if os.path.exists(missing_socket):
             os.unlink(missing_socket)
 
@@ -475,6 +561,317 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         # The error must be about the missing daemon, proving we did not quietly
         # fall through to a disk load.
         self.assertIn("daemon", str(ctx.exception).lower())
+
+
+class TestSeedManifest(CustomTestCase):
+    """The manifest is the mirror's only description of what to allocate.
+
+    A mirror builds no nn.Module, so anything the manifest omits is gone for
+    good -- hence the insistence that it cover the whole export set, not just
+    named_parameters().
+    """
+
+    def test_manifest_describes_every_entry(self):
+        from sglang.srt.weight_cache.seed import build_manifest
+
+        state_tensors = {
+            "w": (torch.zeros(2, 3, dtype=torch.float16), True),
+            "scale": (torch.zeros(2, dtype=torch.float32), True),
+            "rotary.cos_sin_cache": (torch.zeros(4, dtype=torch.bfloat16), False),
+        }
+        manifest = build_manifest(state_tensors)
+
+        self.assertEqual(set(manifest), set(state_tensors))
+        self.assertEqual(manifest["w"]["shape"], [2, 3])
+        self.assertEqual(manifest["w"]["dtype"], "float16")
+        self.assertTrue(manifest["w"]["is_param"])
+        # A non-persistent buffer must survive as a buffer, not be promoted.
+        self.assertFalse(manifest["rotary.cos_sin_cache"]["is_param"])
+
+    def test_manifest_dtype_round_trip(self):
+        from sglang.srt.weight_cache.seed import build_manifest, manifest_dtype
+
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float8_e4m3fn,
+            torch.int8,
+            torch.uint8,
+        ):
+            manifest = build_manifest({"t": (torch.zeros(2, dtype=dtype), True)})
+            self.assertEqual(manifest_dtype(manifest["t"]["dtype"]), dtype)
+
+    def test_manifest_survives_the_wire(self):
+        # The manifest travels through the same framing as everything else, so a
+        # non-picklable field would only show up here.
+        from sglang.srt.weight_cache.seed import build_manifest
+
+        manifest = build_manifest({"w": (torch.zeros(2, 3, dtype=torch.float16), True)})
+        a, b = socket.socketpair()
+        try:
+            send_msg(a, {"status": "ok", "manifest": manifest})
+            self.assertEqual(recv_msg(b)["manifest"], manifest)
+        finally:
+            a.close()
+            b.close()
+
+    def test_unknown_dtype_name_raises(self):
+        # A dtype this torch build lacks means the source runs a different torch
+        # version; that must surface as a version mismatch, not an AttributeError.
+        from sglang.srt.weight_cache.seed import manifest_dtype
+
+        with self.assertRaises(RuntimeError):
+            manifest_dtype("not_a_dtype")
+        # "nn" resolves on torch but is not a dtype -- the isinstance check, not
+        # mere attribute presence, is what makes this safe.
+        with self.assertRaises(RuntimeError):
+            manifest_dtype("nn")
+
+    def test_manifest_nbytes_sums_the_payload(self):
+        from sglang.srt.weight_cache.seed import build_manifest, manifest_nbytes
+
+        manifest = build_manifest(
+            {
+                "a": (torch.zeros(2, 3, dtype=torch.float16), True),
+                "b": (torch.zeros(4, dtype=torch.float32), True),
+            }
+        )
+        self.assertEqual(manifest_nbytes(manifest), 2 * 3 * 2 + 4 * 4)
+
+
+class TestPeerIpcSourceReachability(CustomTestCase):
+    """CUDA IPC handles carry the *source process's logical* device index.
+
+    Visibility alone is not enough: if the same physical card sits at a
+    different logical index here, the handle opens against the wrong device.
+    Both failures must be caught with actionable text before
+    cudaIpcOpenMemHandle fails opaquely.
+    """
+
+    def _check(self, seed_meta, device_index=1):
+        from sglang.srt.weight_cache.seed import PeerIpcSeedSource
+
+        PeerIpcSeedSource._assert_source_reachable(
+            seed_meta, torch.device("cuda", device_index)
+        )
+
+    def test_invisible_source_card_names_the_fix(self):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._check({"source_local_index": 0, "source_daemon_key": "6"})
+        message = str(ctx.exception)
+        self.assertIn("CUDA_VISIBLE_DEVICES", message)
+        self.assertIn("6", message)
+
+    def test_reindexed_source_card_names_the_fix(self):
+        # Physical device 4 is logical 0 in the source but logical 1 here.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "3,4"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._check({"source_local_index": 0, "source_daemon_key": "4"})
+        message = str(ctx.exception)
+        self.assertIn("CUDA_VISIBLE_DEVICES", message)
+        self.assertIn("index", message)
+
+    def test_matching_indices_pass(self):
+        # Same visibility on both sides: nothing to complain about. The peer
+        # access probe below is advisory and tolerates a CPU-only host.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}):
+            self._check({"source_local_index": 0, "source_daemon_key": "4"})
+
+
+class TestMirrorFingerprintVerification(CustomTestCase):
+    """A mirror adopts the source's CacheConfig, but only after proving the
+    subset it can compute on its own is identical.
+
+    That subset is what makes the two shards byte-identical; moe_dp_rank and
+    moe_ep_rank are excluded because they are read off process groups a mirror
+    never creates, and they are deterministic functions of the verified size
+    fields plus tp_rank/pp_rank.
+    """
+
+    def _daemon(self, **overrides):
+        from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+
+        # Bypass __init__: it touches ServerArgs and address resolution, none of
+        # which the fingerprint logic under test reads.
+        d = object.__new__(WeightCacheDaemon)
+        attrs = dict(
+            gpu_id=0,
+            model_path="/models/demo",
+            tp_size=4,
+            tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            ep_size=1,
+            moe_dp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=False,
+            attn_cp_size=1,
+            moe_dense_tp_size=None,
+            moe_a2a_backend="none",
+            revision=None,
+            seed_addr="/tmp/sglang_weight_cache_gpu4.sock",
+        )
+        attrs.update(overrides)
+        for key, value in attrs.items():
+            setattr(d, key, value)
+        return d
+
+    def _model_config(self):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            dtype=torch.float16,
+        )
+
+    def _source_config(self, daemon, **overrides):
+        """What a matching source daemon would have published."""
+        fields = daemon._fingerprint_fields(self._model_config(), "", None)
+        # The two fields a mirror cannot derive; the source always has them.
+        fields.update(moe_dp_rank=0, moe_ep_rank=0)
+        fields.update(overrides)
+        return fields
+
+    def test_identical_configuration_verifies(self):
+        d = self._daemon()
+        # Must not raise.
+        d._verify_seed_config(self._source_config(d), self._model_config(), "", None)
+
+    def test_source_config_covers_every_cache_config_field(self):
+        # Guards the test's own premise: the verified subset plus the two MoE
+        # ranks must be the whole fingerprint, or the mirror would adopt fields
+        # nobody checked.
+        d = self._daemon()
+        self.assertEqual(
+            set(self._source_config(d)),
+            set(CacheConfig.__struct_fields__),
+        )
+
+    def test_differing_shard_defining_field_is_rejected(self):
+        d = self._daemon()
+        for field, value in (
+            ("model_path", "/models/other"),
+            ("model_arch", "Qwen2ForCausalLM"),
+            ("tp_size", 8),
+            ("tp_rank", 1),
+            ("pp_size", 2),
+            ("dp_size", 2),
+            ("ep_size", 2),
+            ("moe_dp_size", 2),
+            ("enable_dp_attention", True),
+            ("moe_dense_tp_size", 1),
+            ("moe_a2a_backend", "deepep"),
+            ("quant_method", "fp8"),
+            ("quant_config_hash", "deadbeef"),
+            ("dtype", "torch.bfloat16"),
+            ("revision", "v2"),
+            ("torch_version", "0.0.0-not-this-build"),
+        ):
+            source = self._source_config(d, **{field: value})
+            with self.assertRaises(
+                RuntimeError, msg=f"{field} must be rejected"
+            ) as ctx:
+                d._verify_seed_config(source, self._model_config(), "", None)
+            # The message must name the offending field, or a mismatch on a
+            # 20-field fingerprint is undebuggable.
+            self.assertIn(field, str(ctx.exception))
+
+    def test_moe_ranks_are_adopted_not_verified(self):
+        # A mirror has no process groups, so these two cannot be recomputed. They
+        # are deliberately excluded from verification; differing values must NOT
+        # fail the check (they are a function of the fields that were checked).
+        d = self._daemon()
+        source = self._source_config(d, moe_dp_rank=3, moe_ep_rank=5)
+        d._verify_seed_config(source, self._model_config(), "", None)
+        adopted = CacheConfig.from_dict(source)
+        self.assertEqual(adopted.moe_dp_rank, 3)
+        self.assertEqual(adopted.moe_ep_rank, 5)
+
+    def test_source_config_missing_fields_is_version_skew(self):
+        d = self._daemon()
+        source = self._source_config(d)
+        del source["moe_ep_rank"]
+        with self.assertRaises(RuntimeError) as ctx:
+            d._verify_seed_config(source, self._model_config(), "", None)
+        self.assertIn("moe_ep_rank", str(ctx.exception))
+
+
+class TestWeightCacheServerArgsGuards(CustomTestCase):
+    """The addressing preconditions ServerArgs refuses to start without.
+
+    _validate_weight_cache_options is exercised directly: the surrounding
+    __post_init__ probes the checkpoint on disk, which these purely
+    configuration-level rules do not need.
+    """
+
+    def _args(self, **overrides):
+        from sglang.srt.server_args import ServerArgs
+
+        args = object.__new__(ServerArgs)
+        attrs = dict(
+            weight_cache_mode="daemon",
+            speculative_algorithm=None,
+            enable_eplb=False,
+            weight_cache_socket=None,
+            weight_cache_seed=None,
+            weight_cache_listen_addr=None,
+            weight_cache_seed_token=None,
+            tp_size=1,
+            pp_size=1,
+        )
+        attrs.update(overrides)
+        for key, value in attrs.items():
+            setattr(args, key, value)
+        return args
+
+    def test_baseline_configuration_passes(self):
+        self._args()._validate_weight_cache_options()
+
+    def test_explicit_socket_rejected_beyond_one_rank(self):
+        # --weight-cache-socket is a scalar: honoring it for tp>1 would point
+        # every rank at one daemon and map another rank's shard.
+        with self.assertRaises(ValueError) as ctx:
+            self._args(
+                weight_cache_socket="/tmp/x.sock", tp_size=2
+            )._validate_weight_cache_options()
+        self.assertIn("single rank", str(ctx.exception))
+
+        # pp is part of the same world size, so it must trip the guard too.
+        with self.assertRaises(ValueError):
+            self._args(
+                weight_cache_socket="/tmp/x.sock", pp_size=2
+            )._validate_weight_cache_options()
+
+    def test_explicit_socket_allowed_for_single_rank(self):
+        self._args(weight_cache_socket="/tmp/x.sock")._validate_weight_cache_options()
+
+    def test_seed_list_must_cover_every_rank(self):
+        # Rank i can only mirror the source's rank i, so a short list would
+        # silently leave later ranks disk-loading.
+        with self.assertRaises(ValueError) as ctx:
+            self._args(
+                weight_cache_seed="/tmp/a.sock", tp_size=2
+            )._validate_weight_cache_options()
+        self.assertIn("per rank", str(ctx.exception))
+
+        self._args(
+            weight_cache_seed="/tmp/a.sock,/tmp/b.sock", tp_size=2
+        )._validate_weight_cache_options()
+
+    def test_tcp_control_plane_requires_a_token(self):
+        # The cross-node plane has no equivalent of the peer-uid check that
+        # protects the node-local Unix socket.
+        with self.assertRaises(ValueError) as ctx:
+            self._args(
+                weight_cache_listen_addr="0.0.0.0:29700"
+            )._validate_weight_cache_options()
+        self.assertIn("token", str(ctx.exception))
+
+        self._args(
+            weight_cache_listen_addr="0.0.0.0:29700",
+            weight_cache_seed_token="s3cret",
+        )._validate_weight_cache_options()
 
 
 if __name__ == "__main__":

@@ -36,13 +36,16 @@ Usage:
 
 import argparse
 import dataclasses
+import hmac
 import logging
 import multiprocessing
 import os
+import select
 import signal
 import socket
+import stat
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -65,6 +68,12 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
+from .seed import (
+    PEER_IPC_SEED_SOURCE,
+    RDMA_SEED_SOURCE,
+    build_manifest,
+    get_seed_source,
+)
 from .transport import choose_daemon_transport_backend
 
 logger = logging.getLogger(__name__)
@@ -77,6 +86,55 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+# CacheConfig fields a mirror daemon cannot derive on its own: they are read off
+# initialized process groups, which a mirror never creates. Everything else is
+# verified against the source before its config is adopted.
+_MIRROR_UNVERIFIABLE_FIELDS = frozenset({"moe_dp_rank", "moe_ep_rank"})
+
+
+def _split_addresses(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [addr.strip() for addr in value.split(",") if addr.strip()]
+
+
+def _resolve_seed_address(server_args: "ServerArgs", global_rank: int) -> Optional[str]:
+    """Address of the source daemon this rank mirrors from, if any.
+
+    The list is indexed by global rank because rank i's shard is byte-identical
+    only to the source replica's rank i (see compute_global_rank). Indexing that
+    way also means the identical flag value can be handed to every node.
+    """
+    addresses = _split_addresses(server_args.weight_cache_seed)
+    if not addresses:
+        return None
+    if global_rank >= len(addresses):
+        raise ValueError(
+            f"[WeightCacheDaemon] --weight-cache-seed lists "
+            f"{len(addresses)} address(es) but this daemon is global rank "
+            f"{global_rank}. Pass one address per rank of the source replica."
+        )
+    return addresses[global_rank]
+
+
+def _resolve_listen_address(
+    server_args: "ServerArgs", global_rank: int
+) -> Optional[Tuple[str, int]]:
+    """TCP control-plane endpoint for this rank, if cross-node seeding is on.
+
+    The configured port is a base: rank i listens on base + i, mirroring how the
+    seed list is indexed, so one flag value works for a whole replica.
+    """
+    if not server_args.weight_cache_listen_addr:
+        return None
+    host, _, port = server_args.weight_cache_listen_addr.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(
+            f"[WeightCacheDaemon] --weight-cache-listen-addr must be "
+            f"host:base_port, got {server_args.weight_cache_listen_addr!r}"
+        )
+    return host, int(port) + global_rank
 
 
 @dataclasses.dataclass
@@ -171,18 +229,31 @@ class WeightCacheDaemon:
         self.revision = server_args.revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
-        self.ready_path = get_ready_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
+        self.socket_path = get_socket_path(gpu_id)
+        self.ready_path = get_ready_path(gpu_id)
+
+        self.global_rank = compute_global_rank(self.tp_size, pp_rank, tp_rank)
+        # When set, this daemon is a *mirror*: it copies an existing daemon's
+        # already-post-processed weights instead of loading from disk.
+        self.seed_addr = _resolve_seed_address(server_args, self.global_rank)
+        self.seed_backend = server_args.weight_cache_seed_backend
+        self.seed_token = server_args.weight_cache_seed_token
+        self.listen_address = _resolve_listen_address(server_args, self.global_rank)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        # The tensors behind state_entries. On the disk path self.model owns them
+        # too; on the mirror path this dict is their ONLY owner, so dropping it
+        # would free memory that clients have already mapped.
+        self.state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
         self.transport_backend = None
+        # Built on first fetch_manifest, not at load time: a seed source can be
+        # expensive to stand up (RDMA memory registration takes seconds) and
+        # most daemons are never used as a seed.
+        self._manifest: Optional[Dict[str, Dict[str, Any]]] = None
+        self._seed_sources: Dict[str, Any] = {}
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -250,7 +321,12 @@ class WeightCacheDaemon:
         )
 
     def load(self):
-        """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        """Populate this daemon's weights, then export them for clients.
+
+        Two sources: disk (full pipeline disk -> TP shard -> quantize) or, when
+        ``--weight-cache-seed`` is set, a peer daemon that already did all of
+        that (see _load_from_seed).
+        """
         # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
         # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
         # instead of dying deep inside the export with an opaque error.
@@ -264,7 +340,8 @@ class WeightCacheDaemon:
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device.
+        # message before touching the device. A mirror re-exports its own copy,
+        # so this applies to it just the same.
         self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
@@ -272,16 +349,17 @@ class WeightCacheDaemon:
         torch.set_num_threads(1)
 
         # Lazy imports to avoid circular dependencies and speed up startup
-        from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
         publish(server_args, role="weight_cache_daemon")
 
-        from sglang.srt.layers.moe import initialize_moe_config
+        if self.seed_addr is None:
+            # Only the disk path instantiates layers, so only it needs the MoE
+            # config resolved.
+            from sglang.srt.layers.moe import initialize_moe_config
 
-        initialize_moe_config(server_args)
+            initialize_moe_config(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -308,8 +386,27 @@ class WeightCacheDaemon:
             quant_method = get_quant_method_name(quant_config)
 
         # Refuse unsupported quant methods before creating distributed groups
-        # or touching model weights.
+        # or touching model weights. A mirror re-exports over IPC too, so the
+        # allowlist is not relaxed for it.
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
+
+        if self.seed_addr is not None:
+            self._load_from_seed(model_config, quant_method, quant_config)
+        else:
+            self._load_from_disk(model_config, quant_method, quant_config)
+
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+            f"Exported {len(self.state_entries)} tensors as IPC handles. "
+            f"Ready to serve."
+        )
+
+    def _load_from_disk(self, model_config, quant_method, quant_config):
+        """Full loading pipeline: disk -> TP shard -> quantize -> export."""
+        from sglang.srt.configs.device_config import DeviceConfig
+        from sglang.srt.model_loader.loader import get_model_loader
+
+        server_args = self.server_args
 
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
@@ -317,31 +414,9 @@ class WeightCacheDaemon:
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
-            model_path=self.model_path,
-            model_arch=(
-                model_config.hf_config.architectures[0]
-                if model_config.hf_config.architectures
-                else ""
-            ),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_size=self.pp_size,
-            pp_rank=self.pp_rank,
-            dp_size=self.dp_size,
-            ep_size=self.ep_size,
-            moe_dp_size=self.moe_dp_size,
+            **self._fingerprint_fields(model_config, quant_method, quant_config),
             moe_dp_rank=moe_dp_rank,
             moe_ep_rank=moe_ep_rank,
-            enable_dp_attention=self.enable_dp_attention,
-            enable_dp_lm_head=self.enable_dp_lm_head,
-            attn_cp_size=self.attn_cp_size,
-            moe_dense_tp_size=self.moe_dense_tp_size,
-            moe_a2a_backend=self.moe_a2a_backend,
-            quant_method=quant_method,
-            quant_config_hash=hash_quant_config(quant_config),
-            dtype=str(model_config.dtype),
-            revision=self.revision or "",
-            **compute_env_stamp(),
         )
 
         # Build load config
@@ -378,11 +453,244 @@ class WeightCacheDaemon:
         # Export all parameters and buffers as IPC handles
         self._export_state()
 
+    def _fingerprint_fields(
+        self, model_config, quant_method, quant_config
+    ) -> Dict[str, Any]:
+        """Every CacheConfig field derivable without initialized process groups.
+
+        Shared by the disk path (which adds the two group-derived MoE ranks) and
+        by a mirror's verification of the source's config, so the two can never
+        compute the fingerprint differently.
+        """
+        return dict(
+            model_path=self.model_path,
+            model_arch=(
+                model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else ""
+            ),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            pp_size=self.pp_size,
+            pp_rank=self.pp_rank,
+            dp_size=self.dp_size,
+            ep_size=self.ep_size,
+            moe_dp_size=self.moe_dp_size,
+            enable_dp_attention=self.enable_dp_attention,
+            enable_dp_lm_head=self.enable_dp_lm_head,
+            attn_cp_size=self.attn_cp_size,
+            moe_dense_tp_size=self.moe_dense_tp_size,
+            moe_a2a_backend=self.moe_a2a_backend,
+            quant_method=quant_method,
+            quant_config_hash=hash_quant_config(quant_config),
+            dtype=str(model_config.dtype),
+            revision=self.revision or "",
+            **compute_env_stamp(),
+        )
+
+    def _load_from_seed(self, model_config, quant_method, quant_config):
+        """Mirror a peer daemon's already post-processed weights.
+
+        The peer has done the expensive part -- disk read, TP sharding and
+        ``process_weights_after_loading`` -- and its shard is byte-identical to
+        ours as long as the fingerprint matches, so loading collapses into a
+        bandwidth copy. Consequently this path never builds an ``nn.Module`` and
+        never creates a process group: _init_distributed, initialize_moe_config,
+        initialize_dp_attention and the model loader are all skipped.
+
+        The copy leaves us owning private memory, so once it returns the source
+        daemon may die freely -- unlike an engine client, which maps the daemon's
+        memory and must watch its liveness.
+        """
+        source = get_seed_source(
+            self.seed_backend, **self._seed_source_kwargs_for(self.seed_backend)
+        )
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Mirroring weights from {self.seed_addr} "
+            f"via seed backend {self.seed_backend}"
         )
+        tic = time.perf_counter()
+
+        conn = self._connect_seed()
+        try:
+            request = {"type": "fetch_manifest", "seed_backend": self.seed_backend}
+            if self.seed_token:
+                request["token"] = self.seed_token
+            send_msg(conn, request)
+            # The source may have to stand up an RDMA registration covering the
+            # whole model before it can answer, which outlasts the handshake-sized
+            # default timeout.
+            conn.settimeout(
+                max(self.server_args.weight_cache_timeout, CLIENT_CONNECTION_TIMEOUT)
+            )
+            response = recv_msg(conn)
+        finally:
+            conn.close()
+
+        if response.get("status") != "ok":
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] source daemon at "
+                f"{self.seed_addr} refused to seed: "
+                f"{response.get('message', response)}"
+            )
+
+        source_config = response["config"]
+        self._verify_seed_config(
+            source_config, model_config, quant_method, quant_config
+        )
+        # moe_dp_rank / moe_ep_rank are the only two fields left. They are
+        # deterministic functions of the parallel *size* fields plus
+        # tp_rank/pp_rank -- every one of which _verify_seed_config just proved
+        # equal -- so adopting the source's values is sound, not an unchecked
+        # hole. Recomputing them would require the process groups this path
+        # exists to avoid.
+        self.config = CacheConfig.from_dict(source_config)
+
+        manifest = response["manifest"]
+        seed_pid = response.get("pid")
+        self._assert_seed_alive(seed_pid, when="before starting the copy")
+
+        self.state_tensors = {}
+        tensors = source.fill(
+            manifest,
+            response["seed"],
+            current_platform.get_device(self.gpu_id),
+        )
+        # The source's memory had to stay valid for the whole copy; if it exited
+        # partway we may have read freed memory, and there is no way to tell
+        # good bytes from garbage after the fact. Refuse to serve.
+        self._assert_seed_alive(seed_pid, when="after the copy completed")
+
+        missing = set(manifest) - set(tensors)
+        if missing:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] seed backend "
+                f"{self.seed_backend} did not fill {len(missing)} manifest "
+                f"entry(ies) (e.g. {sorted(missing)[:3]})."
+            )
+
+        elapsed = time.perf_counter() - tic
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+            f"Mirrored {len(tensors)} tensors from {self.seed_addr} "
+            f"in {elapsed:.2f}s (no disk read, no TP sharding, no post-load "
+            f"processing)"
+        )
+
+        self._export_tensors(
+            {name: (tensors[name], manifest[name]["is_param"]) for name in manifest}
+        )
+
+    def _connect_seed(self) -> socket.socket:
+        """Connect to the source daemon named by ``--weight-cache-seed``.
+
+        A path-like address is the node-local Unix socket (same-node seeding);
+        anything else is host:port on the source's TCP control plane.
+        """
+        addr = self.seed_addr
+        if addr.startswith("/") or addr.startswith("./"):
+            # Same ownership check the engine client applies: only talk to a real
+            # socket node owned by us, never a symlink or another user's socket
+            # planted at a /tmp path.
+            try:
+                st = os.lstat(addr)
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] no seed socket at "
+                    f"{addr}. Start the source daemon first and point "
+                    f"--weight-cache-seed at its socket."
+                )
+            if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+                raise RuntimeError(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] refusing to seed "
+                    f"from {addr}: not a socket owned by this user."
+                )
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            target: Any = addr
+        else:
+            host, _, port = addr.rpartition(":")
+            if not host or not port.isdigit():
+                raise RuntimeError(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                    f"--weight-cache-seed entry {addr!r} is neither an absolute "
+                    f"socket path nor host:port."
+                )
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            target = (host, int(port))
+
+        sock.settimeout(CLIENT_CONNECTION_TIMEOUT)
+        try:
+            sock.connect(target)
+        except Exception as e:
+            sock.close()
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] failed to connect to "
+                f"seed daemon at {addr}: {e}"
+            ) from e
+        return sock
+
+    def _verify_seed_config(
+        self, source_config: Dict[str, Any], model_config, quant_method, quant_config
+    ) -> None:
+        """Reject a source whose weights would not be byte-compatible with ours.
+
+        Only same-shape replicas can seed each other: an identical shard is
+        produced only by an identical (model, revision, dtype, quantization,
+        parallel layout) tuple. Every such field is computable here without
+        process groups, so compare them all and fail loud on any difference.
+        """
+        expected = self._fingerprint_fields(model_config, quant_method, quant_config)
+        mismatches = {
+            key: (source_config.get(key), value)
+            for key, value in expected.items()
+            if key not in _MIRROR_UNVERIFIABLE_FIELDS
+            and source_config.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] cannot mirror "
+                f"{self.seed_addr}: its weights were built with a different "
+                f"configuration, so its shard is not our shard. Differing "
+                f"fields (source, ours): {mismatches}"
+            )
+
+        unknown = set(CacheConfig.__struct_fields__) - set(source_config)
+        if unknown:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] source daemon at "
+                f"{self.seed_addr} sent a config missing {sorted(unknown)}; it "
+                f"runs an incompatible SGLang version."
+            )
+
+    def _assert_seed_alive(self, seed_pid: Optional[int], *, when: str) -> None:
+        """The source process must exist for its memory to be readable.
+
+        Deliberately NOT the engine client's watchdog: that one SIGKILLs itself
+        when the daemon dies because it *maps* the daemon's memory forever. A
+        mirror only needs the source alive until the copy retires.
+        """
+        if not seed_pid or seed_pid <= 0:
+            logger.warning(
+                "[WeightCacheDaemon gpu=%s] seed daemon at %s reported no PID; "
+                "cannot verify it stayed alive %s.",
+                self.gpu_id,
+                self.seed_addr,
+                when,
+            )
+            return
+        try:
+            os.kill(seed_pid, 0)
+        except ProcessLookupError:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] seed daemon "
+                f"(pid={seed_pid}) at {self.seed_addr} is gone {when}. Its "
+                f"weight memory was freed, so the bytes we read cannot be "
+                f"trusted. Refusing to serve them."
+            )
+        except PermissionError:
+            pass  # exists, owned by another user
 
     @staticmethod
     def _assert_ipc_compatible_allocator() -> None:
@@ -411,9 +719,7 @@ class WeightCacheDaemon:
                     )
 
     def _export_state(self):
-        """Export model state entries through the selected transport backend."""
-        self.state_entries.clear()
-
+        """Export the loaded model's state entries through the transport backend."""
         # remove_duplicate=False so tied weights are recognized as parameters
         # under every name. state_dict() below emits both tied keys, and with the
         # deduped set the duplicate would be mis-registered as a buffer, not a
@@ -436,6 +742,18 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        self._export_tensors(state_tensors, non_persistent_count=non_persistent_count)
+
+    def _export_tensors(
+        self,
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]],
+        *,
+        non_persistent_count: Optional[int] = None,
+    ):
+        """Export an explicit tensor set, whether it came from disk or a peer."""
+        self.state_entries.clear()
+        self.state_tensors = state_tensors
+
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
@@ -447,16 +765,21 @@ class WeightCacheDaemon:
             for handle in (entry.get("handle") for entry in self.state_entries.values())
             if isinstance(handle, (str, bytes, bytearray))
         )
+        buffers_note = (
+            f"({non_persistent_count} non-persistent buffers), "
+            if non_persistent_count is not None
+            else ""
+        )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
-            f"({non_persistent_count} non-persistent buffers), "
+            f"{buffers_note}"
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
     def serve(self):
-        """Block and serve IPC handles over Unix socket."""
+        """Block and serve transport entries over Unix socket (and optionally TCP)."""
         # Do NOT unlink an existing socket here: stale-file cleanup is the launch
         # path's job (cleanup_stale_daemon_files refuses to remove a socket whose
         # .ready still points at a live PID). A leftover live socket makes bind()
@@ -468,7 +791,9 @@ class WeightCacheDaemon:
         finally:
             os.umask(old_umask)
         sock.listen(8)
-        sock.settimeout(1.0)  # Allow periodic shutdown check
+
+        tcp_sock = self._maybe_listen_tcp()
+        listeners = [sock] + ([tcp_sock] if tcp_sock is not None else [])
 
         # Write ready file
         with open(self.ready_path, "w") as f:
@@ -492,37 +817,128 @@ class WeightCacheDaemon:
 
         try:
             while self._running:
+                # select rather than a per-socket accept timeout: with two
+                # listeners, polling them in turn would add a full timeout of
+                # latency to whichever one is checked second.
                 try:
-                    conn, _ = sock.accept()
-                    # The listen-socket timeout above only bounds accept(); the
-                    # accepted connection is blocking by default. Since we serve
+                    readable, _, _ = select.select(listeners, [], [], 1.0)
+                except InterruptedError:
+                    continue
+                for listener in readable:
+                    conn, peer = listener.accept()
+                    # The select timeout above only bounds accept(); the accepted
+                    # connection is blocking by default. Since we serve
                     # connections serially, a client that connects but never sends
                     # (or dies mid-send) would block recv_msg forever and stall
                     # every other engine rank. Bound each exchange instead.
                     conn.settimeout(CLIENT_CONNECTION_TIMEOUT)
                     try:
-                        self._handle_connection(conn)
+                        self._handle_connection(conn, remote=listener is tcp_sock)
                     except Exception as e:
                         logger.error(
                             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                            f"Error handling connection: {e}",
+                            f"Error handling connection from {peer}: {e}",
                             exc_info=True,
                         )
                     finally:
                         conn.close()
-                except socket.timeout:
-                    continue
         finally:
             sock.close()
+            if tcp_sock is not None:
+                tcp_sock.close()
             if os.path.exists(self.socket_path):
                 os.unlink(self.socket_path)
             if os.path.exists(self.ready_path):
                 os.unlink(self.ready_path)
             logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Shutdown complete")
 
-    def _handle_connection(self, conn: socket.socket):
-        """Handle a single client connection."""
+    def _maybe_listen_tcp(self) -> Optional[socket.socket]:
+        """Open the cross-node control plane, if configured.
+
+        A daemon must be able to act as a seed without any engine attached, so
+        this is its own listener rather than a route on the engine's bootstrap
+        server. It is deliberately narrower than the Unix socket: the peer-uid
+        check that protects /tmp has no cross-machine equivalent, so a shared
+        token is mandatory and only seeding requests are answered.
+        """
+        if self.listen_address is None:
+            return None
+
+        host, port = self.listen_address
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind((host, port))
+        tcp_sock.listen(8)
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Cross-node seed control "
+            f"plane listening on {host}:{port}"
+        )
+        return tcp_sock
+
+    def _authorize_remote(self, req: Dict[str, Any]) -> Optional[str]:
+        """Return an error message if a TCP request must be rejected."""
+        if not self.seed_token:
+            return (
+                "this daemon exposes a TCP control plane but has no "
+                "--weight-cache-seed-token configured, so it cannot "
+                "authenticate remote peers"
+            )
+        presented = req.get("token")
+        if not isinstance(presented, str) or not hmac.compare_digest(
+            presented, self.seed_token
+        ):
+            return "invalid or missing seed token"
+        if req.get("type") != "fetch_manifest":
+            # CUDA IPC handles are meaningful only within a node, and
+            # query_config leaks the model layout; the remote plane exists purely
+            # so another node can mirror our weights.
+            return (
+                f"request type {req.get('type')!r} is not served over the "
+                f"cross-node control plane; only fetch_manifest is"
+            )
+        return None
+
+    def _get_seed_source(self, backend: str):
+        """Seed sources are built once, on first use, and cached.
+
+        Standing one up can be expensive (the RDMA source registers every weight
+        buffer with the NIC), so a daemon nobody seeds from never pays for it.
+        """
+        source = self._seed_sources.get(backend)
+        if source is None:
+            source = get_seed_source(backend, **self._seed_source_kwargs_for(backend))
+            self._seed_sources[backend] = source
+        return source
+
+    def _seed_source_kwargs_for(self, backend: str) -> Dict[str, Any]:
+        if backend == RDMA_SEED_SOURCE:
+            # Reuse the HCA selection the rest of SGLang already exposes rather
+            # than adding a weight-cache-only copy of the same knob.
+            return {
+                "ib_device": (
+                    self.server_args.disaggregation_ib_device
+                    or self.server_args.mooncake_ib_device
+                )
+            }
+        return {}
+
+    def _handle_connection(self, conn: socket.socket, *, remote: bool = False):
+        """Handle a single client connection.
+
+        ``remote`` marks a connection from the cross-node TCP plane, which is
+        authenticated and restricted to seeding (see _authorize_remote).
+        """
         req = recv_msg(conn)
+
+        if remote:
+            denial = self._authorize_remote(req)
+            if denial is not None:
+                logger.warning(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] rejected remote "
+                    f"request: {denial}"
+                )
+                send_msg(conn, {"status": "error", "message": denial})
+                return
 
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
@@ -564,6 +980,50 @@ class WeightCacheDaemon:
                 pid=os.getpid(),
             )
 
+        elif req.get("type") == "fetch_manifest":
+            # A peer daemon wants to mirror our weights. Unlike fetch_state this
+            # has copy semantics: we describe every tensor we hold and publish
+            # whatever the requested mover needs, and the peer ends up owning its
+            # own memory. Note the manifest covers the full export set, including
+            # post-quant params and non-persistent buffers -- that is exactly what
+            # lets the mirror skip building a model.
+            backend = req.get("seed_backend") or PEER_IPC_SEED_SOURCE
+            try:
+                source = self._get_seed_source(backend)
+                if self._manifest is None:
+                    self._manifest = build_manifest(self.state_tensors)
+                seed_meta = source.prepare_seed(
+                    self.state_tensors,
+                    transport_entries=self.state_entries,
+                    gpu_id=self.gpu_id,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] Failed to prepare "
+                    f"seed via {backend}: {e}",
+                    exc_info=True,
+                )
+                send_msg(conn, {"status": "error", "message": str(e)})
+                return
+
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                f"Seeding {len(self._manifest)} tensors to a mirror daemon via "
+                f"{backend}"
+            )
+            send_msg(
+                conn,
+                {
+                    "status": "ok",
+                    "config": self.config.to_dict(),
+                    # The mirror checks this PID stayed alive across the copy:
+                    # our memory has to exist for the whole transfer.
+                    "pid": os.getpid(),
+                    "manifest": self._manifest,
+                    "seed": seed_meta,
+                },
+            )
+
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
 
@@ -580,10 +1040,17 @@ class WeightCacheDaemon:
         """Release GPU memory and clean up."""
         if dist.is_initialized():
             dist.destroy_process_group()
+        for source in self._seed_sources.values():
+            source.close()
+        self._seed_sources.clear()
         if self.model is not None:
             del self.model
             self.model = None
         self.state_entries.clear()
+        # On the mirror path this is the only reference to the weights, so it
+        # must be dropped for the memory to actually be released.
+        self.state_tensors.clear()
+        self._manifest = None
         current_platform.empty_cache()
         self._running = False
 
@@ -705,8 +1172,17 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
+            cleanup_stale_daemon_files(
+                compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                ),
+                force=force,
+            )
 
     procs = []
     for pp_rank in pp_rank_range:
@@ -738,8 +1214,15 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=server_args.base_gpu_id,
+                gpu_id_step=server_args.gpu_id_step,
+            )
+            ready_path = get_ready_path(gpu_id)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
                 if time.time() - start_time > timeout:
@@ -832,10 +1315,7 @@ if __name__ == "__main__":
             if daemon_args.tp_rank is not None
             else daemon_args.gpu_id
         )
-        cleanup_stale_daemon_files(
-            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
-            force=daemon_args.force,
-        )
+        cleanup_stale_daemon_files(gpu_id, force=daemon_args.force)
         run_weight_cache_daemon(
             server_args,
             gpu_id=gpu_id,
