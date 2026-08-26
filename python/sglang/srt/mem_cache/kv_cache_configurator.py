@@ -2741,6 +2741,17 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # Fixed system prompt (--system-prompt): warm requests (the steady
+        # state once the shared prefix is cached) reuse the cached boundary
+        # state and only hold a single running mamba slot — no ping-pong, no
+        # suffix tracking/donation (see is_system_prefix_warm). The rare cold
+        # request (warm-up pass / post-eviction) still needs extra slots, but
+        # those are throttled per-request at admission (_mamba_gap_budget_for_req
+        # and alloc_req_slots), so the global cap can use ratio 1 — matching
+        # the no-radix case but retaining prefix reuse.
+        if self.server_args.system_prompt:
+            return 1  # AFTER: ratio 1 (warm holds 1 running slot)
+
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
@@ -2813,6 +2824,17 @@ class KVCacheConfigurator:
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            # Fixed system prompt at ratio 1: warm requests each hold one
+            # running slot, but the shared boundary state also occupies a
+            # resident slot and transient COW/evict needs headroom. With
+            # ratio 1 the cap would otherwise equal the pool size (zero
+            # headroom), so the last running request's COW allocation fails
+            # (assert "Can not alloc mamba cache"). Reserve a couple of slots
+            # for the boundary state + evict headroom. No-op at ratio > 1
+            # (already over-reserved) and for the disable_radix_cache ratio-1
+            # path (no shared boundary state).
+            if ratio == 1 and self.server_args.system_prompt:
+                mamba_cap = max(1, mamba_cap - 2)
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(

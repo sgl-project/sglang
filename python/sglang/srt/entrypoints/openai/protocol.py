@@ -2316,6 +2316,9 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # Chunk-aligned length of the fixed system-prompt prefix; the scheduler
+    # stops mamba tracking at this boundary.
+    system_prefix_boundary: Optional[int] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

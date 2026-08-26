@@ -307,6 +307,11 @@ class GenerateReqInput:
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
+    # Token length at which the fixed system-prompt prefix ends (chunk-aligned).
+    # When set, the scheduler stops mamba/linear-attention tracking past this
+    # boundary so only the shared system-prefix state is cached. Only meaningful
+    # for hybrid SSM models with --system-prompt; None keeps default behavior.
+    system_prefix_boundary: Optional[int] = None
     # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
     # Used to route outputs back in multi-tokenizer mode.
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
@@ -1035,6 +1040,9 @@ class GenerateReqInput:
             require_reasoning=self.require_reasoning,
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
+            # Shared system-prefix boundary is identical for every parallel
+            # sample (the prefix is global), so propagate the scalar as-is.
+            system_prefix_boundary=self.system_prefix_boundary,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
@@ -1127,6 +1135,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routing_key: Optional[str] = None
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+
+    # Token length at which the fixed system-prompt prefix ends (chunk-aligned).
+    # Mirrors GenerateReqInput.system_prefix_boundary; see there for semantics.
+    system_prefix_boundary: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None

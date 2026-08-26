@@ -216,6 +216,9 @@ class SchedulePolicy:
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
+        # (Fixed-system-prompt warm/cold detection needs no match here: every
+        # admitted request is re-matched by init_next_round_input before any
+        # warm-detection consumer reads its fields.)
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
@@ -807,13 +810,40 @@ class PrefillAdder:
         request slot. Continuing chunks only need the request-state budget;
         their host-hit metadata may still describe an already consumed hit.
         Tracking buffers and radix CoW headroom are not included here.
+
+        Fixed system prompt: charge per-request actual allocation — 1 slot for
+        a warm request (running only, sentinel ping-pong) and the full
+        cold_factor (running + ping-pong) for a cold one — so a cold request is
+        not admitted on a single free slot and then crash-alloc 3.
         """
         if not self._mamba_slot_cost:
             return 0
         slots = int(not req.kv.holds_mamba)
-        if include_host_hit:
-            slots += req.mamba_host_hit_length
-        return slots * self._mamba_slot_cost
+        host_slots = req.mamba_host_hit_length if include_host_hit else 0
+        if slots == 0:
+            return host_slots * self._mamba_slot_cost
+        from sglang.srt.mem_cache.common import (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+        )
+        from sglang.srt.system_prompt import is_system_prefix_warm
+
+        req_pool = self.tree_cache.req_to_token_pool
+        cold_factor = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+            if req_pool.enable_mamba_extra_buffer_lazy
+            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        )
+        factor = (
+            1
+            if is_system_prefix_warm(
+                req.system_prefix_boundary,
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+            )
+            else cold_factor
+        )
+        return (slots * factor + host_slots) * self._mamba_slot_cost
 
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
