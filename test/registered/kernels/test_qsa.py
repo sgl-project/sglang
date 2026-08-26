@@ -1,5 +1,5 @@
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -42,6 +42,62 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+def test_qsa_trtllm_sparse_decode_is_enabled_on_sm120(monkeypatch):
+    resolver = qsa_backend_module._resolve_trtllm_sparse_decode
+    resolver.cache_clear()
+
+    trtllm_decode_func = object()
+    flashinfer_decode = ModuleType("flashinfer.decode")
+    flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
+
+    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: False)
+    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: True)
+    monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
+
+    try:
+        assert resolver() is trtllm_decode_func
+    finally:
+        resolver.cache_clear()
+
+
+def test_qsa_varlen_fallback_uses_sglang_fa4_on_sm120(monkeypatch):
+    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
+    resolver.cache_clear()
+
+    sglang_varlen_func = object()
+    classic_varlen_func = object()
+    sglang_fa4 = ModuleType("sglang.kernels.ops.attention.flash_attention_v4")
+    sglang_fa4.flash_attn_varlen_func = sglang_varlen_func
+    classic_fa = ModuleType("flash_attn")
+    classic_fa.flash_attn_varlen_func = classic_varlen_func
+
+    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: True)
+    monkeypatch.setitem(sys.modules, sglang_fa4.__name__, sglang_fa4)
+    monkeypatch.setitem(sys.modules, classic_fa.__name__, classic_fa)
+
+    try:
+        assert resolver() is sglang_varlen_func
+    finally:
+        resolver.cache_clear()
+
+
+def test_qsa_varlen_fallback_keeps_classic_fa_preference_off_sm120(monkeypatch):
+    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
+    resolver.cache_clear()
+
+    classic_varlen_func = object()
+    classic_fa = ModuleType("flash_attn")
+    classic_fa.flash_attn_varlen_func = classic_varlen_func
+
+    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: False)
+    monkeypatch.setitem(sys.modules, classic_fa.__name__, classic_fa)
+
+    try:
+        assert resolver() is classic_varlen_func
+    finally:
+        resolver.cache_clear()
 
 
 def test_qwen4_exp_indexer_config_is_read_from_text_config():
