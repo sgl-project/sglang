@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -13,15 +16,16 @@ logger = logging.getLogger(__name__)
 
 def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     """Apply speculative backend defaults for Kimi hybrid models."""
+    cfg = resolving_view(server_args)
     from sglang.srt.utils import is_sm100_supported
 
-    if server_args.speculative_algorithm is None:
+    if cfg.speculative_algorithm is None:
         return
 
     # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
-    if server_args.linear_attn_verify_backend is None:
+    if cfg.linear_attn_verify_backend is None:
         declare_resolution(
             server_args,
             "apply_kimi_k3_spec_backend_defaults",
@@ -36,8 +40,8 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     # dspark's draft is dense MQA; trtllm_mha avoids flashinfer's blocking
     # per-step host plan. DSPARK-only: other spec algos use MLA-family drafts.
     if (
-        server_args.speculative_algorithm == "DSPARK"
-        and server_args.speculative_draft_attention_backend is None
+        cfg.speculative_algorithm == "DSPARK"
+        and cfg.speculative_draft_attention_backend is None
         and is_sm100_supported()
     ):
         declare_resolution(
@@ -63,20 +67,21 @@ def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
     Gates on the arch itself: this runs from cuda-graph resolution, which is earlier
     than the model-specific hook block.
     """
+    cfg = resolving_view(server_args)
     from sglang.srt.connector import ConnectorType
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.utils import parse_connector_type
 
-    if not server_args.enable_symm_mem:
+    if not cfg.enable_symm_mem:
         return
-    if parse_connector_type(server_args.model_path) == ConnectorType.INSTANCE:
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
     if server_args.get_model_config().hf_config.architectures[0] not in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
     ):
         return
-    graph = server_args.cuda_graph_config
+    graph = cfg.cuda_graph_config
     if (
         graph.decode.backend == Backend.DISABLED
         and graph.prefill.backend == Backend.DISABLED
@@ -100,14 +105,15 @@ def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
 
 def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
     """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
+    cfg = resolving_view(server_args)
     from sglang.srt.utils import is_sm100_supported
 
     # Preempts the generic SM100+bf16 flashinfer switch (a GDN default): on
     # KDA shapes the triton packed decode measures ~35% faster than
     # recurrent_kda across bs 1-256, and ReplaySSM requires triton.
     if (
-        server_args.linear_attn_decode_backend is None
-        and server_args.mamba_ssm_dtype == "bfloat16"
+        cfg.linear_attn_decode_backend is None
+        and cfg.mamba_ssm_dtype == "bfloat16"
         and is_sm100_supported()
     ):
         declare_resolution(
