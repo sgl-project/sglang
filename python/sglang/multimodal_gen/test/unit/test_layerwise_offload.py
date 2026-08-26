@@ -229,6 +229,9 @@ def _server_args(**kwargs):
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,
+        model_path=None,
+        backend="sglang",
+        model_id=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)

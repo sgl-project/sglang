@@ -617,6 +617,10 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.vae_scale_factor = 32
+        server_args.pipeline_config.vae_config = SimpleNamespace(
+            use_temporal_scaling_frames=True,
+            arch_config=SimpleNamespace(temporal_compression_ratio=8),
+        )
         server_args.pipeline_config.adjust_num_frames.return_value = 25
         server_args.num_gpus = 2
 

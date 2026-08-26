@@ -201,7 +201,9 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
         11,
     )
     assert peaks["0:denoise:between"] == ((), 11)
-    assert peaks["request:cleanup:transformer"] == (("transformer",), 11)
+    # A non-preferred component is being released during cleanup, so it is no
+    # longer part of the placement that follows this transition.
+    assert peaks["request:cleanup:transformer"] == ((), 11)
     assert peaks["idle"] == ((), 3)
 
 

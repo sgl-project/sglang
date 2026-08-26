@@ -511,11 +511,16 @@ class TestPlanAutoResidency:
         assert plan.reserve_bytes == 14 * GIB_BYTES
 
     def test_partial_layer_residency_is_selected_when_full_dit_does_not_fit(self):
-        full = _candidate(
-            "transformer",
-            mode=LAYERWISE_OFFLOAD,
-            weight_gib=30,
-            h2d_gib=300,
+        full = PromotionCandidate(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            promoted_weight_bytes=30 * GIB_BYTES,
+            h2d_bytes_per_request=300 * GIB_BYTES,
+            target_layerwise_resident_layers=(30,),
+            target_layerwise_pinned_layers=((),),
+            permanent_residency=True,
+            active_device_delta_bytes=30 * GIB_BYTES,
+            inactive_device_delta_bytes=30 * GIB_BYTES,
         )
         partial = PromotionCandidate(
             component_name="transformer",
@@ -570,9 +575,11 @@ class TestPlanAutoResidency:
             ]
         )
 
+        # Plans are reported by benefit. apply_promotions independently sorts
+        # pin changes so the release still happens before the acquisition.
         assert [candidate.component_name for candidate in plan.promotions] == [
-            "cold_encoder",
             "hot_dit",
+            "cold_encoder",
         ]
         assert plan.resource_budget_bytes["hostpin:node0"] == 0
 
@@ -1147,18 +1154,23 @@ class TestApplyAndRollback:
                 raise AssertionError()
 
         args = _BrokenArgs()
+        failing_manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        failing_manager.fail_load = True
         candidates = [
             _candidate("text_encoder", weight_gib=1),
-            _candidate("missing_component", weight_gib=1),
+            _candidate("transformer", mode=LAYERWISE_OFFLOAD, weight_gib=1),
         ]
         with pytest.raises(AutoResidencyRollbackError) as exc_info:
             apply_promotions(
                 plan=_plan_for(candidates),
-                modules={"text_encoder": nn.Linear(2, 2)},
+                modules={
+                    "text_encoder": nn.Linear(2, 2),
+                    "transformer": _FakeLayerwiseDit([failing_manager]),
+                },
                 server_args=args,
             )
         assert "AssertionError" in str(exc_info.value)
-        assert "missing_component" in str(exc_info.value)
+        assert "CUDA out of memory" in str(exc_info.value)
 
     def test_rollback_keeps_going_past_a_broken_component(self):
         released: list[str] = []
@@ -1232,6 +1244,7 @@ class TestWarmupFrameAdjustment:
     def _server_args(self, *, bcg: bool = False, num_gpus: int = 1) -> SimpleNamespace:
         return SimpleNamespace(
             pipeline_config=LongLive2T2VConfig(),
+            pipeline_class_name=None,
             enable_breakable_cuda_graph=bcg,
             num_gpus=num_gpus,
         )
@@ -1277,6 +1290,7 @@ class TestWarmupFrameAdjustment:
                     arch_config=SimpleNamespace(temporal_compression_ratio=4),
                 ),
             ),
+            pipeline_class_name=None,
             enable_breakable_cuda_graph=False,
             num_gpus=2,
         )
