@@ -112,5 +112,38 @@ class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
     backend_cls = CuteDslMLABackend
 
 
+class TestDcpDecodeLayout(CustomTestCase):
+    """Rank-local length math the decode page table above is built from."""
+
+    SIZES = [1, 2, 3, 4, 8]
+    LENS = list(range(0, 41))
+
+    def test_ranks_partition_the_global_length(self):
+        lens = torch.tensor(self.LENS, dtype=torch.int32)
+        for n in self.SIZES:
+            total = sum(
+                get_dcp_lens(lens, n, rank).to(torch.int64) for rank in range(n)
+            )
+            self.assertTrue(
+                torch.equal(total, lens.to(torch.int64)),
+                f"per-rank lengths do not sum to the global length at n={n}",
+            )
+
+    def test_newest_token_is_owned_by_exactly_one_rank(self):
+        # A decode step appends one token; the cross-rank merge double counts
+        # or drops it unless exactly one rank sees its length grow.
+        for n in self.SIZES:
+            for global_len in self.LENS[1:]:
+                prev = torch.tensor([global_len - 1], dtype=torch.int32)
+                cur = torch.tensor([global_len], dtype=torch.int32)
+                grew = [
+                    int(get_dcp_lens(cur, n, rank).item())
+                    - int(get_dcp_lens(prev, n, rank).item())
+                    for rank in range(n)
+                ]
+                self.assertEqual(sum(grew), 1, f"n={n}, global_len={global_len}")
+                self.assertEqual(grew[(global_len - 1) % n], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
