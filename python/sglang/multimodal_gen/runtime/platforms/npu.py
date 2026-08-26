@@ -46,6 +46,9 @@ class NPUPlatformBase(Platform):
     def is_float64_supported(cls) -> bool:
         return False
 
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        return t.is_npu
+
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"npu:{envs.LOCAL_RANK}")
