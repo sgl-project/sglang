@@ -8,12 +8,12 @@ from typing import List, Optional, Tuple
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
@@ -288,7 +288,7 @@ class NightlyBenchmarkRunner:
         finally:
             # Always clean up server process
             if process is not None:
-                kill_process_tree(process.pid)
+                terminate_and_kill_process_tree(process)
 
     def _get_spec_accept_length(self) -> Optional[float]:
         """Query the server for avg_spec_accept_length metric.

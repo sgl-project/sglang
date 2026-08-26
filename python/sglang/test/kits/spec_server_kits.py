@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils.common import kill_process_tree
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -26,6 +25,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
     run_logprob_check,
+    terminate_and_kill_process_tree,
 )
 
 
@@ -173,7 +173,7 @@ class SpecParityKit:
                 p: _greedy(ref_url, p) for p in cls.parity_prompts
             }
         finally:
-            kill_process_tree(ref_proc.pid, wait_timeout=60)
+            terminate_and_kill_process_tree(ref_proc, wait_timeout=60)
         # Now the spec server (same port; ref is gone).
         super().setUpClass()
 

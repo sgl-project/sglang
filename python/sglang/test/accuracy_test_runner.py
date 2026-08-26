@@ -2,13 +2,13 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
@@ -164,7 +164,7 @@ def _run_simple_eval(
 
     finally:
         if process:
-            kill_process_tree(process.pid)
+            terminate_and_kill_process_tree(process)
 
 
 def run_accuracy_test(

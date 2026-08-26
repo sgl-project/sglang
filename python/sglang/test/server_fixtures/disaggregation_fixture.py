@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -19,6 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -217,7 +217,7 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Stop the watcher BEFORE killing processes: kill_process_tree
+        # Stop the watcher BEFORE killing processes: the teardown
         # below makes them exit with a negative signal rc, which would
         # otherwise trip the watcher and os._exit out of pytest mid-teardown.
         if cls._fail_fast_stop is not None:
@@ -228,7 +228,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 

@@ -297,7 +297,13 @@ def run_unittest_files(
                     break
 
             except TimeoutError:
-                kill_process_tree(process.pid)
+                # Reap this file's servers before the next file starts; a
+                # leftover still holding GPU memory fails that file's idle gate
+                # and reports the failure against it instead of against us.
+                try:
+                    kill_process_tree(process.pid, wait_timeout=60)
+                except RuntimeError as e:
+                    logger.warning(f"[CI] {filename} left processes behind: {e}")
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
