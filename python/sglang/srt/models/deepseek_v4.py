@@ -91,7 +91,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+    uses_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -3302,6 +3305,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
+            )
+        if get_parallel().moe_ep_size > 1 and not uses_per_rank_fused_shared_slots():
+            return (
+                "Expert parallelism keeps only a slice of the routed experts on "
+                "each rank, so the fused shared expert cannot be appended to the "
+                "routed weight tensor (only DeepEP/MegaMOE per-rank shared slots "
+                "support fusion under EP)."
             )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
