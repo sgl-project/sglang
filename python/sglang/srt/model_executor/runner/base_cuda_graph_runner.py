@@ -92,6 +92,24 @@ def get_batch_sizes_to_capture(
         # capture the real bs=1/15-row shape directly.
         if not draft_is_deepseek_v4(server_args=server_args):
             mul_base = 1
+    elif (
+        is_npu()
+        and model_runner.spec_algorithm.is_dspark()
+        and captured_req_width > 1
+    ):
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_parallel
+
+        fixed_width = int(envs.SGLANG_DSPARK_FIXED_VERIFY_LEN.get())
+        # Fixed verify replays the same width on every attention-DP rank,
+        # including idle ranks.  The gathered buffer therefore contains
+        # width * dp_size rows; allow bs=1 when that global shape already
+        # satisfies the attention-TP alignment.
+        if (
+            fixed_width == captured_req_width
+            and fixed_width * get_parallel().dp_size % mul_base == 0
+        ):
+            mul_base = 1
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
