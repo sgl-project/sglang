@@ -21,6 +21,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Qwen4ExpTextConfig,
     ZayaConfig,
 )
 
@@ -55,6 +56,7 @@ def hybrid_gdn_config(model_config: ModelConfig):
         Qwen3NextConfig
         | Qwen3_5Config
         | Qwen3_5MoeConfig
+        | Qwen4ExpTextConfig
         | InternS2PreviewConfig
         | JetNemotronConfig
         | JetVLMConfig,
