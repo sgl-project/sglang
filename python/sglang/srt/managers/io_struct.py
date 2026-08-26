@@ -2339,9 +2339,9 @@ class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
     lora_name: str
     # The PEFT adapter_config.json fields (r, lora_alpha, target_modules, ...).
     config_dict: Dict[str, Any]
-    # Registered adapters are pinned by default: they hold their pool slot so
-    # streamed in-place refreshes always target a resident slot.
-    pinned: bool = True
+    # Unpinned: the pool refills a registered adapter lazily from its CPU copy,
+    # and pinning every slot would trip the anti-starvation check.
+    pinned: bool = False
     lora_id: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
