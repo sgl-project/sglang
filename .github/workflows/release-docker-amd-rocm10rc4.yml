@@ -1,0 +1,103 @@
+name: Build ROCm 10.0.0 RC4 Docker Images (AMD)
+on:
+  workflow_dispatch:
+    inputs:
+      job_select:
+        description: 'Select which release job to run'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
+  # A new workflow cannot be dispatched until it exists on the default branch,
+  # so this temporary branch trigger builds the two validation images.
+  push:
+    branches:
+      - codex/rocm10-rc4-gfx942-950
+
+concurrency:
+  # Tags are date-based, so only the newest build for a ref may publish them.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Scratch registry for the ROCm 10 RC4 bring-up images.
+  IMAGE_REPO: bingxche/sgl-test
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm10rc4', 'gfx950-rocm10rc4']
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git describe to find tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Set Date"
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          # Get short commit hash of current HEAD
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+
+          # Compose pretend version for setuptools_scm: e.g., 0.5.8.post1.dev20260211+g1a2b3c4
+          PRETEND_VERSION="${VERSION}.dev${{ env.DATE }}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "pretend_version=${PRETEND_VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+
+      - name: Login to Docker Hub (test)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+
+      - name: Build and push to test registry
+        run: |
+          version=${{ steps.version.outputs.version }}
+          pretend_version=${{ steps.version.outputs.pretend_version }}
+          echo "Version: ${version}"
+          echo "Pretend version: ${pretend_version}"
+
+          case "${{ matrix.gpu_arch }}" in
+            gfx942-rocm10rc4) rocm_tag="rocm10rc4-mi30x" ;;
+            gfx950-rocm10rc4) rocm_tag="rocm10rc4-mi35x" ;;
+            *)
+              echo "Unsupported gfx arch"
+              exit 1
+              ;;
+          esac
+
+          tag=v${version}-${rocm_tag}
+
+          # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t ${IMAGE_REPO}:${tag}-${{ env.DATE }} --no-cache
+          docker push ${IMAGE_REPO}:${tag}-${{ env.DATE }}
