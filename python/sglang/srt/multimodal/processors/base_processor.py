@@ -37,7 +37,11 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    MmItemMemoryPool,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MmItemMemoryPool as CudaMmItemMemoryPool,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import get_mm
@@ -52,6 +56,9 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+)
+from sglang.srt.utils.npu_ipc_transport_utils import (
+    MmItemMemoryPool as NpuMmItemMemoryPool,
 )
 
 _is_cpu = is_cpu()
@@ -220,12 +227,13 @@ class BaseMultimodalProcessor(ABC):
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
+            if configured_mm_feature_transport
+            in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_device_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.use_ipc_pool_handle_cache = (
-            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+            self.use_device_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
         self.image_processor_backend = server_args.image_processor_backend
         if server_args.disable_fast_image_processor:
@@ -398,36 +406,50 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_device_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
+            from sglang.srt.utils import is_npu
+
+            device_type = "npu" if is_npu() else "cuda"
+            device_name = "NPU" if device_type == "npu" else "GPU"
             worker_num = self.server_args.tokenizer_worker_num
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
                 MM_FEATURE_CACHE_SIZE, worker_num
             )
             total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
-                "budget %.0f MiB).",
+                f"%s IPC multimodal feature pools reserve %.0f MiB total on "
+                f"%s %d (%.0f MiB per tokenizer worker × %d; configured "
+                f"budget %.0f MiB).",
+                device_name.upper(),
                 total_pool_size / (1024 * 1024),
+                device_name,
                 self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
-                self.server_args.tp_size,
-            )
+            if device_type == "npu":
+                self.cudaipc_mmfeature_pool = NpuMmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                    self.server_args.tp_size,
+                )
+            else:
+                self.cudaipc_mmfeature_pool = CudaMmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                    self.server_args.tp_size,
+                )
 
     @property
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -1502,8 +1524,8 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        """helper function to turn a tensor into a cuda-ipc or npu-ipc tensor"""
+        if not tensor.is_cuda and not tensor.is_npu:
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
@@ -1788,7 +1810,7 @@ class BaseMultimodalProcessor(ABC):
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
         """Wrap final GPU features for dispatch to the scheduler."""
-        if not self.use_cuda_ipc:
+        if not self.use_device_ipc:
             return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
