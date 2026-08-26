@@ -3709,7 +3709,7 @@ class ServerArgs:
         arrived by pickle and brought its declarations along, so the child has
         nothing left to derive and projects what the parent decided.
         """
-        if getattr(self, "_declarations_materialized", False):
+        if getattr(self, "_resolution_finished", False):
             return
         if getattr(self, "_resolution_failed", False):
             raise RuntimeError(
@@ -3721,23 +3721,22 @@ class ServerArgs:
         try:
             self._run_resolution_pipeline()
         except BaseException:
-            # The handlers that ran already wrote to the record, and they are
-            # not idempotent over their own output.
+            # The handlers that ran already declared, and they are not
+            # idempotent over their own output.
             object.__setattr__(self, "_resolution_failed", True)
             raise
         # Set here too, because the dummy/absent-model path returns before the
-        # materialization that normally sets it: the gate is about whether the
-        # handlers ran, not how far they got.
-        self._declarations_materialized = True
+        # end of the pipeline that normally sets it: the gate is about whether
+        # the handlers ran, not how far they got.
+        self._resolution_finished = True
 
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
 
         What the whole-object readbacks report (`/server_info` and its gRPC and
         in-process twins). `dataclasses.asdict(self)` reads the fields, which
-        carry resolution's result only while declarations materialize onto the
-        record; this reads the declarations, so it keeps answering with what
-        resolution decided once they stop. Nested dataclass fields are expanded
+        carry the raw input; this reads the declarations, so it answers with what
+        resolution decided. Nested dataclass fields are expanded
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
@@ -3750,12 +3749,11 @@ class ServerArgs:
 
         `dataclasses.replace` builds a new instance, so the copy carries none of
         what makes a record resolved: no raw snapshot, no declarations, no
-        materialization. The next publish therefore finds an unmaterialized
-        record and runs the pipeline over values it already decided -- DP
-        attention halves `chunked_prefill_size` a second time (8192 -> 4096 ->
-        2048) and the schedule conservativeness is scaled again (0.3 -> 0.09).
-        The Ray paths replace `dist_init_addr` on a resolved record, which is
-        how they hit it.
+        finished flag. The next publish therefore resolves it again, which
+        drops every decision the stash held -- the late ones (the auto-detected
+        parsers) and the direct ones alike -- and re-runs the device probes in
+        whatever process opened the copy. The Ray paths replace
+        `dist_init_addr` on a resolved record, which is how they reach this.
 
         The change is appended to the stash rather than left on the field: the
         projection reads the raw snapshot plus the declarations, so a field the
@@ -3770,7 +3768,7 @@ class ServerArgs:
         copy's deep structure in-process mutates the parent's too.
         """
         replacement = dataclasses.replace(self, **changes)
-        if not getattr(self, "_declarations_materialized", False):
+        if not getattr(self, "_resolution_finished", False):
             # Not resolved yet: the copy goes through the gate itself.
             return replacement
 
@@ -3780,7 +3778,7 @@ class ServerArgs:
         # (the read-only guard refuses the write).
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
-            if name in field_names or name == "_declarations_materialized":
+            if name in field_names or name == "_resolution_finished":
                 continue
             if isinstance(value, (dict, list, set)):
                 value = copy.copy(value)
@@ -3791,7 +3789,7 @@ class ServerArgs:
             object.__setattr__(replacement, "_resolved_overrides", stash)
         if changes:
             stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_declarations_materialized", True)
+        object.__setattr__(replacement, "_resolution_finished", True)
         return replacement
 
     def _declare(self, source: str, **fields: Any) -> None:
@@ -4022,13 +4020,7 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
-        # End of resolution: apply the accumulated declarations onto the
-        # fields once (gate order). From here on server_args carries the
-        # resolved configuration — post-init readers, in any process, read
-        # the fields directly.
-        from sglang.srt.arg_groups.overrides import materialize_declarations
-
-        materialize_declarations(self)
+        self._resolution_finished = True
 
     def _handle_return_hidden_states_mode(self):
         cfg = resolving_view(self)
@@ -9794,22 +9786,22 @@ class ServerArgs:
     def _late_resolution(self, source: str, **fields) -> None:
         """Resolve fields at the launcher's validation stage (pre-publish).
 
-        See ``arg_groups.overrides.declare_late_resolution``: in place, because
-        every holder of this instance must see the resolved value, and refused
-        outright once the config is published.
+        See ``arg_groups.overrides.declare_late_resolution``: the decision goes
+        to this instance's declaration stash, so every holder of it carries the
+        decision and publishes bags that answer with it. Refused outright once
+        the config is published.
         """
         from sglang.srt.arg_groups.overrides import declare_late_resolution
 
         declare_late_resolution(self, source, **fields)
 
     def __setattr__(self, name, value):
-        # After materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record that the config bags
-        # were projected from. Resolved config changes go to the bags via
+        # Once resolution has finished the record is the READ-ONLY raw input
+        # the config bags were projected from. Resolved config changes go to the bags via
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
         if (
-            getattr(self, "_declarations_materialized", False)
+            getattr(self, "_resolution_finished", False)
             and not getattr(self, "_internal_write", False)
             and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
@@ -9832,7 +9824,13 @@ class ServerArgs:
         return attention_backends_of(resolved_view(self))
 
     def get_attention_backends(self):
-        return attention_backends_of(self)
+        """The (prefill, decode) pair resolution decided.
+
+        Reads through the declaration stash, not the fields: the model-specific
+        overrides declare into the stash without writing the fields, so a field
+        read answers with what the operator typed.
+        """
+        return attention_backends_of(resolved_view(self))
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
@@ -9884,7 +9882,7 @@ class ServerArgs:
             # state needs steps + 1 draft-token slots. Revisit this if topk>1
             # is supported.
             result = max(candidate_steps) + 1
-        if getattr(self, "_declarations_materialized", False):
+        if getattr(self, "_resolution_finished", False):
             object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
         return result
 
@@ -9913,7 +9911,7 @@ class ServerArgs:
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
-            if not getattr(self, "_declarations_materialized", False):
+            if not getattr(self, "_resolution_finished", False):
                 return max(chunk_size, page_size)
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
@@ -10574,8 +10572,8 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": self.kv_event_block_size,
-            "dp_size": self.dp_size,
+            "block_size": resolved.kv_event_block_size,
+            "dp_size": resolved.dp_size,
         }
 
     def should_report_expert_balancedness(self) -> bool:
@@ -10593,12 +10591,19 @@ class ServerArgs:
         return cfg.expert_balancedness_report_mode in ("prometheus", "both")
 
 
-def compute_world_size(server_args: ServerArgs) -> int:
-    """Return the total GPU count across all data-parallel replicas."""
+def compute_world_size(config) -> int:
+    """Return the total GPU count across all data-parallel replicas.
+
+    Takes the resolved topology -- the published `parallel` bag, or a view over
+    the declarations. `enable_dp_attention` and `dp_size` are both resolution's
+    answers (`_handle_dwdp` fills the pair, DeepSeek MLA context parallelism
+    turns DP attention on), so a raw-record read would size the world from what
+    the operator typed.
+    """
     return (
-        (1 if server_args.enable_dp_attention else server_args.dp_size)
-        * server_args.tp_size
-        * server_args.pp_size
+        (1 if config.enable_dp_attention else config.dp_size)
+        * config.tp_size
+        * config.pp_size
     )
 
 

@@ -14,9 +14,13 @@
 """Declarative model-override registry.
 
 Model-identity adjustments to the server configuration are DECLARED here and
-materialized onto ``server_args`` at the end of ``__post_init__`` (gate
-order, last writer wins) — model code never mutates ``ServerArgs`` fields
-imperatively.
+appended to the record's declaration stash (gate order, last writer wins).
+Nothing here writes back onto ``ServerArgs``: the record holds the user's raw
+input, and a decision is read through ``resolution_result`` or the published
+config bags — model code never mutates ``ServerArgs`` fields imperatively. The
+one channel that still leaves a field changed is ``declare_direct_writes``,
+which does not perform the write: it captures one an out-of-tree plugin already
+made, and undoing it would surprise the plugin's own reads.
 
 Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
@@ -206,10 +210,8 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
     """What the declarations say so far, last writer wins.
 
-    Passes declare without touching the fields until
-    ``materialize_declarations``, so a mid-resolution reader needs this to see
-    them; handlers and hooks write as they declare, and for those the overlay
-    repeats what the field already holds."""
+    Nothing writes the fields, so a mid-resolution reader needs this to see a
+    decision at all; the fields keep what the caller supplied."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -222,9 +224,9 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     Evaluates the pass on the resolving state (a read-only view with the
     accumulated declarations overlaid from the stash) and appends its
     declaration to the stash. During ``__post_init__`` the fields stay
-    untouched — ``materialize_declarations`` applies the whole stash once at
-    the end of resolution; a pass invoked after materialization (a post-init
-    slot) writes through immediately.
+    untouched: the stash is what the config bags are projected from. A pass
+    invoked after resolution finished (a post-init slot) writes through
+    immediately, because there is no later projection to pick it up.
     """
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
@@ -244,7 +246,7 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             stash = server_args._resolved_overrides = []
         stash.append(entry)
         validate_declarations(server_args, [entry])
-        if getattr(server_args, "_declarations_materialized", False):
+        if getattr(server_args, "_resolution_finished", False):
             _apply_fields(server_args, declared)
 
 
@@ -260,29 +262,17 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """Record a resolution write in the declaration stash, and apply it now.
+    """Record a resolution write in the declaration stash.
 
-    The stash is what the projection reads, so a resolver that only assigns
-    the field leaves that write invisible to it. The immediate write keeps the
-    resolver's successors seeing the value where they read the field directly.
+    The stash *is* the resolution result: the bags are projected from it,
+    `resolution_result` answers from it, and no field is written. A resolver
+    reading a field another resolver may have decided must read `resolving_view`
+    (or `ServerArgs._resolved()`), which
+    `test_resolution_reads_the_declarations` pins.
 
-    What it does change is which writer wins. A declaration is appended and
-    replayed last, so a resolver that declares a field a *deferred* writer (a
-    post-process pass, a registry entry) also decides now beats it, where its
-    bare assignment used to be overwritten by that writer's declaration. A
-    resolver that gates on such a field has to read the resolving view rather
-    than the raw field, or it decides from a value that is already stale.
-
-    For resolvers inside ``__post_init__``: the handlers on ``ServerArgs``
-    (through ``self._declare``) and the ``arg_groups`` hooks and hardware
-    defaults they call. Resolution that has to wait for the launcher stage
-    goes through ``declare_late_resolution`` instead.
-
-    Names arrive as keyword arguments, which accept anything; a misspelled one
-    would otherwise become a new attribute that nothing ever reads, so it is
-    rejected here. This is not the model-override whitelist: that one limits
-    which fields a *registry entry* may reach, while a resolver writing the
-    field it owns is the pipeline resolving by construction.
+    For resolvers inside ``__post_init__``; launcher-stage resolution goes
+    through ``declare_late_resolution``. A name that is not a field is rejected
+    here rather than becoming an attribute nothing reads.
     """
     if dataclasses.is_dataclass(type(server_args)):
         unknown = sorted(set(fields) - field_names(type(server_args)))
@@ -293,8 +283,6 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
         stash = []
         object.__setattr__(server_args, "_resolved_overrides", stash)
     stash.append((source, dict(fields)))
-    for name, value in fields.items():
-        setattr(server_args, name, value)
 
 
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -304,10 +292,10 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     normalization and the auto-parser detection need the launcher's validation
     stage (and, for the parsers, a tokenizer / chat-template load). They still
     belong to the resolution pipeline — they decide what the process will run
-    with — so they write the fields in place, before anything publishes the
-    object. Writing in place is the point: every holder of that instance (the
-    HTTP server, the multi-tokenizer workers it serializes for, the schedulers
-    it forks) must see the resolved value.
+    with — so their decision goes to the stash like any other, and the record
+    keeps what the caller passed. Every holder of that instance reads the
+    decision the same way the rest of the pipeline does: the bags it publishes,
+    or ``resolution_result``, both of which survive the pickle to a child.
 
     Refuses to touch the published instance: after publish the bags exist and a
     field write would desync them, which is what ``get_context().override`` is
@@ -334,7 +322,6 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
         stash = []
         object.__setattr__(server_args, "_resolved_overrides", stash)
     stash.append((source, dict(fields)))
-    _apply_fields(server_args, fields)
 
 
 def declare_direct_writes(
@@ -348,7 +335,10 @@ def declare_direct_writes(
     Out-of-tree platform plugins are handed the record and set fields on it.
     Their implementations live outside this tree, so they cannot be converted
     by editing the resolver; and the raw snapshot is taken before the pipeline
-    starts, so a plugin's default is neither declared nor raw.
+    starts, so a plugin's default is neither declared nor raw. The write itself
+    stays: this captures it into the stash so the projection and the bags carry
+    it, but reverting the field would break the plugin's own reads of what it
+    just set. It is the only field a record still carries from resolution.
 
     Rebinding is what the diff sees, and rebinding is all it needs to see: a
     plugin that mutates a value in place reaches the projection anyway, because
@@ -384,24 +374,12 @@ def declare_direct_writes(
     return result
 
 
-def materialize_declarations(server_args: Any) -> None:
-    """Apply the accumulated declarations onto ``server_args`` once, at the
-    end of ``__post_init__`` (gate order: last writer wins). After this the
-    fields carry the resolved configuration — every post-init reader, in any
-    process, reads them directly; ``resolved_view`` remains an internal
-    helper for mid-resolution code only."""
-    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
-        for field, value in declared.items():
-            setattr(server_args, field, value)
-    server_args._declarations_materialized = True
-
-
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     """What resolution decided for ``field``: the declaration if there is one,
     otherwise what the caller supplied.
 
     This is what the config projection reads. Reading the field instead would
-    work only for as long as declarations materialize onto the record -- and
+    work whatever the caller passed onto the record -- and
     the point of declaring is that they will not, so the projection must not
     depend on it. A config that never ran the pipeline (a mock, a partial
     fixture) carries no raw snapshot; its fields are all it has.
@@ -422,9 +400,8 @@ def resolution_projection(server_args: Any) -> Dict[str, Any]:
 
     The whole-object shape of ``resolution_result``, for the exits that hand out
     the entire configuration (``/server_info``, the gRPC and engine readbacks).
-    They used ``dataclasses.asdict``, which reads the fields -- correct only for
-    as long as declarations materialize onto the record, and the point of
-    declaring is that they will not. Field values only: the private resolution
+    They used ``dataclasses.asdict``, which reads the fields -- the operator's
+    input, not what resolution decided. Field values only: the private resolution
     bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
     the readback are not configuration.
     """
@@ -453,10 +430,14 @@ def _plain(value: Any) -> Any:
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
-    """Read-only view of the resolving configuration for mid-resolution code
-    that is not a pass (``__post_init__`` handlers and hooks). Internal to
-    the resolution pipeline: after ``materialize_declarations`` runs, the
-    fields themselves carry the resolved values — read them directly."""
+    """Read-only view of the resolving configuration: the declarations
+    overlaid on the fields, snapshotted per call.
+
+    For mid-resolution code that is not a pass (``__post_init__`` handlers and
+    hooks), and for the record's own members that must answer with what
+    resolution decided -- a declaration-only resolver (a model-specific
+    override, a registry entry) never writes the field, so a field read there
+    answers with the raw input."""
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
