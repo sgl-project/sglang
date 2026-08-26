@@ -244,6 +244,55 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     assert strategy.prepare_for_use.call_count == 2
 
 
+def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    encoder_use = ComponentUse("encode", "text_encoder")
+    transformer_use = ComponentUse("denoise", "transformer", memory_intensive=True)
+    encode_stage = _Stage(encoder_use)
+    denoise_stage = _Stage(transformer_use)
+    modules = {
+        "text_encoder": torch.nn.Linear(2, 2),
+        "transformer": torch.nn.Linear(2, 2),
+    }
+    pipeline = SimpleNamespace(
+        modules=modules,
+        _stage_name_mapping={
+            "encode": encode_stage,
+            "denoise": denoise_stage,
+        },
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = True
+    manager.strategy_for = Mock(return_value=strategy)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request(
+        [encode_stage, denoise_stage],
+        SimpleNamespace(is_warmup=True),
+        server_args,
+    )
+
+    manager.before_stage(encode_stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager.begin_stage()
+    manager.end_stage()
+    manager.before_stage(denoise_stage, 1, SimpleNamespace(is_warmup=True), server_args)
+
+    assert manager._warmup_phase_peaks[
+        "0:encode:prefetch:transformer"
+    ] == WarmupPhasePeak(("transformer",), 7)
+    assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
+
+
 def test_warmup_splits_sequential_component_transition(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,

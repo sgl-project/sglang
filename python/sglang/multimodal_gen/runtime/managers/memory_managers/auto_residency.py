@@ -755,10 +755,9 @@ def collect_promotion_candidates(
                 )
 
         full_resident_layers = tuple(manager.num_layers for manager in managers)
-        # Fully resident layers never read their host stores. On one worker we
-        # can release those pins and reuse the allowance. Multi-worker pin
-        # migration needs a node-coordinated host-RAM scratch budget because
-        # repacking briefly holds both the old and new layer buffers.
+        # Fully resident layers never read their host stores, so their pins can
+        # be released and reused. Every worker plans against its non-overlapping
+        # HostPin and transition-headroom share before repacking concurrently.
         permanent_pin_targets = [current_pinned_layers]
         if allow_host_pin_reallocation:
             permanent_pin_targets.append(tuple(() for _ in managers))
@@ -989,18 +988,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         for candidate in candidates
     )
     if has_hostpin_options:
-        if len(reports) != 1:
-            return _skip_plan("dynamic HostPin placement requires a single-worker node")
-        report = reports[0]
-        resource_budgets[f"hostpin:node{report.node_rank}"] = (
-            report.host_pin_capacity_bytes - report.pinned_host_bytes
-        )
-        resource_budgets[f"hostram:node{report.node_rank}:unpin"] = (
-            report.host_transition_headroom_bytes
-        )
-        resource_budgets[f"hostram:node{report.node_rank}:pin"] = (
-            report.host_transition_headroom_bytes
-        )
+        for report in reports:
+            prefix = f"node{report.node_rank}:rank{report.rank}"
+            resource_budgets[f"hostpin:{prefix}"] = (
+                report.host_pin_capacity_bytes - report.pinned_host_bytes
+            )
+            resource_budgets[f"hostram:{prefix}:unpin"] = (
+                report.host_transition_headroom_bytes
+            )
+            resource_budgets[f"hostram:{prefix}:pin"] = (
+                report.host_transition_headroom_bytes
+            )
 
     candidate_by_key = {candidate.option_key(): candidate for candidate in candidates}
     report_candidates = [
@@ -1022,15 +1020,16 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 )
                 resource_deltas[resource_name] = phase_cost
             if has_hostpin_options:
-                host_resource = f"hostpin:node{report.node_rank}"
+                prefix = f"node{report.node_rank}:rank{report.rank}"
+                host_resource = f"hostpin:{prefix}"
                 resource_deltas[host_resource] = (
                     resource_deltas.get(host_resource, 0)
                     + rank_candidate.pinned_host_delta_bytes
                 )
-                resource_deltas[f"hostram:node{report.node_rank}:unpin"] = (
+                resource_deltas[f"hostram:{prefix}:unpin"] = (
                     rank_candidate.host_unpin_scratch_bytes
                 )
-                resource_deltas[f"hostram:node{report.node_rank}:pin"] = (
+                resource_deltas[f"hostram:{prefix}:pin"] = (
                     rank_candidate.host_pin_scratch_bytes
                 )
         options.append(

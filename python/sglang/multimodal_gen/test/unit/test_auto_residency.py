@@ -674,9 +674,9 @@ class TestPlanAutoResidency:
             "hot_dit",
             "cold_encoder",
         ]
-        assert plan.resource_budget_bytes["hostpin:node0"] == 0
+        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 0
 
-    def test_dynamic_hostpin_is_not_planned_across_workers(self):
+    def test_dynamic_hostpin_is_constrained_for_every_worker(self):
         pin_more = PromotionCandidate(
             component_name="transformer",
             residency_mode=LAYERWISE_OFFLOAD,
@@ -701,10 +701,11 @@ class TestPlanAutoResidency:
             ]
         )
 
-        assert plan.promotions == []
-        assert plan.skip_reason == (
-            "dynamic HostPin placement requires a single-worker node"
-        )
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            "transformer"
+        ]
+        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 20 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostpin:node0:rank1"] == 20 * GIB_BYTES
 
     def test_hostpin_repack_must_fit_transition_headroom(self):
         pin_more = PromotionCandidate(
@@ -728,7 +729,7 @@ class TestPlanAutoResidency:
         )
 
         assert plan.promotions == []
-        assert plan.resource_budget_bytes["hostram:node0:pin"] == 5 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostram:node0:rank0:pin"] == 5 * GIB_BYTES
 
 
 class _FakeLayerwiseManager:

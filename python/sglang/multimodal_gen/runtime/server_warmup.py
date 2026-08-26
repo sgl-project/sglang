@@ -128,10 +128,9 @@ async def maybe_apply_auto_residency(
     """Promote implicitly offloaded components after warmup, then re-warm.
 
     Runs between the synthetic warmup and the ready signal, so the residency
-    is frozen before ``/health`` turns 200. If a promotion (or the
-    post-promotion re-warmup) fails, the workers roll back and startup
-    continues on the original strategy; only a failed rollback raises, which
-    aborts startup.
+    is frozen before ``/health`` turns 200. If a promotion (or its calibration)
+    fails, the workers roll back that round and retain the last calibrated
+    placement; only a failed rollback raises and aborts startup.
     """
     from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
         AutoResidencyReq,
@@ -157,40 +156,12 @@ async def maybe_apply_auto_residency(
     # Same fail-open contract as the warmup itself: implicit warmups must
     # never abort startup, explicit --warmup-resolutions ones must succeed.
     fail_open = server_args.warmup_resolutions is None
-    try:
-        response = await forward(AutoResidencyReq(action="apply"))
-    except Exception as e:
-        if not fail_open:
-            raise
-        logger.warning(
-            "Auto residency apply request failed; continuing on the original "
-            "strategy: %s",
-            e,
-        )
-        return
-    status = _auto_residency_status(response)
-    if status == PROMOTION_STATUS_ROLLBACK_FAILED:
-        raise RuntimeError(f"auto residency rollback failed: {response.error}")
-    if response.error is not None:
-        logger.warning(
-            "Auto residency promotion not applied; continuing on the original "
-            "strategy: %s",
-            response.error,
-        )
-        return
-    if status != PROMOTION_STATUS_PROMOTED:
-        return
+    promoted_any = False
 
-    # Re-run the synthetic warmup under the final residency: it physically
-    # moves promoted components, rebuilds compile caches invalidated by the
-    # placement change, and proves the promoted layout fits before ready.
-    try:
-        await run_async_client_warmup(
-            server_args, forward, fail_open=False, rewarm=True
-        )
-    except Exception as e:
+    async def rollback_and_rewarm(error: Exception) -> None:
         logger.warning(
-            "Post-promotion re-warmup failed (%s); rolling back auto residency", e
+            "Post-promotion calibration failed (%s); rolling back auto residency",
+            error,
         )
         rollback = await forward(AutoResidencyReq(action="rollback"))
         if (
@@ -199,18 +170,76 @@ async def maybe_apply_auto_residency(
         ):
             raise RuntimeError(
                 f"auto residency rollback failed: {rollback.error}"
-            ) from e
-        # restore warm caches for the original strategy before turning ready,
-        # keeping the caller's fail-open contract
+            ) from error
+        # Restore warm caches for the previous calibrated placement before
+        # turning ready, keeping the caller's fail-open contract.
         await run_async_client_warmup(
             server_args, forward, fail_open=fail_open, rewarm=True
         )
+
+    for _ in range(MAX_AUTO_RESIDENCY_ROUNDS):
+        try:
+            response = await forward(AutoResidencyReq(action="apply"))
+        except Exception as e:
+            if promoted_any:
+                # The worker-side apply is transactional, but an RPC failure
+                # does not tell us whether its response was lost after commit.
+                # Do not mistake the last validated round for an unvalidated
+                # one and roll it back; abort startup rather than serve a
+                # placement whose calibration state is unknown.
+                raise RuntimeError(
+                    "auto residency apply failed after a calibrated promotion"
+                ) from e
+            if not fail_open:
+                raise
+            logger.warning(
+                "Auto residency apply request failed; continuing on the original "
+                "strategy: %s",
+                e,
+            )
+            return
+        status = _auto_residency_status(response)
+        if status == PROMOTION_STATUS_ROLLBACK_FAILED:
+            raise RuntimeError(f"auto residency rollback failed: {response.error}")
+        if response.error is not None:
+            retained = (
+                "the last calibrated placement"
+                if promoted_any
+                else "the original strategy"
+            )
+            logger.warning(
+                "Auto residency promotion not applied; continuing on %s: %s",
+                retained,
+                response.error,
+            )
+            return
+        if status != PROMOTION_STATUS_PROMOTED:
+            return
+
+        promoted_any = True
+        # This pass physically realizes the selected placement and measures
+        # phases that overlap under it. The next round can then use that new
+        # evidence instead of permanently charging components twice.
+        try:
+            await run_async_client_warmup(
+                server_args, forward, fail_open=False, rewarm=True
+            )
+        except Exception as e:
+            await rollback_and_rewarm(e)
+            return
+
+    logger.warning(
+        "Auto residency stopped after %d promotion rounds; keeping the last "
+        "successfully calibrated placement.",
+        MAX_AUTO_RESIDENCY_ROUNDS,
+    )
 
 
 # Enough to clear a probe that overshot the card, few enough that a failure
 # which is not about probe size gives up quickly instead of walking the
 # workload down to nothing.
 MAX_WARMUP_DEGRADE_ATTEMPTS = 3
+MAX_AUTO_RESIDENCY_ROUNDS = 8
 
 
 def _is_out_of_memory(error: Any) -> bool:

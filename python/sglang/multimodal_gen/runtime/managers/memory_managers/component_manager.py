@@ -509,8 +509,11 @@ class ComponentResidencyManager:
 
         self._uses_seen[use.component_name] = use
         self._modules_seen[use.component_name] = module
+        self._begin_warmup_prefetch(use)
         if strategy.prefetch_for_use(module, use, self.state):
             self._prefetched_use_keys.add(self._use_key(use))
+        else:
+            self._begin_warmup_between_uses()
 
     def _finish_use(
         self,
@@ -620,6 +623,13 @@ class ComponentResidencyManager:
             components=self._warmup_active_components(),
         )
 
+    def _begin_warmup_prefetch(self, use: ComponentUse) -> None:
+        phase = use.phase or use.component_name
+        self._begin_warmup_phase(
+            key=f"{self.state.stage_index}:{self.state.stage_name}:prefetch:{phase}",
+            components=self._warmup_active_components((use,)),
+        )
+
     def _warmup_active_components(
         self, active_uses: Sequence[ComponentUse] = ()
     ) -> tuple[str, ...]:
@@ -660,6 +670,15 @@ class ComponentResidencyManager:
         peaks = self._completed_warmup_phase_peaks
         self._completed_warmup_phase_peaks = {}
         return peaks
+
+    def current_device_components(self) -> tuple[str, ...]:
+        """Components whose complete module is currently on the device.
+
+        Dormant layerwise-managed modules are excluded because only their
+        resident window is present. Active layerwise uses are attributed by
+        the managed phase timeline instead.
+        """
+        return self._warmup_active_components()
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)

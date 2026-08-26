@@ -198,6 +198,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # the auto-residency promotion decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._auto_residency_applied: list[AppliedPromotion] = []
+        self._auto_residency_round_sizes: list[int] = []
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
@@ -700,11 +701,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
+        untracked_active_components: tuple[str, ...] = ()
         residency_manager = peek_global_component_residency_manager()
         if residency_manager is not None:
             for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
                 phase_allocated_peaks[phase_name] = peak.allocated_bytes
                 phase_components[phase_name] = peak.active_components
+            untracked_active_components = residency_manager.current_device_components()
         request_allocated_peak = max(
             int(torch.get_device_module().max_memory_allocated()),
             max(phase_allocated_peaks.values(), default=0),
@@ -715,7 +718,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # A reserved-only increase is reclaimable allocator cache, not a
             # second live placement, and is covered by the explicit reserve.
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
-            phase_components["request:untracked"] = ()
+            phase_components["request:untracked"] = untracked_active_components
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
                 width=int(req.width or 0),
@@ -1180,25 +1183,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return can_stay_resident
 
     def apply_auto_residency(self) -> OutputBatch:
-        """Apply the warmup-calibrated residency promotion on this replica.
+        """Apply one warmup-calibrated residency promotion round.
 
         Every rank executes this handler at the same queue position; the plan
         is computed from all-gathered rank reports so each rank reaches the
-        same decision. A failure on any rank rolls every rank back to the
-        original strategy.
+        same decision. Post-promotion warmup can expose more safe headroom, so
+        the server may call this again with measurements from the new layout.
+        A failure on any rank rolls every rank back to the previously
+        calibrated placement.
 
         Everything before the first all-gather is fenced into a skip report:
         an uncaught raise there would leave the peer ranks parked in the
         collective until the group timeout.
         """
-        if self._auto_residency_applied:
-            # one-shot per process: records measured after a promotion
-            # describe the promoted layout, not the startup strategy
-            return OutputBatch(output={"status": PROMOTION_STATUS_SKIPPED})
-
         records = list(self._auto_residency_warmup_records)
-        # consumed exactly once; the post-promotion re-warm appends fresh
-        # records that must not feed a later decision
+        # Each round must describe one placement. Intersecting phase ownership
+        # across old and newly promoted layouts would double-count weights that
+        # are already resident in the new layout.
         self._auto_residency_warmup_records.clear()
 
         try:
@@ -1236,12 +1237,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         apply_error: str | None = None
         local_rollback_failed = False
+        # Keep round history aligned across ranks. A zero entry means this
+        # rank's transactional apply failed before committing the round, so a
+        # peer-triggered rollback must leave earlier calibrated rounds alone.
+        self._auto_residency_round_sizes.append(0)
         try:
-            self._auto_residency_applied = apply_promotions(
+            newly_applied = apply_promotions(
                 plan=plan,
                 modules=self.pipeline.modules,
                 server_args=self.server_args,
             )
+            if not newly_applied:
+                raise RuntimeError("promotion plan applied no residency changes")
+            self._auto_residency_applied.extend(newly_applied)
+            self._auto_residency_round_sizes[-1] = len(newly_applied)
         except AutoResidencyRollbackError as e:
             logger.error(
                 "Auto residency promotion failed on rank %d and the rank "
@@ -1250,7 +1259,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 e,
                 exc_info=True,
             )
-            self._auto_residency_applied = []
             apply_error = describe_error(e)
             local_rollback_failed = True
         except Exception as e:  # this rank already rolled itself back
@@ -1260,7 +1268,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 e,
                 exc_info=True,
             )
-            self._auto_residency_applied = []
             apply_error = describe_error(e)
 
         gathered = self._auto_residency_all_gather((apply_error, local_rollback_failed))
@@ -1268,7 +1275,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         any_rollback_failed = any(failed for _, failed in gathered)
         if rank_errors:
             return self._rollback_everywhere(
-                cause=rank_errors[0], already_failed=any_rollback_failed
+                cause=rank_errors[0],
+                already_failed=any_rollback_failed,
+                latest_round_only=True,
             )
 
         self._invalidate_component_strategies(
@@ -1282,11 +1291,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
 
     def rollback_auto_residency(self) -> OutputBatch:
-        """Restore the pre-promotion residency (post-promotion re-warm failed)."""
-        return self._rollback_everywhere(cause=None, already_failed=False)
+        """Undo the latest promotion round after its calibration failed."""
+        return self._rollback_everywhere(
+            cause=None, already_failed=False, latest_round_only=True
+        )
 
     def _rollback_everywhere(
-        self, *, cause: str | None, already_failed: bool
+        self,
+        *,
+        cause: str | None,
+        already_failed: bool,
+        latest_round_only: bool = False,
     ) -> OutputBatch:
         """Roll this rank back and gather the replica-wide outcome.
 
@@ -1296,7 +1311,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         rollback, which is fatal regardless of what the remaining ranks do.
         Collective-symmetric: every rank gathers exactly once.
         """
-        rollback_error = self._rollback_applied_promotions()
+        rollback_error = self._rollback_applied_promotions(
+            latest_round_only=latest_round_only
+        )
         gathered = self._auto_residency_all_gather(rollback_error)
         rank_errors = [error for error in gathered if error is not None]
         if already_failed and not rank_errors:
@@ -1312,19 +1329,29 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 output={"status": PROMOTION_STATUS_ROLLBACK_FAILED},
             )
         if cause is not None:
+            restored = (
+                "previously calibrated placement"
+                if self._auto_residency_applied
+                else "original strategy"
+            )
             return OutputBatch(
                 error=(
-                    "auto residency promotion failed; original strategy "
-                    f"restored: {cause}"
+                    f"auto residency promotion failed; {restored} restored: {cause}"
                 ),
                 output={"status": PROMOTION_STATUS_ROLLED_BACK},
             )
         if self.is_output_rank:
-            logger.info(
-                "Auto residency: rolled back; the residency configured at "
-                "startup is in effect again (no equivalent server-arg "
-                "changes remain)."
-            )
+            if self._auto_residency_applied:
+                logger.info(
+                    "Auto residency: rolled back the latest promotion round; "
+                    "the previously calibrated placement remains active."
+                )
+            else:
+                logger.info(
+                    "Auto residency: rolled back; the residency configured at "
+                    "startup is in effect again (no equivalent server-arg "
+                    "changes remain)."
+                )
         return OutputBatch(output={"status": PROMOTION_STATUS_ROLLED_BACK})
 
     def _build_auto_residency_report(
@@ -1384,13 +1411,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         budget_bytes = int(free_bytes) + int(
             torch.get_device_module().memory_reserved()
         )
+        test_cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
+        if test_cap_gib is not None:
+            budget_bytes = min(budget_bytes, int(test_cap_gib * GIB_BYTES))
         candidates = collect_promotion_candidates(
             modules=self.pipeline.modules,
             residency_mode_of=self.server_args.residency_mode,
             explicit_residency_mode_of=self.server_args.explicit_residency_mode,
             custom_strategy_names=self.pipeline.component_residency_strategies,
             num_inference_steps=workload.num_inference_steps,
-            allow_host_pin_reallocation=self.server_args.num_gpus == 1,
+            allow_host_pin_reallocation=True,
+        )
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
         )
         return RankResidencyReport(
             rank=self.rank,
@@ -1405,7 +1438,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             host_transition_headroom_bytes=max(
                 0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
-            ),
+            )
+            // local_worker_count,
             candidates=candidates,
             skip_reason=skip_reason,
         )
@@ -1420,10 +1454,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return gathered
 
-    def _rollback_applied_promotions(self) -> str | None:
-        if not self._auto_residency_applied:
-            return None
-        applied = self._auto_residency_applied
+    def _rollback_applied_promotions(
+        self, *, latest_round_only: bool = False
+    ) -> str | None:
+        if latest_round_only:
+            if not self._auto_residency_round_sizes:
+                return None
+            round_size = self._auto_residency_round_sizes[-1]
+            if round_size == 0:
+                self._auto_residency_round_sizes.pop()
+                return None
+            if round_size > len(self._auto_residency_applied):
+                return "auto residency round history is inconsistent"
+            applied = self._auto_residency_applied[-round_size:]
+        else:
+            if not self._auto_residency_applied:
+                self._auto_residency_round_sizes = []
+                return None
+            applied = self._auto_residency_applied
         try:
             rollback_promotions(
                 applied=applied,
@@ -1441,7 +1489,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._invalidate_component_strategies(
             [promotion.component_name for promotion in applied]
         )
-        self._auto_residency_applied = []
+        if latest_round_only and self._auto_residency_round_sizes:
+            del self._auto_residency_applied[-len(applied) :]
+            self._auto_residency_round_sizes.pop()
+        else:
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
         return None
 
     @staticmethod

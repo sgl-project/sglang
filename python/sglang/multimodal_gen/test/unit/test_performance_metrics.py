@@ -8,6 +8,7 @@ import torch
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    GIB_BYTES,
     DefaultWorkload,
     WarmupMemoryRecord,
 )
@@ -104,6 +105,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     residency_manager.take_warmup_phase_peaks.return_value = {
         "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
+    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
@@ -126,7 +128,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
     assert record.phase_peak_allocated_bytes["request:untracked"] == 9
-    assert record.phase_active_components["request:untracked"] == ()
+    assert record.phase_active_components["request:untracked"] == ("transformer",)
 
 
 def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
@@ -136,6 +138,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     residency_manager.take_warmup_phase_peaks.return_value = {
         "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
+    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
     device_module.max_memory_reserved.return_value = 12
@@ -173,6 +176,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     )
     worker.server_args = SimpleNamespace(
         num_gpus=1,
+        nnodes=1,
         node_rank=0,
         residency_mode=lambda _name: "resident",
         explicit_residency_mode=lambda _name: None,
@@ -202,6 +206,52 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         )
 
     assert report.skip_reason is None
+
+
+def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.rank = 0
+    worker.pipeline = SimpleNamespace(
+        modules={"transformer": torch.nn.Linear(1, 1)},
+        component_residency_strategies={},
+    )
+    worker.server_args = SimpleNamespace(
+        num_gpus=1,
+        nnodes=1,
+        node_rank=0,
+        residency_mode=lambda _name: "resident",
+        explicit_residency_mode=lambda _name: None,
+    )
+    device_module = Mock()
+    device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)
+    device_module.memory_reserved.return_value = 2 * GIB_BYTES
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB",
+        80,
+    )
+
+    with patch.object(torch, "get_device_module", return_value=device_module):
+        report = worker._build_auto_residency_report(
+            workload=DefaultWorkload(
+                width=64,
+                height=64,
+                num_frames=1,
+                num_inference_steps=1,
+            ),
+            records=[
+                WarmupMemoryRecord(
+                    width=64,
+                    height=64,
+                    num_frames=1,
+                    baseline_allocated_bytes=1,
+                    peak_allocated_bytes=2,
+                    succeeded=True,
+                )
+            ],
+        )
+
+    assert report.budget_bytes == 80 * GIB_BYTES
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
