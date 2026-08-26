@@ -65,8 +65,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     Phase,
+    decode_capture_sizes,
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
+    prefill_capture_sizes,
     with_phase,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -4208,11 +4210,7 @@ class ServerArgs:
                         16384,
                     )
                     if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                        prefill_config.bs = (
-                            self._generate_prefill_cuda_graph_batch_sizes(
-                                prefill_config.max_bs
-                            )
-                        )
+                        prefill_config.bs = prefill_capture_sizes(prefill_config.max_bs)
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
@@ -4885,7 +4883,7 @@ class ServerArgs:
             if bs is None:
                 # 2048 = documented prefill default; max_bs unresolved here.
                 max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
-                bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+                bs = prefill_capture_sizes(max_bs)
             aligned = sorted({((b + 7) // 8) * 8 for b in bs})
             if aligned != sorted(bs):
                 logger.info(
@@ -5404,10 +5402,10 @@ class ServerArgs:
         # Set cuda graph batch sizes
         if cfg.device != "cpu":
             if decode_cuda_graph_config.bs is None:
-                decode_cuda_graph_config.bs = (
-                    self._generate_decode_cuda_graph_batch_sizes(
-                        decode_cuda_graph_config.max_bs
-                    )
+                decode_cuda_graph_config.bs = decode_capture_sizes(
+                    decode_cuda_graph_config.max_bs,
+                    disable_padding=cfg.disable_cuda_graph_padding,
+                    speculative=cfg.speculative_algorithm is not None,
                 )
             else:
                 decode_cuda_graph_config.max_bs = max(decode_cuda_graph_config.bs)
@@ -5457,10 +5455,8 @@ class ServerArgs:
                 )
 
         if prefill_cuda_graph_config.bs is None:
-            prefill_cuda_graph_config.bs = (
-                self._generate_prefill_cuda_graph_batch_sizes(
-                    prefill_cuda_graph_config.max_bs
-                )
+            prefill_cuda_graph_config.bs = prefill_capture_sizes(
+                prefill_cuda_graph_config.max_bs
             )
 
         if cuda_graph_config != cfg.cuda_graph_config:
@@ -5658,40 +5654,6 @@ class ServerArgs:
             return 2 * 1024
         return 0.0
 
-    def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
-        """
-        Generate the list of batch sizes for CUDA graph capture based on max_bs.
-        This integrates the logic from cuda_graph_runner.py.
-        """
-        cfg = resolving_view(self)
-        # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
-        if cfg.disable_cuda_graph_padding:
-            capture_bs = list(range(1, max_bs + 1))
-        elif cfg.speculative_algorithm is None:
-            # Normal case:
-            capture_bs = (
-                [1, 2, 4, 8, 12]
-                + list(range(16, 257, 8))
-                + list(range(272, 512, 16))
-                + list(range(512, max_bs + 1, 32))
-            )
-        else:
-            # Spec decoding case: less padding for smaller batch sizes
-            capture_bs = (
-                list(range(1, 9, 1))
-                + list(range(10, 33, 2))
-                + list(range(40, 65, 4))
-                + list(range(72, 257, 8))
-                + list(range(272, max_bs + 1, 16))
-            )
-
-        capture_bs = [bs for bs in capture_bs if bs <= max_bs]
-
-        if max_bs not in capture_bs:
-            capture_bs.append(max_bs)
-
-        return capture_bs
-
     def _generate_cpu_graph_batch_sizes(self):
         """
         Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
@@ -5712,25 +5674,6 @@ class ServerArgs:
         capture_bs = [bs for bs in capture_bs if bs <= cfg.torch_compile_max_bs]
 
         return capture_bs
-
-    def _generate_prefill_cuda_graph_batch_sizes(self, max_bs: int):
-        """
-        Generate the list of batch sizes for prefill CUDA graph capture
-        based on max_bs. For tc_piecewise prefill, bs carries the
-        captured token count (one shape knob per phase).
-        """
-        capture_sizes = (
-            list(range(4, 33, 4))
-            + list(range(48, 257, 16))
-            + list(range(288, 513, 32))
-            + list(range(576, 1024 + 1, 64))
-            + list(range(1280, 4096 + 1, 256))
-            + list(range(4608, max_bs + 1, 512))
-        )
-
-        capture_sizes = [s for s in capture_sizes if s <= max_bs]
-
-        return capture_sizes
 
     def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -7387,9 +7330,7 @@ class ServerArgs:
             ):
                 prefill_cfg.max_bs = cfg.chunked_prefill_size
                 if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
-                        prefill_cfg.max_bs
-                    )
+                    prefill_cfg.bs = prefill_capture_sizes(prefill_cfg.max_bs)
 
         # Resolve the phase-aware TP LM-head default before validating the
         # resulting DP/TP LM-head configuration.

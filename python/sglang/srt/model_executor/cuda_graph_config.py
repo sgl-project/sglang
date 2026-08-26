@@ -119,6 +119,55 @@ def default_prefill_backend() -> str:
     return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
 
 
+def decode_capture_sizes(
+    max_bs: int, *, disable_padding: bool, speculative: bool
+) -> list:
+    """Decode batch sizes to capture, up to and including ``max_bs``.
+
+    Without padding every batch size needs its own graph. Speculative decoding
+    pads in finer steps at the small end, where a padded batch wastes a larger
+    fraction of the verify work.
+    """
+    if disable_padding:
+        sizes = list(range(1, max_bs + 1))
+    elif not speculative:
+        sizes = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + list(range(512, max_bs + 1, 32))
+        )
+    else:
+        sizes = (
+            list(range(1, 9, 1))
+            + list(range(10, 33, 2))
+            + list(range(40, 65, 4))
+            + list(range(72, 257, 8))
+            + list(range(272, max_bs + 1, 16))
+        )
+    sizes = [bs for bs in sizes if bs <= max_bs]
+    if max_bs not in sizes:
+        sizes.append(max_bs)
+    return sizes
+
+
+def prefill_capture_sizes(max_bs: int) -> list:
+    """Prefill shapes to capture, up to and including ``max_bs``.
+
+    For a tc_piecewise prefill these are token counts rather than request
+    counts -- one shape knob per phase.
+    """
+    sizes = (
+        list(range(4, 33, 4))
+        + list(range(48, 257, 16))
+        + list(range(288, 513, 32))
+        + list(range(576, 1024 + 1, 64))
+        + list(range(1280, 4096 + 1, 256))
+        + list(range(4608, max_bs + 1, 512))
+    )
+    return [s for s in sizes if s <= max_bs]
+
+
 def with_phase(config: "CudaGraphConfig", phase: str, **changes) -> "CudaGraphConfig":
     """A copy of ``config`` with ``changes`` applied to one phase.
 
