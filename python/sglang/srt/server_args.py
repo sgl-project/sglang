@@ -125,6 +125,12 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "presharded",
     "gguf",
+    # Experimental and intentionally narrow: expert_pack is validated only for
+    # DeepSeek-V4-Flash-0731 MXFP4 GGUF (MXFP4 experts, FP8 dense weights)
+    # and KIMI-K3-MXP4-DERISKED-Q2_K-*.gguf (Q2_K gate/up, Q3_K down weights):
+    # https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF
+    # https://huggingface.co/Blackfrost-AI/KIMI-K3-Q2_K-GGUF-ABLITERATED
+    "expert_pack",
     "bitsandbytes",
     "mistral",
     "layered",
@@ -573,6 +579,9 @@ class ServerArgs:
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
+            '"expert_pack" is experimental and loads only the validated '
+            "DeepSeek-V4-Flash-0731 MXFP4 or text-only Kimi-K3 Q2_K GGUF "
+            "model with routed experts stored in an SSD expert pack. "
             '"bitsandbytes" will load the weights using bitsandbytes '
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
@@ -2249,7 +2258,10 @@ class ServerArgs:
     ] = "prefill"
     speculative_draft_attention_backend: A[
         Optional[str],
-        "Attention backend for speculative decoding drafting.",
+        Arg(
+            help="Attention backend for speculative decoding drafting.",
+            resolvable=True,
+        ),
         NS("spec"),
     ] = None
     speculative_draft_kv_cache_dtype: A[
@@ -3835,6 +3847,11 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        # expert_pack may replace a raw GGUF input with its generated local
+        # model metadata before any model-specific handler calls get_model_config.
+        # It also establishes eager-only invariants before CUDA graph parsing.
+        self._handle_expert_pack()
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
@@ -6069,14 +6086,6 @@ class ServerArgs:
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            # Quantization / MoE runner / attention backend defaults moved to
-            # the override registry (arg_groups/overrides.py:
-            # _nemotron_h_overrides).
-            assert resolved_view(self).attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
-            )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -8084,6 +8093,11 @@ class ServerArgs:
                     speculative_draft_model_path=resolved_draft,
                 )
 
+    def _handle_expert_pack(self):
+        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
+
+        handle_expert_pack(self)
+
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
         # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
@@ -9638,22 +9652,26 @@ class ServerArgs:
 
         memo = getattr(self, "model_config", None)
         if memo is not None:
-            # A configuration built before resolution describes the path the
-            # caller typed; the GGUF and ModelScope handlers declare a
-            # different `model_path`, and every later decision keyed on the
-            # architecture would read the wrong contents. Only a real
-            # `ModelConfig` is checked -- a fixture's stand-in stays untouched.
-            if not (
-                isinstance(memo, ModelConfig) and memo.model_path != self.model_path
-            ):
+            # The key is the path this record carried when the cache was
+            # filled. The GGUF and ModelScope handlers declare a different
+            # `model_path`, and a configuration built before them describes
+            # another checkpoint. `ModelConfig` re-points its own `model_path`
+            # at the local pull directory when the weights sit behind an
+            # object-store URI, so its field is not the key. A configuration a
+            # fixture supplied carries no key and is handed back as it is.
+            built_from = getattr(self, "_model_config_built_from", None)
+            if built_from is None or built_from == self.model_path:
                 return memo
-        self.model_config = ModelConfig.from_server_args(self)
-        if self.model_config.is_hybrid_swa:
+
+        model_config = ModelConfig.from_server_args(self)
+        self.model_config = model_config
+        self._model_config_built_from = self.model_path
+        if model_config.is_hybrid_swa:
             logger.info(
                 "Hybrid SWA model detected. architectures=%s",
-                self.model_config.hf_config.architectures,
+                model_config.hf_config.architectures,
             )
-        return self.model_config
+        return model_config
 
     def _resolved(self):
         """Read-only view of the resolving configuration: declared fields
@@ -9681,6 +9699,7 @@ class ServerArgs:
         if (
             getattr(self, "_declarations_materialized", False)
             and not getattr(self, "_internal_write", False)
+            and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
@@ -10476,6 +10495,14 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
+# Caches, which the read-only guard lets through: a value the record derived
+# from itself is not resolved configuration, and a key that can invalidate on a
+# resolved record needs the refill to be storable there. Only the public-named
+# ones are listed -- a cache key spelled with a leading underscore is already
+# exempt.
+_CACHE_SLOTS = frozenset({"model_config"})
+
+
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
@@ -10487,8 +10514,8 @@ def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.
 
     The read-only guard exempts underscore names because they are the record's
-    own bookkeeping (the stash, the flags, the memoized model config). A *field*
-    that happens to start with an underscore is still resolved configuration --
+    own bookkeeping (the stash, the flags, the cache keys). A *field* that
+    happens to start with an underscore is still resolved configuration --
     `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
     by spelling would leave exactly one leaf writable on a read-only record.
     """
