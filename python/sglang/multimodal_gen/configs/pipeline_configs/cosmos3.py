@@ -24,6 +24,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+# On SM120, cuDNN SDPA wins for Edge video shapes at 4,725+ query tokens,
+# while the 1,344-token shape regresses and the 2,352-token shape is neutral.
+COSMOS3_EDGE_SM120_CUDNN_SDPA_MIN_QUERY_LEN = 4096
 
 
 @functools.lru_cache(maxsize=None)
@@ -145,6 +148,9 @@ class Cosmos3Config(PipelineConfig):
         if self.model_path:
             self.distilled_sigmas = get_distilled_sigmas(self.model_path)
             self.is_edge = is_edge_checkpoint(self.model_path)
+            self.dit_config.cudnn_sdpa_min_query_len_on_sm120 = (
+                COSMOS3_EDGE_SM120_CUDNN_SDPA_MIN_QUERY_LEN if self.is_edge else None
+            )
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 

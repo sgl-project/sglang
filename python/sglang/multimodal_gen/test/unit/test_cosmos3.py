@@ -10,9 +10,13 @@ from unittest import mock
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
+    Cosmos3VideoConfig,
     _build_cosmos3_param_names_mapping,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+    COSMOS3_EDGE_SM120_CUDNN_SDPA_MIN_QUERY_LEN,
+    Cosmos3Config,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -45,10 +49,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     DomainAwareLinear,
+    _resolve_cosmos3_cudnn_sdpa_min_query_len,
+    _should_use_cosmos3_cudnn_sdpa,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3ImagePreprocessStage,
@@ -291,6 +298,120 @@ class TestCosmos3AdjustNumFrames(unittest.TestCase):
     def test_minimum_video_frame_count(self):
         # 2 frames: (2-1)=1, 1//4=0, 0*4+1=1 → rounds to 1, but 1 is T2I — still valid
         self.assertEqual(self.cfg.adjust_num_frames(2), 1)
+
+
+class TestCosmos3EdgeSM120CudnnSDPA(unittest.TestCase):
+    def test_edge_checkpoint_sets_long_query_threshold(self):
+        cfg = Cosmos3Config()
+        cfg.model_path = "unused"
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "PipelineConfig.update_config_from_dict"
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "get_distilled_sigmas",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "is_edge_checkpoint",
+                return_value=True,
+            ),
+        ):
+            cfg.update_config_from_dict({})
+
+        self.assertEqual(
+            cfg.dit_config.cudnn_sdpa_min_query_len_on_sm120,
+            COSMOS3_EDGE_SM120_CUDNN_SDPA_MIN_QUERY_LEN,
+        )
+
+    def test_non_edge_checkpoint_leaves_threshold_disabled(self):
+        cfg = Cosmos3Config()
+        cfg.model_path = "unused"
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "PipelineConfig.update_config_from_dict"
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "get_distilled_sigmas",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.cosmos3."
+                "is_edge_checkpoint",
+                return_value=False,
+            ),
+        ):
+            cfg.update_config_from_dict({})
+
+        self.assertIsNone(cfg.dit_config.cudnn_sdpa_min_query_len_on_sm120)
+
+    def test_runtime_gate_requires_default_eager_single_gpu_sm120(self):
+        cfg = Cosmos3VideoConfig(cudnn_sdpa_min_query_len_on_sm120=4096)
+        kwargs = {
+            "is_sm120": True,
+            "attention_backend": None,
+            "forced_attention_backend": None,
+            "enable_torch_compile": False,
+            "sp_size": 1,
+        }
+        self.assertEqual(_resolve_cosmos3_cudnn_sdpa_min_query_len(cfg, **kwargs), 4096)
+
+        disabled_overrides = (
+            {"is_sm120": False},
+            {"attention_backend": "torch_sdpa"},
+            {"forced_attention_backend": AttentionBackendEnum.TORCH_SDPA},
+            {"enable_torch_compile": True},
+            {"sp_size": 2},
+        )
+        for override in disabled_overrides:
+            with self.subTest(override=override):
+                self.assertIsNone(
+                    _resolve_cosmos3_cudnn_sdpa_min_query_len(
+                        cfg, **(kwargs | override)
+                    )
+                )
+
+    def test_only_long_cuda_torch_sdpa_queries_use_cudnn(self):
+        query = types.SimpleNamespace(
+            device=types.SimpleNamespace(type="cuda"), shape=(1, 4096, 16, 128)
+        )
+        kwargs = {
+            "min_query_len": 4096,
+            "attention_backend": AttentionBackendEnum.TORCH_SDPA,
+        }
+        with mock.patch.object(torch.compiler, "is_compiling", return_value=False):
+            self.assertTrue(_should_use_cosmos3_cudnn_sdpa(query, **kwargs))
+            query.shape = (1, 4095, 16, 128)
+            self.assertFalse(_should_use_cosmos3_cudnn_sdpa(query, **kwargs))
+            query.shape = (1, 8190, 16, 128)
+            query.device.type = "cpu"
+            self.assertFalse(_should_use_cosmos3_cudnn_sdpa(query, **kwargs))
+
+    def test_compilation_and_non_sdpa_backend_bypass_cudnn(self):
+        query = types.SimpleNamespace(
+            device=types.SimpleNamespace(type="cuda"), shape=(1, 8190, 16, 128)
+        )
+        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertFalse(
+                _should_use_cosmos3_cudnn_sdpa(
+                    query,
+                    min_query_len=4096,
+                    attention_backend=AttentionBackendEnum.TORCH_SDPA,
+                )
+            )
+        with mock.patch.object(torch.compiler, "is_compiling", return_value=False):
+            self.assertFalse(
+                _should_use_cosmos3_cudnn_sdpa(
+                    query,
+                    min_query_len=4096,
+                    attention_backend=AttentionBackendEnum.FA,
+                )
+            )
 
 
 class TestCosmos3SchedulerConfig(unittest.TestCase):

@@ -224,3 +224,4 @@ class Cosmos3VideoConfig(DiTConfig):
 
     arch_config: DiTArchConfig = field(default_factory=Cosmos3VideoArchConfig)
     prefix: str = "Cosmos3"
+    cudnn_sdpa_min_query_len_on_sm120: int | None = None

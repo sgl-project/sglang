@@ -13,6 +13,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
@@ -28,6 +29,10 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
@@ -55,7 +60,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -64,6 +73,43 @@ logger = init_logger(__name__)
 
 def is_cosmos_layer(name: str, _module: object) -> bool:
     return is_module_list_entry_in(name, ("layers", "gen_layers"))
+
+
+def _resolve_cosmos3_cudnn_sdpa_min_query_len(
+    config: Cosmos3VideoConfig,
+    *,
+    is_sm120: bool,
+    attention_backend: str | None,
+    forced_attention_backend: AttentionBackendEnum | None,
+    enable_torch_compile: bool,
+    sp_size: int,
+) -> int | None:
+    min_query_len = config.cudnn_sdpa_min_query_len_on_sm120
+    if (
+        min_query_len is None
+        or not is_sm120
+        or attention_backend is not None
+        or forced_attention_backend is not None
+        or enable_torch_compile
+        or sp_size != 1
+    ):
+        return None
+    return min_query_len
+
+
+def _should_use_cosmos3_cudnn_sdpa(
+    query: torch.Tensor,
+    *,
+    min_query_len: int | None,
+    attention_backend: AttentionBackendEnum,
+) -> bool:
+    return (
+        min_query_len is not None
+        and query.shape[1] >= min_query_len
+        and not torch.compiler.is_compiling()
+        and attention_backend == AttentionBackendEnum.TORCH_SDPA
+        and query.device.type == "cuda"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -754,6 +800,7 @@ class Cosmos3CrossAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
+        use_cudnn_sdpa: bool,
         round_norm_before_rope: bool = False,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
@@ -764,6 +811,7 @@ class Cosmos3CrossAttention(nn.Module):
             v_und: [B, S_und, H_kv_local, D] UND values (replicated over SP)
             cos_sin_cache: [B*S_gen_local, D] local rows of [cos, sin]
             rope_cache_positions: identity row positions into cos_sin_cache
+            use_cudnn_sdpa: Whether to force cuDNN for this attention call
         """
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
@@ -822,7 +870,11 @@ class Cosmos3CrossAttention(nn.Module):
                 rope_cache_positions,
                 round_norm_before_rope=round_norm_before_rope,
             )
-            out = self.attn.forward(q, packed_k, packed_v)
+            if use_cudnn_sdpa:
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    out = self.attn.forward(q, packed_k, packed_v)
+            else:
+                out = self.attn.forward(q, packed_k, packed_v)
         elif use_fused_qk_norm_rope:
             q, k = _apply_qwen3_qk_norm_rope(
                 q,
@@ -841,7 +893,13 @@ class Cosmos3CrossAttention(nn.Module):
         if not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
             # USPAttention applies the configured backend and SP collectives.
-            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+            if use_cudnn_sdpa:
+                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                    out = self.attn.forward_with_replicated_kv_prefix(
+                        q, k_und, v_und, k, v
+                    )
+            else:
+                out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -972,6 +1030,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
+        use_cudnn_sdpa: bool,
         round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -992,6 +1051,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             cos_sin_cache,
             rope_cache_positions,
             use_fused_qk_norm_rope,
+            use_cudnn_sdpa,
             round_norm_before_rope,
         )
 
@@ -1158,6 +1218,19 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             logger.info(
                 f"Cosmos3 SP enabled: sp_size={self.sp_size}, sp_rank={self.sp_rank}"
             )
+
+        server_args = get_global_server_args()
+        forced_attention_backend = (
+            get_global_forced_attn_backend() or get_component_forced_attn_backend()
+        )
+        self.cudnn_sdpa_min_query_len = _resolve_cosmos3_cudnn_sdpa_min_query_len(
+            config,
+            is_sm120=current_platform.is_sm120(),
+            attention_backend=server_args.attention_backend,
+            forced_attention_backend=forced_attention_backend,
+            enable_torch_compile=server_args.enable_torch_compile,
+            sp_size=self.sp_size,
+        )
 
         # Language model (UND pathway)
         self.language_model = Cosmos3LanguageModel(
@@ -1680,6 +1753,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 pack_kv=True,
             )
         )
+        use_cudnn_sdpa = T > 1 and _should_use_cosmos3_cudnn_sdpa(
+            hidden_gen,
+            min_query_len=self.cudnn_sdpa_min_query_len,
+            attention_backend=self.gen_layers[0].cross_attention.attn.backend,
+        )
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
@@ -1689,6 +1767,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 cos_sin_gen,
                 gen_rope_cache_positions,
                 use_fused_qk_norm_rope,
+                use_cudnn_sdpa,
                 round_norm_before_rope,
                 residual=residual,
             )
