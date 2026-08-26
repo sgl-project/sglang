@@ -10,6 +10,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils.common import is_hip
+
 try:
     import flashinfer.comm  # noqa: F401
 except ImportError:
@@ -356,10 +358,14 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # The validated MMA layout requires N (the Q-head dimension) to be a
-    # multiple of eight. Zero-padding preserves the weight-free head sum.
+    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
+    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
     query_heads, head_dim = q.shape[1:]
-    kernel_heads = max(8, ((query_heads + 7) // 8) * 8)
+    head_alignment = 16 if is_hip() else 8
+    kernel_heads = max(
+        head_alignment,
+        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
+    )
     q_kernel = q.to(torch.bfloat16)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(

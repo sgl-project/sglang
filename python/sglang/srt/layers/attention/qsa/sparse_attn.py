@@ -309,6 +309,60 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     return out
 
 
+def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    """Run one packed sparse-attention row per request without a host sync.
+
+    Decode and speculative-verify already compact the selected K/V rows into
+    contiguous request segments.  This wrapper reuses the chunk-prefill
+    kernel with a fixed query length of one, avoiding the ``.item()`` needed
+    to derive ``max_q`` in the general chunk-prefill interface during graph
+    capture.
+    """
+
+    k, v = k.contiguous(), v.contiguous()
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty_like(q)
+    _sparse_gqa_chunk_prefill[(1, (cu_q.shape[0] - 1) * num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
 @triton.jit
 def _fa2_valid_counts(
     seq_lens,
@@ -453,4 +507,5 @@ __all__ = [
     "qwen_sparse_kv_extraction_compact_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
+    "sparse_gqa_packed_decode_triton",
 ]

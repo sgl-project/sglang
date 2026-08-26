@@ -22,6 +22,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_hip
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
@@ -330,6 +331,18 @@ class QSAIndexer(MultiPlatformOp):
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
+            if is_hip():
+                # The device-side write plan pads its capacity with no-op
+                # entries targeting the reserved compressed slot 0.  A short
+                # ROCm extend (for example, one MTP token) can have fewer
+                # source rows than ``compress_ratio``; make those padded
+                # gathers read row 0 instead of launching an out-of-bounds
+                # advanced-indexing kernel.  Real writes never target slot 0.
+                group_locs = torch.where(
+                    (compressed_locs != 0)[:, None],
+                    group_locs,
+                    torch.zeros_like(group_locs),
+                )
             source_keys = token_k
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:

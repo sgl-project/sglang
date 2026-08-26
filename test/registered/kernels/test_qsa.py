@@ -24,17 +24,22 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_decode,
     qsa_mqa_prefill,
+    torch_qsa_mqa_decode,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.layers.attention.qsa.sparse_attn import (
+    sparse_gqa_packed_decode_triton,
+)
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-large-amd")
 
 COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
@@ -1282,7 +1287,7 @@ def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
                 rope_rows=rope.numel(),
             )
         ),
-        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens: (
+        select_decode_tokens=lambda q, cache, table, lengths, max_len, positions, seqlens, **kwargs: (
             calls.update(q_rows=q.shape[0], positions=positions.tolist())
             or q.squeeze(1)
         ),
@@ -1426,7 +1431,7 @@ class _DispatchIndexer:
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args):
+    def select_decode_tokens(self, *args, **kwargs):
         self.selected = "decode"
         return torch.tensor([2])
 
@@ -1504,6 +1509,50 @@ def test_qsa_average_pool_matches_training_reference():
     expected = token_keys.reshape(2, 4, 1, 128).mean(dim=1)
     actual = average_pool_qsa_keys(token_keys.to(torch.bfloat16).reshape(2, 4, 1, 128))
     torch.testing.assert_close(actual.float(), expected, rtol=0, atol=2)
+
+
+def test_qsa_rocm_short_extend_uses_safe_rows_for_padded_compression(monkeypatch):
+    """A padded no-op plan must not gather past a one-token ROCm extend."""
+
+    monkeypatch.setattr(qsa_indexer_module, "is_hip", lambda: True)
+
+    class Pool:
+        def set_qsa_compressed_k_buffer(self, layer_id, locs, values):
+            self.layer_id = layer_id
+            self.locs = locs.clone()
+            self.values = values.clone()
+
+    pool = Pool()
+    indexer = SimpleNamespace(
+        layer_id=7,
+        compress_ratio=COMPRESS_RATIO,
+        _use_fused_compress=lambda pool: False,
+        _rope_from_matrix=lambda positions: positions[:, 0],
+        normalize_compressed_keys=lambda values, positions: values,
+    )
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        is_cuda_graph=False,
+        write_locs=torch.tensor([0], dtype=torch.int32),
+        compress_group_positions=torch.tensor([3]),
+        compress_sequence_ids=torch.tensor([0]),
+        compress_member_rows=torch.tensor([0]),
+        extend_rope_matrix=torch.zeros(1, 3, dtype=torch.long),
+    )
+    token_k = torch.arange(128, dtype=torch.bfloat16).reshape(1, 1, 128)
+
+    QSAIndexer.update_key_state_and_compress(
+        indexer,
+        token_k,
+        logical_positions=torch.tensor([0]),
+        rope_positions=torch.tensor([0]),
+        metadata=metadata,
+        state_stored=True,
+    )
+
+    assert pool.layer_id == 7
+    assert pool.locs.tolist() == [0]
+    torch.testing.assert_close(pool.values, token_k)
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
@@ -1709,6 +1758,71 @@ def test_qsa_decode_mqa_reads_paged_cache():
     positions = torch.arange(192).unsqueeze(0)
     expected.masked_fill_(positions >= context_lens[:, None], -float("inf"))
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qsa_decode_mqa_four_heads_gpu():
+    """The released Qwen3.8 indexer shape must compile on CUDA and ROCm."""
+
+    torch.manual_seed(7)
+    q = torch.randn(2, 4, 128, dtype=torch.bfloat16, device="cuda")
+    cache = torch.randn(8, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
+    page_table = torch.tensor([[3, 1, 5], [4, 2, 0]], dtype=torch.int32, device="cuda")
+    context_lens = torch.tensor([130, 67], dtype=torch.int32, device="cuda")
+
+    actual = qsa_mqa_decode(
+        q,
+        cache,
+        page_table,
+        context_lens,
+        max_model_len=192,
+    )
+    expected = torch_qsa_mqa_decode(
+        q,
+        cache,
+        page_table,
+        context_lens,
+        max_model_len=192,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qsa_packed_decode_triton_matches_reference():
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch, num_q_heads, num_kv_heads, head_dim = 2, 4, 2, 128
+    lengths = torch.tensor([5, 3], dtype=torch.int32, device=device)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, 5, 8], dtype=torch.int32, device=device)
+    q = torch.randn(batch, num_q_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(8, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn_like(k)
+    indices = torch.arange(8, dtype=torch.int32, device=device).expand(batch, -1)
+    indices = indices.masked_fill(indices >= lengths[:, None], -1).contiguous()
+    scale = head_dim**-0.5
+
+    actual = sparse_gqa_packed_decode_triton(
+        q, k, v, indices, cu_q, cu_k, lengths, scale
+    )
+    expected = torch.empty_like(q)
+    group_size = num_q_heads // num_kv_heads
+    offsets = [0, 5, 8]
+    for batch_idx, length in enumerate(lengths.tolist()):
+        key = k[offsets[batch_idx] : offsets[batch_idx + 1]]
+        value = v[offsets[batch_idx] : offsets[batch_idx + 1]]
+        for head in range(num_q_heads):
+            kv_head = head // group_size
+            scores = torch.matmul(
+                q[batch_idx, head].float(), key[:length, kv_head].float().T
+            )
+            probs = torch.softmax(scores * scale, dim=-1)
+            expected[batch_idx, head] = torch.matmul(
+                probs, value[:length, kv_head].float()
+            ).to(dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 def test_qsa_sparse_attention_matches_explicit_gqa():
