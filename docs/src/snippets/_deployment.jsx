@@ -671,12 +671,19 @@ export const Deployment = ({ config, benchmarks }) => {
     // Overlay dims ride along: they never key cells, so snapping must not drop
     // them (it did — a strict-mode hash round-trip lost the spec default).
     // Keep the parsed value when it names a real option, else the row default.
+    // A hash can also name an option that showWhen hides (or a rule disables)
+    // for the composed selection; snap those like an interactive reseat would.
     for (const spec of overlayDimSpecs) {
       const want = parsed[spec.id];
       const opts = spec.options || [];
-      valid[spec.id] = opts.some((o) => o.id === want)
+      const picked = opts.some((o) => o.id === want)
         ? want
         : spec.default ?? (opts[0] && opts[0].id) ?? "";
+      const withPick = { ...valid, [spec.id]: picked };
+      const usable = visibleOptions(spec, withPick).filter((o) => !optionDisabled(o, withPick));
+      valid[spec.id] = usable.some((o) => o.id === picked)
+        ? picked
+        : (usable[0] && usable[0].id) ?? picked;
     }
     return valid;
   };
@@ -2488,8 +2495,15 @@ export const Deployment = ({ config, benchmarks }) => {
       {modal === "bench" && benchEntry && (() => {
         const bc = buildBenchCommands(benchEntry, sel);
         if (!bc) return null;
-        const selSummary =
-          `${sel.hw.toUpperCase()} · ${sel.variant} · ${sel.quant.toUpperCase()} · ${sel.strategy} · ${sel.nodes}`;
+        const selSummary = [
+          sel.hw && sel.hw.toUpperCase(),
+          sel.variant,
+          sel.quant && sel.quant.toUpperCase(),
+          sel.strategy,
+          sel.nodes,
+        ]
+          .filter((part) => part !== undefined && part !== null && part !== "")
+          .join(" · ");
         let selConc = null;
         let speedCmd = null;
         if (bc.speed) {

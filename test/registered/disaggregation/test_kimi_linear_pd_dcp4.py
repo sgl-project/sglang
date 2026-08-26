@@ -58,8 +58,21 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Mooncake >=0.3.13 (kvcache-ai/Mooncake#2974) bounds TCP admission per
+        # peer and hard-fails the overflow instead of applying backpressure.
+        # This test's TP4/EP4 -> TP4/DCP4 fan-out blows past the 1024 + 1024
+        # defaults on hosts that fall back to TCP, killing every KV transfer.
+        # Set before launch_all() so the server subprocesses inherit it.
+        os.environ["MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"] = "65535"
+        os.environ["MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"] = "65535"
         cls._collect_monolithic_references()
         cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER")
+        os.environ.pop("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER")
+        super().tearDownClass()
 
     @classmethod
     def _monolithic_reference_args(cls):
