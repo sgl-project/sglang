@@ -128,6 +128,24 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_mixed_chunk(self) -> bool:
+        """Whether mixed chunk prefill may stay enabled with this algorithm.
+
+        The contract is algorithm-agnostic: spec runs only on pure-decode
+        steps; in a mixed step every running request commits one plain token
+        (a 1-token extend of its pending bonus token) and the worker resumes
+        drafting afterward. An algorithm joins this list once its worker's
+        resume path is verified: EAGLE-family re-seeds draft state via the
+        prefill draft-extend. standalone likely works (draft prefill covers
+        the gap) but is unverified; ngram publishes its overlap relay into
+        accept bufs, not output_tokens_buf, so the mixed input resolve would
+        read stale rows.
+        """
+        return self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+        )
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
