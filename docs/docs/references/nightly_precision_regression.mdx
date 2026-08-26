@@ -108,7 +108,7 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 | `SGLANG_PRECISION_COMMIT` | _(auto-detected from git)_ | Override the sglang commit SHA tagged on push |
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
-| `HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset |
+| `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
 
 ---
 
@@ -116,23 +116,26 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 
 ### Workflow job
 
-The nightly job `nightly-test-precision-8-gpu-h200` is defined in `.github/workflows/nightly-test-nvidia.yml` and runs on an 8-GPU H200 runner. It is included in the nightly suite via `test/run_suite.py`.
+The test is registered on the `nightly-8-gpu-h200` stage in `.github/workflows/nightly-test-nvidia.yml`, which runs through `_pr-test-stage.yml` like every other CUDA stage. The baseline env below is exported on every scheduled stage; only this test reads it.
 
 Key CI configuration:
 
 ```yaml
-- name: Run precision regression test
-  timeout-minutes: 120
+- name: Export precision baseline env
+  if: inputs.scheduled
   env:
-    SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
-    SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
-    SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
-    HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
-    SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+    BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
   run: |
-    cd test
-    python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
+    {
+      echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
+      echo "SGLANG_PRECISION_HF_REPO=${{ vars.SGLANG_PRECISION_HF_REPO }}"
+      echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
+      echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
+      echo "SGLANG_PRECISION_HF_TOKEN=${BASELINE_HF_TOKEN}"
+    } >> "$GITHUB_ENV"
 ```
+
+`SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
 
 ### Required GitHub secrets/variables
 
@@ -140,7 +143,7 @@ Key CI configuration:
 |------|------|---------|
 | `SGLANG_PRECISION_HF_REPO` | Repository variable | HF dataset repo ID (e.g. `org/sglang-precision-baselines`) — **required**, the test errors if unset |
 | `SGLANG_PRECISION_HF_REVISION` | Repository variable (optional) | Dataset branch (defaults to `main`) |
-| `HF_TOKEN_PRECISION_STORE` | Repository secret | HF token with write access to the dataset |
+| `HF_TOKEN_PRECISION_STORE` | Repository secret | HF token with write access to the dataset; exported to the job as `SGLANG_PRECISION_HF_TOKEN` |
 
 ### GitHub Step Summary
 
@@ -187,7 +190,7 @@ export SGLANG_PRECISION_MODELS="your-org/your-model"
 export SGLANG_PRECISION_BASELINE_DIR="/tmp/my_precision_baselines"
 export SGLANG_PRECISION_DIFF_THRESHOLD="1e-3"
 export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-export HF_TOKEN="hf_..."
+export SGLANG_PRECISION_HF_TOKEN="hf_..."
 
 cd test
 python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
@@ -201,7 +204,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
    export SGLANG_PRECISION_MODELS="your-org/your-model"
    export SGLANG_PRECISION_BASELINE_DIR="/tmp/test_baselines"
    export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-   export HF_TOKEN="hf_..."
+   export SGLANG_PRECISION_HF_TOKEN="hf_..."
    export SGLANG_PRECISION_FORCE_UPDATE="1"  # first run: establish baseline
 
    cd test
@@ -249,7 +252,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 - SGLang installed in development mode
 - GPUs matching the model's requirements
 - `huggingface_hub` installed
-- A **HuggingFace dataset** for baseline storage and a write-capable `HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
+- A **HuggingFace dataset** for baseline storage and a write-capable `SGLANG_PRECISION_HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
 
 ### Quick local test
 
@@ -258,7 +261,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 export SGLANG_PRECISION_MODELS="Qwen/Qwen2.5-0.5B-Instruct"
 export SGLANG_PRECISION_BASELINE_DIR="/tmp/precision_baselines"
 export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-export HF_TOKEN="hf_..."
+export SGLANG_PRECISION_HF_TOKEN="hf_..."
 
 # First run: establish baseline
 cd test
@@ -356,7 +359,7 @@ The framework uses a **rolling baseline**: every successful comparison updates t
 
 ### No local-only mode
 
-The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
+The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `SGLANG_PRECISION_HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
 
 ---
 
@@ -369,4 +372,4 @@ The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write
 | `python/sglang/srt/debug_utils/comparator/` | Tensor comparison engine |
 | `python/sglang/srt/debug_utils/dumper.py` | Runtime hidden-state capture |
 | `.github/workflows/nightly-test-nvidia.yml` | CI workflow definition |
-| `test/run_suite.py` | Test suite registration (includes `nightly-precision-8-gpu-h200`) |
+| `test/run_suite.py` | Test suite registration (includes `nightly-test-8-gpu-h200`) |

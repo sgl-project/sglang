@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct FusedQkvParams {
   const void* __restrict__ q;
@@ -199,4 +199,4 @@ struct FusedFp8QkvKvCache {
   }
 };
 
-}  // namespace
+}  // namespace sglang

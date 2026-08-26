@@ -51,21 +51,15 @@ class TestChunkedPrefixCacheGate(CustomTestCase):
         get_context().set_server_args(sa)  # what a later republish would do
         self.assertFalse(get_schedule().disable_chunked_prefix_cache)
 
-    def test_draft_copy_overrides_carry_the_gate(self):
-        # The draft copy comes from the pristine instance, which never sees
-        # the bag-only gate; the copy's pre-publish overrides carry it.
-        from types import SimpleNamespace
-
-        from sglang.srt.speculative.draft_worker_common import (
-            draft_server_args_overrides,
-        )
-
+    def test_the_gate_survives_a_draft_build(self):
+        # The draft build no longer publishes a config of its own, so the gate
+        # the target resolved stays in the bags for the rest of the process.
         self._seed(attention_backend="triton")
         maybe_disable_chunked_prefix_cache(use_mla_backend=True, is_draft_worker=False)
-        fields = draft_server_args_overrides(
-            SimpleNamespace(context_len=64), draft_backend="fa3"
-        )
-        self.assertTrue(fields["disable_chunked_prefix_cache"])
+        self.assertTrue(get_schedule().disable_chunked_prefix_cache)
+
+        maybe_disable_chunked_prefix_cache(use_mla_backend=False, is_draft_worker=True)
+        self.assertTrue(get_schedule().disable_chunked_prefix_cache)
 
 
 if __name__ == "__main__":

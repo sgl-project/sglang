@@ -20,6 +20,8 @@ from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
 from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.kernels.ops.attention.vision_rope import (
     apply_fused_qk_complex_rope,
+    apply_fused_qk_complex_rope_inplace,
+    prepare_fused_qk_complex_rope_inplace,
 )
 from sglang.kernels.ops.elementwise import add3
 from sglang.kernels.ops.gemm.tiny_gemm import (
@@ -426,6 +428,33 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
         atol = 2 * torch.finfo(torch.bfloat16).eps
         torch.testing.assert_close(actual_q, reference(q), rtol=0, atol=atol)
         torch.testing.assert_close(actual_k, reference(k), rtol=0, atol=atol)
+
+    def test_vision_rope_inplace(self):
+        # VisionAttention hands the applier contiguous q/k, which is what the
+        # in-place kernel requires; mirror that rather than qkv.unbind views.
+        for dtype in (torch.bfloat16, torch.float16):
+            torch.manual_seed(4)
+            q = torch.randn(480, 12, 128, device="cuda", dtype=dtype)
+            k = torch.randn(480, 12, 128, device="cuda", dtype=dtype)
+            angles = torch.randn(480, 64, device="cuda")
+            freqs = torch.polar(torch.ones_like(angles), angles)
+            freqs_expanded = freqs.unsqueeze(-2)
+
+            def reference(x):
+                value = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+                return torch.view_as_real(value * freqs_expanded).flatten(-2).type_as(x)
+
+            expected_q, expected_k = reference(q), reference(k)
+            prepared = prepare_fused_qk_complex_rope_inplace(freqs)
+            actual_q, actual_k = apply_fused_qk_complex_rope_inplace(q, k, prepared)
+
+            atol = 2 * torch.finfo(dtype).eps
+            torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=atol)
+            torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=atol)
+
+    def test_vision_rope_inplace_rejects_non_complex_frequencies(self):
+        with self.assertRaises(ValueError):
+            prepare_fused_qk_complex_rope_inplace(torch.randn(8, 64, device="cuda"))
 
     def test_normalize_and_patchify(self):
         torch.manual_seed(5)

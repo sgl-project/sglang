@@ -279,6 +279,9 @@ def kda_decode_mtp_kernel(
         # staged if (UNSUP_EARLY_EXIT).
         nvvm.exit()
 
+    # int64: `slot * stride` overflows int32 on envelope-strided pools.
+    slot = cutlass.Int64(slot)
+
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
     # so the split needs no cross-warp communication.

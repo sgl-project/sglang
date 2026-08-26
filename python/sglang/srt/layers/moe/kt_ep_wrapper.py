@@ -18,7 +18,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -93,7 +96,7 @@ def create_kt_config_from_server_args(
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         weight_path=server_args.kt_weight_path,
-        chunked_prefill_size=server_args.chunked_prefill_size,
+        chunked_prefill_size=get_schedule().chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,

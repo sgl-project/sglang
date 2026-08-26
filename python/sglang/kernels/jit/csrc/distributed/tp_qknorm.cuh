@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace {
+namespace sglang {
 
 using device::distributed::Counter;
 using host::distributed::CommunicatorObj, host::distributed::CommunicatorRef;
@@ -324,4 +324,4 @@ struct FusedParallelQKNormAcrossHead {
   }
 };
 
-}  // namespace
+}  // namespace sglang

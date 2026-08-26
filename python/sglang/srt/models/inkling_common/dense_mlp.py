@@ -217,6 +217,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             self.quant_method,
             self.moe_runner_config,
             self.moe_tp_rank,
+            self.moe_tp_size,
         )
         self.quant_method.create_weights(
             layer=self,

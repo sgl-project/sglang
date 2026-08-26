@@ -30,7 +30,7 @@
 #include <string>
 #include <variant>
 
-namespace {
+namespace sglang {
 
 using device::distributed::Counter, device::distributed::Semaphore;
 using host::distributed::CommunicatorRef;
@@ -649,4 +649,4 @@ tvm::ffi::Tensor custom_all_reduce(
   return AllReduceKernel<T, kWorldSize, kUsePDL>::run(comm, input, algo, pull_arg);
 }
 
-}  // namespace
+}  // namespace sglang

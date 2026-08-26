@@ -45,6 +45,8 @@
 #include <sstream>
 #include <utility>
 
+namespace sglang {
+
 namespace host {
 
 template <typename>
@@ -98,22 +100,22 @@ struct RuntimeCheck {
   template <typename Cond>
   explicit RuntimeCheck(Cond&& condition, Args&&... args, DebugInfo location = {}) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
   template <typename Cond>
   explicit RuntimeCheck(DebugInfo location, Cond&& condition, Args&&... args) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
 };
 
 template <typename... Args>
 struct Panic {
   explicit Panic(Args&&... args, DebugInfo location = {}) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   explicit Panic(DebugInfo location, Args&&... args) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   [[noreturn]] ~Panic() {
     std::terminate();
@@ -206,6 +208,8 @@ struct Error {
 #define CHECK_HOST(COND) \
   if (COND) [[likely]] { \
   } else                 \
-    ::host::Error()
+    host::Error()
 
 }  // namespace host
+
+}  // namespace sglang

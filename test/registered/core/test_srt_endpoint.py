@@ -41,6 +41,7 @@ class TestSRTEndpoint(CustomTestCase):
     # Extra server-launch env; subclasses override to run the same suite
     # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
+    expect_startup_observability = True
 
     @classmethod
     def setUpClass(cls):
@@ -562,6 +563,45 @@ class TestSRTEndpoint(CustomTestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+        if not self.expect_startup_observability:
+            return
+
+        startup_time = response_json["startup_time"]
+        for phase in (
+            "load_weight",
+            "kv_cache_allocation",
+            "scheduler_e2e",
+            "tokenizer_e2e",
+        ):
+            self.assertIsInstance(startup_time[phase], float)
+            self.assertGreater(startup_time[phase], 0)
+
+        graph_phases = {
+            "prefill",
+            "decode",
+            "target_verify",
+            "draft_prefill",
+            "draft_decode",
+            "draft_extend",
+        }
+        self.assertTrue(graph_phases.issubset(startup_time["cuda_graph"]))
+        for phase in graph_phases:
+            self.assertIsInstance(startup_time["cuda_graph"][phase], float)
+            self.assertGreaterEqual(startup_time["cuda_graph"][phase], 0)
+        self.assertGreater(startup_time["cuda_graph"]["decode"], 0)
+
+        memory_usage = response_json["internal_states"][0]["memory_usage"]
+        self.assertIsInstance(memory_usage["weight"], float)
+        self.assertIsInstance(memory_usage["kvcache"], float)
+        self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
+        self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertIsInstance(memory_usage["startup_available"], float)
+        self.assertGreater(memory_usage["startup_available"], 0)
+        self.assertTrue(graph_phases.issubset(memory_usage["graph"]))
+        for phase in graph_phases:
+            self.assertIsInstance(memory_usage["graph"][phase], float)
+            self.assertGreaterEqual(memory_usage["graph"][phase], 0)
+
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
         # Choose a token ID to bias (using 5 as an example)
@@ -864,6 +904,7 @@ class TestTokenizeDetokenize(CustomTestCase):
 )
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}
+    expect_startup_observability = False
 
     _RUST_TODO = "not implemented by the embedded Rust server yet"
 

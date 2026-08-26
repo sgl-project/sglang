@@ -53,6 +53,8 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
 
+namespace sglang {
+
 #ifndef USE_ROCM
 using fp32_t = float;
 using fp16_t = __half;
@@ -235,7 +237,7 @@ namespace host {
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
-    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
 
@@ -384,6 +386,8 @@ struct LaunchKernel {
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
-    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
+
+}  // namespace sglang

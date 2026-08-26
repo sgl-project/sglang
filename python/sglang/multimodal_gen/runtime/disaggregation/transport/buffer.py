@@ -101,7 +101,6 @@ class TransferTensorBuffer:
     def write_tensor(
         self,
         handle: SlotHandle,
-        name: str,
         tensor: torch.Tensor,
         byte_offset: int = 0,
         stream: torch.Stream | None = None,
@@ -186,7 +185,7 @@ class TransferTensorBuffer:
 
             entries = []
             if isinstance(value, torch.Tensor):
-                nbytes = self.write_tensor(handle, name, value, byte_offset, stream)
+                nbytes = self.write_tensor(handle, value, byte_offset, stream)
                 entries.append(
                     {
                         "offset": byte_offset,
@@ -201,9 +200,7 @@ class TransferTensorBuffer:
                 for i, t in enumerate(value):
                     if t is None:
                         continue
-                    nbytes = self.write_tensor(
-                        handle, f"{name}[{i}]", t, byte_offset, stream
-                    )
+                    nbytes = self.write_tensor(handle, t, byte_offset, stream)
                     entries.append(
                         {
                             "offset": byte_offset,
@@ -261,12 +258,3 @@ class TransferTensorBuffer:
                 )
 
         return result
-
-    def free_slots_count(self, typical_request_size: int) -> int:
-        """Estimate how many requests of typical size can still be buffered."""
-        return self._allocator.count_free_slots(typical_request_size)
-
-    def get_stats(self) -> dict:
-        alloc_stats = self._allocator.get_stats()
-        alloc_stats["role"] = self._role_name
-        return alloc_stats

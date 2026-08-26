@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "bfloat16": {"flashmla_sparse"},
-    "fp8_e4m3": {"flashmla_kv"},
+    "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
@@ -32,7 +32,7 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     if _is_hip():
         return HISPARSE_ROCM_DSA_BACKENDS
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
-        kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
+        kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
     )
 
 
@@ -56,9 +56,8 @@ def validate_hisparse_dsa_backend(
             f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
             f"on this platform with --kv-cache-dtype={kv_cache_dtype}, "
             f"but got --dsa-{label}-backend={backend}. "
-            f"Please use --dsa-{label}-backend="
-            f"{_hisparse_default_backend(kv_cache_dtype)} "
-            "or omit it."
+            f"Please use one of {sorted(allowed_backends)}, or omit the option "
+            "to let SGLang pick a backend for this platform."
         )
 
 

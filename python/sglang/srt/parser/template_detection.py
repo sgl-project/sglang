@@ -22,12 +22,14 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import jinja2
 import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
+
+from sglang.srt.arg_groups.overrides import declare_late_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -625,26 +627,21 @@ def detect_inline_system_support(chat_template: Optional[str]) -> bool:
         return False
 
 
-def _resolve_auto_parser(
-    server_args,
+def _detect_auto_parser(
     attr: str,
     ctx: TemplateDetectionContext,
     rules: Tuple[DetectionRule, ...],
     label: str,
-) -> None:
-    """Resolve a single auto parser, updating server_args in place."""
+) -> Optional[str]:
+    """The parser one auto field resolves to (``None`` disables it)."""
     detected = match_rules(ctx, rules, label)
     if detected:
-        server_args.override(source="template-detection", **{attr: detected})
         logger.info(
             f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
         )
-    else:
-        logger.warning(
-            f"--{attr.replace('_', '-')}=auto specified but could not detect "
-            f"{label} from chat template. Disabling {label}."
-        )
-        server_args.override(source="template-detection", **{attr: None})
+        return detected
+    _log_undetected_parser(attr, label)
+    return None
 
 
 def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
@@ -658,15 +655,15 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
-def _disable_auto_parser(server_args, attr: str, label: str) -> None:
+def _log_undetected_parser(attr: str, label: str) -> None:
     logger.warning(
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
-    server_args.override(source="template-detection", **{attr: None})
 
 
-def _resolve_architecture_auto_parsers(server_args) -> None:
+def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
+    """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     config = get_config(
@@ -686,30 +683,37 @@ def _resolve_architecture_auto_parsers(server_args) -> None:
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
     else:
-        return
+        return {}
 
+    resolved = {}
     for attr, detected in (
         ("reasoning_parser", reasoning_parser),
         ("tool_call_parser", tool_call_parser),
     ):
-        if getattr(server_args, attr) == "auto":
-            server_args.override(source="template-detection", **{attr: detected})
+        if attr in needs:
+            resolved[attr] = detected
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
                 f"from model architecture '{arch}'"
             )
+    return resolved
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve --reasoning-parser=auto and --tool-call-parser=auto before scheduler.
+    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
+    chat template, in place, before anything publishes ``server_args``.
 
-    This performs a lightweight tokenizer load to detect parsers from the chat
-    template. Called early in engine init before scheduler subprocesses are spawned.
+    Performs a lightweight tokenizer load, so it runs once in engine init. In
+    place because everyone who holds this instance must see the resolved value:
+    the schedulers it forks, the HTTP server, and the tokenizer workers it is
+    serialized for.
     """
-    needs_reasoning = server_args.reasoning_parser == "auto"
-    needs_tool_call = server_args.tool_call_parser == "auto"
-
-    if not needs_reasoning and not needs_tool_call:
+    needs = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(server_args, attr) == "auto"
+    )
+    if not needs:
         return
 
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -741,6 +745,8 @@ def resolve_auto_parsers(server_args) -> None:
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
+
+    detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
@@ -750,38 +756,26 @@ def resolve_auto_parsers(server_args) -> None:
             )
         else:
             try:
-                _resolve_architecture_auto_parsers(server_args)
+                detected.update(_architecture_auto_parsers(server_args, needs))
             except Exception as e:
                 logger.warning(
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
-        if needs_reasoning:
-            if server_args.reasoning_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "reasoning_parser", "reasoning parser"
-                )
-        if needs_tool_call:
-            if server_args.tool_call_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "tool_call_parser", "tool-call parser"
-                )
-        return
+        for attr, label in (
+            ("reasoning_parser", "reasoning parser"),
+            ("tool_call_parser", "tool-call parser"),
+        ):
+            if attr in needs and attr not in detected:
+                _log_undetected_parser(attr, label)
+                detected[attr] = None
+    else:
+        for attr, rules, label in (
+            ("reasoning_parser", REASONING_PARSER_RULES, "reasoning parser"),
+            ("tool_call_parser", TOOL_CALL_PARSER_RULES, "tool-call parser"),
+        ):
+            if attr in needs:
+                detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
-    if needs_reasoning:
-        _resolve_auto_parser(
-            server_args,
-            "reasoning_parser",
-            ctx,
-            REASONING_PARSER_RULES,
-            "reasoning parser",
-        )
-
-    if needs_tool_call:
-        _resolve_auto_parser(
-            server_args,
-            "tool_call_parser",
-            ctx,
-            TOOL_CALL_PARSER_RULES,
-            "tool-call parser",
-        )
+    if detected:
+        declare_late_resolution(server_args, "template-detection", **detected)
