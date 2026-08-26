@@ -511,16 +511,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         is_amplify_first_chunk = pipeline_config.is_amplify_first_chunk
         gamma = pipeline_config.gamma
 
-        transformer_use = ComponentUse(
-            self.__class__.__name__,
-            "transformer",
-            phase="transformer",
-            preferred_ready_after_request=True,
-            memory_intensive=True,
-        )
-        manager = self._component_residency_manager
-        manager.begin_use(transformer_use, module=self.transformer)
-
         # Get encoder outputs (prompt_embeds is a list of tensors, one per encoder)
         prompt_embeds = batch.prompt_embeds
         if isinstance(prompt_embeds, list):

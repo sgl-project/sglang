@@ -32,6 +32,13 @@ try:
 except ImportError:
     use_nixl = False
 
+try:
+    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
+except ImportError:
+    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
+
+assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
+
 logger = logging.getLogger(__name__)
 
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
@@ -128,7 +135,7 @@ class NixlEPBuffer:
         offset = ElasticEPStateManager.get_ep_join_rank_offset()
         global_rank = rank + offset
 
-        max_ep_size = get_parallel().max_ep_size or world_size
+        max_ep_size = get_parallel().config.max_ep_size or world_size
         nixl_max_ranks = max_ep_size
 
         num_rdma_bytes = 0
@@ -226,7 +233,7 @@ class _NixlEPDispatcherImplBase:
         )
         self._active_world_size = dist.get_world_size(group)
 
-        _max_ep = get_parallel().max_ep_size or self._active_world_size
+        _max_ep = get_parallel().config.max_ep_size or self._active_world_size
         self._mask_buffer = (
             torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
@@ -288,7 +295,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(NIXL_EP_TOPK_INDICES_DTYPE)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts

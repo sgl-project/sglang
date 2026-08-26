@@ -9,10 +9,13 @@ from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -30,6 +33,16 @@ def gather_and_crop_vocab(
 ) -> torch.Tensor:
     full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
+
+
+def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """Project draft hidden states through the target head; a quantized head
+    stores `weight` packed, so it needs its own kernel instead of a matmul."""
+    quant_method = lm_head.quant_method
+    if should_apply_lm_head_quant_method(lm_head, quant_method):
+        return quant_method.apply(lm_head, hidden, None)
+    weight = lm_head.weight
+    return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
 def run_markov_block(
@@ -129,6 +142,39 @@ class VanillaMarkov(nn.Module):
             hidden_states=hidden_states,
             sampler=sampler,
         )
+
+
+class Nemotron35VanillaMarkov(VanillaMarkov):
+    """Checkpoint-quantized Markov head used only by Nemotron 3.5 DSpark."""
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        quant_config,
+        prefix: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        if self.markov_rank <= 0:
+            raise ValueError(
+                "Nemotron35VanillaMarkov requires markov_rank > 0, "
+                f"got {self.markov_rank}."
+            )
+        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = ReplicatedLinear(
+            self.markov_rank,
+            self.vocab_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.markov_w2" if prefix else "markov_w2",
+        )
+
+    def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
+        bias, _ = self.markov_w2(latent_states)
+        return bias
 
 
 class GatedMarkovHead(VanillaMarkov):
@@ -287,6 +333,22 @@ def build_markov_head(config) -> Optional[nn.Module]:
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
 
+def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Module:
+    markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+    if markov_head_type != "vanilla":
+        raise ValueError(
+            "Nemotron 3.5 DSpark requires markov_head_type='vanilla', "
+            f"got {markov_head_type!r}."
+        )
+    markov_prefix = f"{prefix}.markov_head" if prefix else "markov_head"
+    return Nemotron35VanillaMarkov(
+        vocab_size=int(config.vocab_size),
+        markov_rank=int(config.markov_rank),
+        quant_config=quant_config,
+        prefix=markov_prefix,
+    )
+
+
 class DSparkConfidenceHead(nn.Module):
 
     def __init__(
@@ -354,11 +416,7 @@ def build_confidence_head(config) -> Optional[nn.Module]:
     )
 
 
-_DSPARK_SKIPPED_WEIGHT_PREFIXES = (
-    "embed_tokens.",
-    "lm_head.",
-    "rotary_emb.",
-)
+_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
 class DSparkDraftMixin:
@@ -374,14 +432,21 @@ class DSparkDraftMixin:
                 f"got markov_rank={dspark_config.markov_rank}."
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
-        self.markov_head = build_markov_head(config)
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
+        if self.is_nemotron_35_draft:
+            self.markov_head = build_nemotron_35_markov_head(
+                config, quant_config, prefix
+            )
+        else:
+            self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        self.embed_tokens = embed_tokens
+        if not self.is_nemotron_35_draft:
+            self.embed_tokens = embed_tokens
         self.lm_head = lm_head
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -409,10 +474,7 @@ class DSparkDraftMixin:
             )
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
-        weight = self.lm_head.weight
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
-        local_logits = torch.matmul(hidden, weight.T)
+        local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
@@ -422,7 +484,14 @@ class DSparkDraftMixin:
         backbone_weights = []
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
+            normalized_name = name.removeprefix("model.")
+            if any(
+                normalized_name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES
+            ):
+                continue
+            if normalized_name.startswith("embed_tokens.") and not (
+                self.is_nemotron_35_draft
+            ):
                 continue
             if name.startswith("confidence_head."):
                 if self.confidence_head is None:

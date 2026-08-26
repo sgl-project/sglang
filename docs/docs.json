@@ -936,6 +936,7 @@
               "docs/advanced_features/separate_reasoning",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
@@ -1225,6 +1226,7 @@
                   {
                     "group": "GLM",
                     "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.3-Flash",
                       "cookbook/autoregressive/GLM/GLM-5.2",
                       "cookbook/autoregressive/GLM/GLM-5.1",
                       "cookbook/autoregressive/GLM/GLM-5",
@@ -1241,6 +1243,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
                       "cookbook/autoregressive/Qwen/Qwen3.8",
                       "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -1302,6 +1305,12 @@
                     ]
                   },
                   {
+                    "group": "IBM",
+                    "pages": [
+                      "cookbook/autoregressive/IBM/Granite-4.2"
+                    ]
+                  },
+                  {
                     "group": "LiquidAI",
                     "pages": [
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
@@ -1335,6 +1344,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
@@ -1468,8 +1478,10 @@
                   },
                   {
                     "group": "LTX",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3",
+                      "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
@@ -1510,10 +1522,24 @@
                     ]
                   },
                   {
+                    "group": "SANA Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-Video/SANA-Video"
+                    ]
+                  },
+                  {
                     "group": "MiniMax",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "LingBot Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
                   },
                   {
@@ -1590,6 +1616,7 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",

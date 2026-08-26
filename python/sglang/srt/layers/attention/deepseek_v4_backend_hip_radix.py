@@ -21,9 +21,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -39,7 +36,10 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
@@ -459,7 +459,7 @@ class DeepseekV4HipRadixBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
@@ -505,39 +505,10 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            return DSV4RawDecodeMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-            )
-
-        core_attn_metadata = self.make_core_attn_metadata(
-            req_to_token=self.req_to_token,
-            req_pool_indices_repeated=req_pool_indices,
-            seq_lens_casual=seq_lens,
-            max_seq_len=max_seq_len,
-            out_loc=out_cache_loc,
-            need_compress=True,
-        )
-        self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
-
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
+        return DSV4RawDecodeMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-        )
-
-        return DSV4Metadata(
-            core_attn_metadata,
-            indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            out_cache_loc=out_cache_loc,
         )
 
     def init_forward_metadata_prefill(
@@ -658,8 +629,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         ragged_layout=None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        # HIP path: build target-verify metadata eagerly even when
-        # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
+        # HIP path: build target-verify metadata eagerly. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
         if seq_lens_cpu is None:
             seq_lens_cpu = seq_lens.tolist()
@@ -1495,19 +1465,11 @@ class DeepseekV4HipRadixBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_k=swa_k,
-            )
-        else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+            layer_id=layer_id,
+            swa_loc=swa_loc,
+            cache_k=swa_k,
+        )
 
     def forward(
         self,

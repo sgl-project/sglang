@@ -9,13 +9,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.triton.wan_temb_table_slices import (
     can_use_fused_temb_table_slices,
     fused_temb_table_slices,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
@@ -204,6 +202,7 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=is_cross_attention,
+            is_cross_attention=is_cross_attention,
             quant_config=quant_config,
         )
 

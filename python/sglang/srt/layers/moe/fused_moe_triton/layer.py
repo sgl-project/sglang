@@ -228,6 +228,9 @@ class FusedMoE(torch.nn.Module):
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False
 
+    # Attached by quant methods for a quantized MoE layer; see LinearBase.scheme.
+    scheme = None
+
     _skip_aiter_moe_shuffle: bool = False
 
     def __init__(
@@ -290,10 +293,10 @@ class FusedMoE(torch.nn.Module):
 
         self._num_global_routed = num_experts - num_shared_slots
         if get_exec().moe.ep_join_mode == "scale":
-            storage_ep_size = get_parallel().elastic_ep_initial_size
+            storage_ep_size = get_parallel().config.elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                get_parallel().ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().config.ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
@@ -1082,7 +1085,7 @@ class FusedMoE(torch.nn.Module):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
@@ -1349,7 +1352,7 @@ class FusedMoE(torch.nn.Module):
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
