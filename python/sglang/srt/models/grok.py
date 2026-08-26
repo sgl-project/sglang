@@ -721,9 +721,8 @@ class Grok1ForCausalLM(nn.Module):
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        # Installed for every tp_size: a presharded checkpoint has to be reassembled
-        # at tp_size=1 as well, and both helpers fall back to the stock loader when
-        # the checkpoint is not presharded.
+        # Every tp_size: tp_size=1 must reassemble too; both fall back to the stock
+        # loader for non-presharded checkpoints.
         setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
         setattr(
             DefaultModelLoader,
@@ -976,9 +975,8 @@ def _prepare_presharded_weights(
     tp_rank = get_parallel().tp_rank
     tp_size = get_parallel().tp_size
 
-    # Width of the presharded checkpoint, derived from the shard ids present.
-    # Use max(id)+1 rather than the count so that a checkpoint missing shards is
-    # reported as such instead of being mistaken for a narrower one.
+    # Width comes from max(id)+1, not the count, so gaps are reported as missing
+    # shards instead of looking like a narrower checkpoint.
     shard_ids = sorted(
         {
             int(m.group(1))
@@ -987,8 +985,7 @@ def _prepare_presharded_weights(
         }
     )
 
-    if not shard_ids:
-        # Not a presharded checkpoint; nothing to do here.
+    if not shard_ids:  # not a presharded checkpoint
         return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
     n_ckpt_shards = shard_ids[-1] + 1
@@ -1000,10 +997,8 @@ def _prepare_presharded_weights(
             f"{', '.join(f'TP-{i:03d}' for i in missing)}."
         )
 
-    # Rank r owns the contiguous slice covered by checkpoint shards
-    # [r*g, (r+1)*g), so it reads g files and concatenates them (see
-    # _presharded_get_weights_iterator). Going above n_ckpt_shards would require
-    # splitting a shard, which is not supported.
+    # Rank r covers checkpoint shards [r*g, (r+1)*g); a larger tp_size would need a
+    # shard split, which is not supported.
     if tp_size > n_ckpt_shards or n_ckpt_shards % tp_size != 0:
         raise ValueError(
             f"Checkpoint is presharded {n_ckpt_shards} ways; tp_size={tp_size} is "
@@ -1048,11 +1043,8 @@ old_get_weights_iterator = getattr(DefaultModelLoader, "_get_weights_iterator")
 
 
 def _group_presharded_files(hf_weights_files):
-    """Split files into {group_prefix: [shard paths in rank order]} plus the rest.
-
-    Only groups holding more than one checkpoint shard for this rank need merging;
-    single shards, ``*-TP-common`` and ``*.bin`` are passed through untouched.
-    """
+    """Split into {group_prefix: [shard paths in rank order]} needing a merge, and
+    everything else (single shards, ``*-TP-common``, ``*.bin``) to pass through."""
     import os
     import re
     from collections import defaultdict
@@ -1075,16 +1067,12 @@ def _group_presharded_files(hf_weights_files):
 
 
 def _shard_concat_dim(name):
-    """Axis along which a presharded expert weight must be concatenated.
-
-    Only the MoE expert matrices are presharded in known Grok checkpoints, and
-    their axes are fixed. Anything else is rejected rather than guessed: an
-    incorrect axis would yield a plausibly shaped but silently corrupted tensor.
-    """
-    if name.endswith(".w2.weight"):  # row-parallel:    [hidden, moe_inter/g]
+    """Concat axis for a presharded expert weight. Only w1/w2/w3 are presharded;
+    anything else raises, since a wrong axis silently corrupts the tensor."""
+    if name.endswith(".w2.weight"):  # row-parallel: [hidden, moe_inter/g]
         return 1
-    if name.endswith((".w1.weight", ".w3.weight")):
-        return 0  # column-parallel: [moe_inter/g, hidden]
+    if name.endswith((".w1.weight", ".w3.weight")):  # column-parallel
+        return 0
     raise ValueError(
         f"Cannot determine the shard axis for presharded tensor '{name}'. Only MoE "
         "expert weights (w1/w2/w3) are expected to be presharded; refusing to guess."
@@ -1092,11 +1080,8 @@ def _shard_concat_dim(name):
 
 
 def _merged_presharded_iterator(merged_groups):
-    """Yield (name, tensor) with each tensor rebuilt from its checkpoint shards.
-
-    A group's shard files are opened together and concatenated tensor by tensor, so
-    peak memory is one merged tensor rather than a whole group.
-    """
+    """Yield (name, tensor) rebuilt from a group's shards, which are opened together
+    and concatenated per tensor so peak memory is one merged tensor."""
     from contextlib import ExitStack
 
     import torch
