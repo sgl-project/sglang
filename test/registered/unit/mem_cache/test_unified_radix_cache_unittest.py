@@ -3194,6 +3194,11 @@ class UnifiedRadixCacheSuite:
         marker exactly once, a re-issued check must serve once the content
         lands, and abort cleanup must drop unserved markers."""
         self._skip_unsupported_hicache_test()
+        # Marker bookkeeping is layout-independent, and each hicache fixture
+        # retains ~100MiB of device memory for the whole file run. Pin to one
+        # config so the matrix does not exhaust a small CI GPU.
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
@@ -3261,6 +3266,11 @@ class UnifiedRadixCacheSuite:
         """Deadlock invariant: cap <= pool - context_length (floor 0), so
         pinned anchors always leave room to admit the largest request."""
         self._skip_unsupported_hicache_test()
+        # The cap is pool-size arithmetic, not a layout property; pin to one
+        # SWA config (which also covers the SWAKVPool full_kv_pool branch) so
+        # the retained per-fixture device memory stays bounded.
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
         cm = envs.SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK.override(True)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
