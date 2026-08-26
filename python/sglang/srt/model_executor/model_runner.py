@@ -168,11 +168,15 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_context,
+    get_device,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
+    get_memory,
     get_model,
+    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -188,7 +192,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -279,7 +282,7 @@ def resolve_draft_attention_backend(
     """
     if not is_draft_worker:
         return None
-    return draft_attention_backend or server_args.speculative_draft_attention_backend
+    return draft_attention_backend or get_spec().speculative_draft_attention_backend
 
 
 class ModelRunner:
@@ -323,7 +326,6 @@ class ModelRunner:
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
-        self.device = server_args.device
         self.gpu_id = gpu_id
         self.ps = ps
         self.model_config = model_config
@@ -336,10 +338,11 @@ class ModelRunner:
         # construction (benchmark/one_batch, the manual runner tests) has no
         # earlier publish.
         if not is_draft_worker:
-            set_global_server_args_for_scheduler(server_args)
+            ensure_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
+        self.device = get_device().device
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
@@ -356,7 +359,7 @@ class ModelRunner:
             model_config.is_multimodal_chunked_prefill_supported
         )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
         self.page_size = get_schedule().page_size
@@ -367,12 +370,12 @@ class ModelRunner:
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        self.enable_elastic_ep = server_args.elastic_ep_backend is not None
+        self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
@@ -385,7 +388,7 @@ class ModelRunner:
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
-        if server_args.show_time_cost:
+        if get_observability().show_time_cost:
             enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
@@ -486,17 +489,19 @@ class ModelRunner:
         if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
-        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = (
+            get_parallel().config.ep_join_rank_offset + self.ps.tp_size
+        )
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
-                get_parallel().ep_join_rank_offset,
+                get_parallel().config.ep_join_rank_offset,
                 join_effective_ep_size,
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -696,7 +701,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
+            get_parallel().config.ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
@@ -804,6 +809,15 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
+            if self.spec_algorithm.is_dspark() and self.is_draft_worker:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    get_dspark_sample_from_anchor,
+                )
+
+                if not get_dspark_sample_from_anchor(self.model_config.hf_config):
+                    if num_draft_tokens is None:
+                        num_draft_tokens = get_spec().speculative_num_draft_tokens
+                    return int(num_draft_tokens)
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=self.spec_algorithm,
@@ -885,7 +899,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if get_parallel().enable_dp_attention
+                if get_parallel().config.enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -921,7 +935,7 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -961,7 +975,7 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().config.dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -1245,7 +1259,7 @@ class ModelRunner:
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
-        if get_parallel().dwdp_size <= 1:
+        if get_parallel().config.dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
@@ -1295,9 +1309,12 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            capacity = self.max_total_num_tokens
+        if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
+            return req_to_token_pool.schedulable_token_capacity(capacity)
+        return capacity
 
     @property
     def max_token_pool_size(self):
@@ -1348,7 +1365,7 @@ class ModelRunner:
                     else False
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
-                speculative_draft_kv_cache_dtype=self.server_args.speculative_draft_kv_cache_dtype,
+                speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention
@@ -1412,8 +1429,14 @@ class ModelRunner:
         )
 
     def init_threads_binding(self):
+        # With --enable-dp-attention, dp partitions the existing TP group
+        # rather than spawning additional processes, so dp_size must not be
+        # multiplied into the process count here (unlike regular DP, where
+        # dp_size * tp_size * pp_size is the true worker count).
+        dp_size = 1 if get_parallel().config.enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
-            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
+            numa_index=self.gpu_id,
+            world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
         )
 
     def apply_torch_tp(self):
@@ -1895,7 +1918,7 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = get_parallel().elastic_ep_initial_size
+        initial_ep_size = get_parallel().config.elastic_ep_initial_size
         assert initial_ep_size is not None
         get_context().override("elastic_ep.scale", ep_size=effective_size)
 
@@ -1914,7 +1937,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        return self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
 
     def _rearm_eplb_after_elastic_scale(self) -> None:
         if self.eplb_manager is None:

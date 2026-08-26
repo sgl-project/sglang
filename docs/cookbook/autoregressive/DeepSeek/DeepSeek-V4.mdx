@@ -52,11 +52,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260822`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.17-rocm720-mi30x-20260822`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -66,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710 \
+    lmsysorg/sglang-rocm:v0.5.17-rocm720-{mi35x,mi30x}-20260822 \
     sglang serve <use args below>
 ```
 
@@ -204,6 +204,18 @@ For the original Flash and Pro checkpoints:
 - `balanced`: steps=1, draft-tokens=2 → gentler MTP, reduces throughput hit at higher batch.
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
+
+**Shared experts fusion (Blackwell, flashinfer_mxfp4)**
+
+On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shared expert runs as a separate FP8 MLP on an alternate stream by default. Adding:
+
+```bash Command
+--enforce-shared-experts-fusion
+```
+
+routes it as one extra MXFP4 expert through the same trtllm-gen MoE kernel, so the whole MoE runs on a single stream (~4 fewer kernel launches and 2 fewer stream syncs per MoE layer). The shared expert is requantized from FP8 to MXFP4 at load time. Measured on GB200 tp4: gsm8k and AIME25 accuracy on par with the unfused baseline; Mean TTFT -13% to -21% and P99 ITL -15% to -53% at QPS 1-8 with neutral throughput.
+
+Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use.
 
 **Compressed attention state dtype**
 

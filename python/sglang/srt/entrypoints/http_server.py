@@ -394,7 +394,7 @@ async def lifespan(fast_api_app: FastAPI):
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
-            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+            and not (get_serving().smg_grpc_mode or server_args.grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
@@ -484,6 +484,7 @@ from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_lora,
     get_model,
     get_parallel,
     get_serving,
@@ -744,9 +745,9 @@ async def model_info():
         # Manager-owned, and moved by a weight update alongside `model_path`:
         # this is where a client reads the identity the server answers under.
         "served_model_name": _global_state.tokenizer_manager.served_model_name,
-        "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
+        "tokenizer_path": get_serving().tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
-        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
+        "preferred_sampling_params": get_serving().preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.config_value(
             "weight_version"
         ),
@@ -1441,9 +1442,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        _global_state.tokenizer_manager.record_config_updates(
-            "http.update_weight_version", weight_version=obj.new_version
-        )
+        await _global_state.tokenizer_manager.update_weight_version(obj)
 
         return ORJSONResponse(
             {
@@ -1857,7 +1856,7 @@ async def available_models():
         )
 
     # Add loaded LoRA adapters
-    if _global_state.tokenizer_manager.server_args.enable_lora:
+    if get_lora().enable_lora:
         lora_registry = _global_state.tokenizer_manager.lora_registry
         for _, lora_ref in lora_registry.get_all_adapters().items():
             model_cards.append(
@@ -2178,7 +2177,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
+                for dp_rank in range(get_parallel().config.dp_size)
             )
         )
 
@@ -2237,9 +2236,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [
+            [10, 11, 12] for _ in range(get_parallel().config.dp_size)
+        ]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().config.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2283,9 +2284,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = [
+            "The capital city of France is"
+        ] * get_parallel().config.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().config.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2327,7 +2330,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+                    get_parallel().config.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
             else:

@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.runtime_context import (
+    get_schedule,
+)
+
 logger = logging.getLogger(__name__)
 
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
@@ -548,7 +552,7 @@ class PrefillStagingStrategy:
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
         self.full_chunk_pages = (
-            staging_grid_tokens(kv_manager.server_args.chunked_prefill_size, page_size)
+            staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)
             // page_size
         )
 

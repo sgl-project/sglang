@@ -25,7 +25,8 @@ class TestContextOverride(CustomTestCase):
 
     def _publish(self):
         sa = ServerArgs(model_path="dummy")
-        rc.get_context().set_server_args(sa)
+        # Through publish, so the record is resolved the way a process resolves it.
+        rc.publish(sa, role="test")
         return sa
 
     def test_override_writes_bag_not_server_args(self):
@@ -86,7 +87,7 @@ class TestContextOverride(CustomTestCase):
             speculative_accept_threshold_single=0.5,
             speculative_accept_threshold_acc=0.9,
         )
-        self.assertEqual(rc.get_parallel().pp_max_micro_batch_size, 8)
+        self.assertEqual(rc.get_parallel().config.pp_max_micro_batch_size, 8)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_single, 0.5)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_acc, 0.9)
 
