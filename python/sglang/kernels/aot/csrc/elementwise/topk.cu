@@ -169,10 +169,12 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       const int base_i = tx * kPerLane;
       int v[kPerLane];
 #pragma unroll
-      for (int k = 0; k < kPerLane; ++k) v[k] = s_histogram[base_i + k];
+      for (int k = 0; k < kPerLane; ++k)
+        v[k] = s_histogram[base_i + k];
       // suffix sum of this lane's own slice
 #pragma unroll
-      for (int k = kPerLane - 2; k >= 0; --k) v[k] += v[k + 1];
+      for (int k = kPerLane - 2; k >= 0; --k)
+        v[k] += v[k + 1];
       // suffix scan of the per-lane totals across the wave
       const int total = v[0];
       int suf = total;
@@ -183,7 +185,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       }
       const int excl = suf - total;  // sum of every bin owned by a later lane
 #pragma unroll
-      for (int k = 0; k < kPerLane; ++k) s_histogram[base_i + k] = v[k] + excl;
+      for (int k = 0; k < kPerLane; ++k)
+        s_histogram[base_i + k] = v[k] + excl;
     }
     __syncthreads();
 #else
