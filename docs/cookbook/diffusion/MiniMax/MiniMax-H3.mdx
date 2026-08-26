@@ -47,11 +47,13 @@ Choose H3 when synchronized audiovisual output or reference-driven generation ma
 | --- | --- | --- |
 | Text to video and audio | `t2va` | Text prompt only |
 | First/last frame to video and audio | `fl2va` | First frame, last frame, or both |
-| Reference to video and audio | `ref2va` | Image, video, and audio references |
+| Reference to video and audio | `ref2va` | Image, video, and audio references, optionally combined with first/last keyframes |
 
 Video-to-video (V2V) is a supported `ref2va` use case, not a fourth task
 value. Run the `Ref2VA` partition and provide a video reference in
-`conditions`.
+`conditions`. A hybrid `ref2va` request may also include the same ordered
+first/last keyframes accepted by `fl2va`, but it must still contain at least one
+reference condition.
 
 Use the selected Hub's root model ID: `MiniMaxAI/MiniMax-H3` on Hugging Face
 or `MiniMax/MiniMax-H3` on ModelScope. Select the checkpoint variant with
@@ -69,6 +71,48 @@ The builder accepts legal custom GPU counts and topologies, marking them
 **Unverified** until the exact recipe has completed end-to-end validation.
 Static H3 head or partition violations disable Copy before they reach
 `sglang serve`.
+
+### Checkpoint and adapter formats
+
+Start with the command emitted by the builder. Every row below is an overlay on
+the same native SGLang pipeline; component repositories contribute their own
+config and weights, while weight files retain the base component config.
+
+| Scope | Format or variant | Add to the base command | Contract |
+| --- | --- | --- | --- |
+| Full model | Official mixed BF16/FP32 | `--model-variant fl2va` or `--model-variant ref2va` | Lossless reference and consistency GT path. |
+| DiT | Official Diffusers component layout | `--component-paths.transformer MiniMaxAI/MiniMax-H3/transformer` (`fl2va`) or `.../transformer_ref` (`ref2va`) | Loads the official component through the native SGLang graph; no Diffusers runtime fallback. |
+| DiT | [AdaLN-pruned Diffusers component](https://huggingface.co/multimodalart/MiniMax-H3-Pruned) | `--component-paths.transformer multimodalart/MiniMax-H3-Pruned/transformer` or `.../transformer_ref` | Approximate curve-AdaLN architecture; its config and basis metadata are loaded natively. |
+| DiT | [Full or AdaLN-pruned BF16 safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Weight-only override. Match the FL2VA/Ref2VA partition; pruned or dtype-converted exports are approximate. |
+| DiT | Comfy FP8 or self-describing MXFP8 safetensors | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Per-layer metadata selects static/dynamic FP8 or MXFP8 automatically. |
+| DiT | ConvRot INT8, W4A8, W4A4, or mixed W4A4+INT8 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. TP must preserve each file's ConvRot group boundaries. |
+| DiT | [NVFP4, optionally mixed with INT8 or FP8](https://huggingface.co/Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot) | `--component-weights-paths.transformer OWNER/REPO/path/FILE.safetensors` | Auto-detected; NVFP4 execution requires NVIDIA compute capability 10.0+. |
+| DiT | [AutoRound W4A16 component](https://huggingface.co/Ar4ikov/MiniMax-H3-transformer-W4A16-RTN) | `--component-paths.transformer Ar4ikov/MiniMax-H3-transformer-W4A16-RTN` | Self-describing Diffusers component; SGLang reuses the SRT GPTQ/Marlin backend. The linked export is FL2VA. |
+| DiT | GGUF, full or AdaLN-pruned ([full](https://huggingface.co/leejet/MiniMax-H3-GGUF), [pruned](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `--component-weights-paths.transformer OWNER/REPO/FILE.gguf` | CUDA capacity path; aligned TP and layerwise offload are supported, FSDP and LoRA are not. |
+| DiT | Online FP8 or ConvRot INT8 | `--component-quantizations.transformer fp8` or `... kitchen_int8` | Quantizes the official weights during load; this is not a pre-quantized checkpoint format. |
+| Text encoder | [Serialized FP8 component](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct-FP8) | `--component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8` | Only eligible language-model linears use FP8; embeddings, norms, and the vision tower keep their declared precision. |
+| Text encoder | ConvRot INT8, W4A8, or W4A4 safetensors ([INT8](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders), [W4A8](https://huggingface.co/Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI), [W4A4](https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot)) | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Auto-detected; requires `comfy-kitchen`. Unmarked vision and embedding tensors keep their declared precision. |
+| Text encoder | [NVFP4-AWQ](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders) or [Quanto qint8](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) safetensors | `--component-weights-paths.text_encoder OWNER/REPO/path/FILE.safetensors` | Memory-oriented formats: compressed storage is restored, then each active matrix uses BF16/FP16 compute. |
+| Text encoder | [GGUF Qwen3-VL](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/main/Qwen3-VL-32B-Instruct) | `--component-weights-paths.text_encoder OWNER/REPO/FILE.gguf` | CUDA capacity path with encoder TP/layerwise support; encoder FSDP is not supported. |
+| Text encoder | [Compact Qwen3-VL 4B/8B + ClipProj](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3) | `--component-paths.text_encoder ENCODER_REPO --component-paths.conditioning_projection PROJECTION.safetensors` | Approximate conditioning replacement. A separate weight-only override may quantize the selected small encoder. |
+| Adapter | Native fused or Diffusers/PEFT LoRA | `--lora-path OWNER/REPO [--lora-weight-name FILE] --lora-merge-mode auto` | Layout and alpha metadata are normalized at load time; see [LoRA recipes](#5-lora-recipes). |
+
+For H3, the registered component names are `transformer`, `text_encoder`,
+`video_vae`, and `audio_vae`. The shorter `--transformer-weights-path` and
+`--text-encoder-path` aliases remain supported. `conditioning_projection` is an
+H3 text-encoder sidecar key, not a standalone model component. Plain
+video/audio VAE safetensors can use `--component-weights-paths.video_vae` or
+`--component-weights-paths.audio_vae`, but SGLang does not currently advertise
+a native quantized H3 VAE format.
+
+Pre-quantized files are self-describing: do not combine those rows with
+`--quantization` or `--component-quantizations.*`. Only byte-identical official
+full weights—whether loaded from the original model, Diffusers component, or a
+weight-only layout—belong to the consistency GT. Pruned, quantized,
+compact-encoder, and LoRA routes are outside that baseline and the audited
+`quality="high"` contract. Packed and per-layer mixed formats reject FSDP unless
+their row says otherwise; see
+[Quantization](/docs/sglang-diffusion/quantization) for backend-wide constraints.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident by default.
 The model fits without FSDP, so this path avoids the per-block parameter
@@ -184,144 +228,15 @@ baseline; everything else stays identical. GPU peak stays about 18 GB
 either way because streaming offload is set by the offload buffers and VAE
 decode, not the weight dtype.
 
-### Pre-quantized GGUF transformer
+The first launch resolves every selected source through the normal Hub path. If
+a repository requires authentication, export a Hugging Face token in the
+server environment; no manual pre-download is required.
 
-Use `--transformer-weights-path` to replace only the DiT with a GGUF file; the
-base repository continues to provide the text encoder, VAEs, scheduler, and
-tokenizers. Do not also pass `--quantization gguf`.
-
-```bash 1×RTX 5090 Q4_K_M
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --transformer-weights-path \
-    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
-  --attention-backend fa \
-  --performance-mode memory \
-  --layerwise-offload-components dit,text_encoder \
-  --dit-offload-prefetch-size 1 \
-  --dit-layerwise-resident-layers 0 \
-  --enable-torch-compile false \
-  --port 30010
-```
-
-The loader also recognizes pruned checkpoints that replace the timestep MLP
-with `adaln_t_table`. Repositories containing both FL2VA and Ref2VA variants
-need a full file reference:
-
-```bash Pruned FL2VA Q4_K
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --transformer-weights-path \
-    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
-  --performance-mode memory \
-  --layerwise-offload-components dit,text_encoder \
-  --enable-torch-compile false \
-  --port 30010
-```
-
-The linear adapter reuses SRT's GGUF type definitions and CUDA dequantization,
-then runs the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
-regime and are slower at diffusion sequence lengths. TP is supported when each
-row-parallel input shard remains GGML-block aligned; incompatible degrees fail
-during model construction. FSDP, LoRA merging, and the separate MiniMax-H3
-AdaLN cache flags are not compatible with packed GGUF weights.
-
-The first launch downloads the model through the selected Hub. If the Hugging
-Face repository requires authentication, export a Hugging Face token in the
-server environment.
-
-For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
-
-### AdaLN-pruned safetensors transformers
-
-[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
-publishes smaller DiT-only checkpoints that replace the original AdaLN branches
-with an interpolated curve table. Select one file explicitly; the base model
-still supplies the text encoder and VAEs.
-
-```bash Command
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --transformer-weights-path \
-    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
-  --num-gpus 4 \
-  --tp-size 2 \
-  --ulysses-degree 2 \
-  --performance-mode speed \
-  --port 30010
-```
-
-The pruned checkpoint is approximate and is therefore rejected by
-`quality="high"`, which remains limited to the audited official BF16 DiT.
-
-The Comfy `pruned_fp8_scaled` FL2VA and Ref2VA files are also supported. Their
-per-layer markers are detected automatically; do not add `--quantization`:
-
-```bash Command
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --transformer-weights-path \
-    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors \
-  --num-gpus 4 \
-  --tp-size 2 \
-  --ulysses-degree 2 \
-  --performance-mode speed \
-  --port 30010
-```
-
-SGLang uses its native static-activation FP8 linear path when the checkpoint
-stores input scales, and automatically uses dynamic activation scaling for
-Comfy FP8 exports that omit them. The checkpoint above marks `fc2` for
-full-precision matrix multiplication, so
-SGLang retains its FP8 storage but materializes and scales one compute-dtype
-`fc2` matrix for each call. This preserves the checkpoint's mixed execution
-contract and low resident weight memory, but that part is slower than a fully
-quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
-component/layerwise offload are supported; FSDP inference is rejected.
-
-The `pruned_int8_convrot` files use the same override path and are detected
-automatically. Install `comfy-kitchen`, replace the FP8 filename above with
-`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and still omit
-`--quantization`. SGLang loads their serialized INT8 weights and row scales into
-the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
-layerwise offload are supported; TP8 violates the checkpoint's 256-element
-ConvRot group boundary, and FSDP is rejected.
-
-Self-describing community MXFP8 files use the same
-`--transformer-weights-path <repo/file.safetensors>` form and need no
-quantization flag. SGLang reads their global format metadata, keeps unmarked H3
-layers in their original dtype, and reuses SRT's MXFP8 dense kernels. The
-selected SRT backend must support MXFP8 on the target GPU; FSDP is rejected for
-this mixed per-layer layout.
-
-W4A8 ConvRot DiT files use the same flagless flow. With
-`comfy-kitchen>=0.2.27`, pass a file such as
-`starsfriday/MiniMax-H3-w4a8/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
-to `--transformer-weights-path`; SGLang reads the serialized per-layer metadata
-and packed INT4 tensors automatically. Do not add `--quantization`. TP remains
-subject to each row-parallel shard preserving the checkpoint's ConvRot group
-boundary, and FSDP is rejected.
-
-W4A4 ConvRot files are also detected from their layer metadata. Install a
-current `comfy-kitchen`, then pass a full or pruned FL2VA / Ref2VA file such as
-`Merserk/MiniMax-H3-INT4-ConvRot/minimax_h3_fl2va_pruned_int4_convrot.safetensors`
-to `--transformer-weights-path`. The packed weights stay INT4 and the runtime
-honors each layer's activation mode; omit `--quantization`.
-Mixed exports use the same command: SGLang dispatches each marked layer to its
-serialized W4A4 or INT8 ConvRot kernel instead of applying one global method.
-
-Comfy NVFP4 DiTs reuse SGLang's ModelOpt NVFP4 backend, which requires CUDA
-compute capability 10.0 or newer. Pass a pruned FL2VA / Ref2VA file such as
-`Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot/MiniMax_H3_FL2VA_pruned_nvfp4.safetensors`
-to `--transformer-weights-path` and omit `--quantization`. SGLang infers the
-packed group size and Comfy scale layout from the checkpoint; FSDP is rejected.
-Mixed files may mark selected linears as `int8_tensorwise` or dynamic/static
-FP8; SGLang dispatches those layers to their serialized Kitchen INT8 or native
-FP8 path automatically.
+For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager.
+The current `torch.compile` path changes the model's numerical output, so no
+recommended lossless preset enables it implicitly. An explicit
+`--enable-torch-compile true` remains available for controlled experiments, but
+do not use it to generate consistency ground truth.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -707,11 +622,11 @@ the adapter author explicitly provides Ref2VA-compatible weights. Also avoid
 stacking a distilled adapter with `quality: "high"`: both alter denoising, and
 that combination has not been quality-validated.
 
-<Warning>
-LoRAs trained for a pruned or structurally modified ComfyUI graph are not
-automatically compatible with the native H3 weights. Use only adapters whose
-architecture and target modules match the full native H3 checkpoint.
-</Warning>
+AdaLN-pruned Diffusers components that publish `adaln_basis` and `adaln_mean`
+can also consume a LoRA trained against the released full-width AdaLN modules:
+SGLang projects those adapter factors onto the pruned coordinates at load time.
+A structurally modified checkpoint without that metadata still fails closed,
+and packed GGUF weights remain incompatible with LoRA.
 
 ## 6. Sampling and output controls
 
@@ -1016,90 +931,11 @@ the attention algorithm. Neither is a consistency ground-truth mode. The
 BF16 path is unchanged when `comfy-kitchen` is not installed.
 </Warning>
 
-The Qwen3-VL text encoder can be replaced independently of the DiT. To reduce
-its resident memory, point the text-encoder component at the serialized FP8
-checkpoint used in validation:
-
-```bash Command
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
-  --num-gpus 4 \
-  --tp-size 2 \
-  --ulysses-degree 2 \
-  --performance-mode speed \
-  --port 30010
-```
-
-`--text-encoder-path` is accepted as a shorter alias. No separate quantization
-flag is required: SGLang reads the checkpoint's `quantization_config` and
-fails closed if the native encoder does not support that format. The language
-linear layers use FP8 while embeddings, normalization, and the vision tower
-remain BF16. This is an approximate serve-time choice and is incompatible with
-the strict `quality="high"` deployment contract.
-
-The mixed W4A8 community encoder follows the same component-path contract:
-
-```bash Overlay
---component-paths.text_encoder \
-  Winnougan/MiniMax-H3-INT4_Convrot_ComfyUI/qwen3vl_32b_minimax_h3-w4a8_convrot.safetensors
-```
-
-Install `comfy-kitchen>=0.2.27` and omit `--quantization`. SGLang automatically
-loads its W4A8 language linears and tensorwise INT8 embedding; the unmarked
-vision tower remains BF16.
-
-W4A4 Qwen3-VL files use the same overlay, for example:
-
-```bash Overlay
---component-paths.text_encoder \
-  Merserk/MiniMax-H3-INT4-ConvRot/qwen3vl_32b_minimax_h3_int4_convrot.safetensors
-```
-
-This checkpoint keeps its unmarked embedding and vision tower in their source
-precision; no explicit component quantization option is needed.
-
-The official Comfy NVFP4-AWQ encoder uses the same flagless overlay:
-
-```bash Overlay
---component-paths.text_encoder \
-  Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
-```
-
-SGLang auto-detects its row-wise INT8 embedding, NVFP4 language linears, and
-AWQ input pre-scales. The weights stay compressed at rest; each active linear
-is dequantized for a BF16/FP16 matrix multiplication, so this path primarily
-reduces resident memory rather than encoder latency. Do not add a component or
-transformer quantization option.
-
-The same component option accepts a self-describing Quanto qint8 file without
-an additional quantization flag:
-
-```bash Overlay
---component-paths.text_encoder \
-  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_quanto_bf16_int8.safetensors
-```
-
-This variant keeps the declared language and vision linear weights in qint8
-storage, then dequantizes only the active matrix for BF16/FP16 linear math. Use
-it as a memory option, not as an INT8 throughput claim. The embedded Quanto map
-is the selector; adding `--quantization` would describe a different operation.
-
-Qwen3-VL GGUF files use the same component option:
-
-```bash Overlay
---component-paths.text_encoder \
-  DeepBeepMeep/MiniMax-H3/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf
-```
-
-The file selects its own Q4/Q6 layout; do not add `--quantization`. SGLang keeps
-the aligned vocabulary table and language linears in packed GGML storage. The
-smaller Comfy vision tower, whose flattened blocks can cross row and TP shard
-boundaries, is restored one matrix at a time to BF16 during loading.
-This CUDA-only memory option supports encoder TP and layerwise placement, but
-not encoder FSDP. Like the Quanto variant, it is approximate and is not a
-throughput claim.
+Pre-quantized and compact H3 text encoders are listed once in
+[Checkpoint and adapter formats](#checkpoint-and-adapter-formats). They use
+component-local paths and never inherit the DiT's `--quantization` setting.
+SGLang reads their metadata before constructing the native Qwen3-VL encoder and
+fails closed when the selected format, projection, or topology is incompatible.
 
 </Tab>
 
