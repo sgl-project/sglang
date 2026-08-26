@@ -34,6 +34,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     name = "csgmv"
     supports_prefill_cuda_graph = True
+    supports_repeated_sgemm_batch_info = True
 
     def __init__(
         self,

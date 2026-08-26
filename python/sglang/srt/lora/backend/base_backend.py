@@ -1,3 +1,4 @@
+import dataclasses
 from typing import Optional, Tuple, Union
 
 import torch
@@ -26,6 +27,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
+    # Backends that honor the pruned_batch_info argument on both segmented
+    # GEMMs can opt into grouped projections whose rows repeat per token.
+    supports_repeated_sgemm_batch_info: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -51,6 +55,52 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def _get_sgemm_batch_info(self) -> LoRABatchInfo:
+        assert self.batch_info is not None, "LoRA batch metadata is not prepared"
+        return self.batch_info
+
+    def get_repeated_sgemm_batch_info(self, repeats: int) -> LoRABatchInfo:
+        """Repeat every logical token row while preserving adapter routing.
+
+        Grouped projections flatten ``[tokens, groups, hidden]`` to
+        ``[tokens * groups, hidden]`` in token-major order. Supporting
+        segmented-GEMM backends use this descriptor to route every expanded
+        group row to the same adapter as its source token.
+        """
+        if not self.supports_repeated_sgemm_batch_info:
+            raise RuntimeError(
+                f"LoRA backend {self.name!r} does not support repeated segmented-GEMM metadata"
+            )
+        if repeats <= 0:
+            raise ValueError(f"repeats must be positive, got {repeats}")
+
+        batch_info = self._get_sgemm_batch_info()
+        permutation = batch_info.permutation
+        if permutation is not None:
+            repeat_ids = torch.arange(
+                repeats,
+                device=permutation.device,
+                dtype=permutation.dtype,
+            )
+            permutation = (permutation.unsqueeze(-1) * repeats + repeat_ids).reshape(-1)
+
+        return dataclasses.replace(
+            batch_info,
+            seg_lens=(
+                None if batch_info.seg_lens is None else batch_info.seg_lens * repeats
+            ),
+            seg_indptr=batch_info.seg_indptr * repeats,
+            max_len=(
+                None if batch_info.max_len is None else batch_info.max_len * repeats
+            ),
+            permutation=permutation,
+            expected_tokens=(
+                None
+                if batch_info.expected_tokens is None
+                else batch_info.expected_tokens * repeats
+            ),
+        )
 
     def run_lora_a_embedding(
         self,
