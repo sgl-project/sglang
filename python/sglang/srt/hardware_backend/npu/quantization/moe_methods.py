@@ -8,7 +8,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -24,6 +23,12 @@ from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
+)
+from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+    NPUOnlineIntegerQuantSpec,
+    get_npu_online_integer_quant_spec,
+    npu_dynamic_quantize_weight,
+    npu_format_online_weight,
 )
 
 logger = logging.getLogger(__name__)
@@ -903,16 +908,15 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
 
-        online_quantization = get_server_args().online_quantization
-        if online_quantization == "w8a8_int8":
-            self._apply_online_w8a8(layer, weight_prefix, weight_name)
-            self._quant_mode = "w8a8_int8"
-            return
-        if online_quantization in {"w4a8_int8", "w4a4_int4"}:
-            self._apply_online_w4(
-                layer, weight_prefix, weight_name, online_quantization
-            )
-            self._quant_mode = online_quantization
+        loader = getattr(layer, "_npu_online_moe_loader", None)
+        spec = (
+            loader.spec
+            if loader is not None
+            else get_npu_online_integer_quant_spec()
+        )
+        if spec is not None:
+            self._apply_online_integer(layer, weight_prefix, weight_name, spec)
+            self._quant_mode = spec.mode
             return
 
         weight: torch.Tensor = getattr(layer, weight_name)
@@ -922,49 +926,61 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             self._set_dispatcher_output_dtype(layer, "bf16")
         self._quant_mode = "bf16"
 
-    def _apply_online_w8a8(
-        self, layer: torch.nn.Module, weight_prefix: str, weight_name: str
-    ) -> None:
-        weight = getattr(layer, weight_name)
-        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight.data)
-        quantized_weight = npu_format_cast(
-            quantized_weight.transpose(-2, -1).contiguous()
-        )
-
-        copy_or_rebind_param(layer, weight_name, quantized_weight)
-        copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
-        setattr(self, weight_name, quantized_weight)
-        setattr(self, f"{weight_name}_scale", weight_scale)
-        if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
-        self.transposed = True
-
-    def _apply_online_w4(
+    def _apply_online_integer(
         self,
         layer: torch.nn.Module,
         weight_prefix: str,
         weight_name: str,
-        quant_mode: str,
+        spec: NPUOnlineIntegerQuantSpec,
     ) -> None:
         weight = getattr(layer, weight_name)
-        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(
-            weight.data, dst_type=torch.quint4x2
-        )
-        quantized_weight = npu_format_cast(
-            quantized_weight.transpose(-2, -1).contiguous()
-        )
+        loader = getattr(layer, "_npu_online_moe_loader", None)
+        if loader is None or loader.loaded_numel[weight_prefix] == 0:
+            raise RuntimeError(
+                "Ascend online integer MoE requires its completion-tracked "
+                "weight loader; direct, remote, and IPC-cache loading are not "
+                "supported."
+            )
+        if (
+            loader.state[weight_prefix] == "ready_reload"
+            and weight.dtype == loader.params_dtype
+        ):
+            raise RuntimeError(
+                "Ascend online integer MoE hot reload must use the registered "
+                "completion-tracked weight loader."
+            )
+        if hasattr(layer, f"{weight_name}_scale") and loader.state[
+            weight_prefix
+        ] in {"converted", "ready_reload"}:
+            self._configure_online_integer(layer, weight_prefix, weight_name, spec)
+            loader.state[weight_prefix] = "ready_reload"
+            return
+
+        quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight.data, spec)
+        quantized_weight = npu_format_online_weight(quantized_weight)
 
         copy_or_rebind_param(layer, weight_name, quantized_weight)
         copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
-        if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(
-                layer, "int8" if quant_mode == "w4a8_int8" else "bf16"
-            )
-        activation_dtype = (
-            torch.int8 if quant_mode == "w4a8_int8" else torch.quint4x2
+        self._configure_online_integer(layer, weight_prefix, weight_name, spec)
+
+    def _configure_online_integer(
+        self,
+        layer: torch.nn.Module,
+        weight_prefix: str,
+        weight_name: str,
+        spec: NPUOnlineIntegerQuantSpec,
+    ) -> None:
+        setattr(self, weight_name, getattr(layer, weight_name))
+        setattr(
+            self,
+            f"{weight_name}_scale",
+            getattr(layer, f"{weight_name}_scale"),
         )
-        self.hidden_states_quantizer = HiddenStatesDynamicQuant(activation_dtype)
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, spec.dispatcher_output_dtype)
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=spec.activation_dtype
+        )
         self.transposed = True
 
     def apply(

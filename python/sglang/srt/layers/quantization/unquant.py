@@ -59,6 +59,9 @@ if TYPE_CHECKING:
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
+from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+    create_npu_online_moe_weight_loader,
+)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
@@ -418,6 +421,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     ):
         self.with_bias = with_bias
 
+        weight_attrs = extra_weight_attrs
+        npu_online_loader = None
+        if _is_npu:
+            npu_online_loader = create_npu_online_moe_weight_loader(
+                layer=layer,
+                params_dtype=params_dtype,
+                original_weight_loader=extra_weight_attrs["weight_loader"],
+            )
+        if npu_online_loader is not None:
+            weight_attrs = dict(extra_weight_attrs)
+            weight_attrs["weight_loader"] = npu_online_loader.weight_loader
+
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
         # stride, so it can be padded to dodge L3 set aliasing on unlucky K
         # dims. Every other device allocates plainly, exactly as before.
@@ -437,12 +452,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 num_experts, w13_weight_n, w13_weight_k, params_dtype
             )
         else:
+            device = "meta" if npu_online_loader is not None else None
             w13_weight_data = torch.empty(
-                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype
+                num_experts,
+                w13_weight_n,
+                w13_weight_k,
+                dtype=params_dtype,
+                device=device,
             )
         w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
+        set_weight_attrs(w13_weight, weight_attrs)
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
@@ -464,12 +484,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 num_experts, w2_weight_n, w2_weight_k, params_dtype
             )
         else:
+            device = "meta" if npu_online_loader is not None else None
             w2_weight_data = torch.empty(
-                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype
+                num_experts,
+                w2_weight_n,
+                w2_weight_k,
+                dtype=params_dtype,
+                device=device,
             )
         w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
+        set_weight_attrs(w2_weight, weight_attrs)
+
+        if npu_online_loader is not None:
+            npu_online_loader.register_sources(w13_weight, w2_weight)
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(

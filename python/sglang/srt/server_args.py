@@ -712,7 +712,11 @@ class ServerArgs:
     online_quantization: A[
         Optional[str],
         Arg(
-            help="The online quantization method.",
+            help=(
+                "The online quantization method. Ascend integer online "
+                "quantization supports full-precision FP16 checkpoints; use "
+                "--dtype float16."
+            ),
             choices=ONLINE_QUANTIZATION_CHOICES,
             resolvable=True,
         ),
