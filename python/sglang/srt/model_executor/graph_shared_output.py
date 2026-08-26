@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Dict, Optional
 import torch
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    get_exec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -29,7 +32,7 @@ class GraphSharedOutput:
     def create_for_model_runner(
         cls, model_runner: ModelRunner
     ) -> Optional[GraphSharedOutput]:
-        cuda_graph_config = model_runner.server_args.cuda_graph_config
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         if cuda_graph_config is None:
             return None
 

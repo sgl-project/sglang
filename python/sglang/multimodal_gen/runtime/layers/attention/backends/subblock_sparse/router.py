@@ -243,8 +243,9 @@ class SubBlockRouter:
         scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
         gq = scores.shape[2]
         topk = _snap_up_to_8(math.ceil((1.0 - sparsity) * gk), gk)
-        # One pass over the score matrix instead of torch.topk's several; the kernel
-        # accepts the blocks in any order, so nothing sorts them.
+        # One pass over the score matrix instead of torch.topk's several. The
+        # output order is unspecified: SM100 consumes it directly, while the
+        # SM90 backend sorts compact active prefixes before heterogeneous expansion.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)
         return RoutingPlan(index=index, topk=topk, num_blocks=gk)
 
