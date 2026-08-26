@@ -579,6 +579,18 @@ class TokenizerControlMixin:
 
         return success, message
 
+
+    def _validate_dynamic_lora_supported(self: TokenizerManager):
+        if self.server_args.tokenizer_worker_num > 1:
+            raise ValueError(
+                "Dynamic LoRA load/unload is not supported with "
+                "--tokenizer-worker-num > 1: each worker keeps its own "
+                "lora registry and runtime updates are not synced "
+                "(https://github.com/sgl-project/sglang/issues/31084). "
+                "Use --tokenizer-worker-num 1, or preload adapters via "
+                "--lora-paths."
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -613,6 +625,8 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            self._validate_dynamic_lora_supported()
 
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
@@ -691,6 +705,8 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            self._validate_dynamic_lora_supported()
 
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
@@ -771,6 +787,8 @@ class TokenizerControlMixin:
             assert (
                 obj.lora_name is not None
             ), "lora_name must be provided to unload LoRA adapter"
+
+            self._validate_dynamic_lora_supported()
 
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
