@@ -1501,7 +1501,16 @@ def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) ->
 def _binding_phase_constraints(
     report: RankResidencyReport,
     candidate_component_names: set[str],
-) -> list[tuple[str, int, tuple[str, ...], tuple[str, ...], tuple[str, ...]]]:
+) -> list[
+    tuple[
+        str,
+        int,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]
+]:
     """Keep the binding measured and conservative unobserved phases.
 
     Every candidate has the same device delta in phases with the same active
@@ -1542,7 +1551,13 @@ def _binding_phase_constraints(
     }
 
     binding: dict[
-        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], tuple[str, int]
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+        ],
+        tuple[str, int],
     ] = {}
     for phase_name, phase_peak in phase_peaks.items():
         measured_components = set(report.active_components_by_phase.get(phase_name, ()))
@@ -1557,6 +1572,7 @@ def _binding_phase_constraints(
                 & candidate_component_names
             )
         )
+        measured = tuple(sorted(measured_components & candidate_component_names))
         used = tuple(sorted(report.used_components_by_phase.get(phase_name, ())))
         full_weight_transitions = tuple(
             sorted(
@@ -1568,13 +1584,13 @@ def _binding_phase_constraints(
                 & candidate_component_names
             )
         )
-        layout = (present, used, full_weight_transitions)
+        layout = (present, measured, used, full_weight_transitions)
         current = binding.get(layout)
         if current is None or (phase_peak, phase_name) > (current[1], current[0]):
             binding[layout] = (phase_name, phase_peak)
     observed_components = {
         component_name
-        for (_, used, full_weight_transitions) in binding
+        for (_, _, used, full_weight_transitions) in binding
         for component_name in set(used) | set(full_weight_transitions)
     }
     steady_request_peak = max(
@@ -1587,7 +1603,7 @@ def _binding_phase_constraints(
                 (steady_state_components | {component_name}) & candidate_component_names
             )
         )
-        binding[(present, (component_name,), ())] = (
+        binding[(present, (), (component_name,), ())] = (
             f"unobserved:{component_name}",
             steady_request_peak,
         )
@@ -1596,10 +1612,11 @@ def _binding_phase_constraints(
             f"gpu:rank{report.rank}:{phase_name}",
             phase_peak,
             present,
+            measured,
             used,
             full_weight_transitions,
         )
-        for (present, used, full_weight_transitions), (
+        for (present, measured, used, full_weight_transitions), (
             phase_name,
             phase_peak,
         ) in sorted(binding.items(), key=lambda item: item[1][0])
@@ -1767,7 +1784,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 max(
                     (
                         phase_peak + reserves_by_rank[report.rank] - report.budget_bytes
-                        for _, phase_peak, _, _, _ in phase_constraints[report.rank]
+                        for _, phase_peak, _, _, _, _ in phase_constraints[report.rank]
                     ),
                     default=0,
                 )
@@ -1778,7 +1795,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     current_placement_reserve_shortfall = max(0, current_placement_reserve_shortfall)
     resource_budgets: dict[str, int] = {}
     for report in reports:
-        for resource_name, phase_peak, _, _, _ in phase_constraints[report.rank]:
+        for resource_name, phase_peak, _, _, _, _ in phase_constraints[report.rank]:
             # The measured placement has already completed warmup. A negative
             # reserve headroom therefore means "do not grow this phase", not
             # that the current zero-delta placement is infeasible.
@@ -1896,13 +1913,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 resource_name,
                 _,
                 present_components,
+                measured_components,
                 used_components,
                 full_weight_transition_components,
             ) in phase_constraints[report.rank]:
+                # ``present_components`` also includes request-end placement
+                # carried into this phase. Only the measured set proves that
+                # the phase peak already captured a complete materialization.
                 transition_measured_full_weights = (
                     candidate.component_name in full_weight_transition_components
                     and (
-                        candidate.component_name in present_components
+                        candidate.component_name in measured_components
                         or (
                             current_rank_candidate is not None
                             and current_rank_candidate.target_mode()
