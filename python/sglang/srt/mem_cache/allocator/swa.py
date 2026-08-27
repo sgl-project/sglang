@@ -341,6 +341,25 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
+        # §24.56 (candidate 2 discriminator): this scatter is UNCLAMPED -- a
+        # garbage full_index walks off the mapping table (row-clobber family,
+        # §22 swa.py:330 crash). Audit both sides' range BEFORE the write:
+        # map-oob>0 => dirty tree-held indices reach an unclamped scatter;
+        # read out only inside [mf-scatter]'s piggyback D2H (zero-sync).
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob as _swa_count_oob,
+            )
+
+            _cap = self.full_to_swa_index_mapping.shape[0]
+            _fi = full_indices.to(torch.int64)
+            _oob = (_fi < 0) | (_fi >= _cap)
+            if torch.is_tensor(swa_indices):
+                _si = swa_indices.to(torch.int64)
+                _oob |= (_si < 0) | (_si >= _cap)
+            _swa_count_oob(_oob.reshape(-1), "swa:map-oob")
+        except Exception:
+            pass
         full_indices = full_indices.to(torch.int64)
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
         self.full_to_swa_index_mapping[full_indices] = swa_indices
@@ -348,6 +367,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        # §24.56 (candidate 2 discriminator): the mapping read+clear below
+        # (full_to_swa_index_mapping[mapping_indices] and the =0 write) is
+        # UNCLAMPED; audit the incoming free_index range here. fswa-oob>0 =>
+        # garbage indices from the tree free path (FreeDeviceKV ->
+        # free_segment) reach the unclamped gather/scatter pair.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob as _swa_count_oob,
+            )
+
+            _cap = self.full_to_swa_index_mapping.shape[0]
+            _vi = free_index.to(torch.int64)
+            _oob = (_vi < 0) | (_vi >= _cap)
+            _swa_count_oob(_oob.reshape(-1), "swa:fswa-oob")
+        except Exception:
+            pass
 
         if not self.is_not_in_free_group:
             self.swa_free_group.append(self._copy_for_free_group(free_index))

@@ -437,6 +437,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("logs", nargs="+", help="merged sglang log file(s)")
     ap.add_argument("--max-report", type=int, default=MAX_REPORT)
+    ap.add_argument(
+        "--verbose", action="store_true",
+        help="print the full per-line scatter dump and the long verdict texts",
+    )
     args = ap.parse_args()
 
     cp, mfraw, mftrans, census, torn, mfer, mffp_found, mfer_names, mftrap, mfreg_fail, mftrap_send, mfscatter, mflayout = parse(args.logs)
@@ -849,6 +853,47 @@ def main():
                 "fixed layout relationship."
             )
         return lines
+
+    if mftrap:
+        # ---- §24.57: first dirty occurrence per rank (layer-resolved) -----
+        # Every decoder layer takes an L{i} mark (deepseek_v4.py layer loop),
+        # first-hit discipline keeps ONE catch per rank -- so the rank's
+        # first catch IS its first dirty observation. after=L{i} => the
+        # write landed inside layer i's execution (window (L{i-1}, L{i}]).
+        print("\n== [mf-trap] first dirty occurrence per rank (layer-resolved) ==")
+        seen_rank = set()
+        firsts = []
+        for h in mftrap:  # parse order == log order
+            rk = (h["dp"], h["cp"], h["tp"])
+            if rk in seen_rank:
+                continue
+            seen_rank.add(rk)
+            firsts.append(h)
+        for h in firsts:
+            print(
+                f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: "
+                f"after={h['label']} row={h['row']} col={h['col']} "
+                f"val={h['val']} seq={h['seq']}"
+            )
+        _lyr = []
+        for h in firsts:
+            _m = re.match(r"L(\d+)$", str(h["label"]))
+            if _m:
+                _lyr.append((int(_m.group(1)), h))
+        if _lyr:
+            _lyr.sort(key=lambda x: x[0])
+            l0, h0 = _lyr[0]
+            print(
+                f"  GLOBAL earliest layer catch: L{l0} "
+                f"(DP{h0['dp']} CP{h0['cp']} TP{h0['tp']}) -- the first "
+                "model layer whose execution window contains a dirty write"
+            )
+        else:
+            print(
+                "  (no L{i} catches -- every first hit is outside the layer "
+                "loop: 'start' = pre-layer0, PL: = post-loop, GL:/glue:/gap: "
+                "= scheduler glue)"
+            )
 
     if layer_hits:
         print("\n== [mf-trap] writer catches (layer windows) ==")
@@ -1587,145 +1632,196 @@ def main():
         fired += len(mfscatter)
 
         def _split_slots(body):
-            """Split a {k: v, ...} body into scatter-loc vs page-table slots."""
-            sc, pt, fl = {}, {}, {}
+            """Split a {k: v, ...} body into scatter-loc vs page-table slots.
+
+            §24.56: radix:*/swa:* tree-value entries form their own group."""
+            sc, pt, fl, tv = {}, {}, {}, {}
             try:
                 d = ast.literal_eval(body)
                 if isinstance(d, dict):
                     for k, v in d.items():
                         if k.startswith("swapt") or k.startswith("cmp") or k.startswith("c4topk"):
                             pt[k] = v
+                        elif k.startswith("radix:") or k.startswith("swa:"):
+                            tv[k] = v
                         elif "fallback" in k:
                             fl[k] = v
                         else:
                             sc[k] = v
             except (ValueError, SyntaxError):
                 sc["<unparsed>"] = body
-            return sc, pt, fl
+            return sc, pt, fl, tv
 
-        # §24.52 single-core A/B verdict guide (env: SGL_LI_SINGLE_CORE=1,
-        # fingerprint line "[li-single-core] ACTIVE" in the server log).
-        print(
-            "      -> VERDICT (§24.52 single-core A/B): run with "
-            "SGL_LI_SINGLE_CORE=1 and compare 'c4topk:proc-junk' against the "
-            "same workload without it. Junk GONE with =1 and BACK without it "
-            "=> the multi-core split / LD reduce race is CONVICTED "
-            "(kernel-side; collect source lines + co-occurrence log for the "
-            "CANN defect report). Junk PERSISTS on a single core => "
-            "kernel-internal single-core path or upstream input; weigh "
-            "'c4topk:jrc:negrow/negcol' below (padding vs scattered)."
-        )
-        any_pt = False
-        for h in mfscatter[: args.max_report]:
-            sc, pt, fl = _split_slots(h["body"])
-            # §24.51 qli:* shape slots ride in the same dict (scatter group).
-            qli = {k: v for k, v in sc.items() if k.startswith("qli:")}
-            for k in qli:
-                sc.pop(k, None)
-            if qli:
-                print(
-                    f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: "
-                    f"qli-geometry {qli}"
-                )
-            if sc:
-                print(
-                    f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: {sc}"
-                )
-            if fl:
-                print(
-                    f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: paths {fl}"
-                )
-            if pt:
-                any_pt = True
-                print(
-                    f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: pagetables {pt}"
-                )
-        print(
-            "      -> VERDICT (scatter slots): OOB locs reached a clamped "
-            "scatter entry; 'compressor-state' present => S1 VALUE-entry "
-            "convicted (garbage positions/req_pool_indices -> ring state_loc "
-            "OOB -> fused compressor fp32 ring write lands outside the ring); "
-            "'compressor-index:hi' => S1 KERNEL-INDEX convicted (seqused + "
-            "coff*cmpRatio exceeds the table width -- the kernel's column "
-            "read runs past the table, pulling off-table memory in as "
-            "stateLoc; verify-path draft-augmented seq_lens is the prime "
-            "suspect); 'compressor-index:bs' => table batch-dim != live "
-            "batch size (kernel batchIdx reads past the table's batch "
-            "axis); 'swa'/'compress' => S2/S3 family "
-            "(npu_scatter_nd_update_/index_put OOB)."
-        )
-        print(
-            "      -> VERDICT (§24.47 b2b + produce-time): 'swa-b2b' > 0 "
-            "=> the S2 set_swa_buffer index_put (or the ops queued "
-            "between the two same-stream checks) dirtied ACTIVE r2t "
-            "rows -- S2 convicted (contradicts Run 30's fp32 payload "
-            "family; re-examine). 'swa-b2b' == 0 across a run WITH "
-            "catches => S2 terminally excluded. "
-            "'c4topk:proc-junk' > 0 => the lightning-indexer kernel "
-            "EMITTED garbage indices (source) -> CANN op dump / tiling "
-            "audit of npu_quant_lightning_indexer. 'c4topk:proc-junk' "
-            "== 0 while attention-time 'c4topk:junk' > 0 (§24.46) => "
-            "the buffer was CLEAN at production and dirtied in "
-            "between (victim) -> reopen the writer model, weigh the "
-            "logprob/move_logprobs family (fp32 payload, "
-            "glue:entry catch)."
-        )
-        print(
-            "      -> VERDICT (§24.48/§24.50 seq-lens audit): "
-            "'qseq:min' < 0 or 'qseq:max'/'kseq:max' beyond the max "
-            "context (or 'kseq:min' < 0) => the HOST-side lens tensor "
-            "was ALREADY dirty at the indexer call -> every "
-            "indiceOutOffset (kernel.h:535-546 prefix-sum arithmetic) "
-            "is garbage, and the proc-junk output is DOWNSTREAM of bad "
-            "lens -> fix the H2D/build path (cumsum(extend_seq_lens)), "
-            "not the kernel. qseq/kseq clean while "
-            "'c4topk:proc-junk' > 0 => lens are innocent: the garbage "
-            "is INTERNAL to the kernel -> §24.50 static-audit reading "
-            "(score-bit pattern -2.0/NaN landing in index slots; prime "
-            "suspect = multi-core LD reduction workspace race, value "
-            "region never initialized) -> convict via single-core A/B "
-            "(force usedCoreNum=1, disables S2 split + LD path: "
-            "garbage vanishes = LD race convicted) + DUMP_OP on the "
-            "catching rank only."
-        )
-        if any_pt:
+        # ---- default compact mode: per-slot aggregate, first-nonzero only --
+        # One line per slot: max value, first nonzero (ts, rank). The long
+        # per-line dump and verdict texts stay behind --verbose.
+        def _slot_aggregate():
+            agg = {}  # slot -> {max, first}
+            for h in mfscatter:
+                try:
+                    d = ast.literal_eval(h["body"])
+                except (ValueError, SyntaxError):
+                    d = {"<unparsed>": h["body"]}
+                if not isinstance(d, dict):
+                    continue
+                for k, v in d.items():
+                    if not isinstance(v, int):
+                        continue
+                    a = agg.setdefault(k, {"max": 0, "first": None})
+                    if v > a["max"]:
+                        a["max"] = v
+                    if v > 0 and a["first"] is None:
+                        a["first"] = (h["ts"], h["dp"], h["cp"], h["tp"])
+            return agg
+
+        agg = _slot_aggregate()
+
+        if args.verbose:
+            any_pt = False
+            for h in mfscatter[: args.max_report]:
+                sc, pt, fl, tv = _split_slots(h["body"])
+                for grp, name in (
+                    (sc, None), (fl, "paths"), (tv, "treevalues"),
+                    (pt, "pagetables"),
+                ):
+                    if not grp:
+                        continue
+                    if name:
+                        print(
+                            f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}:"
+                            f" {name} {grp}"
+                        )
+                        if name == "pagetables":
+                            any_pt = True
+                    else:
+                        print(
+                            f"  {h['ts']} DP{h['dp']} CP{h['cp']} TP{h['tp']}: {grp}"
+                        )
+            if len(mfscatter) > args.max_report:
+                print("  (more suppressed)")
             print(
-                "      -> VERDICT (page tables, §24.43): 'swapt*:neg' > 0 => "
-                "the CANN attention kernel received NEGATIVE swa page ids "
-                "(full_to_swa -1 sentinel / graph tail fill) and computes "
-                "kv_base + page*stride BELOW the swa pool base -> the r2t "
-                "last-rows corruption geometry; check swapt:min (== -1 "
-                "sentinel vs other garbage) and swapt:negrow/negcol for the "
-                "first offending request/page slot. 'swapt*:hi' > 0 with "
-                "'swapt:fulltable-fallback' > 0 => the eager path fed "
-                "FULL-pool page ids into the swa kernel (index-space "
-                "mismatch, positive OOB). 'cmp4pt/cmp128pt' same reading "
-                "for the compressed tables; 'c4topk:min < 0' => topk sparse "
-                "indices negative. §24.45: '*:tailneg' - '*:neg' = -1 mass "
-                "OUTSIDE the valid region (the graph tables' -1 tail past "
-                "the seqused-derived width); a catch with large tailneg - "
-                "neg on a rank whose eager tables carry no -1 fill => the "
-                "kernel's read width EXCEEDS the valid width and it walked "
-                "into the -1 tail -> kv_base - stride below-pool writes. "
-                "All-zero page-table slots => the "
-                "kernel's INPUT tables were clean: remaining suspect is a "
-                "kernel-INTERNAL addressing bug (go CANN op dump / tiling "
-                "audit)."
+                "      -> VERDICT (scatter slots): OOB locs reached a clamped "
+                "scatter entry; 'compressor-state' present => S1 VALUE-entry "
+                "convicted (garbage positions/req_pool_indices -> ring state_loc "
+                "OOB -> fused compressor fp32 ring write lands outside the ring); "
+                "'compressor-index:hi' => S1 KERNEL-INDEX convicted (seqused + "
+                "coff*cmpRatio exceeds the table width -- the kernel's column "
+                "read runs past the table, pulling off-table memory in as "
+                "stateLoc; verify-path draft-augmented seq_lens is the prime "
+                "suspect); 'compressor-index:bs' => table batch-dim != live "
+                "batch size (kernel batchIdx reads past the table's batch "
+                "axis); 'swa'/'compress' => S2/S3 family "
+                "(npu_scatter_nd_update_/index_put OOB)."
             )
-        print(
-            "      -> VERDICT (§24.52 junk-position, c4topk:jrc): "
-            "'c4topk:jrc:negrow/negcol' (INT_MAX = none seen) name the FIRST "
-            "junk (row, col) in the produce-time topk. Junk first-appearance "
-            "in LOW rows / TAIL cols matching the batch's causal geometry "
-            "(short-context rows' tail topk slots / partial-block tail) => "
-            "padding-family reading (fill path read uninitialized memory "
-            "instead of writing -1). Junk coordinates SCATTERED / same "
-            "(row,col) repeating across ranks with the same lens => "
-            "deterministic kernel indexing bug; coordinates varying run to "
-            "run at the same shape => race (weigh the single-core A/B above)."
-        )
-        if len(mfscatter) > args.max_report:
-            print("  (more suppressed)")
+            print(
+                "      -> VERDICT (§24.47 b2b + produce-time): 'swa-b2b' > 0 "
+                "=> the S2 set_swa_buffer index_put (or the ops queued "
+                "between the two same-stream checks) dirtied ACTIVE r2t "
+                "rows -- S2 convicted (contradicts Run 30's fp32 payload "
+                "family; re-examine). 'swa-b2b' == 0 across a run WITH "
+                "catches => S2 terminally excluded. "
+                "'c4topk:proc-junk' > 0 => the lightning-indexer kernel "
+                "EMITTED garbage indices on VALID rows (source) -> CANN op "
+                "dump / tiling audit of npu_quant_lightning_indexer. "
+                "'c4topk:proc-junk' == 0 while attention-time "
+                "'c4topk:junk' > 0 (§24.46) => the buffer was CLEAN at "
+                "production and dirtied in between (victim) -> reopen the "
+                "writer model, weigh the logprob/move_logprobs family "
+                "(fp32 payload, glue:entry catch)."
+            )
+            if any_pt:
+                print(
+                    "      -> VERDICT (page tables, §24.43): 'swapt*:neg' > 0 => "
+                    "the CANN attention kernel received NEGATIVE swa page ids "
+                    "(full_to_swa -1 sentinel / graph tail fill) and computes "
+                    "kv_base + page*stride BELOW the swa pool base -> the r2t "
+                    "last-rows corruption geometry; check swapt:min (== -1 "
+                    "sentinel vs other garbage) and swapt:negrow/negcol for the "
+                    "first offending request/page slot. 'swapt*:hi' > 0 with "
+                    "'swapt:fulltable-fallback' > 0 => the eager path fed "
+                    "FULL-pool page ids into the swa kernel (index-space "
+                    "mismatch, positive OOB). 'cmp4pt/cmp128pt' same reading "
+                    "for the compressed tables; 'c4topk:min < 0' => topk sparse "
+                    "indices negative. §24.45: '*:tailneg' - '*:neg' = -1 mass "
+                    "OUTSIDE the valid region (the graph tables' -1 tail past "
+                    "the seqused-derived width); a catch with large tailneg - "
+                    "neg on a rank whose eager tables carry no -1 fill => the "
+                    "kernel's read width EXCEEDS the valid width and it walked "
+                    "into the -1 tail -> kv_base - stride below-pool writes. "
+                    "All-zero page-table slots => the "
+                    "kernel's INPUT tables were clean: remaining suspect is a "
+                    "kernel-INTERNAL addressing bug (go CANN op dump / tiling "
+                    "audit)."
+                )
+        else:
+            groups = {
+                "treevalues (§24.56)": [k for k in agg if k.startswith(("radix:", "swa:"))],
+                "pagetables (§24.43)": [k for k in agg if k.startswith(("swapt", "cmp", "c4topk"))],
+                "scatter-loc": [k for k in agg if not k.startswith(("radix:", "swa:", "swapt", "cmp", "c4topk"))],
+            }
+            for gname, keys in groups.items():
+                if not keys:
+                    continue
+                print(f"  -- {gname} --")
+                for k in sorted(keys):
+                    a = agg[k]
+                    if a["first"]:
+                        ts, dp, cp_, tp = a["first"]
+                        print(
+                            f"    {k:28s} max={a['max']:<12d} first@ "
+                            f"{ts} DP{dp} CP{cp_} TP{tp}"
+                        )
+                    else:
+                        print(f"    {k:28s} 0")
+            if len(mfscatter) > args.max_report:
+                print("  (more suppressed)")
+        # §24.54/§24.56 compact verdicts (always printed, both modes): the
+        # current discriminating questions only.
+        def _nz(k):
+            return agg.get(k, {}).get("max", 0) > 0
+
+        tv_verdicts = []
+        if _nz("radix:ins-junk"):
+            tv_verdicts.append(
+                "ins-junk>0: garbage ALREADY in the r2t row at insert-read -- "
+                "writer acted BEFORE this cache call (walk the glue chain UP)"
+            )
+        if _nz("radix:match-junk"):
+            tv_verdicts.append(
+                "match-junk>0: dirty node reachable in the tree; the :910 "
+                "write-back itself replants garbage into r2t"
+            )
+        if _nz("swa:map-oob") or _nz("swa:fswa-oob"):
+            tv_verdicts.append(
+                "swa map/fswa-oob>0: dirty indices reached the UNCLAMPED "
+                "full_to_swa scatter (§22 crash family)"
+            )
+        if tv_verdicts:
+            fired += len(tv_verdicts)
+            for v in tv_verdicts:
+                print(f"  -> VERDICT (§24.56 tree values): {v}")
+        elif any(k.startswith(("radix:", "swa:")) for k in agg):
+            print(
+                "  -> VERDICT (§24.56 tree values): all tree-value slots 0 -- "
+                "radix insert/match/free paths carried only clean indices; "
+                "candidates 1/2 exonerated in this window (stream-C residue / "
+                "B prologue remain)"
+            )
+        pj, pp = agg.get("c4topk:proc-junk", {}).get("max", 0), agg.get(
+            "c4topk:proc-pad", {}
+        ).get("max", 0)
+        if pj > 0:
+            print(
+                f"  -> VERDICT (§24.54): proc-junk={pj} on VALID rows -- "
+                "lightning-indexer emitted garbage (source); CANN op dump / "
+                "tiling audit"
+            )
+        elif pp > 0:
+            print(
+                f"  -> VERDICT (§24.54): proc-junk=0, proc-pad={pp} -- all junk "
+                "was TND padding rows (benign, never read by attention); "
+                "indexer EXONERATED, writer search continues per §24.56"
+            )
     elif mfraw:
         print(
             "\n== [mf-scatter] S1/S2 discriminator: ZERO [mf-scatter] lines "

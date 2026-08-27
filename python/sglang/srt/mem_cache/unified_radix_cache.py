@@ -844,6 +844,29 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        # §24.56 (candidate 2 discriminator): count garbage in the r2t row
+        # AT INSERT-READ TIME. cache_unfinished_req reads the row here and
+        # copies page-aligned slices into the tree (insert_params.value);
+        # if garbage is already present, the tree replants it and the
+        # FreeDeviceKV / free_swa mapping scatters (swa.py:346/364, no
+        # clamp) spread it -- the §22 row-clobber crash family. ins-junk>0
+        # at FIRST read => the writer acted BEFORE this cache call (walk
+        # the glue chain upward); ins-junk==0 while a catch convicts this
+        # window => the row was clean here and the tree path replants
+        # nothing (candidate 2 exonerated, reopen stream-C residue).
+        # Zero-sync discipline: device-side counter, read only inside
+        # [mf-scatter]'s existing piggyback D2H.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob as _radix_count_junk,
+            )
+
+            _iv = kv_indices_orig.to(torch.int64)
+            _ijunk = (_iv < 0) & (_iv != -1)
+            _ijunk |= _iv >= 1 << 30
+            _radix_count_junk(_ijunk.reshape(-1), "radix:ins-junk")
+        except Exception:
+            pass
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
@@ -899,6 +922,26 @@ class UnifiedRadixCache(BasePrefixCache):
         # Match prefix
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
+        # §24.56 (candidate 2 discriminator, write-side): audit the values
+        # the :910 write-back replants into r2t. new_indices comes from the
+        # tree walk (node-held device values); match-junk>0 while ins-junk==0
+        # => a DIRTY NODE is reachable in the tree (garbage entered via an
+        # earlier insert -- locate which node), and the write-back itself
+        # becomes the r2t junk writer. match-junk==0 => the tree replants
+        # only clean indices and candidate 1 (write-back) is exonerated.
+        # Zero-sync: device-side counter, piggyback D2H readout.
+        try:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                count_scatter_oob as _radix_count_junk,
+            )
+
+            if torch.is_tensor(new_indices) and new_indices.numel():
+                _mv = new_indices.to(torch.int64)
+                _mjunk = (_mv < 0) & (_mv != -1)
+                _mjunk |= _mv >= 1 << 30
+                _radix_count_junk(_mjunk.reshape(-1), "radix:match-junk")
+        except Exception:
+            pass
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (

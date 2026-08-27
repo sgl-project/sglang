@@ -1137,6 +1137,16 @@ class C4IndexerAscendBackendMixin:
         # the "produce-time" prefix: proc:junk > 0 => indexer EMITTED it;
         # proc:junk == 0 while the attention-time c4topk:junk > 0 => the
         # buffer was clean at production and dirtied in between.
+        # §24.54 (Run 33): TND PADDING-ROW EXCLUSION. The indexer kernel's
+        # zero-work path (lens_k/cmpRatio == 0 -> DealActSeqLenIsZero) and
+        # the BSND-only invalid-S1 cleanup (service_vector.h:473) leave the
+        # TND output's padding rows (rows >= sum(lens_q)) NEVER INITIALIZED
+        # -- run 33's dumps showed exactly that: junk_per_row=[0,N] on every
+        # call, float bit patterns from recycled memory, benign (the
+        # attention kernel never reads those rows: topKBaseOffset is driven
+        # by cu_seqlens_q). Masking to valid rows keeps this audit a real
+        # signal instead of a padding detector; padding-row junk is still
+        # tracked separately as proc-pad for regression visibility.
         try:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 count_scatter_oob,
@@ -1145,7 +1155,24 @@ class C4IndexerAscendBackendMixin:
             _p64 = topk_idxs.reshape(-1).to(torch.int64)
             _pjunk = (_p64 < 0) & (_p64 != -1)
             _pjunk |= _p64 >= (1 << 31) - 2
-            count_scatter_oob(_pjunk, "c4topk:proc-junk")
+            _pjunk = _pjunk.view(topk_idxs.shape[0], -1)
+            # TND cumsum-ending lens (kernel.h GetActualSeqLen, no leading 0):
+            # rows [0, lens[-1]) are the kernel's own valid output rows; the
+            # rest are never written (Run 33) and never read by attention
+            # (topKBaseOffset is cu_seqlens_q-driven). Device-side scalar
+            # compare only -- no D2H, zero-sync discipline preserved.
+            _lensq = fm.actual_seq_lengths_q
+            if _lensq is not None and _lensq.numel() > 0:
+                _vrows = _lensq.reshape(-1)[-1].to(torch.int64).reshape(1)
+            else:
+                _vrows = torch.full(
+                    (1,), topk_idxs.shape[0], dtype=torch.int64, device=topk_idxs.device
+                )
+            _valid = torch.arange(
+                topk_idxs.shape[0], device=topk_idxs.device, dtype=torch.int64
+            ).unsqueeze(1) < _vrows
+            count_scatter_oob((_pjunk & _valid).reshape(-1), "c4topk:proc-junk")
+            count_scatter_oob((_pjunk & ~_valid).reshape(-1), "c4topk:proc-pad")
             # §24.52 (causal-padding hypothesis): record WHERE the junk sits.
             # If the junk is the causal padding region (short-context rows'
             # tail topk slots or the partial-block tail), its first (row,col)
@@ -1155,8 +1182,8 @@ class C4IndexerAscendBackendMixin:
                 record_oob_first_rc,
             )
 
-            _j2d = _pjunk.view(topk_idxs.shape[0], -1)
-            record_oob_first_rc("c4topk:jrc", _j2d)
+            _j2d = _pjunk
+            record_oob_first_rc("c4topk:jrc", _j2d & _valid)
             # §24.51 (scheme A): record the op geometry of THIS call so the
             # catch-time [mf-scatter] readout names the victim batch's indexer
             # shapes -- shape-trigger vs data-trigger without any dump.
@@ -1175,12 +1202,14 @@ class C4IndexerAscendBackendMixin:
             pass
         # §24.53 replay-capture dump: junk-triggered ('1') or unconditional
         # ('all'), bounded by _LI_DUMP_MAX. The .item() sync is accepted --
-        # this is an explicit debug mode, never a production path.
+        # this is an explicit debug mode, never a production path. The gate
+        # uses VALID-row junk only (Run 33: padding rows are always dirty
+        # and would make every call dump).
         global _LI_DUMP_SEQ
         if _LI_DUMP_MODE != "0" and _LI_DUMP_SEQ < _LI_DUMP_MAX:
             _li_junk = -1
             try:
-                _li_junk = int(_pjunk.sum().item())
+                _li_junk = int(_pjunk[_valid.reshape(-1)].sum().item())
             except Exception:
                 pass
             if _LI_DUMP_MODE == "all" or _li_junk > 0:
