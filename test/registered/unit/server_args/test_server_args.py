@@ -2198,19 +2198,20 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaises(ValueError):
             args._handle_a2a_moe()
 
-    def test_declarations_materialize_ep_size_and_fusion(self):
-        from sglang.srt.arg_groups.overrides import materialize_declarations
+    def test_declarations_resolve_ep_size_and_fusion(self):
+        from sglang.srt.arg_groups.overrides import resolved_view
 
         args = self._args(moe_runner_backend="auto", tp_size=2)
         args._handle_a2a_moe()
-        materialize_declarations(args)
-        self.assertEqual(args.ep_size, args.tp_size)
-        self.assertTrue(args.disable_shared_experts_fusion)
+        self.assertEqual(resolved_view(args).ep_size, args.tp_size)
+        self.assertTrue(resolved_view(args).disable_shared_experts_fusion)
 
     def test_auto_runner_defaults_to_deep_gemm(self):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
         args = self._args(moe_runner_backend="auto")
         args._handle_a2a_moe()
-        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+        self.assertEqual(resolved_view(args).moe_runner_backend, "deep_gemm")
 
     def test_unsupported_runner_rejected(self):
         args = self._args(moe_runner_backend="flashinfer_trtllm")
