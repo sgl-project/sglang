@@ -1358,9 +1358,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
+        if not (_is_cuda or _use_aiter_gfx95):
+            return (
+                "Shared experts fusion requires CUDA or the supported "
+                "AITER ROCm path."
+            )
+        if _is_cuda and _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
