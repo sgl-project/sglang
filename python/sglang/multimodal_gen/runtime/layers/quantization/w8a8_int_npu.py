@@ -34,13 +34,13 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
     ) -> None:
         super().__init__()
         if not current_platform.is_npu():
-            raise ValueError("w8a8_int8 diffusion quantization requires Ascend NPU")
+            raise ValueError("w8a8_int diffusion quantization requires Ascend NPU")
         self.ignored_layers = ignored_layers or []
         self.packed_modules_mapping = packed_modules_mapping or {}
 
     @classmethod
     def get_name(cls) -> str:
-        return "w8a8_int8"
+        return "w8a8_int"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -84,7 +84,7 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
 class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: NPUOnlineW8A8DiffusionConfig) -> None:
         self.quant_config = quant_config
-        self.spec = get_npu_online_integer_quant_spec("w8a8_int8")
+        self.spec = get_npu_online_integer_quant_spec("w8a8_int")
         assert self.spec is not None
 
     def create_weights(
@@ -113,7 +113,7 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
         weight = layer.weight.data
         if weight.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                "w8a8_int8 diffusion quantization requires FP16 or BF16 "
+                "w8a8_int diffusion quantization requires FP16 or BF16 "
                 f"weights, got {weight.dtype}"
             )
         if not weight.is_npu:
@@ -142,7 +142,7 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
         output_dtype = x.dtype
         if output_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                "w8a8_int8 diffusion quantization requires FP16 or BF16 "
+                "w8a8_int diffusion quantization requires FP16 or BF16 "
                 f"activations, got {output_dtype}"
             )
         quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(

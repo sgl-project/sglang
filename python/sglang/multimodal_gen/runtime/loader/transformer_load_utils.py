@@ -1021,7 +1021,7 @@ def _resolve_quant_config(
             "fp8",
             "mxfp4",
             "kitchen_int8",
-            "w8a8_int8",
+            "w8a8_int",
         }:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None

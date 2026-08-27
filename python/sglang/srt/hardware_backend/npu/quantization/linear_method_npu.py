@@ -159,7 +159,7 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
 class NPUOnlineW8A8Int8LinearMethod(_NPUOnlineIntegerLinearMethod):
     """Online W8A8 INT8 method for unquantized dense NPU linear layers."""
 
-    quant_mode = "w8a8_int8"
+    quant_mode = "w8a8_int"
 
 
 _W8A8_LINEAR_PROJECTIONS = frozenset(
@@ -185,7 +185,7 @@ def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]
     projection = prefix.rsplit(".", 1)[-1]
     if projection not in _W8A8_LINEAR_PROJECTIONS:
         return None
-    # w4a4_int4 is mixed precision: dense projections stay W8A8 while MoE
+    # w4a4_int is mixed precision: dense projections stay W8A8 while MoE
     # expert projections use W4A4.
     return NPUOnlineW8A8Int8LinearMethod()
 

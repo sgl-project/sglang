@@ -1175,10 +1175,10 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```mxfp8``` linear with online quantization (`--quantization mxfp8`)
     - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
     - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
-    - [x]  ```w8a8_int8``` linear with online quantization on Ascend (`--quantization w8a8_int8`)
+    - [x]  ```w8a8_int``` linear with online quantization on Ascend (`--quantization w8a8_int`)
 
 For an unquantized diffusion transformer on Ascend, `--quantization
-w8a8_int8` converts supported linear weights after loading. Activations are
+w8a8_int` converts supported linear weights after loading. Activations are
 dynamically quantized per token, while layer outputs are restored to the
 transformer's original FP16/BF16 dtype. Use
 `--quantization-ignored-layers PATTERN...` to retain accuracy-sensitive layers

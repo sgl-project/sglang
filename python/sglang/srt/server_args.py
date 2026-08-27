@@ -182,8 +182,8 @@ QUANTIZATION_CHOICES = [
 
 # Ascend online quantization for full-precision checkpoints.
 ONLINE_QUANTIZATION_CHOICES = [
-    "w8a8_int8",
-    "w4a4_int4",
+    "w8a8_int",
+    "w4a4_int",
 ]
 
 W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS = {"Qwen3MoeForCausalLM"}
@@ -4724,13 +4724,13 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.tc_compiler = "eager"
 
     def _validate_npu_online_quantization(self):
-        if self.online_quantization != "w4a4_int4":
+        if self.online_quantization != "w4a4_int":
             return
 
         architectures = self.get_model_config().hf_config.architectures
         if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(architectures):
             raise ValueError(
-                "--online-quantization w4a4_int4 is disabled for dense models "
+                "--online-quantization w4a4_int is disabled for dense models "
                 "because dense W4A4 is inaccurate; it is currently MoE-only. "
                 f"Got architectures={architectures}."
             )

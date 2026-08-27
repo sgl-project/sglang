@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
     NPUMXFP4Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
-from sglang.multimodal_gen.runtime.layers.quantization.w8a8_int8_npu import (
+from sglang.multimodal_gen.runtime.layers.quantization.w8a8_int_npu import (
     NPUOnlineW8A8DiffusionConfig,
 )
 
@@ -44,7 +44,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "kitchen_int8",
-    "w8a8_int8",
+    "w8a8_int",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -62,7 +62,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,
     "kitchen_int8": KitchenInt8Config,
-    "w8a8_int8": NPUOnlineW8A8DiffusionConfig,
+    "w8a8_int": NPUOnlineW8A8DiffusionConfig,
 }
 
 

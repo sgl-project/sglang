@@ -20,14 +20,14 @@ class NPUOnlineIntegerQuantSpec:
 
 
 _ONLINE_INTEGER_QUANT_SPECS = {
-    "w8a8_int8": NPUOnlineIntegerQuantSpec(
-        mode="w8a8_int8",
+    "w8a8_int": NPUOnlineIntegerQuantSpec(
+        mode="w8a8_int",
         weight_dtype=torch.int8,
         activation_dtype=torch.int8,
         dispatcher_output_dtype="int8",
     ),
-    "w4a4_int4": NPUOnlineIntegerQuantSpec(
-        mode="w4a4_int4",
+    "w4a4_int": NPUOnlineIntegerQuantSpec(
+        mode="w4a4_int",
         weight_dtype=torch.quint4x2,
         activation_dtype=torch.quint4x2,
         dispatcher_output_dtype="bf16",
@@ -48,13 +48,13 @@ def get_npu_online_moe_integer_quant_spec(
 ) -> Optional[NPUOnlineIntegerQuantSpec]:
     if mode is None:
         mode = get_server_args().online_quantization
-    if mode != "w4a4_int4":
+    if mode != "w4a4_int":
         return get_npu_online_integer_quant_spec(mode)
     if weight_prefix not in {"w13", "w2"}:
         raise ValueError(
             f"Expected an online MoE w13/w2 weight, got {weight_prefix!r}."
         )
-    return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int4"]
+    return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int"]
 
 
 def validate_npu_online_source_dtype(params_dtype: torch.dtype) -> None:
@@ -156,10 +156,8 @@ def npu_format_online_moe_scale(
         # FP16 output retains FP32 scales.
         return scale.to(torch.bfloat16) if output_dtype == torch.bfloat16 else scale
 
-    scale = scale.transpose(-1, -2).contiguous()
-    # GMM1 expects per-channel [E, N], while GMM2 retains [E, 1, N].
-    if weight_prefix == "w13":
-        scale = scale.squeeze(1)
+    # Keep the known-good per-channel layout used by both W4A4 GMMs.
+    scale = scale.squeeze(-1)
     return _encode_online_int4_scale(scale)
 
 
