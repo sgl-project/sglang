@@ -2107,10 +2107,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # Transfer data
         xfer_kwargs = {}
         if ready_tail is not None:
-            xfer_kwargs = {
-                "backends": ["GPUNETIO"],
-                "custom_param": b"gpunetio_qp=0",
-            }
+            xfer_kwargs = {"backends": ["GPUNETIO"]}
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
             src_descs,

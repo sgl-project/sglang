@@ -738,7 +738,7 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
         frames = sock.send_multipart.call_args.args[0]
         self.assertEqual(frames[11:13], [b"", b""])
 
-    def test_ready_tail_is_last_and_uses_fixed_gpunetio_qp(self):
+    def test_ready_tail_is_last_and_selects_gpunetio(self):
         class TailAgent:
             def __init__(self):
                 self.descs = []
@@ -779,7 +779,7 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
         self.assertEqual(tuple(mgr.agent.descs[1][-1]), (0x4000, 8, 1))
         self.assertEqual(
             mgr.agent.kwargs,
-            {"backends": ["GPUNETIO"], "custom_param": b"gpunetio_qp=0"},
+            {"backends": ["GPUNETIO"]},
         )
 
     def test_generic_can_create_without_posting(self):
