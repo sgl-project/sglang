@@ -347,9 +347,9 @@ def initialize_dp_attention(
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = get_parallel().config.enable_dp_attention
-    dp_size = get_parallel().config.dp_size
-    attn_cp_size = get_parallel().config.attn_cp_size
+    enable_dp_attention = get_parallel().enable_dp_attention
+    dp_size = get_parallel().dp_size
+    attn_cp_size = get_parallel().attn_cp_size
 
     dp.enabled = enable_dp_attention
 
@@ -361,11 +361,8 @@ def initialize_dp_attention(
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if (
-        get_exec().moe.elastic_ep_backend is not None
-        and get_parallel().config.max_ep_size
-    ):
-        _ATTN_DP_RANK = tp_rank + get_parallel().config.ep_join_rank_offset
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
         if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 
@@ -1029,12 +1026,10 @@ def get_moe_cp_size() -> int:
 def is_enable_moe_cp_allgather() -> bool:
     """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE.
 
-    Reads the configured sizes, not the live groups: that very configuration makes
-    ``initialize_model_parallel`` alias ``_MOE_DP`` to ``_ATTN_CP``
-    (``parallel_state.py``), so the live sizes are equal and the comparison would
-    always be false.
+    In that configuration ``initialize_model_parallel`` aliases ``_MOE_DP`` to
+    ``_ATTN_CP``, so the two groups report equal widths.
     """
-    return get_parallel().config.attn_cp_size > get_parallel().config.moe_dp_size
+    return get_parallel().attn_cp_size > get_parallel().moe_dp_size
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

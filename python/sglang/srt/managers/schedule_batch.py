@@ -140,7 +140,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1960,7 +1959,6 @@ def release_req(
     *,
     req: Req,
     remaing_req_count: int,
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -1997,7 +1995,6 @@ def release_req(
 def retract_all(
     *,
     reqs: List[Req],
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -2008,7 +2005,6 @@ def retract_all(
         release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -2843,6 +2839,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def convert_decode_to_extend(self):
+        """View every decode request as a 1-token extend with its context as
+        prefix, making this a plain extend (prefill) batch. Called after the
+        DP mlp-sync when a peer rank runs extend, so this rank replays the
+        extend graphs; requires prepare_for_decode(); token count unchanged.
+        """
+        bs = self.batch_size()
+        self.forward_mode = ForwardMode.EXTEND
+        # Stale residue from this object's life as a prefill batch; the
+        # extend-merge path would exclude (silently drop) that req otherwise.
+        self.chunked_req = None
+        # Also stale residue; None keeps the prefill result path from
+        # re-reporting old prefill stats for what is decode work.
+        self.prefill_stats = None
+        for req in self.reqs:
+            req._refresh_fill_ids()
+            full_len = len(req.full_untruncated_fill_ids)
+            req.set_extend_range(full_len - 1, full_len)
+
+        # Same one-step output_ids delay handling as mix_with_running.
+        delta = 0 if self.enable_overlap else -1
+        self.prefix_lens = [
+            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
+        ]
+        self.extend_lens = [1] * bs
+        self.extend_num_tokens = bs
+        self.extend_logprob_start_lens = [0] * bs
+        self.decoding_reqs = self.reqs
+        self.is_prefill_only = False
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -2877,9 +2903,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_decode(
-        self, server_args: ServerArgs
-    ) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
@@ -2913,12 +2937,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.token_to_kv_pool_allocator,
                 )
                 # Aborting, so a host backup to resume from would be wasted.
-                self.release_req(
-                    idx, len(sorted_indices), server_args, offload_kv=False
-                )
+                self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), server_args):
+            if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
                 # The retraction host pool could not hold the backup and the
@@ -2953,7 +2975,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.req_to_token_pool,
                     self.token_to_kv_pool_allocator,
                 )
-            self.release_req(last_idx, 0, server_args, offload_kv=False)
+            self.release_req(last_idx, 0, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -3012,13 +3034,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         idx: int,
         remaing_req_count: int,
-        server_args: ServerArgs,
         offload_kv: bool = True,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
-            server_args=server_args,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
