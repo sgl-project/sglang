@@ -22,6 +22,8 @@ MASK = 0
 DELETE = 1
 SPLIT = 2
 VOCAB_SIZE = 12
+LLADA2_MASK_ID = 156895
+LLADA2_VOCAB_SIZE = 157184
 
 
 def make_config(
@@ -135,6 +137,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_checkpoint_metadata_enables_indel(self, mock_model_config):
+        mock_model_config.return_value.vocab_size = LLADA2_VOCAB_SIZE
         mock_model_config.return_value.hf_config = SimpleNamespace(
             architectures=["LLaDA2MoeModelLM"],
             delete_token_id=9,
@@ -155,6 +158,38 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         self.assertEqual(config.split_token_id, 10)
         self.assertEqual(config.max_running_requests, 1)
         self.assertTrue(config.first_done_first_out_mode)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_invalid_checkpoint_edit_token_ids_are_rejected(self, mock_model_config):
+        mock_model_config.return_value.vocab_size = LLADA2_VOCAB_SIZE
+        server_args = SimpleNamespace(
+            dllm_algorithm="JointThresholdInDel",
+            model_path="local/indel-checkpoint",
+            revision=None,
+            max_running_requests=4,
+            dllm_algorithm_config=None,
+            dllm_fdfo=False,
+        )
+        test_cases = [
+            ("boolean", True, 10, "delete_token_id must be an integer token ID"),
+            ("non_integer", 1.5, 10, "delete_token_id must be an integer token ID"),
+            ("negative", -1, 10, "delete_token_id must be within"),
+            ("upper_bound", 9, LLADA2_VOCAB_SIZE, "split_token_id must be within"),
+            ("same_edit_ids", 9, 9, "token IDs must be distinct"),
+            ("delete_is_mask", LLADA2_MASK_ID, 10, "token IDs must be distinct"),
+            ("split_is_mask", 9, LLADA2_MASK_ID, "token IDs must be distinct"),
+        ]
+
+        for case_name, delete_token_id, split_token_id, error_pattern in test_cases:
+            with self.subTest(case=case_name):
+                mock_model_config.return_value.hf_config = SimpleNamespace(
+                    architectures=["LLaDA2MoeModelLM"],
+                    delete_token_id=delete_token_id,
+                    split_token_id=split_token_id,
+                )
+
+                with self.assertRaisesRegex(ValueError, error_pattern):
+                    DllmConfig.from_server_args(server_args)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_incomplete_checkpoint_edit_token_ids_are_rejected(self, mock_model_config):
