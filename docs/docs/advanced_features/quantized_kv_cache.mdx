@@ -97,12 +97,37 @@ materialize a full BF16 cache. Prefill gathers and dequantizes the paged prefix
 into a BF16 compatibility workspace for FlashMLA sparse-prefill; only decode is
 fused, and ordinary decode supports CUDA Graph replay.
 
+Prefill context parallelism is supported with the CP-v2 interleave strategy.
+Each CP rank first all-gathers the BF16 latent K/RoPE rows into logical token
+order, then writes a replicated NVFP4 cache. This favors a simple correctness
+path; it does not shard KV-cache capacity or reduce the BF16 CP communication
+volume. For TP8, use:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --tp-size 8 \
+    --dp-size 1 \
+    --enable-prefill-cp \
+    --cp-strategy interleave \
+    --attn-cp-size 8 \
+    --attention-backend dsa \
+    --dsa-prefill-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_kv \
+    --kv-cache-dtype nvfp4 \
+    --page-size 64
+```
+
+Prefill CUDA Graph is disabled while Prefill CP is active; ordinary decode
+CUDA Graph remains available.
+
 This path currently rejects non-SM100 devices, other DSA model layouts, local
-query-head counts other than 64, page sizes other than 64, and prefill CP or
-DCP configurations. HiSparse is not supported on this path. The native
-FlashMLA operator must be rebuilt from a source revision that includes the
-SM100 NVFP4 specialization; a missing operator is reported at backend
-initialization instead of silently falling back to an unfused decode path.
+query-head counts other than 64, page sizes other than 64, DCP, non-interleave
+Prefill CP, Prefill CP decode attention-TP, and DSA cache layer splitting.
+HiSparse is not supported on this path. The native FlashMLA operator must be
+rebuilt from a source revision that includes the SM100 NVFP4 specialization; a
+missing operator is reported at backend initialization instead of silently
+falling back to an unfused decode path.
 
 ### Scaling Factors
 

@@ -1479,7 +1479,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_prefill_cp=False,
+                cp_strategy=None,
                 dcp_size=1,
+                enable_dsa_cache_layer_split=False,
+                enable_cp_decode_attn_tp=False,
                 enable_hisparse=False,
             )
             defaults.update(kw)
@@ -1530,23 +1533,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
                     with self.assertRaisesRegex(ValueError, "specialized for GLM-5.2"):
                         _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="nvfp4"))
-                    for topology in (
-                        {"enable_prefill_cp": True},
-                        {"dcp_size": 2},
-                    ):
-                        with (
-                            self.subTest(topology=topology),
-                            self.assertRaisesRegex(
-                                ValueError, "does not yet support.*context parallelism"
-                            ),
-                        ):
-                            _dsa_kv_cache_dtype_default(
-                                _view(
-                                    arch="GlmMoeDsaForCausalLM",
-                                    kv_cache_dtype="nvfp4",
-                                    **topology,
-                                )
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
                             )
+                        ),
+                        {},
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not yet support decode context parallelism"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                dcp_size=2,
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "only with --cp-strategy=interleave"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="zigzag",
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not yet support.*cache-layer-split"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                                enable_dsa_cache_layer_split=True,
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "requires H64 attention-DP decode"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                                enable_cp_decode_attn_tp=True,
+                            )
+                        )
                     with self.assertRaisesRegex(
                         ValueError, "does not yet support HiSparse"
                     ):

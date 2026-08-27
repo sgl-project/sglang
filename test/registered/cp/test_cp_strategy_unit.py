@@ -1149,6 +1149,78 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertTrue(torch.equal(full_k_nope, full_latent[:, :3].unsqueeze(1)))
         self.assertTrue(torch.equal(full_k_rope, full_latent[:, 3:].unsqueeze(1)))
 
+    def test_interleave_materialized_glm_kv_writes_identical_nvfp4_rows(self):
+        from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+            NVFP4_BYTES_PER_TOKEN,
+            quantize_nvfp4_k_cache_into_reference,
+        )
+
+        cp_size = 4
+        total_tokens = 65
+        generator = torch.Generator().manual_seed(20260827)
+        k_nope = torch.randn(
+            total_tokens, 1, 512, generator=generator, dtype=torch.bfloat16
+        )
+        k_rope = torch.randn(
+            total_tokens, 1, 64, generator=generator, dtype=torch.bfloat16
+        )
+        full_latent = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)
+        metas, rank_tensors = self._rank_tensors(
+            full_latent,
+            cp_size=cp_size,
+            seq_lens=[total_tokens],
+            extend_seq_lens=[total_tokens],
+        )
+        physical_rank_len = max(tensor.shape[0] for tensor in rank_tensors)
+        padded_rank_tensors = []
+        for tensor in rank_tensors:
+            padded = tensor.new_zeros((physical_rank_len, tensor.shape[1]))
+            padded[: tensor.shape[0]] = tensor
+            padded_rank_tensors.append(padded)
+
+        # Use a non-contiguous physical-location order to verify that the
+        # gathered logical token order remains aligned with out_cache_loc.
+        loc = torch.arange(total_tokens, dtype=torch.int64).roll(17)
+        reference_rows = torch.zeros(
+            total_tokens, 1, NVFP4_BYTES_PER_TOKEN, dtype=torch.uint8
+        )
+        quantize_nvfp4_k_cache_into_reference(
+            k_nope, k_rope, reference_rows, loc, global_scale=1.375
+        )
+
+        for rank in range(cp_size):
+            fb = self._forward_batch(metas[rank], [total_tokens])
+            local = rank_tensors[rank]
+            with (
+                get_parallel().override(
+                    attn_cp_rank=rank,
+                    attn_cp_size=cp_size,
+                ),
+                self._patch_interleave_all_gather(padded_rank_tensors),
+                patch(
+                    "sglang.srt.layers.cp.interleave.torch.cuda.current_stream",
+                    return_value=None,
+                ),
+            ):
+                full_k_nope, full_k_rope = InterleaveCPStrategy(
+                    cp_size=cp_size
+                ).materialize_full_mla_kv(
+                    fb,
+                    object(),
+                    local[:, :512].unsqueeze(1),
+                    local[:, 512:].unsqueeze(1),
+                )
+
+            actual_rows = torch.zeros_like(reference_rows)
+            quantize_nvfp4_k_cache_into_reference(
+                full_k_nope,
+                full_k_rope,
+                actual_rows,
+                loc,
+                global_scale=1.375,
+            )
+            self.assertTrue(torch.equal(actual_rows, reference_rows))
+
 
 if __name__ == "__main__":
     unittest.main()

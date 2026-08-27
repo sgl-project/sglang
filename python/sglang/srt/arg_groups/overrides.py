@@ -1641,11 +1641,25 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
                 f"DSA --kv-cache-dtype={kv_cache_dtype} is currently specialized for "
                 f"GLM-5.2, got architecture {model_arch}"
             )
-        if view.enable_prefill_cp or view.dcp_size > 1:
+        if view.dcp_size > 1:
             raise ValueError(
                 "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 does not yet support "
-                "prefill context parallelism or decode context parallelism; "
-                "disable --enable-prefill-cp and set --dcp-size=1"
+                "decode context parallelism; set --dcp-size=1"
+            )
+        if view.enable_prefill_cp and view.cp_strategy != "interleave":
+            raise ValueError(
+                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 supports prefill "
+                "context parallelism only with --cp-strategy=interleave"
+            )
+        if view.enable_dsa_cache_layer_split:
+            raise ValueError(
+                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 does not yet support "
+                "--enable-dsa-cache-layer-split; use the replicated KV cache"
+            )
+        if view.enable_cp_decode_attn_tp:
+            raise ValueError(
+                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 requires H64 "
+                "attention-DP decode; disable --enable-cp-decode-attn-tp"
             )
         if view.enable_hisparse:
             raise ValueError(
