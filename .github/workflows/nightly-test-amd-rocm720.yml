@@ -1008,11 +1008,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      # `!cancelled()` keeps perf independent of accuracy, as it was when these
-      # were two jobs. Perf stays blocking, matching this workflow's
-      # check-all-jobs, which listed both perf jobs before they were folded in.
       - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
-        if: ${{ !cancelled() }}
         timeout-minutes: 150
         run: |
           > github_summary.md  # Clear summary file
@@ -1064,7 +1060,6 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
-        if: ${{ !cancelled() }}
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
