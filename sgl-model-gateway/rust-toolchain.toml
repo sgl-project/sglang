@@ -1,4 +1,0 @@
-[toolchain]
-channel = "1.90"
-profile = "minimal"
-components = ["clippy"]

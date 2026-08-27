@@ -21,8 +21,6 @@ import aiohttp
 import requests
 from llava.conversation import conv_llava_llama_3
 
-from sglang.utils import normalize_base_url
-
 
 async def send_request(url, data, delay=0):
     await asyncio.sleep(delay)
@@ -33,7 +31,7 @@ async def send_request(url, data, delay=0):
 
 
 async def test_concurrent(args):
-    url = normalize_base_url(args.host, args.port)
+    url = f"{args.host}:{args.port}"
 
     prompt = "<image>\nPlease generate caption towards this image."
     conv_template = copy.deepcopy(conv_llava_llama_3)
@@ -66,7 +64,7 @@ async def test_concurrent(args):
 
 
 def test_streaming(args):
-    url = normalize_base_url(args.host, args.port)
+    url = f"{args.host}:{args.port}"
     prompt = "<image>\nPlease generate caption towards this image."
     conv_template = copy.deepcopy(conv_llava_llama_3)
     conv_template.append_message(role=conv_template.roles[0], message=prompt)
@@ -106,7 +104,7 @@ def test_streaming(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     args = parser.parse_args()
     asyncio.run(test_concurrent(args))

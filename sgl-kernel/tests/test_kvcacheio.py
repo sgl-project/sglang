@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel.kvcacheio import (
@@ -13,14 +11,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
 )
 
-from sglang.srt.utils import get_cuda_version, is_hip
-
-# Skip entire module on CUDA 13.x — segfaults in transfer_kv kernel.
-# Reference failure: https://github.com/sgl-project/sglang/actions/runs/24600433057/job/71938317621?pr=23119
-pytestmark = pytest.mark.skipif(
-    get_cuda_version()[0] >= 13,
-    reason="test_kvcacheio segfaults on CUDA 13.x (sgl-kernel bug)",
-)
+from sglang.srt.utils import is_hip
 
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
@@ -326,7 +317,6 @@ def test_transfer_kv_pf_direct(
     torch.set_default_dtype(dtype)
     device = "cuda"
     torch.cuda.manual_seed(42)
-    test_stream = torch.cuda.Stream()
 
     num_layers = 4
 
@@ -366,16 +356,13 @@ def test_transfer_kv_pf_direct(
             dst_pool_direct = torch.zeros_like(dst_pool_ref)
             torch.cuda.synchronize()
 
-            with torch.cuda.stream(test_stream):
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_pool_ptrs,
-                    [dst_pool_direct],
-                    src_indices_host,
-                    dst_indices_host,
-                    page_size,
-                )
-            test_stream.synchronize()
-
+            transfer_kv_all_layer_direct_lf_pf(
+                src_pool_ptrs,
+                [dst_pool_direct],
+                src_indices_host,
+                dst_indices_host,
+                page_size,
+            )
             for i in range(num_layers):
                 ref_copy_with_indices_pf_direct(
                     src_pool,
@@ -406,16 +393,13 @@ def test_transfer_kv_pf_direct(
             dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
             torch.cuda.synchronize()
 
-            with torch.cuda.stream(test_stream):
-                transfer_kv_all_layer_direct_lf_pf(
-                    src_k_pool_ptrs + src_v_pool_ptrs,
-                    [dst_k_pool_direct, dst_v_pool_direct],
-                    src_indices_host,
-                    dst_indices_host,
-                    page_size,
-                )
-            test_stream.synchronize()
-
+            transfer_kv_all_layer_direct_lf_pf(
+                src_k_pool_ptrs + src_v_pool_ptrs,
+                [dst_k_pool_direct, dst_v_pool_direct],
+                src_indices_host,
+                dst_indices_host,
+                page_size,
+            )
             for i in range(num_layers):
                 ref_copy_with_indices_pf_direct(
                     src_k_pool,
@@ -451,17 +435,14 @@ def test_transfer_kv_pf_direct(
             dst_pool_direct_ptrs = [dst_pool_direct[i] for i in range(num_layers)]
             torch.cuda.synchronize()
 
-            with torch.cuda.stream(test_stream):
-                transfer_kv_per_layer_direct_pf_lf(
-                    [src_pool],
-                    [dst_pool_direct_ptrs[layer_idx_to_test]],
-                    src_indices_host,
-                    dst_indices_host,
-                    layer_idx_to_test,
-                    page_size,
-                )
-            test_stream.synchronize()
-
+            transfer_kv_per_layer_direct_pf_lf(
+                [src_pool],
+                [dst_pool_direct_ptrs[layer_idx_to_test]],
+                src_indices_host,
+                dst_indices_host,
+                layer_idx_to_test,
+                page_size,
+            )
             ref_copy_with_indices_pf_direct(
                 src_pool,
                 dst_pool_ref,
@@ -492,19 +473,17 @@ def test_transfer_kv_pf_direct(
             dst_v_pool_direct_ptrs = [dst_v_pool_direct[i] for i in range(num_layers)]
             torch.cuda.synchronize()
 
-            with torch.cuda.stream(test_stream):
-                transfer_kv_per_layer_direct_pf_lf(
-                    [src_k_pool, src_v_pool],
-                    [
-                        dst_k_pool_direct_ptrs[layer_idx_to_test],
-                        dst_v_pool_direct_ptrs[layer_idx_to_test],
-                    ],
-                    src_indices_host,
-                    dst_indices_host,
-                    layer_idx_to_test,
-                    page_size,
-                )
-            test_stream.synchronize()
+            transfer_kv_per_layer_direct_pf_lf(
+                [src_k_pool, src_v_pool],
+                [
+                    dst_k_pool_direct_ptrs[layer_idx_to_test],
+                    dst_v_pool_direct_ptrs[layer_idx_to_test],
+                ],
+                src_indices_host,
+                dst_indices_host,
+                layer_idx_to_test,
+                page_size,
+            )
 
             ref_copy_with_indices_pf_direct(
                 src_k_pool,
@@ -712,4 +691,4 @@ def test_transfer_kv_page_head(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

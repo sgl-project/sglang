@@ -6,11 +6,10 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=3, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestBuildEagleTree(unittest.TestCase):
@@ -18,7 +17,7 @@ class TestBuildEagleTree(unittest.TestCase):
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
-        bonus_tokens = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
+        verified_id = torch.tensor([29974, 13], device="cuda", dtype=torch.int32)
         score_list = [
             torch.tensor(
                 [
@@ -26,7 +25,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     [[9.7476e-01, 2.2219e-02, 6.5031e-04, 1.3212e-04]],
                 ],
                 dtype=torch.float32,
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -44,7 +43,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -62,7 +61,7 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -80,14 +79,14 @@ class TestBuildEagleTree(unittest.TestCase):
                     ],
                 ],
                 dtype=torch.float32,
-                device=get_device(),
+                device="cuda",
             ),
         ]
         token_list = [
             torch.tensor(
                 [[29896, 29906, 29900, 29945], [13, 2, 29871, 28956]],
                 dtype=torch.int64,
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -128,7 +127,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         259,
                     ],
                 ],
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -169,7 +168,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         2186,
                     ],
                 ],
-                device=get_device(),
+                device="cuda",
             ),
             torch.tensor(
                 [
@@ -210,7 +209,7 @@ class TestBuildEagleTree(unittest.TestCase):
                         13,
                     ],
                 ],
-                device=get_device(),
+                device="cuda",
             ),
         ]
         parents_list = [
@@ -244,7 +243,7 @@ class TestBuildEagleTree(unittest.TestCase):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            bonus_tokens=bonus_tokens,
+            verified_id=verified_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,

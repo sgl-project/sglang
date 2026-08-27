@@ -16,8 +16,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=53, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=82, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=82, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=82, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestPenalty(CustomTestCase):
@@ -62,15 +62,10 @@ class TestPenalty(CustomTestCase):
         print(json.dumps(response.json()))
         print("=" * 100)
 
-    def run_generate_with_prompt(
-        self, prompt, sampling_params, max_tokens=100, seed=None
-    ):
+    def run_generate_with_prompt(self, prompt, sampling_params, max_tokens=100):
         """Helper method to generate text with a specific prompt and parameters."""
-        sampling_params = sampling_params.copy()
         sampling_params.setdefault("temperature", 0.05)
         sampling_params.setdefault("top_p", 1.0)
-        if seed is not None:
-            sampling_params["seed"] = seed
 
         response = requests.post(
             self.base_url + "/v1/chat/completions",
@@ -86,72 +81,54 @@ class TestPenalty(CustomTestCase):
         content = result["choices"][0]["message"]["content"]
         return content
 
-    def _get_vocab_diversity(self, text):
-        """Calculate vocabulary diversity as unique_words / total_words.
-
-        Higher values mean more diverse (less repetitive) text.
-        """
-        words = re.findall(r"\b\w+\b", text.lower())
-        if not words:
-            return 1.0
-        return len(set(words)) / len(words)
+    def count_word_repetitions(self, text, word):
+        """Count how many times a specific word appears in the text."""
+        return len(re.findall(r"\b" + re.escape(word) + r"\b", text.lower()))
 
     def _test_penalty_effect(
         self,
         prompt,
         baseline_params,
         penalty_params,
+        target_word,
         expected_reduction=True,
-        max_tokens=150,
+        max_tokens=50,
     ):
-        """Generic test for penalty effects using vocabulary diversity.
-
-        Measures unique_words/total_words ratio instead of counting a specific
-        word, because penalties affect ALL token probabilities — the model may
-        avoid some repeated tokens while using others more.
-        """
-        # Use higher temperature so penalties can actually affect token selection.
-        # The default temperature (0.05) is near-greedy, making penalty adjustments
-        # to logits ineffective since the top token still dominates.
-        baseline_params = baseline_params.copy()
-        penalty_params = penalty_params.copy()
-        baseline_params.setdefault("temperature", 0.8)
-        penalty_params.setdefault("temperature", 0.8)
-
+        """Generic test for penalty effects."""
         # Run multiple iterations to get more reliable results
-        # Use fixed seeds for deterministic behavior
-        base_seed = 42
-        baseline_diversities = []
-        penalty_diversities = []
+        baseline_counts = []
+        penalty_counts = []
 
         for i in range(5):
-            seed = base_seed + i
             baseline_output = self.run_generate_with_prompt(
-                prompt, baseline_params, max_tokens, seed=seed
+                prompt, baseline_params, max_tokens
             )
             penalty_output = self.run_generate_with_prompt(
-                prompt, penalty_params, max_tokens, seed=seed
+                prompt, penalty_params, max_tokens
             )
 
-            baseline_diversities.append(self._get_vocab_diversity(baseline_output))
-            penalty_diversities.append(self._get_vocab_diversity(penalty_output))
+            baseline_count = self.count_word_repetitions(baseline_output, target_word)
+            penalty_count = self.count_word_repetitions(penalty_output, target_word)
 
-        avg_baseline = sum(baseline_diversities) / len(baseline_diversities)
-        avg_penalty = sum(penalty_diversities) / len(penalty_diversities)
+            baseline_counts.append(baseline_count)
+            penalty_counts.append(penalty_count)
+
+        # Calculate averages
+        avg_baseline = sum(baseline_counts) / len(baseline_counts)
+        avg_penalty = sum(penalty_counts) / len(penalty_counts)
 
         if expected_reduction:
-            # Penalty should increase vocabulary diversity (less repetition)
-            self.assertGreater(
-                avg_penalty,
-                avg_baseline,
-                f"Penalty should increase vocab diversity: {avg_baseline:.3f} → {avg_penalty:.3f}",
-            )
-        else:
-            # Negative penalty should decrease diversity (more repetition)
+            # Simple check: penalty should reduce repetition
             self.assertLess(
                 avg_penalty,
                 avg_baseline,
-                f"Negative penalty should decrease vocab diversity: {avg_baseline:.3f} → {avg_penalty:.3f}",
+                f"Penalty should reduce '{target_word}' repetition: {avg_baseline:.1f} → {avg_penalty:.1f}",
+            )
+        else:
+            self.assertGreater(
+                avg_penalty,
+                avg_baseline,
+                f"Negative penalty should increase '{target_word}' repetition",
             )
 
     def test_default_values(self):
@@ -188,21 +165,23 @@ class TestPenalty(CustomTestCase):
             list(executor.map(self.run_decode, args))
 
     def test_frequency_penalty_reduces_word_repetition(self):
-        """Test that frequency penalty increases vocabulary diversity."""
+        """Test frequency penalty using word repetition."""
         prompt = "Write exactly 10 very small sentences, each containing the word 'data'. Use the word 'data' as much as possible."
         baseline_params = {"frequency_penalty": 0.0, "repetition_penalty": 1.0}
         penalty_params = {"frequency_penalty": 1.99, "repetition_penalty": 1.0}
-        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+        self._test_penalty_effect(prompt, baseline_params, penalty_params, "data")
 
     def test_presence_penalty_reduces_topic_repetition(self):
-        """Test that presence penalty increases vocabulary diversity."""
+        """Test presence penalty using topic repetition."""
         prompt = "Write the word 'machine learning' exactly 20 times in a row, separated by spaces."
         baseline_params = {"presence_penalty": 0.0, "repetition_penalty": 1.0}
         penalty_params = {"presence_penalty": 1.99, "repetition_penalty": 1.0}
-        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+        self._test_penalty_effect(
+            prompt, baseline_params, penalty_params, "machine learning"
+        )
 
     def test_combined_penalties_reduce_repetition(self):
-        """Test that combined penalties increase vocabulary diversity."""
+        """Test combined penalty effects."""
         prompt = "Write exactly 10 short sentences, each containing the word 'data'. Use the word 'data' as much as possible."
         baseline_params = {
             "frequency_penalty": 0.0,
@@ -214,10 +193,12 @@ class TestPenalty(CustomTestCase):
             "presence_penalty": 1.99,
             "repetition_penalty": 1.99,
         }
-        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+        self._test_penalty_effect(
+            prompt, baseline_params, penalty_params, "data", max_tokens=100
+        )
 
     def test_penalty_edge_cases_negative_penalty_values(self):
-        """Test that negative penalties decrease vocabulary diversity."""
+        """Test edge cases with negative penalty values."""
         prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
         baseline_params = {
             "frequency_penalty": 0.0,
@@ -229,15 +210,18 @@ class TestPenalty(CustomTestCase):
             "presence_penalty": -0.25,
             "repetition_penalty": 1.0,
         }
+        # Negative penalties should increase repetition (expected_reduction=False)
         self._test_penalty_effect(
             prompt,
             baseline_params,
             negative_penalty_params,
+            "test",
             expected_reduction=False,
+            max_tokens=60,
         )
 
     def test_penalty_edge_cases_extreme_penalty_values(self):
-        """Test that extreme penalties strongly increase vocabulary diversity."""
+        """Test edge cases with extreme penalty values."""
         prompt = (
             "Write the word 'extreme' exactly 20 times in a row, separated by spaces."
         )
@@ -251,10 +235,14 @@ class TestPenalty(CustomTestCase):
             "presence_penalty": 2.0,
             "repetition_penalty": 2.0,
         }
+        # Extreme penalties should strongly reduce repetition
         self._test_penalty_effect(
             prompt,
             baseline_params,
             extreme_penalty_params,
+            "extreme",
+            expected_reduction=True,
+            max_tokens=80,
         )
 
 

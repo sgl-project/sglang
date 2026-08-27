@@ -22,20 +22,16 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_dtype_str,
     invoke_fused_moe_kernel,
     moe_align_block_size,
 )
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_file_name,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -136,10 +132,8 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
-    use_int4_w4a16: bool,
     topk_ids_list,
     block_shape: List[int] = None,
-    ep_size: int = 1,
     num_iters: int = 100,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
@@ -168,27 +162,6 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
-    elif use_int4_w4a16:
-        w1 = torch.randint(
-            0,
-            255,
-            (
-                num_experts,
-                shard_intermediate_size,
-                hidden_size // 2,
-            ),
-            dtype=torch.uint8,
-        )
-        w2 = torch.randint(
-            0,
-            255,
-            (
-                num_experts,
-                hidden_size,
-                shard_intermediate_size // 4,
-            ),
-            dtype=torch.uint8,
-        )
     else:
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
@@ -206,19 +179,6 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
-    if use_int4_w4a16:
-        block_n = 1 if (block_shape[0] == 0) else block_shape[0]
-        block_k = block_shape[1]
-        n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
-        n_tiles_w2 = (hidden_size + block_n - 1) // block_n
-        k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
-        w1_scale = torch.randn(
-            (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
-        )
-        w2_scale = torch.randn(
-            (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.bfloat16
-        )
     if use_fp8_w8a8 or use_int8_w8a8:
         if use_int8_w8a8 and block_shape is None:
             w1_scale = torch.randn(
@@ -293,12 +253,6 @@ def benchmark_config(
     def prepare(i: int, inner_iter):  # update inputs according to topk_ids
         for k in range(inner_iter):
             topk_ids = topk_ids_list[i * inner_iter + k]
-            # With EP, saved topk_ids are global expert indices; remap to local.
-            if ep_size > 1:
-                topk_ids = (topk_ids // ep_size).to(
-                    device=moe_inputs[k].topk_ids.device,
-                    dtype=moe_inputs[k].topk_ids.dtype,
-                )
             tokens, _topk = moe_inputs[k].topk_ids.shape
             moe_inputs[k].topk_ids.copy_(topk_ids[:tokens, :_topk])
             sorted_token_ids_, expert_ids_, num_tokens_post_padded_ = (
@@ -323,7 +277,7 @@ def benchmark_config(
             B=w1,
             bias=None,
             C=intermediate_cache1,
-            A_scale=a1_scale,
+            A_scale=None,
             B_scale=w1_scale,
             B_zp=None,
             topk_weights=topk_output_.topk_weights,
@@ -333,9 +287,9 @@ def benchmark_config(
             config=config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
             per_channel_quant=False,
             block_shape=block_shape,
             b_use_tma=moe_use_tma,
@@ -359,9 +313,9 @@ def benchmark_config(
             config=config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
             per_channel_quant=False,
             block_shape=block_shape,
             a_use_tma=moe_use_tma,
@@ -444,14 +398,13 @@ class BestConfigTrace:
 
 class BenchmarkWorker:
 
-    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+    def __init__(self, seed: int) -> None:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
         self.device_id = 0  # int(ray.get_gpu_ids()[0])
-        set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
         self,
@@ -464,11 +417,9 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        use_int4_w4a16: bool,
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
-        ep_size: int = 1,
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
@@ -484,10 +435,8 @@ class BenchmarkWorker:
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
-                use_int4_w4a16,
                 topk_ids_list,
                 block_shape,
-                ep_size=ep_size,
             )
         return cfg, kernel_time
 
@@ -502,11 +451,9 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        use_int4_w4a16: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
-        ep_size: int = 1,
     ) -> Dict[str, int]:
         trace0 = BestConfigTrace("kernel0", down_moe=False)
         trace1 = BestConfigTrace("kernel1", down_moe=True)
@@ -526,10 +473,8 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
-                        use_int4_w4a16,
                         topk_ids_list,
                         block_shape,
-                        ep_size=ep_size,
                         num_iters=100,
                     )
                 except triton.runtime.autotuner.OutOfResources:
@@ -571,11 +516,9 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        use_int4_w4a16: bool,
         block_shape: List[int],
         cmp_config_files: List[str],
         topk_ids_dir: str,
-        ep_size: int = 1,
     ):
         # compare performance of different configs
         cmp_configs = []
@@ -607,10 +550,8 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
-                        use_int4_w4a16,
                         topk_ids_list,
                         block_shape,
-                        ep_size=ep_size,
                     )
                     kernel_times.append(kernel_time)
                 print(f"batch_size={bs=}:")
@@ -628,7 +569,6 @@ def save_configs_sep(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
-    use_int4_w4a16: bool,
     block_shape: List[int],
     down_moe: bool = False,
 ) -> None:
@@ -637,7 +577,6 @@ def save_configs_sep(
         use_int8_w8a16=use_int8_w8a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
-        use_int4_w4a16=use_int4_w4a16,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
@@ -659,10 +598,6 @@ def save_configs_sep(
 def main(args: argparse.Namespace):
     print(args)
 
-    server_args = ServerArgs(
-        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
-    )
-
     model_config = get_model_config(
         args.model,
         args.tp_size,
@@ -681,7 +616,6 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
-    use_int4_w4a16 = args.dtype == "int4_w4a16"
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -691,7 +625,7 @@ def main(args: argparse.Namespace):
         batch_sizes = [args.batch_size]
 
     if args.cmp_configs is not None:
-        worker = BenchmarkWorker(args.seed, server_args)
+        worker = BenchmarkWorker(args.seed)
         worker.cmp_configs(
             batch_sizes,
             E,
@@ -702,16 +636,14 @@ def main(args: argparse.Namespace):
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
-            use_int4_w4a16,
             block_shape,
             args.cmp_configs,
             topk_ids_dir,
-            args.ep_size,
         )
         return
 
     if len(batch_sizes) == 1:
-        worker = BenchmarkWorker(args.seed, server_args)
+        worker = BenchmarkWorker(args.seed)
         if args.tune:
             search_space = get_configs_compute_bound()
             worker.tune(
@@ -724,11 +656,9 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
-                use_int4_w4a16,
                 block_shape,
                 search_space,
                 topk_ids_dir,
-                args.ep_size,
             )
         else:
             cfg = {
@@ -750,11 +680,9 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
-                use_int4_w4a16,
                 block_shape,
                 cfg,
                 topk_ids_dir,
-                args.ep_size,
             )
             print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
@@ -764,7 +692,7 @@ def main(args: argparse.Namespace):
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [
-        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
+        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed)
         for _ in range(num_gpus)
     ]
 
@@ -794,7 +722,6 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
-        use_int4_w4a16,
         False,
         block_shape,
     )
@@ -816,11 +743,9 @@ def main(args: argparse.Namespace):
                 use_fp8_w8a8,
                 use_int8_w8a8,
                 use_int8_w8a16,
-                use_int4_w4a16,
                 block_shape,
                 search_space,
                 topk_ids_dir,
-                args.ep_size,
             )
             for batch_size in batch_sizes
         ],
@@ -845,7 +770,6 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
-        use_int4_w4a16,
         block_shape,
     )
 
@@ -860,7 +784,6 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
-        use_int4_w4a16,
         block_shape,
         down_moe=True,
     )
@@ -878,7 +801,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8"],
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)

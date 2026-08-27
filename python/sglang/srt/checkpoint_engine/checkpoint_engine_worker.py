@@ -15,7 +15,6 @@
 Checkpoint-engine integration for SGLang.
 This module provides weight update functionality via IPC for checkpoint-engine compatibility.
 """
-
 import logging
 from typing import Callable, Dict, Optional
 

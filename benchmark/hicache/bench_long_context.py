@@ -12,14 +12,14 @@ from bench_multiturn import (
 )
 from tqdm.asyncio import tqdm
 
-from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate
+from sglang.bench_serving import get_tokenizer
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
     def __init__(self, args):
-        self.url = f"http://{args.host}:{args.port}/generate"
-        self.request_func = async_request_sglang_generate
+        # Construct the base URL for requests
+        self.baseurl = f"http://{args.host}:{args.port}/"
+        self.url = self.baseurl + "generate"
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -36,18 +36,20 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         init_requests = []
         for i in range(num_requests):
             context_id = self.dataset["queries"][i]["context"]
-            # Tokenize the context + question to get input_ids
-            prompt_text = (
-                self.dataset["contexts"][context_id]
-                + self.dataset["queries"][i]["question"]
+            init_requests.append(
+                (
+                    i,
+                    gen_payload(
+                        self.dataset["contexts"][context_id]
+                        + self.dataset["queries"][i]["question"],
+                        len(
+                            self.tokenizer(
+                                self.dataset["queries"][i]["reference_answer"]
+                            )["input_ids"]
+                        ),
+                    ),
+                )
             )
-            input_ids = self.tokenizer.encode(prompt_text)
-            output_len = len(
-                self.tokenizer(self.dataset["queries"][i]["reference_answer"])[
-                    "input_ids"
-                ]
-            )
-            init_requests.append((i, gen_payload(input_ids, output_len)))
         self.ready_queue = ReadyQueue(init_requests=init_requests)
 
         self.response_queue = queue.Queue()

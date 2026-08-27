@@ -6,9 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from sglang.bench_serving import run_benchmark
-from sglang.benchmark.utils import parse_custom_headers
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.bench_serving import parse_custom_headers, run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -81,7 +79,7 @@ class TestBenchServingFunctionality(CustomTestCase):
                 continue
             text = obj.get("obj", {}).get("text")
             rid = obj.get("rid", "")
-            if text and not rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            if text and not rid.startswith("HEALTH_CHECK"):
                 reqs.append(text)
 
         self.assertGreaterEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)

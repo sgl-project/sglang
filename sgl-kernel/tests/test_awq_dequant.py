@@ -1,5 +1,4 @@
 import itertools
-import sys
 from typing import Optional, Tuple
 
 import pytest
@@ -113,4 +112,4 @@ def test_awq_dequant_compare_implementations(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

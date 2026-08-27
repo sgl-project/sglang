@@ -7,8 +7,6 @@ import triton
 import triton.testing
 from sgl_kernel import awq_dequantize
 
-from sglang.utils import is_in_ci
-
 # Optional vLLM import
 try:
     from vllm import _custom_ops as ops
@@ -18,7 +16,11 @@ except ImportError:
     ops = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def vllm_awq_dequantize(

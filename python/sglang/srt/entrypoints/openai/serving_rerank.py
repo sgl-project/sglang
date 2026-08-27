@@ -119,14 +119,13 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
 def _get_jinja_env():
     try:
         import jinja2  # Lazy import: server env should provide this dependency.
-        from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ModuleNotFoundError as e:
         raise ValueError(
             "Rendering Qwen3 reranker prompts requires `jinja2`. "
             "Please install it in your runtime environment (e.g., `pip install jinja2`)."
         ) from e
-    # Using a sandboxed environment to stop malicious execution during model loading.
-    return ImmutableSandboxedEnvironment(
+
+    return jinja2.Environment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
         undefined=jinja2.Undefined,
@@ -377,13 +376,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                 for doc in request.documents
             ]
 
-            result = await self.tokenizer_manager.score_prompts(
+            probs = await self.tokenizer_manager.score_prompts(
                 prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,
                 request=raw_request,
             )
-            scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
+            scores = [_qwen3_rerank_score(p[0], p[1]) for p in probs]
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:

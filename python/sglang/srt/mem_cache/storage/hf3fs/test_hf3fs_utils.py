@@ -1,5 +1,4 @@
 import multiprocessing.shared_memory
-import sys
 from pathlib import Path
 
 import pytest
@@ -41,4 +40,4 @@ def test_rw_shm():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

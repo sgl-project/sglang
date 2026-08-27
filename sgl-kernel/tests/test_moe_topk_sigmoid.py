@@ -1,5 +1,4 @@
 import itertools
-import sys
 
 import pytest
 import torch
@@ -181,4 +180,4 @@ def test_topk_sigmoid_renormalize_correction_bias(num_tokens, num_experts, topk)
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

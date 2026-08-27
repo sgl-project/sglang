@@ -11,14 +11,11 @@ The eval output will be logged
 
 import argparse
 import asyncio
-import base64
-import mimetypes
 import re
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import aiohttp
@@ -77,12 +74,7 @@ def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
 
 
 async def process_sample(
-    client: Any,
-    sample: dict,
-    sampling_params: dict,
-    model: str,
-    reasoning_effort: Optional[str] = None,
-    lora_path: Optional[str] = None,
+    client: Any, sample: dict, sampling_params: dict, lora_path: Optional[str] = None
 ) -> Tuple[dict, str]:
     """Send a single sample to the LLM and return (sample, response)."""
     prompt = sample["final_input_prompt"]
@@ -90,38 +82,25 @@ async def process_sample(
     image = sample["image"]
     assert image is not None
     image_path = sample["image_path"]
-    if image_path and not image_path.startswith(("http://", "https://", "data:")):
-        p = Path(image_path)
-        mime = mimetypes.guess_type(str(p))[0] or "image/png"
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        image_url = f"data:{mime};base64,{b64}"
-    else:
-        image_url = image_path
-    extra_body = {"lora_path": lora_path} if lora_path else None
+    extra_body = None if lora_path is None else {"lora_path": lora_path}
     payload = {
-        "model": model,
+        "model": "default",
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prefix},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": image_path}},
                     {"type": "text", "text": suffix},
                 ],
             }
         ],
         "extra_body": extra_body,
-        **sampling_params,
     }
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+    if sampling_params:
+        payload.update(sampling_params)
     response = await client.chat.completions.create(**payload)
-    msg = response.choices[0].message
-    content = msg.content
-    if content is None:
-        content = getattr(msg, "reasoning_content", None)
-    return sample, content
+    return sample, response.choices[0].message.content
 
 
 async def process_sample_with_semaphore(
@@ -129,15 +108,11 @@ async def process_sample_with_semaphore(
     client: Any,
     sample: dict,
     sampling_params: dict,
-    model: str,
-    reasoning_effort: Optional[str] = None,
     lora_path: Optional[str] = None,
 ) -> Tuple[dict, str]:
     """Wrap process_sample with a semaphore for concurrency control."""
     async with semaphore:
-        return await process_sample(
-            client, sample, sampling_params, model, reasoning_effort, lora_path
-        )
+        return await process_sample(client, sample, sampling_params, lora_path)
 
 
 async def eval_mmmu(args) -> None:
@@ -145,8 +120,6 @@ async def eval_mmmu(args) -> None:
     eval_args = EvalArgs.from_cli_args(args)
     sampling_params = get_sampling_params(eval_args)
     samples = prepare_samples(eval_args)
-    model = args.model
-    reasoning_effort = eval_args.reasoning_effort
     lora_path = eval_args.lora_path
     answer_dict = {}
     out_samples = {}
@@ -173,7 +146,7 @@ async def eval_mmmu(args) -> None:
         # this is mainly for profiling
         for sample in tqdm(samples):
             _, response = await process_sample(
-                client, sample, sampling_params, model, reasoning_effort, lora_path
+                client, sample, sampling_params, lora_path
             )
             sample["original_response"] = response
             answer = (
@@ -191,13 +164,7 @@ async def eval_mmmu(args) -> None:
         semaphore = asyncio.Semaphore(args.concurrency)
         tasks = [
             process_sample_with_semaphore(
-                semaphore,
-                client,
-                sample,
-                sampling_params,
-                model,
-                reasoning_effort,
-                lora_path,
+                semaphore, client, sample, sampling_params, lora_path
             )
             for sample in samples
         ]
@@ -235,12 +202,6 @@ async def eval_mmmu(args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="default",
-        help="Model name to use in API requests.",
-    )
     EvalArgs.add_cli_args(parser)
     args = add_common_sglang_args_and_parse(parser)
     return args

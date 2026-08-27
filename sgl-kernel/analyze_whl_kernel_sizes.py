@@ -197,7 +197,7 @@ def generate_report(all_kernels, output_file):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze CUDA kernel sizes in sglang-kernel wheel files"
+        description="Analyze CUDA kernel sizes in sgl-kernel whl file"
     )
     parser.add_argument("whl", type=str, help="Path to whl file")
     parser.add_argument(

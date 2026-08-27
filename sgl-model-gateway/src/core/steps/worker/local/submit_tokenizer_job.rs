@@ -6,7 +6,6 @@
 
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     core::{
@@ -14,6 +13,7 @@ use crate::{
         Job,
     },
     tokenizer::TokenizerRegistry,
+    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 /// Step: Submit tokenizer registration job for the worker's model

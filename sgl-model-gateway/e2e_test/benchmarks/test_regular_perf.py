@@ -22,8 +22,6 @@ class TestRegularPerf:
                 "e2e_latency_mean_max": 14,
                 "input_throughput_mean_min": 800,
                 "output_throughput_mean_min": 12,
-                # gpu_util_p50_min intentionally omitted: see test_pd_perf.py.
-                # On 4-gpu-h100 the median sample lands at 0% for the bursty
-                # grpc workload even when mean is healthy (~22%).
+                "gpu_util_p50_min": 99,
             },
         )

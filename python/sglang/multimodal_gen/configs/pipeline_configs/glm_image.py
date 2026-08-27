@@ -5,17 +5,15 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
-from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
-from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ImagePipelineConfig,
     ModelTaskType,
-    SpatialImagePipelineConfig,
 )
 
 
 @dataclass
-class GlmImagePipelineConfig(SpatialImagePipelineConfig):
+class GlmImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the GlmImage pipeline."""
 
     vae_precision: str = "bf16"
@@ -27,19 +25,9 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
 
     vae_sp: bool = False
 
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (T5Config(),)
-    )
-
     dit_config: DiTConfig = field(default_factory=GlmImageDitConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=GlmImageVAEConfig)
-
-    # GLM-Image uses T5 text encoder; base default is EncoderConfig() which lacks
-    # parallel_folding and causes AttributeError + fallback to native T5 with missing weights.
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (T5Config(),)
-    )
 
     enable_autocast: bool = False
 

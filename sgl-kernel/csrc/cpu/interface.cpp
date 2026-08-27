@@ -48,6 +48,8 @@ void initialize(int64_t size, int64_t rank) {
 }
 
 void shm_allreduce(torch::Tensor& data, int64_t op) {
+  RECORD_FUNCTION("sgl-kernel::shm_allreduce", std::vector<c10::IValue>({data}));
+
   TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
 
   auto numel = data.numel();
@@ -58,6 +60,8 @@ void shm_allreduce(torch::Tensor& data, int64_t op) {
 }
 
 torch::Tensor shm_allgather(torch::Tensor& data, int64_t dim) {
+  RECORD_FUNCTION("sgl-kernel::shm_allgather", std::vector<c10::IValue>({data}));
+
   auto numel = data.numel();
   int data_size = numel * data.element_size();
   if (dim < 0) {

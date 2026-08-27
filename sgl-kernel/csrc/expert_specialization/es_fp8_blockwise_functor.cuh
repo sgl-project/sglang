@@ -126,12 +126,7 @@ struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigLowMH20> {
   Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor(int* _problem_sizes) : problem_sizes(_problem_sizes) {}
 
   void CUTE_DEVICE operator()(int64_t expert_id, int m, int n, int k) {
-    float m_f = __int2float_rn(m);
-    float n_f = __int2float_rn(n);
-    float k_f = __int2float_rn(k);
-    float arithmetic_intensity = 2.0f * m_f * n_f * k_f / (m_f * k_f + k_f * n_f + 2.0f * m_f * n_f);
-
-    if (m <= 32 || arithmetic_intensity < 70.0f) {
+    if (m < 64) {
       // Swap A/B
       problem_sizes[expert_id * 3 + 0] = n;
       problem_sizes[expert_id * 3 + 1] = m;
@@ -173,12 +168,7 @@ struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigMiddleMH20> {
   Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor(int* _problem_sizes) : problem_sizes(_problem_sizes) {}
 
   void CUTE_DEVICE operator()(int64_t expert_id, int m, int n, int k) {
-    float m_f = __int2float_rn(m);
-    float n_f = __int2float_rn(n);
-    float k_f = __int2float_rn(k);
-    float arithmetic_intensity = 2.0f * m_f * n_f * k_f / (m_f * k_f + k_f * n_f + 2.0f * m_f * n_f);
-
-    if ((!(m <= 32 || arithmetic_intensity < 70.0f)) && m <= 64) {
+    if (m >= 64 && m < 128) {
       problem_sizes[expert_id * 3 + 0] = m;
       problem_sizes[expert_id * 3 + 1] = n;
       problem_sizes[expert_id * 3 + 2] = k;
@@ -218,12 +208,7 @@ struct Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor<PerfConfigHighMH20> {
   Fp8BlockwiseGroupedGemmProblemSizeFilterFunctor(int* _problem_sizes) : problem_sizes(_problem_sizes) {}
 
   void CUTE_DEVICE operator()(int64_t expert_id, int m, int n, int k) {
-    float m_f = __int2float_rn(m);
-    float n_f = __int2float_rn(n);
-    float k_f = __int2float_rn(k);
-    float arithmetic_intensity = 2.0f * m_f * n_f * k_f / (m_f * k_f + k_f * n_f + 2.0f * m_f * n_f);
-
-    if ((!(m <= 32 || arithmetic_intensity < 70.0f)) && m > 64) {
+    if (m >= 128) {
       problem_sizes[expert_id * 3 + 0] = m;
       problem_sizes[expert_id * 3 + 1] = n;
       problem_sizes[expert_id * 3 + 2] = k;

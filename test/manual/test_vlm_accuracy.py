@@ -1,4 +1,5 @@
-""" """
+"""
+"""
 
 import unittest
 from typing import List, Optional
@@ -194,7 +195,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            hf_output, _ = self.hf_model.get_vllm_embedding(
+            (hf_output, _) = self.hf_model.get_vllm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)

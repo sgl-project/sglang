@@ -7,8 +7,6 @@ import triton
 import triton.testing
 from sgl_kernel import sgl_per_token_quant_fp8
 
-from sglang.utils import is_in_ci
-
 # Optional vLLM import
 try:
     from vllm import _custom_ops as ops
@@ -22,7 +20,11 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
-IS_CI = is_in_ci()
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 

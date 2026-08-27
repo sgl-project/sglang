@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use wfaas::{EventSubscriber, InMemoryStore, WorkflowEngine};
-
 use super::{
     create_external_worker_workflow, create_local_worker_workflow,
     create_mcp_registration_workflow, create_tokenizer_registration_workflow,
@@ -15,7 +13,10 @@ use super::{
     LocalWorkerWorkflowData, McpWorkflowData, TokenizerWorkflowData, WasmRegistrationWorkflowData,
     WasmRemovalWorkflowData, WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
-use crate::config::RouterConfig;
+use crate::{
+    config::RouterConfig,
+    workflow::{EventSubscriber, InMemoryStore, WorkflowEngine},
+};
 
 /// Type alias for local worker workflow engine
 pub type LocalWorkerEngine =

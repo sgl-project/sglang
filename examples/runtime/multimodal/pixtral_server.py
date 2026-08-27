@@ -19,8 +19,6 @@ import json
 import aiohttp
 import requests
 
-from sglang.utils import normalize_base_url
-
 IMAGE_TOKEN_SEP = "\n[IMG]"
 ROUTE = "/generate"
 
@@ -34,7 +32,7 @@ async def send_request(url, data, delay=0):
 
 
 async def test_concurrent(args):
-    url = f"{normalize_base_url(args.host, args.port)}{ROUTE}"
+    url = f"{args.host}:{args.port}{ROUTE}"
 
     # Single image test
     if args.single_image:
@@ -71,7 +69,7 @@ async def test_concurrent(args):
 
 
 def test_streaming(args):
-    url = f"{normalize_base_url(args.host, args.port)}/generate"
+    url = f"{args.host}:{args.port}/generate"
 
     # Single image test
     if args.single_image:
@@ -114,7 +112,7 @@ def test_streaming(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument(
         "--single-image",

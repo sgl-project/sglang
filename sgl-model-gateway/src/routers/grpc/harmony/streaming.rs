@@ -11,9 +11,6 @@ use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::json;
-use smg_grpc_client::sglang_proto::generate_complete::MatchedStop::{
-    MatchedStopStr, MatchedTokenId,
-};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -22,6 +19,7 @@ use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
+    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{

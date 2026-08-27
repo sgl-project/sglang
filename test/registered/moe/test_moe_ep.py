@@ -5,20 +5,20 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=279, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=140, suite="stage-b-test-large-2-gpu")
 
 
 class TestEp(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -37,25 +37,23 @@ class TestEp(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=None,
+            num_threads=1024,
         )
-        metrics = run_eval(args)
-        print(metrics)
 
-        self.assertGreater(metrics["score"], 0.60)
+        metrics = run_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.8)
 
 
 class TestEpDeepGEMM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -78,19 +76,17 @@ class TestEpDeepGEMM(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=None,
+            num_threads=1024,
         )
-        metrics = run_eval(args)
-        print(metrics)
 
-        self.assertGreater(metrics["score"], 0.60)
+        metrics = run_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.8)
 
 
 if __name__ == "__main__":

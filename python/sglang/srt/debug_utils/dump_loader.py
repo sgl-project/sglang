@@ -1,59 +1,10 @@
 import functools
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict
 
 import polars as pl
 import torch
-
-LOAD_FAILED: object = object()
-
-
-def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
-    stem = Path(path).stem
-    result: Dict[str, Any] = {}
-    for kv in stem.split("___"):
-        if "=" in kv:
-            k, v = kv.split("=", 1)
-            result[k] = v
-    for field_name, converter in _TYPED_FIELDS:
-        if field_name in result:
-            result[field_name] = converter(result[field_name])
-    return result
-
-
-@dataclass
-class ValueWithMeta:
-    value: Any
-    meta: Dict[str, Any]
-
-    @staticmethod
-    def load(path: Path) -> "ValueWithMeta":
-        path = Path(path)
-        meta_from_filename = parse_meta_from_filename(path)
-
-        try:
-            raw = torch.load(path, weights_only=False, map_location="cpu")
-        except Exception as e:
-            print(f"Skip load {path} since error {e}")
-            return ValueWithMeta(
-                value=LOAD_FAILED, meta={**meta_from_filename, "filename": path.name}
-            )
-
-        value, meta_from_embedded = _unwrap_dict_format(raw)
-        return ValueWithMeta(
-            value=value,
-            meta={**meta_from_filename, **meta_from_embedded, "filename": path.name},
-        )
-
-
-def _unwrap_dict_format(obj: Any) -> Tuple[Any, Dict[str, Any]]:
-    if isinstance(obj, dict) and "value" in obj:
-        meta = obj.get("meta", {})
-        assert isinstance(meta, dict), f"Expected meta to be dict, got {type(meta)}"
-        return obj["value"], meta
-    return obj, {}
 
 
 class DumpLoader:
@@ -74,8 +25,8 @@ class DumpLoader:
 
         from sglang.srt.debug_utils.dumper import dumper
 
-        step = dumper._state.step
-        conditions = dict(name=name, step=step, **kwargs)
+        forward_pass_id = dumper._forward_pass_id
+        conditions = dict(name=name, forward_pass_id=forward_pass_id, **kwargs)
         row = find_row(self._df, conditions=conditions)
         assert (
             row is not None
@@ -83,8 +34,6 @@ class DumpLoader:
 
         path = self._directory / row["filename"]
         output = torch.load(path, weights_only=False)
-        if isinstance(output, dict) and "value" in output:
-            output = output["value"]
 
         print(
             f"[DumpLoader] load from {path=} (query: {name=} {kwargs=}, output: {type(output)})"
@@ -99,7 +48,10 @@ def read_meta(directory):
     rows = []
     for p in directory.glob("*.pt"):
         try:
-            full_kwargs = parse_meta_from_filename(p)
+            full_kwargs = {}
+            for kv in p.stem.split("___"):
+                k, v = kv.split("=")
+                full_kwargs[k] = v
             rows.append(
                 {
                     "filename": str(p.name),
@@ -111,7 +63,7 @@ def read_meta(directory):
 
     df = pl.DataFrame(rows)
     df = df.with_columns(
-        pl.col("step").cast(int),
+        pl.col("forward_pass_id").cast(int),
         pl.col("rank").cast(int),
         pl.col("dump_index").cast(int),
     )
@@ -129,27 +81,26 @@ def _add_duplicate_index(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def filter_rows(df: pl.DataFrame, conditions: Dict[str, Any]) -> list[dict]:
-    filter_exprs = [
-        (
-            pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col])
-            if conditions[col] is not None
-            else pl.col(col).is_null()
+def find_row(df, conditions: Dict[str, Any]):
+    df_sub = df.filter(
+        functools.reduce(
+            lambda a, b: a & b,
+            [
+                (
+                    pl.col(col)
+                    == _cast_to_polars_dtype(conditions[col], df.schema[col])
+                    if conditions[col] is not None
+                    else pl.col(col).is_null()
+                )
+                for col in conditions.keys()
+                if col in df.columns
+            ],
         )
-        for col in conditions
-        if col in df.columns
-    ]
-    if not filter_exprs:
-        return []
-    return df.filter(functools.reduce(lambda a, b: a & b, filter_exprs)).to_dicts()
-
-
-def find_row(df: pl.DataFrame, conditions: Dict[str, Any]):
-    rows = filter_rows(df, conditions)
-    if len(rows) > 1:
-        print(f"find_row find ambiguous results: {rows=}")
+    )
+    if len(df_sub) > 1:
+        print(f"find_row find ambiguous results: {df_sub=}")
         return None
-    return rows[0] if rows else None
+    return df_sub.to_dicts()[0] if len(df_sub) > 0 else None
 
 
 def _cast_to_polars_dtype(value, target_dtype):
@@ -163,21 +114,6 @@ def _cast_to_polars_dtype(value, target_dtype):
         return str(value)
     else:
         return value
-
-
-def read_tokenizer_path(directory: Path) -> Optional[str]:
-    """Read tokenizer_path from any .pt file's embedded metadata in a dump directory."""
-    for p in directory.glob("*.pt"):
-        item: ValueWithMeta = ValueWithMeta.load(p)
-        tokenizer_path: Optional[str] = item.meta.get("tokenizer_path")
-        if tokenizer_path is not None:
-            return str(tokenizer_path)
-    return None
-
-
-_TYPED_FIELDS: list[tuple[str, Callable[[str], Any]]] = [
-    ("rank", int),
-]
 
 
 dump_loader = DumpLoader()

@@ -7,8 +7,6 @@ import torch
 import triton
 from sgl_kernel import int8_scaled_mm
 
-from sglang.utils import is_in_ci
-
 # Optional vLLM import
 try:
     from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
@@ -18,7 +16,11 @@ except ImportError:
     vllm_scaled_mm = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
