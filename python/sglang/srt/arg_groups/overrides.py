@@ -738,6 +738,37 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
     )
 
 
+def _is_nvfp4_pack_quantized(hf_config: Any) -> bool:
+    qc = getattr(hf_config, "quantization_config", None)
+    if not isinstance(qc, dict):
+        return False
+    groups = qc.get("config_groups") or {}
+    formats = [qc.get("format", "")] + [
+        g.get("format", "") for g in groups.values() if isinstance(g, dict)
+    ]
+    return any("nvfp4" in str(fmt) for fmt in formats)
+
+
+@_register_for(
+    "Cohere2VisionForConditionalGeneration",
+    "Cohere2MoeForCausalLM",
+)
+def _cohere2_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend != "auto":
+        return {}
+    if not is_sm100_supported():
+        return {}
+    if server_args.get_model_config().quantization is not None:
+        if not _is_nvfp4_pack_quantized(hf_config):
+            return {}
+    logger.info(
+        "Command-A-Plus on SM10X: moe_runner_backend=flashinfer_trtllm "
+        "(trtllm-gen fused MoE)."
+    )
+    return {"moe_runner_backend": "flashinfer_trtllm"}
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
