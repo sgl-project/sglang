@@ -5851,6 +5851,16 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
+                if is_deepseek_dsa(hf_config):
+                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                    # CUDA/Hopper-only path: its JIT source includes
+                    # <cooperative_groups.h> and uses cg::this_cluster()
+                    # (thread-block clusters), neither of which exists on ROCm,
+                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
+                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
+                    # here for the rest of the DSA family (DeepSeek-V3.2 /
+                    # GLM-5.x) that shares the same decode top-k path.
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and cfg.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
@@ -5883,6 +5893,7 @@ class ServerArgs:
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
                     envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
@@ -5894,7 +5905,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
