@@ -33,7 +33,6 @@ from sglang.srt.layers.cp.base import (
     get_cp_strategy,
 )
 from sglang.srt.layers.cp.utils import enable_cp_v2
-from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -159,22 +158,13 @@ class DecodeMetadata:
 
 
 @dataclass
-class FlashInferCPPrefillPlan:
-    wrapper: BatchPrefillWithPagedKVCacheWrapper
-    qo_indptr: torch.Tensor
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
-    paged_kv_last_page_len: torch.Tensor
-
-
-@dataclass
 class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    cp_plan: Optional[FlashInferCPPrefillPlan] = None
+    cp_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -561,7 +551,7 @@ class FlashInferAttnBackend(AttentionBackend):
             unsupported_reason = "CP-v2 must be enabled"
         elif server_args.cp_strategy != "zigzag":
             unsupported_reason = "only --cp-strategy zigzag is supported"
-        elif getattr(server_args, "moe_dense_tp_size", None) != 1:
+        elif server_args.moe_dense_tp_size != 1:
             unsupported_reason = (
                 "dense MLP weights must be replicated with --moe-dense-tp-size 1"
             )
@@ -581,7 +571,7 @@ class FlashInferAttnBackend(AttentionBackend):
             unsupported_reason = "multi-item scoring is not supported"
         elif self.prefill_uses_dequant_workspace or self.is_nvfp4_kvcache:
             unsupported_reason = "FP4/dequant prefill is not supported"
-        elif getattr(model_runner, "kv_cache_dtype_str", None) == "mxfp8":
+        elif model_runner.kv_cache_dtype_str == "mxfp8":
             unsupported_reason = "MXFP8 KV cache is not supported"
         elif model_runner.sliding_window_size is not None:
             unsupported_reason = "sliding-window attention is not supported"
@@ -591,7 +581,7 @@ class FlashInferAttnBackend(AttentionBackend):
             unsupported_reason = "asymmetric QK/V head dimensions are not supported"
         elif server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
             unsupported_reason = "prefill CUDA graphs must be disabled"
-        elif getattr(self.token_to_kv_pool, "kv_cache_layout", "nhd") != "nhd":
+        elif self.token_to_kv_pool.kv_cache_layout != "nhd":
             unsupported_reason = "only the NHD KV-cache layout is supported"
 
         if unsupported_reason is not None:
@@ -602,38 +592,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
         cp_metadata = forward_batch.attn_cp_metadata
-        if not self.prefill_cp_enabled:
-            raise ValueError(
-                "FlashInfer received CP-v2 metadata without a supported "
-                "FlashInfer prefill CP configuration."
-            )
-        if forward_batch.forward_mode != ForwardMode.EXTEND:
-            raise ValueError(
-                "FlashInfer prefill CP supports only regular EXTEND forwards."
-            )
-        if not isinstance(cp_metadata, ZigzagContextParallelMetadata):
-            raise ValueError(
-                "FlashInfer prefill CP requires zigzag context-parallel metadata."
-            )
-        if forward_batch.spec_info is not None:
-            raise ValueError(
-                "FlashInfer prefill CP does not support speculative metadata."
-            )
-        if forward_batch.cross_attention_custom_mask is not None:
-            raise ValueError(
-                "FlashInfer prefill CP does not support custom attention masks."
-            )
-        if getattr(forward_batch, "multi_item_delimiter_indices", None) is not None:
-            raise ValueError(
-                "FlashInfer prefill CP does not support multi-item metadata."
-            )
-
+        assert forward_batch.forward_mode == ForwardMode.EXTEND
         req_pool_indices = forward_batch.req_pool_indices
-        if len(req_pool_indices) != cp_metadata.bs:
-            raise ValueError(
-                "FlashInfer prefill CP request metadata is inconsistent: "
-                f"got {len(req_pool_indices)} requests for batch size {cp_metadata.bs}."
-            )
 
         q_lens_cpu = (
             cp_metadata.actual_seq_q_prev_list + cp_metadata.actual_seq_q_next_list
@@ -687,18 +647,11 @@ class FlashInferAttnBackend(AttentionBackend):
             non_blocking=True,
             fixed_split_size=self.prefill_split_tile_size,
         )
-        cp_plan = FlashInferCPPrefillPlan(
-            wrapper=wrapper,
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=paged_kv_last_page_len,
-        )
         self.forward_metadata = PrefillMetadata(
             prefill_wrappers=[wrapper],
             use_ragged=False,
             extend_no_prefix=False,
-            cp_plan=cp_plan,
+            cp_wrapper=wrapper,
         )
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
@@ -1078,7 +1031,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.attn_cp_metadata is not None:
+        if self.prefill_cp_enabled and forward_batch.attn_cp_metadata is not None:
             self._init_forward_metadata_cp(forward_batch)
             return
 
@@ -1426,46 +1379,16 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        cp_plan = self.forward_metadata.cp_plan
-        if cp_plan is not None:
-            if not save_kv_cache:
-                raise ValueError("FlashInfer prefill CP requires save_kv_cache=True.")
-            if k is None or v is None:
-                raise ValueError(
-                    "FlashInfer prefill CP requires current K and V tensors."
-                )
-            if layer.is_cross_attention:
-                raise ValueError(
-                    "FlashInfer prefill CP does not support cross-attention."
-                )
-            if layer.attn_type != AttentionType.DECODER:
-                raise ValueError(
-                    "FlashInfer prefill CP supports only causal decoder attention."
-                )
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                raise ValueError(
-                    "FlashInfer prefill CP does not support sliding-window attention."
-                )
-            if layer.logit_cap > 0:
-                raise ValueError(
-                    "FlashInfer prefill CP does not support attention logit soft caps."
-                )
-            if layer.head_dim != layer.v_head_dim:
-                raise ValueError(
-                    "FlashInfer prefill CP does not support asymmetric QK/V head "
-                    "dimensions."
-                )
-
+        cp_wrapper = self.forward_metadata.cp_wrapper
+        if cp_wrapper is not None:
+            assert save_kv_cache and k is not None and v is not None
             cp_strategy = get_cp_strategy()
-            if cp_strategy is None:
-                raise ValueError(
-                    "FlashInfer prefill CP metadata is present without a CP strategy."
-                )
+            assert cp_strategy is not None
             cp_strategy.materialize_full_kv(forward_batch, layer, k, v)
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             def _flashinfer_cp_attn(logical_q: torch.Tensor) -> torch.Tensor:
-                return cp_plan.wrapper.forward(
+                return cp_wrapper.forward(
                     logical_q.contiguous().view(
                         -1, layer.tp_q_head_num, layer.head_dim
                     ),

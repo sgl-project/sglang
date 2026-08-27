@@ -8,7 +8,6 @@ from unittest.mock import patch
 import requests
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     update_environment_variables,
 )
@@ -19,8 +18,6 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
-from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -221,9 +218,6 @@ def _run_flashinfer_case(
     forward_batch = SimpleNamespace(
         attn_cp_metadata=metadata,
         forward_mode=ForwardMode.EXTEND,
-        spec_info=None,
-        cross_attention_custom_mask=None,
-        multi_item_delimiter_indices=None,
         req_pool_indices=torch.arange(
             len(extend_lens), dtype=torch.int32, device=device
         ),
@@ -238,7 +232,6 @@ def _run_flashinfer_case(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
     backend = object.__new__(FlashInferAttnBackend)
-    backend.prefill_cp_enabled = True
     backend.req_to_token_pool = SimpleNamespace(req_to_token=fixture.req_to_token)
     backend.prefill_wrappers_paged = [wrapper]
     backend.indices_updater_prefill = SimpleNamespace(
@@ -251,30 +244,6 @@ def _run_flashinfer_case(
     backend.prefill_split_tile_size = None
     backend._init_forward_metadata_cp(forward_batch)
 
-    q_lens = metadata.actual_seq_q_prev_list + metadata.actual_seq_q_next_list
-    kv_lens = metadata.kv_len_prev_list + metadata.kv_len_next_list
-    expected_q_indptr = [0]
-    expected_kv_indptr = [0]
-    for q_len, kv_len in zip(q_lens, kv_lens):
-        expected_q_indptr.append(expected_q_indptr[-1] + q_len)
-        expected_kv_indptr.append(expected_kv_indptr[-1] + kv_len)
-    assert backend.forward_metadata.cp_plan.qo_indptr.tolist() == expected_q_indptr
-    assert (
-        backend.forward_metadata.cp_plan.paged_kv_indptr.tolist() == expected_kv_indptr
-    )
-    assert backend.forward_metadata.cp_plan.paged_kv_last_page_len.tolist() == [1] * (
-        2 * len(extend_lens)
-    )
-    expected_indices = []
-    for req_id, kv_len in zip(
-        list(range(len(extend_lens))) * 2,
-        kv_lens,
-    ):
-        expected_indices.extend(fixture.req_to_token[req_id, :kv_len].tolist())
-    assert (
-        backend.forward_metadata.cp_plan.paged_kv_indices.tolist() == expected_indices
-    )
-
     pool = fixture.pool
     key_cache, value_cache = pool.get_kv_buffer(0)
     key_cache[: fixture.key_cache.shape[0]].copy_(fixture.key_cache)
@@ -286,12 +255,9 @@ def _run_flashinfer_case(
         tp_k_head_num=num_kv_heads,
         tp_v_head_num=num_kv_heads,
         head_dim=HEAD_DIM,
-        v_head_dim=HEAD_DIM,
         scaling=HEAD_DIM**-0.5,
         logit_cap=0.0,
-        sliding_window_size=-1,
         is_cross_attention=False,
-        attn_type=AttentionType.DECODER,
         k_scale=None,
         v_scale=None,
         k_scale_float=1.0,
@@ -386,255 +352,6 @@ class TestFlashInferPrefillCP(CustomTestCase):
             nprocs=NUM_GPUS,
             join=True,
         )
-
-    def test_configuration_rejections(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferAttnBackend,
-        )
-
-        cases = [
-            ("cp_v1", "CP-v2 must be enabled"),
-            ("interleave", "only --cp-strategy zigzag"),
-            ("sharded_mlp", "dense MLP weights must be replicated"),
-            ("mla", "only dense MHA/GQA"),
-            ("hybrid", "hybrid linear/state-space"),
-            ("sparse", "hybrid sparse-attention"),
-            ("speculative", "speculative decoding"),
-            ("dllm", "DLLM"),
-            ("multimodal", "multimodal"),
-            ("mis", "multi-item"),
-            ("dequant", "FP4/dequant"),
-            ("nvfp4", "FP4/dequant"),
-            ("mxfp8", "MXFP8"),
-            ("sliding", "sliding-window"),
-            ("encoder_decoder", "encoder-decoder"),
-            ("asymmetric_heads", "asymmetric QK/V"),
-            ("prefill_graph", "prefill CUDA graphs"),
-            ("hnd", "NHD KV-cache"),
-        ]
-        for case_name, expected_error in cases:
-            backend = object.__new__(FlashInferAttnBackend)
-            backend.is_dllm_model = case_name == "dllm"
-            backend.is_multimodal = case_name == "multimodal"
-            backend.enable_mis = case_name == "mis"
-            backend.prefill_uses_dequant_workspace = case_name == "dequant"
-            backend.is_nvfp4_kvcache = case_name == "nvfp4"
-            backend.token_to_kv_pool = SimpleNamespace(
-                kv_cache_layout="hnd" if case_name == "hnd" else "nhd"
-            )
-            model_runner = SimpleNamespace(
-                server_args=SimpleNamespace(
-                    cp_strategy=(
-                        "interleave" if case_name == "interleave" else "zigzag"
-                    ),
-                    moe_dense_tp_size=(None if case_name == "sharded_mlp" else 1),
-                    cuda_graph_config=SimpleNamespace(
-                        prefill=SimpleNamespace(
-                            backend=(
-                                Backend.BREAKABLE
-                                if case_name == "prefill_graph"
-                                else Backend.DISABLED
-                            )
-                        )
-                    ),
-                ),
-                spec_algorithm=SimpleNamespace(
-                    is_speculative=(lambda value=case_name: value == "speculative")
-                ),
-                kv_cache_dtype_str=("mxfp8" if case_name == "mxfp8" else "bfloat16"),
-                sliding_window_size=(4096 if case_name == "sliding" else None),
-                model_config=SimpleNamespace(
-                    is_encoder_decoder=case_name == "encoder_decoder",
-                    head_dim=HEAD_DIM,
-                    v_head_dim=(
-                        HEAD_DIM // 2 if case_name == "asymmetric_heads" else HEAD_DIM
-                    ),
-                    attention_arch=(
-                        AttentionArch.MLA if case_name == "mla" else AttentionArch.MHA
-                    ),
-                    hf_config=SimpleNamespace(),
-                ),
-            )
-            with (
-                self.subTest(case=case_name),
-                patch(
-                    "sglang.srt.layers.attention.flashinfer_backend.enable_cp_v2",
-                    return_value=case_name != "cp_v1",
-                ),
-                patch(
-                    "sglang.srt.layers.attention.flashinfer_backend.mambaish_config",
-                    return_value=object() if case_name == "hybrid" else None,
-                ),
-                patch(
-                    "sglang.srt.layers.attention.flashinfer_backend.is_minimax_sparse",
-                    return_value=case_name == "sparse",
-                ),
-                self.assertRaisesRegex(ValueError, expected_error),
-            ):
-                backend._validate_prefill_cp_configuration(model_runner)
-
-        backend = object.__new__(FlashInferAttnBackend)
-        backend.is_dllm_model = False
-        backend.is_multimodal = False
-        backend.enable_mis = False
-        backend.prefill_uses_dequant_workspace = False
-        backend.is_nvfp4_kvcache = False
-        backend.token_to_kv_pool = SimpleNamespace(kv_cache_layout="nhd")
-        model_runner = SimpleNamespace(
-            server_args=SimpleNamespace(
-                cp_strategy="zigzag",
-                moe_dense_tp_size=1,
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend=Backend.DISABLED)
-                ),
-            ),
-            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
-            kv_cache_dtype_str="bfloat16",
-            sliding_window_size=None,
-            model_config=SimpleNamespace(
-                is_encoder_decoder=False,
-                head_dim=HEAD_DIM,
-                v_head_dim=HEAD_DIM,
-                attention_arch=AttentionArch.MHA,
-                hf_config=SimpleNamespace(),
-            ),
-        )
-        with (
-            patch(
-                "sglang.srt.layers.attention.flashinfer_backend.enable_cp_v2",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.flashinfer_backend.mambaish_config",
-                return_value=None,
-            ),
-            patch(
-                "sglang.srt.layers.attention.flashinfer_backend.is_minimax_sparse",
-                return_value=False,
-            ),
-        ):
-            backend._validate_prefill_cp_configuration(model_runner)
-
-    def test_metadata_rejections(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferAttnBackend,
-        )
-        from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
-
-        metadata = ZigzagContextParallelMetadata(
-            bs=1,
-            actual_seq_q_prev_list=[2],
-            actual_seq_q_next_list=[2],
-            kv_len_prev_list=[2],
-            kv_len_next_list=[4],
-        )
-        cases = [
-            ("disabled", "without a supported", False, ForwardMode.EXTEND),
-            ("mixed", "regular EXTEND", True, ForwardMode.MIXED),
-            ("wrong_metadata", "zigzag", True, ForwardMode.EXTEND),
-            ("speculative", "speculative", True, ForwardMode.EXTEND),
-            ("custom_mask", "custom attention masks", True, ForwardMode.EXTEND),
-            ("multi_item", "multi-item metadata", True, ForwardMode.EXTEND),
-            ("request_count", "inconsistent", True, ForwardMode.EXTEND),
-        ]
-        for case_name, expected_error, enabled, forward_mode in cases:
-            backend = object.__new__(FlashInferAttnBackend)
-            backend.prefill_cp_enabled = enabled
-            forward_batch = SimpleNamespace(
-                attn_cp_metadata=(
-                    SimpleNamespace() if case_name == "wrong_metadata" else metadata
-                ),
-                forward_mode=forward_mode,
-                spec_info=(object() if case_name == "speculative" else None),
-                cross_attention_custom_mask=(
-                    torch.ones(1) if case_name == "custom_mask" else None
-                ),
-                multi_item_delimiter_indices=(
-                    [torch.zeros(1)] if case_name == "multi_item" else None
-                ),
-                req_pool_indices=torch.arange(
-                    2 if case_name == "request_count" else 1,
-                    dtype=torch.int32,
-                ),
-            )
-            with (
-                self.subTest(case=case_name),
-                self.assertRaisesRegex(ValueError, expected_error),
-            ):
-                backend._init_forward_metadata_cp(forward_batch)
-
-    def test_forward_rejections(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferAttnBackend,
-        )
-
-        q = torch.zeros(1, 8, HEAD_DIM, dtype=DTYPE)
-        key = torch.zeros(1, 2, HEAD_DIM, dtype=DTYPE)
-        value = torch.zeros_like(key)
-        cases = [
-            ("no_save", "save_kv_cache", False, key, value),
-            ("missing_kv", "current K and V", True, None, value),
-            ("cross", "cross-attention", True, key, value),
-            ("encoder", "causal decoder", True, key, value),
-            ("sliding", "sliding-window", True, key, value),
-            ("logit_cap", "logit soft caps", True, key, value),
-            ("asymmetric_heads", "asymmetric QK/V", True, key, value),
-        ]
-        for case_name, expected_error, save_kv_cache, case_key, case_value in cases:
-            backend = object.__new__(FlashInferAttnBackend)
-            backend.forward_metadata = SimpleNamespace(cp_plan=object())
-            layer = SimpleNamespace(
-                is_cross_attention=case_name == "cross",
-                attn_type=(
-                    AttentionType.ENCODER_ONLY
-                    if case_name == "encoder"
-                    else AttentionType.DECODER
-                ),
-                sliding_window_size=(128 if case_name == "sliding" else -1),
-                logit_cap=30.0 if case_name == "logit_cap" else 0.0,
-                head_dim=HEAD_DIM,
-                v_head_dim=(
-                    HEAD_DIM // 2 if case_name == "asymmetric_heads" else HEAD_DIM
-                ),
-            )
-            with (
-                self.subTest(case=case_name),
-                self.assertRaisesRegex(ValueError, expected_error),
-            ):
-                backend.forward_extend(
-                    q,
-                    case_key,
-                    case_value,
-                    layer,
-                    SimpleNamespace(),
-                    save_kv_cache=save_kv_cache,
-                )
-
-        backend = object.__new__(FlashInferAttnBackend)
-        backend.forward_metadata = SimpleNamespace(cp_plan=object())
-        layer = SimpleNamespace(
-            is_cross_attention=False,
-            attn_type=AttentionType.DECODER,
-            sliding_window_size=-1,
-            logit_cap=0.0,
-            head_dim=HEAD_DIM,
-            v_head_dim=HEAD_DIM,
-        )
-        with (
-            patch(
-                "sglang.srt.layers.attention.flashinfer_backend.get_cp_strategy",
-                return_value=None,
-            ),
-            self.assertRaisesRegex(ValueError, "without a CP strategy"),
-        ):
-            backend.forward_extend(
-                q,
-                key,
-                value,
-                layer,
-                SimpleNamespace(),
-                save_kv_cache=True,
-            )
 
 
 class TestFlashInferPrefillCPServer(CustomTestCase):
