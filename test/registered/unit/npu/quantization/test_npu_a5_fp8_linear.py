@@ -84,6 +84,14 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         self.assertIs(matmul_call.kwargs["bias"], bias)
         self.assertEqual(matmul_call.kwargs["group_sizes"], (1, 1, 32))
 
+    def test_rejects_noncontiguous_input(self):
+        input_tensor = torch.randn(2, 3, 128, dtype=torch.bfloat16).transpose(0, 1)
+        weight = torch.empty(128, 64, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
+
+        with self.assertRaisesRegex(RuntimeError, "view size is not compatible"):
+            npu_w8a8_block_fp8_linear(input_tensor, weight, [64, 128], weight_scale)
+
     def test_preserves_supported_input_dtype(self):
         input_tensor = torch.randn(2, 128, dtype=torch.float16)
         weight = torch.empty(128, 64, dtype=torch.float8_e4m3fn)
