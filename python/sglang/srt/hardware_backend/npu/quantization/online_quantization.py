@@ -43,6 +43,20 @@ def get_npu_online_integer_quant_spec(
     return _ONLINE_INTEGER_QUANT_SPECS.get(mode)
 
 
+def get_npu_online_moe_integer_quant_spec(
+    weight_prefix: str, mode: Optional[str] = None
+) -> Optional[NPUOnlineIntegerQuantSpec]:
+    if mode is None:
+        mode = get_server_args().online_quantization
+    if mode != "w4a4_int4":
+        return get_npu_online_integer_quant_spec(mode)
+    if weight_prefix == "w13":
+        return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int4"]
+    if weight_prefix == "w2":
+        return _ONLINE_INTEGER_QUANT_SPECS["w8a8_int8"]
+    raise ValueError(f"Expected an online MoE w13/w2 weight, got {weight_prefix!r}.")
+
+
 def validate_npu_online_source_dtype(params_dtype: torch.dtype) -> None:
     if params_dtype != torch.float16:
         raise ValueError(
@@ -295,13 +309,13 @@ class NPUOnlineMoEWeightLoader:
         layer: torch.nn.Module,
         params_dtype: torch.dtype,
         original_weight_loader: Callable,
-        spec: NPUOnlineIntegerQuantSpec,
+        specs: dict[str, NPUOnlineIntegerQuantSpec],
     ) -> None:
         validate_npu_online_source_dtype(params_dtype)
         self.layer = layer
         self.params_dtype = params_dtype
         self.original_weight_loader = original_weight_loader
-        self.spec = spec
+        self.specs = specs
         self.load_device = torch.get_default_device()
         self.lock = threading.Lock()
         self.loaded_numel = {"w13": 0, "w2": 0}
@@ -405,12 +419,14 @@ def create_npu_online_moe_weight_loader(
     params_dtype: torch.dtype,
     original_weight_loader: Callable,
 ) -> Optional[NPUOnlineMoEWeightLoader]:
-    spec = get_npu_online_integer_quant_spec()
-    if spec is None:
+    if get_npu_online_integer_quant_spec() is None:
         return None
+    w13_spec = get_npu_online_moe_integer_quant_spec("w13")
+    w2_spec = get_npu_online_moe_integer_quant_spec("w2")
+    assert w13_spec is not None and w2_spec is not None
     return NPUOnlineMoEWeightLoader(
         layer=layer,
         params_dtype=params_dtype,
         original_weight_loader=original_weight_loader,
-        spec=spec,
+        specs={"w13": w13_spec, "w2": w2_spec},
     )

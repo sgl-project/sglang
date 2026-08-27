@@ -182,6 +182,19 @@ class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineIntegerLinearMethod):
         return _apply_w4a4_dynamic_linear(layer=layer, x=x, bias=bias)
 
 
+_W8A8_LINEAR_PROJECTIONS = frozenset(
+    {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "qkv_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "gate_up_proj",
+        "down_proj",
+    }
+)
 _W4A4_LINEAR_PROJECTIONS = frozenset({"gate_proj", "up_proj", "gate_up_proj"})
 
 
@@ -191,7 +204,7 @@ def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]
         return None
 
     projection = prefix.rsplit(".", 1)[-1]
-    if projection == "lm_head":
+    if projection not in _W8A8_LINEAR_PROJECTIONS:
         return None
     if spec.mode == "w4a4_int4" and projection in _W4A4_LINEAR_PROJECTIONS:
         return NPUOnlineW4A4Int4LinearMethod()

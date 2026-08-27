@@ -26,7 +26,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
     NPUOnlineIntegerQuantSpec,
-    get_npu_online_integer_quant_spec,
+    get_npu_online_moe_integer_quant_spec,
     npu_dynamic_quantize_weight,
     npu_format_online_moe_scale,
     npu_format_online_weight,
@@ -911,9 +911,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 
         loader = getattr(layer, "_npu_online_moe_loader", None)
         spec = (
-            loader.spec
+            loader.specs[weight_prefix]
             if loader is not None
-            else get_npu_online_integer_quant_spec()
+            else get_npu_online_moe_integer_quant_spec(weight_prefix)
         )
         if spec is not None:
             self._apply_online_integer(layer, weight_prefix, weight_name, spec)
