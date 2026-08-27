@@ -2014,6 +2014,14 @@ def _consensus_candidates(
             or len(current) != 1
         ):
             continue
+        concurrent_prefetch_delta = None
+        if any(
+            candidate.concurrent_prefetch_device_delta_bytes is not None
+            for candidate in rank_candidates
+        ):
+            concurrent_prefetch_delta = max(
+                candidate.concurrent_prefetch_delta() for candidate in rank_candidates
+            )
         merged.append(
             ResidencyTarget(
                 component_name=component_names.pop(),
@@ -2052,10 +2060,7 @@ def _consensus_candidates(
                     candidate.present_device_delta_bytes
                     for candidate in rank_candidates
                 ),
-                concurrent_prefetch_device_delta_bytes=max(
-                    candidate.concurrent_prefetch_delta()
-                    for candidate in rank_candidates
-                ),
+                concurrent_prefetch_device_delta_bytes=concurrent_prefetch_delta,
                 inactive_device_delta_bytes=max(
                     candidate.inactive_device_delta_bytes
                     for candidate in rank_candidates
