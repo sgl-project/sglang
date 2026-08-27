@@ -283,7 +283,7 @@ class TestImageProcessorBackend(CustomTestCase):
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
-        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+        server_args._model_config = SimpleNamespace(is_multimodal=is_multimodal)
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
@@ -920,8 +920,8 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
-        args.model_config = MagicMock()
-        args.model_config.hf_config.dual_chunk_attention_config = None
+        args._model_config = MagicMock()
+        args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
@@ -1809,7 +1809,7 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1882,7 +1882,7 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
 
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1915,7 +1915,7 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         # Pin the tc_piecewise LoRA rule itself, with the hardware rule
         # neutralized so this runs on CPU-only CI.
         args = ServerArgs(model_path="dummy", enable_lora=True)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1945,7 +1945,7 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
 
     def _handled_args(self, *, architectures, is_multimodal, allowlisted):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=architectures),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=is_multimodal,
@@ -2129,7 +2129,7 @@ class TestDeepEPv2Args(CustomTestCase):
 
     def _args(self, **overrides):
         server_args = ServerArgs(model_path="dummy", moe_a2a_backend="deepep_v2")
-        server_args.model_config = SimpleNamespace(
+        server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
         )
         # The dummy path does not initialize phase configs.
@@ -2152,7 +2152,7 @@ class TestDeepEPv2Args(CustomTestCase):
             "Qwen3MoeForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
-            args.model_config.hf_config.architectures = [architecture]
+            args._model_config.hf_config.architectures = [architecture]
             args._handle_a2a_moe()
 
     def test_unvalidated_and_missing_architectures_rejected(self):
@@ -2163,7 +2163,7 @@ class TestDeepEPv2Args(CustomTestCase):
             None,
         ):
             args = self._args(moe_runner_backend="deep_gemm")
-            args.model_config.hf_config.architectures = architectures
+            args._model_config.hf_config.architectures = architectures
             with self.assertRaisesRegex(ValueError, "not validated"):
                 args._handle_a2a_moe()
 
@@ -2188,7 +2188,7 @@ class TestDeepEPv2Args(CustomTestCase):
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
         )
-        args.model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+        args._model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
         with (
             envs.SGLANG_VLM_CACHE_SIZE_MB.override(envs.SGLANG_VLM_CACHE_SIZE_MB.get()),
             envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(
@@ -2514,7 +2514,7 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
             sa._handle_deprecated_args()
         self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
-        self.assertEqual(sa.grpc_worker_threads, 8)
+        self.assertEqual(resolution_result(sa, "grpc_worker_threads"), 8)
 
     def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
@@ -2698,13 +2698,11 @@ class TestGrpcServerArgs(CustomTestCase):
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
-        # The host comes from the `serving` bag; `grpc_worker_threads` is not a
-        # field (resolution sets it from the environment), so it stays on the
-        # stand-in the call site is handed.
-        override = get_context().override_server_args(host="127.0.0.1", grpc_port=50051)
-        override.install()
+        override = get_context().override_server_args(
+            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+        )
+        server_args = override.install()
         self.addCleanup(override.restore)
-        server_args = SimpleNamespace(grpc_worker_threads=4)
         with (
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension",
@@ -2728,6 +2726,7 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
         )
+        self.assertEqual(kwargs["worker_threads"], 4)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 

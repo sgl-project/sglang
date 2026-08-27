@@ -265,12 +265,8 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 
 
 def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
-    """Write record fields past the guard that forbids post-resolution writes.
-
-    Resolution declares, so nothing in the pipeline calls this. It exists for
-    ``RuntimeContext.override_server_args``, the launch stand-in tests use: there
-    the caller's values are both the operator's input and resolution's answer.
-    """
+    """Write fields on behalf of the pipeline (bypasses the strict bare-
+    assignment guard that protects post-resolution mutation)."""
     object.__setattr__(server_args, "_internal_write", True)
     try:
         for field, value in fields.items():
@@ -299,7 +295,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
-        object.__setattr__(server_args, "_resolved_overrides", stash)
+        server_args._resolved_overrides = stash
     stash.append((source, dict(fields)))
 
 
@@ -333,12 +329,12 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     log = getattr(server_args, "_runtime_mutations", None)
     if log is None:
         log = []
-        object.__setattr__(server_args, "_runtime_mutations", log)
+        server_args._runtime_mutations = log
     log.append((source, dict(fields)))
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
-        object.__setattr__(server_args, "_resolved_overrides", stash)
+        server_args._resolved_overrides = stash
     stash.append((source, dict(fields)))
 
 
@@ -376,7 +372,7 @@ def declare_direct_writes(
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
-        object.__setattr__(server_args, "_resolved_overrides", stash)
+        server_args._resolved_overrides = stash
     # A resolver reached this way can also declare properly -- the in-tree
     # implementations of these hooks do. Those fields are already explained, and
     # recording them again would attribute them to the wrapper and bury an
