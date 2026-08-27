@@ -29,7 +29,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.runtime_context import get_context, get_serving
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
