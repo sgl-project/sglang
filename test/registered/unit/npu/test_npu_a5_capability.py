@@ -20,7 +20,7 @@ class TestNPUArch35Capability(unittest.TestCase):
                 "sys.modules",
                 {
                     "acl": SimpleNamespace(
-                        rt=SimpleNamespace(get_device_info=lambda *_: (3501, 0))
+                        rt=SimpleNamespace(get_device_info=lambda *_: (3510, 0))
                     )
                 },
             ),

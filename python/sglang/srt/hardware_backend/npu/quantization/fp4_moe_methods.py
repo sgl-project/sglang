@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 MXFP4_BLOCK_SIZE = 32
 
 
+def _wrap_mxfp4_scale_weight_loader(weight_loader):
+    def load_scale(param, loaded_weight, *args, **kwargs):
+        if param.dtype == torch.uint8 and loaded_weight.dtype == torch.float8_e8m0fnu:
+            loaded_weight = loaded_weight.view(torch.uint8)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return load_scale
+
+
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
     """DeepSeek-V4 routed experts on Ascend A5: W4A8 MXFP weights.
 
@@ -68,6 +77,10 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
 
         scale_attrs = dict(extra_weight_attrs)
         scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        if weight_loader := scale_attrs.get("weight_loader"):
+            scale_attrs["weight_loader"] = _wrap_mxfp4_scale_weight_loader(
+                weight_loader
+            )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 (
